@@ -480,6 +480,7 @@ vi.mock('../src/im/lark/doc-comment.js', () => {
 
 vi.mock('../src/services/doc-subs-store.js', () => ({
   docWatchAnchor: (fileToken: string) => `doc:${fileToken}:watch`,
+  isPollingDocTriggerMode: (mode?: string) => mode === 'all' || mode === 'owner-mention',
   putDocSubscription: vi.fn(() => ({})),
   removeDocSubscription: vi.fn(),
   listDocSubscriptionsForSession: vi.fn(() => []),

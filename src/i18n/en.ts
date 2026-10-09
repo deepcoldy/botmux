@@ -545,6 +545,7 @@ export const messages: Record<string, string> = {
   'cmd.subdoc.failed': '❌ Subscribe failed: {err}',
   'cmd.subdoc.mode_mention': 'only comments @ me',
   'cmd.subdoc.mode_all': 'all new comments',
+  'cmd.subdoc.mode_owner_mention': 'only comments @ the owner',
   'cmd.watch.no_session': '⚠️ No usable session exists in this topic. Please retry /watch-comment.',
   'cmd.watch.usage': 'Usage:\n• /watch-comment <doc link> [--dir <path>] [--all|--mentions-only] — watch comments and post AI replies back into their threads\n• /watch-comment list — list this session\'s watches, or all doc-comment watches for this bot when no session exists\n• /watch-comment off [doc link|all] — stop one watch or every watch in the current scope',
   'cmd.watch.conflicting_modes': '❌ --all and --mentions-only cannot be specified together.',

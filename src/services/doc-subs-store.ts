@@ -17,8 +17,24 @@ import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
-/** 评论触发范围：仅 @bot 的评论触发 / 该文档所有新评论都触发。 */
-export type CommentTriggerMode = 'mention-only' | 'all';
+/**
+ * 评论触发范围：
+ * - mention-only：仅评论里 @ 了本机器人时触发（靠飞书 WS 推送，飞书只推 @bot 的评论）。
+ * - owner-mention：仅评论里 @ 了**订阅负责人**（sub.ownerOpenId）时触发，类似替身：
+ *   别人在文档里 @ 负责人，bot 代为响应。飞书不会把「@ 了别人、没 @bot」的评论推给
+ *   应用，所以本模式与 all 一样靠应用身份**轮询**，只是投递前多一道 owner 提及过滤。
+ * - all：该文档所有新评论都触发（同样走轮询）。
+ */
+export type CommentTriggerMode = 'mention-only' | 'owner-mention' | 'all';
+
+/**
+ * 哪些模式需要应用身份**轮询**评论列表（而非只等飞书 WS 推送）。
+ * mention-only 只覆盖 @bot（WS 已推送）；owner-mention 与 all 都要靠轮询才能读到
+ * 「没 @bot」的评论，因此共用轮询游标与基线。切进/切出这组模式时基线语义一致。
+ */
+export function isPollingDocTriggerMode(mode: CommentTriggerMode | undefined): boolean {
+  return mode === 'all' || mode === 'owner-mention';
+}
 
 /** 已通过 WS 的 @/审计门、但 daemon 尚未接纳的评论投递。 */
 export interface PendingDocCommentDelivery {

@@ -7,6 +7,7 @@ import { toast } from './toast.js';
 import {
   createDocWatch,
   deleteDocWatch,
+  isPollingMode,
   loadDocWatches,
   outcomeMeta,
   relTime,
@@ -213,9 +214,11 @@ function AddForm(props: {
       <p className="hint">
         监听后，该文档的评论会喂进会话、bot 的回复发回评论串。
         <br />
-        「@ 本机器人才回复」：只在评论里 @ 了这个机器人时回复。注意飞书只会把「@ 了本机器人」的评论推送给它——你 @ 自己或 @ 同事的评论，机器人收不到，需要它回应请选「所有新评论」。
+        「@ 本机器人才回复」：只在评论里 @ 了这个机器人时回复。飞书只会把「@ 了本机器人」的评论推送给它——@ 自己或 @ 同事的评论它收不到。
         <br />
-        「所有新评论」：bot 用应用身份主动轮询，未 @ 机器人的评论（含 @ 自己/@ 同事）也会读到并回复，适合专用文档；切换到该模式时会先重建轮询基线、不重放历史评论。
+        「@ 负责人才回复（替身）」：别人在文档里 @ 了本监听的负责人时，bot 代为回复（替身逻辑）。飞书不推送这类评论，所以 bot 会主动轮询；没 @ 负责人的普通评论不回复。
+        <br />
+        「所有新评论」：bot 轮询所有评论，未 @ 任何人的也回复，适合专用文档。后两种都会先重建轮询基线、不重放历史评论。
       </p>
     </div>
   );
@@ -293,7 +296,11 @@ function DocWatchesPage() {
     if (!mountedRef.current) return;
     setBusyToken(null);
     if (!r.ok) { toast(`切换失败：${r.error}`, { kind: 'error' }); return; }
-    toast(mode === 'all' ? '已改为「所有新评论（含未 @ 机器人）」（下一轮先重建基线）' : '已改为「@ 本机器人才回复」');
+    toast(isPollingMode(mode)
+          ? (mode === 'owner-mention'
+              ? '已改为「@ 负责人才回复（替身）」（下一轮先重建基线）'
+              : '已改为「所有新评论（含未 @ 机器人）」（下一轮先重建基线）')
+          : '已改为「@ 本机器人才回复」');
     await reload(bots);
   }
 

@@ -38,6 +38,17 @@ describe('文档评论 poller 运行态接线（源码形状）', () => {
     expect(recordIdx).toBeGreaterThan(dispatchIdx);
   });
 
+  it('订阅过滤对 owner-mention 与 all 一视同仁（都走轮询；mention-only 不进）', () => {
+    // 轮询循环只挑 isPollingDocTriggerMode 的订阅，不能写死 === 'all'，否则
+    // owner-mention（同样靠轮询读 @ 负责人的评论）永远不会被 poller 扫到。
+    expect(pollRegion).toContain('isPollingDocTriggerMode(');
+    expect(pollRegion).not.toContain("commentTriggerMode === 'all'");
+  });
+
+  it('owner-mention 投递前过 polledReplyTriggerAllowed（没 @ 负责人/bot 的评论不投）', () => {
+    expect(pollRegion).toContain('polledReplyTriggerAllowed(');
+  });
+
   it('应用身份读文档失败时记 poll-failed 并带真实错误信息（功能「配着」却静默失效最需要可见）', () => {
     expect(pollRegion).toContain("outcome: 'poll-failed'");
     expect(pollRegion).toContain('error: message');

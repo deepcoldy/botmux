@@ -5,7 +5,12 @@
  * roles / message-listeners 同款。单个 bot 的 daemon 离线不该让整页空白。
  */
 
-export type DocWatchMode = 'mention-only' | 'all';
+export type DocWatchMode = 'mention-only' | 'owner-mention' | 'all';
+
+/** owner-mention 与 all 都靠应用身份轮询（飞书不推送未 @ 机器人的评论）。 */
+export function isPollingMode(mode: string | undefined): boolean {
+  return mode === 'all' || mode === 'owner-mention';
+}
 
 /** 与后端 `DocWatchOutcome` 一一对应，见 doc-subs-store.ts。 */
 export type DocWatchOutcome =

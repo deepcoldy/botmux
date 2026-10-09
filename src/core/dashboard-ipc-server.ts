@@ -202,6 +202,7 @@ import {
   setDocCommentPollCursor,
   docWatchAnchor,
   isDocNativeWatchSubscription,
+  isPollingDocTriggerMode,
   type CommentTriggerMode,
   type DocSubscription,
 } from '../services/doc-subs-store.js';
@@ -6128,7 +6129,7 @@ ipcRoute('PUT', '/api/doc-watches/:fileToken', async (req, res, p) => {
   let body: any;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const mode = body?.commentTriggerMode;
-  if (mode !== 'all' && mode !== 'mention-only') {
+  if (mode !== 'all' && mode !== 'mention-only' && mode !== 'owner-mention') {
     return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
   }
   const existing = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
@@ -6139,7 +6140,7 @@ ipcRoute('PUT', '/api/doc-watches/:fileToken', async (req, res, p) => {
   // 重放全部历史。先清游标则失败时 mode 仍是 mention-only、根本不进轮询，无重放窗口；
   // 在 mention-only 上清游标本身也无害（那个模式不读游标）。基线交给 poller 既有建
   // 基线分支重建，而不是在这里自取 latest（取失败会退化成重放全部历史）。
-  if (mode === 'all' && existing.commentTriggerMode !== 'all') {
+  if (isPollingDocTriggerMode(mode) && !isPollingDocTriggerMode(existing.commentTriggerMode)) {
     setDocCommentPollCursor(config.session.dataDir, cachedLarkAppId, p.fileToken, undefined, false);
   }
   if (!setCommentTriggerMode(config.session.dataDir, cachedLarkAppId, p.fileToken, mode)) {
@@ -6147,7 +6148,7 @@ ipcRoute('PUT', '/api/doc-watches/:fileToken', async (req, res, p) => {
   }
   const updated = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
   if (!updated) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
-  logger.info(`[doc-comment] dashboard set mode=${mode} file=${p.fileToken.slice(0, 12)}${mode === 'all' && existing.commentTriggerMode !== 'all' ? ' (poll baseline reset)' : ''}`);
+  logger.info(`[doc-comment] dashboard set mode=${mode} file=${p.fileToken.slice(0, 12)}${isPollingDocTriggerMode(mode) && !isPollingDocTriggerMode(existing.commentTriggerMode) ? ' (poll baseline reset)' : ''}`);
   jsonRes(res, 200, { ok: true, watch: composeDocWatchRow(updated) });
 });
 
@@ -6208,9 +6209,9 @@ ipcRoute('POST', '/api/doc-watches', async (req, res) => {
   const keepsExistingBinding = !!existing && !isDocNativeWatchSubscription(existing);
   const watchAnchor = docWatchAnchor(file.fileToken);
 
-  const reuseBaseline = mode === 'all'
+  const reuseBaseline = isPollingDocTriggerMode(mode)
     && existing?.managedBy === 'watch-comment'
-    && existing.commentTriggerMode === 'all'
+    && isPollingDocTriggerMode(existing.commentTriggerMode)
     && existing.pollBaselineReady === true;
 
   const subscription: DocSubscription = {
@@ -6228,7 +6229,7 @@ ipcRoute('POST', '/api/doc-watches', async (req, res) => {
     workingDir: workingDir ?? existing?.workingDir ?? getBot(cachedLarkAppId).config.docRepoMap?.[file.fileToken],
     pollCursorAt: reuseBaseline ? existing?.pollCursorAt : undefined,
     pollCursorReplyId: reuseBaseline ? existing?.pollCursorReplyId : undefined,
-    pollBaselineReady: mode === 'all' ? (reuseBaseline ? true : false) : undefined,
+    pollBaselineReady: isPollingDocTriggerMode(mode) ? (reuseBaseline ? true : false) : undefined,
     createdAt: existing?.createdAt ?? Date.now(),
     // 溯源显式透传（F2）：dashboard 只改配置、不改变「这一行怎么产生的」，陌生人 @
     // 出来的 auto-sub 经此保存后仍是 auto-sub。对比 /watch-comment 接管刻意不传。

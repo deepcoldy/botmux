@@ -72,9 +72,37 @@ export function commentTriggerAllowed(
   mode: CommentTriggerMode,
   triggerMentions: string[],
   selfBotOpenId: string | undefined,
+  ownerOpenId?: string,
 ): boolean {
   if (mode === 'all') return true;
-  return !!selfBotOpenId && triggerMentions.includes(selfBotOpenId);
+  if (!selfBotOpenId) return false;
+  // @ 了本机器人始终相关。
+  if (triggerMentions.includes(selfBotOpenId)) return true;
+  // owner-mention（替身语义）：评论 @ 了订阅负责人才触发。WS 链路只在 @bot 时才会
+  // 推到这里，所以 owner 提及主要由 poller 侧的同款判定兜；这里保留谓词使两条链路
+  // 口径一致、也防御未来 WS 投递范围变化。
+  if (mode === 'owner-mention') return !!ownerOpenId && triggerMentions.includes(ownerOpenId);
+  return false;
+}
+
+/**
+ * 轮询路径（poller 读到一条评论后）的触发判定。调用方应已先排除 bot 自发评论与空
+ * 正文。与 WS 的 {@link commentTriggerAllowed} 同语义但面向轮询：
+ * - all：任何评论投递。
+ * - owner-mention（替身）：评论 @ 了订阅负责人 **或** @ 了本机器人才投递；既没 @
+ *   负责人也没 @bot 的普通评论跳过（推进游标但不回复）。ownerOpenId 缺失时保守不投。
+ * - mention-only：不靠轮询（WS 已覆盖 @bot），这里恒 false。
+ */
+export function polledReplyTriggerAllowed(
+  mode: CommentTriggerMode,
+  mentions: string[],
+  selfBotOpenId: string | undefined,
+  ownerOpenId: string | undefined,
+): boolean {
+  if (mode === 'all') return true;
+  if (mode !== 'owner-mention') return false;
+  if (selfBotOpenId && mentions.includes(selfBotOpenId)) return true;
+  return !!ownerOpenId && mentions.includes(ownerOpenId);
 }
 
 /** 飞书云文档评论里富文本元素的最小子集（够 bot 发纯文本 + @人）。 */

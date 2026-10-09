@@ -70,7 +70,7 @@ import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
-  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
+  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription, isPollingDocTriggerMode,
   type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import {
@@ -3868,7 +3868,7 @@ export async function handleCommand(
         const anchor = sessionAnchorId(ds);
         const dataDir = config.session.dataDir;
         const modeLabel = (m: CommentTriggerMode) =>
-          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : m === 'owner-mention' ? 'cmd.subdoc.mode_owner_mention' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (arg === 'list' || arg === '列表') {
           const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor)
@@ -3972,7 +3972,7 @@ export async function handleCommand(
         const request = parseDocWatchCommand(message.content);
         const dataDir = config.session.dataDir;
         const modeLabel = (m: CommentTriggerMode) =>
-          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : m === 'owner-mention' ? 'cmd.subdoc.mode_owner_mention' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (request.kind === 'usage' || request.kind === 'invalid') {
           const prefix = request.kind === 'invalid' && request.reason === 'conflicting_modes'
@@ -4059,9 +4059,11 @@ export async function handleCommand(
           let pollCursorAt: number | undefined;
           let pollCursorReplyId: string | undefined;
           let pollBaselineReady: boolean | undefined;
-          if (mode === 'all') {
+          if (isPollingDocTriggerMode(mode)) {
+            // 轮询模式（all / owner-mention）共用游标基线；在两种轮询模式之间互切可
+            // 直接复用，从 mention-only 切进来才需要新建/置待建。
             const canReuseBaseline = existing?.managedBy === 'watch-comment'
-              && existing.commentTriggerMode === 'all'
+              && isPollingDocTriggerMode(existing.commentTriggerMode)
               && existing.pollBaselineReady === true;
             if (canReuseBaseline) {
               pollCursorAt = existing.pollCursorAt;

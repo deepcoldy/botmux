@@ -640,8 +640,8 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
-import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
-import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
+import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
+import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -27413,7 +27413,7 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
   try {
     const pendingRetry = await retryPendingDocCommentDeliveries(larkAppId);
     const subs = listAllDocSubscriptions(config.session.dataDir, larkAppId)
-      .filter(sub => sub.managedBy === 'watch-comment' && sub.commentTriggerMode === 'all');
+      .filter(sub => sub.managedBy === 'watch-comment' && isPollingDocTriggerMode(sub.commentTriggerMode));
     for (const snapshot of subs) {
       try {
         if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
@@ -27423,7 +27423,7 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
         });
         const latest = latestDocCommentPollCursor(comments);
         const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
-        if (!current || current.managedBy !== 'watch-comment' || current.commentTriggerMode !== 'all') continue;
+        if (!current || current.managedBy !== 'watch-comment' || !isPollingDocTriggerMode(current.commentTriggerMode)) continue;
         const acceptedPending = current.pendingDocCommentDeliveries?.filter(item => item.acceptedAt !== undefined) ?? [];
         const visibleReplyIds = new Set(comments.flatMap(comment => comment.replies.map(reply => reply.replyId)));
         if (acceptedPending.some(item => !visibleReplyIds.has(item.replyId || item.commentId))) {
@@ -27454,7 +27454,7 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
           fresh,
           async (reply) => {
             const stillWatching = getDocSubscription(config.session.dataDir, larkAppId, current.fileToken);
-            if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || stillWatching.commentTriggerMode !== 'all') {
+            if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || !isPollingDocTriggerMode(stillWatching.commentTriggerMode)) {
               return false; // watch removed mid-loop → stop without advancing
             }
             const pendingKey = `${current.fileToken}:${reply.replyId}`;
@@ -27465,7 +27465,17 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
               || hasBotSentinel(reply.text);
             const text = reply.text.replaceAll(BOT_REPLY_SENTINEL, '').trim();
             if (isSelfReply || !text) return true; // safely skip; advance past it
-            logger.info(`[doc-comment-poll] dispatch file=${current.fileToken.slice(0, 12)} comment=${reply.commentId.slice(0, 12)} reply=${reply.replyId.slice(0, 12)}`);
+            // owner-mention（替身语义）：只有 @ 了订阅负责人（或 @ 了本 bot）才投递，
+            // 其余普通评论跳过（推进游标但不回复）。与 WS 闸共用同一谓词。
+            if (!polledReplyTriggerAllowed(
+              stillWatching.commentTriggerMode,
+              reply.mentions,
+              selfBotOpenId,
+              stillWatching.ownerOpenId,
+            )) {
+              return true;
+            }
+            logger.info(`[doc-comment-poll] dispatch file=${current.fileToken.slice(0, 12)} comment=${reply.commentId.slice(0, 12)} reply=${reply.replyId.slice(0, 12)} mode=${stillWatching.commentTriggerMode}`);
             const ok = await handleDocComment({
               larkAppId,
               sub: stillWatching,

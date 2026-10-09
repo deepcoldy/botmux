@@ -3877,11 +3877,12 @@ async function processCommentEvent(
     return;
   }
 
-  // 4) 触发范围闸（mention-only 仅当评论真的 @ 了本 bot 才触发）。
+  // 4) 触发范围闸：mention-only 仅当评论真的 @ 了本 bot；owner-mention 还允许 @ 了
+  //    订阅负责人（sub.ownerOpenId）。
   //    ⚠️ 必须以拉到的评论正文 @person(open_id) 列表为准，不能信事件自带的
   //    `is_mentioned`——它表示「评论里存在任意 @」，@ 别人时也是 true，曾导致
   //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
-  if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
+  if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId, sub.ownerOpenId)) {
     logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
     rollbackAutoSub();
     noteOutcome('not-mentioned');

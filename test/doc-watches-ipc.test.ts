@@ -135,6 +135,55 @@ describe('PUT /api/doc-watches/:fileToken（切触发范围）', () => {
     expect(after.pollBaselineReady).toBe(true);
   });
 
+  it('⭐owner-mention 与 all 同属轮询：mention-only→owner-mention 也重置基线', async () => {
+    const base = await server();
+    putDocSubscription(dir, APP, sub({
+      commentTriggerMode: 'mention-only',
+      pollCursorAt: 1, pollCursorReplyId: 'ancient', pollBaselineReady: true,
+    }));
+    const r = await fetch(`${base}/api/doc-watches/${TOKEN}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ commentTriggerMode: 'owner-mention' }),
+    });
+    expect(r.status).toBe(200);
+    const after = getDocSubscription(dir, APP, TOKEN)!;
+    expect(after.commentTriggerMode).toBe('owner-mention');
+    expect(after.pollBaselineReady).toBe(false);
+    expect(after.pollCursorAt).toBeUndefined();
+  });
+
+  it('all↔owner-mention 互切复用同一轮询基线（游标不动）', async () => {
+    const base = await server();
+    putDocSubscription(dir, APP, sub({
+      commentTriggerMode: 'all', pollCursorAt: 9090, pollCursorReplyId: 'r90', pollBaselineReady: true,
+    }));
+    await fetch(`${base}/api/doc-watches/${TOKEN}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ commentTriggerMode: 'owner-mention' }),
+    });
+    let after = getDocSubscription(dir, APP, TOKEN)!;
+    expect(after.pollCursorAt).toBe(9090);
+    expect(after.pollBaselineReady).toBe(true);
+    // 切回 all 同样不动
+    await fetch(`${base}/api/doc-watches/${TOKEN}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ commentTriggerMode: 'all' }),
+    });
+    after = getDocSubscription(dir, APP, TOKEN)!;
+    expect(after.pollCursorAt).toBe(9090);
+  });
+
+  it('owner-mention→mention-only 合法（停止轮询）', async () => {
+    const base = await server();
+    putDocSubscription(dir, APP, sub({ commentTriggerMode: 'owner-mention' }));
+    const r = await fetch(`${base}/api/doc-watches/${TOKEN}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ commentTriggerMode: 'mention-only' }),
+    });
+    expect(r.status).toBe(200);
+    expect(getDocSubscription(dir, APP, TOKEN)!.commentTriggerMode).toBe('mention-only');
+  });
+
   it('未知 token → 404；非法 mode → 400；坏 token 形状 → 400', async () => {
     const base = await server();
     const a = await fetch(`${base}/api/doc-watches/${TOKEN}`, {

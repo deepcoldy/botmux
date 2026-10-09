@@ -15,6 +15,7 @@ import {
   commitDocCommentPollCursor,
   normalizeDocNativeWatchSubscription,
   settleDocCommentWsDelivery,
+  isPollingDocTriggerMode,
   recordDocWatchActivity,
   setDocTitle,
   asDocWatchOutcome,
@@ -302,5 +303,14 @@ describe('putDocSubscription inheritRuntime（运行态 vs 溯源，策略相反
     const fresh = getDocSubscription(dataDir, APP_A, 'doccnFILE1')!;
     expect(fresh.dispatchCount).toBeUndefined();
     expect(fresh.lastOutcome).toBeUndefined();
+  });
+});
+
+describe('isPollingDocTriggerMode（哪些模式靠轮询而非 WS 推送）', () => {
+  it('all 与 owner-mention 都走轮询；mention-only 不靠轮询', () => {
+    expect(isPollingDocTriggerMode('all')).toBe(true);
+    expect(isPollingDocTriggerMode('owner-mention')).toBe(true);
+    expect(isPollingDocTriggerMode('mention-only')).toBe(false);
+    expect(isPollingDocTriggerMode(undefined)).toBe(false);
   });
 });
