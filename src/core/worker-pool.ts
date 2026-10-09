@@ -45,7 +45,6 @@ import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './sessio
 import {
   initialNativeRenameStartupCommand,
   initialPiLaunchSessionTitle,
-  withInitialNativeRenameStartupCommand,
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
@@ -12591,9 +12590,11 @@ export function forkWorker(
     }
   });
 
-  // 用户在话题头里写的标题：Pi 经 --name 带上；Claude Code / Grok / Cursor 在正文前
-  // 敲一次 /rename。Codex 走上面 nativeSessionTitle 的 thread/name/set，不在这里追加。
-  // 只改这一次 init 的 startupCommands，不写回 bot 配置，所以冷恢复不会重放。
+  // 用户在话题头里写的标题：Pi 经 --name 带上；Claude Code / Grok / Cursor 用单独的
+  // initialNativeRename 在正文前敲一次 /rename。不混进 startupCommands——那些命令
+  // 在 worker 内每次重启 CLI 都要重放，/rename 重放会盖掉用户后来改的会话名。
+  // Codex 走上面 nativeSessionTitle 的 thread/name/set，不在这里追加。
+  // 不写回 bot 配置，冷恢复过不了 fresh 闸。
   const userDefinedNativeTitle = ds.session.nativeSessionTitleUserDefined
     ? ds.session.nativeSessionTitle?.trim() || undefined
     : undefined;
@@ -12609,9 +12610,9 @@ export function forkWorker(
     const piTitle = initialPiLaunchSessionTitle(nativeRenameInput);
     if (piTitle) nativeSessionTitle = piTitle;
   }
-  const startupCommands = withInitialNativeRenameStartupCommand(
-    agentCfg.startupCommands,
-    initialNativeRenameStartupCommand(nativeRenameInput),
+  const initialNativeRename = initialNativeRenameStartupCommand(
+    nativeRenameInput,
+    familyAdapter.buildSessionRenameCommand,
   );
 
   // Send init config — use per-bot settings
@@ -12668,10 +12669,12 @@ export function forkWorker(
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
-    // `startupCommands` may additionally carry a one-shot `/rename` for a fresh
-    // user-titled Claude Code / Grok / Cursor session; that extra line is not
-    // part of the bot config and is absent on resume.
-    startupCommands,
+    startupCommands: agentCfg.startupCommands,
+    // One-shot `/rename` for a fresh user-titled Claude Code / Grok / Cursor
+    // session. Kept off startupCommands so an in-worker CLI restart, which
+    // replays startupCommands, cannot overwrite a name the user changed later.
+    // The worker consumes it once and does not re-arm that one-shot.
+    ...(initialNativeRename ? { initialNativeRename } : {}),
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.

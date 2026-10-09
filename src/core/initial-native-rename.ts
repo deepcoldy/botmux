@@ -2,17 +2,17 @@
  * 话题头（以及其它在首次 spawn 之前就写好的用户标题）怎么落到 CLI 自己的会话名。
  *
  * 三条通道，故意不合成一条：
- *   - Pi：启动参数 `--name`。标题在进程起来时就在，不必敲命令。
- *   - Claude Code / Grok / Cursor：追加一条一次性的 `/rename <标题>` 到本次 spawn
- *     的 startupCommands 末尾。Grok 和 Cursor 把首轮正文烤进 argv，多了这条命令后
- *     现有的 shouldDeferInitialPromptForStartup 会把正文挪回队列，于是顺序变成
- *     「已有启动命令 → /rename → 正文」。Claude Code 的 `/model` `/effort` 本来就是
- *     进程参数，正文本来就走队列，同一条追加把它放在正文之前。
+ *   - Pi：启动参数 `--name`，且只在 `resume === false` 的首次启动。带 `--session-id`
+ *     resume 时 Pi 会无条件再写一条 session_info，名字取最后一条，所以重启不能再带。
+ *   - Claude Code / Grok / Cursor：单独的 `initialNativeRename`（`/rename <标题>`），
+ *     不混进 bot 的 startupCommands。那些命令（如 `/effort`）每次新进程都要重放；
+ *     `/rename` 只在这个 worker 里敲一次，worker 内重启不再武装，否则会盖掉用户
+ *     后来在 CLI 里改的名字。Grok / Cursor 把首轮正文烤进 argv，这条命令仍算进
+ *     {@link spawnHasStartupWork}，正文会推迟到「已有启动命令 → /rename → 正文」。
  *   - Codex：用户标题已经由 thread/name/set 在首条输入提交后写上，这里不再敲 `/rename`。
  *
- * 只作用于还没有 CLI 会话 id 的全新 spawn。冷恢复、接管、wrapper、远端后端都不做：
- * 冷恢复重敲会盖掉用户在 CLI 里改过的名字；riff/mojo 会跳过 startupCommands，
- * 若仍把命令算进 hasStartupCommands，argv 正文会被推迟却永远敲不进去。
+ * 只作用于还没有 CLI 会话 id 的全新 spawn。冷恢复、接管、wrapper、远端后端都不做。
+ * 命令文本来自适配器的 `buildSessionRenameCommand`：没声明这项能力就不敲。
  */
 
 const STARTUP_RENAME_CLI_IDS = new Set(['claude-code', 'grok', 'cursor']);
@@ -43,21 +43,24 @@ export function initialPiLaunchSessionTitle(input: InitialNativeRenameInput): st
 }
 
 /**
- * 追加到本次 spawn 的 startupCommands 末尾的那一行。不经过
- * normalizeStartupCommand：那条有 200 字上限，而会话标题本身就可以到 200，
- * 加上 `/rename ` 前缀会把合法标题丢掉。运行时只是把这一行敲进 TUI。
+ * 本次 spawn 单独携带的那一行 `/rename`。不经过 normalizeStartupCommand：那条有
+ * 200 字上限，而会话标题本身就可以到 200，加上前缀会把合法标题丢掉。
+ * `buildCommand` 必须是适配器声明的 `buildSessionRenameCommand`；没声明则不敲。
  */
-export function initialNativeRenameStartupCommand(input: InitialNativeRenameInput): string | undefined {
-  if (!input.cliId || !STARTUP_RENAME_CLI_IDS.has(input.cliId) || !eligible(input)) return undefined;
+export function initialNativeRenameStartupCommand(
+  input: InitialNativeRenameInput,
+  buildCommand: ((title: string) => string) | undefined,
+): string | undefined {
+  if (!buildCommand || !input.cliId || !STARTUP_RENAME_CLI_IDS.has(input.cliId) || !eligible(input)) return undefined;
   const title = input.userDefinedTitle!.trim().replace(/[\r\n]+/g, ' ');
-  return `/rename ${title}`;
+  return buildCommand(title);
 }
 
-/** 不改 bot 配置。没有改名命令时原样返回，避免把 `undefined` 变成空数组。 */
-export function withInitialNativeRenameStartupCommand(
-  commands: readonly string[] | undefined,
-  renameCommand: string | undefined,
-): string[] | undefined {
-  if (!renameCommand) return commands ? [...commands] : undefined;
-  return [...(commands ?? []), renameCommand];
+/** argv 首轮正文要不要推迟到启动命令和一次性改名之后。改名不在 startupCommands
+ *  里，但同样必须发生在正文之前。 */
+export function spawnHasStartupWork(
+  startupCommands: readonly string[] | undefined,
+  initialNativeRename: string | undefined,
+): boolean {
+  return (startupCommands?.length ?? 0) > 0 || !!initialNativeRename;
 }
