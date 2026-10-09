@@ -7581,7 +7581,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset}, skipTail=true)`);
   } else if (existsSync(rolloutPath)) {
     const journalPath = structuredBridgeJournalPath() ?? codexAdoptJournalPath();
-    const canRecover = journalPath && !structuredBridgeRecoveryAttempted;
+    // Cursor's JSONL transcript lacks per-event timestamps and stamps wall-clock Date.now() on drain;
+    // timestamp-cutoff replay cannot partition Cursor history, so Cursor stays on the offset EOF baseline.
+    const canRecover = journalPath && !structuredBridgeRecoveryAttempted && !codexBridgeIsCursor();
     const restorable = canRecover ? selectRestorableBridgeTurns(readBridgeTurnJournal(journalPath), { currentJsonlPath: rolloutPath }) : [];
     if (journalPath) structuredBridgeRecoveryAttempted = true;
     if (restorable.length > 0 && journalPath) {
@@ -9073,8 +9075,6 @@ function stopCodexBridge(): void {
   mtrBridgeOffset = 0;
   mtrBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
-  checkpointCodexAdoptRecovery();
-  checkpointStructuredBridgeRecovery();
   codexBridgeQueue.setLocalTurns(false);
   resetThinkingChannel();
   stopAllCursorCot();

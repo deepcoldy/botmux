@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
-import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
 
@@ -168,5 +168,20 @@ describe('adopted Codex turn recovery', () => {
     expect(q2.drainEmittable()).toMatchObject([{ turnId: 'om_pi_task', finalText: 'Pi offline output' }]);
     checkpointCodexAdoptTurns(path, rollout, q2);
     expect(readBridgeTurnJournal(path)).toEqual([]);
+  });
+
+  it('documents why wall-clock Date.now() drainers (like Cursor) cannot use timestamp cutoff replay', () => {
+    // When a drainer lacks real event timestamps and stamps Date.now(),
+    // all replayed events exceed minMarkTime - 5s, putting everything into live.
+    // This verifies why worker explicitly guards cutoff recovery with !codexBridgeIsCursor().
+    const now = 50_000;
+    const wallClockEvents = [
+      event('user', now, 'historical prompt'),
+      event('assistant_final', now, 'historical answer'),
+    ];
+    const cutoff = 20_000 - 5_000;
+    const { history, live } = splitCodexEventsByCutoff(wallClockEvents, cutoff);
+    expect(history).toHaveLength(0);
+    expect(live).toHaveLength(2);
   });
 });

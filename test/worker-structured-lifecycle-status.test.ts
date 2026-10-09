@@ -42,6 +42,7 @@ describe('worker structured-turn status wiring', () => {
     expect(checkpoint).toContain('!structuredBridgeRecoveryAttempted');
     const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 6_000);
     expect(attach).toContain('!structuredBridgeRecoveryAttempted');
+    expect(attach).toContain('!codexBridgeIsCursor()');
     expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
   });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
