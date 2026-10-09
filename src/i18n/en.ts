@@ -1138,6 +1138,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_cancelled': '⚠️ The session was closed while resume was committing; resume was cancelled.',
   'card.action.resume_start_failed': '⚠️ The remote recovery process could not start. The session remains closed; please retry later.',
   'card.action.resume_reconciliation_required': '⚠️ Remote recovery failed to start and the session could not be proven closed again. It remains protected; retry close or inspect the remote state.',
+  'card.action.primary_lifecycle_unavailable': '⚠️ Card-based close, resume, and restart are not yet available in multi-replica durable mode. Send `/close` in this thread to close the session; mention the bot again to start a new session.',
   'card.action.disconnected': '⏏ Disconnected. The original CLI is untouched.',
   'card.voice.toast_wait': '🔊 Generating a voice summary, hang tight…',
   'card.voice.toast_already': '🔊 A voice summary for this reply is already on the way.',

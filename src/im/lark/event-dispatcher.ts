@@ -1103,6 +1103,19 @@ function cardActionMessageId(data: any): string | undefined {
   return data?.context?.open_message_id ?? data?.open_message_id;
 }
 
+const PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS = new Set([
+  'close',
+  'restart',
+  'resume',
+]);
+
+function cardActionType(data: any): string | undefined {
+  const action = data?.action;
+  const value = action?.value ?? {};
+  const raw = value?.action ?? action?.name ?? action?.option ?? action?.tag;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+}
+
 function cardActionKey(larkAppId: string, data: any): string {
   const eventId = eventIdForKey(data);
   if (eventId) return `card.action.trigger:${larkAppId}:${eventId}`;
@@ -5449,7 +5462,30 @@ export function createLarkEventDispatcherRuntime(
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_ended', VC_BOT_MEETING_ENDED_EVENT),
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
-    'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
+    'card.action.trigger': (data: any) => {
+      const actionType = cardActionType(data);
+      if (
+        runtimeOptions.enqueuePrimary
+        && actionType
+        && PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS.has(actionType)
+      ) {
+        logger.warn(
+          `[card-action] durable primary rejected unfenced session lifecycle action: `
+          + `app=${larkAppId} action=${actionType}`,
+        );
+        return {
+          toast: {
+            type: 'warning',
+            content: t(
+              'card.action.primary_lifecycle_unavailable',
+              undefined,
+              localeForBot(larkAppId),
+            ),
+          },
+        };
+      }
+      return handleCardActionAckSafe(data, larkAppId, handlers);
+    },
     // 表情回复事件——一旦在开发者后台订阅了 reaction，SDK 每收到一次都会因
     // 没有 handler 打 "no im.message.reaction.created_v1 handle" 警告刷屏。
     // botmux 不消费表情事件，注册显式 no-op 把这条噪声静默掉。

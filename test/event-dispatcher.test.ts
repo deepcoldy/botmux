@@ -1298,6 +1298,70 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it.each(['close', 'resume', 'restart'])(
+    'rejects unfenced %s card actions before local side effects',
+    async action => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      const handlers = makeHandlers();
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        handlers,
+        'feishu',
+        undefined,
+        { enqueuePrimary },
+      );
+      runtime.connect();
+
+      const result = await capturedHandlers['card.action.trigger']({
+        action: { value: { action, session_id: 'session-primary' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_primary_lifecycle' },
+      });
+
+      expect(result).toEqual({
+        toast: {
+          type: 'warning',
+          content: expect.stringContaining('多副本持久模式'),
+        },
+      });
+      expect(handlers.handleCardAction).not.toHaveBeenCalled();
+      expect(enqueuePrimary).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
+
+  it('keeps read-only card actions available in durable primary mode', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.handleCardAction.mockResolvedValue({
+      toast: { type: 'success', content: 'opened' },
+    });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const data = {
+      action: { value: { action: 'open_terminal', session_id: 'session-primary' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_primary_readonly' },
+    };
+
+    await expect(capturedHandlers['card.action.trigger'](data)).resolves.toEqual({
+      toast: { type: 'success', content: 'opened' },
+    });
+    expect(handlers.handleCardAction).toHaveBeenCalledWith(data, MY_APP_ID);
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it('routes message-updated WS events through durable ingress instead of the legacy path', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();
