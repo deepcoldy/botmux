@@ -435,6 +435,7 @@ import {
   stripAnsiScreenText,
   type IdleEvidenceSource,
 } from './utils/idle-detector.js';
+import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import {
   StuckDetector,
@@ -2168,6 +2169,7 @@ let spawnArgvTurnStartBusyScanTail = '';
 let spawnArgvTurnStartEvidenceDeadlineMs = 0;
 let spawnArgvTurnStartFailOpenTimer: ReturnType<typeof setTimeout> | null = null;
 let idleDetector: IdleDetector | null = null;
+let programStatusStream: ProgramStatusFramingStream | null = null;
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
 let crashDiagnosticTmuxParked = false;
@@ -11943,7 +11945,34 @@ function cancelAmbiguousSubmissionAfterFailure(
   }
 }
 
-function onPtyData(data: string): void {
+function onPtyData(data: string, isLiveStream = true): void {
+  if (!programStatusStream) {
+    handlePtyDataChunk(data);
+    return;
+  }
+
+  const parts = programStatusStream.feed(data);
+  for (const part of parts) {
+    if (part.type === 'probe') {
+      lastPtyActivityAtMs = Date.now();
+      if (isLiveStream) {
+        log('[program-status] probe received; replying with OSC 7501 handshake');
+        try {
+          backend?.write('\x1b]7501;?\x1b\\');
+        } catch (err: any) {
+          log(`[program-status] probe reply failed: ${err.message}`);
+        }
+      }
+    } else if (part.type === 'status') {
+      lastPtyActivityAtMs = Date.now();
+      idleDetector?.observeProgramStatus(part.event);
+    } else if (part.type === 'data') {
+      handlePtyDataChunk(part.text);
+    }
+  }
+}
+
+function handlePtyDataChunk(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   backendScreenRevision += 1;
@@ -14683,6 +14712,12 @@ function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>,
       markPromptReady();
       return;
     }
+    if (evidenceSource === 'program-status') {
+      drainBridges();
+      if (idleBackend) markPromptReadyFromPty(idleBackend);
+      else markPromptReady();
+      return;
+    }
     if (idleBackend && deferPromptReadyWhileBusy(`${label} adopt-idle`, idleBackend)) return;
     drainBridges();
     markPromptReady();
@@ -14696,7 +14731,7 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
       if (be instanceof ZmxBackend) {
         scheduleBackendScreenResync(initial, source);
       } else {
-        onPtyData(initial);
+        onPtyData(initial, false);
       }
       if (be instanceof HerdrBackend) {
         relayHerdrWebSnapshot(initial);
@@ -14972,6 +15007,7 @@ async function spawnCli(
   }
   // Prefer force-clear so a half-finished rename cannot block the new generation.
   forceClearSessionRenameInFlight();
+  programStatusStream = cfg.cliId === 'claude-code' ? new ProgramStatusFramingStream() : null;
   currentCliCredentialIsolated = false;
   // Enrollment writes the fixed marker before any device credential appears.
   // From that instant onward every NEW local CLI must carry a credential
@@ -19169,6 +19205,10 @@ async function spawnCli(
   };
   const markReadyFromEvidence = (evidenceSource?: string): void => {
     if (evidenceSource === 'screen') markPromptReadyFromPty(observedBackend);
+    // OSC 7501 done/idle/error is a real prompt edge. It has to take the PTY
+    // path so the post-SessionStart fence accepts it, and it must not fall
+    // through to the footer veto below: Claude's ❯ stays up while busy.
+    else if (evidenceSource === 'program-status') markPromptReadyFromPty(observedBackend);
     else markPromptReady();
   };
   const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
@@ -19801,6 +19841,8 @@ function killCli(opts: {
   destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
+  programStatusStream?.reset();
+  programStatusStream = null;
   stopReattachIdleProbe();
   stopBusyPatternIdleProbe();
   stopStructuredStartGraceRecheck();
