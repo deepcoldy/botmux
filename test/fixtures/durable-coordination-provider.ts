@@ -49,6 +49,7 @@ lines.on('line', line => {
     return;
   }
   if (request.method === 'readSession' || request.method === 'readOutbox'
+      || request.method === 'readControlOperation'
       || request.method === 'claimNextInbox' || request.method === 'reserveNextOutbox') {
     send({ ...base, type: 'result', result: null });
     return;

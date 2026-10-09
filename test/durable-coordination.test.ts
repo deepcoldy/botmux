@@ -30,8 +30,8 @@ afterEach(() => {
 });
 
 describe('SQLite durable coordination contract', () => {
-  it('pins the lane-aware coordination contract version', () => {
-    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(2);
+  it('pins the control-operation-aware coordination contract version', () => {
+    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(3);
   });
 
   it('uses monotonic session epochs and fences stale state writers', async () => {
@@ -286,6 +286,45 @@ describe('SQLite durable coordination contract', () => {
       event: { eventId: 'legacy-message', lane: DURABLE_INBOX_LANE_LARK_MESSAGE },
     });
     await reopened.close();
+  });
+
+  it('upgrades version 2 stores with the control operation table', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-control-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP TABLE durable_control_operations;');
+    raw.prepare(
+      'UPDATE durable_coordination_meta SET schema_version = 2 WHERE singleton = 1',
+    ).run();
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 11 });
+    const lease = acquired(await reopened.acquireSessionLease({
+      sessionKey: 'session-migrated', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    expect(await reopened.enqueueControlOperation({
+      lease,
+      operation: {
+        operationId: 'control-migrated',
+        sessionKey: 'session-migrated',
+        payload: { action: 'close' },
+        createdAt: 11,
+      },
+    })).toEqual({ kind: 'inserted' });
+    expect(await reopened.readControlOperation('control-migrated')).toMatchObject({
+      state: 'pending', attempts: 0,
+    });
+    await reopened.close();
+
+    const migrated = openDatabaseSyncOrThrow(path);
+    expect(migrated.prepare(
+      'SELECT schema_version FROM durable_coordination_meta WHERE singleton = 1',
+    ).get()).toEqual({ schema_version: 3 });
+    migrated.close();
   });
 
   it('retries claimed inbox work only after the requested visibility time', async () => {
@@ -559,6 +598,238 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.completeOutboxAttempt({
       attempt: nextAttempt.attempt, receipt: { platformMessageId: 'om_delayed' },
     })).toMatchObject({ kind: 'applied', record: { state: 'delivered' } });
+    await store.close();
+  });
+
+  it('deduplicates stable control operation ids and only retries proven pre-effect failures', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-control', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    const operation = {
+      operationId: 'control:event-1',
+      sessionKey: 'session-control',
+      payload: { action: 'close', expectedGeneration: 3 },
+      createdAt: 1,
+    } as const;
+    expect(await store.enqueueControlOperation({ lease, operation })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueControlOperation({
+      lease, operation: { ...operation, createdAt: 99 },
+    })).toEqual({ kind: 'duplicate' });
+    expect(await store.enqueueControlOperation({
+      lease, operation: { ...operation, payload: { action: 'resume' } },
+    })).toEqual({ kind: 'conflict' });
+
+    now = 2;
+    const first = await store.beginControlOperationAttempt({
+      lease, operationId: operation.operationId,
+    });
+    expect(first).toMatchObject({
+      kind: 'applied',
+      record: { state: 'attempting', attempts: 1, originEpoch: 1 },
+      attempt: { ownerId: 'worker-a', leaseEpoch: 1, attempt: 1 },
+    });
+    if (first.kind !== 'applied') throw new Error('expected first control attempt');
+    now = 3;
+    expect(await store.retryControlOperationAttempt({
+      attempt: first.attempt,
+      error: 'provider rejected before dispatch',
+    })).toMatchObject({
+      kind: 'applied', record: { state: 'pending', attempts: 1 },
+    });
+    expect(await store.completeControlOperationAttempt({
+      attempt: first.attempt, result: { closed: true },
+    })).toEqual({ kind: 'stale' });
+
+    now = 4;
+    const second = await store.beginControlOperationAttempt({
+      lease, operationId: operation.operationId,
+    });
+    expect(second).toMatchObject({
+      kind: 'applied', record: { state: 'attempting', attempts: 2 },
+    });
+    if (second.kind !== 'applied') throw new Error('expected second control attempt');
+    now = 5;
+    expect(await store.completeControlOperationAttempt({
+      attempt: second.attempt,
+      result: { status: 'closed', remoteGeneration: 3 },
+    })).toMatchObject({
+      kind: 'applied',
+      record: {
+        state: 'completed',
+        attempts: 2,
+        result: { status: 'closed', remoteGeneration: 3 },
+      },
+    });
+    expect(await store.beginControlOperationAttempt({
+      lease, operationId: operation.operationId,
+    })).toMatchObject({ kind: 'not_pending', record: { state: 'completed' } });
+    await store.close();
+  });
+
+  it('freezes an attempting control operation on lease takeover but accepts its exact late result', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const firstLease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-takeover', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:takeover',
+        sessionKey: 'session-takeover',
+        payload: { action: 'resume' },
+        createdAt: 1,
+      },
+    });
+    const begun = await store.beginControlOperationAttempt({
+      lease: firstLease, operationId: 'control:takeover',
+    });
+    if (begun.kind !== 'applied') throw new Error('expected begun control attempt');
+
+    now = 11;
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-takeover', ownerId: 'worker-b', leaseDurationMs: 100,
+    }));
+    expect(takeover.epoch).toBe(2);
+    expect(await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:takeover',
+    })).toMatchObject({
+      kind: 'not_pending',
+      record: {
+        state: 'ambiguous',
+        attempts: 1,
+        lastError: 'control attempt lost its session lease before result',
+      },
+    });
+    expect(await store.retryControlOperationAttempt({
+      attempt: begun.attempt, error: 'must not replay result-unknown work',
+    })).toEqual({ kind: 'stale' });
+
+    now = 12;
+    expect(await store.completeControlOperationAttempt({
+      attempt: begun.attempt,
+      result: { status: 'resumed', generation: 4 },
+    })).toMatchObject({
+      kind: 'applied',
+      record: { state: 'completed', result: { status: 'resumed', generation: 4 } },
+    });
+    await store.close();
+  });
+
+  it('leaves ambiguous control work closed until backend reconciliation proves the outcome', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const firstLease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-reconcile', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:reconcile-completed',
+        sessionKey: 'session-reconcile',
+        payload: { action: 'close' },
+        createdAt: 1,
+      },
+    });
+    const firstAttempt = await store.beginControlOperationAttempt({
+      lease: firstLease, operationId: 'control:reconcile-completed',
+    });
+    if (firstAttempt.kind !== 'applied') throw new Error('expected first reconcile attempt');
+
+    now = 11;
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-reconcile', ownerId: 'worker-b', leaseDurationMs: 100,
+    }));
+    await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:reconcile-completed',
+    });
+    await expect(store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 1,
+      outcome: { kind: 'completed', result: {}, evidence: null },
+    })).rejects.toThrow(/evidence must be non-null/);
+    expect(await store.reconcileControlOperation({
+      lease: firstLease,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 1,
+      outcome: { kind: 'completed', result: {}, evidence: { source: 'backend' } },
+    })).toEqual({ kind: 'stale_lease' });
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 2,
+      outcome: { kind: 'completed', result: {}, evidence: { source: 'backend' } },
+    })).toEqual({ kind: 'stale' });
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-completed',
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'completed',
+        result: { status: 'closed' },
+        evidence: { source: 'backend', remoteState: 'missing' },
+      },
+    })).toMatchObject({
+      kind: 'applied',
+      record: {
+        state: 'completed',
+        result: { status: 'closed' },
+        reconciliation: {
+          kind: 'completed', evidence: { source: 'backend', remoteState: 'missing' },
+        },
+      },
+    });
+
+    now = 12;
+    await store.enqueueControlOperation({
+      lease: takeover,
+      operation: {
+        operationId: 'control:reconcile-not-applied',
+        sessionKey: 'session-reconcile',
+        payload: { action: 'resume' },
+        createdAt: 12,
+      },
+    });
+    const notAppliedAttempt = await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:reconcile-not-applied',
+    });
+    if (notAppliedAttempt.kind !== 'applied') throw new Error('expected not-applied attempt');
+    expect(await store.markControlOperationAmbiguous({
+      attempt: notAppliedAttempt.attempt, error: 'transport result unknown',
+    })).toMatchObject({ kind: 'applied', record: { state: 'ambiguous' } });
+    now = 13;
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-not-applied',
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'not_applied',
+        evidence: { source: 'backend', terminal: true },
+        error: 'backend proved the request was not applied',
+      },
+    })).toMatchObject({
+      kind: 'applied',
+      record: {
+        state: 'pending',
+        attempts: 1,
+        reconciliation: {
+          kind: 'not_applied', evidence: { source: 'backend', terminal: true },
+        },
+      },
+    });
+    expect(await store.completeControlOperationAttempt({
+      attempt: notAppliedAttempt.attempt,
+      result: { status: 'resumed' },
+    })).toEqual({ kind: 'stale' });
+    const retried = await store.beginControlOperationAttempt({
+      lease: takeover, operationId: 'control:reconcile-not-applied',
+    });
+    expect(retried).toMatchObject({
+      kind: 'applied', record: { state: 'attempting', attempts: 2 },
+    });
     await store.close();
   });
 

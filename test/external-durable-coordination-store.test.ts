@@ -33,6 +33,7 @@ describe('external durable coordination provider', () => {
       },
     });
     await expect(store.readSession('missing')).resolves.toBeUndefined();
+    await expect(store.readControlOperation('missing-control')).resolves.toBeUndefined();
     await store.close();
   });
 
