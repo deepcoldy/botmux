@@ -39,22 +39,51 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
   const footer = below.slice(0, 4).filter(row => row.trim());
   if (footer.length < 1 || footer.length > 2 || below.slice(4).some(row => row.trim())
     || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(lines.join('\n'))) return undefined;
-  if (footer.length === 2 && !/^\s*(?:← for agents|\? for shortcuts|esc to interrupt|tab to queue)\b/.test(footer[1] ?? '')) return undefined;
+  // The second footer row is the native hints/warning row. A warning-only row
+  // is native too: when hints are hidden the warning is the only thing left in
+  // that row. Codex degrades the notice by width: `\u26a0 N warnings \u00b7 f2
+  // to view` -> `\u26a0 N \u00b7 f2` -> `\u26a0 N`, so accept the shared
+  // `\u26a0 N` prefix (the optional \uFE0F covers the emoji-presentation
+  // glyph). This gates the row shape only; it never feeds ID extraction.
+  if (footer.length === 2
+    && !/^\s*(?:\u2190 for agents|\? for shortcuts|esc to interrupt|tab to queue)\b/.test(footer[1] ?? '')
+    && !/^\s*\u26a0(?:\ufe0f)?\s*\d+\b/.test(footer[1] ?? '')) return undefined;
   return footer.map(row => row.trim()).join('\n');
 }
 
+// A complete Codex thread UUID (the `thread-id` / legacy `session-id` item).
+const THREAD_ID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+// The ID must OPEN its segment and be a standalone whitespace-delimited
+// token: only leading whitespace / braille spinners may precede it (stripped
+// above), and the very next character after the id must be whitespace or the
+// segment end. This anchoring keeps a cwd segment such as `/tmp/<uuid>` from
+// impersonating the thread id -- there the UUID does not start the segment --
+// and rejects glued path/file/colon suffixes (`<id>.json`, `<id>/sub`,
+// `<id>:x`) even though those punctuation marks are not word characters. A
+// space-separated suffix is allowed because the TUI right-aligns notices after
+// the id on the same segment using space padding, not ` \u00b7 `: busy
+// spinners and the `\u26a0 N warnings \u00b7 f2 to view` notice.
+const THREAD_ID_OPENING_SEGMENT = new RegExp(`^(${THREAD_ID_PATTERN})(?:\\s([\\s\\S]*))?$`, 'i');
+const THREAD_ID_ANYWHERE = new RegExp(THREAD_ID_PATTERN, 'i');
+
 function statusLineSession(footer: string): string | undefined {
-  // Codex's native `thread-id` status-line item (legacy alias `session-id`)
-  // renders the full UUID as a separate segment. Read only the live footer:
-  // UUIDs in scrollback, pasted drafts, and old /status cards are not evidence.
-  const ids = footer.split(/\n|\s+·\s+/)
-    // Busy spinners are plain braille characters, not ANSI escapes. Only strip
-    // that known decoration at segment boundaries; /tmp/<uuid> is not an ID.
+  // Read only the live footer: UUIDs in scrollback, pasted drafts, and old
+  // /status cards are not evidence.
+  const ids = footer
+    .split(/\n|\s+\u00b7\s+/)
+    // Busy spinners are plain braille characters, not ANSI escapes. Strip that
+    // known decoration at segment boundaries; a /tmp/<uuid> prefix is kept.
     .map(segment => segment.replace(/^[\s\u2800-\u28ff]+|[\s\u2800-\u28ff]+$/g, ''))
-    .filter(segment =>
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment),
-    );
-  return ids.length === 1 ? ids[0]?.toLowerCase() : undefined;
+    .flatMap((segment): string[] => {
+      const match = THREAD_ID_OPENING_SEGMENT.exec(segment);
+      if (!match) return [];
+      const [, id, remainder] = match;
+      // A second UUID inside the trailing decoration is ambiguous (one thread
+      // never renders two ids) -- drop the segment instead of guessing.
+      if (THREAD_ID_ANYWHERE.test(remainder ?? '')) return [];
+      return [id!.toLowerCase()];
+    });
+  return ids.length === 1 ? ids[0] : undefined;
 }
 
 /**

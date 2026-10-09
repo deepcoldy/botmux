@@ -71,6 +71,22 @@ describe('Codex terminal session identity', () => {
     `  GPT-6-Astra xhigh · /tmp · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
     `  ⠙ ${sid} · GPT-6 · ⠋\n  ← for agents · ? for shortcuts`,
     `  /tmp/${other} · ${sid}\n  ← for agents · ? for shortcuts`,
+    // A right-aligned `⚠ N warnings · f2 to view` notice is space-padded onto
+    // the SAME status segment (no ` · ` between id and warning). Reproduced on
+    // codex 0.160 with a live warning present.
+    `  GPT-6-Astra xhigh · /tmp · ${sid}                                 ⚠ 1 warning · f2 to view`,
+    `  ${sid} ⠋                                  ⚠ 2 warnings · f2 to view`,
+    // When hints are hidden the warning can also occupy the second row alone.
+    `  GPT-6 · ${sid}\n  ⚠ 1 warning · f2 to view`,
+    // Codex degrades the notice by width (warning_notice.rs): compact and
+    // minimal shapes share only the `⚠ N` prefix and no longer say "warnings".
+    `  GPT-6 · ${sid}\n  ⚠ 3 · f2`,
+    `  GPT-6 · ${sid}\n  ⚠ 3 · /warnings`,
+    `  GPT-6 · ${sid}\n  ⚠ 3`,
+    // Emoji-presentation variant (⚠ + U+FE0F) must not fool the row gate.
+    `  GPT-6 · ${sid}\n  ⚠️ 2 warnings · f2 to view`,
+    // Hints on the left and the warning on the right of the same second row.
+    `  GPT-6 · ${sid}\n  ← for agents · ? for shortcuts                        ⚠ 1 warning · f2 to view`,
   ])('reads the two-row Codex 0.158 footer: %s', async (footer) => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal();
@@ -89,6 +105,16 @@ describe('Codex terminal session identity', () => {
     `${sid} · ${other}`,
     `${sid} · ${sid}`,
     `GPT-6 · Context 79% used`,
+    // A non-id suffix may not smuggle a second UUID past the uniqueness gate.
+    `${sid} see /tmp/${other}`,
+    // The id has to open the segment; a hyphen glued to it is not a boundary.
+    `${sid}-x · GPT-6`,
+    // A non-word punctuation glued directly after the id is still glued, not a
+    // whitespace-delimited status token: file/path/colon suffixes must not bind.
+    `${sid}.json · GPT-6`,
+    `${sid}/sub · GPT-6`,
+    `${sid}:x · GPT-6`,
+    `${sid},foo · GPT-6`,
   ])('rejects non-ID or ambiguous segments in the two-row footer: %s', async (footer) => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal();
