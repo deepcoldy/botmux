@@ -43,6 +43,10 @@ import {
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
+import {
+  initialNativeRenameStartupCommand,
+  initialPiLaunchSessionTitle,
+} from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
@@ -12730,6 +12734,31 @@ export function forkWorker(
     }
   });
 
+  // 用户在话题头里写的标题：Pi 经 --name 带上；Claude Code / Grok / Cursor 用单独的
+  // initialNativeRename 在正文前敲一次 /rename。不混进 startupCommands——那些命令
+  // 在 worker 内每次重启 CLI 都要重放，/rename 重放会盖掉用户后来改的会话名。
+  // Codex 走上面 nativeSessionTitle 的 thread/name/set，不在这里追加。
+  // 不写回 bot 配置，冷恢复过不了 fresh 闸。
+  const userDefinedNativeTitle = ds.session.nativeSessionTitleUserDefined
+    ? ds.session.nativeSessionTitle?.trim() || undefined
+    : undefined;
+  const nativeRenameInput = {
+    cliId: agentCfg.cliId,
+    wrapperCli: agentCfg.wrapperCli,
+    backendType: resolvedBackendType,
+    fresh: !resume && !ds.session.cliSessionId,
+    adopted: !!ds.adoptedFrom || isSharedAdoptSession(ds),
+    userDefinedTitle: userDefinedNativeTitle,
+  };
+  if (!nativeSessionTitle) {
+    const piTitle = initialPiLaunchSessionTitle(nativeRenameInput);
+    if (piTitle) nativeSessionTitle = piTitle;
+  }
+  const initialNativeRename = initialNativeRenameStartupCommand(
+    nativeRenameInput,
+    familyAdapter.buildSessionRenameCommand,
+  );
+
   // Send init config — use per-bot settings
   const runtimeIdentity = runtimeBuildIdentity();
   const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
@@ -12785,6 +12814,11 @@ export function forkWorker(
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
     startupCommands: agentCfg.startupCommands,
+    // One-shot `/rename` for a fresh user-titled Claude Code / Grok / Cursor
+    // session. Kept off startupCommands so an in-worker CLI restart, which
+    // replays startupCommands, cannot overwrite a name the user changed later.
+    // The worker consumes it once and does not re-arm that one-shot.
+    ...(initialNativeRename ? { initialNativeRename } : {}),
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.

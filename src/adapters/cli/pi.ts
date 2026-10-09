@@ -83,6 +83,7 @@ export function materializePiTurnBoundaryExtension(): string | undefined {
  *  BOTH sides without stubbing the filesystem. */
 export function buildPiArgs(opts: {
   sessionId: string;
+  resume?: boolean;
   initialPrompt?: string;
   nativeSessionTitle?: string;
   model?: string;
@@ -100,7 +101,11 @@ export function buildPiArgs(opts: {
   // only in the argv we build). See pi-turn-boundary-extension.ts.
   if (opts.turnBoundaryExtension) args.push('--extension', opts.turnBoundaryExtension);
   args.push('--session-id', opts.sessionId);
-  if (opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
+  // Resume opens the existing session file and then appends session_info.
+  // Pi takes the name from the last record, so `--name` on resume overwrites a
+  // title the user changed inside the CLI. Fresh spawns are the only ones that
+  // should stamp the Botmux title.
+  if (!opts.resume && opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
   if (opts.model?.trim()) args.push('--model', opts.model.trim());
   if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
   if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
@@ -199,6 +204,7 @@ export function createPiAdapter(
 
     buildArgs({
       sessionId,
+      resume,
       initialPrompt,
       nativeSessionTitle,
       model,
@@ -251,6 +257,7 @@ export function createPiAdapter(
 
       return buildPiArgs({
         sessionId,
+        resume,
         initialPrompt,
         nativeSessionTitle,
         model,

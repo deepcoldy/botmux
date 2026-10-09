@@ -2095,6 +2095,17 @@ describe('pi buildArgs', () => {
     expect(adapter.buildSessionRenameCommand?.('Renamed in Botmux')).toBe('/name Renamed in Botmux');
   });
 
+  it('does not pass --name on resume, so a restart cannot overwrite a renamed Pi session', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: true,
+      nativeSessionTitle: 'Original title',
+      initialPrompt: 'hello pi',
+    });
+    expect(args).not.toContain('--name');
+    expect(args).toContain('--session-id');
+  });
+
   it('loads the turn-boundary extension on every spawn so mid-turn retries are not read as failures', () => {
     // Pi's `stopReason:"error"` is per-REQUEST and its loop retries inside the
     // same turn, so the transcript alone cannot say when a turn ended. The
@@ -3869,6 +3880,8 @@ describe('native session rename capability', () => {
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
       .toBe('/rename 新标题');
+    expect(createCursorAdapter('/usr/bin/cursor-agent').buildSessionRenameCommand?.('Cursor 标题'))
+      .toBe('/rename Cursor 标题');
     expect(createPiAdapter('/bin/pi').buildSessionRenameCommand?.('Pi 标题'))
       .toBe('/name Pi 标题');
 

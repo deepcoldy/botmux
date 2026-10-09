@@ -137,6 +137,7 @@ import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
+import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
@@ -2654,6 +2655,12 @@ const codexUpgradeMonitor = new CodexSessionUpgradeMonitor({
   upgrade: autoUpgradeCodex,
   report: (state, reason) => log(`Codex session upgrade ${state}: ${reason}`),
 });
+/** Worker-lifetime one-shot for `initialNativeRename`. Unlike hasRunStartupCommands,
+ *  spawnCli must NOT re-arm this: an in-worker CLI restart replays `/effort` and
+ *  the like, but replaying `/rename` would overwrite a session name the user
+ *  changed inside the CLI after the first spawn. */
+let hasRunInitialNativeRename = false;
+
 /** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
  *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
  *  them — needed because session-only settings like `/effort ultracode` are lost
@@ -2957,6 +2964,35 @@ async function runStartupCommands(): Promise<void> {
   // Commands consumed turns and reset idle; treat the first user prompt fresh.
   isPromptReady = false;
   idleDetector?.reset();
+}
+
+/** Type the fresh-spawn `/rename` once per worker. Not part of startupCommands,
+ *  so the re-arm in spawnCli cannot replay it. Once an attempt actually starts,
+ *  a later restart must not apply the original title over a name the user may
+ *  already have changed. A restart that is already in progress does not consume
+ *  the command; the replacement flush does. */
+async function runInitialNativeRename(): Promise<void> {
+  const cmd = lastInitConfig?.initialNativeRename?.trim();
+  if (!cmd || hasRunInitialNativeRename) return;
+  // A restart that began while startup commands were still typing owns the next
+  // flush. Leave the command in place so that flush can apply it once; consuming
+  // it here would rename the process already being torn down and then skip the
+  // replacement.
+  if (cliRestartInProgress) return;
+  hasRunInitialNativeRename = true;
+  if (lastInitConfig) lastInitConfig.initialNativeRename = undefined;
+  if (lastInitConfig?.adoptMode || !backend) return;
+  if (isRemoteBackendType(effectiveBackendType)) {
+    log(`Skipping initial native rename — ${effectiveBackendType} backend has no PTY to drive`);
+    return;
+  }
+  try {
+    await sendRawCommandLineWithRecoveryFence(backend, cmd);
+    await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+    log(`Initial native rename sent: ${cmd}`);
+  } catch (e: any) {
+    log(`Initial native rename failed (${cmd}): ${e?.message ?? e}`);
+  }
 }
 
 const freshnessInputQueue = new CodexRunnerFreshnessInputQueue<
@@ -13351,6 +13387,7 @@ async function flushPending(): Promise<void> {
     if (!hasRunStartupCommands) {
       hasRunStartupCommands = true;
       await runStartupCommands();
+      await runInitialNativeRename();
     }
     // Commands deferred behind a previous rename run before the latest pending
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
@@ -16659,7 +16696,7 @@ async function spawnCli(
     ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
     : undefined;
   const deferInitialPrompt = shouldDeferInitialPromptForStartup({
-    hasStartupCommands: !!cfg.startupCommands?.length,
+    hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || shouldDeferArgsBakedDurablePrompt({

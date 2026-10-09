@@ -89,6 +89,8 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     passesInitialPromptViaArgs: true,
     maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
+
     buildResumeCommand({ cliSessionId }) {
       // Cursor's chat id is opaque and not derivable from botmux's sessionId;
       // without one we can't print a precise one-liner, so let the closed-session

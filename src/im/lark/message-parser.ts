@@ -844,7 +844,14 @@ function renderPostCodeBlock(node: any): string {
 
 function renderPostNode(node: any, numberer?: ImgNumberer): string {
   if (node.tag === 'text') return node.text ?? '';
-  if (node.tag === 'a') return node.text ?? node.href ?? '';
+  if (node.tag === 'a') {
+    // Titled links keep their destination only in href. Preserve it just as
+    // card anchors do, without duplicating links whose label is already a URL.
+    const text = node.text ?? '';
+    return text && node.href && text !== node.href
+      ? `${text}(${node.href})`
+      : (text || node.href || '');
+  }
   if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
   if (node.tag === 'code_block') return renderPostCodeBlock(node);
   if (node.tag === 'img' || node.tag === 'media') {

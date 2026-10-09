@@ -22,15 +22,7 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 const wiringStart = workerSource.indexOf('const startWrapperRealPidResolve =');
 const wiringEnd = workerSource.indexOf('// Bridge fallback: claude-code only.', wiringStart);
 if (wiringStart < 0 || wiringEnd < wiringStart) throw new Error('Worker launcher wiring not found');
-// Include the real ownership resolver called by both spawn paths. A VM has no
-// access to worker.ts's surrounding module scope.
-const codexResolverStart = workerSource.indexOf('function resolveCodexOwnershipPid(');
-const codexResolverEnd = workerSource.indexOf('\n}', codexResolverStart);
-if (codexResolverStart < 0 || codexResolverEnd < codexResolverStart) {
-  throw new Error('Worker Codex ownership resolver not found');
-}
-const workerWiring = transpileModule(
-  workerSource.slice(codexResolverStart, codexResolverEnd + 2) + '\n' + workerSource.slice(wiringStart, wiringEnd), {
+const workerWiring = transpileModule(workerSource.slice(wiringStart, wiringEnd), {
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
 }).outputText;
 
@@ -43,7 +35,8 @@ function runWorkerWiring(late: boolean, options: {
     cfg: { cliId: options.cliId ?? 'codex', wrapperCli: options.wrapperCli ?? 'launcher', workingDir: '/work' },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
-    lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false,
+    lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
+    resolveCodexOwnershipPid: vi.fn((candidatePid: number) => candidatePid),
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: vi.fn(() => 200), scheduleWrapperRealCliPid,
@@ -82,13 +75,13 @@ describe('worker wrapper PID wiring', () => {
     }
   });
 
-  it.each([false, true])('resolves the sandbox Codex child independently of wrapper discovery (late PID=%s)', late => {
+  // Sandbox ignores wrapperCli, so the #1745 wrapper bridge resolver must stay
+  // off (bridgeCliPid never rewired). Sandboxed Codex instead has its OWN bwrap
+  // resolver (#1755): it rewires backend.cliPid but never the bridge pid.
+  it.each([false, true])('keeps the wrapper bridge resolver off under sandbox while the codex bwrap resolver runs (late=%s)', late => {
     const result = runWorkerWiring(late, { sandboxRequested: true });
-    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');
-    expect(result.backend.cliPid).toBe(200);
-    // Sandbox ownership wiring does not use the wrapper's bridge rewrite.
     expect(result.bridgeCliPid).toBeUndefined();
-    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+    expect(result.backend.cliPid).toBe(200);
   });
 });
 
