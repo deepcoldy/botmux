@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Enable the native plugin for the selected Bot without changing CODEX_HOME."""
+
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(__file__).resolve().parent.parent
+runtime = json.loads((root / "runtime.json").read_text())
+bot_id = os.environ.get("BOTMUX_LARK_APP_ID")
+if bot_id and bot_id != runtime["bot_app_id"]:
+    raise SystemExit("This OpenViking wrapper is bound to a different Botmux Bot.")
+os.environ["OPENVIKING_CLI_CONFIG_FILE"] = runtime["client_config"]
+os.environ["OPENVIKING_CREDENTIAL_SOURCE"] = "cli"
+os.environ["OPENVIKING_RECALL_COMPRESS"] = "off"
+os.environ["OPENVIKING_DEBUG"] = "1"
+os.environ["OPENVIKING_WRITE_PATH_ASYNC"] = "0"
+override = 'plugins.' + runtime["plugin"] + '.enabled=true'
+os.execv(runtime["codex"], [runtime["codex"], "--no-daemon", "-c", override, *sys.argv[1:]])

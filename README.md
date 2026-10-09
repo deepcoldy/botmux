@@ -92,6 +92,8 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 ## 支持的 CLI / Agent
 
+可选的 [OpenViking Codex 长期记忆示例](examples/openviking-codex-memory/README.md)支持在新话题中召回项目约定。**默认关闭**，需要显式绑定单个已有的单用户 Codex Bot；配置准备与常规 daemon 启动均不自动启用。
+
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
 `claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `remote-runner`([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax`(MiniMax `mmx text repl`；区域由 `mmx auth login --region cn|global` 决定，同机多区用 per-bot `env` 的 `MMX_CONFIG_DIR` 隔离) …
