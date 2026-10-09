@@ -1,3 +1,6 @@
+import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
+import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
+import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
