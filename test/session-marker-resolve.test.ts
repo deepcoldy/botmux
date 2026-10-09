@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readProcessStartIdentity, resolveSessionContext } from '../src/core/session-marker.js';
+import {
+  advanceAncestorSessionTurn,
+  findAncestorSessionMarkerContext,
+  readProcessStartIdentity,
+  resolveSessionContext,
+} from '../src/core/session-marker.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -218,5 +223,59 @@ describe('resolveSessionContext()', () => {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
     }
+  });
+
+  it('parses queued type-ahead turns and advances to the next turn', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      dispatchAttempt: 1,
+      queuedTurnId: 'turn-2',
+      queuedTurns: [
+        { turnId: 'turn-2', dispatchAttempt: 2 },
+        { turnId: 'turn-3', dispatchAttempt: 1 },
+      ],
+    }));
+
+    const markerCtx = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(markerCtx).toEqual({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      dispatchAttempt: 1,
+      markerPid: process.pid,
+      queuedTurnId: 'turn-2',
+      queuedTurns: [
+        { turnId: 'turn-2', dispatchAttempt: 2 },
+        { turnId: 'turn-3', dispatchAttempt: 1 },
+      ],
+    });
+
+    // Mismatched consumed turn does not advance
+    const mismatch = advanceAncestorSessionTurn(dir, process.pid, 'wrong-turn');
+    expect(mismatch).toEqual({ advanced: false, turnId: 'turn-1' });
+
+    // Matching consumed turn advances to turn-2
+    const adv1 = advanceAncestorSessionTurn(dir, process.pid, 'turn-1');
+    expect(adv1).toEqual({ advanced: true, turnId: 'turn-2' });
+
+    const step1 = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step1?.turnId).toBe('turn-2');
+    expect(step1?.dispatchAttempt).toBe(2);
+    expect(step1?.queuedTurnId).toBe('turn-3');
+    expect(step1?.queuedTurns).toEqual([{ turnId: 'turn-3', dispatchAttempt: 1 }]);
+
+    // Advances to turn-3
+    const adv2 = advanceAncestorSessionTurn(dir, process.pid, 'turn-2');
+    expect(adv2).toEqual({ advanced: true, turnId: 'turn-3' });
+
+    const step2 = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step2?.turnId).toBe('turn-3');
+    expect(step2?.dispatchAttempt).toBe(1);
+    expect(step2?.queuedTurnId).toBeUndefined();
+    expect(step2?.queuedTurns).toBeUndefined();
+
+    // No more queued turns
+    const adv3 = advanceAncestorSessionTurn(dir, process.pid, 'turn-3');
+    expect(adv3).toEqual({ advanced: false, turnId: 'turn-3' });
   });
 });

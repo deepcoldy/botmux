@@ -46,7 +46,8 @@ import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
-  findAncestorSessionContext as findLiveAncestorSessionContext,
+  advanceAncestorSessionTurn,
+  findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -10693,6 +10694,13 @@ async function cmdSend(rest: string[]): Promise<void> {
           appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
+      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+        advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
+        );
+      }
       console.error(voiceDelivery.replayed
         ? `✓ 已复用本轮已发送语音 ${messageId}`
         : `✓ 已发送语音 ${messageId} ｜ ${Math.round((voiceDurationMs ?? 0) / 1000)}s`);
@@ -10807,6 +10815,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (previewText) marker.previewText = previewText;
         appendFileSync(join(markerDir, `${originSessionId}.jsonl`), JSON.stringify(marker) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
+      if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+        advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
+        );
+      }
       // Do not write this startup snapshot back after the async provider calls:
       // the daemon may have advanced the dispatch ledger or accepted another
       // turn in the meantime.  Daemon settlement owns exact target retirement.
@@ -12108,6 +12123,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         !customCard && !pureFileSend && !pureVideoSend
           ? 'standard_reply_card'
           : 'non_patchable',
+      );
+    }
+    if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+      advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        originTurnId ?? currentTurnId,
       );
     }
 

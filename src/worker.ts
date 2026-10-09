@@ -3347,6 +3347,12 @@ let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
+interface QueuedTypeAheadTurnRecord {
+  turnId: string;
+  dispatchAttempt?: number;
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+}
+let queuedTypeAheadTurns: QueuedTypeAheadTurnRecord[] = [];
 let durableTurnInFlight = false;
 const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
   // Ordered IPC reaches the daemon before any output attributed to the steer.
@@ -3771,16 +3777,66 @@ function writeCliPidMarker(): void {
       const procStart = Number.isInteger(markerPid) && markerPid > 0
         ? readProcessStartIdentity(markerPid)
         : undefined;
+      const queuedTurns = queuedTypeAheadTurns.map(t => ({
+        turnId: t.turnId,
+        ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
+      }));
+      const queuedTurnId = queuedTurns[0]?.turnId;
       atomicWriteFileSync(markerPath, JSON.stringify({
         sessionId,
         turnId: currentBotmuxTurnId ?? null,
         dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
+        ...(queuedTurnId ? { queuedTurnId } : {}),
+        ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
         ...(procStart ? { procStart } : {}),
       }));
     } catch (err: any) {
       log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
     }
   }
+}
+
+function syncQueuedTurnsFromMarkerDisk(): void {
+  for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
+    if (!markerPath || !existsSync(markerPath)) continue;
+    try {
+      const raw = readFileSync(markerPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+        const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
+        if (idx >= 0) {
+          const prevTurnId = currentBotmuxTurnId;
+          const advancedRecord = queuedTypeAheadTurns[idx]!;
+          currentBotmuxTurnId = parsed.turnId;
+          currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
+            ? parsed.dispatchAttempt
+            : advancedRecord.dispatchAttempt;
+          currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
+          queuedTypeAheadTurns.splice(0, idx + 1);
+          markActiveTurnStarted(advancedRecord);
+          publishSandboxRelayCapability();
+          log(`Synced active turn advance from PID marker: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function advanceQueuedTypeAheadTurn(reason: string): boolean {
+  syncQueuedTurnsFromMarkerDisk();
+  if (queuedTypeAheadTurns.length === 0) return false;
+  const next = queuedTypeAheadTurns.shift()!;
+  const prevTurnId = currentBotmuxTurnId;
+  currentBotmuxTurnId = next.turnId;
+  currentBotmuxDispatchAttempt = next.dispatchAttempt;
+  currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
+  markActiveTurnStarted(next);
+  writeCliPidMarker();
+  publishSandboxRelayCapability();
+  log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
+  return true;
 }
 let lastStructuredBridgeActivityAtMs = 0;
 const codexAppTurnLiveness = new CodexAppTurnLiveness();
@@ -12532,6 +12588,10 @@ function markPromptReady(): void {
   isPromptReady = true;
   promptReadyEdges++;
   settleSessionRenameOnPrompt();
+  syncQueuedTurnsFromMarkerDisk();
+  if (queuedTypeAheadTurns.length > 0) {
+    advanceQueuedTypeAheadTurn('prompt_ready');
+  }
   // An old backend can still report idle while its async teardown is running.
   // Only a prompt observed after the general restart fence drops may release
   // slash commands to the replacement generation.
@@ -13371,6 +13431,8 @@ async function flushPending(): Promise<void> {
   if (!isPromptReady && !typeAheadAllowed) return;
 
   isFlushing = true;
+  const promptReadyAtFlushStart = isPromptReady;
+  let itemsWrittenInThisFlush = 0;
   const codexAppPromptReplay = new CodexAppFlushPromptReplay();
   // Raw input and native rename own their explicit command-line/session gates;
   // pending adopt writes re-arm inside writeAdoptMessage. Clearing readiness
@@ -13530,11 +13592,30 @@ async function flushPending(): Promise<void> {
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
         normalWritePrepared = true;
-        renderer?.markNewTurn();
-        currentBotmuxTurnId = item.turnId;
-        currentBotmuxDispatchAttempt = item.dispatchAttempt;
-        currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
-        markActiveTurnStarted(item);
+        syncQueuedTurnsFromMarkerDisk();
+
+        const isTypeAhead = !!currentBotmuxTurnId
+          && !!item.turnId
+          && item.turnId !== currentBotmuxTurnId
+          && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0);
+
+        if (isTypeAhead && item.turnId) {
+          log(`Queuing type-ahead turn attribution: active=${currentBotmuxTurnId?.slice(0, 12)}, queued=${item.turnId.slice(0, 12)}`);
+          if (!queuedTypeAheadTurns.some(t => t.turnId === item.turnId)) {
+            queuedTypeAheadTurns.push({
+              turnId: item.turnId,
+              dispatchAttempt: item.dispatchAttempt,
+              vcMeetingImTurnOrigin: item.vcMeetingImTurnOrigin,
+            });
+          }
+        } else {
+          renderer?.markNewTurn();
+          currentBotmuxTurnId = item.turnId;
+          currentBotmuxDispatchAttempt = item.dispatchAttempt;
+          currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
+          queuedTypeAheadTurns = [];
+          markActiveTurnStarted(item);
+        }
         // Acquire durable HOL ownership only after this turn owns the backend
         // submission mutex. If an older ZMX recovery debt rejects capture,
         // this input is known not to have started and must not leave a latch
@@ -13551,7 +13632,10 @@ async function flushPending(): Promise<void> {
         }
         writeCliPidMarker();
         publishSandboxRelayCapability();
-        turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        if (!isTypeAhead) {
+          turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        }
+        itemsWrittenInThisFlush++;
         // Anchor the bridge baseline only after this turn owns the ZMX
         // submission lock, immediately before its literal write.
         if (claudeBridgeActive) {
@@ -19600,6 +19684,7 @@ async function spawnCli(
     isPromptReady = false;
     currentBotmuxTurnId = undefined;
     currentBotmuxDispatchAttempt = undefined;
+    queuedTypeAheadTurns = [];
     activeTurnAuthority.clear();
     if (!intentionalRestart && activeRestartAttemptId) {
       send({
@@ -19892,6 +19977,7 @@ function killCli(opts: {
   readIsolationOriginChannelId = null;
   currentBotmuxTurnId = undefined;
   currentBotmuxDispatchAttempt = undefined;
+  queuedTypeAheadTurns = [];
   activeTurnAuthority.clear();
   currentVcMeetingImTurnOrigin = undefined;
   submittedCodexAppReplyTurnIds.clear();

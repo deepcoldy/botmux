@@ -6,20 +6,32 @@ import {
   readLinuxBootIdentity,
   readProcessStartIdentity,
 } from '../utils/process-identity.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export {
   readLinuxBootIdentity,
   readProcessStartIdentity,
 } from '../utils/process-identity.js';
 
+export interface QueuedTypeAheadTurn {
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
 export interface AncestorSessionContext {
   sessionId: string;
   turnId?: string;
   dispatchAttempt?: number;
+  queuedTurnId?: string;
+  queuedTurns?: QueuedTypeAheadTurn[];
 }
 
 interface IdentityBoundSessionMarker extends AncestorSessionContext {
   procStart?: string;
+}
+
+export interface AncestorSessionMarkerContext extends AncestorSessionContext {
+  markerPid?: number;
 }
 
 export interface AuthenticatedAncestorSessionContext extends AncestorSessionContext {
@@ -75,14 +87,35 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
   if (!text.startsWith('{')) return { sessionId: text };
   try {
     const parsed = JSON.parse(text) as {
-      sessionId?: unknown; turnId?: unknown; dispatchAttempt?: unknown; procStart?: unknown;
+      sessionId?: unknown;
+      turnId?: unknown;
+      dispatchAttempt?: unknown;
+      procStart?: unknown;
+      queuedTurnId?: unknown;
+      queuedTurns?: unknown;
     };
     const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
+    const queuedTurns = Array.isArray(parsed.queuedTurns)
+      ? parsed.queuedTurns
+          .filter((t: any) => typeof t?.turnId === 'string' && t.turnId)
+          .map((t: any) => {
+            const attempt = parseDispatchAttempt(t.dispatchAttempt);
+            return {
+              turnId: String(t.turnId),
+              ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
+            };
+          })
+      : undefined;
+    const queuedTurnId = typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId
+      ? parsed.queuedTurnId
+      : (queuedTurns && queuedTurns.length > 0 ? queuedTurns[0].turnId : undefined);
     return {
       sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
-      ...(typeof parsed.turnId === 'string' ? { turnId: parsed.turnId } : {}),
+      ...(typeof parsed.turnId === 'string' && parsed.turnId ? { turnId: parsed.turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
+      ...(queuedTurnId ? { queuedTurnId } : {}),
+      ...(queuedTurns && queuedTurns.length > 0 ? { queuedTurns } : {}),
     };
   } catch {
     return { sessionId: '' };
@@ -135,6 +168,8 @@ export function findAuthenticatedAncestorSessionContext(
         ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
         markerPid: pid,
         procStart: marker.procStart,
+        ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
+        ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
       };
     }
     const parent = readParentPid(pid);
@@ -189,11 +224,11 @@ function isTrustworthyAncestorMarker(
  * climbing; a genuine ancestor marker may sit higher, and if none does the caller
  * falls back to the env id.
  */
-export function findAncestorSessionContext(
+export function findAncestorSessionMarkerContext(
   dataDir: string,
   startPid: number = process.ppid,
   envSessionId?: string,
-): AncestorSessionContext | null {
+): AncestorSessionMarkerContext | null {
   const markersDir = join(dataDir, '.botmux-cli-pids');
   if (!existsSync(markersDir)) return null;
 
@@ -209,6 +244,9 @@ export function findAncestorSessionContext(
           sessionId: marker.sessionId,
           ...(marker.turnId ? { turnId: marker.turnId } : {}),
           ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+          markerPid: pid,
+          ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
+          ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
         };
       }
       // Marker present but not ours: keep climbing (see doc comment above).
@@ -218,6 +256,61 @@ export function findAncestorSessionContext(
     pid = parent;
   }
   return null;
+}
+
+export function findAncestorSessionContext(
+  dataDir: string,
+  startPid: number = process.ppid,
+  envSessionId?: string,
+): AncestorSessionContext | null {
+  const markerCtx = findAncestorSessionMarkerContext(dataDir, startPid, envSessionId);
+  if (!markerCtx) return null;
+  const { markerPid: _, ...ctx } = markerCtx;
+  return ctx;
+}
+
+/**
+ * Atomically advances the ancestor process-tree marker to the next queued type-ahead turn.
+ * Used when a turn's final response has been successfully delivered so subsequent subcommands
+ * inside the same long-lived CLI process will immediately observe the successor turn.
+ */
+export function advanceAncestorSessionTurn(
+  dataDir: string,
+  markerPid: number,
+  consumedTurnId?: string,
+): { advanced: boolean; turnId?: string } {
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  const markerPath = join(markersDir, String(markerPid));
+  if (!existsSync(markerPath)) return { advanced: false };
+  try {
+    const raw = readFileSync(markerPath, 'utf-8');
+    const marker = parseIdentityBoundSessionMarker(raw);
+    if (!marker.sessionId) return { advanced: false };
+    if (consumedTurnId && marker.turnId && marker.turnId !== consumedTurnId) {
+      return { advanced: false, turnId: marker.turnId };
+    }
+    const queuedTurns = marker.queuedTurns ? [...marker.queuedTurns] : [];
+    if (queuedTurns.length === 0 && marker.queuedTurnId) {
+      queuedTurns.push({ turnId: marker.queuedTurnId });
+    }
+    if (queuedTurns.length === 0) {
+      return { advanced: false, turnId: marker.turnId };
+    }
+    const nextTurn = queuedTurns.shift()!;
+    const nextQueuedTurnId = queuedTurns[0]?.turnId;
+    const updatedPayload: Record<string, unknown> = {
+      sessionId: marker.sessionId,
+      turnId: nextTurn.turnId,
+      ...(nextTurn.dispatchAttempt !== undefined ? { dispatchAttempt: nextTurn.dispatchAttempt } : {}),
+      ...(marker.procStart ? { procStart: marker.procStart } : {}),
+      ...(nextQueuedTurnId ? { queuedTurnId: nextQueuedTurnId } : {}),
+      ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
+    };
+    atomicWriteFileSync(markerPath, JSON.stringify(updatedPayload));
+    return { advanced: true, turnId: nextTurn.turnId };
+  } catch {
+    return { advanced: false };
+  }
 }
 
 /**
