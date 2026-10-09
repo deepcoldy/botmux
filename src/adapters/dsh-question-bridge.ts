@@ -320,11 +320,134 @@ export function apply(ctx) {
 `;
 }
 
+/**
+ * Structured readiness / turn-idle reporting for the dsh-tui wrapper plugin.
+ *
+ * WHY this exists: dsh-tui repaints a blinking cursor cell several times a
+ * second even while completely idle. The worker's IdleDetector Strategy 2
+ * requires `QUIESCENCE_MS` of PTY silence and re-arms on every feed, so a
+ * dsh-tui session NEVER satisfies it → `markPromptReady()` is never called →
+ * the first queued prompt is only written by the 90s hard timeout.
+ *
+ * The TUI hands us a precise in-process signal instead. Its
+ * `openInjectChannel()` runs immediately after `await render(tree)` (first
+ * frame flushed, composer mounted) and publishes
+ * `~/.dsh-tui/inject/servers.json` with `{pid, sessionId, cwd, socketPath,
+ * startedAt}` — the same record `dsh.nvim` discovers. Matching our own
+ * `process.pid` there is the earliest trustworthy "UI is ready" evidence, so
+ * the plugin fires `BOTMUX_READY_COMMAND` exactly once.
+ *
+ * `agent/status` is deliberately NOT the readiness trigger: dsh-agent-loop only
+ * emits on a status CHANGE and the loop starts out idle, so a fresh boot emits
+ * nothing at all. It is exactly right for end-of-turn idle (there it IS the
+ * transition), and that is the only thing we use it for.
+ *
+ * Everything here is fail-quiet: a missing env var, an unreadable discovery
+ * file, or a failed spawn must never break the TUI boot. The worker keeps its
+ * own fallback timeout, so a lost signal degrades to the previous behaviour
+ * (and strictly improves on it: READY_SIGNAL_TIMEOUT_MS is 45s < the 90s hard
+ * cap).
+ *
+ * The inject path is resolved at RUNTIME through `homedir()` — the same way
+ * dsh-tui itself computes `~/.dsh-tui` (utils/paths.js: `join(homedir(),
+ * '.dsh-tui')`) — so it follows the session's HOME inside a sandbox instead of
+ * pinning the worker's home.
+ */
+function buildDshTuiStatusSnippet(): string {
+  return `
+const BOTMUX_READY_POLL_MS = 250;
+const BOTMUX_STATUS_SIGNAL_TIMEOUT_MS = 15_000;
+// Bounded: the worker's own ready-gate fallback is 45s, so polling much past
+// that only keeps a timer alive for a signal nobody is waiting for anymore.
+const BOTMUX_READY_POLL_LIMIT_MS = 120_000;
+
+let botmuxReadySignalled = false;
+let botmuxReadyPollTimer;
+
+function botmuxStatusCommand(envKey) {
+  const raw = process.env[envKey];
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : '';
+}
+
+/** The TUI process's own inject-channel record, or undefined while it has not
+ *  published one yet (i.e. before its first frame). */
+function readBotmuxInjectRecord() {
+  try {
+    const parsed = JSON.parse(readFileSync(join(homedir(), '.dsh-tui', 'inject', 'servers.json'), 'utf8'));
+    if (!Array.isArray(parsed)) return undefined;
+    return parsed.find((entry) => entry && entry.pid === process.pid && typeof entry.sessionId === 'string');
+  } catch {
+    // Absent/corrupt discovery file, or the TUI has not rendered yet.
+    return undefined;
+  }
+}
+
+/** Fire-and-forget "botmux <status>" subcommand. Never awaited, never blocks
+ *  the TUI, never surfaces an error into the render loop. */
+function spawnBotmuxStatusCommand(command, payload) {
+  let child;
+  try {
+    child = spawn(command, { shell: true, detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+  } catch {
+    return;
+  }
+  const timer = setTimeout(() => { try { child.kill(); } catch {} }, BOTMUX_STATUS_SIGNAL_TIMEOUT_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  child.on('error', () => clearTimeout(timer));
+  child.on('exit', () => clearTimeout(timer));
+  try { child.stdin.end(JSON.stringify(payload)); }
+  catch { try { child.kill(); } catch {} }
+  try { child.unref(); } catch {}
+}
+
+function stopBotmuxReadyPoll() {
+  if (!botmuxReadyPollTimer) return;
+  clearInterval(botmuxReadyPollTimer);
+  botmuxReadyPollTimer = undefined;
+}
+
+/** Exactly one exec per process: the ready edge is a one-shot startup event and
+ *  a second "session_ready" would only re-open an already-released gate. */
+function publishBotmuxReady() {
+  if (botmuxReadySignalled) return;
+  botmuxReadySignalled = true;
+  stopBotmuxReadyPoll();
+  const command = botmuxStatusCommand('BOTMUX_READY_COMMAND');
+  if (command) spawnBotmuxStatusCommand(command, {});
+}
+
+function pollBotmuxReady(startedAt) {
+  if (botmuxReadySignalled) return;
+  const record = readBotmuxInjectRecord();
+  if (record) {
+    publishBotmuxReady();
+    return;
+  }
+  if (Date.now() - startedAt >= BOTMUX_READY_POLL_LIMIT_MS) stopBotmuxReadyPoll();
+}
+
+function installBotmuxStatusChannel(ctx) {
+  const startedAt = Date.now();
+  pollBotmuxReady(startedAt);
+  if (botmuxReadySignalled) return;
+  botmuxReadyPollTimer = setInterval(() => pollBotmuxReady(startedAt), BOTMUX_READY_POLL_MS);
+  if (typeof botmuxReadyPollTimer.unref === 'function') botmuxReadyPollTimer.unref();
+  if (typeof ctx.effect === 'function') {
+    try { ctx.effect(() => stopBotmuxReadyPoll, 'botmux-dsh-tui-status-channel'); } catch {}
+  }
+}
+`;
+}
+
 function buildDshTuiWrapperPlugin(parts: HookCommandParts, originalDshTuiUrl: string): string {
   return `// botmux generated dsh-tui question wrapper v${BRIDGE_VERSION}
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import * as original from ${jsonLiteral(originalDshTuiUrl)};
 ${buildRuntimeBridgeSnippet(parts, 'dsh-tui')}
+${buildDshTuiStatusSnippet()}
 export const name = original.name;
 export const inject = original.inject;
 export const Config = original.Config;
@@ -391,7 +514,11 @@ function wrapLegacyProvider(service) {
 }
 export async function apply(ctx, config) {
   const effectiveConfig = originalDshTuiConfig(ctx, config);
-  if (!isBotmuxSessionEnv(process.env) || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return original.apply(ctx, effectiveConfig);
+  const botmuxSession = isBotmuxSessionEnv(process.env);
+  // Readiness / turn-idle reporting is independent of the question-bridge kill
+  // switch: disabling the bridge must not silently restore the 90s stall.
+  if (botmuxSession) installBotmuxStatusChannel(ctx);
+  if (!botmuxSession || process.env.BOTMUX_DSH_ASK_BRIDGE === '0') return original.apply(ctx, effectiveConfig);
   const service = ctx.get && ctx.get('userQuestions');
   const legacyRestore = service && typeof service.registerProvider === 'function'
     ? wrapLegacyProvider(service)

@@ -160,6 +160,17 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // reintroduce the queued-message stall: it only delays the first write
     // until idle is proven or the hard cap fires.
     deferFirstPromptTimeoutUntilReady: true,
+    // Structured readiness instead of PTY quiescence: the TUI repaints a
+    // blinking cursor ~2x/s even while idle, so IdleDetector Strategy 2's
+    // QUIESCENCE_MS is never satisfied and the first prompt would have to wait
+    // for the 90s hard cap. The generated wrapper plugin (this process) fires
+    // `BOTMUX_READY_COMMAND` once dsh-tui publishes its inject-channel record —
+    // i.e. right after `await render(tree)` flushed the first frame. The worker
+    // arms its ready-gate on this flag and holds the first prompt until the
+    // signal (or READY_SIGNAL_TIMEOUT_MS = 45s) lands, which is strictly better
+    // than the 90s hard-timeout flush it replaces: cold start shows the composer
+    // at ~+5s, so the gate is released on evidence in ~10s total.
+    injectsReadyHook: true,
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.
