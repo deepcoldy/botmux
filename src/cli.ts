@@ -11819,8 +11819,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       // the session owner). Bot recipients are filtered out so footer chrome
       // cannot accidentally wake a sibling bot.
       // Brand segment honours this bot's configured brandLabel (unset →
-      // default botmux, '' → suppressed, else custom). Same resolver/rule as
-      // the daemon's card builders so both send paths render identically.
+      // default botmux, '' → suppressed, else custom). Only attached to final
+      // replies (or top-level broadcasts); interim sends (progress / auxiliary)
+      // omit brand to avoid noisy repeated signatures across turns.
       // All real mentions land on one footer line: human addressee first, then
       // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
       // the body prose are skipped. Top-level publish keeps sendTo empty.
@@ -11831,8 +11832,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         inlinedIds: usedIds,
       });
       const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const shouldRenderBrand = effectiveResponseKind === 'final' || sendTopLevel;
+      const footerBrand = shouldRenderBrand
+        ? renderBrandTemplate(resolveBrandLabel(appId), s.workingDir)
+        : '';
       const footer = buildReplyCardFooter({
-        brand: renderBrandTemplate(resolveBrandLabel(appId), s.workingDir),
+        brand: footerBrand,
         recipientOpenIds: footerRecipients,
         usage: usageSnapshot,
         locale: localeForBot(appId),

@@ -87,6 +87,14 @@ describe('real CLI send into a running reply card', () => {
       const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
         .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
       expect(requests).toHaveLength(1);
+      if (!merged) {
+        const cardContent = requests[0].body?.content ?? '';
+        if (responseKind === 'final') {
+          expect(cardContent).toContain('Powered by [botmux]');
+        } else {
+          expect(cardContent).not.toContain('Powered by [botmux]');
+        }
+      }
       expect(getDeliveredGroupContextSeqs(binding.appId, binding.chatId, binding.sessionId, binding.epoch, dataDir)).toEqual([]);
       expect(confirmGroupContextDelivery(binding, dataDir)).toBe(true);
       if (responseKind !== 'progress') {
@@ -250,4 +258,48 @@ describe('real CLI send into a running reply card', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 35_000);
+
+  it('top-level send includes brand footer as a standalone card', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-toplevel-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId, turnId: key.turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'claude-code',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId: 'claude-code', cliSessionId: 'native_reply', workerGeneration: 1,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+
+      const result = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--top-level', 'Top level announcement',
+      ], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId,
+          BOTMUX_TURN_ID: key.turnId,
+          BOTMUX_LARK_APP_ID: key.larkAppId,
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(requests).toHaveLength(1);
+      expect(requests[0].body?.content).toContain('Powered by [botmux]');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
