@@ -28,6 +28,7 @@ const workerWiring = transpileModule(workerSource.slice(wiringStart, wiringEnd),
 
 function runWorkerWiring(late: boolean, options: {
   cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean;
+  launchedCliPid?: number | null;
 } = {}) {
   const scheduler = makeScheduler();
   const backend = { cliPid: 100, getChildPid: () => 100 };
@@ -39,7 +40,7 @@ function runWorkerWiring(late: boolean, options: {
     resolveCodexOwnershipPid: vi.fn((candidatePid: number) => candidatePid),
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
-    findLaunchedCliPid: vi.fn(() => 200), scheduleWrapperRealCliPid,
+    findLaunchedCliPid: vi.fn(() => options.launchedCliPid === undefined ? 200 : options.launchedCliPid), scheduleWrapperRealCliPid,
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
@@ -65,8 +66,24 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
   });
 
+  it.each([false, true])('attests the native Codex child behind the standard npm launcher (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { wrapperCli: '' });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('keeps a directly launched native Codex pid unchanged (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { wrapperCli: '', launchedCliPid: null });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');
+    expect(result.backend.cliPid).toBe(100);
+    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+  });
+
   it.each([
-    { wrapperCli: '' }, { wrapperCli: '  ' }, { cliId: 'claude-code' },
+    { cliId: 'claude-code', wrapperCli: '' },
   ])('does not resolve an ineligible wrapper: %j', options => {
     for (const late of [false, true]) {
       const result = runWorkerWiring(late, options);
