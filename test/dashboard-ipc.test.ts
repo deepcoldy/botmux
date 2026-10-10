@@ -7337,6 +7337,50 @@ describe('PUT /api/bot-oncall-group', () => {
   });
 });
 
+describe('PUT /api/bot-no-progress-notify', () => {
+  it('persists, rejects out-of-range values and clears back to default', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-no-progress-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-no-progress-app';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex-app' }]));
+      loadBotConfigs().forEach((bot: any) => registerBot(bot));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle!.port}`;
+      const put = (noProgressNotify: unknown) => fetch(`${base}/api/bot-no-progress-notify`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ noProgressNotify }),
+      });
+
+      // set: 200, response and bots.json agree, in-memory registry updated live.
+      const saved = await put({ enabled: false, timeoutMs: 300000 });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, noProgressNotify: { enabled: false, timeoutMs: 300000 } });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify)
+        .toEqual({ enabled: false, timeoutMs: 300000 });
+      expect(getBot(appId).config.noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+
+      // invalid: out-of-range timeoutMs / unknown field → 400, disk untouched.
+      expect((await put({ timeoutMs: 5000 })).status).toBe(400);
+      expect((await put({ unknown: 1 })).status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify)
+        .toEqual({ enabled: false, timeoutMs: 300000 });
+
+      // null: clears back to the built-in default.
+      const cleared = await put(null);
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, noProgressNotify: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify).toBeUndefined();
+      expect(getBot(appId).config.noProgressNotify).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-substitute-mode', () => {
   it('preserves quote reply mode in the response and bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));
