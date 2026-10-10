@@ -28,7 +28,9 @@
 // (.github/workflows/release.yml `bun-binaries`). Windows is excluded — the
 // daemon is Unix-only (PTY/tmux/pm2).
 
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -133,6 +135,57 @@ function resolveNodePtyNative(platform, arch) {
   return { ptyNode, spawnHelper: spawnHelper && existsSync(spawnHelper) ? spawnHelper : null };
 }
 
+/**
+ * Resolve the skia native that `@napi-rs/canvas` loads on a darwin target.
+ *
+ * WHY: canvas ships its native per arch as an optionalDependency
+ * (`@napi-rs/canvas-darwin-<arch>`), and the darwin release leg runs ONE
+ * `bun install` on an arm64 runner, which installs only the arm64 package. Bun
+ * embeds a `.node` only when the loader's static `require()` resolves at build
+ * time, so `botmux-darwin-x64` shipped without skia (v3.40.0): the worker died at
+ * module load with `Cannot find native binding`. Here the x64 file is produced
+ * explicitly instead — from the lockfile-pinned tarball, sha512-checked against
+ * `bun.lock` — and handed to the embed plugin.
+ *
+ * Linux is not affected: each linux leg builds on its own arch's runner, where
+ * the matching package is installed, so this stays darwin-only.
+ *
+ * Returns the absolute path to the skia `.node`, or throws (fail closed: a
+ * darwin binary without canvas would silently lose card rendering).
+ */
+async function resolveCanvasSkiaNative(platform, arch) {
+  const pkg = `@napi-rs/canvas-${platform}-${arch}`;
+  const skiaName = `skia.${platform}-${arch}.node`;
+
+  try {
+    const local = join(dirname(require.resolve(`${pkg}/package.json`)), skiaName);
+    if (existsSync(local)) return local;
+  } catch { /* not installed for this arch — fetch the locked tarball below */ }
+
+  // The version and integrity come from bun.lock, not from a live `npm view`,
+  // so the fetched bytes are exactly the ones the lockfile pins.
+  const lock = readFileSync(join(REPO_ROOT, 'bun.lock'), 'utf8');
+  const esc = pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const entry = new RegExp(`"${esc}": \\["${esc}@([^"]+)", "([^"]+)", \\{[^}]*\\}, "(sha512-[^"]+)"\\]`).exec(lock);
+  if (!entry) throw new Error(`${pkg} is not pinned in bun.lock; cannot resolve its skia native for darwin-${arch}.`);
+  const [, version, tarball, integrity] = entry;
+
+  const res = await fetch(tarball);
+  if (!res.ok) throw new Error(`fetching ${pkg}@${version} from ${tarball} failed: HTTP ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  const digest = `sha512-${createHash('sha512').update(bytes).digest('base64')}`;
+  if (digest !== integrity) throw new Error(`${pkg}@${version} integrity mismatch: bun.lock ${integrity}, downloaded ${digest}`);
+
+  const dir = mkdtempSync(join(tmpdir(), `botmux-skia-${platform}-${arch}-`));
+  const tgz = join(dir, 'canvas.tgz');
+  writeFileSync(tgz, bytes);
+  const untar = runTool(['tar', '-xzf', tgz, '-C', dir]);
+  if (untar.code !== 0) throw new Error(`extracting ${tgz} failed: ${untar.err}`);
+  const skia = join(dir, 'package', skiaName);
+  if (!existsSync(skia)) throw new Error(`${pkg}@${version} has no ${skiaName} in its tarball`);
+  return skia;
+}
+
 /** Run a tool, returning exit code + stderr instead of throwing on ENOENT. */
 function runTool(argv) {
   try {
@@ -214,6 +267,7 @@ function adhocResignDarwin(outfile) {
 async function buildOne({ target, out }) {
   const { platform, arch } = targetToPlatformArch(target);
   const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch);
+  const skiaNode = platform === 'darwin' ? await resolveCanvasSkiaNative(platform, arch) : null;
 
   const entry = join(REPO_ROOT, 'dist', 'standalone-entry.js');
   if (!existsSync(entry)) {
@@ -234,14 +288,14 @@ async function buildOne({ target, out }) {
     // identifier is absent under Node — where the disk read still works — and only
     // this compiled path needs the constant.
     define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked) },
-    plugins: [makeNativeEmbedPlugin({ ptyNode, spawnHelper })],
+    plugins: [makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode })],
   });
   if (!result.success) {
     for (const log of result.logs) console.error(log);
     throw new Error(`bun build failed for ${target ?? 'host'}`);
   }
   if (platform === 'darwin') adhocResignDarwin(outfile);
-  console.log(`✅ built ${outfile} (${target ?? 'host'}; version=${baked}; pty.node=${ptyNode}${spawnHelper ? `, spawn-helper=${spawnHelper}` : ''})`);
+  console.log(`✅ built ${outfile} (${target ?? 'host'}; version=${baked}; pty.node=${ptyNode}${spawnHelper ? `, spawn-helper=${spawnHelper}` : ''}${skiaNode ? `, skia=${skiaNode}` : ''})`);
   return outfile;
 }
 

@@ -767,6 +767,28 @@ jobs:
           done
           if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
 
+      - name: Verify the canvas skia native is embedded in every darwin binary
+        if: matrix.glibc_baseline == '' && runner.os == 'macOS'
+        # botmux-darwin-x64 shipped in v3.40.0 without @napi-rs/canvas's skia native:
+        # the cross-built x64 target could not resolve it, and the smoke below runs
+        # only the host arch, so nothing ever inspected the x64 file. Bun embeds the
+        # skia .node as raw bytes, so its unique native error string is a cheap
+        # presence check. Fail closed: a darwin binary without it cannot render cards
+        # and must not ship.
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in dist-bin/botmux-darwin-*; do
+            case "$f" in *.map|*.sha256) continue;; esac
+            found=1
+            if ! grep -aq "Create Custom GC ThreadsafeFunction" "$f"; then
+              echo "::error::skia native missing from $f"
+              exit 1
+            fi
+            echo "skia native present: $f"
+          done
+          if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
+
       - name: Smoke-test the host-arch binary
         if: matrix.glibc_baseline == ''
         # Each leg executes the binary it just built for its OWN arch, so with the
