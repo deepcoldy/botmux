@@ -7,6 +7,7 @@ import {
   normalizeMessageListenerPreviewLimit,
   previewMessageListenerMatches,
   refreshListenerCardTextFromResolved,
+  refreshListenerForwardTextFromParsed,
   renderMessageListenerInstruction,
   renderMessageListenerPrompt,
 } from '../src/services/message-listener.js';
@@ -150,6 +151,44 @@ describe('message listener evaluation', () => {
     expect(match).toMatchObject({
       messageText: 'CPU 告警来自 REST 历史',
       msgType: 'text',
+      senderOpenId: 'ou_allowed',
+      senderType: 'user',
+    });
+  });
+
+  it('admits configured merge-forward topic roots for daemon-side expansion', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: '阅读转发内容并响应',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['ou_allowed'],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+        },
+      },
+    });
+
+    const match = evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage({
+        message_type: 'merge_forward',
+        content: '{}',
+        thread_id: 'omt_forwarded_topic',
+      }),
+      senderOpenId: 'ou_allowed',
+      senderTypeRaw: 'user',
+      explicitlyMentionedThisBot: false,
+    });
+
+    expect(match).toMatchObject({
+      prompt: '阅读转发内容并响应',
+      messageText: '',
+      msgType: 'merge_forward',
       senderOpenId: 'ou_allowed',
       senderType: 'user',
     });
@@ -974,5 +1013,37 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
     expect(prompt).toContain('查看详情');
     // Title recovered from the merged card is surfaced as an attribute too.
     expect(prompt).toContain('message_title="Argos 报警"');
+  });
+});
+
+describe('refreshListenerForwardTextFromParsed', () => {
+  it('feeds expanded merge-forward XML into the rendered listener prompt', () => {
+    const match = {
+      prompt: '阅读转发内容并响应',
+      messageText: '',
+      msgType: 'merge_forward',
+      senderType: 'user' as const,
+    };
+    const expanded = '<forwarded_messages>\n<msg from="A">保存失败</msg>\n</forwarded_messages>';
+
+    refreshListenerForwardTextFromParsed(match, expanded);
+    const prompt = renderMessageListenerPrompt(match);
+
+    expect(match.messageText).toBe(expanded);
+    expect(prompt).toContain('msg_type="merge_forward"');
+    expect(prompt).toContain('&lt;forwarded_messages&gt;');
+    expect(prompt).toContain('保存失败');
+  });
+
+  it('does not overwrite other listener message types', () => {
+    const match = {
+      prompt: 'p',
+      messageText: '原始正文',
+      msgType: 'text',
+      senderType: 'user' as const,
+    };
+
+    refreshListenerForwardTextFromParsed(match, '<forwarded_messages />');
+    expect(match.messageText).toBe('原始正文');
   });
 });
