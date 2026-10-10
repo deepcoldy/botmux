@@ -1,4 +1,7 @@
-import { __testOnly_handleDocComment } from '../src/daemon.js';
+import {
+  __testOnly_durablePrimaryWorkerAdmission,
+  __testOnly_handleDocComment,
+} from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
 /**
  * 普通消息处理链终态失败的可行动提示（ingress failure notice）。
@@ -424,6 +427,56 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     await handleThreadReply(makeEventData('om_msg_4', 'all good'), makeCtx(anchor, 'om_msg_4'));
 
     expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('freezes a blocked primary reply for post-admission durable delivery', async () => {
+    const anchor = 'om_primary_blocked';
+    const ds = seedThreadSession(anchor, 'seeded');
+    const ctx = makeCtx(anchor, 'om_primary_turn');
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    const gate = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_turn',
+    );
+    expect(gate).toBeDefined();
+
+    gate!.options.onAdmissionBlocked?.({
+      content: 'Memory pressure is critical',
+      turnId: 'om_primary_turn',
+    });
+
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith({
+      target: { kind: 'reply', messageId: anchor, replyInThread: true },
+      content: 'Memory pressure is critical',
+      msgType: 'text',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+      hookContext: {
+        sessionId: ds.session.sessionId,
+        turnId: 'om_primary_turn',
+      },
+    });
+
+    gate!.options.marginalReclaimScheduled = true;
+    gate!.markForkReturned();
+    let settled = false;
+    const waiting = gate!.waitIfMarginal().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    gate!.options.onAdmission?.('rejected');
+    await waiting;
+    expect(settled).toBe(true);
+
+    const deferredAgain = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_turn',
+    )!;
+    deferredAgain.options.marginalReclaimScheduled = true;
+    deferredAgain.markForkReturned();
+    deferredAgain.options.onAdmission?.('deferred');
+    await expect(deferredAgain.waitIfMarginal()).resolves.toBeUndefined();
   });
 
   it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {

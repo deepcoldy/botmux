@@ -11633,8 +11633,14 @@ export type ForkResumeOrTurnId = boolean | string | {
 };
 
 export type WorkerForkAdmission = 'accepted' | 'deferred' | 'rejected';
+export interface WorkerAdmissionBlockedNotice {
+  content: string;
+  turnId?: string;
+}
 export type ForkWorkerOptions = {
   onAdmission?: (admission: WorkerForkAdmission) => void;
+  /** Replace the direct provider reply when the caller owns a durable output lane. */
+  onAdmissionBlocked?: (notice: WorkerAdmissionBlockedNotice) => void;
   /** Called once when an admitted worker exits before its ready boundary. */
   onPreReadyExit?: () => void;
   /** Called once when an admitted Remote Runner worker survives startup but
@@ -12040,12 +12046,20 @@ export function forkWorker(
         + `No worker was started. Free memory or wait for pressure to recover, then retry your message `
         + `(reserve ${formatMemoryBytes(decision.policy.minAvailableMemoryBytes)}, `
         + `PSI limit ${decision.policy.maxMemoryFullAvg10.toFixed(2)}%).${reclamationNote}`;
+      const blockedTurnId = fallbackTurnId(ds, initTurnId);
+      if (opts.onAdmissionBlocked) {
+        opts.onAdmissionBlocked({
+          content: retry,
+          ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
+        });
+        return;
+      }
       void cb.sessionReply(
         sessionAnchorId(ds),
         retry,
         'text',
         ds.larkAppId,
-        fallbackTurnId(ds, initTurnId),
+        blockedTurnId,
         { sourceSessionId: ds.session.sessionId },
       ).catch(error => logger.error(
         `[${tag(ds)}] Failed to report blocked worker admission: `

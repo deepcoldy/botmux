@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Session } from '../src/types.js';
 import type {
+  DurableOutboxStore,
   DurableSessionRecord,
   InboxClaim,
   WriteSessionResult,
@@ -52,7 +53,7 @@ function claim(): InboxClaim {
 
 function fakeStore() {
   const records = new Map<string, DurableSessionRecord>();
-  const store: DurableSessionFacadeStore = {
+  const store: DurableSessionFacadeStore & Pick<DurableOutboxStore, 'enqueueOutbox'> = {
     acquireSessionLease: vi.fn(async input => ({
       kind: 'acquired',
       lease: { sessionKey: input.sessionKey, ownerId: input.ownerId, epoch: 4, leaseUntil: 60_000 },
@@ -71,6 +72,7 @@ function fakeStore() {
       records.set(record.sessionKey, record);
       return { kind: 'written', record } as WriteSessionResult;
     }),
+    enqueueOutbox: vi.fn(async () => ({ kind: 'inserted' as const })),
   };
   return { store, records };
 }
@@ -80,7 +82,7 @@ describe('durable Lark canonical dispatch', () => {
     const { store, records } = fakeStore();
     const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
     const handle = vi.fn(async () => ({ kind: 'admitted' as const, session: session() }));
-    const dispatch = createDurableLarkCanonicalDispatch({ facade, handle });
+    const dispatch = createDurableLarkCanonicalDispatch({ facade, store, handle });
 
     await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
       .resolves.toMatchObject({
@@ -97,6 +99,7 @@ describe('durable Lark canonical dispatch', () => {
     const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
     const dispatch = createDurableLarkCanonicalDispatch({
       facade,
+      store,
       handle: async () => ({ kind: 'ignored', reason: 'not addressed to this bot' }),
     });
 
@@ -113,6 +116,7 @@ describe('durable Lark canonical dispatch', () => {
     const firstFacade = createDurableSessionFacade({ store: first.store, ownerId: 'canonical-boot' });
     const firstDispatch = createDurableLarkCanonicalDispatch({
       facade: firstFacade,
+      store: first.store,
       handle: async () => ({ kind: 'admitted', session: session() }),
     });
     await expect(firstDispatch(message(), { claim: claim(), signal: aborted.signal }))
@@ -121,6 +125,7 @@ describe('durable Lark canonical dispatch', () => {
 
     const invalidDispatch = createDurableLarkCanonicalDispatch({
       facade: firstFacade,
+      store: first.store,
       handle: async () => ({ kind: 'queued' } as never),
     });
     await expect(invalidDispatch(message(), { claim: claim(), signal: new AbortController().signal }))
@@ -131,11 +136,94 @@ describe('durable Lark canonical dispatch', () => {
     const conflictFacade = createDurableSessionFacade({ store: conflict.store, ownerId: 'canonical-boot' });
     const conflictDispatch = createDurableLarkCanonicalDispatch({
       facade: conflictFacade,
+      store: conflict.store,
       handle: async () => ({ kind: 'admitted', session: session() }),
     });
     await expect(conflictDispatch(message(), { claim: claim(), signal: new AbortController().signal }))
       .rejects.toThrow(/admission failed: conflict/);
     await firstFacade.stop();
     await conflictFacade.stop();
+  });
+
+  it('persists queued outputs only after the canonical Session admission', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    let queueLate: ((output: any) => void) | undefined;
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async (_message, context) => {
+        queueLate = context.queuePostAdmissionOutput;
+        context.queuePostAdmissionOutput({
+          target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+          content: 'worker admission rejected',
+          providerUuid: 'admission_blocked_1',
+        });
+        expect(store.enqueueOutbox).not.toHaveBeenCalled();
+        return { kind: 'admitted', session: session() };
+      },
+    });
+
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toMatchObject({ kind: 'committed' });
+    expect(store.enqueueOutbox).toHaveBeenCalledWith({
+      lease: expect.objectContaining({ sessionKey: 'om_root::cli_test', epoch: 4 }),
+      message: expect.objectContaining({
+        messageId: 'out_admission_blocked_1',
+        sessionKey: 'om_root::cli_test',
+        visibleAt: 1,
+        createdAt: 1,
+      }),
+    });
+    expect(vi.mocked(store.writeSession).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(store.enqueueOutbox).mock.invocationCallOrder[0]!);
+    expect(() => queueLate?.({
+      target: { kind: 'send', chatId: 'oc_chat' },
+      content: 'late',
+      providerUuid: 'late_output',
+    })).toThrow(/after handler completion/);
+    await facade.stop();
+  });
+
+  it('fails closed when queued output has no Session authority or loses fencing', async () => {
+    const ignored = fakeStore();
+    const ignoredFacade = createDurableSessionFacade({ store: ignored.store, ownerId: 'canonical-boot' });
+    const ignoredDispatch = createDurableLarkCanonicalDispatch({
+      facade: ignoredFacade,
+      store: ignored.store,
+      handle: async (_message, context) => {
+        context.queuePostAdmissionOutput({
+          target: { kind: 'send', chatId: 'oc_chat' },
+          content: 'must not send',
+          providerUuid: 'ignored_output',
+        });
+        return { kind: 'ignored', reason: 'no Session' };
+      },
+    });
+    await expect(ignoredDispatch(message(), {
+      claim: claim(), signal: new AbortController().signal,
+    })).rejects.toThrow(/ignored result cannot publish/);
+    expect(ignored.store.enqueueOutbox).not.toHaveBeenCalled();
+
+    const stale = fakeStore();
+    vi.mocked(stale.store.enqueueOutbox).mockResolvedValue({ kind: 'stale_lease' });
+    const staleFacade = createDurableSessionFacade({ store: stale.store, ownerId: 'canonical-boot' });
+    const staleDispatch = createDurableLarkCanonicalDispatch({
+      facade: staleFacade,
+      store: stale.store,
+      handle: async (_message, context) => {
+        context.queuePostAdmissionOutput({
+          target: { kind: 'send', chatId: 'oc_chat' },
+          content: 'retry through Inbox',
+          providerUuid: 'stale_output',
+        });
+        return { kind: 'admitted', session: session() };
+      },
+    });
+    await expect(staleDispatch(message(), {
+      claim: claim(), signal: new AbortController().signal,
+    })).rejects.toThrow(/post-admission output failed: stale_lease/);
+    await ignoredFacade.stop();
+    await staleFacade.stop();
   });
 });
