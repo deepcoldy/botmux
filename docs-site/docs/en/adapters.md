@@ -147,3 +147,7 @@ The wait lasts up to one hour. Dispatch errors, timeout, invalidation, or unsupp
 Choice questions require at least two options. Secret inputs and malformed batches fail explicitly without answering only part of the batch. Do not send secrets through chat cards. Workflow subagents use `humanGate` / decision nodes instead. API-only sessions without Lark transport, ordinary terminal paste mode, and the App history service do not use this bridge.
 
 To verify, ask a model in an ordinary Codex App session to use native `request_user_input` for a choice question. Confirm the Lark card appears, then submit and confirm the same turn continues with your answer. Native tool availability still depends on the Codex version and execution mode.
+
+Card structure preview (rendered locally from actual card JSON; live Lark interaction has not yet been manually verified):
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

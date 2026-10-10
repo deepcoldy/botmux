@@ -148,3 +148,7 @@ Botmux 管理的 `codex-app` 会话，以及启用 app-server RPC 的 `codex` �
 - Workflow 子任务仍使用 `humanGate` / decision 节点。无飞书传输的 API-only 会话、普通终端粘贴模式，以及 App 历史查看服务不走此问答桥接。
 
 验证时，在普通 Codex App 会话中让模型用原生 `request_user_input` 问一个选择题，确认飞书卡片能收到问题，提交后同一轮继续并能复述所选答案。原生工具是否可用仍由 Codex 的版本和运行模式决定。
+
+卡片结构示意（由实际卡片 JSON 本地渲染，尚未进行真人飞书点击验收）：
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)
