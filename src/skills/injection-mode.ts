@@ -156,8 +156,8 @@ const FULLY_ROUTING_COVERED_SKILLS = new Set(['botmux-history', 'botmux-quoted',
 function promptCatalogDescription(entry: BuiltinSkillEntry, locale?: Locale): string {
   if (entry.name !== 'botmux-send') return entry.description;
   return locale === 'en'
-    ? 'Read once before the first complex Lark send: images, multi-line/structured Markdown (tables or code blocks), attachments/cards/@mentions, cross-chat/top-level publishing, or --attention. Prefer --image-mode small for standalone QR codes/icons unless the user specifies a size. Follow the full heredoc/--content-file guidance; never pass JSON.stringify/JSON-escaped \\n as literal text.'
-    : '首次复杂飞书发送前读取：图片、多行/结构化 Markdown（表格或代码块）、附件/卡片/@mention、跨群/顶层发布或 --attention。二维码、图标等独立小图优先使用 --image-mode small，用户明确指定尺寸时按要求。按完整说明使用 heredoc/--content-file，不要把 JSON.stringify/JSON 转义产生的 \\n 当字面量发送。';
+    ? 'Read once before the first complex Lark send: multi-line/structured Markdown (tables or code blocks), attachments/cards/@mentions, cross-chat/top-level publishing, or --attention. Follow the full heredoc/--content-file guidance; never pass JSON.stringify/JSON-escaped \\n as literal text.'
+    : '首次复杂飞书发送前读取：多行/结构化 Markdown（表格或代码块）、附件/卡片/@mention、跨群/顶层发布或 --attention。按完整说明使用 heredoc/--content-file，不要把 JSON.stringify/JSON 转义产生的 \\n 当字面量发送。';
 }
 
 /** First `description:` value from a SKILL.md YAML frontmatter (single line). */
