@@ -444,10 +444,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
     startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
     systemHints: BOTMUX_SHELL_HINTS,
-    // TraeX 0.207.x can display a parked message without durably appending it
-    // to history.jsonl, especially after transcript/TUI state desynchronizes.
-    // Keep PTY delivery serial until the real composer is visible.
-    supportsTypeAhead: false,
+    // Healthy TraeX turns accept parked input while working. The worker fences
+    // delivery independently after a terminal/composer conflict or an unknown
+    // history receipt, so ordinary corrections need not wait for completion.
+    supportsTypeAhead: true,
     // task_complete in the per-session rollout is an explicit durable turn
     // boundary; worker.ts drains it independently of screen-idle detection.
     reliableTurnTerminal: true,

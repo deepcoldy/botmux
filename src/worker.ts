@@ -8619,6 +8619,16 @@ function codexBridgeIngest(opts: {
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
+  if (cliAdapter?.postTerminalPromptFence === true) {
+    const turns = codexBridgeQueue.peek();
+    if (turns.some(turn => turn.started && turn.finalText === undefined)) {
+      // A queued, fingerprint-matched successor has actually started. Busy
+      // output now belongs to live work, not the preceding completed turn.
+      postTerminalInputFence = null;
+    } else if (turns.some(turn => turn.started && turn.finalText !== undefined)) {
+      armPostTerminalInputFence();
+    }
+  }
   // After ingest so the latch's delivery re-kick observes the started turn —
   // the flush's own bridge mark must queue behind it, not ahead of it.
   noteSpawnArgvTurnStartTranscriptEvidence(result.events);
@@ -9168,6 +9178,9 @@ function emitReadyCodexTurns(): void {
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   if (ready.length === 0) return;
+  if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
+    armPostTerminalInputFence();
+  }
   // Turns suppressed as GENUINE SILENCE (model terminated with a bare
   // nothing-to-send sentinel, no `botmux send`). Tracked by object identity —
   // both the emit loop and the terminal loop below iterate this same `ready`
@@ -9936,6 +9949,12 @@ async function writeAdoptMessage(
     return 'stale-before-write';
   }
   const adoptBackend = executionFence.backend;
+  if (cliAdapter?.postTerminalPromptFence === true
+    && (currentInputDeliveryQuarantine()
+      || await postTerminalInputIsBlocked(adoptBackend))) {
+    return 'stale-before-write';
+  }
+  if (!adoptWriteFenceIsCurrent(executionFence)) return 'stale-before-write';
 
   renderer?.markNewTurn();
   const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
@@ -11948,6 +11967,51 @@ interface InputDeliveryQuarantine {
 }
 let inputDeliveryQuarantine: InputDeliveryQuarantine | null = null;
 
+/** A terminal is a logical completion, not a PTY write receipt. Install this
+ * synchronously before async screen settlement so type-ahead cannot race the
+ * idle callback. A real composer or a started native successor clears it. */
+let postTerminalInputFence: {
+  backend: SessionBackend;
+  generation: number;
+} | null = null;
+
+function currentPostTerminalInputFence(): typeof postTerminalInputFence {
+  if (postTerminalInputFence
+    && (postTerminalInputFence.backend !== backend
+      || postTerminalInputFence.generation !== cliSpawnGeneration)) {
+    postTerminalInputFence = null;
+  }
+  return postTerminalInputFence;
+}
+
+function armPostTerminalInputFence(): void {
+  if (cliAdapter?.postTerminalPromptFence !== true || !backend
+    || !backendScreenEvidenceIsAuthoritativeForMutation()
+    || currentPostTerminalInputFence()) return;
+  postTerminalInputFence = { backend, generation: cliSpawnGeneration };
+  isPromptReady = false;
+}
+
+async function postTerminalInputIsBlocked(target: SessionBackend): Promise<boolean> {
+  if (cliAdapter?.postTerminalPromptFence === true) {
+    // Do not depend on fs.watch ordering: a terminal can already be on disk
+    // when the next message arrives, before the bridge timer has noticed it.
+    codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+  }
+  const fence = currentPostTerminalInputFence();
+  if (!fence) return false;
+  try {
+    await renderer?.writeAndFlush('');
+  } catch (err: any) {
+    log(`${cliName()} post-terminal input renderer settle failed: ${err.message}`);
+    return true;
+  }
+  if (backend !== target || fence.generation !== cliSpawnGeneration
+    || cliRestartInProgress) return true;
+  if (!currentPostTerminalInputFence()) return false;
+  return postTerminalPromptFenceHolds('external', target);
+}
+
 function currentInputDeliveryQuarantine(): InputDeliveryQuarantine | null {
   const quarantine = inputDeliveryQuarantine;
   if (!quarantine) return null;
@@ -12646,6 +12710,11 @@ function markPromptReady(): void {
   }
   if (currentInputDeliveryQuarantine()) {
     log('Ignoring prompt-ready while input delivery is quarantined');
+    idleDetector?.reset();
+    return;
+  }
+  if (currentPostTerminalInputFence()) {
+    log('Ignoring prompt-ready until the post-terminal PTY composer is verified');
     idleDetector?.reset();
     return;
   }
@@ -13516,6 +13585,13 @@ async function flushPending(): Promise<void> {
     log(`Holding ${pendingMessages.length} pending message(s) behind unconfirmed input delivery`);
     return;
   }
+  if (cliAdapter.postTerminalPromptFence === true) {
+    const target = backend;
+    if (await postTerminalInputIsBlocked(target)) return;
+    // Two input arrivals can both await the same renderer. Only one may own
+    // the drain, and a restart during that await invalidates both arrivals.
+    if (isFlushing || backend !== target || cliRestartInProgress) return;
+  }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -13752,6 +13828,14 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
+      if (currentInputDeliveryQuarantine()) break;
+      if (cliAdapter.postTerminalPromptFence === true) {
+        const target: SessionBackend = backend;
+        const generation = cliSpawnGeneration;
+        if (await postTerminalInputIsBlocked(target)
+          || backend !== target || generation !== cliSpawnGeneration
+          || cliRestartInProgress) break;
+      }
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
@@ -14291,6 +14375,10 @@ async function flushPending(): Promise<void> {
           if (recoveryFailureReason) {
             notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
           } else {
+            if (submissionBackend && normalWritePrepared) {
+              deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item);
+              if (deliveryQuarantine) inflightInputs.forget(item);
+            }
             scheduleSubmitFailureNotify(
               logicalMsg,
               undefined,
@@ -14361,6 +14449,7 @@ async function flushPending(): Promise<void> {
         );
         if (!result.failureReason && !recoveryFailureReason && submissionBackend) {
           deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item);
+          if (deliveryQuarantine) inflightInputs.forget(item);
         }
         const codexAppSafeNonSubmission = result.submissionDisposition === 'untouched'
           || result.submissionDisposition === 'flushed_invalid';
@@ -14471,13 +14560,13 @@ async function flushPending(): Promise<void> {
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
       if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
-      // Only adapters that explicitly couple serial delivery to their
-      // post-terminal composer fence stop after one ordinary write. Preserve
-      // master's same-batch behavior for every other non-type-ahead adapter.
+      // Fence-enabled adapters can batch healthy type-ahead only after each
+      // write is confirmed. Terminal conflicts and unknown receipts are
+      // checked again before the next item, independently from readiness.
       if (shouldStopPendingBatch(
         item,
         pendingMessages[0],
-        cliAdapter.postTerminalPromptFence !== true,
+        cliAdapter.postTerminalPromptFence !== true || runtimeSupportsTypeAhead,
       )) break;
     }
   } finally {
@@ -14984,7 +15073,7 @@ function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>,
   wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);
   idleDetector.onIdle(async (evidenceSource) => {
     const idleBackend = backend;
-    if (evidenceSource === 'external'
+    if ((evidenceSource === 'external' || currentPostTerminalInputFence())
       && cliAdapter?.postTerminalPromptFence === true
       && renderer) {
       try {
@@ -14999,7 +15088,7 @@ function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>,
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
       try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
     };
-    if (evidenceSource === 'external'
+    if ((evidenceSource === 'external' || currentPostTerminalInputFence())
       && cliAdapter?.postTerminalPromptFence === true) {
       drainBridges();
       if (idleBackend && postTerminalPromptFenceHolds(evidenceSource, idleBackend)) return;
@@ -15068,16 +15157,29 @@ function postTerminalPromptFenceHolds(
   evidenceSource: IdleEvidenceSource,
   be: SessionBackend,
 ): boolean {
-  if (evidenceSource !== 'external'
+  if ((evidenceSource !== 'external' && !currentPostTerminalInputFence())
     || cliAdapter?.postTerminalPromptFence !== true
     || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
+    postTerminalInputFence = null;
+    // The predecessor's idle edge must not publish readiness for this active
+    // successor. Input remains allowed because no post-terminal fence is held.
+    idleDetector?.reset();
+    return true;
+  }
   const composerPattern = cliAdapter.staticBusyClearPattern ?? cliAdapter.readyPattern;
   if (!composerPattern) return false;
   try {
-    const screen = busyProbeRegion(captureBackendScreen(be));
+    // tmux capture-pane retains the unused bottom rows. Scan the visible
+    // content tail instead of a tail made entirely of viewport padding.
+    const screen = busyProbeRegion(captureBackendScreen(be).trimEnd());
     const busyAt = lastPatternIndex(cliAdapter.busyPattern, screen);
     const composerAt = lastPatternIndex(composerPattern, screen);
-    if (composerAt >= 0 && composerAt > busyAt) return false;
+    if (composerAt >= 0 && composerAt > busyAt) {
+      postTerminalInputFence = null;
+      return false;
+    }
+    armPostTerminalInputFence();
     log(
       `${cliName()} external-idle: structured terminal observed without a newer `
       + `PTY composer (busy=${busyAt >= 0}, composer=${composerAt >= 0}); `
@@ -15086,6 +15188,7 @@ function postTerminalPromptFenceHolds(
     idleDetector?.reset();
     return true;
   } catch (err: any) {
+    armPostTerminalInputFence();
     log(`${cliName()} external-idle composer fence capture failed: ${err.message}`);
     idleDetector?.reset();
     return true;
@@ -19559,7 +19662,7 @@ async function spawnCli(
       // terminal can arrive in the same tick as the TUI's busy redraw; drain
       // queued render bytes before the post-terminal composer fence inspects
       // the viewport, or it can see the stale pre-submit prompt.
-      if (evidenceSource === 'external'
+      if ((evidenceSource === 'external' || currentPostTerminalInputFence())
         && cliAdapter?.postTerminalPromptFence === true
         && renderer) {
         try {
@@ -19571,7 +19674,7 @@ async function spawnCli(
       // Selected PTY adapters (TraeX) split logical terminal from composer
       // readiness. Their structured terminal must not publish prompt-ready
       // until the authoritative viewport shows a newer real composer.
-      if (evidenceSource === 'external'
+      if ((evidenceSource === 'external' || currentPostTerminalInputFence())
         && cliAdapter?.postTerminalPromptFence === true) {
         // Business completion is independent from PTY readiness: publish the
         // structured final/terminal now, then fence only prompt-ready/input.
@@ -20140,6 +20243,7 @@ function killCli(opts: {
   // depend on that implementation detail.
   cliSpawnGeneration++;
   inputDeliveryQuarantine = null;
+  postTerminalInputFence = null;
   currentCliCredentialIsolated = false;
   stopNativeSessionTitleSync();
   stopSessionMcpGatewayHost();

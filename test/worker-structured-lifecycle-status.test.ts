@@ -593,11 +593,11 @@ describe('worker structured-turn status wiring', () => {
     expect(adoptFence).toBeGreaterThan(adoptDrain);
   });
 
-  it('limits ordinary flush batches only for post-terminal-fence adapters', () => {
+  it('allows healthy type-ahead batches while keeping explicit serial adapters gated', () => {
     const flush = functionSlice('flushPending', 'sendToPty');
     const batchStop = flush.indexOf('if (shouldStopPendingBatch(');
     const serialOptIn = flush.indexOf(
-      'cliAdapter.postTerminalPromptFence !== true',
+      'cliAdapter.postTerminalPromptFence !== true || runtimeSupportsTypeAhead',
       batchStop,
     );
     expect(batchStop).toBeGreaterThanOrEqual(0);
