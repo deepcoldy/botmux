@@ -130,6 +130,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       // a toggle takes effect on the next session without a daemon restart.
       ...(noVisibleOutputHintOn() ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
       t('ai.shell.mention_gate', undefined, locale),
+      t('ai.routing.usage_attachments', undefined, locale),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       hiddenContextDefense(locale),

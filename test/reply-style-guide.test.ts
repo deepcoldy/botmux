@@ -93,6 +93,7 @@ describe('session-scoped botmux-send reply style guide', () => {
   it('ships a stable loader that delegates to the session-scoped command', () => {
     expect(SEND_SKILL_SESSION_LOADER).toContain('name: botmux-send');
     expect(SEND_SKILL_SESSION_LOADER).toContain('botmux skill show botmux-send');
+    expect(SEND_SKILL_SESSION_LOADER.split('\n---')[0]).toContain('--image-mode small');
     expect(SEND_SKILL_SESSION_LOADER).not.toContain('结果摘要');
     expect(SEND_SKILL_SESSION_LOADER).not.toContain('--layout result');
   });

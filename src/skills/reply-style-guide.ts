@@ -45,7 +45,7 @@ const LAYOUT_GUIDE = `### 可选语义卡头：\`--layout\`
 /** Stable content written to shared/native skill directories. */
 export const SEND_SKILL_SESSION_LOADER = `---
 name: botmux-send
-description: 向飞书话题发送消息。复杂排版、附件、卡片、@mention、跨群发布或 --attention 前必须先读取当前会话的完整指南。
+description: 向飞书话题发送消息。图片、复杂排版、附件、卡片、@mention、跨群发布或 --attention 前必须先读取当前会话的完整指南。二维码、图标等独立小图优先使用 --image-mode small，用户明确指定尺寸时按要求。
 ---
 
 # botmux-send — 读取当前会话指南

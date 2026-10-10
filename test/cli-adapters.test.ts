@@ -330,6 +330,25 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('makes QR size guidance visible before skill loading in both locales and injection paths', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const prompts = [
+        buildBotmuxSystemPromptText({ locale }),
+        buildBotmuxShellHints(locale).join('\n'),
+      ];
+      for (const prompt of prompts) {
+        expect(prompt).toContain('botmux skill show botmux-send');
+        expect(prompt).toContain('--image-mode small');
+      }
+      // No-transport and transcript delivery must keep their existing contract:
+      // these modes do not advertise explicit send commands in routing hints.
+      expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('--image-mode small');
+      expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('--image-mode small');
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('--image-mode small');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('--image-mode small');
+    }
+  });
+
   it('keeps the final-answer feedback hint aligned across both injection paths', () => {
     // 回归守卫：feedbackResponseKindHint 必须同时出现在 system-prompt 路径
     // （injectsSessionContext CLI）与 shell-hints 路径，否则启用最终回答反馈时

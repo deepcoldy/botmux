@@ -200,10 +200,12 @@ describe('built-in skill catalog', () => {
     expect(block).toContain('botmux skill show &lt;name&gt;');
     expect(block).toContain('- botmux-send:');
     expect(block).toContain('首次复杂飞书发送前读取');
+    expect(block).toContain('--image-mode small');
     expect(block).toContain('JSON.stringify');
     expect(block).toContain('JSON 转义产生的 \\n 当字面量');
     // The compact prompt description must not replace the full/native metadata.
     expect(entries.find((e) => e.name === 'botmux-send')?.description).toContain('向飞书话题发送消息');
+    expect(entries.find((e) => e.name === 'botmux-send')?.description).toContain('--image-mode small');
   });
 
   it('keeps catalog prose as escaped text instead of nested XML-like tags', () => {
