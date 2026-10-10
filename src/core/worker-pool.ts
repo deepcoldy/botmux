@@ -7964,7 +7964,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; cardVisibility?: 'private' | 'public' },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public' },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -8099,6 +8099,7 @@ export async function closeSession(
       // earlier — one layer up.
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
+        ...(opts?.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
         ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
         // Park a LOCAL residual so an idempotent re-close still reports it — the
         // journal (its runtime home) is wiped by this same transaction.
@@ -8166,6 +8167,7 @@ export async function closeSession(
       // SUCCESSFUL save, and skipped when the two are the same object anyway, so
       // the runtime view cannot end up carrying a park the disk does not have.
       if (after && after !== ds.session) {
+        ds.session.workspaceRetirement = after.workspaceRetirement;
         ds.session.mojoCloseJournal = after.mojoCloseJournal;
         if (clearMojoLineage || prepared.parkMojoLineage) {
           ds.session.riffParentTaskId = after.riffParentTaskId;
@@ -8617,13 +8619,14 @@ function removeInactiveRegistration(
   key: string,
   ds: DaemonSession,
 ): boolean {
-  if (ds.session.status === 'active') return false;
+  if (ds.session.status === 'active' && !ds.session.workspaceRetirement) return false;
   // Only remove our exact stale object. A newer session may already own the
   // same routing key and must never be evicted by this continuation.
   if (map.get(key) === ds) map.delete(key);
   logger.warn(
-    `[${tag(ds)}] Refusing to register an inactive session ` +
-    `(status=${ds.session.status})`,
+    ds.session.workspaceRetirement
+      ? `[${tag(ds)}] Refusing to register a workspace-retired session (status=${ds.session.status}, operationId=${ds.session.workspaceRetirement.operationId})`
+      : `[${tag(ds)}] Refusing to register an inactive session (status=${ds.session.status})`,
   );
   return true;
 }
@@ -8735,12 +8738,7 @@ export async function setActiveSessionSafe(
     // to a non-active status while an async creator/restore awaited Lark/project
     // metadata. Never publish that now-inactive row back into the live map; drop
     // only our exact stale object so a newer owner of the same key is untouched.
-    if (ds.session.status !== 'active') {
-      if (map.get(key) === ds) map.delete(key);
-      logger.warn(
-        `[setActiveSessionSafe] refusing to register inactive session `
-        + `${ds.session.sessionId.substring(0, 8)} (status=${ds.session.status})`,
-      );
+    if (removeInactiveRegistration(map, key, ds)) {
       return {
         accepted: false,
         reason: 'inactive_incoming',
@@ -8926,6 +8924,15 @@ type OrdinaryImDelivery = {
  * daemon event has already been claimed by Lark dedup at this point, so losing
  * this in-memory delivery without retry would permanently drop the message. */
 const pendingOrdinaryImDeliveries = new Map<string, OrdinaryImDelivery>();
+
+/** A cached idle screen does not prove that a just-admitted message has been
+ * committed by the worker. Automatic workspace recycling must preserve it. */
+export function hasPendingOrdinaryImDelivery(ds: DaemonSession): boolean {
+  for (const delivery of pendingOrdinaryImDeliveries.values()) {
+    if (delivery.ds === ds) return true;
+  }
+  return false;
+}
 
 function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGeneration: number): string {
   return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;

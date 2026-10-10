@@ -11,6 +11,11 @@ import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
 
+export function resumeErrorMessage(reason: unknown, translate: typeof t = t): string {
+  if (reason === 'workspace_retired') return translate('sessions.resumeWorkspaceRetired');
+  return `${translate('sessions.resumeFailed')}: ${reason}`;
+}
+
 export function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }

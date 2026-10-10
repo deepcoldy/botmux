@@ -928,9 +928,9 @@ function resolveStoreFile(appId: string, dataDir: string): StoreFileRef | undefi
 
 /** App ids whose `sessions-<id>.json` exists and whose `.db` does not.
  *  Existence only — the JSON is never parsed. */
-export function listUnmigratedAppIds(dataDir: string): string[] {
+export function listUnmigratedAppIds(dataDir: string, opts: { strict?: boolean } = {}): string[] {
   let names: string[] = [];
-  try { names = readdirSync(dataDir); } catch { return []; }
+  try { names = readdirSync(dataDir); } catch (error) { if (opts.strict) throw error; return []; }
   const ids: string[] = [];
   for (const name of names) {
     if (!name.startsWith('sessions-') || !name.endsWith('.json')) continue;
@@ -963,13 +963,14 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
 
 /** All [key, value] entries of one store. Throws on an unreadable store;
  *  callers decide skip-vs-propagate (capability errors always propagate). */
-function readStoreEntries(ref: StoreFileRef): [string, Session][] {
+function readStoreEntries(ref: StoreFileRef, strict = false): [string, Session][] {
   const db = openDbForRead(ref.path);
   try {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     const entries: [string, Session][] = [];
     for (const r of rows) {
-      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
+      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); }
+      catch (error) { if (strict) throw error; /* display readers skip unparseable rows */ }
     }
     return entries;
   } finally {
@@ -2129,10 +2130,18 @@ function persistRow(session: Session): void {
       new Error(`session store ${currentAppId ? getDbPath() : '<uninitialized>'} is not attached`),
     );
   }
+  // Retirement is a terminal invariant even when the durable row has no marker yet.
+  if (session.workspaceRetirement && session.status !== 'closed') throw new Error('workspace_retired');
   testOnlyBeforeRowPersist?.(session.sessionId);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    if (durable.workspaceRetirement) {
+      if (session.status !== 'closed') throw new Error('workspace_retired');
+      // Late whole-row writers may hold a pre-close copy. Retirement cannot
+      // be erased by a stale metadata write or by changing workingDir.
+      session = { ...session, workspaceRetirement: durable.workspaceRetirement };
+    }
     // Pre-migration whole-row writers must not erase the frozen input policy.
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
@@ -2660,6 +2669,7 @@ export function closeSession(
   sessionId: string,
   opts: {
     cleanupBridgeMarkers?: boolean;
+    workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
     /**
      * Park an uncancellable mojo lineage as PART of this transaction.
@@ -2718,6 +2728,7 @@ export function closeSession(
       type: 'close',
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
+      ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
       ...(opts.parkMojoLineage ? { parkMojoLineage: opts.parkMojoLineage } : {}),
       ...(opts.parkLocalResidual ? { parkLocalResidual: opts.parkLocalResidual } : {}),
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
@@ -2763,10 +2774,11 @@ export function closeSession(
 export function reactivateClosedSession(
   sessionId: string,
 ): { ok: true; session: Session }
-| { ok: false; error: 'not_found' | 'not_closed' } {
+| { ok: false; error: 'not_found' | 'not_closed' | 'workspace_retired' } {
   loadForWrite();
   const session = sessions.get(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
+  if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // Durable first (see closeSession): the reactivated row is committed before
@@ -7897,6 +7909,39 @@ export function loadAllSessionsSnapshot(options: {
   }
   for (const ref of refs) readInto(ref);
   return out;
+}
+
+/** Destructive lifecycle discovery must account for every store, including
+ * corrupt stores and duplicate owners. Unlike the display snapshot this does
+ * not skip errors or collapse two copies of the same session id. Pure reader. */
+export function loadAllSessionsStrict(dataDir = config.session.dataDir): Session[] {
+  // Display readers may omit unmigrated stores; destructive discovery cannot.
+  // Probe existence only, preserving the SQLite-only cross-process contract.
+  const refs = listStoreRefs(dataDir, { strict: true });
+  const unmigrated = listUnmigratedAppIds(dataDir, { strict: true });
+  if (unmigrated.length) {
+    throw new SessionStoreUnmigratedError(`Unmigrated session stores: ${unmigrated.join(', ')}`);
+  }
+  // The shared legacy projection has no authoritative owner index. Require
+  // explicit migration/removal before claiming complete discovery coverage.
+  if (existsSync(join(dataDir, 'sessions.json'))) {
+    throw new SessionStoreUnmigratedError('Legacy session store prevents complete workspace discovery');
+  }
+  const result: Session[] = [];
+  for (const ref of refs) {
+    for (const [key, raw] of readStoreEntries(ref, true)) {
+      const session = raw as Session;
+      if (!session || typeof session !== 'object' || Array.isArray(session)
+          || session.sessionId !== key || !['active', 'closed'].includes(session.status)) {
+        throw new Error(`Invalid session identity in ${ref.path}`);
+      }
+      if (ref.appId && session.larkAppId && session.larkAppId !== ref.appId) {
+        throw new Error(`Session owner mismatch in ${ref.path}`);
+      }
+      result.push({ ...session, larkAppId: ref.appId ?? session.larkAppId });
+    }
+  }
+  return result;
 }
 
 /**

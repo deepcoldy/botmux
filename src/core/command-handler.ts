@@ -4288,6 +4288,8 @@ export async function handleCommand(
               await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
             } else if (result.error === 'resume_cancelled') {
               await sessionReply(rootId, t('card.action.resume_cancelled', undefined, loc));
+            } else if (result.error === 'workspace_retired') {
+              await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, loc));
             } else if (result.error === 'resume_start_failed') {
               await sessionReply(rootId, t('card.action.resume_start_failed', undefined, loc));
             } else if (result.error === 'resume_reconciliation_required') {

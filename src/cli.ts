@@ -6608,6 +6608,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，不能 resume。');
   } else if (errCode === 'resume_cancelled') {
     console.error('❌ 恢复过程中会话被关闭，本次 resume 已取消。');
+  } else if (errCode === 'workspace_retired') {
+    console.error('❌ 该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。');
   } else if (errCode === 'resume_start_failed') {
     console.error('❌ 远程后端恢复进程未能启动，会话已恢复为 closed；请稍后重试。');
   } else if (errCode === 'resume_reconciliation_required') {
@@ -6816,6 +6818,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
   actor current --json
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
+  workspace-recycle discover|prepare|finish|status|hook
+                         按精确工作区发现、回收会话并读取资源验证结果
   execution current --json
               只读核验当前进程所属的 bot/session/turn、执行尝试和 Worker 代次
   auth request [--scope "<scope1 scope2,...>"] [--json]
@@ -17323,6 +17327,11 @@ switch (command) {
     // never self-release (weak handles on non-cgroup hosts, unprovable handles).
     const { runMojoContainmentCommand } = await import('./core/mojo-containment-command.js');
     process.exitCode = await runMojoContainmentCommand(process.argv.slice(3));
+    break;
+  }
+  case 'workspace-recycle': {
+    const { runWorkspaceRecycleCommand } = await import('./cli/workspace-recycle.js');
+    process.exitCode = await runWorkspaceRecycleCommand(process.argv.slice(3));
     break;
   }
   case 'turn-send-ledger': {

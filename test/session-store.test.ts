@@ -3604,6 +3604,52 @@ describe('closeSession()', () => {
     expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
   });
 
+  it('rejects a first retirement marker on an active row without changing memory or disk', () => {
+    const session = createSession('chat1', 'root1', 'Incoming retirement');
+    const retirement = { operationId: 'recycle-incoming', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    expect(() => updateSession({ ...session, workspaceRetirement: retirement })).toThrow('workspace_retired');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+
+    // A normal close and an idempotent retirement of an already closed row remain valid.
+    closeSession(session.sessionId);
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', workspaceRetirement: retirement });
+  });
+
+  it('commits workspace retirement with closed state and refuses stale writers that resurrect or erase it', () => {
+    const session = createSession('chat1', 'root1', 'Retired workspace');
+    const stale = { ...session };
+    const retirement = { operationId: 'recycle-1', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', workspaceRetirement: retirement });
+    expect(reactivateClosedSession(session.sessionId)).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(() => updateSession({ ...stale, workingDir: tempDir })).toThrow('workspace_retired');
+    updateSession({ ...stale, status: 'closed', title: 'Late metadata' });
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', title: 'Late metadata', workspaceRetirement: retirement });
+  });
+
+  it('leaves no retirement in memory or on disk if the atomic close write fails', () => {
+    const session = createSession('chat1', 'root1', 'Retirement write failure');
+    __testOnly_setBeforeRowPersist(() => { throw new Error('retirement write failure'); });
+    expect(() => closeSession(session.sessionId, {
+      workspaceRetirement: { operationId: 'recycle-1', workspacePath: '/removed', retiredAt: new Date().toISOString() },
+    })).toThrow('retirement write failure');
+    expect(session.status).toBe('active');
+    expect(session.workspaceRetirement).toBeUndefined();
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getSession(session.sessionId)?.status).toBe('active');
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+  });
+
   it('restores Riff close state in memory when the atomic save fails', () => {
     const session = createSession('chat1', 'root1', 'Close Riff Save Failure');
     session.backendType = 'riff';

@@ -104,6 +104,7 @@ import {
   killStalePids,
   killWorker,
   setActiveSessionSafe,
+  setActiveSessionIfActive,
   teardownAuthoritativePersistentBackingBeforeClose,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
@@ -131,6 +132,28 @@ beforeEach(() => {
   herdrList.mockReturnValue([]);
   zmxList.mockReturnValue([]);
   getBotMock.mockReturnValue({ resolvedAllowedUsers: [], config: {} } as any);
+});
+
+describe('workspace retirement registration guard', () => {
+  it.each(['sync', 'locked'] as const)('rejects active retired rows at the %s gate and preserves a newer occupant', async gate => {
+    const register = async (map: Map<string, DaemonSession>, key: string, incoming: DaemonSession) => gate === 'sync'
+      ? setActiveSessionIfActive(map, key, incoming)
+      : (await setActiveSessionSafe(map, key, incoming)).accepted;
+    const { logger } = await import('../src/utils/logger.js');
+    const incoming = ds();
+    incoming.session.status = 'active';
+    incoming.session.workspaceRetirement = { operationId: 'recycle-registration', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    const key = activeSessionKey(incoming);
+    const map = new Map([[key, incoming]]);
+    expect(await register(map, key, incoming)).toBe(false);
+    expect(map.size).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('workspace-retired session (status=active, operationId=recycle-registration)'));
+    const winner = ds({ session: { ...incoming.session, sessionId: 'new-session', workspaceRetirement: undefined } });
+    map.set(key, winner);
+    expect(await register(map, key, incoming)).toBe(false);
+    expect(map.get(key)).toBe(winner);
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('inactive session (status=active)'));
+  });
 });
 
 describe('killStalePids — ZMX CLI-change cleanup', () => {

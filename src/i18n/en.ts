@@ -1138,6 +1138,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_adopt_unsupported': '⚠️ Adopted sessions cannot be resumed.',
   'card.action.resume_deferred_unmaterialized': '⚠️ This silent scheduled run never created a topic. Its hidden session is audit-only and cannot be resumed.',
   'card.action.resume_cancelled': '⚠️ The session was closed while resume was committing; resume was cancelled.',
+  'card.action.resume_workspace_retired': 'This session’s workspace has been reclaimed and the session cannot be resumed. Create a new session in a valid workspace.',
   'card.action.resume_start_failed': '⚠️ The remote recovery process could not start. The session remains closed; please retry later.',
   'card.action.resume_reconciliation_required': '⚠️ Remote recovery failed to start and the session could not be proven closed again. It remains protected; retry close or inspect the remote state.',
   'card.action.primary_lifecycle_unavailable': '⚠️ Card-based close, resume, and restart are not yet available in multi-replica durable mode. Send `/close` in this thread to close the session; mention the bot again to start a new session.',
