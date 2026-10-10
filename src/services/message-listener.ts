@@ -148,6 +148,20 @@ export function refreshListenerCardTextFromResolved(match: MessageListenerMatch,
   if (title?.trim()) match.messageTitle = title;
 }
 
+/**
+ * A merge_forward event carries no useful body at listener-match time. The
+ * daemon expands it later through the same parser used by direct mentions;
+ * copy that expanded XML into the listener match before rendering the prompt.
+ */
+export function refreshListenerForwardTextFromParsed(
+  match: MessageListenerMatch,
+  parsedContent: string,
+): void {
+  if (match.msgType !== 'merge_forward') return;
+  const text = parsedContent.trim();
+  if (text) match.messageText = text;
+}
+
 function contains(list: readonly string[] | undefined, value: string | undefined): boolean {
   return !!value && !!list && list.includes(value);
 }

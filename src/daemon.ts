@@ -479,7 +479,11 @@ import {
   updateSessionTitle,
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
-import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
+import {
+  renderMessageListenerPrompt,
+  refreshListenerCardTextFromResolved,
+  refreshListenerForwardTextFromParsed,
+} from './services/message-listener.js';
 import { renderCommandTriggerPrompt } from './services/command-trigger.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { sweepOrphanScratchSandboxes } from './adapters/backend/scratch-sandbox.js';
@@ -22654,7 +22658,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const botCfg = getBot(larkAppId).config;
   // Upgrade a card match's text/title from the resolved message (button URLs the
   // simplified match-time view dropped). See refreshListenerCardTextFromResolved.
-  if (messageListener) refreshListenerCardTextFromResolved(messageListener, data.message);
+  if (messageListener) {
+    refreshListenerCardTextFromResolved(messageListener, data.message);
+    refreshListenerForwardTextFromParsed(messageListener, parsed.content);
+  }
   const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
   if (listenerPrompt) {
     content = listenerPrompt;
@@ -24720,6 +24727,7 @@ async function handleThreadReplyAdmitted(
   let listenerPrompt: string | undefined;
   if (ctx.messageListener) {
     refreshListenerCardTextFromResolved(ctx.messageListener, data.message);
+    refreshListenerForwardTextFromParsed(ctx.messageListener, parsed.content);
     listenerPrompt = renderMessageListenerPrompt(ctx.messageListener);
   }
   if (listenerPrompt) {

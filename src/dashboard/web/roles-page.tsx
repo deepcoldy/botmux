@@ -84,7 +84,7 @@ type ListenerTargetTab = 'members' | 'bots';
 type SenderTypeOption = 'user' | 'bot';
 type Translator = ReturnType<typeof useT>;
 
-const LISTENER_MESSAGE_TYPES = ['text', 'post', 'image', 'interactive'] as const;
+const LISTENER_MESSAGE_TYPES = ['text', 'post', 'image', 'interactive', 'merge_forward'] as const;
 
 /** Keywords accept comma (ASCII/CJK) or newline separators. */
 function parseListenerKeywords(text: string): string[] {
