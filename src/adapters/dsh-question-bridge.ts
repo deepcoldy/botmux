@@ -395,6 +395,12 @@ const BOTMUX_READY_POLL_LIMIT_MS = 120_000;
 // id would filter out every real agent/status event below.
 const BOTMUX_PROCESS_STARTED_AT_MS = Date.now() - Math.round(process.uptime() * 1000);
 const BOTMUX_PID_REUSE_TOLERANCE_MS = 1_000;
+// Birth-stamp plausibility bounds (see botmuxRecordIsOurs). Epoch-ms floor:
+// 2001-09-09, below which the value is a seconds stamp or a raw counter. Future
+// allowance: clock skew only — a record claiming to be born a minute or more
+// after this process started is not ours to claim either.
+const BOTMUX_BIRTH_STAMP_MIN_MS = 1_000_000_000_000;
+const BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS = 60_000;
 
 let botmuxReadySignalled = false;
 let botmuxReadyPollTimer;
@@ -406,19 +412,34 @@ function botmuxStatusCommand(envKey) {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : '';
 }
 
-/** Best-effort birth check on a record's start instant. Only a plausible
- *  epoch-ms value is comparable (a seconds/ISO stamp is left alone rather than
- *  guessed at), so this can never reject a genuine record of ours. */
+/** FAIL-CLOSED birth check on a record's start instant.
+ *
+ *  Only an epoch-ms value inside [this process's start − 1s, now + clock skew]
+ *  can be ours. Anything else — missing, non-finite, a seconds stamp, a raw
+ *  counter like 1, or a significantly future value — is rejected rather than
+ *  guessed at: accepting it is exactly how a PID-reuse leftover (or a
+ *  hand-written row) claims our pid, releases the first-prompt gate for a TUI
+ *  that has not rendered yet, and then filters out every real agent/status
+ *  event because the bound session id is not the one the agent reports.
+ *
+ *  The record's startedAt is written by our own TUI right after the first
+ *  frame (verified against live ~/.dsh-tui/inject/servers.json), so a genuine
+ *  record always carries it. "never early" wins over "always signal": a lost
+ *  readiness edge degrades to the adapter's readyPattern / 90s hard cap, while
+ *  an early one writes into a TUI that cannot accept input. */
 function botmuxRecordIsOurs(entry) {
-  if (typeof entry.startedAt !== 'number' || !Number.isFinite(entry.startedAt)) return true;
-  if (entry.startedAt < 1_000_000_000_000) return true;
-  return entry.startedAt >= BOTMUX_PROCESS_STARTED_AT_MS - BOTMUX_PID_REUSE_TOLERANCE_MS;
+  const stamp = entry.startedAt;
+  if (typeof stamp !== 'number' || !Number.isFinite(stamp)) return false;
+  if (stamp < BOTMUX_BIRTH_STAMP_MIN_MS) return false;
+  if (stamp > Date.now() + BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS) return false;
+  return stamp >= BOTMUX_PROCESS_STARTED_AT_MS - BOTMUX_PID_REUSE_TOLERANCE_MS;
 }
 
 /** The TUI process's own inject-channel record, or undefined while it has not
  *  published one yet (i.e. before its first frame). Records for our pid that
- *  carry a birth stamp older than this process are PID-reuse leftovers; when
- *  several of ours exist (dsh-tui republishes on restart) the newest wins. */
+ *  fail the birth check above (PID-reuse leftovers, malformed stamps) are
+ *  dropped; when several of ours exist (dsh-tui republishes on restart) the
+ *  newest wins. */
 function readBotmuxInjectRecord() {
   try {
     const parsed = JSON.parse(readFileSync(join(homedir(), '.dsh-tui', 'inject', 'servers.json'), 'utf8'));

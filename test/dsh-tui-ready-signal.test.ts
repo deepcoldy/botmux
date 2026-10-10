@@ -70,29 +70,33 @@ function makeExecutable(file: string, body: string): string {
  */
 const DRIVER_SOURCE = `
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-const [pluginPath, homeDir, readyCountFile, doneFile, injectPidArg, sessionId, statusScript, staleSessionId] = process.argv.slice(2);
+const [pluginPath, homeDir, readyCountFile, doneFile, injectPidArg, sessionId, statusScript, staleSessionId, staleStampKind] = process.argv.slice(2);
 const injectDir = homeDir + '/.dsh-tui/inject';
 mkdirSync(injectDir, { recursive: true });
-function publishRecord(pid, sid, startedAt) {
-  writeFileSync(injectDir + '/servers.json', JSON.stringify([{
-    pid,
-    sessionId: sid,
-    cwd: homeDir,
-    socketPath: injectDir + '/' + sid + '.sock',
-    startedAt: startedAt === undefined ? Date.now() : startedAt,
-  }]));
+/** The birth evidence a PID-reuse leftover (or a hand-written row) carries. */
+function staleStamp() {
+  if (staleStampKind === 'missing') return undefined;           // field omitted
+  if (staleStampKind === 'seconds') return Math.floor(Date.now() / 1000);
+  if (staleStampKind === 'future') return Date.now() + 3_600_000;
+  if (staleStampKind === 'raw-1') return 1;                     // e.g. an uptime
+  return Date.now() - 600_000;                                  // plausible epoch-ms
 }
-if (injectPidArg === 'stale-then-self') {
-  // PID reuse: OUR pid, but the record was published by a previous process for
-  // a previous session. The birth stamp must reject it.
-  publishRecord(process.pid, staleSessionId || 'stale-session', 1);
+function publishRecord(pid, sid, startedAt) {
+  const record = { pid, sessionId: sid, cwd: homeDir, socketPath: injectDir + '/' + sid + '.sock' };
+  if (startedAt !== undefined) record.startedAt = startedAt;
+  writeFileSync(injectDir + '/servers.json', JSON.stringify([record]));
+}
+if (injectPidArg === 'stale-then-self' || injectPidArg === 'stale-only') {
+  // PID reuse: OUR pid, but the row was published by a previous process for a
+  // previous session. The birth stamp must reject it.
+  publishRecord(process.pid, staleSessionId || 'stale-session', staleStamp());
 } else if (injectPidArg === 'rebind') {
   // A record of ours that is NOT the session the agent reports (dsh-tui
   // restarted its server / republished): binding once would filter out the real
   // event forever.
-  publishRecord(process.pid, staleSessionId || 'superseded-session');
+  publishRecord(process.pid, staleSessionId || 'superseded-session', Date.now());
 } else {
-  publishRecord(injectPidArg === 'self' ? process.pid : Number(injectPidArg), sessionId);
+  publishRecord(injectPidArg === 'self' ? process.pid : Number(injectPidArg), sessionId, Date.now());
 }
 const listeners = new Map();
 const mod = await import(pluginPath);
@@ -108,7 +112,7 @@ await mod.apply(ctx, {});
 await new Promise((resolvePromise) => setTimeout(resolvePromise, 1500));
 if (injectPidArg === 'rebind' || injectPidArg === 'stale-then-self') {
   // The real TUI record finally shows up for the same pid.
-  publishRecord(process.pid, sessionId);
+  publishRecord(process.pid, sessionId, Date.now());
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 800));
 }
 // Scripted agent/status edges, as "<agentSessionId|owner>:<status>" tokens.
@@ -126,10 +130,15 @@ appendFileSync(doneFile, 'done');
 `;
 
 interface ReadyRun {
+  /** The session id of the inject record that was visible when each ready exec
+   *  fired, one line per exec — i.e. WHICH record released the gate. */
   readyLines: string[];
   /** Raw bridge payloads the turn-idle command received, one JSON object each. */
   idlePayloads: Array<Record<string, unknown>>;
 }
+
+/** How the stale (PID-reuse) row's birth evidence is malformed. */
+type StaleStampKind = 'past' | 'missing' | 'seconds' | 'future' | 'raw-1';
 
 async function runReadyDriver(opts: {
   home: string;
@@ -137,6 +146,9 @@ async function runReadyDriver(opts: {
   botmuxSessionEnv: boolean;
   statusScript?: string;
   staleSessionId?: string;
+  /** Birth evidence carried by the stale row (default: a plausible epoch-ms
+   *  stamp from a previous process = real PID reuse). */
+  staleStampKind?: StaleStampKind;
   /** Frozen dispatch identity the worker published for the executing turn. */
   publishedTurn?: { turnId: string; dispatchAttempt?: number };
   /** Per-dispatch relay token + tuple (isolated transport), when enabled. */
@@ -182,9 +194,18 @@ async function runReadyDriver(opts: {
   }
 
   const readyCountFile = join(opts.home, 'ready-count');
+  // The ready command records WHICH inject record was visible at fire time, so
+  // "the gate was released by the stale PID-reuse row" is observable instead of
+  // being masked by the one-shot flag (exactly one line either way).
   const readyCommand = makeExecutable(
     join(opts.home, 'ready-command.mjs'),
-    `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(readyCountFile)}, 'x');\n`,
+    'import { appendFileSync, readFileSync } from "node:fs";\n'
+      + 'let fired = "none";\n'
+      + 'try {\n'
+      + `  fired = JSON.parse(readFileSync(${JSON.stringify(join(opts.home, '.dsh-tui', 'inject', 'servers.json'))}, "utf8"))\n`
+      + '    .map((record) => record.sessionId).join(",") || "none";\n'
+      + '} catch {}\n'
+      + `appendFileSync(${JSON.stringify(readyCountFile)}, fired + "\\n");\n`,
   );
   const idlePayloadFile = join(opts.home, 'idle-payloads');
   const idleCommand = makeExecutable(
@@ -227,6 +248,7 @@ async function runReadyDriver(opts: {
       'dsh-session-1',
       opts.statusScript ?? 'none',
       opts.staleSessionId ?? '',
+      opts.staleStampKind ?? 'past',
     ],
     { env, stdio: ['ignore', 'pipe', 'pipe'] },
   ) as ChildProcessWithoutNullStreams;
@@ -248,7 +270,8 @@ async function runReadyDriver(opts: {
   const idleText = existsSync(idlePayloadFile) ? readFileSync(idlePayloadFile, 'utf8') : '';
   const idlePayloads = idleText.split('\n').filter(line => line.trim().length > 0)
     .map(line => JSON.parse(line) as Record<string, unknown>);
-  return { readyLines: [...readyText], idlePayloads };
+  const readyLines = readyText.split('\n').filter(line => line.trim().length > 0);
+  return { readyLines, idlePayloads };
 }
 
 describe('dsh-tui structured readiness', () => {
@@ -263,7 +286,9 @@ describe('dsh-tui structured readiness', () => {
     const home = tmp();
     const run = await runReadyDriver({ home, injectPid: 'self', botmuxSessionEnv: true });
     // Idempotent: the driver outlives ~6 poll ticks and must still see one exec.
-    expect(run.readyLines).toEqual(['x']);
+    // The recorded value is the session id of the record visible at fire time,
+    // so this also pins WHICH record released the gate.
+    expect(run.readyLines).toEqual(['dsh-session-1']);
   }, 30_000);
 
   it('stays silent while the published inject record belongs to another process', async () => {
@@ -407,11 +432,47 @@ describe('dsh-tui structured readiness', () => {
       statusScript: 'owner:running,owner:idle',
       publishedTurn: { turnId: 'published-turn' },
     });
-    // Exactly one ready exec: the ancient record for our pid is not ours, and the
-    // real record (published afterwards) is what releases the gate.
-    expect(run.readyLines).toEqual(['x']);
+    // Exactly one ready exec — and the witness says it was released by the REAL
+    // record, not by the PID-reuse row that carries a plausible epoch-ms stamp
+    // from a previous process: nothing may be published for a TUI that has not
+    // rendered yet.
+    expect(run.readyLines).toEqual(['dsh-session-1']);
     expect(run.idlePayloads.map(payload => payload.turnId)).toEqual(['published-turn']);
   }, 30_000);
+
+  it.each(['missing', 'seconds', 'future', 'raw-1'] as const)(
+    'rejects %s birth evidence: no ready before the real record exists',
+    async (staleStampKind) => {
+      // Only the unprovable row is published: the gate must stay shut (the idle
+      // channel too — a rejected record never binds this process to a session).
+      const only = await runReadyDriver({
+        home: tmp(),
+        injectPid: 'stale-only',
+        botmuxSessionEnv: true,
+        staleSessionId: 'stale-session',
+        staleStampKind,
+        statusScript: 'owner:running,owner:idle',
+        publishedTurn: { turnId: 'published-turn' },
+      });
+      expect(only.readyLines).toEqual([]);
+      expect(only.idlePayloads).toEqual([]);
+
+      // …and once the real record for this pid is published, THAT is what fires
+      // (the earlier bad row must not have claimed the process in the meantime).
+      const then = await runReadyDriver({
+        home: tmp(),
+        injectPid: 'stale-then-self',
+        botmuxSessionEnv: true,
+        staleSessionId: 'stale-session',
+        staleStampKind,
+        statusScript: 'owner:running,owner:idle',
+        publishedTurn: { turnId: 'published-turn' },
+      });
+      expect(then.readyLines).toEqual(['dsh-session-1']);
+      expect(then.idlePayloads.map(payload => payload.turnId)).toEqual(['published-turn']);
+    },
+    60_000,
+  );
 
   it('re-binds when the real discovery record supersedes a claimed one', async () => {
     const home = tmp();
