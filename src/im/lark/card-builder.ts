@@ -1018,9 +1018,9 @@ const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
 
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean },
 ): void {
-  const { status, usageLimit, displayMode, imageKey, cliName, locale, usage } = opts;
+  const { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable } = opts;
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -1034,7 +1034,15 @@ function pushStreamBody(
     if (imageKey) {
       elements.push({ tag: 'img', img_key: imageKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true });
     } else {
-      elements.push({ tag: 'markdown', content: t('card.status.waiting_screenshot', undefined, locale) });
+      // A cached image always wins. Without one, say honestly whether a fresh
+      // frame is on its way or cannot arrive (no working capture process /
+      // no provable card target) instead of waiting forever.
+      elements.push({
+        tag: 'markdown',
+        content: t(screenshotUnavailable
+          ? 'card.status.screenshot_unavailable'
+          : 'card.status.waiting_screenshot', undefined, locale),
+      });
     }
     elements.push({ tag: 'hr' });
   }
@@ -1115,6 +1123,9 @@ export function buildStreamingCard(
    *  degrades to the status quo rather than to a broken button. */
   dshRuntime?: 'official' | 'tui',
   hiddenButtons: readonly StreamingCardButtonId[] = [],
+  /** Screenshot mode with no image: render "no screenshot available" instead
+   *  of "waiting for first screenshot". Ignored when `imageKey` is present. */
+  screenshotUnavailable = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1130,7 +1141,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable });
 
   // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
   // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer

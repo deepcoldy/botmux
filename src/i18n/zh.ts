@@ -67,6 +67,7 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 会话已搬迁',
   'card.status.selected': '已选择',
   'card.status.waiting_screenshot': '_(等待第一张截图…)_',
+  'card.status.screenshot_unavailable': '_(当前没有可用截图，请在会话恢复后刷新。)_',
   'card.status.truncated_prefix': '… (已截断)',
   'card.pending.detoured_title': '已发送',
   'card.pending.detoured_body': '最终回复已发送到其他目标。',
@@ -1712,6 +1713,7 @@ export const messages: Record<string, string> = {
   'toast.action_received_no_repeat': '操作已收到，请勿重复点击',
   'toast.action_in_progress': '操作正在处理中，请稍候',
   'toast.action_received_bg': '操作已收到，后台处理中',
+  'toast.card_update_busy_retry': '卡片正在更新，请稍后再点一次',
   'toast.not_in_approver_list': '你不在该审批人名单里，无法操作',
 
   // Quote hint (injected into the CLI prompt)

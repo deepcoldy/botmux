@@ -100,7 +100,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -109,7 +109,7 @@ import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard } from '../../core/types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard, larkTransportEnabled } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
@@ -3899,6 +3899,103 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         };
       }
 
+      // ── Shared toggle plumbing (current + historical cards) ───────────────
+      // Rendering only uses cached daemon state. Worker readiness decides
+      // whether a FRESH frame can arrive on the current card, never whether
+      // the clicked card may change or collapse.
+      const locToggle = localeForBot(ds.larkAppId);
+      const toggleBotCfg = getBot(ds.larkAppId).config;
+      if (ds.session.status === 'closed'
+        || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: toggleBotCfg.apiOnly })) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locToggle) } };
+      }
+      /** Flip + persist + tell the worker. Returns whether the worker IPC was
+       * accepted (false: no worker, closed channel, or send threw) — a fresh
+       * frame can only be promised when it was. */
+      const applyToggleMode = (mode: DisplayMode): boolean => {
+        ds.displayMode = mode;
+        persistStreamCardState(ds);
+        if (!ds.worker && !isSessionTransferring(ds)) return false;
+        try {
+          return sendWorkerSessionInput(ds, { type: 'set_display_mode', mode });
+        } catch (err) {
+          logger.warn(`[${tag(ds)}] set_display_mode IPC failed: ${err instanceof Error ? err.message : String(err)}`);
+          return false;
+        }
+      };
+      /** Undo an optimistic flip that the clicked card will not reflect, so a
+       * retry requests the same visible transition instead of toggling back. */
+      const revertToggleMode = (from: DisplayMode, to: DisplayMode): void => {
+        if (ds.displayMode === to) applyToggleMode(from);
+      };
+      const shortId = (id: string | undefined): string =>
+        id ? (id === CARD_POSTING_SENTINEL ? 'posting' : id.substring(0, 12)) : 'none';
+      const logToggle = (fields: {
+        next: DisplayMode; path: string; restored?: boolean; unavailable?: boolean;
+      }): void => {
+        const nonceState = !clickedNonce ? 'absent'
+          : !ds.streamCardNonce ? 'no-current'
+            : clickedNonce === ds.streamCardNonce ? 'match' : 'mismatch';
+        logger.info(
+          `[${tag(ds)}] Display toggle → ${fields.next} session=${ds.session.sessionId.substring(0, 8)} `
+          + `clicked=${shortId(cardMessageId)} current=${shortId(ds.streamCardId)} nonce=${nonceState} `
+          + `workerReady=${workerHasInitialized(ds)} restored=${fields.restored === true} `
+          + `unavailable=${fields.unavailable === true} path=${fields.path}`,
+        );
+      };
+      const buildToggleCard = (
+        mode: DisplayMode,
+        opts: { canReceiveFreshFrame: boolean; serviceTierBadge: string | undefined; idleLabel: ReturnType<typeof idleCardLabel> },
+      ): { cardJson: string; unavailable: boolean } => {
+        const effectiveCliId = sessionCliId(ds);
+        const readUrl = readableTerminalUrlFor(ds);
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+        // Only a frame whose capturing turn may be shown here (silent /
+        // managed / substitute sources are filtered out).
+        const imageKey = displayableStreamingCardImageKey(ds);
+        const unavailable = mode === 'screenshot' && !imageKey && !opts.canReceiveFreshFrame;
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          sessionAnchorId(ds),
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          ds.lastScreenStatus || 'working',
+          effectiveCliId,
+          mode,
+          ds.streamCardNonce,
+          imageKey,
+          isSharedAdoptSession(ds),
+          false,
+          locToggle,
+          cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
+          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+          sessionRuntimeDisplayName(ds),
+          opts.serviceTierBadge,
+          opts.idleLabel,
+          dshRuntimeForSession(ds),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          unavailable,
+        );
+        return { cardJson, unavailable };
+      };
+      /** Why the raw callback card may NOT be returned for `targetMessageId`,
+       * or undefined when it may. pendingCardId is cleared before the PATCH
+       * HTTP completes, so only the exact in-flight id can prove the callback
+       * does not race the same message; an unknown target is refused. */
+      const rawCallbackRefusal = (targetMessageId: string | undefined): { path: string; toast: { type: string; content: string } } | undefined => {
+        if (isSessionTransferring(ds)) {
+          return { path: 'refused-transfer', toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locToggle) } };
+        }
+        if (ds.cardPatchInFlight
+          && (!targetMessageId || !ds.cardPatchInFlightMessageId || ds.cardPatchInFlightMessageId === targetMessageId)) {
+          return { path: 'refused-inflight', toast: { type: 'warning', content: t('toast.card_update_busy_retry', undefined, locToggle) } };
+        }
+        return undefined;
+      };
+
       if (isFrozenClick) {
         // Historical card — toggle using cached state
         if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
@@ -3908,48 +4005,29 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // active session (e.g. a stale Worker card whose session_id/card_nonce
           // came from a now-closed session). Migrate the visible card to the
           // current root session/CLI instead of leaving stale terminal URL/chrome.
+          // This only repaints the CLICKED message: it is never written back as
+          // the current streamCardId (a stale card can carry any nonce).
           const effectiveCliId = sessionCliId(ds);
           const cur: DisplayMode = ds.displayMode ?? 'hidden';
           const next = nextMode(cur);
-          ds.displayMode = next;
-          persistStreamCardState(ds);
-          if (ds.worker || isSessionTransferring(ds)) {
-            sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
+          const refusal = rawCallbackRefusal(cardMessageId);
+          if (refusal) {
+            logToggle({ next, path: `unknown-frozen:${refusal.path}` });
+            return { toast: refusal.toast };
           }
-          if (cardMessageId && workerHasInitialized(ds)) {
-            const readUrl = readableTerminalUrlFor(ds);
-            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
-            const cardJson = buildStreamingCard(
-              ds.session.sessionId,
-              sessionAnchorId(ds),
-              readUrl,
-              turnTitle,
-              ds.lastScreenContent || '',
-              ds.lastScreenStatus || 'working',
-              effectiveCliId,
-              next,
-              ds.streamCardNonce,
-              ds.currentImageKey,
-              isSharedAdoptSession(ds),
-              false,
-              localeForBot(ds.larkAppId),
-              cardUsageLimit(ds),
-              writableTerminalLinkFor(ds),
-              isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-              getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
-              sessionRuntimeDisplayName(ds),
-              codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              idleCardLabel(ds),
-              dshRuntimeForSession(ds),
-              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
-            );
-            updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
-              logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
-            );
-            logger.info(`[${tag(ds)}] Migrated unknown frozen card to ${next} (legacy nonce=${clickedNonce})`);
-            try { return JSON.parse(cardJson); } catch { /* fall through */ }
-          }
-          logger.debug(`[${tag(ds)}] Toggle on unknown frozen card could not migrate: nonce=${clickedNonce}`);
+          applyToggleMode(next);
+          const { cardJson, unavailable } = buildToggleCard(next, {
+            // Fresh frames only ever target the current card.
+            canReceiveFreshFrame: false,
+            serviceTierBadge: codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            idleLabel: idleCardLabel(ds),
+          });
+          // Callback-only: an extra updateMessage here is an unqueued second
+          // channel to the same message — a delayed PATCH from this click
+          // could land after the next click's callback and undo it.
+          logToggle({ next, path: 'unknown-frozen:callback', unavailable });
+          logger.info(`[${tag(ds)}] Migrated unknown frozen card to ${next} (legacy nonce=${clickedNonce})`);
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
           return;
         }
         // Self-heal known historical cards by migrating the clicked card to the
@@ -3960,109 +4038,81 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // an old Claude Code screenshot.
         const cur: DisplayMode = ds.displayMode ?? frozenDisplayMode(frozen);
         const next = nextMode(cur);
-        ds.displayMode = next;
-        persistStreamCardState(ds);
-        if (ds.worker || isSessionTransferring(ds)) {
-          sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
+        const refusal = rawCallbackRefusal(frozen.messageId);
+        if (refusal) {
+          logToggle({ next, path: `frozen:${refusal.path}` });
+          return { toast: refusal.toast };
         }
+        applyToggleMode(next);
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
-        const cardJson = buildStreamingCard(
-          ds.session.sessionId,
-          sessionAnchorId(ds),
-          readUrl,
-          turnTitle,
-          ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
-          effectiveCliId,
-          next,
-          ds.streamCardNonce,
-          ds.currentImageKey,
-          isSharedAdoptSession(ds),
-          false,
-          localeForBot(ds.larkAppId),
-          cardUsageLimit(ds),
-          writableTerminalLinkFor(ds),
-          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
-          sessionRuntimeDisplayName(ds),
-          effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
-          frozenIdleLabel(frozen),
-          dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
-        );
-        updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
-          logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
-        );
+        const { cardJson, unavailable } = buildToggleCard(next, {
+          canReceiveFreshFrame: false,
+          serviceTierBadge: effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
+          idleLabel: frozenIdleLabel(frozen),
+        });
+        // Callback-only (single channel): see the unknown-frozen branch above.
         ds.frozenCards.delete(clickedNonce!);
         saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+        logToggle({ next, path: 'frozen:callback', unavailable });
         logger.info(`[${tag(ds)}] Migrated frozen card to current ${next} (legacy nonce=${clickedNonce})`);
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
         return;
       }
 
       // Current (latest) card — change displayMode + tell worker
-      const botCfg = getBot(ds.larkAppId).config;
       const effectiveCliId = sessionCliId(ds);
       const cur: DisplayMode = ds.displayMode ?? 'hidden';
       const next = nextMode(cur);
-      ds.displayMode = next;
-      persistStreamCardState(ds);
-      if (ds.worker || isSessionTransferring(ds)) {
-        sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
+      const displayModeIpcDelivered = applyToggleMode(next);
+      // A missing runtime card id may be re-bound to the clicked message ONLY
+      // with the independent publication proof (exact messageId + nonce +
+      // session/root/route + turn generation). Matching nonce alone is not
+      // proof: an old card that self-healed carries the current nonce.
+      let restored = false;
+      if (!ds.streamCardId && cardMessageId) {
+        restored = restoreStreamingCardIdentityFromProof(ds, {
+          messageId: cardMessageId,
+          clickedNonce,
+          actionSessionId: typeof value?.session_id === 'string' ? value.session_id : undefined,
+          actionRootId: typeof value?.root_id === 'string' ? value.root_id : undefined,
+        });
       }
-      if (ds.streamCardId && workerHasInitialized(ds)) {
-        const readUrl = readableTerminalUrlFor(ds);
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
-        const cardJson = buildStreamingCard(
-          ds.session.sessionId,
-          sessionAnchorId(ds),
-          readUrl,
-          turnTitle,
-          ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
-          effectiveCliId,
-          next,
-          ds.streamCardNonce,
-          ds.currentImageKey,
-          isSharedAdoptSession(ds),
-          false,
-          localeForBot(ds.larkAppId),
-          cardUsageLimit(ds),
-          writableTerminalLinkFor(ds),
-          isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-          getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
-          sessionRuntimeDisplayName(ds),
-          codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          idleCardLabel(ds),
-          dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
-        );
-        logger.info(`[${tag(ds)}] Display mode → ${next}`);
-        if (cardMessageId && cardMessageId !== ds.streamCardId) {
-          updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
-            logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
-          );
-          try { return JSON.parse(cardJson); } catch { /* fall through */ }
-        } else if (!scheduleCardPatch(ds, cardJson, undefined, { userInitiated: true })) {
-          // The queue can decline when live cards are disabled for this turn or
-          // transport/card identity is unavailable. In that case the callback
-          // must carry the rebuilt card so the clicked card still updates.
-          try { return JSON.parse(cardJson); } catch { /* fall through */ }
-          return;
-        }
+      const isCurrentTarget = Boolean(
+        ds.streamCardId
+        && ds.streamCardId !== CARD_POSTING_SENTINEL
+        && (!cardMessageId || cardMessageId === ds.streamCardId),
+      );
+      const { cardJson, unavailable } = buildToggleCard(next, {
+        canReceiveFreshFrame: isCurrentTarget && displayModeIpcDelivered && canExpectFreshStreamingScreenshot(ds),
+        serviceTierBadge: codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+        idleLabel: idleCardLabel(ds),
+      });
+      if (isCurrentTarget
+        && scheduleCardPatch(ds, cardJson, undefined, { userInitiated: true })) {
         // The queue accepted this update. Returning the same card here would
         // make Lark apply a second, synchronous update outside that queue; an
         // older in-flight PATCH could then land after it and restore stale state.
+        logToggle({ next, path: 'queue', restored, unavailable });
         return {
           toast: {
             type: 'info',
-            content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)),
+            content: t('toast.action_received_bg', undefined, locToggle),
           },
         };
       }
-      logger.info(`[${tag(ds)}] Display mode → ${next}`);
+      // The queue declined (live card disabled for this turn, no provable
+      // current card, or a historical message that shares the nonce). Carry
+      // the rebuilt card in the callback so the CLICKED card still updates —
+      // unless that would race an in-flight PATCH to the same message.
+      const rawTarget = cardMessageId ?? (isCurrentTarget ? ds.streamCardId : undefined);
+      const refusal = rawCallbackRefusal(rawTarget);
+      if (refusal) {
+        revertToggleMode(cur, next);
+        logToggle({ next, path: refusal.path, restored });
+        return { toast: refusal.toast };
+      }
+      logToggle({ next, path: 'callback', restored, unavailable });
+      try { return JSON.parse(cardJson); } catch { /* fall through */ }
       return;
     }
 

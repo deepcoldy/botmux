@@ -3152,8 +3152,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         if (currentBotmuxTurnId && currentBotmuxTurnId !== msg.turnId) {
           markTurnRetired(currentBotmuxTurnId);
         }
-        currentBotmuxTurnId = msg.turnId;
-        currentBotmuxDispatchAttempt = undefined;
+        setCaptureIdentity(msg.turnId, undefined);
         currentVcMeetingImTurnOrigin = undefined;
         if (!activeTurnAuthority.inheritOrStartControl(
           msg.turnId,
@@ -3321,6 +3320,31 @@ const inflightInputs = new InflightInputTracker();
 let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
+/** Monotonic per worker PROCESS (never reset by a CLI restart). Bumped only
+ * when the capture tuple really changes; frames carry the revision they were
+ * captured under so the daemon can match them to an exact identity. */
+let captureRevision = 0;
+let captureIdentityAnnounced = false;
+
+/** The ONLY writer of the screenshot capture identity. Called at real CLI
+ * write/activation points (IM/HTTP flush, raw input, adopt, opening argv,
+ * queued-turn promotion and PID-marker restoration) and on CLI exit/kill.
+ * Merely enqueueing type-ahead input or acknowledging it never calls it.
+ * The first call always announces a snapshot, even for (undefined, undefined). */
+function setCaptureIdentity(turnId: string | undefined, dispatchAttempt: number | undefined): void {
+  const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
+  currentBotmuxTurnId = turnId;
+  currentBotmuxDispatchAttempt = dispatchAttempt;
+  if (!changed && captureIdentityAnnounced) return;
+  if (changed && captureIdentityAnnounced) captureRevision += 1;
+  captureIdentityAnnounced = true;
+  send({
+    type: 'capture_identity',
+    revision: captureRevision,
+    ...(turnId !== undefined ? { turnId } : {}),
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+  });
+}
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
 interface QueuedTypeAheadTurnRecord {
@@ -3749,10 +3773,10 @@ function adoptInitialActiveTurn(parsed: {
   trustedController?: TrustedCaller;
   steerPromotedTurn?: boolean;
 }): void {
-  currentBotmuxTurnId = parsed.turnId;
-  currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
-    ? parsed.dispatchAttempt
-    : undefined;
+  setCaptureIdentity(
+    parsed.turnId,
+    typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+  );
   currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
@@ -3787,10 +3811,10 @@ function adoptDisplacedActiveTurn(parsed: {
   };
   const prevTurnId = currentBotmuxTurnId;
   markTurnRetired(prevTurnId);
-  currentBotmuxTurnId = parsed.turnId;
-  currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
-    ? parsed.dispatchAttempt
-    : undefined;
+  setCaptureIdentity(
+    parsed.turnId,
+    typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+  );
   currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   if (!queuedTypeAheadTurns.some(q => q.turnId === displaced.turnId)) {
     queuedTypeAheadTurns.unshift(displaced);
@@ -3849,10 +3873,10 @@ function writeCliPidMarker(): void {
                   const prevTurnId = currentBotmuxTurnId;
                   markTurnRetired(prevTurnId);
                   const advancedRecord = queuedTypeAheadTurns[idx]!;
-                  currentBotmuxTurnId = parsed.turnId;
-                  currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
-                    ? parsed.dispatchAttempt
-                    : advancedRecord.dispatchAttempt;
+                  setCaptureIdentity(
+                    parsed.turnId,
+                    typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : advancedRecord.dispatchAttempt,
+                  );
                   currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
                   currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
                   queuedTypeAheadTurns.splice(0, idx + 1);
@@ -3971,10 +3995,10 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
               const prevTurnId = currentBotmuxTurnId;
               markTurnRetired(prevTurnId);
               const advancedRecord = queuedTypeAheadTurns[idx]!;
-              currentBotmuxTurnId = parsed.turnId;
-              currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
-                ? parsed.dispatchAttempt
-                : advancedRecord.dispatchAttempt;
+              setCaptureIdentity(
+                parsed.turnId,
+                typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : advancedRecord.dispatchAttempt,
+              );
               currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
               currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
               queuedTypeAheadTurns.splice(0, idx + 1);
@@ -4023,15 +4047,14 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   const next = queuedTypeAheadTurns.shift()!;
   const prevTurnId = currentBotmuxTurnId;
   markTurnRetired(prevTurnId);
-  currentBotmuxTurnId = next.turnId;
-  currentBotmuxDispatchAttempt = next.dispatchAttempt;
+  setCaptureIdentity(next.turnId, next.dispatchAttempt);
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
   currentTurnSteerPromoted = true;
   queuedTurnAdvanceConsumedForPrompt = true;
   markActiveTurnStarted(next);
   writeCliPidMarker();
   publishSandboxRelayCapability();
-  log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
+  log(`Advanced active turn (${reason}): ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
   return true;
 }
 let lastStructuredBridgeActivityAtMs = 0;
@@ -10010,8 +10033,7 @@ async function writeAdoptMessage(
   if (currentBotmuxTurnId && currentBotmuxTurnId !== turnId) {
     markTurnRetired(currentBotmuxTurnId);
   }
-  currentBotmuxTurnId = turnId;
-  currentBotmuxDispatchAttempt = dispatchAttempt;
+  setCaptureIdentity(turnId, dispatchAttempt);
   currentVcMeetingImTurnOrigin = vcMeetingImTurnOrigin;
   markActiveTurnStarted({ turnId, dispatchAttempt, trustedCaller, trustedController });
   if (dispatchAttempt !== undefined) durableTurnInFlight = true;
@@ -10422,6 +10444,9 @@ let lastShotHash = '';
 // Throttle for the happy-path upload log in captureAndUpload (one line/min).
 let lastUploadLogAtMs = 0;
 let screenshotCaptureInFlight = false;
+// Bumped whenever the display mode is (re)applied, so a frame captured under
+// an earlier show/hide cycle cannot be delivered after a later one.
+let screenshotDisplayGeneration = 0;
 let larkAppIdForUpload = '';
 let larkAppSecretForUpload = '';
 let larkBrandForUpload: 'feishu' | 'lark' = 'feishu';
@@ -10485,22 +10510,53 @@ async function captureAndUpload(): Promise<void> {
   if (!larkAppIdForUpload || !larkAppSecretForUpload) { logScreenshotSkip('lark credentials missing'); return; }
   if (screenshotCaptureInFlight)    { logScreenshotSkip('capture/upload already in flight'); return; }
 
+  // Bind the frame's FULL identity before the first await: capture revision,
+  // turn/attempt tuple and display generation. Every later await boundary
+  // re-checks it; a frame that outlived its identity is cancelled (never
+  // uploaded once known stale, never sent) and retaken under the current one.
+  const capturedRevision = captureRevision;
+  const capturedTurnId = currentBotmuxTurnId;
+  const capturedAttempt = currentBotmuxDispatchAttempt;
+  const capturedDisplayGeneration = screenshotDisplayGeneration;
+  const frameIsStale = (): boolean => displayMode !== 'screenshot'
+    || capturedRevision !== captureRevision
+    || capturedDisplayGeneration !== screenshotDisplayGeneration
+    || capturedTurnId !== currentBotmuxTurnId
+    || capturedAttempt !== currentBotmuxDispatchAttempt;
+  // Dedup is bound to the full identity: the same pixels under a new capture
+  // identity or display cycle are a NEW first frame, never a duplicate.
+  const dedupKey = (pixelHash: string): string =>
+    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}`;
+  let recaptureAfterStaleFrame = false;
+  let ownedKey: string | null = null;
+  let previousShotHash = lastShotHash;
+  /** Roll back only the dedup key THIS capture committed; a newer reset or a
+   * newer identity's key is never overwritten. */
+  const releaseOwnedKey = (): void => {
+    if (ownedKey !== null && lastShotHash === ownedKey) lastShotHash = previousShotHash;
+  };
+  const cancelStale = (where: string): void => {
+    releaseOwnedKey();
+    logScreenshotSkip(`stale frame (identity/display changed during ${where})`);
+    recaptureAfterStaleFrame = true;
+  };
   screenshotCaptureInFlight = true;
   try {
     let png: Buffer;
     let usageLimitContent = '';
-    const previousShotHash = lastShotHash;
-    let attemptedShotHash: string | null = null;
     try {
       // Preferred path: pipe-pane backends ask tmux for a fresh viewport
       // snapshot and render it through a transient xterm-headless. This
       // avoids the accumulated-buffer drift that produced duplicated /
       // staircase content under the legacy long-lived renderer.
       const pipeResult = await snapshotToPng(backend, renderCols, renderRows);
+      if (frameIsStale()) { cancelStale('snapshot'); return; }
       if (pipeResult) {
-        if (pipeResult.ansi === lastShotHash) return;
-        attemptedShotHash = pipeResult.ansi;
-        lastShotHash = attemptedShotHash;
+        const key = dedupKey(pipeResult.ansi);
+        if (key === lastShotHash) return;
+        previousShotHash = lastShotHash;
+        ownedKey = key;
+        lastShotHash = key;
         png = pipeResult.png;
         usageLimitContent = pipeResult.content;
       } else {
@@ -10510,16 +10566,19 @@ async function captureAndUpload(): Promise<void> {
         const term = renderer.xterm;
         const startY = term.buffer.active.baseY;
         const snap = renderer.rawSnapshot();
-        const hash = createHash('md5').update(snap).digest('hex');
-        if (hash === lastShotHash) return;
-        attemptedShotHash = hash;
-        lastShotHash = attemptedShotHash;
+        const key = dedupKey(createHash('md5').update(snap).digest('hex'));
+        if (key === lastShotHash) return;
+        previousShotHash = lastShotHash;
+        ownedKey = key;
+        lastShotHash = key;
         usageLimitContent = snap;
         const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
         const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
         png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
+        if (frameIsStale()) { cancelStale('render'); return; }
       }
     } catch (err: any) {
+      releaseOwnedKey();
       logError(`Screenshot render failed: ${err?.message ?? err}`);
       return;
     }
@@ -10528,15 +10587,15 @@ async function captureAndUpload(): Promise<void> {
     try {
       imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png, larkBrandForUpload);
     } catch (err: any) {
-      // Do not clobber a newer reset (display-mode change/manual refresh) that
-      // happened while the request was pending. Otherwise restore the prior
-      // hash so the next regular tick retries this unchanged frame.
-      if (attemptedShotHash !== null && lastShotHash === attemptedShotHash) {
-        lastShotHash = previousShotHash;
-      }
+      // Restore only our own key so the next regular tick retries this
+      // unchanged frame; a newer reset/identity stands.
+      releaseOwnedKey();
       logError(`Screenshot upload failed: ${err?.message ?? err}`);
+      if (frameIsStale()) recaptureAfterStaleFrame = true;
       return;
     }
+
+    if (frameIsStale()) { cancelStale('upload'); return; }
 
     const status = projectedRuntimeScreenStatus();
     // Success is otherwise completely silent (skips and failures log above), which
@@ -10551,16 +10610,24 @@ async function captureAndUpload(): Promise<void> {
       type: 'screenshot_uploaded',
       imageKey,
       ...classifyScreenUsageLimit(usageLimitContent, status),
-      turnId: currentBotmuxTurnId,
-      dispatchAttempt: currentBotmuxDispatchAttempt,
+      turnId: capturedTurnId,
+      dispatchAttempt: capturedAttempt,
+      captureRevision: capturedRevision,
     });
   } finally {
     screenshotCaptureInFlight = false;
+    // A capture requested meanwhile (e.g. the immediate frame for a new
+    // identity) was skipped by the single-flight guard; take it now. Never
+    // while output is hidden.
+    if (recaptureAfterStaleFrame && displayMode === 'screenshot') {
+      setTimeout(() => { void captureAndUpload(); }, 0);
+    }
   }
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
   displayMode = mode;
+  screenshotDisplayGeneration += 1;
   lastShotHash = '';
   if (mode === 'screenshot') startScreenshotLoop();
   else stopScreenshotLoop();
@@ -13887,8 +13954,7 @@ async function flushPending(): Promise<void> {
           if (currentBotmuxTurnId && currentBotmuxTurnId !== item.turnId) {
             markTurnRetired(currentBotmuxTurnId);
           }
-          currentBotmuxTurnId = item.turnId;
-          currentBotmuxDispatchAttempt = item.dispatchAttempt;
+          setCaptureIdentity(item.turnId, item.dispatchAttempt);
           currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
           currentTurnSteerPromoted = false;
           // Intentionally preserve queuedTypeAheadTurns: earlier type-ahead turns remain in queue.
@@ -20013,8 +20079,7 @@ async function spawnCli(
     }
     backend = null;
     isPromptReady = false;
-    currentBotmuxTurnId = undefined;
-    currentBotmuxDispatchAttempt = undefined;
+    setCaptureIdentity(undefined, undefined);
     queuedTypeAheadTurns = [];
     queuedTurnAdvanceConsumedForPrompt = false;
     retiredTurnIds.clear();
@@ -20332,8 +20397,7 @@ function killCli(opts: {
   sandboxRelayOutbox = null;
   readIsolationOriginCapabilityFile = null;
   readIsolationOriginChannelId = null;
-  currentBotmuxTurnId = undefined;
-  currentBotmuxDispatchAttempt = undefined;
+  setCaptureIdentity(undefined, undefined);
   queuedTypeAheadTurns = [];
   queuedTurnAdvanceConsumedForPrompt = false;
   retiredTurnIds.clear();
@@ -22999,9 +23063,10 @@ process.on('message', async (raw: unknown) => {
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
 
       try {
+        // Initial capture-identity snapshot (sent even for an idle/restored
+        // (undefined, undefined) tuple) before any frame can be captured.
+        setCaptureIdentity(msg.turnId, msg.turnId ? msg.dispatchAttempt : undefined);
         if (msg.turnId) {
-          currentBotmuxTurnId = msg.turnId;
-          currentBotmuxDispatchAttempt = msg.dispatchAttempt;
           currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
           if (msg.prompt) {
             reserveActiveTurn({
