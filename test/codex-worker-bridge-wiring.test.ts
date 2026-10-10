@@ -11,6 +11,20 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 // parent+sibling sid IS — is exercised against real subprocesses in
 // codex-coco-pid-discovery.smoke.test.ts (findCodexRolloutSetByPid).
 describe('Codex worker structured-bridge wiring', () => {
+  it('follows same-session generations from both the ticker and session notifications', () => {
+    const timer = workerSource.slice(workerSource.indexOf('function codexBridgeStartTimer'), workerSource.indexOf('function hermesBridgeAttach'));
+    expect(timer).toContain('maybeFollowCodexRolloutRotation();');
+    const notify = workerSource.slice(workerSource.indexOf('function codexBridgeNotifyCliSessionId'));
+    expect(notify).toContain('maybeFollowCodexRolloutRotation(true);');
+    const start = workerSource.indexOf('function maybeFollowCodexRolloutRotation');
+    const rotation = workerSource.slice(start, workerSource.indexOf('\nfunction codexBridgeIngest', start));
+    expect(rotation).toContain('rpcTranscriptIngestBlockedByAwaitingActivation');
+    expect(rotation).toContain('codexSessionIdFromRolloutPath(next)?.toLowerCase() !== sid.toLowerCase()');
+    expect(rotation).not.toContain('codexHistorySidOwnedByCurrentPid(');
+    expect(rotation).toContain('codexBridgeQueue.absorb(codexConsumedRolloutEvents(');
+    expect(rotation).toContain("codexBridgeAttach(next, 'fresh-empty')");
+    expect(workerSource).toContain('result.events = codexEventsWithStableIds(path, result.events);');
+  });
   it('reattaches an incorrectly discovered rollout after writeInput verifies the session id', () => {
     const start = workerSource.indexOf('function codexBridgeNotifyCliSessionId');
     const end = workerSource.indexOf('// Already attached — first-attach-wins for most CLIs.', start);

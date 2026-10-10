@@ -104,7 +104,9 @@ beforeAll(async () => {
   // env-independent). `customhome` deliberately omits `.codex`.
   const customHomeDir = join(dir, 'customhome', 'sessions', '2026', '05', '15');
   mkdirSync(customHomeDir, { recursive: true });
-  customHomeRollout = join(customHomeDir, `rollout-2026-05-15T07-04-41-${CUSTOM_HOME_SID}.jsonl`);
+  // Resumed Codex files add a generation UUID; PID discovery must still return
+  // the original native session id, including under a custom CODEX_HOME.
+  customHomeRollout = join(customHomeDir, `rollout-2026-05-15T07-04-41-${CUSTOM_HOME_SID}_bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb.jsonl`);
   writeFileSync(customHomeRollout, '');
   customHomeChild = spawn(
     process.execPath,

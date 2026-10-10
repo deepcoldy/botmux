@@ -248,6 +248,7 @@ import {
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult, type CodexDrainState } from './services/codex-transcript.js';
+import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
@@ -7432,6 +7433,7 @@ function structuredBridgeIngestPath(
   if (structuredBridgeIsCodex()) {
     const result = drainCodexRollout(path, offset, codexBridgeDrainState);
     codexBridgeDrainState = result.state;
+    result.events = codexEventsWithStableIds(path, result.events);
     return result;
   }
   // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
@@ -7613,6 +7615,7 @@ function codexBridgeStartTimer(): void {
       maybeFollowTraexSessionRotationViaPid();
       maybeFollowOmpTranscriptRotation();
       maybeFollowEbsdTranscriptRotation();
+      maybeFollowCodexRolloutRotation();
       if (!codexBridgeRolloutPath) {
         // Late-attach: cliSessionId (writeInput / daemon probe) then adopt
         // pid. Path lookup is centralized in resolveFileBridgePath so
@@ -8256,7 +8259,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // terminal is appended to the old path and lost.
     if (structuredBridgeIsCodex()) {
       const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
-      if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) return;
+      if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) {
+        maybeFollowCodexRolloutRotation(true);
+        return;
+      }
       // Ownership gate: only re-attach to a session id THIS pid actually holds
       // open (admits the real parent+sibling multi-rollout case, rejects a
       // foreign id from another pane's identical-text history line). Fail
@@ -8565,6 +8571,32 @@ function maybeFollowEbsdTranscriptRotation(): void {
   log(`ebsd transcript rotated: ${codexBridgeRolloutPath} → ${next}`);
   ebsdRetiredTranscriptPaths.add(retired);
   codexBridgeDetachFile();
+  codexBridgeAttach(next, 'fresh-empty');
+}
+
+/** Follow a new file for the already-bound native session, including local
+ * resume/App-Server rotations that produce no writeInput notification. */
+let codexRolloutLastCheckedAtMs = 0;
+function maybeFollowCodexRolloutRotation(fresh = false): void {
+  if (!structuredBridgeIsCodex() || !codexBridgeRolloutPath) return;
+  if (rpcTranscriptIngestBlockedByAwaitingActivation(rpcTurnsAwaitingActivation.keys())) return;
+  const now = Date.now();
+  if (!fresh && now - codexRolloutLastCheckedAtMs < 5_000) return;
+  codexRolloutLastCheckedAtMs = now;
+  const sid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  if (!sid) return;
+  const next = resolveFileBridgePath('codex', { sessionId: sid });
+  if (!next || next === codexBridgeRolloutPath) return;
+  // Reuse only the already-bound sid. Its initial/different-session ownership
+  // gates still apply; a shared App-Server may hold the new fd instead of the
+  // observed frontend, so do not demand a new frontend fd for this same sid.
+  if (codexSessionIdFromRolloutPath(next)?.toLowerCase() !== sid.toLowerCase()) return;
+  codexBridgeIngest();
+  codexBridgeQueue.absorb(codexConsumedRolloutEvents(codexBridgeRolloutPath, codexBridgeOffset));
+  log(`Codex rollout rotated for ${sid}: ${codexBridgeRolloutPath} → ${next}`);
+  codexBridgeDetachFile();
+  // Keep collecting/pending turns and ingest the new generation from zero:
+  // stable event ids suppress copied history without discarding a live final.
   codexBridgeAttach(next, 'fresh-empty');
 }
 
