@@ -386,8 +386,9 @@ const BOTMUX_TURN_IDLE_PROTOCOL = ${TURN_IDLE_PROTOCOL_VERSION};
 const BOTMUX_RELAY_CAPABILITY_FILE = ${jsonLiteral(RELAY_ORIGIN_CAPABILITY_BASENAME)};
 const BOTMUX_READY_POLL_MS = 250;
 const BOTMUX_STATUS_SIGNAL_TIMEOUT_MS = 15_000;
-// Bounded: the worker's own ready-gate fallback is 45s, so polling much past
-// that only keeps a timer alive for a signal nobody is waiting for anymore.
+// Bounded: this adapter's ready-gate fallback is aligned with its own first-prompt
+// hard cap (90s, see resolveReadySignalTimeoutMs), so polling much past that only
+// keeps a timer alive for a signal nobody is waiting for anymore.
 const BOTMUX_READY_POLL_LIMIT_MS = 120_000;
 // Our own process start as an epoch-ms instant. A discovery record published by
 // a PREVIOUS process that owned this same pid is not ours to claim: binding to
@@ -395,21 +396,42 @@ const BOTMUX_READY_POLL_LIMIT_MS = 120_000;
 // id would filter out every real agent/status event below.
 const BOTMUX_PROCESS_STARTED_AT_MS = Date.now() - Math.round(process.uptime() * 1000);
 const BOTMUX_PID_REUSE_TOLERANCE_MS = 1_000;
-// Birth-stamp plausibility bounds (see botmuxRecordIsOurs). Epoch-ms floor:
+// Birth-stamp plausibility bounds (see botmuxRecordRejection). Epoch-ms floor:
 // 2001-09-09, below which the value is a seconds stamp or a raw counter. Future
 // allowance: clock skew only — a record claiming to be born a minute or more
 // after this process started is not ours to claim either.
 const BOTMUX_BIRTH_STAMP_MIN_MS = 1_000_000_000_000;
 const BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS = 60_000;
+// Diagnostic trail for the fail-closed decisions below. Rejections are silent by
+// design (never disturb the TUI, never exec anything), which makes a genuine
+// mis-kill — the feature quietly degrading to the 90s hard cap — impossible to
+// tell apart from "the TUI has not published its record yet". One JSONL line per
+// distinct rejected record in the session's own data dir; the TUI's stdout is the
+// screen, so stderr/console is deliberately NOT used.
+const BOTMUX_SIGNAL_LOG_FILE = 'dsh-tui-ready-signal.log';
+const BOTMUX_SIGNAL_LOG_MAX_KEYS = 32;
 
 let botmuxReadySignalled = false;
 let botmuxReadyPollTimer;
 let botmuxInjectSessionId;
 let botmuxIdleSeq = 0;
+const botmuxLoggedSignalEvents = new Set();
 
 function botmuxStatusCommand(envKey) {
   const raw = process.env[envKey];
   return typeof raw === 'string' && raw.trim() ? raw.trim() : '';
+}
+
+/** Best-effort JSONL diagnostics; never throws, never writes twice per key. */
+function botmuxLogSignalEvent(event, fields) {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir) return;
+  const key = event + ':' + (fields?.sessionId ?? '') + ':' + String(fields?.startedAt ?? fields?.reason ?? '');
+  if (botmuxLoggedSignalEvents.has(key) || botmuxLoggedSignalEvents.size >= BOTMUX_SIGNAL_LOG_MAX_KEYS) return;
+  botmuxLoggedSignalEvents.add(key);
+  try {
+    appendFileSync(join(dataDir, BOTMUX_SIGNAL_LOG_FILE), JSON.stringify({ at: Date.now(), event, ...fields }) + '\\n', { mode: 0o600 });
+  } catch { /* diagnostics must never break the TUI boot */ }
 }
 
 /** FAIL-CLOSED birth check on a record's start instant.
@@ -426,26 +448,44 @@ function botmuxStatusCommand(envKey) {
  *  frame (verified against live ~/.dsh-tui/inject/servers.json), so a genuine
  *  record always carries it. "never early" wins over "always signal": a lost
  *  readiness edge degrades to the adapter's readyPattern / 90s hard cap, while
- *  an early one writes into a TUI that cannot accept input. */
-function botmuxRecordIsOurs(entry) {
+ *  an early one writes into a TUI that cannot accept input.
+ *
+ *  Returns the rejection REASON (or undefined when the record is ours) so the
+ *  caller can leave a diagnostic trail — the decision is deliberately silent,
+ *  and a mis-kill must be distinguishable from "no record yet". */
+function botmuxRecordRejection(entry) {
   const stamp = entry.startedAt;
-  if (typeof stamp !== 'number' || !Number.isFinite(stamp)) return false;
-  if (stamp < BOTMUX_BIRTH_STAMP_MIN_MS) return false;
-  if (stamp > Date.now() + BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS) return false;
-  return stamp >= BOTMUX_PROCESS_STARTED_AT_MS - BOTMUX_PID_REUSE_TOLERANCE_MS;
+  if (typeof stamp !== 'number' || !Number.isFinite(stamp)) return 'missing-or-invalid-startedAt';
+  if (stamp < BOTMUX_BIRTH_STAMP_MIN_MS) return 'startedAt-not-epoch-ms';
+  if (stamp > Date.now() + BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS) return 'startedAt-in-the-future';
+  if (stamp < BOTMUX_PROCESS_STARTED_AT_MS - BOTMUX_PID_REUSE_TOLERANCE_MS) return 'startedAt-before-this-process';
+  return undefined;
 }
 
 /** The TUI process's own inject-channel record, or undefined while it has not
  *  published one yet (i.e. before its first frame). Records for our pid that
  *  fail the birth check above (PID-reuse leftovers, malformed stamps) are
- *  dropped; when several of ours exist (dsh-tui republishes on restart) the
- *  newest wins. */
+ *  dropped — and logged once each; when several of ours exist (dsh-tui
+ *  republishes on restart) the newest wins. */
 function readBotmuxInjectRecord() {
   try {
     const parsed = JSON.parse(readFileSync(join(homedir(), '.dsh-tui', 'inject', 'servers.json'), 'utf8'));
     if (!Array.isArray(parsed)) return undefined;
-    const mine = parsed.filter((entry) => entry && entry.pid === process.pid
-      && typeof entry.sessionId === 'string' && botmuxRecordIsOurs(entry));
+    const mine = [];
+    for (const entry of parsed) {
+      if (!entry || entry.pid !== process.pid || typeof entry.sessionId !== 'string') continue;
+      const rejection = botmuxRecordRejection(entry);
+      if (rejection) {
+        botmuxLogSignalEvent('inject-record-rejected', {
+          reason: rejection,
+          pid: entry.pid,
+          sessionId: entry.sessionId,
+          startedAt: typeof entry.startedAt === 'number' ? entry.startedAt : null,
+        });
+        continue;
+      }
+      mine.push(entry);
+    }
     let best;
     for (const entry of mine) {
       const stamp = typeof entry.startedAt === 'number' ? entry.startedAt : -Infinity;
@@ -499,6 +539,10 @@ function publishBotmuxReady() {
   if (botmuxReadySignalled) return;
   botmuxReadySignalled = true;
   stopBotmuxReadyPoll();
+  // Diagnostic counterpart to the rejection trail above: proves the channel DID
+  // fire (and which record it bound to), so "no signal" can be told apart from
+  // "mis-killed record".
+  botmuxLogSignalEvent('ready-published', { sessionId: botmuxInjectSessionId, pid: process.pid });
   const command = botmuxStatusCommand('BOTMUX_READY_COMMAND');
   if (command) spawnBotmuxStatusCommand(command, {});
 }
@@ -631,7 +675,7 @@ function installBotmuxStatusChannel(ctx) {
 function buildDshTuiWrapperPlugin(parts: HookCommandParts, originalDshTuiUrl: string): string {
   return `// botmux generated dsh-tui question wrapper v${BRIDGE_VERSION}
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import * as original from ${jsonLiteral(originalDshTuiUrl)};

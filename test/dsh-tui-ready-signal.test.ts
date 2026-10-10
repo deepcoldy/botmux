@@ -135,7 +135,24 @@ interface ReadyRun {
   readyLines: string[];
   /** Raw bridge payloads the turn-idle command received, one JSON object each. */
   idlePayloads: Array<Record<string, unknown>>;
+  /** The plugin's own JSONL diagnostic trail (`dsh-tui-ready-signal.log`): every
+   *  fail-closed rejection and every published ready signal. */
+  signalEvents: Array<Record<string, unknown>>;
 }
+
+/** Build salt must differ per run: the patch generator caches by content. */
+function runSalt(opts: { injectPid: string; botmuxSessionEnv: boolean; statusScript?: string; staleStampKind?: StaleStampKind }): string {
+  return `ready-${opts.injectPid}-${opts.botmuxSessionEnv}-${opts.statusScript ?? 'none'}-${opts.staleStampKind ?? 'past'}`;
+}
+
+/** Why each malformed stamp must be rejected (the plugin's own reason strings). */
+const REJECTION_REASON: Record<StaleStampKind, string> = {
+  past: 'startedAt-before-this-process',
+  missing: 'missing-or-invalid-startedAt',
+  seconds: 'startedAt-not-epoch-ms',
+  future: 'startedAt-in-the-future',
+  'raw-1': 'startedAt-not-epoch-ms',
+};
 
 /** How the stale (PID-reuse) row's birth evidence is malformed. */
 type StaleStampKind = 'past' | 'missing' | 'seconds' | 'future' | 'raw-1';
@@ -160,7 +177,7 @@ async function runReadyDriver(opts: {
     homeDir: opts.home,
     dshTuiProfileDir: profile,
     hookCommand: { cmd: '/bin/true', args: [] },
-    buildSalt: `ready-${opts.injectPid}-${opts.botmuxSessionEnv}-${opts.statusScript ?? 'none'}`,
+    buildSalt: runSalt(opts),
   });
   expect(patch).not.toBeNull();
 
@@ -271,7 +288,13 @@ async function runReadyDriver(opts: {
   const idlePayloads = idleText.split('\n').filter(line => line.trim().length > 0)
     .map(line => JSON.parse(line) as Record<string, unknown>);
   const readyLines = readyText.split('\n').filter(line => line.trim().length > 0);
-  return { readyLines, idlePayloads };
+  // The plugin's diagnostic trail: only created when something was logged.
+  const signalLog = join(dataDir, 'dsh-tui-ready-signal.log');
+  const signalEvents = existsSync(signalLog)
+    ? readFileSync(signalLog, 'utf8').split('\n').filter(line => line.trim().length > 0)
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+    : [];
+  return { readyLines, idlePayloads, signalEvents };
 }
 
 describe('dsh-tui structured readiness', () => {
@@ -289,6 +312,11 @@ describe('dsh-tui structured readiness', () => {
     // The recorded value is the session id of the record visible at fire time,
     // so this also pins WHICH record released the gate.
     expect(run.readyLines).toEqual(['dsh-session-1']);
+    // The diagnostic trail proves the signal fired and nothing was rejected —
+    // a rejection here would be a mis-kill of a genuine record.
+    expect(run.signalEvents).toEqual([
+      expect.objectContaining({ event: 'ready-published', sessionId: 'dsh-session-1' }),
+    ]);
   }, 30_000);
 
   it('stays silent while the published inject record belongs to another process', async () => {
@@ -438,6 +466,21 @@ describe('dsh-tui structured readiness', () => {
     // rendered yet.
     expect(run.readyLines).toEqual(['dsh-session-1']);
     expect(run.idlePayloads.map(payload => payload.turnId)).toEqual(['published-turn']);
+    // …and the rejection is diagnosable: one JSONL line naming the reason, the
+    // pid, the stale session and the stamp that failed the birth check. Without
+    // it a mis-kill would be indistinguishable from "no record yet" (the feature
+    // just quietly degrades to the 90s cap).
+    expect(run.signalEvents).toEqual([
+      {
+        at: expect.any(Number),
+        event: 'inject-record-rejected',
+        reason: REJECTION_REASON.past,
+        pid: expect.any(Number),
+        sessionId: 'previous-process-session',
+        startedAt: expect.any(Number),
+      },
+      expect.objectContaining({ event: 'ready-published', sessionId: 'dsh-session-1' }),
+    ]);
   }, 30_000);
 
   it.each(['missing', 'seconds', 'future', 'raw-1'] as const)(
@@ -456,6 +499,15 @@ describe('dsh-tui structured readiness', () => {
       });
       expect(only.readyLines).toEqual([]);
       expect(only.idlePayloads).toEqual([]);
+      // The rejection is logged with its own reason (bounded to one line per
+      // distinct record, so the 250ms poll cannot spam the file).
+      expect(only.signalEvents).toEqual([
+        expect.objectContaining({
+          event: 'inject-record-rejected',
+          reason: REJECTION_REASON[staleStampKind],
+          sessionId: 'stale-session',
+        }),
+      ]);
 
       // …and once the real record for this pid is published, THAT is what fires
       // (the earlier bad row must not have claimed the process in the meantime).
@@ -470,6 +522,8 @@ describe('dsh-tui structured readiness', () => {
       });
       expect(then.readyLines).toEqual(['dsh-session-1']);
       expect(then.idlePayloads.map(payload => payload.turnId)).toEqual(['published-turn']);
+      expect(then.signalEvents.map(entry => entry.event)).toEqual(['inject-record-rejected', 'ready-published']);
+      expect(then.signalEvents[0]).toMatchObject({ reason: REJECTION_REASON[staleStampKind] });
     },
     60_000,
   );
