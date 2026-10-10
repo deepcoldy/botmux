@@ -21,7 +21,7 @@ describe('bytedcli provider process boundary', () => {
     mkdirSync(tools);
     const real = join(tools, 'bytedcli');
     writeFileSync(real, `#!/bin/sh
-if [ -n "$BOTMUX_IDENTITY_BIN$BOTMUX_SESSION_ID$BYTEDCLI_USER_CLOUD_JWT$AIME_USER_CLOUD_JWT$BYTEDCLI_PROFILE$BYTECLOUD_AUTH_ACCESS_KEY_ID$AIME_WORKSPACE_PATH$AIME_CURRENT_USER" ]; then
+if [ -n "$BOTMUX_IDENTITY_BIN$BOTMUX_SESSION_ID$BYTEDCLI_USER_CLOUD_JWT$AIME_USER_CLOUD_JWT$BYTEDCLI_PROFILE$BYTECLOUD_AUTH_ACCESS_KEY_ID$BYTECLOUD_AUTH_ACCESS_KEY_ID_I18N_TT$BYTECLOUD_CLI_API_JWT_TOKEN$BYTECLOUD_CLI_API_JWT_TOKEN_CN$BYTECLOUD_CLI_JWT_TOKEN$AIPAAS_BYTECLAW$AIME_WORKSPACE_PATH$AIME_CURRENT_USER" ]; then
   exit 77
 fi
 [ "$BYTECLOUD_AUTH_AS" = user ] || exit 78
@@ -49,6 +49,11 @@ esac
     vi.stubEnv('AIME_WORKSPACE_PATH', root);
     vi.stubEnv('AIME_CURRENT_USER', 'unrelated-user');
     vi.stubEnv('BYTECLOUD_AUTH_ACCESS_KEY_ID', 'unrelated-app');
+    vi.stubEnv('BYTECLOUD_AUTH_ACCESS_KEY_ID_I18N_TT', 'unrelated-regional-app');
+    vi.stubEnv('BYTECLOUD_CLI_API_JWT_TOKEN', 'unrelated-global-jwt');
+    vi.stubEnv('BYTECLOUD_CLI_API_JWT_TOKEN_CN', 'unrelated-cn-jwt');
+    vi.stubEnv('BYTECLOUD_CLI_JWT_TOKEN', 'unrelated-legacy-jwt');
+    vi.stubEnv('AIPAAS_BYTECLAW', '1');
     expect(findRealToolBinary('bytedcli', process.env.PATH)).toBe(real);
     vi.resetModules();
     const provider = await import('../src/services/bytedcli-auth.js');
@@ -69,6 +74,10 @@ esac
       GIT_ASKPASS: '/custom/cli-identity/old.bin/botmux-git-askpass',
       GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: 'old-helper',
       SESSION_DATA_DIR: '/custom', HTTPS_PROXY: 'https://proxy.example.test',
+      BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP: 'stale-user',
+      BYTECLOUD_AUTH_SECRET_ACCESS_KEY_EU_TTP: 'stale-app',
+      BYTECLOUD_AUTH_AS: 'app',
+      AIPAAS_BYTECLAW: '1',
     };
     scrubSessionTurnMarkerEnv(env);
     expect(env).toEqual({ PATH: '/usr/bin', SESSION_DATA_DIR: '/custom', HTTPS_PROXY: 'https://proxy.example.test' });

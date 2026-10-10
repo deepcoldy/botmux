@@ -591,6 +591,37 @@ export function isCliIdentityPath(value: string | undefined): boolean {
   return !!value && /(?:^|[\\/])cli-identity[\\/][^\\/]+\.bin(?:[\\/]|$)/.test(value);
 }
 
+/**
+ * ByteCloud credential environment variables understood by bytedcli and the
+ * shared ByteCloud Auth SDK (used by larkdev).
+ *
+ * The SDK deliberately gives these variables precedence over its on-disk
+ * login.  Consequently a private HOME / LARKDEV_AUTH_DIR is not an isolation
+ * boundary while one of them is inherited from the daemon, an enclosing agent
+ * session, or a previous botmux turn.  Keep the predicate in one place so the
+ * provider subprocesses and the session wrappers cannot drift.
+ */
+export function isByteCloudCredentialEnvKey(key: string): boolean {
+  return key === 'AIPAAS_BYTECLAW'
+    || key === 'AIME_USER_CLOUD_JWT'
+    || key === 'AIME_USER_CODE_JWT'
+    || key === 'BYTECLOUD_CLI_JWT_TOKEN'
+    || key === 'BYTECLOUD_AUTH_AS'
+    || /^BYTECLOUD_CLI_API_JWT_TOKEN(?:_[A-Z0-9_]+)?$/.test(key)
+    || /^BYTECLOUD_AUTH_ACCESS_KEY_ID(?:_[A-Z0-9_]+)?$/.test(key)
+    || /^BYTECLOUD_AUTH_SECRET_ACCESS_KEY(?:_[A-Z0-9_]+)?$/.test(key)
+    // Older SDK call sites use the same AK/SK names without the AUTH segment.
+    || /^BYTECLOUD_ACCESS_KEY_ID(?:_[A-Z0-9_]+)?$/.test(key)
+    || /^BYTECLOUD_SECRET_ACCESS_KEY(?:_[A-Z0-9_]+)?$/.test(key);
+}
+
+/** Delete every inherited ByteCloud user/app identity from `env` in place. */
+export function scrubByteCloudCredentialEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of Object.keys(env)) {
+    if (isByteCloudCredentialEnvKey(key)) delete env[key];
+  }
+}
+
 export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
   const bin = env.BOTMUX_IDENTITY_BIN?.replace(/[\\/]+$/, '');
   const managed = (value: string | undefined): boolean => !!value && (
@@ -614,9 +645,9 @@ export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
   }
   for (const key of [
     'BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT', 'BYTEDCLI_USER_CB_OAUTH_AT',
-    'AIME_USER_CLOUD_JWT', 'AIME_USER_CODE_JWT',
     'LARKSUITE_CLI_USER_ACCESS_TOKEN',
   ]) delete env[key];
+  scrubByteCloudCredentialEnv(env);
 }
 
 /** Proxy env vars that must reach the CLI child process so it can dial the

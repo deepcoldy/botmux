@@ -19,17 +19,16 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const tokens = new Map<string, string>();
 vi.mock('../src/utils/user-token.js', () => ({
-  resolveUserToken: vi.fn(async (appId: string, _secret: string, _brand: string, openId?: string) =>
-    tokens.get(`${appId}|${openId ?? ''}`) ?? null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
 }));
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
+const larkdevJwts = new Map<string, Record<string, string>>();
 vi.mock('../src/services/bytedcli-auth.js', () => ({
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
+  mintLarkdevByteCloudJwts: vi.fn(async (openId: string) => larkdevJwts.get(openId) ?? null),
   beginBytedcliLogin: vi.fn(async () => ({
     authUrl: 'https://cloud.example.com/auth?state=auto',
     completeToken: 'tok-auto',
@@ -41,15 +40,24 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
 const larkHomes = new Map<string, string>();
 const pendingChallenges = new Set<string>();
 const resolveLarkCliHomeForTurn = vi.fn(async (openId: string) => larkHomes.get(openId) ?? null);
+const materializeLarkCliHomeForSession = vi.fn(
+  async (openId: string, _sessionDataDir: string, _sessionId: string) =>
+    resolveLarkCliHomeForTurn(openId),
+);
 vi.mock('../src/services/lark-cli-auth.js', () => ({
   resolveLarkCliHomeForTurn: (openId: string) => resolveLarkCliHomeForTurn(openId),
+  materializeLarkCliHomeForSession: (openId: string, sessionDataDir: string, sessionId: string) =>
+    materializeLarkCliHomeForSession(openId, sessionDataDir, sessionId),
   pendingLarkCliChallenge: vi.fn((openId: string) => pendingChallenges.has(openId) ? { deviceCode: 'dc' } : null),
-  beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
+  beginLarkCliLogin: vi.fn(async () => ({
+    authUrl: 'https://example.com/lark-device', stage: 'user-login' as const,
+  })),
 }));
 
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
 const { sessionIdentityPath, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -59,11 +67,12 @@ const SESSION = 'sess-1';
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-'));
-  tokens.clear();
   bytedcliJwts.clear();
+  larkdevJwts.clear();
   larkHomes.clear();
   pendingChallenges.clear();
   resolveLarkCliHomeForTurn.mockClear();
+  materializeLarkCliHomeForSession.mockClear();
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -99,6 +108,30 @@ describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', ()
     expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
   });
 
+  it('uses the session-frozen sandbox mode when selecting the executable HOME', async () => {
+    larkHomes.set(ALICE, '/homes/alice');
+    await publishTurnCliIdentity({
+      botConfig: { ...botConfig(), sandbox: false },
+      sessionSandbox: 'oncall',
+      sessionDataDir: dir,
+      sessionId: SESSION,
+      senderOpenId: ALICE,
+    });
+    expect(materializeLarkCliHomeForSession).toHaveBeenCalledWith(ALICE, dir, SESSION);
+
+    materializeLarkCliHomeForSession.mockClear();
+    resolveLarkCliHomeForTurn.mockClear();
+    await publishTurnCliIdentity({
+      botConfig: { ...botConfig(), sandbox: 'oncall' },
+      sessionSandbox: 'off',
+      sessionDataDir: dir,
+      sessionId: SESSION,
+      senderOpenId: ALICE,
+    });
+    expect(materializeLarkCliHomeForSession).not.toHaveBeenCalled();
+    expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(ALICE);
+  });
+
   // F-A end to end at the decision layer: refusal while the link is pending,
   // then the very next turn — after the person tapped — the resolver's poll
   // lands the HOME and the identical retry runs as that person.
@@ -122,26 +155,41 @@ describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', ()
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(BOB);
   });
+
+  it('automatically embeds the first-use personal-app link without requiring /login', async () => {
+    vi.mocked(beginLarkCliLogin).mockResolvedValueOnce({
+      authUrl: 'https://open.feishu.cn/page/cli?user_code=PERSONAL',
+      stage: 'app-setup',
+    });
+    const outcomes = await publish(botConfig(), ALICE);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain('https://open.feishu.cn/page/cli?user_code=PERSONAL');
+    expect(body).toContain('选择之前已经创建的应用');
+    expect(body).not.toContain('发一条 /login');
+  });
+
 });
 
 describe('publishTurnCliIdentity — the sender acts as themselves', () => {
-  it('publishes the sender\'s own token', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+  it('publishes only the sender\'s own personal HOME', async () => {
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     const outcomes = await publish(botConfig(), ALICE);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('user');
     const body = readFileSync(larkPath(), 'utf8');
-    expect(body).toContain('tok-alice');
-    expect(body).toContain(APP);
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='/homes/alice-personal-app'");
+    expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+    expect(body).not.toContain(APP);
   });
 
   it('swaps the acting identity when a different person speaks next', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
-    tokens.set(`${APP}|${BOB}`, 'tok-bob');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
+    larkHomes.set(BOB, '/homes/bob-personal-app');
     await publish(botConfig(), ALICE);
     await publish(botConfig(), BOB);
     const body = readFileSync(larkPath(), 'utf8');
-    expect(body).toContain('tok-bob');
-    expect(body).not.toContain('tok-alice');
+    expect(body).toContain('/homes/bob-personal-app');
+    expect(body).not.toContain('/homes/alice-personal-app');
   });
 });
 
@@ -150,7 +198,7 @@ describe('publishTurnCliIdentity — the sender acts as themselves', () => {
 // and with the wrong name in the audit trail.
 describe('publishTurnCliIdentity — withholding removes, never inherits', () => {
   it('denies with a device link when the new sender has not authorized', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE);
     expect(existsSync(larkPath())).toBe(true);
 
@@ -160,7 +208,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const outcomes = await publish(botConfig(), BOB);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     const body = readFileSync(larkPath(), 'utf8');
-    expect(body).not.toContain('tok-alice');
+    expect(body).not.toContain('/homes/alice-personal-app');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('https://example.com/lark-device');
   });
@@ -169,11 +217,11 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   // trigger user. Reaching for the session creator's or owner's credentials to
   // fill that gap is exactly the borrowing this feature removes.
   it('denies (no link) when the turn has no human sender', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE);
     const outcomes = await publish(botConfig(), undefined);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
-    expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
+    expect(readFileSync(larkPath(), 'utf8')).not.toContain('/homes/alice-personal-app');
   });
 
   it('reports needs-authorization instead of degrading under fallback: none', async () => {
@@ -193,10 +241,10 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
   // bytedcli authenticates against ByteCloud SSO, a different provider from Lark
   // OAuth — a Lark token cannot become a ByteCloud JWT. It must report "not
   // authorized" rather than quietly using the machine's own SSO session.
-  it('never fabricates a bytedcli identity from a Lark token', async () => {
+  it('never fabricates a bytedcli identity from a personal Lark HOME', async () => {
     // Authorized for Feishu, NOT for ByteCloud — a real and common state, since
     // they are different identity providers with no conversion between them.
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     const config = botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
     const outcomes = await publish(config, ALICE);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('user');
@@ -253,6 +301,25 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8'))
       .not.toContain('cloud-alice');
   });
+
+  it('publishes larkdev site JWTs for this sender and clears them for the next', async () => {
+    larkdevJwts.set(ALICE, {
+      cn: 'alice-cn', 'i18n-tt': 'alice-tt', 'us-ttp': 'alice-us',
+    });
+    const config = botConfig({ enabled: true, tools: ['larkdev'] });
+    const first = await publish(config, ALICE, 'turn-alice');
+    expect(first.find(o => o.tool === 'larkdev')?.state).toBe('user');
+    const path = sessionIdentityPath(dir, SESSION, 'larkdev');
+    expect(readFileSync(path, 'utf8')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='alice-cn'");
+    expect(readFileSync(path, 'utf8')).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP='alice-us'");
+
+    const second = await publish(config, BOB, 'turn-bob');
+    expect(second.find(o => o.tool === 'larkdev')?.state).toBe('needs-authorization');
+    const denied = readFileSync(path, 'utf8');
+    expect(denied).not.toContain('alice-cn');
+    expect(denied).toContain('ByteCloud');
+    expect(denied).toContain('https://cloud.example.com/auth?state=auto');
+  });
 });
 
 // The identity has to say which turn it is for, or the wrapper cannot tell a
@@ -260,7 +327,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
 // cli-identity.test.ts for what it does with this.
 describe('publishTurnCliIdentity — turn stamping', () => {
   it('stamps the turn on published credentials', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE, 'turn-A');
     expect(readFileSync(larkPath(), 'utf8')).toContain("BOTMUX_IDENTITY_TURN='turn-A'");
   });
@@ -285,7 +352,7 @@ describe('publishTurnCliIdentity — an off policy touches nothing', () => {
   });
 
   it('reports off for a tool outside the selected set', async () => {
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     const outcomes = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(outcomes.find(o => o.tool === 'bytedcli')?.state).toBe('off');
   });
@@ -297,26 +364,23 @@ describe('publishTurnCliIdentity — an off policy touches nothing', () => {
 });
 
 describe('publishTurnCliIdentity — failures fail closed', () => {
-  it('withholds rather than propagating when the token store throws', async () => {
-    const { resolveUserToken } = await import('../src/utils/user-token.js');
-    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+  it('withholds rather than propagating when the personal HOME resolver throws', async () => {
+    larkHomes.set(ALICE, '/homes/alice-personal-app');
     await publish(botConfig(), ALICE);
     expect(existsSync(larkPath())).toBe(true);
 
-    vi.mocked(resolveUserToken).mockRejectedValueOnce(new Error('keychain unavailable'));
+    resolveLarkCliHomeForTurn.mockRejectedValueOnce(new Error('personal credential store unavailable'));
     const outcomes = await publish(botConfig(), ALICE);
     // The turn survives, and the stale identity is gone. A store outage lands on
     // the same policy as "never authorized" — a refusal with a link, never a
     // borrowed or machine identity.
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
-    expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
+    expect(readFileSync(larkPath(), 'utf8')).not.toContain('/homes/alice-personal-app');
   });
 
-  // Without app credentials there is no bot identity to fall back to either —
-  // running as the bot needs the very app id and secret that are missing. So
-  // this degrades to a refusal, not to "run it and see".
-  it('refuses when the bot has no app credentials to pair with the token', async () => {
-    tokens.set(`|${ALICE}`, 'tok');
+  // Missing Bot app credentials must not resurrect the legacy Bot-app token
+  // fallback. With no personal HOME, lark-cli stays denied.
+  it('refuses when the bot has no app credentials and no personal HOME', async () => {
     const outcomes = await publish(
       { larkAppId: '', larkAppSecret: '', brand: 'feishu', triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }) } as any,
       ALICE,
@@ -340,7 +404,11 @@ describe('verified cross-bot delegation', () => {
     bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
     bytedcliJwts.set('ou_source_bot', { cloudJwt: 'wrong-bot' });
     larkHomes.set(ALICE, '/isolated/alice');
-    expect(await delegated()).toEqual([{ tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'user' }]);
+    expect(await delegated()).toEqual([
+      { tool: 'lark-cli', state: 'user' },
+      { tool: 'bytedcli', state: 'user' },
+      { tool: 'larkdev', state: 'off' },
+    ]);
     expect(readFileSync(larkPath(), 'utf8')).toContain('/isolated/alice');
     const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(env).toContain('alice-cloud');
@@ -357,19 +425,22 @@ describe('verified cross-bot delegation', () => {
     expect(env).toContain('report --dispatch-root om_dispatch');
     expect(env).toContain('Do not ask a bot to log in');
   });
-  it('does not forward source-app OAuth as a target-app token', async () => {
-    tokens.set(`cli_source|${ALICE}`, 'source-oauth');
+  it('accepts only the original user\'s personal HOME across apps', async () => {
     await delegated();
-    expect(readFileSync(larkPath(), 'utf8')).not.toContain('source-oauth');
-    tokens.set(`${APP}|ou_alice_target`, 'target-oauth');
+    expect(readFileSync(larkPath(), 'utf8')).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    larkHomes.set(ALICE, '/isolated/alice-personal-app');
     await delegated();
-    expect(readFileSync(larkPath(), 'utf8')).toContain('target-oauth');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain('/isolated/alice-personal-app');
+    expect(body).not.toContain(APP);
   });
   it('target cannot widen delegated tool permissions', async () => {
     bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
     larkHomes.set(ALICE, '/isolated/alice');
     expect(await delegated('om_narrow', ['bytedcli'])).toEqual([
-      { tool: 'lark-cli', state: 'needs-authorization' }, { tool: 'bytedcli', state: 'user' },
+      { tool: 'lark-cli', state: 'needs-authorization' },
+      { tool: 'bytedcli', state: 'user' },
+      { tool: 'larkdev', state: 'off' },
     ]);
     expect(readFileSync(larkPath(), 'utf8')).not.toContain('/isolated/alice');
   });

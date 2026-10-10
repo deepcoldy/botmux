@@ -17831,6 +17831,15 @@ async function spawnCli(
     const hostOnlyDenyPaths: string[] = [join(canonical(dataDir), 'schedule-preconditions')];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
+    if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('larkdev')) {
+      // The wrapper injects sender JWTs and uses a fresh LARKDEV_AUTH_DIR. Keep
+      // the machine SDK login outside the sandbox even when workingDir=HOME or
+      // an explicit user allow-list would otherwise reopen it.
+      hostOnlyDenyPaths.push(canonical(join(hostHomeDir, '.larkdev', 'auth')));
+      if (process.env.LARKDEV_AUTH_DIR?.startsWith('/')) {
+        hostOnlyDenyPaths.push(canonical(process.env.LARKDEV_AUTH_DIR));
+      }
+    }
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
     // cleanup manifest + the mode-000 empty ro-bind SOURCES. If SESSION_DATA_DIR
     // is configured INSIDE the working dir (a custom data dir under a RW-bound

@@ -32,6 +32,10 @@ function layout() {
   writeFileSync(join(data(), 'vc-meeting-daemon-auth', '57'), 't');
   mkdirSync(join(data(), 'bytedcli-home', 'ou_p'), { recursive: true });
   writeFileSync(join(data(), 'bytedcli-home', 'ou_p', 'login.json'), '{}');
+  mkdirSync(join(data(), 'lark-cli-home', 'ou_p'), { recursive: true });
+  writeFileSync(join(data(), 'lark-cli-home', 'ou_p', 'token.enc'), 'personal');
+  mkdirSync(join(home(), '.larkdev', 'auth'), { recursive: true });
+  writeFileSync(join(home(), '.larkdev', 'auth', 'refresh.json'), 'bytecloud');
   // trigger-user identity (#1543 layout): <sid>.bin/ wrapper dir containing
   // .data/<tool>.env + turn; another person's session sits in a sibling .bin dir.
   mkdirSync(join(data(), 'cli-identity', 'sess-1.bin', '.data'), { recursive: true });
@@ -59,6 +63,7 @@ describe('enumerateScratchSecretPaths', () => {
       botmuxHomes: [home()],
       dataDirs: [data()],
       botsConfigPath: join(home(), 'bots.json'),
+      homeDir: home(),
       sessionId: 'sess-1',
     });
     const got = new Set(secret.denyPaths);
@@ -77,6 +82,8 @@ describe('enumerateScratchSecretPaths', () => {
     // per-person secret dirs enclosed wholesale
     expect(got.has(join(data(), 'vc-meeting-daemon-auth'))).toBe(true);
     expect(got.has(join(data(), 'bytedcli-home'))).toBe(true);
+    expect(got.has(join(data(), 'lark-cli-home'))).toBe(true);
+    expect(got.has(join(home(), '.larkdev', 'auth'))).toBe(true);
     // cli-identity/ whole dir sealed, own session's <sid>.bin/ dir carved ro
     expect(got.has(join(data(), 'cli-identity'))).toBe(true);
     expect(carve.has(join(data(), 'cli-identity', 'sess-1.bin'))).toBe(true);

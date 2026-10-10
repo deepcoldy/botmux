@@ -111,7 +111,7 @@ export type BotDefaultsRow = {
    *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
-    tools: Array<'lark-cli' | 'bytedcli'>;
+    tools: Array<'lark-cli' | 'bytedcli' | 'larkdev'>;
     fallback: 'bot-identity' | 'none';
     gitHost?: string;
     gitTokenExchangeUrl?: string;

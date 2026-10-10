@@ -56,6 +56,18 @@ describe('renderIdentityEnv', () => {
     expect(body).not.toContain('BYTEDCLI_USER_CODE_JWT');
   });
 
+  it('emits only the sender JWTs available for larkdev control planes', () => {
+    const body = renderIdentityEnv({
+      tool: 'larkdev',
+      cloudJwts: { cn: 'cn.jwt', 'i18n-bd': 'bd.jwt' },
+    });
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='larkdev-user'");
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_CN='cn.jwt'");
+    expect(body).toContain("BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD='bd.jwt'");
+    expect(body).not.toContain('BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT=');
+    expect(body).toContain("BYTECLOUD_AUTH_AS='user'");
+  });
+
   it('refuses a value carrying a line break rather than silently truncating it', () => {
     expect(() => renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'a\nb' }))
       .toThrow(/line break/);
@@ -798,6 +810,51 @@ describe('gitIdentityConfigEnv', () => {
 
 
 describe('tool-owning process identity environment', () => {
+  it('runs larkdev with only this turn JWTs and a fresh auth directory', () => {
+    const bin = join(dir, 'larkdev-real');
+    writeFileSync(bin, `#!/bin/sh
+printf '%s|%s|%s|%s|%s|%s|%s|%s' \
+  "$BYTECLOUD_CLI_API_JWT_TOKEN_CN" \
+  "$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_BD" \
+  "$BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT" \
+  "$BYTECLOUD_CLI_API_JWT_TOKEN" \
+  "$AIME_USER_CLOUD_JWT" \
+  "$AIPAAS_BYTECLAW" \
+  "$BYTECLOUD_AUTH_AS" \
+  "$LARKDEV_AUTH_DIR"
+`, { mode: 0o755 });
+    const wrapper = join(dir, 'larkdev-wrapper');
+    writeFileSync(wrapper, renderIdentityWrapper('larkdev', bin), { mode: 0o755 });
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'larkdev',
+      cloudJwts: { cn: 'alice-cn', 'i18n-bd': 'alice-bd' },
+      turnId: 'turn-a',
+    });
+    publishActiveTurn(dir, SESSION, 'turn-a');
+    const out = execFileSync(wrapper, [], {
+      encoding: 'utf8',
+      env: {
+        PATH: '/usr/bin:/bin', TMPDIR: dir,
+        SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION,
+        BYTECLOUD_CLI_API_JWT_TOKEN_CN: 'machine-cn',
+        BYTECLOUD_CLI_API_JWT_TOKEN_I18N_TT: 'machine-tt',
+        BYTECLOUD_CLI_API_JWT_TOKEN: 'machine-global',
+        AIME_USER_CLOUD_JWT: 'machine-aime',
+        AIPAAS_BYTECLAW: '1',
+        BYTECLOUD_AUTH_ACCESS_KEY_ID: 'machine-ak',
+        BYTECLOUD_AUTH_SECRET_ACCESS_KEY: 'machine-sk',
+        BYTECLOUD_AUTH_AS: 'app',
+        LARKDEV_AUTH_DIR: '/machine/auth',
+      },
+    });
+    const [cn, bd, tt, global, aime, byteclaw, authAs, authDir] = out.split('|');
+    expect({ cn, bd, tt, global, aime, byteclaw, authAs }).toEqual({
+      cn: 'alice-cn', bd: 'alice-bd', tt: '', global: '', aime: '', byteclaw: '', authAs: 'user',
+    });
+    expect(authDir).toMatch(/botmux-larkdev-auth\/invocation\./);
+    expect(authDir).not.toBe('/machine/auth');
+  });
+
   it('intercepts login-shell commands before viewer startup, then follows each turn and revocation', () => {
     const bin = join(dir, 'real-bin');
     mkdirSync(bin);
