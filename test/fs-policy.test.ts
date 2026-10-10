@@ -334,6 +334,14 @@ describe('buildFsPolicy', () => {
     // another session's marker is NOT writable (can't corrupt its send-dedup).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/other.jsonl').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends').access).toBe('none');
+    // ready-signal: the dsh-tui wrapper plugin appends its diagnostic trail from
+    // INSIDE the sandbox. Same shape as turn-sends: the OWN session's single file
+    // is readWrite (the worker pre-creates it), siblings and the shared root stay
+    // deny-by-default — the trail names the session and its dispatch outcome.
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal/s.log').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal/other.log').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/dsh-tui-ready-signal.log').access).toBe('none');
     // statusline: `botmux statusline` atomically writes latest.json (tmp+rename needs
     // a writable parent) → the OWN session DIRECTORY is readWrite; siblings stay 'none'.
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s').access).toBe('readWrite');

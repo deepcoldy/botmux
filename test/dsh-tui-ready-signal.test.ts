@@ -12,12 +12,13 @@
  * the running TUI writes with its own pid.
  */
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ensureDshQuestionBridgePatch } from '../src/adapters/dsh-question-bridge.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import { READY_SIGNAL_LOG_MAX_BYTES } from '../src/services/ready-signal-log.js';
 import { TURN_IDLE_PROTOCOL_VERSION } from '../src/utils/turn-idle-report.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
@@ -126,6 +127,10 @@ for (const token of statusScript === 'none' ? [] : statusScript.split(',')) {
   });
 }
 await new Promise((resolvePromise) => setTimeout(resolvePromise, 800));
+// Optional hold: the ready-dispatch TIMEOUT outcome only exists while this
+// process (the TUI's stand-in) is still alive past the plugin's 15s watchdog.
+const holdMs = Number(process.env.BOTMUX_READY_TEST_HOLD_MS || 0);
+if (Number.isFinite(holdMs) && holdMs > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, holdMs));
 appendFileSync(doneFile, 'done');
 `;
 
@@ -135,8 +140,9 @@ interface ReadyRun {
   readyLines: string[];
   /** Raw bridge payloads the turn-idle command received, one JSON object each. */
   idlePayloads: Array<Record<string, unknown>>;
-  /** The plugin's own JSONL diagnostic trail (`dsh-tui-ready-signal.log`): every
-   *  fail-closed rejection and every published ready signal. */
+  /** The plugin's own JSONL diagnostic trail (`ready-signal/<sessionId>.log`,
+   *  the one per-session file the fs-policy grants readWrite): every fail-closed
+   *  rejection, plus the ready dispatch attempt and its outcome. */
   signalEvents: Array<Record<string, unknown>>;
 }
 
@@ -170,6 +176,16 @@ async function runReadyDriver(opts: {
   publishedTurn?: { turnId: string; dispatchAttempt?: number };
   /** Per-dispatch relay token + tuple (isolated transport), when enabled. */
   relayIdentity?: { token: string; turnId: string; dispatchAttempt?: number; sessionId?: string };
+  /** Ready command override (default: the recorder that witnesses which record
+   *  was live). `''` exercises the "no consumer configured" path; a command that
+   *  exits non-zero / never exits exercises the dispatch OUTCOME paths. */
+  readyCommand?: string;
+  /** Pre-seed the per-session trail with that many bytes (proves the in-place
+   *  truncation at the size cap). */
+  seedSignalLogBytes?: number;
+  /** Keep the TUI stand-in alive this long after its scripted edges (the plugin's
+   *  ready-dispatch watchdog needs the process to survive its 15s timeout). */
+  holdMs?: number;
 }): Promise<ReadyRun> {
   const profile = makeDshTuiProfile(opts.home);
   const patch = ensureDshQuestionBridgePatch({
@@ -186,6 +202,13 @@ async function runReadyDriver(opts: {
   const relayDir = join(opts.home, 'relay');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(relayDir, { recursive: true });
+  // The worker pre-creates the per-session trail (file + parent) before spawn:
+  // the sandbox grants exactly this file readWrite and bwrap cannot bind a
+  // missing source, so the plugin itself must never have to mkdir anything.
+  const signalLog = join(dataDir, 'ready-signal', `${sessionId}.log`);
+  mkdirSync(dirname(signalLog), { recursive: true, mode: 0o700 });
+  if (opts.seedSignalLogBytes) writeFileSync(signalLog, 'x'.repeat(opts.seedSignalLogBytes));
+  else writeFileSync(signalLog, '');
   if (opts.publishedTurn) {
     const identityDir = join(dataDir, 'cli-identity', `${sessionId}.bin`, '.data');
     mkdirSync(identityDir, { recursive: true });
@@ -239,7 +262,8 @@ async function runReadyDriver(opts: {
     HOME: opts.home,
     USERPROFILE: opts.home,
     SESSION_DATA_DIR: dataDir,
-    BOTMUX_READY_COMMAND: `"${process.execPath}" "${readyCommand}"`,
+    BOTMUX_READY_COMMAND: opts.readyCommand ?? `"${process.execPath}" "${readyCommand}"`,
+    BOTMUX_READY_TEST_HOLD_MS: String(opts.holdMs ?? 0),
     BOTMUX_TURN_IDLE_COMMAND: `"${process.execPath}" "${idleCommand}"`,
   };
   if (opts.relayIdentity) env.BOTMUX_SEND_RELAY = relayDir;
@@ -278,7 +302,7 @@ async function runReadyDriver(opts: {
   const status = await new Promise<number | null>((resolvePromise, rejectPromise) => {
     child.once('error', rejectPromise);
     child.once('close', resolvePromise);
-    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, 20_000).unref();
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, Math.max(20_000, (opts.holdMs ?? 0) + 15_000)).unref();
   });
   if (!existsSync(doneFile)) {
     throw new Error(`ready-signal driver did not finish (status=${status})\n${output}\n${patch!.pluginPath}`);
@@ -289,7 +313,6 @@ async function runReadyDriver(opts: {
     .map(line => JSON.parse(line) as Record<string, unknown>);
   const readyLines = readyText.split('\n').filter(line => line.trim().length > 0);
   // The plugin's diagnostic trail: only created when something was logged.
-  const signalLog = join(dataDir, 'dsh-tui-ready-signal.log');
   const signalEvents = existsSync(signalLog)
     ? readFileSync(signalLog, 'utf8').split('\n').filter(line => line.trim().length > 0)
       .map(line => JSON.parse(line) as Record<string, unknown>)
@@ -313,9 +336,13 @@ describe('dsh-tui structured readiness', () => {
     // so this also pins WHICH record released the gate.
     expect(run.readyLines).toEqual(['dsh-session-1']);
     // The diagnostic trail proves the signal fired and nothing was rejected —
-    // a rejection here would be a mis-kill of a genuine record.
+    // a rejection here would be a mis-kill of a genuine record. The dispatch is
+    // recorded as an ATTEMPT plus its OUTCOME: the first line cannot claim a
+    // delivery, and the last one proves the exec really ran and exited 0.
     expect(run.signalEvents).toEqual([
-      expect.objectContaining({ event: 'ready-published', sessionId: 'dsh-session-1' }),
+      expect.objectContaining({ event: 'ready-dispatch-attempted', sessionId: 'dsh-session-1' }),
+      expect.objectContaining({ event: 'ready-dispatch-spawned', sessionId: 'dsh-session-1' }),
+      expect.objectContaining({ event: 'ready-dispatch-exit', sessionId: 'dsh-session-1', code: 0, timedOut: false }),
     ]);
   }, 30_000);
 
@@ -330,6 +357,99 @@ describe('dsh-tui structured readiness', () => {
     const run = await runReadyDriver({ home, injectPid: 'self', botmuxSessionEnv: false });
     expect(run.readyLines).toEqual([]);
   }, 30_000);
+
+  it('records the dispatch OUTCOME, not just the attempt (non-zero exit)', async () => {
+    const home = tmp();
+    // `shell: true` runs the string in /bin/sh, so this exits 3 without any file.
+    const run = await runReadyDriver({ home, injectPid: 'self', botmuxSessionEnv: true, readyCommand: 'exit 3' });
+    expect(run.readyLines).toEqual([]);
+    // The old trail stopped at "ready-published" — it could not tell a delivered
+    // signal from a CLI that ran and failed. Exit code + signal are recorded now.
+    expect(run.signalEvents.map(entry => entry.event))
+      .toEqual(['ready-dispatch-attempted', 'ready-dispatch-spawned', 'ready-dispatch-exit']);
+    expect(run.signalEvents[2]).toMatchObject({ code: 3, signal: null, timedOut: false });
+  }, 30_000);
+
+  it('records the dispatch TIMEOUT when the ready command never exits', async () => {
+    const home = tmp();
+    const run = await runReadyDriver({
+      home,
+      injectPid: 'self',
+      botmuxSessionEnv: true,
+      readyCommand: 'sleep 30',
+      // Outlive the plugin's 15s watchdog so the timeout outcome can be written.
+      holdMs: 16_000,
+    });
+    expect(run.readyLines).toEqual([]);
+    // Bounded: one line per outcome (the watchdog fires once), and the kill it
+    // performs is itself recorded as the exit that followed.
+    expect(run.signalEvents.map(entry => entry.event))
+      .toEqual(['ready-dispatch-attempted', 'ready-dispatch-spawned', 'ready-dispatch-timeout', 'ready-dispatch-exit']);
+    expect(run.signalEvents[2]).toMatchObject({ reason: 'still-running-at-timeout' });
+    expect(run.signalEvents[3]).toMatchObject({ timedOut: true });
+  }, 40_000);
+
+  it('records that NOTHING was dispatched when no ready command is configured', async () => {
+    const home = tmp();
+    const run = await runReadyDriver({ home, injectPid: 'self', botmuxSessionEnv: true, readyCommand: '' });
+    expect(run.readyLines).toEqual([]);
+    // No consumer ⇒ no dispatch. The attempt/outcome pair must be absent: a
+    // "ready-published" line here is exactly the false claim the rename removes.
+    expect(run.signalEvents).toEqual([
+      expect.objectContaining({ event: 'ready-dispatch-skipped', reason: 'no-ready-command' }),
+    ]);
+  }, 30_000);
+
+  it('bounds the trail: an over-cap per-session file is truncated in place, keeping its inode', async () => {
+    const home = tmp();
+    const logPath = join(home, 'session-data', 'ready-signal', 'sess-ready-signal.log');
+    const run = await runReadyDriver({
+      home,
+      injectPid: 'self',
+      botmuxSessionEnv: true,
+      seedSignalLogBytes: READY_SIGNAL_LOG_MAX_BYTES,
+    });
+    // The seeded filler is gone (the file was reset, not appended to)…
+    const text = readFileSync(logPath, 'utf8');
+    expect(text).not.toContain('xxxxxxxxxx');
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(READY_SIGNAL_LOG_MAX_BYTES);
+    // …the new events landed…
+    expect(run.signalEvents.map(entry => entry.event))
+      .toEqual(['ready-dispatch-attempted', 'ready-dispatch-spawned', 'ready-dispatch-exit']);
+    // …and the inode survived: the sandbox binds THIS file, so replacing it
+    // (write-new + rename) would leave the CLI writing into an unbound path.
+    const stat = statSync(logPath);
+    expect(stat.size).toBeGreaterThan(0);
+    expect(stat.nlink).toBe(1);
+  }, 30_000);
+
+  it('has a spawn-error outcome even though a missing binary normally shows up as exit 127', () => {
+    // `shell: true` means the SHELL is what gets spawned, so a nonexistent
+    // ready command exits 127 instead of emitting an 'error' event — the
+    // 'error' branch only covers the shell itself failing to start (ENOMEM /
+    // EMFILE / no /bin/sh). Not behaviourally reachable here, so pin it at the
+    // generated-source level rather than pretend to exercise it.
+    const home = tmp();
+    const patch = ensureDshQuestionBridgePatch({
+      cliId: 'dsh-tui',
+      homeDir: home,
+      dshTuiProfileDir: makeDshTuiProfile(home),
+      hookCommand: { cmd: '/bin/true', args: [] },
+      buildSalt: 'ready-dispatch-error-branch',
+    });
+    expect(patch).not.toBeNull();
+    const generated = readFileSync(patch!.pluginPath, 'utf8');
+    // All four outcome kinds exist; `error` only covers the shell itself failing
+    // to start (ENOMEM / EMFILE / no /bin/sh), which this harness cannot stage —
+    // a missing ready command is the shell's exit 127, covered behaviourally above.
+    for (const kind of ['spawned', 'error', 'exit', 'timeout']) {
+      expect(generated).toContain(`logOutcome('${kind}'`);
+    }
+    // …the ready channel is the one that labels its outcomes, and the old
+    // "ready-published" claim (written before the exec was even attempted) is gone.
+    expect(generated).toContain("prefix: 'ready-dispatch'");
+    expect(generated).not.toContain("botmuxLogSignalEvent('ready-published'");
+  });
 
   it('opts the dsh-tui adapter into the structured turn-idle hook', () => {
     const source = readFileSync(join(__dirname, '..', 'src', 'adapters', 'cli', 'dsh-tui.ts'), 'utf8');
@@ -479,7 +599,9 @@ describe('dsh-tui structured readiness', () => {
         sessionId: 'previous-process-session',
         startedAt: expect.any(Number),
       },
-      expect.objectContaining({ event: 'ready-published', sessionId: 'dsh-session-1' }),
+      expect.objectContaining({ event: 'ready-dispatch-attempted', sessionId: 'dsh-session-1' }),
+      expect.objectContaining({ event: 'ready-dispatch-spawned', sessionId: 'dsh-session-1' }),
+      expect.objectContaining({ event: 'ready-dispatch-exit', sessionId: 'dsh-session-1', code: 0 }),
     ]);
   }, 30_000);
 
@@ -522,7 +644,8 @@ describe('dsh-tui structured readiness', () => {
       });
       expect(then.readyLines).toEqual(['dsh-session-1']);
       expect(then.idlePayloads.map(payload => payload.turnId)).toEqual(['published-turn']);
-      expect(then.signalEvents.map(entry => entry.event)).toEqual(['inject-record-rejected', 'ready-published']);
+      expect(then.signalEvents.map(entry => entry.event))
+        .toEqual(['inject-record-rejected', 'ready-dispatch-attempted', 'ready-dispatch-spawned', 'ready-dispatch-exit']);
       expect(then.signalEvents[0]).toMatchObject({ reason: REJECTION_REASON[staleStampKind] });
     },
     60_000,

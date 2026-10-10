@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { TURN_IDLE_PROTOCOL_VERSION } from '../utils/turn-idle-report.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../core/managed-origin-capability.js';
+import { READY_SIGNAL_LOG_DIR_NAME, READY_SIGNAL_LOG_MAX_BYTES } from '../services/ready-signal-log.js';
 import { hookCommandParts } from './hook-command.js';
 
 const BRIDGE_VERSION = 1;
@@ -402,13 +403,16 @@ const BOTMUX_PID_REUSE_TOLERANCE_MS = 1_000;
 // after this process started is not ours to claim either.
 const BOTMUX_BIRTH_STAMP_MIN_MS = 1_000_000_000_000;
 const BOTMUX_BIRTH_STAMP_FUTURE_TOLERANCE_MS = 60_000;
-// Diagnostic trail for the fail-closed decisions below. Rejections are silent by
-// design (never disturb the TUI, never exec anything), which makes a genuine
-// mis-kill — the feature quietly degrading to the 90s hard cap — impossible to
-// tell apart from "the TUI has not published its record yet". One JSONL line per
-// distinct rejected record in the session's own data dir; the TUI's stdout is the
-// screen, so stderr/console is deliberately NOT used.
-const BOTMUX_SIGNAL_LOG_FILE = 'dsh-tui-ready-signal.log';
+// Diagnostic trail for the fail-closed decisions below and for the ready
+// dispatch. Rejections are silent by design (never disturb the TUI, never exec
+// anything), which makes a genuine mis-kill — the feature quietly degrading to
+// the 90s hard cap — impossible to tell apart from "the TUI has not published
+// its record yet". One JSONL line per distinct event in the session's own data
+// dir (\`<SESSION_DATA_DIR>/${READY_SIGNAL_LOG_DIR_NAME}/<BOTMUX_SESSION_ID>.log\`:
+// the sandbox grants exactly that file readWrite, pre-created by the worker);
+// the TUI's stdout is the screen, so stderr/console is deliberately NOT used.
+const BOTMUX_SIGNAL_LOG_DIR = ${jsonLiteral(READY_SIGNAL_LOG_DIR_NAME)};
+const BOTMUX_SIGNAL_LOG_MAX_BYTES = ${READY_SIGNAL_LOG_MAX_BYTES};
 const BOTMUX_SIGNAL_LOG_MAX_KEYS = 32;
 
 let botmuxReadySignalled = false;
@@ -422,15 +426,26 @@ function botmuxStatusCommand(envKey) {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : '';
 }
 
-/** Best-effort JSONL diagnostics; never throws, never writes twice per key. */
+/** Best-effort JSONL diagnostics; never throws, never writes twice per key.
+ *
+ *  Bounded twice: at most one line per (event, key) and at most
+ *  BOTMUX_SIGNAL_LOG_MAX_KEYS lines PER PROCESS, and the file itself is
+ *  truncated IN PLACE once it reaches BOTMUX_SIGNAL_LOG_MAX_BYTES — a session
+ *  that restarts its TUI many times would otherwise grow one file without
+ *  bound. In-place truncation (not replace) keeps the inode, which matters
+ *  because the sandbox binds exactly this file. */
 function botmuxLogSignalEvent(event, fields) {
   const dataDir = process.env.SESSION_DATA_DIR;
-  if (!dataDir) return;
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  if (!dataDir || !sessionId) return;
   const key = event + ':' + (fields?.sessionId ?? '') + ':' + String(fields?.startedAt ?? fields?.reason ?? '');
   if (botmuxLoggedSignalEvents.has(key) || botmuxLoggedSignalEvents.size >= BOTMUX_SIGNAL_LOG_MAX_KEYS) return;
   botmuxLoggedSignalEvents.add(key);
+  const path = join(dataDir, BOTMUX_SIGNAL_LOG_DIR, sessionId + '.log');
   try {
-    appendFileSync(join(dataDir, BOTMUX_SIGNAL_LOG_FILE), JSON.stringify({ at: Date.now(), event, ...fields }) + '\\n', { mode: 0o600 });
+    const existing = statSync(path, { throwIfNoEntry: false });
+    if (existing && existing.size >= BOTMUX_SIGNAL_LOG_MAX_BYTES) truncateSync(path, 0);
+    appendFileSync(path, JSON.stringify({ at: Date.now(), event, ...fields }) + '\\n', { mode: 0o600 });
   } catch { /* diagnostics must never break the TUI boot */ }
 }
 
@@ -510,20 +525,57 @@ function botmuxBindInjectSession(record) {
 }
 
 /** Fire-and-forget "botmux <status>" subcommand. Never awaited, never blocks
- *  the TUI, never surfaces an error into the render loop. */
-function spawnBotmuxStatusCommand(command, payload) {
+ *  the TUI, never surfaces an error into the render loop. When the caller passes
+ *  an \`outcome\` label, the exec's RESULT is recorded as
+ *  \`<prefix>-spawned/-error/-exit/-timeout\`: that is the only way to tell "the
+ *  signal never reached the worker" apart from "it was dispatched and the CLI
+ *  died". Bounded (one line per outcome, whole trail capped) and never thrown.
+ *  The per-turn idle reports pass no label: a turn can end many times per
+ *  session and that channel has no bounded outcome vocabulary. */
+function spawnBotmuxStatusCommand(command, payload, outcome) {
+  const logOutcome = (kind, fields) => {
+    if (!outcome) return;
+    botmuxLogSignalEvent(outcome.prefix + '-' + kind, { sessionId: outcome.sessionId, ...fields });
+  };
   let child;
+  let timedOut = false;
   try {
     child = spawn(command, { shell: true, detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
-  } catch {
+  } catch (error) {
+    logOutcome('error', { reason: 'spawn-threw', detail: String(error && error.message || error) });
     return;
   }
-  const timer = setTimeout(() => { try { child.kill(); } catch {} }, BOTMUX_STATUS_SIGNAL_TIMEOUT_MS);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    logOutcome('timeout', { reason: 'still-running-at-timeout' });
+    try { child.kill(); } catch {}
+  }, BOTMUX_STATUS_SIGNAL_TIMEOUT_MS);
   if (typeof timer.unref === 'function') timer.unref();
-  child.on('error', () => clearTimeout(timer));
-  child.on('exit', () => clearTimeout(timer));
+  // 'spawn' is the only positive evidence a fire-and-forget exec can offer: the
+  // OS really started it (an exit code alone would not distinguish "never ran").
+  child.on('spawn', () => logOutcome('spawned', { pid: child.pid }));
+  child.on('error', (error) => {
+    clearTimeout(timer);
+    logOutcome('error', {
+      reason: String(error && error.code || 'spawn-error'),
+      detail: String(error && error.message || error),
+    });
+  });
+  child.on('exit', (code, signal) => {
+    clearTimeout(timer);
+    logOutcome('exit', {
+      code: typeof code === 'number' ? code : null,
+      signal: signal ?? null,
+      timedOut,
+    });
+  });
   try { child.stdin.end(JSON.stringify(payload)); }
   catch { try { child.kill(); } catch {} }
+  // A command that exits before reading stdin closes the pipe, and the write
+  // above then fails ASYNCHRONOUSLY — an unhandled stream 'error' would take the
+  // whole TUI down (EPIPE), which is the one thing this fire-and-forget path
+  // promises never to do. The child's own 'error' above is a different event.
+  try { child.stdin.on('error', () => {}); } catch {}
   try { child.unref(); } catch {}
 }
 
@@ -539,12 +591,20 @@ function publishBotmuxReady() {
   if (botmuxReadySignalled) return;
   botmuxReadySignalled = true;
   stopBotmuxReadyPoll();
+  const command = botmuxStatusCommand('BOTMUX_READY_COMMAND');
+  const sessionId = botmuxInjectSessionId;
+  if (!command) {
+    // No consumer exists: nothing was dispatched. Say exactly that, instead of
+    // logging a "ready" edge the worker can never receive.
+    botmuxLogSignalEvent('ready-dispatch-skipped', { sessionId, reason: 'no-ready-command', pid: process.pid });
+    return;
+  }
   // Diagnostic counterpart to the rejection trail above: proves the channel DID
   // fire (and which record it bound to), so "no signal" can be told apart from
-  // "mis-killed record".
-  botmuxLogSignalEvent('ready-published', { sessionId: botmuxInjectSessionId, pid: process.pid });
-  const command = botmuxStatusCommand('BOTMUX_READY_COMMAND');
-  if (command) spawnBotmuxStatusCommand(command, {});
+  // "mis-killed record". Deliberately named for what it proves — the exec has
+  // not even been spawned yet, so it is an ATTEMPT, not a delivery.
+  botmuxLogSignalEvent('ready-dispatch-attempted', { sessionId, pid: process.pid });
+  spawnBotmuxStatusCommand(command, {}, { prefix: 'ready-dispatch', sessionId });
 }
 
 function pollBotmuxReady(startedAt) {
@@ -675,7 +735,7 @@ function installBotmuxStatusChannel(ctx) {
 function buildDshTuiWrapperPlugin(parts: HookCommandParts, originalDshTuiUrl: string): string {
   return `// botmux generated dsh-tui question wrapper v${BRIDGE_VERSION}
 import { spawn } from 'node:child_process';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, statSync, truncateSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import * as original from ${jsonLiteral(originalDshTuiUrl)};

@@ -343,6 +343,7 @@ import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid,
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
 import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
+import { readySignalLogDir, readySignalLogPath } from './services/ready-signal-log.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
@@ -17829,6 +17830,14 @@ async function spawnCli(
       mkdirSync(tsDir, { recursive: true });
       const tsFile = join(tsDir, `${cfg.sessionId}.jsonl`);
       if (!existsSync(tsFile)) writeFileSync(tsFile, '');
+    } catch { /* */ }
+    // dsh-tui ready 通道诊断轨迹：fs-policy 只授本会话的
+    // ready-signal/<sessionId>.log 单个文件（append-only，写满时 in-place 截断保 inode），
+    // 先建好父目录 + 文件本身给 bwrap 当 bind 源；文件不存在时沙盒内的插件写不进去。
+    try {
+      mkdirSync(readySignalLogDir(dataDir), { recursive: true, mode: 0o700 });
+      const rsFile = readySignalLogPath(dataDir, cfg.sessionId);
+      if (!existsSync(rsFile)) writeFileSync(rsFile, '', { mode: 0o600 });
     } catch { /* */ }
     // UserPromptSubmit sidecar 目录（#794）：daemon 逐 turn 写入，沙盒内 hook 只读。
     try { mkdirSync(join(dataDir, 'prompt-ctx', cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
