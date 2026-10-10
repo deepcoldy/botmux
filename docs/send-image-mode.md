@@ -1,11 +1,13 @@
-# 发送完整截图的缩小预览
+# 发送图片的缩小预览
 
 ```sh
-botmux send --images /tmp/screenshot.png --image-mode small "截图"
-botmux send --images /tmp/screenshot.png --image-mode tiny "截图"
+botmux send --images /tmp/qrcode.png --image-mode small --mention-back "请扫码授权；若看不清，可点击图片放大。"
+botmux send --images /tmp/screenshot.png --image-mode medium --mention-back "截图"
 ```
 
 `--image-mode` 控制独立单图的布局。缩小档位保留完整图片和原始宽高比，仍可点击预览。
+
+按图片用途选择尺寸：二维码、图标等小图优先使用 `small`，避免占满卡片；需要直接阅读文字或细节的截图、图表保留默认全宽，或使用 `medium`。用户明确要求的尺寸优先。二维码缩小后仍需清晰可扫，空间不足时选择更大档位或提示点击预览。
 
 | 参数 | 行为 |
 | --- | --- |
