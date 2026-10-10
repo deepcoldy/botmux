@@ -514,11 +514,12 @@ export async function showStreamingOutput(
         `点击${cardClause}里的"📖 显示输出"按钮；不要点击"打开 Web 终端"，也不要点文本气泡上的按钮`,
       );
     }
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
   }
-  await agent.aiAssert(
+  await agent.aiWaitFor(
     `${cardClause}这张卡片的操作按钮中有"📕 隐藏输出"，` +
       '并且卡片正文显示终端截图、终端区域，或"等待第一张截图"占位',
+    { timeoutMs: 30_000, checkIntervalMs: 2_000 },
   );
 }
 
