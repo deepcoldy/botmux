@@ -27,9 +27,13 @@
  * channel entirely), keeping the real `postSessionScopedSignal`, `cmdTurnIdle`,
  * `runPluginCommandByName` and `showHelp` with only module specifiers
  * rewritten to repo-relative paths. The last test in this file re-verifies that
- * claim byte-for-byte against the git object.
+ * claim byte-for-byte against `test/fixtures/v1-turn-idle-cli-upstream-excerpt.txt`
+ * (the checked-in 13f022b41 text, hash-pinned on both sides) — NOT against the git
+ * object: a squash merge + CI's fetch-depth: 1 leaves that object absent, which
+ * used to turn this whole check into a silent skip.
  */
-import { execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -44,7 +48,10 @@ import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const V1_CLI = join(REPO_ROOT, 'test', 'fixtures', 'v1-turn-idle-cli.ts');
-/** The revision the snapshot quotes (see the fixture header). */
+/** The checked-in upstream text the snapshot quotes (see its header); checked in
+ *  rather than read from git so the provenance check runs in a shallow clone too. */
+const V1_CLI_UPSTREAM_EXCERPT = join(REPO_ROOT, 'test', 'fixtures', 'v1-turn-idle-cli-upstream-excerpt.txt');
+/** The revision the snapshot and the excerpt quote (see their headers). */
 const V1_CLI_SNAPSHOT_REF = '13f022b41';
 const SESSION_ID = 'sess-version-skew';
 /** The dispatch that is live when the detached child runs (turn B). */
@@ -456,18 +463,18 @@ describe('turn-idle version skew (v2 plugin → v1 CLI)', () => {
   }, 30_000);
 
   // ── provenance of the snapshot itself ──────────────────────────────────────
-  /** Extract `…<marker> … }` (the first line that is exactly `}` at column 0). */
-  function extractBlock(source: string, marker: string): string | null {
-    const lines = source.split('\n');
-    const start = lines.findIndex(line => line.startsWith(marker));
-    if (start < 0) return null;
-    let depth = 0;
-    for (let j = start; j < lines.length; j += 1) {
-      depth += (lines[j].match(/\{/g)?.length ?? 0) - (lines[j].match(/\}/g)?.length ?? 0);
-      if (j > start && depth <= 0 && lines[j] === '}') return lines.slice(start, j + 1).join('\n');
-    }
-    return null;
-  }
+  // Both sides of the "verbatim" claim are CHECKED IN and hash-pinned, so the
+  // check really runs in every clone:
+  //   - test/fixtures/v1-turn-idle-cli.ts                   (the snapshot under test)
+  //   - test/fixtures/v1-turn-idle-cli-upstream-excerpt.txt  (the 13f022b41 text it quotes)
+  // This used to read `git show 13f022b41:src/cli.ts` behind a hasGitObject()
+  // skipIf. A squash merge re-lands the change under a NEW commit and CI checks
+  // out with fetch-depth: 1, so the object is absent there and the entire
+  // provenance claim silently degraded into a "skipped" line nobody reads.
+  /** sha256 of the frozen snapshot fixture. */
+  const V1_CLI_SHA256 = '171e7f17abbd4eb4fdd997fa8feb727602c6ffd4d2048f80a3862116c541df3e';
+  /** sha256 of the upstream excerpt fixture (provenance: see its own header). */
+  const V1_CLI_UPSTREAM_SHA256 = '49c821cf560e8e086b732e570d784ff14243cae1332fc3984bf5f81d8f141760';
 
   /** The only rewrite the snapshot generator applies (module specifiers). */
   const SPEC_REWRITES: ReadonlyArray<readonly [string, string]> = [
@@ -477,53 +484,81 @@ describe('turn-idle version skew (v2 plugin → v1 CLI)', () => {
     ["'./global-config.js'", "'../../src/global-config.js'"],
   ];
 
-  function hasGitObject(ref: string): boolean {
-    try {
-      execFileSync('git', ['cat-file', '-e', `${ref}^{commit}`], { cwd: REPO_ROOT, stdio: 'ignore' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  const hasSnapshotRef = hasGitObject(V1_CLI_SNAPSHOT_REF);
+  const BLOCK_DELIM = `##### BLOCK ${V1_CLI_SNAPSHOT_REF}:src/cli.ts :: `;
+  const LINE_DELIM = `##### LINE ${V1_CLI_SNAPSHOT_REF}:src/cli.ts :: `;
 
-  it.skipIf(!hasSnapshotRef)(
-    `the snapshot is byte-identical to the ${V1_CLI_SNAPSHOT_REF} branches it quotes`,
-    () => {
-      const upstream = execFileSync('git', ['show', `${V1_CLI_SNAPSHOT_REF}:src/cli.ts`], {
-        cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
-      });
-      const fixture = readFileSync(V1_CLI, 'utf8');
-      for (const marker of [
-        'async function readStdinWithTimeout(ms: number): Promise<Buffer> {',
-        'function resolveDataDir(): string {',
-        'function listOnlineDaemons(): DaemonDescriptorLite[] {',
-        'function findDaemon(',
-        'async function postSessionScopedSignal(',
-        'async function cmdTurnIdle(): Promise<void> {',
-        'function readPluginRegistryCached()',
-        'async function loadPluginRegistryForCommand(',
-        'function printPluginUsage(): void {',
-        'async function runPluginCommandByName(',
-        'function getVersion(): string {',
-        'function showHelp(): void {',
-      ]) {
-        const block = extractBlock(upstream, marker);
-        expect(block, `upstream block missing: ${marker}`).not.toBeNull();
-        let expected = block!;
-        for (const [from, to] of SPEC_REWRITES) expected = expected.split(from).join(to);
-        expect(fixture, `snapshot drifted: ${marker}`).toContain(expected);
+  /** The blocks the snapshot quotes verbatim (same markers as the excerpt). */
+  const QUOTED_BLOCKS = [
+    'async function readStdinWithTimeout(ms: number): Promise<Buffer> {',
+    'function resolveDataDir(): string {',
+    'function listOnlineDaemons(): DaemonDescriptorLite[] {',
+    'function findDaemon(',
+    'async function postSessionScopedSignal(',
+    'async function cmdTurnIdle(): Promise<void> {',
+    'function readPluginRegistryCached()',
+    'async function loadPluginRegistryForCommand(',
+    'function printPluginUsage(): void {',
+    'async function runPluginCommandByName(',
+    'function getVersion(): string {',
+    'function showHelp(): void {',
+    '  default:',
+  ];
+  /** The root dispatch is quoted LINE-wise by the snapshot (it keeps only the
+   *  `case 'turn-idle'`/`default:` branch bodies), so the excerpt records these as
+   *  single lines — the balanced-brace rule would swallow the rest of main()'s switch. */
+  const QUOTED_LINES = [
+    "  case 'turn-idle': {",
+    "    if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();",
+  ];
+
+  /** Parse the excerpt file: `BLOCK`/`LINE` delimiters, section text verbatim. */
+  function excerptSections(text: string): { blocks: Map<string, string>; lines: Map<string, string> } {
+    const blocks = new Map<string, string>();
+    const lines = new Map<string, string>();
+    let kind: 'block' | 'line' | null = null;
+    let key = '';
+    let body: string[] = [];
+    const flush = (): void => {
+      if (kind === 'block') blocks.set(key, body.join('\n').replace(/\n+$/, ''));
+      else if (kind === 'line') lines.set(key, body[0] ?? '');
+    };
+    for (const line of text.split('\n')) {
+      if (line.startsWith(BLOCK_DELIM) || line.startsWith(LINE_DELIM)) {
+        flush();
+        kind = line.startsWith(BLOCK_DELIM) ? 'block' : 'line';
+        key = line.slice((kind === 'block' ? BLOCK_DELIM : LINE_DELIM).length);
+        body = [];
+        continue;
       }
-      // The dispatch branches, verbatim.
-      for (const branch of [
-        "  case 'turn-idle': {",
-        '  default:',
-        '    if (!await runPluginCommandByName(command, process.argv.slice(3))) showHelp();',
-      ]) {
-        expect(upstream).toContain(branch);
-        expect(fixture).toContain(branch);
-      }
-    },
-    30_000,
-  );
+      if (kind) body.push(line);
+    }
+    flush();
+    return { blocks, lines };
+  }
+
+  it('the snapshot is byte-identical to the checked-in 13f022b41 excerpt it quotes', () => {
+    const fixture = readFileSync(V1_CLI, 'utf8');
+    const excerpt = readFileSync(V1_CLI_UPSTREAM_EXCERPT, 'utf8');
+    // ① Integrity first: an edited fixture/excerpt without a re-pinned hash fails
+    // here instead of quietly redefining what "verbatim" means.
+    expect(createHash('sha256').update(fixture).digest('hex')).toBe(V1_CLI_SHA256);
+    expect(createHash('sha256').update(excerpt).digest('hex')).toBe(V1_CLI_UPSTREAM_SHA256);
+    // ② Every quoted section must be present, in order — a truncated excerpt
+    // cannot pass vacuously by yielding zero sections.
+    const sections = excerptSections(excerpt);
+    expect([...sections.blocks.keys()]).toEqual(QUOTED_BLOCKS);
+    expect([...sections.lines.keys()]).toEqual(QUOTED_LINES);
+    // ③ …and the snapshot contains each of them byte-for-byte, with only the
+    // documented module-specifier rewrites applied.
+    for (const marker of QUOTED_BLOCKS) {
+      const block = sections.blocks.get(marker)!;
+      let expected = block;
+      for (const [from, to] of SPEC_REWRITES) expected = expected.split(from).join(to);
+      expect(fixture, `snapshot drifted: ${marker}`).toContain(expected);
+    }
+    // The dispatch branches, verbatim.
+    for (const line of QUOTED_LINES) {
+      expect(fixture, `snapshot drifted: ${line.trim()}`).toContain(line);
+    }
+  }, 30_000);
 });
