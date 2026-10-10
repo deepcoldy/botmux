@@ -42,6 +42,8 @@ import {
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
+import { bridgeCodexUserInput } from './services/codex-user-input.js';
+
 type JsonObject = Record<string, any>;
 
 interface Args {
@@ -91,6 +93,7 @@ interface ActiveTurn {
   startedAtMs: number;
   lastActivityMarkerAtMs: number;
   finalText: string;
+  userInputFailure?: string;
   allAgentText: string;
   itemText: Map<string, string>;
   done: Promise<void>;
@@ -302,6 +305,7 @@ function appDeveloperInstructions(args: Args): string {
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
       '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
       '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
+      '需要用户选择时，原生 `request_user_input` 会桥接为飞书问答卡片并等待答复；也可使用 `botmux ask`。不要通过聊天卡片索取密码等秘密。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
       args.browserFamily
         ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
@@ -314,6 +318,7 @@ function appDeveloperInstructions(args: Args): string {
     'You are connected to Feishu/Lark through botmux, but the runtime is the Codex App app-server protocol rather than the Codex CLI TUI.',
     'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
     'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
+    'Native request_user_input questions are bridged to Lark ask cards and wait for a human answer; botmux ask is also available. Do not request secrets through chat cards.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
     args.browserFamily
       ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
@@ -331,6 +336,7 @@ class AppServerClient {
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
   private fatalError?: Error;
+  readonly lifetime = new AbortController();
 
   get hasExited(): boolean {
     // 后代可能继续持有 stdio，进程退出不能等到 close 才识别。
@@ -412,8 +418,12 @@ class AppServerClient {
     });
   }
 
-  respond(id: number, result: unknown): void {
+  respond(id: number | string, result: unknown): void {
     this.write({ jsonrpc: '2.0', id, result });
+  }
+
+  respondError(id: number | string, message: string): void {
+    this.write({ jsonrpc: '2.0', id, error: { code: -32000, message } });
   }
 
   notify(method: string, params?: unknown): void {
@@ -423,6 +433,7 @@ class AppServerClient {
   }
 
   close(): void {
+    this.lifetime.abort();
     try { this.child.kill(); } catch { /* already gone */ }
   }
 
@@ -432,6 +443,7 @@ class AppServerClient {
   }
 
   private failAll(err: Error): void {
+    this.lifetime.abort();
     this.fatalError = this.fatalError ?? err;
     const fatal = this.fatalError;
     for (const pending of this.pending.values()) {
@@ -501,7 +513,7 @@ class AppServerClient {
       return;
     }
 
-    if (typeof msg.id === 'number' && typeof msg.method === 'string') {
+    if ((typeof msg.id === 'number' || typeof msg.id === 'string') && typeof msg.method === 'string') {
       for (const handler of this.requestHandlers) {
         if (handler(msg)) return;
       }
@@ -922,6 +934,74 @@ function emitTurnActivity(turn: ActiveTurn, phase: 'submitted' | 'progress' | 'c
   });
 }
 
+const userInputRequests = new Map<number | string, { turnId?: string; controller: AbortController }>();
+
+function cancelUserInputRequests(turnId?: string): void {
+  for (const [id, pending] of userInputRequests) {
+    if (turnId !== undefined && pending.turnId !== turnId) continue;
+    userInputRequests.delete(id);
+    pending.controller.abort();
+  }
+}
+
+function handleNativeUserInput(msg: JsonObject): void {
+  if (generationFenced || userInputRequests.has(msg.id)) return;
+  const current = client;
+  const params = msg.params ?? {};
+  if (params.threadId && threadId && params.threadId !== threadId) {
+    current.respondError(msg.id, 'requestUserInput belongs to a different thread');
+    return;
+  }
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, current.lifetime.signal]);
+  const nativeTurnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+  userInputRequests.set(msg.id, { turnId: nativeTurnId, controller });
+  const turn = activeTurn;
+  const onClientDead = () => {
+    if (client === current && !generationFenced && userInputRequests.get(msg.id)?.controller === controller) {
+      fenceUnknown('turn/start', 'transport', turn);
+    }
+  };
+  current.lifetime.signal.addEventListener('abort', onClientDead, { once: true });
+  const owner = turn?.accepted?.at(-1);
+  const originTurnId = owner?.replyTurnId ?? owner?.clientUserMessageId ?? turn?.clientUserMessageId;
+  void bridgeCodexUserInput({
+    sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
+    chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
+    originTurnId,
+  }, params, signal).then(
+    result => {
+      if (!signal.aborted && client === current && !generationFenced) current.respond(msg.id, result);
+    },
+    async error => {
+      if (signal.aborted || client !== current || generationFenced) return;
+      const message = `Codex user input failed: ${asError(error).message}`;
+      writeLine(message);
+      if (activeTurn === turn && turn) turn.userInputFailure = message;
+      // An empty/error tool reply may be normalized to an unanswered success
+      // by app-server. Interrupt instead, preserving the missing-human-answer
+      // boundary. Only requests without native coordinates use an RPC error.
+      if (!params.threadId || !nativeTurnId) { current.respondError(msg.id, message); return; }
+      try {
+        await current.request('turn/interrupt', { threadId: params.threadId, turnId: nativeTurnId }, { timeoutMs: 10_000 });
+      } catch (interruptError) {
+        if (!signal.aborted && client === current) {
+          writeLine(`Codex user input interrupt failed: ${asError(interruptError).message}`);
+          fenceUnknown('turn/start', 'transport', turn);
+          current.close();
+        }
+      }
+    },
+  ).finally(() => {
+    current.lifetime.signal.removeEventListener('abort', onClientDead);
+    if (userInputRequests.get(msg.id)?.controller === controller) userInputRequests.delete(msg.id);
+  }).catch(error => {
+    if (!signal.aborted && client === current) {
+      writeLine(asError(error).message); fenceUnknown('turn/start', 'transport', turn); current.close();
+    }
+  });
+}
+
 function handleServerRequest(msg: JsonObject): boolean {
   const method = msg.method;
   if (method === 'item/commandExecution/requestApproval') {
@@ -937,7 +1017,7 @@ function handleServerRequest(msg: JsonObject): boolean {
     return true;
   }
   if (method === 'item/tool/requestUserInput') {
-    client.respond(msg.id, { answers: {} });
+    handleNativeUserInput(msg);
     return true;
   }
   if (method === 'mcpServer/elicitation/request') {
@@ -1249,6 +1329,7 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'turn/completed') {
     const nativeTurn = params.turn ?? {};
     const completedId = typeof notificationTurnId === 'string' ? notificationTurnId : undefined;
+    if (completedId) cancelUserInputRequests(completedId);
     if (completedId && browserBroker) {
       void browserBroker.handleTurnEnded(completedId).catch(error => {
         writeLine(`[codex-app] browser turn-ended hook failed: ${asError(error).message}`);
@@ -1616,6 +1697,7 @@ function fenceUnknown(
 ): void {
   if (generationFenced) return;
   generationFenced = true;
+  cancelUserInputRequests();
   if (turn) turn.phase = 'fenced';
   emitLifecycle({ kind: 'unknown_outcome', operation, category });
   emitLifecycle({ kind: 'fatal', operation, category });
@@ -2014,7 +2096,7 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
   const group = turn.accepted && turn.accepted.length > 0
     ? turn.accepted
     : [{ input: { content: '' }, receivedAtMs: turn.startedAtMs } as Dispatch];
-  const finalText = (turn.finalText || turn.allAgentText).trim();
+  const finalText = (turn.userInputFailure || turn.finalText || turn.allAgentText).trim();
   const completedAtMs = Date.now();
   const lastIndex = group.length - 1;
   for (let index = 0; index < group.length; index++) {
@@ -2514,6 +2596,7 @@ async function main(): Promise<void> {
 }
 
 process.on('SIGTERM', async () => {
+  cancelUserInputRequests();
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
@@ -2523,6 +2606,7 @@ process.on('SIGTERM', async () => {
 });
 
 process.on('SIGINT', async () => {
+  cancelUserInputRequests();
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();

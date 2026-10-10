@@ -1679,6 +1679,7 @@ export const messages: Record<string, string> = {
   'card.ask.empty_warning': "⚠️ You haven't selected any option. Multi-select allows choosing none; if you really mean an empty answer, click \"Confirm empty submit\" again, otherwise select first and submit.",
   'card.ask.toast.empty_confirm_needed': 'Nothing selected — click confirm once more to answer empty',
   'card.ask.custom_reply_hint': '💬 None of the options fit? Just reply with your answer in this topic.',
+  'card.ask.text_reply_hint': '💬 Reply with your answer in this conversation.',
   'card.ask.title': 'botmux ask',
   'card.ask.title_done': 'botmux ask · done',
   'card.ask.toast.unauthorized': "You're not allowed to answer this ask",

@@ -251,7 +251,7 @@ import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUE
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
-import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
+import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
@@ -1241,62 +1241,6 @@ async function prepareCodexNativeTitleGeneration(
   if (threadId) await captureCodexResumeTitleBaseline(threadId, engine);
 }
 
-type RpcUserInputAnswer = { answers: Record<string, { answers: string[] }> };
-
-/** Bridge TRAE app-server's native request_user_input request to botmux's
- * existing Lark ask broker. The app-server owns tool execution in RPC mode, so
- * returning this response resumes the same turn without terminal key driving. */
-async function bridgeTraexUserInput(
-  cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  params: unknown,
-): Promise<RpcUserInputAnswer> {
-  const parsed = parseTraexUserInputQuestions(params);
-  if (parsed.kind === 'unsupported') {
-    // Returning empty answers makes TraeX silently complete the tool as if no
-    // one answered, dropping the whole batch. Throw instead so the RPC engine
-    // replies with a JSON-RPC error and the failure is visible on the turn.
-    throw new Error(`requestUserInput cannot be represented as an ask card: ${parsed.reason}`);
-  }
-  const { questions } = parsed;
-  const daemon = findOnlineDaemon(cfg.larkAppId);
-  if (!daemon) throw new Error(`daemon not found for larkAppId=${cfg.larkAppId}`);
-
-  const response = await fetchDaemonIpc(daemon.ipcPort, '/api/asks', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      sessionId: cfg.sessionId,
-      chatId: cfg.chatId,
-      larkAppId: cfg.larkAppId,
-      rootMessageId: cfg.rootMessageId || null,
-      questions: questions.map(entry => entry.question),
-      timeoutMs: 3_600_000,
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`ask broker HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
-  }
-  const result = await response.json() as {
-    kind?: string;
-    answers?: ReadonlyArray<ReadonlyArray<string>>;
-    comment?: string | null;
-  };
-  // Timeout/cancel/invalidated — surface as an error rather than an empty answer
-  // that TraeX would treat as "no one answered" and silently skip.
-  if (result.kind !== 'answered') {
-    throw new Error(`ask not answered (${result.kind ?? 'unknown'})`);
-  }
-
-  const customText = result.comment?.trim() ?? '';
-  const answers: RpcUserInputAnswer['answers'] = {};
-  questions.forEach((entry, index) => {
-    const selected = result.answers?.[index] ?? [];
-    const values = selected.length > 0 ? [...selected] : customText ? [customText] : [];
-    if (values.length > 0) answers[entry.id] = { answers: values };
-  });
-  return { answers };
-}
-
 /** Stand up (or re-establish) the per-session codex app-server + botmux-owned
  *  thread and point remote{WsUrl,ThreadId} at it, so the next spawnCli launches
  *  `codex --remote <ws> resume <thread>` and input flows over JSON-RPC. Fully
@@ -1378,9 +1322,11 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
         : undefined,
-      onRequestUserInput: cfg.cliId === 'traex'
-        ? (params: unknown) => bridgeTraexUserInput(cfg, params)
-        : undefined,
+      onRequestUserInput: (params, signal, identity) => bridgeCodexUserInput({
+        sessionId: cfg.sessionId, larkAppId: cfg.larkAppId, chatId: cfg.chatId,
+        rootMessageId: cfg.rootMessageId, originTurnId: identity?.turnId,
+        originDispatchAttempt: identity?.dispatchAttempt,
+      }, params, signal),
       onTurnTerminal: (terminal) => {
         if (!engine) return;
         handleRpcTurnTerminal(terminal, {

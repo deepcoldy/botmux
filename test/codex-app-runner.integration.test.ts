@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -658,6 +659,87 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
+  it.each(['selected', 'string', 'custom', 'text', 'timedOut', 'refused', 'interrupt-error', 'cancelled', 'exit', 'unsupported', 'workflow'] as const)(
+    'bridges native user input through the real runner/IPC exchange: %s', async outcome => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-native-user-input-'));
+      const fakeCodex = join(dir, 'fake-codex');
+      const logPath = join(dir, 'requests.jsonl');
+      copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex); chmodSync(fakeCodex, 0o755);
+      const control = new ControlCollector(dir); await control.listen();
+      const posts: any[] = [];
+      let closed = false;
+      let respond!: (result: unknown, status?: number) => void;
+      const http = createHttpServer((req, res) => {
+        let body = ''; req.on('data', data => { body += data; });
+        req.on('end', () => {
+          posts.push(JSON.parse(body));
+          expect(req.url).toBe('/api/asks');
+          res.on('close', () => { closed = true; });
+          respond = (result, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); };
+        });
+      });
+      await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+      const port = (http.address() as { port: number }).port;
+      writeFileSync(join(dir, '.botmux-origin-capability.json'), JSON.stringify({
+        sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_native_input', dispatchAttempt: 1, ipcPort: port,
+      }), { mode: 0o600 });
+      const requestId = outcome === 'string' ? 'native-question-1' : 9201;
+      const behavior = ['cancelled', 'exit', 'unsupported', 'text', 'string', 'interrupt-error'].includes(outcome) ? `user-input-${outcome}` : 'user-input';
+      const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path, {
+        env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
+          BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test',
+          BOTMUX_WORKFLOW: outcome === 'workflow' ? '1' : '0' },
+      });
+      try {
+        await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask me', undefined, 'om_native_input')}\r`);
+        if (outcome === 'unsupported' || outcome === 'workflow') {
+          await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/interrupt'));
+          expect(posts).toEqual([]);
+          await waitFor(harness, () => control.finals.length > 0);
+          expect(control.finals[0].content).toContain('Codex user input failed');
+        } else {
+          await waitFor(harness, () => posts.length === 1);
+          expect(posts[0]).toMatchObject({ sessionId: SESSION_ID, originCapability: 'a'.repeat(64), originTurnId: 'om_native_input',
+            questions: [{ prompt: expect.stringContaining('Test first') }, { prompt: expect.stringContaining('Choose channel') }] });
+          expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
+          if (outcome === 'cancelled' || outcome === 'exit') {
+            await waitFor(harness, () => closed);
+            // A late result cannot revive or reply to the completed/dead turn.
+            respond({ kind: 'answered', answers: [['Production'], ['Lark']], comment: null });
+            expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
+          } else {
+            if (outcome === 'refused') respond({ error: 'unsupported' }, 400);
+            else if (outcome === 'timedOut' || outcome === 'interrupt-error') respond({ kind: 'timedOut' });
+            else respond({ kind: 'answered', answers: (outcome === 'custom' || outcome === 'text') ? [[], []] : [['Production'], ['Lark']],
+              comment: (outcome === 'custom' || outcome === 'text') ? 'Staging and Lark please' : null });
+            if (outcome === 'selected' || outcome === 'string' || outcome === 'custom' || outcome === 'text') {
+              await waitFor(harness, () => control.finals.length > 0);
+              const answer = readRequests(logPath).find(r => r.id === requestId && r.result !== undefined)?.result;
+              expect(answer).toEqual({ answers: { environment: { answers: [(outcome === 'custom' || outcome === 'text') ? 'Staging and Lark please' : 'Production'] },
+                notify: { answers: [(outcome === 'custom' || outcome === 'text') ? 'Staging and Lark please' : 'Lark'] } } });
+              expect(readRequests(logPath).filter(r => r.method === 'turn/start')).toHaveLength(1);
+            } else {
+              await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/interrupt'));
+              expect(harness.stdout).toContain('Codex user input failed');
+              if (outcome === 'interrupt-error') {
+                await waitFor(harness, () => control.markers.some(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal'));
+              } else {
+                await waitFor(harness, () => control.finals.length > 0);
+                expect(control.finals[0].content).toContain('Codex user input failed');
+              }
+              expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
+            }
+          }
+        }
+      } finally {
+        await stopChild(harness.child); await control.close();
+        http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('refuses to start without a worker-established control bootstrap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-no-key-'));
     const harness = startRunner('/does/not/matter', dir, join(dir, 'requests.jsonl'), '0.136.0', 'success', null);

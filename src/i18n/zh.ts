@@ -1679,6 +1679,7 @@ export const messages: Record<string, string> = {
   'card.ask.empty_warning': '⚠️ 你还没有勾选任何选项。多选允许「一个都不选」，如确实要以空作答，请再次点击「确认空提交」；否则先勾选再提交。',
   'card.ask.toast.empty_confirm_needed': '未勾选任何选项，如确实要空作答请再点一次确认',
   'card.ask.custom_reply_hint': '💬 选项都不合适？直接在话题里回复你的答案即可。',
+  'card.ask.text_reply_hint': '💬 请直接在当前会话回复你的答案。',
   'card.ask.title': 'botmux ask',
   'card.ask.title_done': 'botmux ask 已结束',
   'card.ask.toast.unauthorized': '你没有权限回答这个 ask',

@@ -4,7 +4,7 @@ import type { AskOption, AskQuestion } from './ask-types.js';
 export type AskQuestionParseError =
   | 'bad_options' | 'bad_option_shape' | 'bad_option_key' | 'bad_option_label'
   | 'duplicate_option_key' | 'bad_questions' | 'bad_question_shape'
-  | 'bad_multiSelect' | 'bad_defaultSelectedKeys';
+  | 'bad_multiSelect' | 'bad_defaultSelectedKeys' | 'bad_inputMode';
 
 /** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
 export function parseOption(o: unknown): AskOption | AskQuestionParseError {
@@ -24,7 +24,10 @@ export function parseAskQuestions(arr: unknown): AskQuestion[] | AskQuestionPars
     const qq = q as Record<string, unknown>;
     if (typeof qq.prompt !== 'string' || !qq.prompt.trim()) return 'bad_question_shape';
     if (typeof qq.multiSelect !== 'boolean') return 'bad_multiSelect';
-    if (!Array.isArray(qq.options) || qq.options.length < 2) return 'bad_options';
+    if (qq.inputMode !== undefined && qq.inputMode !== 'text') return 'bad_inputMode';
+    const textOnly = qq.inputMode === 'text';
+    if (textOnly && (qq.multiSelect || qq.defaultSelectedKeys !== undefined)) return 'bad_inputMode';
+    if (!Array.isArray(qq.options) || (textOnly ? qq.options.length !== 0 : qq.options.length < 2)) return 'bad_options';
     const opts: AskOption[] = [];
     const seen = new Set<string>();
     for (const o of qq.options) {
@@ -40,6 +43,7 @@ export function parseAskQuestions(arr: unknown): AskQuestion[] | AskQuestionPars
       || new Set(defaults).size !== defaults.length || (!qq.multiSelect && defaults.length > 1)
     )) return 'bad_defaultSelectedKeys';
     result.push({ prompt: qq.prompt, multiSelect: qq.multiSelect, options: opts,
+      ...(textOnly ? { inputMode: 'text' as const } : {}),
       ...(defaults !== undefined ? { defaultSelectedKeys: [...defaults as string[]] } : {}),
     });
   }
