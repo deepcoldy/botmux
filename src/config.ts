@@ -256,13 +256,7 @@ export function resolveRecoveryForkConfig(env: NodeJS.ProcessEnv = process.env):
 const recoveryForkConfig = resolveRecoveryForkConfig();
 
 function resolvePositiveRuntimeTimeout(raw: string | undefined, fallback: number): number {
-  const normalized = raw?.trim();
-  if (!normalized) return fallback;
-
-  const value = Number(normalized);
-  return Number.isFinite(value) && value > 0 && value <= MAX_TIMER_DELAY_MS
-    ? value
-    : fallback;
+  return parseBoundedInteger(raw, fallback, 1, MAX_TIMER_DELAY_MS);
 }
 
 export function resolveStuckDetectorTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
