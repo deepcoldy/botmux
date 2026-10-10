@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -1561,6 +1561,72 @@ describe('isPureCardUpgradeFallback (replace gate)', () => {
 // ─── extractResources for interactive cards ───────────────────────────────
 
 describe('Post message parsing', () => {
+  function parsePostEvent(post: object) {
+    return parseEventMessage({
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_post_links',
+        message_type: 'post',
+        content: JSON.stringify(post),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    }).parsed.content;
+  }
+
+  it.each(['unwrapped', 'zh_cn', 'en_us'])('preserves titled MR links in %s posts for API and event messages', (shape) => {
+    // The client can show a resolved MR title even when text === href in the
+    // API. A titled link instead stores its URL only in href.
+    const firstUrl = 'https://example.com/team/service/merge_requests/123';
+    const secondUrl = 'https://example.com/team/client/merge_requests/456?to_version=2';
+    const body = {
+      title: 'Batch review',
+      content: [
+        [{ tag: 'at', user_name: 'Reviewer' }, { tag: 'text', text: ' Review these two MRs.' }],
+        [{ tag: 'a', text: 'fix(api): use configured endpoint · !123', href: firstUrl }],
+        [{ tag: 'a', text: 'fix(client): apply effective thresholds · !456', href: secondUrl }],
+      ],
+    };
+    const post = shape === 'unwrapped' ? body : { [shape]: body };
+    const expected = `Batch review\n@Reviewer Review these two MRs.\nfix(api): use configured endpoint · !123(${firstUrl})\nfix(client): apply effective thresholds · !456(${secondUrl})`;
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(expected);
+    expect(parsePostEvent(post)).toBe(expected);
+  });
+
+  it.each([
+    { name: 'URL label', node: { text: 'https://example.com/mr/123', href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'missing label', node: { href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'empty label', node: { text: '', href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'null label', node: { text: null, href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'missing URL', node: { text: 'MR title' }, expected: 'MR title' },
+    { name: 'empty URL', node: { text: 'MR title', href: '' }, expected: 'MR title' },
+    { name: 'empty anchor', node: {}, expected: '' },
+  ])('renders $name without losing or duplicating content', ({ node, expected }) => {
+    const post = { content: [[{ tag: 'text', text: 'Before ' }, { tag: 'a', ...node }, { tag: 'text', text: ' after' }]] };
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(`Before ${expected} after`);
+    expect(parsePostEvent(post)).toBe(`Before ${expected} after`);
+  });
+
+  it('retains link destinations in authored text while excluding attachment metadata', () => {
+    const post = {
+      content: [[
+        { tag: 'a', text: 'MR title', href: 'https://example.com/mr/123' },
+        { tag: 'file', file_key: 'file_spec', file_name: 'spec.md' },
+      ]],
+    };
+    expect(extractAuthoredMessageText('post', JSON.stringify(post))).toBe('MR title(https://example.com/mr/123)');
+  });
+
+  it('distinguishes posts with the same link label but different destinations', () => {
+    const canonical = (href: string) => rawPlaceholderText('post', JSON.stringify({
+      content: [[{ tag: 'a', text: 'MR title', href }]],
+    }));
+    expect(canonical('https://example.com/mr/123')).toContain('https://example.com/mr/123');
+    expect(canonical('https://example.com/mr/123')).not.toBe(canonical('https://example.com/mr/456'));
+  });
+
   it('renders post code block with fence boundaries for API and event messages', () => {
     const post = {
       zh_cn: {
@@ -1616,7 +1682,7 @@ describe('Post message parsing', () => {
       },
     };
 
-    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档@Alice');
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档(https://example.com)@Alice');
   });
 
   it('renders img tag in post body as [图片] placeholder when no numberer', () => {

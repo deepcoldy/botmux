@@ -71,14 +71,19 @@ jobs:
       # AppArmor profile,bwrap 一起 userns 就秒退("setting up uid map:
       # Permission denied",exit 1)。这里放开限制并预装 bubblewrap,让沙盒
       # 用例在 CI 上真正执行。整步 best-effort:哪一步失败都不阻塞——测试侧
-      # 有 bwrap 运行时探测 gate,跑不了会 loud skip 而不是超时挂掉。
+      # 有 bwrap 运行时探测 gate,跑不了会 loud skip。sudo/apt 卡住时 `|| true`
+      # 不会返回,所以整段准备限时 90s,避免吃掉 job 的 20 分钟超时。
       # install 前必须先 apt-get update:runner 镜像自带的 apt 索引会滞后于镜像源,
       # 实测索引里的 bubblewrap 0.9.0-1ubuntu0.1 被 0.9.0-1ubuntu0.2 顶替后,
       # 不 update 直接 install 全部镜像源 404(2026-09-19 master 自身 CI 因此红)。
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          # Healthy runners finish this in ~10s. A hung sudo/apt produces no
+          # output and otherwise burns the whole job timeout.
+          timeout -k 15s 90s bash -c '
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          ' || echo "bwrap setup timed out — continuing without a confirmed sandbox"
           if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else
@@ -182,8 +187,12 @@ jobs:
       # sync with the `test` job's copy.
       - name: Enable bwrap sandbox for integration tests (best-effort)
         run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          # Healthy runners finish this in ~10s. A hung sudo/apt produces no
+          # output and otherwise burns the whole job timeout.
+          timeout -k 15s 90s bash -c '
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
+          ' || echo "bwrap setup timed out — continuing without a confirmed sandbox"
           if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
             echo "bwrap userns OK — sandbox integration tests will run for real"
           else

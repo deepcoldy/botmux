@@ -108,6 +108,10 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: '/project', sessionPolicy: 'sessionless', help: ['help.project'],
     notes: '多一个 token 即 unexpected_arguments，是所有命令里 arity 最严的',
   },
+  {
+    name: '/context-sharing', sessionPolicy: 'sessionless', help: ['help.context_sharing'],
+    notes: '群级后台上下文开关；严格 owner/allowedUsers 闸，不创建或唤醒会话',
+  },
   { name: '/group', aliases: ['/g'], sessionPolicy: 'sessionless', help: ['help.group'] },
   { name: '/relay', sessionPolicy: 'default', help: ['help.relay', 'help.relay_create'] },
   { name: '/quote', sessionPolicy: 'existingOnly', help: ['help.quote'] },

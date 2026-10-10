@@ -124,8 +124,10 @@ describe('TRAE worker structured-bridge wiring', () => {
     const start = workerSource.indexOf('const startTraexLauncherPidResolve');
     const end = workerSource.indexOf('// Bridge fallback:', start);
     const wiring = workerSource.slice(start, end);
-    const matches = wiring.match(/claudeDataDir \|\| cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex'/g) ?? [];
+    // Both wiring sites go through the shared ownership-pid predicate, which names traex.
+    const matches = wiring.match(/cliAdapterBindsOwnershipPid\(cfg\.cliId, claudeDataDir\)/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+    expect(readFileSync(new URL('../src/adapters/cli/ownership-pid.ts', import.meta.url), 'utf8')).toContain("cliId === 'traex'");
     expect(wiring).toContain('.cliPid = realPid;');
     expect(wiring).toContain('.cliPid = wiredPid;');
     expect(wiring).not.toContain('codexAdoptPendingPid = realPid;');

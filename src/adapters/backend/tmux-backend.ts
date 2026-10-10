@@ -4,7 +4,7 @@ import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
+import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
 import { strictPaneCommand } from './strict-env.js';
@@ -869,6 +869,14 @@ export function buildBotmuxEnvAssignments(
     // CLI and overrides a stale server-global one, while a user's own value on
     // their tmux server survives untouched for every other CLI.
     for (const key of CA_BUNDLE_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+    // Session scratch must be pane-local. In particular, never rely on the
+    // shared tmux server's ambient TMPDIR: one bot can otherwise write into
+    // another session's scratch tree (or back into a tmpfs-backed /tmp).
+    for (const key of SESSION_TEMP_ENV_KEYS) {
       const val = env[key];
       if (val === undefined) continue;
       out.push(`${key}=${val}`);

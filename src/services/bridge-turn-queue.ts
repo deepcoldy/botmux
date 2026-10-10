@@ -128,6 +128,8 @@ export interface BridgePendingTurn {
    *  delivered fallback with an "interrupted by restart" notice so the user
    *  can tell a recovered partial answer from a live one. */
   restoredFromJournal?: boolean;
+  /** Observed at least one non-error assistant event (including tool calls). */
+  hasAssistantActivity?: boolean;
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -179,6 +181,16 @@ export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string)
   return markContentNorm.endsWith(recordedNorm);
 }
 
+/** How a transcript user/queued-command record bound a pending Lark turn.
+ *  `fullContentMatch` is true only when the record's normalised text contains
+ *  the ENTIRE normalised marked content — the one binding strong enough to
+ *  prove that this exact input (envelope included) entered the conversation.
+ *  Fingerprint-prefix and truncation binds remain attribution heuristics. */
+export interface BridgeTurnStartEvidence {
+  fullContentMatch: boolean;
+  sourceJsonlPath?: string;
+}
+
 export class BridgeTurnQueue {
   constructor(
     private readonly onLocalTurnStarted?: (turn: BridgePendingTurn) => void,
@@ -187,6 +199,10 @@ export class BridgeTurnQueue {
      *  anchor) pair so it can persist it across worker restarts. `undefined`
      *  anchor means the task was created with no Lark context (local turn). */
     private readonly onScheduledTaskAnchored?: (taskId: string, anchor: string | undefined) => void,
+    /** Fired when a pending Lark turn is started by a transcript record, with
+     *  the strength of that binding. Durable receipts must only act on
+     *  `fullContentMatch`. */
+    private readonly onLarkTurnStarted?: (turn: BridgePendingTurn, evidence: BridgeTurnStartEvidence) => void,
   ) {}
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
@@ -488,6 +504,9 @@ export class BridgeTurnQueue {
           this.collecting = headless;
           this.onLocalTurnStarted?.(headless);
         }
+        if (this.collecting) {
+          this.collecting.hasAssistantActivity = true;
+        }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
           try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
@@ -566,13 +585,16 @@ export class BridgeTurnQueue {
    *  unstarted — the scheduler's prompt must never fingerprint-bind them. */
   private handleScheduledTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
     // Same transcript-order closeout as a real turn start.
-    if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
-      this.collecting.terminalObserved = true;
-      this.collecting = null;
+    if (this.collecting && !this.collecting.terminalObserved) {
+      if (this.collecting.dispatchAttempt !== undefined || this.collecting.hasAssistantActivity) {
+        this.collecting.terminalObserved = true;
+        this.collecting = null;
+      }
     }
     if (this.collecting
       && !this.collecting.terminalObserved
-      && this.collecting.assistantUuids.length === 0) {
+      && this.collecting.assistantUuids.length === 0
+      && !this.collecting.hasAssistantActivity) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
       if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
@@ -644,17 +666,20 @@ export class BridgeTurnQueue {
     // JSONL variants that omitted the explicit final marker, without trusting
     // the TUI's prompt-looking screen. Keep the turn queued so an empty/silent
     // durable delivery still produces its terminal receipt.
-    if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
-      this.collecting.terminalObserved = true;
-      this.collecting = null;
+    if (this.collecting && !this.collecting.terminalObserved) {
+      if (this.collecting.dispatchAttempt !== undefined || this.collecting.hasAssistantActivity) {
+        this.collecting.terminalObserved = true;
+        this.collecting = null;
+      }
     }
     // Head-of-line block drop: previous turn never produced any visible
-    // assistant text and a new meaningful turn-start has arrived → Claude
+    // assistant text or assistant activity and a new meaningful turn-start has arrived → Claude
     // is single-threaded over the PTY, so the old turn will never get
     // text. Applies to both Lark and local turns.
     if (this.collecting
       && !this.collecting.terminalObserved
-      && this.collecting.assistantUuids.length === 0) {
+      && this.collecting.assistantUuids.length === 0
+      && !this.collecting.hasAssistantActivity) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
       // This turn will never reach drainEmittable, which is where the worker
@@ -672,12 +697,14 @@ export class BridgeTurnQueue {
     const eventTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
     const next = this.queue.find(t => !t.started);
     let consumedNext = false;
+    let fullContentMatch = false;
     if (next) {
       if (next.contentFingerprint) {
         // Both sides normalised (whitespace-collapsed + trimmed) before
         // the substring check so a transcript line that preserved newlines
         // still matches a fingerprint built from the same text.
         const userText = normaliseForFingerprint(extractTurnStartText(ev));
+        fullContentMatch = !!next.contentNormalized && userText.includes(next.contentNormalized);
         if (userText.includes(next.contentFingerprint)) {
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
@@ -712,6 +739,9 @@ export class BridgeTurnQueue {
         this.collecting = next;
         consumedNext = true;
       }
+    }
+    if (consumedNext && next) {
+      this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
     }
     if (!consumedNext) {
       // The user event neither fingerprint-matched nor proved a truncation of a

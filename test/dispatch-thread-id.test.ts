@@ -3,9 +3,10 @@
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
+import { pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
-  buildRepoPrimeText, parseDispatchBotSpec } from '../src/core/dispatch.js';
+  buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget } from '../src/core/dispatch.js';
 
 function extract(path: string, names: string[]): string {
   const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -54,7 +55,9 @@ function harness(mode: Mode, options: {
   };
   const getMessageThreadId = new Function('scope',
     'with (scope) { ' + clientCode + '; return getMessageThreadId; }')(lookupScope);
-  const replyMessage = vi.fn(async (_app: string, target: string, _content: string, _type: string, inThread: boolean) => {
+  const replyMessage = vi.fn(async (_app: string, target: string, _content: string, _type: string, inThread: boolean,
+    _uuid?: string, _context?: unknown, writeOptions?: { beforeWrite?: () => Promise<void> }) => {
+    await writeOptions?.beforeWrite?.();
     expect(target).toBe(root);
     expect(inThread).toBe(true);
     if (options.failure === 'send') throw new Error('reply failed');
@@ -83,9 +86,10 @@ function harness(mode: Mode, options: {
   });
   const state = {
     parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
-    buildRepoPrimeText, parseDispatchBotSpec,
+    buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget, pickTurnReplyTarget,
+    resolveSessionContext: () => undefined,
     process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
-      exit: (code: number) => { throw new Error('exit:' + code); } },
+      exit: (code: number) => { throw new Error('exit:' + code + '\n' + stderr.join('\n')); } },
     console: { log: (text: string) => stdout.push(text), error: (text: string) => stderr.push(text) },
     AbortSignal: { timeout },
     assertTurnTransportOrExit: vi.fn(), assertSessionTransportOrExit: vi.fn(),
@@ -112,6 +116,7 @@ function harness(mode: Mode, options: {
     trySyncProjectDispatch: vi.fn(async () => true),
     __import: async (path: string) => {
       if (path === './bot-registry.js') return {
+        getBot: () => ({ config: { topicUnavailablePolicy: 'legacy' } }),
         registerBot: vi.fn(), loadBotConfigs: () => [{ larkAppId: 'cli_source' }, { larkAppId: 'cli_target' }],
       };
       if (path === './im/lark/client.js') return {

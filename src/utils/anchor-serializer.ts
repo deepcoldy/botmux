@@ -38,11 +38,11 @@ const SERIALIZE_MAX_WAIT_MS = 5000;
  * callers can still attach `.catch` for logging. Different anchors are
  * independent and run concurrently.
  */
-export function serializeByAnchor(
+export function serializeByAnchor<T>(
   anchor: string,
-  work: () => Promise<void>,
+  work: () => Promise<T>,
   capMs: number = SERIALIZE_MAX_WAIT_MS,
-): Promise<void> {
+): Promise<T> {
   const prev = queues.get(anchor) ?? Promise.resolve();
   // Wait for `prev` to settle, but no longer than `capMs` — `prev.then` swallows
   // its outcome (one handler's failure must not stall the queue), and the race

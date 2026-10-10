@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
@@ -13,6 +13,7 @@ import * as workerPool from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
 import * as docSubsStore from '../src/services/doc-subs-store.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { ensureSessionTempDir } from '../src/core/session-temp.js';
 
 const tempDirs: string[] = [];
 
@@ -26,6 +27,56 @@ afterEach(() => {
 });
 
 describe('daemon close barrier used by botmux delete', () => {
+  it.each(['workerless', 'active', 'retiring'] as const)('preserves resumed scratch when the old worker exits (replacement: %s)', async replacementState => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-resume-scratch-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-scratch-race');
+    const oldWorker = Object.assign(new EventEmitter(), {
+      killed: false, exitCode: null, signalCode: null, send: vi.fn(), kill: vi.fn(),
+    });
+    let replacementWorker: EventEmitter | undefined;
+    try {
+      const session = sessionStore.createSession('oc_scratch', 'om_scratch', 'scratch race', 'group');
+      session.larkAppId = 'app-scratch-race';
+      sessionStore.updateSession(session);
+      const scratch = ensureSessionTempDir(dataDir, session.sessionId);
+      tempDirs.push(dirname(scratch));
+      const ds = { session, worker: oldWorker, workerGeneration: 1,
+        larkAppId: session.larkAppId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), lastMessageAt: Date.now(), hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+      await workerPool.closeSession(session.sessionId, { awaitWorkerExit: false });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(existsSync(scratch)).toBe(true);
+      const replacement = { ...ds, workerGeneration: 2,
+        worker: replacementState !== 'workerless' ? Object.assign(new EventEmitter(), {
+          killed: false, exitCode: null, signalCode: null, send: vi.fn(), kill: vi.fn(),
+        }) : null,
+      } as any;
+      replacementWorker = replacement.worker ?? undefined;
+      active.set(activeSessionKey(replacement), replacement);
+      if (replacementState === 'retiring') {
+        workerPool.killWorker(replacement);
+        active.delete(activeSessionKey(replacement));
+      }
+      // Leave the persistent row closed: the active owner alone must fence deletion.
+      writeFileSync(join(scratch, 'live'), 'replacement');
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(existsSync(join(scratch, 'live'))).toBe(true);
+    } finally {
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      replacementWorker?.emit('exit', 0, null);
+      config.session.dataDir = previousDataDir;
+    }
+  });
   it('evicts activeSessions and persists closed before awaited doc cleanup', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-barrier-'));
     tempDirs.push(dataDir);
@@ -647,7 +698,7 @@ describe('closed live card lifecycle', () => {
       expect(workerPool.scheduleCardPatch(ds, 'late-working-card')).toBe(false);
       release();
       await vi.waitFor(() => expect(patch).toHaveBeenCalledTimes(2));
-      expect(patch).toHaveBeenLastCalledWith('app-close-card', 'om_live', 'closed-card');
+      expect(patch).toHaveBeenLastCalledWith('app-close-card', 'om_live', 'closed-card', { beforeWrite: expect.any(Function) });
       expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
     } finally { release(); config.session.dataDir = previousDataDir; }
   });

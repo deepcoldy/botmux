@@ -802,10 +802,13 @@ describe('worker pipe initial screen ordering', () => {
 
   it('wires reasonix cliPid/cliCwd in both immediate and late pid paths', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    // reasonix joins the inline pid/cwd-wiring condition alongside grok/traex at
-    // BOTH sites (synchronous tmux/pty resolve + async zellij late-pid fallback).
-    const matches = source.match(/cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex' \|\| cfg\.cliId === 'reasonix'/g) ?? [];
+    // The pid/cwd-wiring gate is one shared predicate used at BOTH sites
+    // (synchronous tmux/pty resolve + async zellij late-pid fallback); reasonix
+    // is named in it alongside grok/traex/codex.
+    const matches = source.match(/cliAdapterBindsOwnershipPid\(cfg\.cliId, claudeDataDir\)/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+    const predicate = readFileSync(join(process.cwd(), 'src/adapters/cli/ownership-pid.ts'), 'utf8');
+    expect(predicate).toContain("cliId === 'reasonix'");
   });
 
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {

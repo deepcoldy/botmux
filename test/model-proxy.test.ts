@@ -16,8 +16,57 @@ const tool = { type: 'function', function: { name: 'add', parameters: { type: 'o
 const chat = { model: 'reasoner', messages: [{ role: 'system', content: 'Calculate.' }, { role: 'user', content: 'Add.' }], tools: [tool] };
 const done = (output: unknown): InvocationResult => ({ requestId: 'r1', state: 'completed', output, error: null, startedAt: '2026-01-01T00:00:00Z', durationMs: 1, startupMs: 1, configuredModel: 'native', actualModel: null, reasoningEffort: null, usage: null, usageSource: null });
 const proposal = { content: '', tool_calls: [{ name: 'add', arguments: '{"x":42}' }] };
+const batch = (count: number) => ({ content: '', tool_calls: Array.from({ length: count }, (_, x) => ({ name: 'add', arguments: JSON.stringify({ x }) })) });
+const history = (count: number) => {
+  const calls = batch(count).tool_calls.map((c, i) => ({ id: `call-${i}`, type: 'function', function: c }));
+  return [...chat.messages, { role: 'assistant', content: null, tool_calls: calls },
+    ...calls.map(c => ({ role: 'tool', tool_call_id: c.id, content: 'ok' }))];
+};
 
 describe('public conversation contract', () => {
+  it.each([16, 17, 20, 129])('preserves all %i generated calls and accepts their complete history', count => {
+    for (const tool_choice of ['auto', 'required'] as const) {
+      const parsed = parseChatRequest({ ...chat, tool_choice });
+      const output = batch(count);
+      const response = completionResponse(parsed, done(output));
+      const message = response.choices[0].message;
+      expect(message.tool_calls?.map(c => c.function)).toEqual(output.tool_calls);
+      expect(new Set(message.tool_calls?.map(c => c.id)).size).toBe(count);
+      expect(response.choices[0].finish_reason).toBe('tool_calls');
+      expect(completionResponse(parsed, done(output))).toEqual(response);
+      const messages = [...chat.messages, message,
+        ...message.tool_calls!.map(c => ({ role: 'tool', tool_call_id: c.id, content: 'ok' }))];
+      const next = parseChatRequest({ ...chat, messages, tool_choice: 'none', parallel_tool_calls: false });
+      const invocation = toInvocation(next, { bot: 'fixture', model: 'native', deadlineMs: 5000 }, 'r2');
+      expect(JSON.parse(invocation.prompt.split('CHAT_REQUEST_JSON:\n')[1]).messages).toEqual(messages);
+    }
+  });
+  it.each([16, 17, 20, 129])('accepts a complete incoming history with %i calls', count => {
+    const messages = history(count);
+    expect(parseChatRequest({ ...chat, messages }).messages).toEqual(messages);
+  });
+  it('keeps ID and result association checks for histories exceeding 16 calls', () => {
+    const messages = history(20);
+    expect(() => parseChatRequest({ ...chat, messages: messages.slice(0, -1) })).toThrow('missing_tool_results');
+    expect(() => parseChatRequest({ ...chat, messages: [...messages, messages.at(-1)] })).toThrow('unmatched_tool_result');
+    const wrongResult = structuredClone(messages);
+    Object.assign(wrongResult[wrongResult.length - 1], { tool_call_id: 'unknown' });
+    expect(() => parseChatRequest({ ...chat, messages: wrongResult })).toThrow('unmatched_tool_result');
+    const duplicate = structuredClone(messages);
+    const assistant = duplicate[2] as { tool_calls: Array<{ id: string }> };
+    assistant.tool_calls[19].id = assistant.tool_calls[0].id;
+    expect(() => parseChatRequest({ ...chat, messages: duplicate })).toThrow('duplicate_tool_call_id');
+    expect(() => parseChatRequest({ ...chat, messages: [...messages.slice(0, -1), { role: 'user', content: 'Continue.' }, messages.at(-1)] })).toThrow('missing_tool_results');
+  });
+  it.each([
+    [{ name: 'unknown', arguments: '{}' }, 'unknown_model_tool'],
+    [{ name: 'add', arguments: '{' }, 'invalid_model_tool_arguments'],
+    [{ name: 'add', arguments: '{"x":"invalid"}' }, 'invalid_model_tool_arguments'],
+  ])('validates every proposal beyond the former limit: %j', (invalid, error) => {
+    const output = batch(20);
+    output.tool_calls[19] = invalid;
+    expect(() => completionResponse(parseChatRequest(chat), done(output))).toThrow(error);
+  });
   it.each([undefined, null])('leaves native output limits unspecified for %s', max_completion_tokens => {
     const route = { bot: 'fixture', model: 'native', deadlineMs: 5000 };
     const result = toInvocation(parseChatRequest({ ...chat, max_completion_tokens }), route, 'r1');
@@ -112,6 +161,28 @@ it('isolates concurrent conversations', async () => {
   const h = await harness(async prompt => ({ content: JSON.parse(prompt.split('CHAT_REQUEST_JSON:\n')[1]).messages[0].content, tool_calls: [] }));
   const results = await Promise.all(['first', 'second'].map(content => h.request({ model: 'reasoner', messages: [{ role: 'user', content }] }).then(r => r.json()) as Promise<any>));
   expect(results.map(r => r.choices[0].message.content)).toEqual(['first', 'second']); expect(h.starts).toBe(2);
+});
+it('returns and replays a complete batch exceeding 16 calls over HTTP', async () => {
+  const chats: Array<{ messages: unknown[] }> = [];
+  const h = await harness(async prompt => {
+    chats.push(JSON.parse(prompt.split('CHAT_REQUEST_JSON:\n')[1]));
+    return chats.length === 1 ? batch(20) : { content: 'done', tool_calls: [] };
+  });
+  const headers = { 'idempotency-key': 'batch' };
+  const first = await h.request(chat, headers);
+  expect(first.status).toBe(200);
+  const body = await first.json() as any;
+  const message = body.choices[0].message;
+  expect(message.tool_calls.map((c: { function: unknown }) => c.function)).toEqual(batch(20).tool_calls);
+  expect(await (await h.request(chat, headers)).json()).toEqual(body);
+  expect(h.starts).toBe(1);
+  const messages = [...chat.messages, message,
+    ...message.tool_calls.map((c: { id: string }) => ({ role: 'tool', tool_call_id: c.id, content: 'ok' }))];
+  const second = await h.request({ ...chat, messages, tool_choice: 'none', parallel_tool_calls: false });
+  expect(second.status).toBe(200);
+  expect((await second.json() as any).choices[0]).toMatchObject({ message: { content: 'done' }, finish_reason: 'stop' });
+  expect(chats[1].messages).toEqual(messages);
+  expect(h.starts).toBe(2);
 });
 it('returns structured deadline failure after native cancellation', async () => {
   const h = await harness(hang, 100);

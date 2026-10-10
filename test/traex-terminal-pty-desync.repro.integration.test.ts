@@ -300,7 +300,7 @@ setInterval(() => {
 
     child.send({
       type: 'message',
-      content: 'third message must remain quarantined',
+      content: 'third message waits behind quarantine',
       turnId: 'om_third',
     } satisfies DaemonToWorker);
     await waitFor(
@@ -316,5 +316,37 @@ setInterval(() => {
       `unconfirmed submit did not quarantine its backend generation\n${logs.join('')}`,
     ).toHaveLength(2);
     expect(logs.join('')).toContain('Quarantined input delivery for backend generation');
-  }, 25_000);
+
+    const successorSubmission = readSubmissions(submissionsPath)[1]!;
+    const successorNativeTurnId = '00000000-0000-7000-8000-000000000335';
+    appendFileSync(
+      rolloutPath,
+      rolloutUser(successorSubmission.text, successorNativeTurnId)
+        + rolloutTerminal(successorNativeTurnId),
+    );
+    await waitFor(
+      child,
+      () => messages.some(message =>
+        message.type === 'turn_terminal' && message.turnId === 'om_successor'),
+      logs,
+      'exact structured terminal for the quarantined submit',
+    );
+    await waitFor(
+      child,
+      () => readSubmissions(submissionsPath)
+        .some(item => item.text === 'third message waits behind quarantine'),
+      logs,
+      'successor release after exact structured terminal',
+    );
+
+    const recoveredSubmissions = readSubmissions(submissionsPath);
+    expect(recoveredSubmissions).toHaveLength(3);
+    expect(recoveredSubmissions.filter(
+      item => item.text === 'successor must stay in BotMux',
+    )).toHaveLength(1);
+    expect(recoveredSubmissions[2]).toEqual({
+      pid: recoveredSubmissions[0]!.pid,
+      text: 'third message waits behind quarantine',
+    });
+  }, 30_000);
 });

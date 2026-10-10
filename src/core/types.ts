@@ -41,7 +41,7 @@ export interface FrozenCard {
   silentIdle?: boolean;
   /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
    *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
-  idleLabel?: 'silent' | 'completed';
+  idleLabel?: 'silent' | 'completed' | 'failed';
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -66,6 +66,10 @@ export interface DaemonSession {
    * only; entries are registered and removed by the final-output delivery
    * pipeline. */
   finalOutputDeliveriesInFlight?: Set<Promise<void>>;
+  /** Same delivery registrations grouped by their exact turn. Terminal-state
+   * receipts wait on only their own turn, so a slow sibling cannot reorder the
+   * visible answer/receipt pair or block an unrelated completion marker. */
+  finalOutputDeliveriesByTurn?: Map<string, Set<Promise<void>>>;
   /** True after the current worker generation has completed init. Kept
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
@@ -430,6 +434,16 @@ export interface DaemonSession {
    *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
    *  完全一致（每个新轮次入口）。内存态，不落盘。 */
   completedIdleTurnId?: string;
+  failedIdleTurnId?: string;
+  /** Last user-visible output carrier observed for each in-flight turn. The
+   *  worker reconstructs explicit-send entries from the durable turn-sends
+   *  journal before publishing turn_terminal; daemon-owned fallback output is
+   *  recorded directly after Lark accepts it. Retained in a bounded map so a
+   *  duplicate terminal can safely retry after an unconfirmed provider error. */
+  turnTerminalCarriers?: Map<string, {
+    messageId: string;
+    kind: 'standard_reply_card' | 'non_patchable';
+  }>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -504,13 +518,14 @@ export interface DaemonSession {
    *  daemon 在构建 CLI 输入前按轮重算（resolveSoloSessionForTurn）；send 模式恒为
    *  false 且不发额外 API。内存态，不持久化——重启后首轮重算即可。 */
   soloSession?: boolean;
-  /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
-   *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
-   *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
-   *  one-slot guard would let A₂ re-post. An entry is claimed BEFORE the reply
-   *  is sent and released if that send fails, so a later replay can compensate
-   *  instead of losing the closure permanently. */
+  /** Backward-compatible dedupe for old sessions that lack a frozen per-turn
+   *  Lark reply context and therefore still use the legacy explicit-@ silent
+   *  receipt. New ordinary Lark turns use terminalReceiptTurnIds instead. */
   silentReceiptTurnIds?: Set<string>;
+  /** Dedupe guard for the independent terminal-state strip. Claimed before
+   *  waiting for the answer delivery and retained when a newer turn supersedes
+   *  it; released only after all bounded send attempts fail. */
+  terminalReceiptTurnIds?: Set<string>;
   /** Latest model reported by the live executor. In-memory and rehydrated from
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
@@ -608,6 +623,8 @@ export interface DaemonSession {
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
   pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
+  settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */

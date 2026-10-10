@@ -217,6 +217,62 @@ export function resolveForwardFollowupWaitMs(env: NodeJS.ProcessEnv = process.en
   return Math.min(MAX_FORWARD_FOLLOWUP_WAIT_MS, Math.max(1, Math.trunc(value)));
 }
 
+const DEFAULT_RECOVERY_FORK_BATCH_SIZE = 5;
+const DEFAULT_RECOVERY_FORK_DELAY_MS = 250;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function parseBoundedInteger(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const normalized = raw?.trim();
+  if (!normalized) return fallback;
+
+  const value = Number(normalized);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+export function resolveRecoveryForkConfig(env: NodeJS.ProcessEnv = process.env): {
+  batchSize: number;
+  delayMs: number;
+} {
+  return {
+    batchSize: parseBoundedInteger(
+      env.BOTMUX_RECOVERY_FORK_BATCH,
+      DEFAULT_RECOVERY_FORK_BATCH_SIZE,
+      1,
+    ),
+    delayMs: parseBoundedInteger(
+      env.BOTMUX_RECOVERY_FORK_DELAY_MS,
+      DEFAULT_RECOVERY_FORK_DELAY_MS,
+      0,
+      MAX_TIMER_DELAY_MS,
+    ),
+  };
+}
+
+const recoveryForkConfig = resolveRecoveryForkConfig();
+
+function resolvePositiveRuntimeTimeout(raw: string | undefined, fallback: number): number {
+  const normalized = raw?.trim();
+  if (!normalized) return fallback;
+
+  const value = Number(normalized);
+  return Number.isFinite(value) && value > 0 && value <= MAX_TIMER_DELAY_MS
+    ? value
+    : fallback;
+}
+
+export function resolveStuckDetectorTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveRuntimeTimeout(env.STUCK_DETECTOR_TIMEOUT_MS, 45_000);
+}
+
+export function resolveWorktreeSlugAiTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS, 5_000);
+}
+
 export const config = {
   lark: {
     appId: process.env.LARK_APP_ID ?? '',
@@ -246,8 +302,8 @@ export const config = {
      *  once spikes CPU/IO, so the re-fork is staggered: spawn `batchSize`
      *  workers, wait `delayMs`, repeat. Tune via BOTMUX_RECOVERY_FORK_BATCH /
      *  BOTMUX_RECOVERY_FORK_DELAY_MS. */
-    recoveryForkBatchSize: Math.max(1, Number(process.env.BOTMUX_RECOVERY_FORK_BATCH) || 5),
-    recoveryForkDelayMs: Math.max(0, Number(process.env.BOTMUX_RECOVERY_FORK_DELAY_MS ?? 250)),
+    recoveryForkBatchSize: recoveryForkConfig.batchSize,
+    recoveryForkDelayMs: recoveryForkConfig.delayMs,
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
@@ -316,7 +372,7 @@ export const config = {
     enabled: (process.env.STUCK_DETECTOR_ENABLED ?? 'true').toLowerCase() !== 'false',
     /** Milliseconds after a write before the detector checks whether the turn
      *  is still unresolved. */
-    timeoutMs: Number(process.env.STUCK_DETECTOR_TIMEOUT_MS) || 45_000,
+    timeoutMs: resolveStuckDetectorTimeoutMs(),
   },
   worktreeSlugAI: {
     /**
@@ -329,7 +385,7 @@ export const config = {
     baseUrl: process.env.BOTMUX_WORKTREE_SLUG_AI_BASE_URL ?? '',
     apiKey: process.env.BOTMUX_WORKTREE_SLUG_AI_API_KEY ?? '',
     model: process.env.BOTMUX_WORKTREE_SLUG_AI_MODEL ?? '',
-    timeoutMs: Number(process.env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS) || 5_000,
+    timeoutMs: resolveWorktreeSlugAiTimeoutMs(),
     /** Extra headers for the API request (JSON string). */
     extraHeaders: (() => {
       try { return JSON.parse(process.env.BOTMUX_WORKTREE_SLUG_AI_EXTRA_HEADERS ?? '{}'); }
@@ -383,6 +439,16 @@ export const config = {
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
   get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
+  // Live getter: machine-wide switch for the reply-card footer brand signature
+  // (default botmux link / per-bot custom brandLabel). Default ON (absent ⇒
+  // shown); an explicit stored false suppresses the brand segment on EVERY bot's
+  // final/broadcast cards (usage/duration/recipient lines are unaffected). Read
+  // live (readGlobalConfig has a 2s TTL) so a Dashboard Settings flip applies to
+  // the next card render without restarting the daemon. Resolved in
+  // bot-registry.resolveBrandLabel, which is the single choke point all card
+  // builders feed; sandboxed one-shot `botmux send` children receive the value
+  // via the worker's env bridge.
+  get cardBrandLabelEnabled(): boolean { return readGlobalConfig().dashboard?.cardBrandLabel !== false; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

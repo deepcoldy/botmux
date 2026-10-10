@@ -255,7 +255,6 @@ function envCommandArgs(env: Record<string, string>): string[] {
 function sharedServerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const safeKeys = [
     'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
-    'TMPDIR', 'TMP', 'TEMP',
     'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR',
     'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'COLORTERM',
   ];
@@ -413,6 +412,7 @@ export class HerdrBackend implements SessionBackend {
 
   claudeJsonlPath?: string;
   cliPid?: number;
+  private cliExecutable?: string;
   cliCwd?: string;
 
   /** Default managed agent name for a Botmux-launched CLI (the single source of
@@ -556,6 +556,7 @@ export class HerdrBackend implements SessionBackend {
     this.cols = opts.cols;
     this.rows = opts.rows;
     this.cliCwd = opts.cwd;
+    this.cliExecutable = basename(opts.cliBin ?? bin);
     // worker.ts builds opts.env via redactChildEnv() (drops bare LARK_APP_*)
     // and injects BOTMUX_SESSION_ID/CHAT_ID/LARK_APP_ID/ROOT_MESSAGE_ID. We
     // must thread this env into the herdr daemon spawn AND the agent-start
@@ -789,6 +790,22 @@ export class HerdrBackend implements SessionBackend {
   }
 
   getChildPid(): number | null {
+    if (this.cliPid) return this.cliPid;
+    if (!this.paneId || !this.cliExecutable || this.exited) return null;
+    // HERDR owns the process, so it is not a child of the worker. Resolve
+    // the exact pane's foreground CLI for the worker's procStart-bound marker.
+    // Retry on later calls when process detection has not caught up yet.
+    const info = jsonCommand(herdrSessionArgs(this.sessionName, [
+      'pane', 'process-info', '--pane', this.paneId,
+    ]))?.result?.process_info;
+    const candidates = (info?.foreground_processes ?? []).filter((p: any) => {
+      const executable = Array.isArray(p.argv) ? p.argv[0] : p.argv0;
+      return typeof executable === 'string'
+        && basename(executable) === this.cliExecutable
+        && Number.isSafeInteger(p.pid) && p.pid > 1 && p.pid !== info.shell_pid;
+    });
+    if (candidates.length !== 1) return null;
+    this.cliPid = candidates[0].pid;
     return this.cliPid ?? null;
   }
 

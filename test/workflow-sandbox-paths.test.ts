@@ -27,6 +27,25 @@ const bot = (extra: Partial<BotConfig> = {}): BotConfig => ({
 } as BotConfig);
 
 describe('blocker #2: sandboxPaths threads through the workflow chain', () => {
+  it('freezes and round-trips wrapperCli', () => {
+    const snap = botToSnapshot(bot({ cliId: 'codex', wrapperCli: 'wrapper codex' }), '/w');
+    expect(snap.wrapperCli).toBe('wrapper codex');
+
+    const frozen = serializeFrozenBotSnapshots(new Map([['app_x', snap]]));
+    const roundTrip = parseFrozenBotSnapshots(JSON.parse(JSON.stringify(frozen)));
+    expect(roundTrip.get('app_x')!.wrapperCli).toBe('wrapper codex');
+  });
+
+  it('keeps historical snapshots without a wrapper and rejects non-string wrapper metadata', () => {
+    const snapshot = botToSnapshot(bot(), '/w');
+    expect(snapshot.wrapperCli).toBeUndefined();
+    const frozen = serializeFrozenBotSnapshots(new Map([['app_x', snapshot]]));
+    expect(parseFrozenBotSnapshots(JSON.parse(JSON.stringify(frozen))).get('app_x')!.wrapperCli).toBeUndefined();
+    const malformed = JSON.parse(JSON.stringify(frozen));
+    malformed.app_x.wrapperCli = { command: 'unexpected' };
+    expect(() => parseFrozenBotSnapshots(malformed)).toThrow('wrapperCli must be a string');
+  });
+
   it('botToSnapshot carries the three tiers', () => {
     const snap = botToSnapshot(bot(), '/w');
     expect(snap.sandboxPaths).toEqual({

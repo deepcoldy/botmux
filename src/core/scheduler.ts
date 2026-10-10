@@ -11,6 +11,8 @@ import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
+import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
 
 export interface ScheduleExecutionContext {
   runId: string;
@@ -32,6 +34,104 @@ let lastTickTz: string | null = null;
  *  fall through to the "primary" daemon (bot-0), matching pre-refactor behavior. */
 let ownerAppId: string | null = null;
 let ownerIsPrimary = false;
+let authorityStore: ScheduleAuthorityStore | null = null;
+let authorityUnavailable: string | null = null;
+
+/** Installed only in daemon processes. CLI processes keep using the JSON
+ * projection for display, but all daemon execution/mutation uses SQLite. */
+export function setScheduleAuthorityStore(store: ScheduleAuthorityStore | null): void {
+  authorityStore = store;
+  authorityUnavailable = null;
+}
+
+/** Keep the daemon alive when authority bootstrap fails, while ensuring the
+ * projection can neither execute nor accept mutations as a fallback. */
+export function setScheduleAuthorityUnavailable(error: unknown): void {
+  authorityStore = null;
+  authorityUnavailable = error instanceof Error ? error.message : String(error);
+}
+
+function assertScheduleAuthorityAvailable(): void {
+  if (authorityUnavailable) {
+    throw new Error(`schedule_authority_store_unavailable: ${authorityUnavailable}`);
+  }
+}
+
+/** Daemon-owned runtime state update used by session materialization/recovery.
+ * Delegated and migrated tasks update the SQLite authority first and then the
+ * JSON projection; standalone callers retain the legacy store behavior. */
+export function updateRuntimeTaskState(
+  id: string,
+  updates: Partial<ScheduledTask>,
+  appId?: string,
+): boolean {
+  assertScheduleAuthorityAvailable();
+  return !!mutateRuntimeTask(id, task => ({ ...task, ...updates }), appId);
+}
+
+export function rollbackUnpublishedRuntimeTask(id: string, appId: string): boolean {
+  assertScheduleAuthorityAvailable();
+  if (!authorityStore?.isInitialized(appId)) return scheduleStore.removeTask(id, appId);
+  const removed = authorityStore.rollbackUnpublishedDirectCreate(appId, id);
+  if (removed) scheduleStore.removeAuthoritativeTaskProjection(id, appId);
+  return removed;
+}
+
+function authorityAppId(appId?: string): string | undefined {
+  const getScope = (scheduleStore as { getScheduleScope?: () => string | null }).getScheduleScope;
+  return appId ?? ownerAppId ?? (typeof getScope === 'function' ? getScope() ?? undefined : undefined);
+}
+
+function runtimeTasks(): ScheduledTask[] {
+  if (authorityUnavailable) return [];
+  if (!authorityStore) return scheduleStore.listTasks();
+  const appId = authorityAppId();
+  if (!appId || !authorityStore.isInitialized(appId)) return scheduleStore.listTasks();
+  return authorityStore.listTasks(appId);
+}
+
+function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
+  if (authorityUnavailable) return;
+  if (!authorityStore) return scheduleStore.getTask(id, appId);
+  const effectiveAppId = authorityAppId(appId);
+  if (!effectiveAppId || !authorityStore?.isInitialized(effectiveAppId)) {
+    return scheduleStore.getTask(id, appId);
+  }
+  const record = authorityStore.getRecord(effectiveAppId, id);
+  return record?.state === 'revoked' ? undefined : record?.task;
+}
+
+function project(task: ScheduledTask): ScheduledTask {
+  try { scheduleStore.projectAuthoritativeTask(task, task.larkAppId); }
+  catch (error) { logger.warn(`[scheduler] failed to refresh projection for ${task.id}: ${error}`); }
+  return task;
+}
+
+function mutateRuntimeTask(
+  id: string,
+  mutate: (task: ScheduledTask) => ScheduledTask | undefined,
+  appId?: string,
+): ScheduledTask | undefined {
+  if (!authorityStore) {
+    const before = scheduleStore.getTask(id, appId);
+    if (!before) return;
+    const next = mutate({ ...before });
+    if (!next) return before;
+    const patch: Record<string, unknown> = {};
+    for (const key of new Set([...Object.keys(before), ...Object.keys(next)])) {
+      if (!Object.is((before as any)[key], (next as any)[key])) patch[key] = (next as any)[key];
+    }
+    if (appId === undefined) scheduleStore.updateTask(id, patch);
+    else scheduleStore.updateTask(id, patch, appId);
+    return next;
+  }
+  const effectiveAppId = authorityAppId(appId);
+  if (effectiveAppId && authorityStore?.isInitialized(effectiveAppId)) {
+    const task = authorityStore.updateTask(effectiveAppId, id, mutate);
+    return task ? project(task) : undefined;
+  }
+  return undefined;
+}
 
 const TICK_INTERVAL_MS = 30_000;          // poll every 30s
 const ONESHOT_GRACE_SECONDS = 120;        // one-shots fire even if <2min late
@@ -105,7 +205,89 @@ function cleanupRemovedTaskSidecars(task: ScheduledTask): void {
 }
 
 function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
-  if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
+  if (!runtimeTask(task.id, task.larkAppId)) cleanupRemovedTaskSidecars(task);
+}
+
+function markRuntimeSkipped(id: string, nextRunAt: string | undefined, runId: string): void {
+  if (!authorityStore) {
+    scheduleStore.markSkipped(id, nextRunAt, runId);
+    return;
+  }
+  mutateRuntimeTask(id, task => {
+    if (task.lastRunId !== runId) return;
+    return { ...task, lastRunAt: new Date().toISOString(), lastStatus: 'skipped',
+      lastError: undefined, lastDeliveryError: undefined,
+      ...(task.parsed.kind === 'once' ? { nextRunAt } : {}) };
+  });
+}
+
+/** Record a calendar block (non-working day / explicit skip) for a claimed run.
+ * Must write the authoritative SQLite row when the store is installed, exactly
+ * like markRuntimeSkipped — otherwise the run stays latched as `running` and
+ * the lastRunId guard blocks every future claim. */
+function markRuntimeCalendarBlocked(
+  id: string,
+  check: NonNullable<ScheduledTask['lastCalendarCheck']>,
+  runId: string,
+): void {
+  if (!authorityStore) {
+    scheduleStore.markCalendarBlocked(id, check, runId);
+    return;
+  }
+  mutateRuntimeTask(id, task => {
+    if (task.lastRunId !== runId) return;
+    return {
+      ...task,
+      lastStatus: check.status === 'error' ? 'error' : 'skipped',
+      lastCalendarCheck: check,
+      lastError: check.status === 'error' ? check.reason : undefined,
+      lastDeliveryError: undefined,
+    };
+  });
+}
+
+/** Persist a passing calendar observation. Under the authority store this must
+ * reach SQLite; the JSON projection alone is rebuilt and never read by tick. */
+function recordRuntimeCalendarCheck(
+  id: string,
+  check: NonNullable<ScheduledTask['lastCalendarCheck']>,
+): void {
+  if (!authorityStore) {
+    scheduleStore.updateTask(id, { lastCalendarCheck: check });
+    return;
+  }
+  mutateRuntimeTask(id, task => ({ ...task, lastCalendarCheck: check }));
+}
+
+function markRuntimeRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  runId?: string,
+): void {
+  if (!authorityStore) {
+    scheduleStore.markRun(id, success, error, deliveryError, runId);
+    return;
+  }
+  if (!runtimeTask(id)) return;
+  mutateRuntimeTask(id, task => {
+    if (runId !== undefined && task.lastRunId !== runId) return;
+    const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
+    const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
+      && repeat.times > 0 && repeat.completed >= repeat.times;
+    return {
+      ...task,
+      lastRunAt: new Date().toISOString(),
+      lastStatus: success ? 'ok' : 'error',
+      lastError: success ? undefined : error,
+      lastDeliveryError: deliveryError,
+      repeat,
+      enabled: finiteComplete || task.parsed.kind === 'once' ? false : task.enabled,
+      disabledReason: finiteComplete || task.parsed.kind === 'once' ? 'once_completed' : task.disabledReason,
+      nextRunAt: finiteComplete || task.parsed.kind === 'once' ? undefined : task.nextRunAt,
+    };
+  });
 }
 
 function recordDispatchOutcome(
@@ -123,9 +305,9 @@ function recordDispatchOutcome(
       const retryAt = Date.now() + TICK_INTERVAL_MS;
       nextRunAt = new Date(scheduledAt ? Math.max(retryAt, Date.parse(scheduledAt)) : retryAt).toISOString();
     }
-    scheduleStore.markSkipped(task.id, nextRunAt, context.runId);
+    markRuntimeSkipped(task.id, nextRunAt, context.runId);
   } else {
-    scheduleStore.markRun(task.id, true, undefined, undefined, context.runId);
+    markRuntimeRun(task.id, true, undefined, undefined, context.runId);
     cleanupIfTaskWasAutoRemoved(task);
   }
   dashboardEventBus.publish({
@@ -504,7 +686,7 @@ function computeGraceSeconds(parsed: ParsedSchedule): number {
 // ─── Tick loop ──────────────────────────────────────────────────────────────
 
 async function tick(): Promise<void> {
-  const tasks = scheduleStore.listTasks();
+  const tasks = runtimeTasks();
   const now = Date.now();
 
   // Re-align to a changed effective timezone before the fire loop.
@@ -528,7 +710,7 @@ async function tick(): Promise<void> {
       const recovered = computeNextRun(task.parsed, task.lastRunAt);
       if (!recovered) continue;
       nextRunAt = recovered;
-      scheduleStore.updateTask(task.id, { nextRunAt });
+      mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt }));
     }
 
     const nextMs = new Date(nextRunAt).getTime();
@@ -542,7 +724,7 @@ async function tick(): Promise<void> {
         const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
         if (newNext) {
           logger.info(`[scheduler] Task "${task.name}" missed window (${Math.round((now-nextMs)/1000)}s late, grace=${grace}s), fast-forward to ${newNext}`);
-          scheduleStore.updateTask(task.id, { nextRunAt: newNext });
+          mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt: newNext }));
           continue;
         }
       }
@@ -555,20 +737,40 @@ async function tick(): Promise<void> {
     // its asynchronous model turn is still in flight. A precondition skip
     // explicitly restores a one-shot retry time in recordDispatchOutcome().
     const newNext = computeNextRun(task.parsed, executionContext.startedAt);
-    const claim = scheduleStore.claimRun(task.id, {
+    const legacyClaim = !authorityStore ? scheduleStore.claimRun(task.id, {
       lastRunAt: executionContext.startedAt,
       nextRunAt: newNext ?? undefined,
       lastRunId: executionContext.runId,
-    });
-    if (!claim.ok) continue;
-    const claimedTask = claim.task;
+    }) : undefined;
+    const claimedTask = legacyClaim
+      ? (legacyClaim.ok ? legacyClaim.task : undefined)
+      : mutateRuntimeTask(task.id, current => {
+          if (current.lastStatus === 'running' || !current.enabled) return;
+          return { ...current, lastRunAt: executionContext.startedAt,
+            nextRunAt: newNext ?? undefined, lastRunId: executionContext.runId,
+            lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
+            // Re-arm for the next cycle: a pending manual flag belongs only to
+            // the run that is being claimed now (mirrors legacy claimRun, which
+            // deletes the field from storage and returns it on the snapshot).
+            manualRunRequested: undefined };
+        });
+    if (!claimedTask || claimedTask.lastRunId !== executionContext.runId) continue;
+    // Mirror claimRun: the claimed snapshot must still carry the manual flag
+    // (it was cleared from storage) so this run is admitted as a manual/dashboard
+    // run, even though future runs are scheduled again.
+    if (!legacyClaim) {
+      const wasManual = !!task.manualRunRequested;
+      if (wasManual) (claimedTask as ScheduledTask).manualRunRequested = true;
+    }
+    // A run requested out-of-band (Dashboard / force-run) is admitted against
+    // the manual calendar check rather than the scheduled non-working-day gate.
     if (claimedTask.manualRunRequested) executionContext.trigger = 'dashboard';
     // Admission uses the locked task snapshot, before any Bash gate/model/message.
     const calendarCheck = executionContext.trigger === 'scheduler'
       ? checkTaskCalendar(claimedTask, claimedTask.larkAppId ?? ownerAppId ?? scheduleStore.getScheduleScope() ?? undefined)
       : manualCalendarCheck(claimedTask);
     if (calendarCheck && calendarCheck.status !== 'bypassed' && !calendarCheck.matches) {
-      scheduleStore.markCalendarBlocked(claimedTask.id, calendarCheck, executionContext.runId);
+      markRuntimeCalendarBlocked(claimedTask.id, calendarCheck, executionContext.runId);
       const status = calendarCheck.status === 'error' ? 'error' : 'skipped';
       logger.info(`[scheduler] Calendar ${calendarCheck.calendar}: ${calendarCheck.reason} (${calendarCheck.date ?? 'unknown date'}), task ${claimedTask.id} ${status}`);
       const appId = claimedTask.larkAppId ?? ownerAppId ?? scheduleStore.getScheduleScope();
@@ -593,7 +795,7 @@ async function tick(): Promise<void> {
     }
     if (calendarCheck) {
       claimedTask.lastCalendarCheck = calendarCheck;
-      scheduleStore.updateTask(claimedTask.id, { lastCalendarCheck: calendarCheck });
+      recordRuntimeCalendarCheck(claimedTask.id, calendarCheck);
     }
     logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) triggered (kind=${claimedTask.parsed.kind})`);
 
@@ -603,7 +805,7 @@ async function tick(): Promise<void> {
         .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
         .catch(err => {
           logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
-          scheduleStore.markRun(taskId, false, err.message, undefined, executionContext.runId);
+          markRuntimeRun(taskId, false, err.message, undefined, executionContext.runId);
           cleanupIfTaskWasAutoRemoved(claimedTask);
           dashboardEventBus.publish({
             type: 'schedule.fired',
@@ -617,7 +819,7 @@ async function tick(): Promise<void> {
           emitScheduleFiredHook(claimedTask, 'error', err);
         });
     } else {
-      scheduleStore.markRun(
+      markRuntimeRun(
         claimedTask.id,
         false,
         'scheduler execute callback is not initialised',
@@ -655,7 +857,7 @@ export function planCronRealign(
  *  scheduleStore.updateTask inside the daemon does not reach them on its own). */
 function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): void {
   for (const u of updates) {
-    scheduleStore.updateTask(u.id, { nextRunAt: u.nextRunAt });
+    mutateRuntimeTask(u.id, task => ({ ...task, nextRunAt: u.nextRunAt }));
     dashboardEventBus.publish({ type: 'schedule.updated', body: { id: u.id, patch: { nextRunAt: u.nextRunAt } } });
   }
 }
@@ -663,10 +865,10 @@ function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): vo
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 export function startScheduler(): void {
-  const startupTasks = scheduleStore.listTasks();
+  const startupTasks = runtimeTasks();
   for (const task of startupTasks) {
     if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
-    scheduleStore.markRun(
+    markRuntimeRun(
       task.id,
       false,
       'schedule run interrupted by daemon restart',
@@ -674,7 +876,7 @@ export function startScheduler(): void {
       task.lastRunId,
     );
   }
-  const tasks = scheduleStore.listTasks();
+  const tasks = runtimeTasks();
   const enabled = tasks.filter(t => t.enabled);
   logger.info(`[scheduler] Starting with ${enabled.length}/${tasks.length} enabled tasks (tick every ${TICK_INTERVAL_MS/1000}s)`);
 
@@ -682,7 +884,7 @@ export function startScheduler(): void {
   for (const task of enabled) {
     if (!task.nextRunAt) {
       const next = computeNextRun(task.parsed, task.lastRunAt);
-      if (next) scheduleStore.updateTask(task.id, { nextRunAt: next });
+      if (next) mutateRuntimeTask(task.id, current => ({ ...current, nextRunAt: next }));
     }
   }
 
@@ -762,6 +964,7 @@ export function addTask(params: {
   /** See ScheduledTask.reasoningEffort. */
   reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
+  assertScheduleAuthorityAvailable();
   const targets = params.chatIds === undefined
     ? { chatId: params.chatId }
     : scheduleStore.normalizeScheduleChatTargets({
@@ -839,8 +1042,90 @@ export function addTask(params: {
     model: params.model?.trim() || undefined,
     reasoningEffort: params.reasoningEffort,
   });
+  if (task.larkAppId && authorityStore?.isInitialized(task.larkAppId)) {
+    authorityStore.createDirect(task);
+    project(task);
+  }
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;
+}
+
+/** Host-daemon only creation path for a one-shot delegated grant. It validates
+ * the same routing invariants as addTask, but commits authority before exposing
+ * the JSON projection. */
+export function commitDelegatedTask(input: {
+  params: Parameters<typeof addTask>[0] & { id: string; larkAppId: string };
+  grantId: string;
+  requestHash: string;
+  control: DelegatedScheduleControl;
+  sourceMessageId: string;
+  sourceSessionId: string;
+  targetTurnId: string;
+  targetGeneration: number;
+  maxTasksPerTurn: number;
+}): CommitDelegatedScheduleResult {
+  assertScheduleAuthorityAvailable();
+  if (!authorityStore?.isInitialized(input.params.larkAppId)) {
+    throw new Error('schedule_authority_store_unavailable');
+  }
+  const params = input.params;
+  const parsed = params.parsed ?? parseSchedule(params.schedule);
+  const targets = scheduleStore.normalizeScheduleChatTargets({
+    chatId: params.chatId,
+    chatIds: params.chatIds,
+  });
+  if ((targets.chatIds ?? [targets.chatId]).length !== 1) throw new Error('delegated_schedule_single_chat_only');
+  const position = params.executionPosition ?? (params.rootMessageId ? 'topic' : 'top-level');
+  if (position !== 'top-level' && position !== 'topic') throw new Error('delegated_schedule_position_denied');
+  if (position === 'topic' && !params.rootMessageId?.trim()) throw new Error('topic_root_required');
+  if (params.followActive || params.deliver === 'new-topic') throw new Error('delegated_schedule_position_denied');
+  const createdAt = new Date().toISOString();
+  const task: ScheduledTask = {
+    id: params.id,
+    name: params.name,
+    schedule: params.schedule,
+    parsed,
+    prompt: params.prompt,
+    workingDir: params.workingDir,
+    chatId: targets.chatId,
+    rootMessageId: position === 'topic' ? params.rootMessageId : undefined,
+    scope: position === 'topic' ? 'thread' : 'chat',
+    executionPosition: position,
+    topicTitle: normalizeTopicTitle(params.topicTitle),
+    chatType: params.chatType,
+    larkAppId: params.larkAppId,
+    creatorChatId: params.creatorChatId,
+    creatorRootMessageId: params.creatorRootMessageId,
+    creatorLarkAppId: params.creatorLarkAppId,
+    // The control principal lives only in the host authority store. Empty
+    // runScopes means the scheduled model turn is intentionally anonymous; it
+    // must not become a generic human TrustedCaller merely because a human
+    // authorized creation.
+    ownerOpenId: undefined,
+    ownerUnionId: undefined,
+    enabled: true,
+    createdAt,
+    nextRunAt: computeNextRun(parsed) ?? undefined,
+    repeat: params.repeat,
+    deliver: 'origin',
+    silent: params.silent === true ? true : undefined,
+    model: params.model?.trim() || undefined,
+    reasoningEffort: params.reasoningEffort,
+  };
+  const result = authorityStore.commitDelegated({
+    appId: params.larkAppId,
+    grantId: input.grantId,
+    requestHash: input.requestHash,
+    task,
+    control: input.control,
+    sourceMessageId: input.sourceMessageId,
+    sourceSessionId: input.sourceSessionId,
+    targetTurnId: input.targetTurnId,
+    targetGeneration: input.targetGeneration,
+    maxTasksPerTurn: input.maxTasksPerTurn,
+  });
+  if (result.ok) project(result.task);
+  return result;
 }
 
 export function normalizeTopicTitle(value: string | undefined): string | undefined {
@@ -867,47 +1152,68 @@ export function resolveTaskExecutionPosition(
 }
 
 export function removeTask(id: string): boolean {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return false;
-  const removed = scheduleStore.removeTask(id);
+  const appId = authorityAppId(task.larkAppId);
+  const removed = appId && authorityStore?.isInitialized(appId)
+    ? authorityStore.revoke(appId, id)
+    : scheduleStore.removeTask(id);
+  if (removed && appId && authorityStore?.isInitialized(appId)) {
+    scheduleStore.removeAuthoritativeTaskProjection(id, appId);
+  }
   if (removed) cleanupRemovedTaskSidecars(task);
   return removed;
 }
 
 export function enableTask(id: string): boolean {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return false;
   // Repeating resume must not move a pending manual request to a future tick.
   if (task.enabled && task.manualRunRequested) return true;
   const next = computeNextRun(task.parsed);
-  scheduleStore.updateTask(id, {
-    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
-  });
+  if (!authorityStore) {
+    scheduleStore.updateTask(id, {
+      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
+    });
+    return true;
+  }
+  mutateRuntimeTask(id, current => ({ ...current,
+    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+    manualRunRequested: undefined }));
   return true;
 }
 
 export function disableTask(id: string): boolean {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return false;
-  scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
+  if (!authorityStore) {
+    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
+    return true;
+  }
+  mutateRuntimeTask(id, current => ({ ...current,
+    enabled: false, disabledReason: 'manual', manualRunRequested: undefined }));
   return true;
 }
 
 export function runTaskNow(id: string): boolean {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return false;
+  if (task.lastStatus === 'running') return false;
   // Ask the owning daemon to execute ASAP by advancing nextRunAt.  Its tick
   // (< 30s) will pick it up.  Previously we invoked executeCallback inline,
   // which was wrong in multi-bot setups — the callback on this daemon may
   // not even be the right bot for this task.
-  const requested = scheduleStore.requestRunNow(id);
-  if (!requested.ok) return false;
+  if (!authorityStore) {
+    const requested = scheduleStore.requestRunNow(id);
+    if (!requested.ok) return false;
+  } else if (!mutateRuntimeTask(id, current => current.lastStatus === 'running'
+    ? undefined : { ...current, nextRunAt: new Date().toISOString() })) return false;
   logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
   return true;
 }
 
 export function getNextRun(id: string): Date | null {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task?.nextRunAt) return null;
   return new Date(task.nextRunAt);
 }
@@ -923,22 +1229,30 @@ export function getNextRun(id: string): Date | null {
  * `schedule.fired` event on completion (success, skip or error).
  */
 export function runNow(id: string): { ok: boolean; error?: string } {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (!executeCallback) return { ok: false, error: 'not_initialised' };
   // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
   // re-fire the same task while this manual run is still in flight.
   const executionContext = createExecutionContext('dashboard');
   const next = computeNextRun(task.parsed, executionContext.startedAt);
-  const claim = scheduleStore.claimRun(id, {
+  const legacyClaim = !authorityStore ? scheduleStore.claimRun(id, {
     lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
     lastRunId: executionContext.runId,
-  });
-  if (!claim.ok) return claim;
-  const claimedTask = claim.task;
+  }) : undefined;
+  const claimedTask = legacyClaim
+    ? (legacyClaim.ok ? legacyClaim.task : undefined)
+    : mutateRuntimeTask(id, current => current.lastStatus === 'running'
+      ? undefined : { ...current, lastRunAt: executionContext.startedAt,
+        nextRunAt: next ?? undefined, lastRunId: executionContext.runId,
+        lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
+        manualRunRequested: undefined });
+  if (!claimedTask || claimedTask.lastRunId !== executionContext.runId) {
+    return { ok: false, error: 'already_running' };
+  }
   claimedTask.lastCalendarCheck = manualCalendarCheck(claimedTask);
-  if (claimedTask.lastCalendarCheck) scheduleStore.updateTask(id, { lastCalendarCheck: claimedTask.lastCalendarCheck });
+  if (claimedTask.lastCalendarCheck) recordRuntimeCalendarCheck(id, claimedTask.lastCalendarCheck);
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
@@ -946,7 +1260,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
     outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      scheduleStore.markRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      markRuntimeRun(claimedTask.id, false, msg, undefined, executionContext.runId);
       cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',
@@ -964,17 +1278,28 @@ export function runNow(id: string): { ok: boolean; error?: string } {
  * `schedule.updated` event.
  */
 export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?: string } {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (task.enabled === enabled
     && (enabled || (task.disabledReason === 'manual' && !task.manualRunRequested))) return { ok: true };
   if (enabled) {
     const next = computeNextRun(task.parsed);
-    scheduleStore.updateTask(id, {
-      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
-    });
+    if (!authorityStore) {
+      scheduleStore.updateTask(id, {
+        enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
+      });
+    } else {
+      mutateRuntimeTask(id, current => ({ ...current,
+        enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+        manualRunRequested: undefined }));
+    }
   } else {
-    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
+    if (!authorityStore) {
+      scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
+    } else {
+      mutateRuntimeTask(id, current => ({ ...current,
+        enabled: false, disabledReason: 'manual', manualRunRequested: undefined }));
+    }
   }
   dashboardEventBus.publish({
     type: 'schedule.updated',
@@ -996,7 +1321,7 @@ export function toggleDelivery(id: string): {
   deliver?: 'origin' | 'new-topic';
   executionPosition?: ScheduleExecutionPosition;
 } {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (task.deliver === 'local') return { ok: false, error: 'local_not_toggleable' };
   const current = resolveTaskExecutionPosition(task);
@@ -1030,9 +1355,8 @@ export function toggleDelivery(id: string): {
   // (undefined in the store; null in the dashboard event so JSON/SSE caches
   // clear it too) — its own root is written back by the first fire.
   const clearsRoot = executionPosition !== 'new-topic' && task.rootMessageId !== undefined;
-  scheduleStore.updateTask(id, clearsRoot
-    ? { scope, executionPosition, rootMessageId: undefined }
-    : { scope, executionPosition });
+  mutateRuntimeTask(id, current => ({ ...current, scope, executionPosition,
+    ...(clearsRoot ? { rootMessageId: undefined } : {}) }));
   const deliver = executionPosition === 'new-topic' ? 'new-topic' : 'origin';
   dashboardEventBus.publish({
     type: 'schedule.updated',
@@ -1072,7 +1396,7 @@ export function updateTask(
   },
   options: { deferEvent?: boolean } = {},
 ): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
-  const task = scheduleStore.getTask(id);
+  const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
 
   let calendar: string | undefined;
@@ -1242,7 +1566,9 @@ export function updateTask(
     patch.manualRunRequested = undefined;
   }
 
-  if (!scheduleStore.updateTask(id, patch)) return { ok: false, error: 'not_found' };
+  if (!mutateRuntimeTask(id, current => ({ ...current, ...patch }))) {
+    return { ok: false, error: 'not_found' };
+  }
   const publishedPatch = { ...patch, ...eventPatch };
   if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
   publishScheduleTaskUpdated(id, publishedPatch);

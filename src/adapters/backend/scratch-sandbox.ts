@@ -60,7 +60,7 @@ import {
 import { join, basename, dirname, isAbsolute, resolve, relative } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { botmuxShimExecLine, reexposeRunBinArgs } from './sandbox.js';
-import { linuxIsolationLaunch } from '../../core/linux-isolation.js';
+import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
 import { PROXY_ENV_KEYS, CA_BUNDLE_ENV_KEYS } from '../../utils/child-env.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
@@ -79,6 +79,8 @@ export interface ScratchSandboxSpawn {
   bin: string;
   /** Launcher args + bwrap args + '--' + original (bin, ...args). */
   args: string[];
+  /** Path to private file containing NUL-separated bwrap options when using args-file launch. */
+  argsFile?: string;
   /** Env overrides merged into childEnv (HOME/path/relay — REAL in-container
    *  paths; the container sees the normal filesystem layout). */
   env: Record<string, string>;
@@ -319,6 +321,9 @@ export interface PrepareScratchOpts {
   home: string;
   cliBin: string;
   cliArgs: string[];
+  /** Transport bwrap options via a private file when launching under a backend
+   *  with command-length limits (tmux new-session). */
+  useBwrapArgsFile?: boolean;
   /** Absolute `botmux` command paths to overlay with the relay shim. */
   shimBindTargets?: readonly string[];
   mcpGatewaySocketPath?: string;
@@ -379,6 +384,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const rolledBack: string[] = [];
   const fail = (where: string): null => {
     console.error(`[scratch-sandbox] setup failed at ${where} — aborting spawn (fail closed, never bare-run)`);
+    for (const p of [...rolledBack].reverse()) unmountAny(p);
+    if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
     if (!isMountpoint(merged)) try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
     return null;
   };
@@ -408,7 +415,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       allowFuseFallback: storage === 'disk',
     });
     if (!mounted) {
-      if (storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
+      if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
       return fail('main-overlay');
     }
     rolledBack.push(merged);
@@ -425,6 +432,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       try { mkdirSync(targetInMerged, { recursive: true }); } catch { /* present from lower */ }
       if (ok && spawnSync('mount', ['--bind', subMerged, targetInMerged], { stdio: 'pipe' }).status === 0) {
         subMounts.push({ mountpoint: m.mountpoint, kind: 'overlay' });
+        rolledBack.push(subMerged);
+        rolledBack.push(targetInMerged);
         return;
       }
       if (ok) unmountAny(subMerged);
@@ -681,15 +690,29 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   args.push('--chdir', cwdCanonical);
   let execBin = opts.cliBin;
   try { execBin = realpathSync(opts.cliBin); } catch { /* keep lexical; fails closed */ }
-  args.push('--', execBin, ...opts.cliArgs);
+  const command = [execBin, ...opts.cliArgs];
+  let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
+  try {
+    compactLaunch = opts.useBwrapArgsFile
+      ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
+      : null;
+  } catch (error) {
+    teardownScratchSession(opts.sessionId, opts.dataDir);
+    throw error;
+  }
+  if (!compactLaunch) args.push('--', ...command);
 
   return {
-    bin: launch.bin,
-    args: [...launch.args, ...args],
+    bin: compactLaunch?.bin ?? launch.bin,
+    args: compactLaunch?.args ?? [...launch.args, ...args],
+    ...(compactLaunch ? { argsFile: compactLaunch.argsFile } : {}),
     env,
     outbox,
     mergedHostPath: merged,
-    cleanup: () => teardownScratchSession(opts.sessionId, opts.dataDir),
+    cleanup: () => {
+      compactLaunch?.cleanup();
+      teardownScratchSession(opts.sessionId, opts.dataDir);
+    },
   };
 }
 

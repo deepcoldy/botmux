@@ -93,6 +93,28 @@ describe('worker memory admission', () => {
     expect(resolveWorkerPressurePolicy(undefined, pressure.totalMemoryBytes).minAvailableMemoryBytes).toBe(2 * GIB);
   });
 
+  it('ignores a total_inactive_file key on cgroup v2 even when present', () => {
+    // v2 memory.stat has no total_* twin — its inactive_file already covers
+    // the whole cgroup tree. Guard the version gate: a stray (or future)
+    // total_inactive_file must never be preferred over inactive_file on v2,
+    // or the working set would be understated by the difference (1 GiB here).
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 64 * GIB,
+      readFile: fixtureReader({
+        '/proc/self/cgroup': '0::/docker/demo\n',
+        '/proc/self/mountinfo': '29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n',
+        '/sys/fs/cgroup/docker/demo/memory.max': String(8 * GIB),
+        '/sys/fs/cgroup/docker/demo/memory.current': String(5 * GIB),
+        '/sys/fs/cgroup/docker/demo/memory.stat': `inactive_file ${3 * GIB}\ntotal_inactive_file ${4 * GIB}\n`,
+        '/sys/fs/cgroup/docker/demo/memory.pressure': 'full avg10=1.00 avg60=0.00 avg300=0.00 total=0\n',
+        '/sys/fs/cgroup/docker/memory.max': 'max\n',
+        '/sys/fs/cgroup/memory.max': 'max\n',
+      }),
+    });
+    expect(pressure.availableMemoryBytes).toBe(6 * GIB);
+  });
+
   it('uses a finite cgroup ancestor when the leaf is unlimited', () => {
     const pressure = readHostMemoryPressure({
       platform: 'linux',
@@ -638,6 +660,41 @@ describe('cgroup-v1 memory admission', () => {
       }),
     });
     expect(pressure.availableMemoryBytes).toBe(6 * GIB);
+  });
+
+  it('uses total_inactive_file for hierarchical v1 usage instead of the leaf-only field', () => {
+    // Real Kubernetes cgroup-v1 shape: memory.usage_in_bytes is hierarchical and is
+    // paired with total_inactive_file. Reading the tiny leaf inactive_file
+    // understates reclaimable cache and falsely rejects a healthy 1 GiB pod.
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 256 * GIB,
+      readFile: fixtureReader({
+        '/proc/self/cgroup': '4:memory:/kubepods/burstable/pod/demo\n',
+        '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+        [`${V1_ROOT}/kubepods/burstable/pod/demo/memory.limit_in_bytes`]: String(GIB),
+        [`${V1_ROOT}/kubepods/burstable/pod/demo/memory.usage_in_bytes`]: '848687104',
+        [`${V1_ROOT}/kubepods/burstable/pod/demo/memory.stat`]: [
+          'inactive_file 32768',
+          'total_inactive_file 400805888',
+        ].join('\n'),
+        [`${V1_ROOT}/kubepods/burstable/pod/memory.limit_in_bytes`]: String(GIB),
+        [`${V1_ROOT}/kubepods/burstable/pod/memory.usage_in_bytes`]: '850771968',
+        [`${V1_ROOT}/kubepods/burstable/pod/memory.stat`]: [
+          'inactive_file 0',
+          'total_inactive_file 400805888',
+        ].join('\n'),
+        [`${V1_ROOT}/kubepods/burstable/memory.limit_in_bytes`]: V1_SENTINEL,
+        [`${V1_ROOT}/kubepods/memory.limit_in_bytes`]: V1_SENTINEL,
+        [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      }),
+    });
+    const decision = evaluateWorkerAdmission(pressure);
+    expect(decision.allowed).toBe(true);
+    expect(decision.pressure.totalMemoryBytes).toBe(GIB);
+    expect(decision.pressure.availableMemoryBytes).toBe(623775744);
+    expect(decision.policy.minAvailableMemoryBytes).toBe(0.25 * GIB);
+    expect(decision.reasons).toEqual([]);
   });
 
   it('falls back to host protection on a v1 host whose whole hierarchy is unlimited', () => {

@@ -4164,7 +4164,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
         sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
         void updateTurnReplyCard(ds, key.turnId, { kind: 'phase', phase: 'stopping' },
-          (body, type, uuid) => deps.sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, key.turnId, { uuid }),
+          (body, type, uuid, beforeWrite) => deps.sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, key.turnId, { uuid, beforeWrite }),
           { dispatchAttempt: key.dispatchAttempt }).catch(error => logger.warn(`[reply-card] stop display: ${error.message}`));
         return { toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
       }

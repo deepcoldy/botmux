@@ -21,6 +21,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mocks = vi.hoisted(() => ({
   replyMessage: vi.fn(async () => 'om_reply'),
   sendMessage: vi.fn(async () => 'om_top'),
+  sendUserMessage: vi.fn(async () => 'om_private'),
   getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
   getMessageDetail: vi.fn(),
   topicRoots: new Map<string, string>(),
@@ -34,7 +35,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
-  return { ...actual, getMessageDetail: mocks.getMessageDetail, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, getChatMode: mocks.getChatMode };
+  return { ...actual, getMessageDetail: mocks.getMessageDetail, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, sendUserMessage: mocks.sendUserMessage, getChatMode: mocks.getChatMode };
 });
 
 vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
@@ -76,6 +77,11 @@ vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
 
 import { createTopicMessageLookupCache } from '../src/cli/topic-send-guard.js';
 import { registerBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { writeRoleReplyPrivately, writeRolePrivateReplyNotice } from '../src/core/role-resolver.js';
 import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
@@ -136,7 +142,10 @@ function seedReceiverSession(): DaemonSession {
 describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    config.session.dataDir = mkdtempSync(join(tmpdir(), 'botmux-private-route-'));
+    mocks.sendUserMessage.mockResolvedValue('om_private');
     mocks.replyMessage.mockReset().mockResolvedValue('om_reply');
+    mocks.getMessageDetail.mockReset();
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
     mocks.topicRoots.clear();
@@ -189,6 +198,88 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     await expect(sessionReply(CHAT, 'next', 'text', APP, 'turn-1')).rejects.toThrow('TOPIC_SEND_BLOCKED');
     expect(mocks.getMessageDetail).toHaveBeenCalledTimes(2);
     expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['om_topic', 'available'], ['om_topic', 'deleted'], ['om_topic', 'network'], ['om_topic', 'unknown'],
+    ['om_frozen', 'available'], ['om_frozen', 'deleted'], ['om_frozen', 'network'], ['om_frozen', 'unknown'],
+  ])('checks source topic %s before private delivery with strict policy: %s', async (root, state) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
+    const ds = seedSharedSession();
+    ds.scope = 'thread';
+    Object.assign(ds.session, {
+      larkAppId: APP, chatType: 'group', scope: 'thread', rootMessageId: 'om_topic',
+      replyTargets: { turn_a: { senderOpenId: 'ou_a', updatedAt: NOW } },
+    });
+    activeSessions.clear();
+    activeSessions.set(sessionKey('om_topic', APP), ds);
+    writeRoleReplyPrivately(APP, CHAT, true);
+    writeRolePrivateReplyNotice(APP, CHAT, 'sent privately');
+    mocks.getMessageDetail.mockImplementation(async () => {
+      if (state === 'network') throw new Error('network unavailable');
+      return { items: state === 'unknown' ? [] : [{ message_id: root, deleted: state === 'deleted' }] };
+    });
+    const cache = createTopicMessageLookupCache(mocks.getMessageDetail);
+    if (state === 'available') await cache.lookup(APP, root);
+    const send = sessionReply('om_topic', 'private answer', 'text', APP, 'turn_a', {
+      topicMessageLookup: cache.lookup,
+      ...(root === 'om_frozen' ? { replyTarget: { mode: 'thread' as const, rootMessageId: root } } : {}),
+    });
+    if (state === 'available') {
+      await expect(send).resolves.toBe('om_private');
+      expect(mocks.sendUserMessage).toHaveBeenCalledExactlyOnceWith(APP, 'ou_a', 'private answer', 'text', undefined);
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    } else {
+      await expect(send).rejects.toThrow(state === 'deleted' ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED');
+      expect(mocks.sendUserMessage).not.toHaveBeenCalled();
+      expect(mocks.replyMessage).not.toHaveBeenCalled();
+    }
+    expect(mocks.getMessageDetail).toHaveBeenCalledExactlyOnceWith(APP, root);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('routes the actual daemon answer privately with group fallback, failure=%s', async failure => {
+    const ds = seedSharedSession();
+    ds.scope = 'thread';
+    Object.assign(ds.session, {
+      larkAppId: APP, chatType: 'group', scope: 'thread', rootMessageId: 'om_topic',
+      quoteTargetId: 'turn_b', quoteTargetSenderOpenId: 'ou_b',
+      replyTargets: { turn_a: { senderOpenId: 'ou_a', updatedAt: NOW } },
+    });
+    activeSessions.clear();
+    activeSessions.set(sessionKey('om_topic', APP), ds);
+    writeRoleReplyPrivately(APP, CHAT, true);
+    writeRolePrivateReplyNotice(APP, CHAT, 'sent privately');
+    if (failure) mocks.sendUserMessage.mockRejectedValueOnce(new Error('DM denied'));
+    const send = sessionReply('om_topic', 'private answer', 'text', APP, 'turn_a');
+    if (failure) {
+      expect(await send).toBe('om_reply');
+      expect(mocks.replyMessage).toHaveBeenCalledExactlyOnceWith(APP, 'om_topic', 'private answer',
+        'text', true, undefined, expect.anything());
+    } else {
+      expect(await send).toBe('om_private');
+      expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_topic', 'sent privately',
+        'text', true, undefined, undefined, { suppressHook: true });
+    }
+    expect(mocks.sendUserMessage).toHaveBeenCalledWith(APP, 'ou_a', 'private answer', 'text', undefined);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'om_command', 'evicted_turn'])('keeps an unregistered %s reply in its topic instead of messaging the last user', async turnId => {
+    const ds = seedSharedSession();
+    ds.scope = 'thread';
+    Object.assign(ds.session, {
+      larkAppId: APP, chatType: 'group', scope: 'thread', rootMessageId: 'om_topic',
+      quoteTargetId: 'turn_b', quoteTargetSenderOpenId: 'ou_b',
+      replyTargets: { turn_b: { senderOpenId: 'ou_b', updatedAt: NOW } },
+    });
+    activeSessions.clear();
+    activeSessions.set(sessionKey('om_topic', APP), ds);
+    writeRoleReplyPrivately(APP, CHAT, true);
+    expect(await sessionReply('om_topic', 'reply', 'text', APP, turnId)).toBe('om_reply');
+    expect(mocks.sendUserMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledExactlyOnceWith(APP, 'om_topic', 'reply',
+      'text', true, undefined, expect.anything());
   });
 
   it('repo-card-style send (interactive, NO turnId) threads into the shared topic, not top-level', async () => {

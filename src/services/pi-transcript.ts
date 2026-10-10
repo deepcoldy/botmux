@@ -483,7 +483,12 @@ export function drainPiTranscript(
     }
 
     if (obj?.type !== 'message' || !obj.message || typeof obj.message !== 'object') continue;
-    const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+    const rawTs = obj.timestamp ?? (obj.message as any)?.timestamp;
+    const ts = typeof rawTs === 'number'
+      ? rawTs
+      : typeof rawTs === 'string'
+        ? Date.parse(rawTs)
+        : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const role = obj.message.role;
 

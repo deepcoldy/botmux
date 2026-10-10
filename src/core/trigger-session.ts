@@ -142,7 +142,11 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       'Your entire reply is returned verbatim to a program as the task result — not shown in a chat.',
       'Output ONLY the final answer. Do NOT include preamble, meta-commentary, or any reasoning about',
       'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
-      'request is…", "here is my answer"). Do not call botmux send; do not post to Feishu/Lark.',
+      'request is…", "here is my answer").',
+      ...(req.options?.allowChatMessages === true ? [
+        'For this turn only, you may call botmux send for messages authorized by the current request in the bound Feishu/Lark group. The request determines whether a message is needed and what it should contain.',
+        'This permission does not carry into later turns. Your final assistant output still returns to the program.',
+      ] : ['Do not call botmux send; do not post to Feishu/Lark.']),
       // 哨兵语义的唯一权威出处（no-transport 会话下 routing/reminder 的 usage_silence
       // 被整块网关掉，见 shared-hints.ts + session-manager buildFollowUpBlocks）。
       // ⚠️ 迁移不删：async settle（#808）**依赖**模型吐出字面 BOTMUX_NOTHING_TO_SEND
@@ -917,6 +921,14 @@ async function triggerSessionTurnAdmitted(
     }
   }
 
+  // Shape checks also protect trusted callers that bypass HTTP validation.
+  if (req.options?.allowChatMessages === true && (req.target.kind !== 'turn'
+    || !req.target.sessionId || req.source.type === 'headless'
+    || !req.options.asyncReturnSessionId || req.options.waitForFinalOutput || req.options.steer
+    || getBot(larkAppId).config.apiOnly === true)) {
+    return { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an async turn on an existing real group session without steer' };
+  }
+
   const dryRun = !!req.options?.dryRun;
   const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
@@ -924,6 +936,8 @@ async function triggerSessionTurnAdmitted(
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
+  const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
+    && req.presentation.topicMessage.trim().length > 0;
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);
   const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
@@ -1156,6 +1170,18 @@ async function triggerSessionTurnAdmitted(
     }
   }
 
+  // Reuse durable receipts before requiring an active group. Only a new
+  // dispatch (including a reserved-lease takeover) needs a live binding.
+  if (req.options?.allowChatMessages === true) {
+    const bound = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
+    if (!bound
+      || !larkTransportEnabled({ chatId: bound.chatId, apiOnly: false })
+      || bound.chatType !== 'group' || bound.larkAppId !== larkAppId
+      || (req.target.chatId && req.target.chatId !== bound.chatId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an existing real group session with Lark transport' };
+    }
+  }
+
   const rootMessageId = typeof req.target.rootMessageId === 'string' ? req.target.rootMessageId.trim() : '';
   let ds = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
   if (req.target.sessionId && !ds) {
@@ -1204,7 +1230,22 @@ async function triggerSessionTurnAdmitted(
   // group's one chat-scope session. Explicit rootMessageId is a stricter target:
   // it always routes to that thread anchor after daemon-side chat ownership check.
   const regularGroupMode: ChatReplyMode = httpVirtual ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
+  // Only `shared` mode needs the real chat topology to decide the explicit-seed
+  // route: it keeps the one shared session UNLESS the chat is actually a topic
+  // group, which always splits (the topic rule externalEventOpensOwnTopic
+  // enforces below). In every other mode the decision is mode-only, so defer
+  // the chat lookup to the new-session path — this also keeps dryRun free of
+  // the chats API call (it returns before that later lookup).
+  const explicitChatMode = hasExplicitTopicMessage && !rootMessageId && !req.target.sessionId && !httpVirtual
+    && regularGroupMode === 'shared'
+    ? await getChatMode(larkAppId, chatId, { forceRefresh: true }) : undefined;
+  // Connector owner's explicit non-empty seed requests its own thread in every
+  // regular-group mode except a flat `shared` group; a shared-mode chat that is
+  // really a topic group still opens the thread (topic-group rule wins).
+  const opensExplicitTopic = hasExplicitTopicMessage
+    && (regularGroupMode !== 'shared' || explicitChatMode === 'topic');
   if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual
+      && !opensExplicitTopic
       && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
@@ -1688,14 +1729,14 @@ async function triggerSessionTurnAdmitted(
       error: `模型 ${effectiveModel || '（Agent 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
     };
   }
-  const chatMode: ChatMode = httpVirtual
+  const chatMode: ChatMode = explicitChatMode ?? (httpVirtual
     ? 'group'
-    : await getChatMode(larkAppId, chatId, { forceRefresh: true });
+    : await getChatMode(larkAppId, chatId, { forceRefresh: true }));
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
   const shouldOpenOwnTopic = !rootMessageId
     && !httpVirtual
-    && externalEventOpensOwnTopic(chatMode, regularGroupMode);
+    && (opensExplicitTopic || externalEventOpensOwnTopic(chatMode, regularGroupMode));
   if (shouldOpenOwnTopic && topicMessage !== null) {
     anchor = await sendMessage(larkAppId, chatId, topicMessage);
     scope = 'thread';

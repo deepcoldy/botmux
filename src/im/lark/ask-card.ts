@@ -394,21 +394,26 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     // 未 settle：只用 action/buttons，避免 form+select 被飞书服务端静默丢弃。
     elements.push({ tag: 'hr' });
 
-    const requiresSubmit = ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect);
+    const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
+    const requiresSubmit = textReplyRequired || ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect || q.defaultSelectedKeys !== undefined);
     const selections = ask.selections ?? ask.questions.map(() => []);
 
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
+
+      const prompt = textReplyRequired && q.options.length
+        ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt;
 
       // 问题标题
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(prompt, 512, locale))}`,
         },
       });
 
+      if (textReplyRequired) continue; // A batch with text inputs is answered in conversation.
       const selected = new Set(selections[i] ?? []);
       const optionButtons = q.options.map((opt) => ({
         tag: 'button',
@@ -435,7 +440,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
       appendActionRows(elements, optionButtons, optionLayout);
     }
 
-    if (requiresSubmit) {
+    if (requiresSubmit && !textReplyRequired) {
       elements.push({ tag: 'hr' });
       // 空提交二次确认：用户一个选项都没勾就点了提交，且至少有一问是多选（多选允许
       // 「一个都不选」，但极可能是手滑）。第一次拦下来、渲染警示 + 把 Submit 按钮的
@@ -478,7 +483,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     elements.push({
       tag: 'note',
       elements: [
-        { tag: 'plain_text', content: t('card.ask.custom_reply_hint', undefined, locale) },
+        { tag: 'plain_text', content: t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
       ],
     });
   }

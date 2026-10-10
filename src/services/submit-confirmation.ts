@@ -91,6 +91,8 @@ export interface CurrentDeferredSubmitConfirmationSettlement {
   stale: false;
   action: SubmitConfirmationAction;
   cliSessionId?: string;
+  /** Positive native ownership reported by the recheck, when the adapter can prove it. */
+  ownershipProven?: boolean;
   recheckError?: unknown;
   lifecycle: 'confirmed' | 'verification-finished' | 'unchanged';
 }
@@ -153,11 +155,13 @@ export async function settleDeferredSubmitConfirmation(
 
   let recheckSubmitted = false;
   let cliSessionId: string | undefined;
+  let ownershipProven = false;
   let recheckError: unknown;
   if (input.recheck) {
     try {
       const result = await input.recheck();
       recheckSubmitted = typeof result === 'boolean' ? result : result.submitted === true;
+      ownershipProven = typeof result === 'object' && !!result && result.ownershipProven === true;
       cliSessionId = typeof result === 'object' && result && typeof result.cliSessionId === 'string'
         ? result.cliSessionId
         : undefined;
@@ -194,6 +198,7 @@ export async function settleDeferredSubmitConfirmation(
     stale: false,
     action,
     ...(cliSessionId ? { cliSessionId } : {}),
+    ...(ownershipProven ? { ownershipProven: true } : {}),
     ...(recheckError !== undefined ? { recheckError } : {}),
     lifecycle,
   };

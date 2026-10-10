@@ -495,6 +495,24 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().httpProxy).toBeUndefined();
   });
 
+  it('keeps schedule delegation issuance and execution revocation independent', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { createEnabled: true, runEnabled: false,
+        defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
+        maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
+        selfManageEnabled: true, ignored: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toEqual({
+      createEnabled: true,
+      runEnabled: false,
+      defaultOnDispatchFromBotAppIds: ['cli_orchestrator'],
+      maxTasksPerTurn: 128,
+      runScopes: ['bytedcli'],
+      selfManageEnabled: true,
+    });
+  });
+
   it('ignores a non-string / blank httpProxy', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: 123 }));
     expect(readGlobalConfig().httpProxy).toBeUndefined();

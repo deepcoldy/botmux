@@ -1,3 +1,4 @@
+import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
  * `/config` 远程编辑 bot 运营字段。与 oncall-store / grant-prefs-store / brand-store
@@ -106,13 +107,14 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'lang', configKey: 'lang', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['zh', 'en'], hint: '机器人 UI 语言 zh|en；unset 回全局默认' },
   { key: 'skillInjection', configKey: 'skillInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['global', 'prompt', 'off'], hint: 'botmux skills 注入方式（仅影响 codex/gemini 等全局 skills 目录的 CLI）：prompt=注入会话不落全局盘(默认)｜global=装进 CLI 全局目录(会被独立 CLI 看到)｜off=只留提示+botmux --help；切到/离开 global 需重启 daemon 才完全生效；unset 回机器级默认' },
   { key: 'defaultWorkingDir', configKey: 'defaultWorkingDir', kind: 'dir', effect: 'next-session', clearable: true, hint: '新话题默认工作目录（跳过仓库选择卡片）' },
-  { key: 'brandLabel', configKey: 'brandLabel', kind: 'string', effect: 'immediate', clearable: true, hint: '卡片页脚品牌文案；unset 回默认 botmux 链接' },
+  { key: 'brandLabel', configKey: 'brandLabel', kind: 'string', effect: 'immediate', clearable: true, hint: '卡片页脚品牌文案；unset 回默认 “Powered by botmux with ❤”' },
   { key: 'usageDisplay', configKey: 'usageDisplay', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['streaming', 'footer', 'off'], hint: '用量显示位置:streaming=流式卡正文(默认)｜footer=回复卡页脚｜off=不显示' },
   { key: 'showReplyTiming', configKey: 'showReplyTiming', kind: 'boolean', effect: 'immediate', clearable: false, hint: '最终回复页脚分别显示等待和执行耗时 on|off（默认 off）；等待含排队/准备，缺失计时则不显示' },
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
+  { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=name|off；unset 恢复默认' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex 普通飞书对话' },
@@ -781,6 +783,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
       try {
         const parsed = JSON.parse(s);
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
+        if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);

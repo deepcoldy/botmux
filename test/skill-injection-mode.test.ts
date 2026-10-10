@@ -139,12 +139,12 @@ describe('skill injection-mode resolution', () => {
 
 describe('resolveSkillInjectionSupport (dashboard control class)', () => {
   it('classifies the whole CLI matrix by capability', () => {
-    // claude-family (incl. the relay/seed forks), pi, oh-my-pi → dynamic --plugin-dir / --skill injection
-    for (const id of ['claude-code', 'seed', 'relay', 'pi', 'oh-my-pi'] as const) {
+    // claude-family (incl. the relay/seed forks), cursor, pi, oh-my-pi → dynamic --plugin-dir / --skill injection
+    for (const id of ['claude-code', 'seed', 'relay', 'cursor', 'pi', 'oh-my-pi'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('dynamic');
     }
     // global skills-dir CLIs → the global|prompt|off knob applies
-    for (const id of ['codex', 'gemini', 'opencode', 'cursor', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
+    for (const id of ['codex', 'gemini', 'opencode', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('global');
     }
     // no skill mechanism → control hidden

@@ -688,6 +688,8 @@ export function prepareDirectSandbox(opts: {
   home: string;
   cliBin: string;
   cliArgs: string[];
+  /** Host-backed, per-session scratch directory already admitted by policy. */
+  tempDir?: string;
   /** Absolute Botmux command paths already persisted in CLI MCP configs.
    * Bind the worker-generated relay shim at those exact paths so a stale or
    * tampered host wrapper cannot replace the trusted gateway entry. */
@@ -891,6 +893,11 @@ export function prepareDirectSandbox(opts: {
     SESSION_DATA_DIR: dataDir,
     BOTMUX_SEND_RELAY: outbox,
     PATH: ['/run/sbxbin', ...canonicalExecDirs, process.env.PATH ?? ''].filter(Boolean).join(':'),
+    ...(opts.tempDir ? {
+      TMPDIR: opts.tempDir,
+      TMP: opts.tempDir,
+      TEMP: opts.tempDir,
+    } : {}),
   };
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
@@ -1165,7 +1172,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
-  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id']);
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate']);
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
@@ -1181,6 +1188,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       }
       if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
         return { ok: false, error: 'dispatch --chat-id is invalid' };
+      }
+      if ((f === '--delegate' || f === '--no-delegate') && v !== 'schedule:create') {
+        return { ok: false, error: `dispatch ${f} only supports schedule:create` };
       }
       flags.push(f, v); i++; continue;
     }

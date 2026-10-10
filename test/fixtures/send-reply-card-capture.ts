@@ -1,6 +1,7 @@
 import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
+import { __setLoopbackTransportForTests } from '../../src/core/loopback-fetch.js';
 
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
@@ -32,6 +33,13 @@ const topicLookups = new Map<string, number>();
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
     data = { code: 0, data: { message_id: 'om_separate_message' } };
+  } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATE) {
+    const state = process.env.BOTMUX_TEST_TOPIC_STATE;
+    data = { code: 0, data: { items: state === 'missing' ? [] : [{
+      message_id: url.pathname.split('/').at(-1),
+      ...(state === 'unknown' ? {} : { deleted: state === 'deleted' }),
+      body: { content: '{"text":"hello"}' },
+    }] } };
   } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATES) {
     const id = url.pathname.split('/').at(-1)!;
     const states = JSON.parse(process.env.BOTMUX_TEST_TOPIC_STATES);
@@ -53,6 +61,22 @@ const topicLookups = new Map<string, number>();
   }
   return { data, status: 200, statusText: 'OK', headers: {}, config };
 };
+if (process.env.BOTMUX_TEST_DURABLE_SEND === '1') {
+  __setLoopbackTransportForTests(async (url, init) => {
+    const target = new URL(url);
+    const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+    console.log('CAPTURE_DURABLE=' + JSON.stringify({
+      method: init.method,
+      path: target.pathname,
+      body,
+    }));
+    return new Response(JSON.stringify({
+      ok: true,
+      kind: 'delivered',
+      messageId: 'om_durable_message',
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+}
 // Any non-SDK network request also fails closed; this fixture never contacts Feishu.
 globalThis.fetch = async () => { throw new Error('Unexpected test fetch'); };
 process.argv = [process.execPath, './src/cli.ts', ...process.argv.slice(2)];

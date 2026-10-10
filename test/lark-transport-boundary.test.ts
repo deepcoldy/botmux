@@ -157,4 +157,11 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
       data: { partial_element: JSON.stringify({ img_key: 'img_x' }), sequence: 3, uuid: 'u3' },
     });
   });
+
+  it('returns an available successful patch timestamp without inventing one for empty acknowledgements', async () => {
+    getBotMock.mockReturnValue(bot(false));
+    fakeClient.im.v1.message.patch.mockResolvedValueOnce({ code: 0, data: { update_time: '1791280000456' } } as any);
+    await expect(updateMessage(NORMAL, 'om', '{}', true)).resolves.toEqual({ update_time: '1791280000456' });
+    await expect(updateMessage(NORMAL, 'om', '{}')).resolves.toBeUndefined();
+  });
 });

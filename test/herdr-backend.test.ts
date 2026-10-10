@@ -192,6 +192,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 // ─── Backend connection surface ────────────────────────────────────────────
@@ -678,6 +679,7 @@ describe('HerdrBackend.spawn', () => {
   });
 
   it('keeps the machine-wide shared server credential-neutral while passing env to its agent', () => {
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) vi.stubEnv(key, '/session/scratch');
     let listCount = 0;
     setHerdrResponses([
       {
@@ -700,16 +702,18 @@ describe('HerdrBackend.spawn', () => {
     });
     be.spawn('claude', [], {
       cwd: '/work', cols: 80, rows: 24,
-      env: { BOTMUX_SESSION_ID: 'topic1' },
+      env: { BOTMUX_SESSION_ID: 'topic1', TMPDIR: '/session/scratch', TMP: '/session/scratch', TEMP: '/session/scratch' },
       injectEnv: { ANTHROPIC_AUTH_TOKEN: 'bot-secret' },
     });
 
     const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
     expect(serverSpawn?.[2].env.BOTMUX_SESSION_ID).toBeUndefined();
     expect(serverSpawn?.[2].env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(serverSpawn?.[2].env[key]).toBeUndefined();
     const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
     expect(startOpts?.env?.BOTMUX_SESSION_ID).toBe('topic1');
     expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('bot-secret');
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(startOpts?.env?.[key]).toBe('/session/scratch');
     be.kill();
   });
 
@@ -1804,5 +1808,52 @@ describe('HerdrBackend callbacks', () => {
     expect(nextCohort.length).toBe(0);
 
     be.kill();
+  });
+});
+
+
+describe('HERDR CLI process identity', () => {
+  it.each(['claude', 'codex'])('resolves %s in an existing pane and retries missing/ambiguous results', cli => {
+    let processes: any[] = [];
+    setHerdrResponses([{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: 10, foreground_processes: processes } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    Object.assign(be, { paneId: 'exact-pane', cliExecutable: cli });
+    expect(be.getChildPid()).toBeNull();
+    processes = [{ pid: 20, argv: ['/bin/helper', cli] }, { pid: 21, argv: ['/bin/' + cli] }, { pid: 22, argv0: cli }];
+    expect(be.getChildPid()).toBeNull();
+    processes = [{ pid: 10, argv0: cli }, { pid: 21, argv: ['/bin/' + cli] }, { pid: 20, argv: ['/bin/helper', cli] }];
+    expect(be.getChildPid()).toBe(21);
+    expect(herdrCall('process-info')).toEqual(['--session', SESSION, 'pane', 'process-info', '--pane', 'exact-pane']);
+    be.kill();
+  });
+});
+
+
+describe('HERDR spawn publishes a usable CLI PID', () => {
+  it.each(['claude', 'codex'])('resolves freshly launched %s', cli => {
+    setManagedLaunchResponses(cli, [{ match: a => a.includes('process-info'), reply: () => JSON.stringify({
+      result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 21, argv: ['/native/' + cli] }] } },
+    }) }]);
+    const be = new HerdrBackend(SESSION);
+    try {
+      be.spawn('/native/' + cli, [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(be.getChildPid()).toBe(21);
+    } finally { be.kill(); }
+  });
+  it.each(['claude', 'codex'])('resolves reattached %s', cli => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('existing-pane') },
+      { match: a => a.includes('process-info'), reply: () => JSON.stringify({
+        result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 21, argv0: cli }] } },
+      }) },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    try {
+      be.spawn(cli, [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+      expect(be.getChildPid()).toBe(21);
+    } finally { be.kill(); }
   });
 });

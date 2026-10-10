@@ -66,7 +66,7 @@ describe('/close card delivery through the real session lifecycle', () => {
   it('patches a thread live card once without posting a second closed card', async () => {
     const f = fixture({ streamCardId: 'om_live' });
     await f.close();
-    expect(f.patch).toHaveBeenCalledExactlyOnceWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'));
+    expect(f.patch).toHaveBeenCalledExactlyOnceWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'), { beforeWrite: expect.any(Function) });
     expect(f.reply).not.toHaveBeenCalled();
     expect(f.ephemeral).not.toHaveBeenCalled();
     expect(sessionStore.getSession(f.ds.session.sessionId)?.status).toBe('closed');
@@ -114,7 +114,7 @@ describe('/close card delivery through the real session lifecycle', () => {
       expect(f.reply).not.toHaveBeenCalled();
       release();
       await vi.waitFor(() => expect(f.patch).toHaveBeenCalledTimes(2));
-      expect(f.patch).toHaveBeenLastCalledWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'));
+      expect(f.patch).toHaveBeenLastCalledWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'), { beforeWrite: expect.any(Function) });
       expect(workerPool.scheduleCardPatch(f.ds, 'late working')).toBe(false);
     } finally {
       release?.();

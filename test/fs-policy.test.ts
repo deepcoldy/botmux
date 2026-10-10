@@ -314,6 +314,7 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-port').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/cursor-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/omp-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/extensions/pi-turn-boundary-extension.js').access).toBe('readOnly');
@@ -361,6 +362,8 @@ describe('buildFsPolicy', () => {
     // schedules moved into per-bot BOT_HOMEs: the legacy shared path is no
     // longer granted (own store rides the BOT_HOME rw; sibling stores denied).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite-wal').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('none'); // sibling store
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
     // sibling session stores stay deny-by-default: neither the store DIR nor any
@@ -796,7 +799,7 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(policyAssembly).toBeGreaterThan(precreate);
     expect(src).toContain("relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)");
     expect(src).toContain('mandatoryDenyPaths.push(canonicalManagedSessionsRoot)');
-    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir])');
+    expect(src).toContain('extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir])');
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {

@@ -23,6 +23,7 @@ import {
 import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
+import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -30,6 +31,128 @@ export const CONFIG_UNSET = '__unset__';
 /** 流式卡片上下文占用百分比变色/高亮的缺省阈值（dashboard.contextCompactThreshold
  *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
 export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
+
+export type TurnTerminalReceiptKind = 'completed' | 'silent';
+
+/** Independent, low-visual-weight terminal marker used when auto mode cannot
+ * patch the last visible carrier (for example a file, voice, or custom card).
+ * It is deliberately headerless and action-free: the answer/progress messages
+ * keep their own presentation while this final strip only answers whether the
+ * agent is still working or has returned control to the user. */
+export function buildTurnTerminalReceiptCard(
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
+    body: {
+      direction: 'vertical',
+      padding: '8px 12px 8px 12px',
+      elements: [{
+        tag: 'markdown',
+        text_size: 'notation_small_v2',
+        content: `<font color='grey'>${t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)}</font>`,
+      }],
+    },
+  });
+}
+
+const TURN_TERMINAL_RECEIPT_ELEMENT_ID = 'botmux_turn_terminal_receipt';
+
+function findCardElementById(value: unknown, elementId: string): any | undefined {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = findCardElementById(child, elementId);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const element = value as Record<string, unknown>;
+  if (element.element_id === elementId) return element;
+  for (const key of ['elements', 'columns', 'actions', 'extra'] as const) {
+    const found = findCardElementById(element[key], elementId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function withoutKnownTurnTerminalReceipt(content: string): string {
+  const known = [
+    t('worker.turn_terminal_receipt.completed', undefined, 'zh'),
+    t('worker.turn_terminal_receipt.silent', undefined, 'zh'),
+    t('worker.turn_terminal_receipt.completed', undefined, 'en'),
+    t('worker.turn_terminal_receipt.silent', undefined, 'en'),
+  ];
+  let result = content;
+  for (const label of known) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    result = result.replace(new RegExp(`\\s*·\\s*(?:<font color=['\"]grey['\"]>)?${escaped}(?:<\\/font>)?\\s*$`), '');
+  }
+  return result.trimEnd();
+}
+
+function appendTurnTerminalReceiptToFooter(content: string, label: string): string {
+  const outerGrey = /^(<font color=['"]grey['"]>)([\s\S]*)(<\/font>)$/.exec(content);
+  if (outerGrey) {
+    const base = withoutKnownTurnTerminalReceipt(outerGrey[2]);
+    return `${outerGrey[1]}${base} · ${label}${outerGrey[3]}`;
+  }
+  const base = withoutKnownTurnTerminalReceipt(content);
+  return `${base} · <font color='grey'>${label}</font>`;
+}
+
+/** Merge the daemon-owned terminal state into an existing standard BotMux
+ * reply card. Prefer the canonical footer so the card keeps one bottom divider
+ * and one compact metadata/status line. Cards without a footer receive only a
+ * small trailing line, without another divider. The source card is read back
+ * from Lark immediately before this patch, so late feedback/control mutations
+ * are preserved. Undefined means the message is no longer a patchable Card 2.0
+ * payload and the caller must use the independent-strip fallback instead. */
+export function appendTurnTerminalReceiptToCard(
+  cardJson: string,
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): string | undefined {
+  let card: any;
+  try {
+    card = JSON.parse(cardJson);
+  } catch {
+    return undefined;
+  }
+  if (!card || card.schema !== '2.0' || !card.body || !Array.isArray(card.body.elements)) {
+    return undefined;
+  }
+  const label = t(`worker.turn_terminal_receipt.${kind}`, undefined, locale);
+  const terminalElement = {
+    tag: 'markdown',
+    element_id: TURN_TERMINAL_RECEIPT_ELEMENT_ID,
+    text_size: 'notation_small_v2',
+    content: `<font color='grey'>${label}</font>`,
+  };
+
+  // Migrate cards patched by the first implementation: remove its standalone
+  // terminal line and the immediately preceding divider before folding the
+  // same state into the canonical footer.
+  const existing = card.body.elements.findIndex(
+    (element: any) => element?.element_id === TURN_TERMINAL_RECEIPT_ELEMENT_ID,
+  );
+  if (existing >= 0) {
+    card.body.elements.splice(existing, 1);
+    if (existing > 0 && card.body.elements[existing - 1]?.tag === 'hr') {
+      card.body.elements.splice(existing - 1, 1);
+    }
+  }
+
+  const footer = findCardElementById(card.body.elements, REPLY_CARD_FOOTER_ELEMENT_ID);
+  if (footer && typeof footer.content === 'string' && footer.content.trim()) {
+    footer.content = appendTurnTerminalReceiptToFooter(footer.content, label);
+  } else {
+    card.body.elements.push(terminalElement);
+  }
+  return JSON.stringify(card);
+}
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
  *  校验 finite 且 1..100，否则回退默认 80（与 readDashboard 的 lenient 读法一致）。 */
@@ -842,12 +965,12 @@ const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
  *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
  *  - 'completed'：transcript 模式下最终回复卡已投递成功。
  *  只对 idle 生效，其它状态一律忽略。 */
-export type IdleCardLabel = 'silent' | 'completed';
+export type IdleCardLabel = 'silent' | 'completed' | 'failed';
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
   if (v === true) return 'silent';
-  if (v === 'silent' || v === 'completed') return v;
+  if (v === 'silent' || v === 'completed' || v === 'failed') return v;
   return undefined;
 }
 
@@ -870,7 +993,8 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
     case 'idle': {
       const label = normalizeIdleLabel(idleLabel);
       return t(
-        label === 'completed' ? 'card.status.idle_completed'
+        label === 'failed' ? 'card.status.idle_failed'
+          : label === 'completed' ? 'card.status.idle_completed'
           : label === 'silent' ? 'card.status.idle_silent'
             : 'card.status.idle',
         undefined,

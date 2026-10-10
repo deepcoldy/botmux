@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   scratchHostView,
   remapIntoMerged,
+  prepareScratchSandbox,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import {
   scratchMergedRootFor,
@@ -14,9 +15,10 @@ import {
   persistedScratchMappings,
   type ScratchPathMapping,
 } from '../src/services/scratch-host-view.js';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 describe('Linux scratch host-view mapping', () => {
   const merged = '/var/lib/botmux/data/sandboxes/sid-1/root';
@@ -142,5 +144,77 @@ describe('scratchViewPath canonicalises symlink-aliased input (mac /tmp → /pri
     // A definitely-nonexistent path uncovered by any mapping returns as-is.
     const p = '/some/missing/path/that/does/not/exist';
     expect(scratchViewPath(maps, p)).toBe(p);
+  });
+});
+
+describe('prepareScratchSandbox tmux argument transport', () => {
+  it('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
+    const root = mkdtempSync(join(tmpdir(), 'scratch-sbx-tmux-args-'));
+    const dataDir = join(root, 'data');
+    const workingDir = join(root, 'work');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(workingDir, { recursive: true });
+    const denyPaths = Array.from({ length: 360 }, (_, index) => {
+      const path = join(workingDir, `deny-entry-${index}-${'x'.repeat(32)}`);
+      mkdirSync(path, { recursive: true });
+      return path;
+    });
+    let plan: ReturnType<typeof prepareScratchSandbox> = null;
+    try {
+      plan = prepareScratchSandbox({
+        sessionId: 'scratch-long-tmux',
+        dataDir,
+        storage: 'disk',
+        chdir: workingDir,
+        home: root,
+        cliBin: '/bin/printf',
+        cliArgs: ['%s', 'space value', '$literal', 'line\nbreak'],
+        denyPaths,
+        useBwrapArgsFile: true,
+      });
+      if (!plan) return;
+
+      expect(plan.argsFile).toBeDefined();
+      expect(statSync(plan.argsFile!).mode & 0o777).toBe(0o600);
+      expect(Buffer.byteLength([plan.bin, ...plan.args].join('\0'))).toBeLessThan(8 * 1024);
+      expect(plan.args.slice(plan.args.indexOf('--') + 1)).toEqual([
+        realpathSync('/bin/printf'), '%s', 'space value', '$literal', 'line\nbreak',
+      ]);
+      const optionBytes = readFileSync(plan.argsFile!);
+      expect(optionBytes.length).toBeGreaterThan(16 * 1024);
+      expect(optionBytes.includes(Buffer.from('space value'))).toBe(false);
+      plan.cleanup();
+      expect(existsSync(join(dataDir, 'sandboxes', 'scratch-long-tmux'))).toBe(false);
+    } finally {
+      plan?.cleanup();
+      if (plan?.argsFile) expect(existsSync(plan.argsFile)).toBe(false);
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('reclaims the scratch sandbox tree if compact launch preparation rejects invalid argv', () => {
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
+    const root = mkdtempSync(join(tmpdir(), 'scratch-sbx-tmux-invalid-'));
+    const dataDir = join(root, 'data');
+    const workingDir = join(root, 'work');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(workingDir, { recursive: true });
+    const sessionRoot = join(realpathSync(dataDir), 'sandboxes', 'invalid-argv');
+    try {
+      expect(() => prepareScratchSandbox({
+        sessionId: 'invalid-argv',
+        dataDir,
+        storage: 'disk',
+        chdir: workingDir,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: ['invalid\0argument'],
+        useBwrapArgsFile: true,
+      })).toThrow(/NUL/);
+      expect(existsSync(sessionRoot)).toBe(false);
+    } finally {
+      rmSandboxScratch(root);
+    }
   });
 });

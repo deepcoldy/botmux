@@ -102,3 +102,16 @@ export function disarmTriggerFinalSuppression(ds: DaemonSession, turnId: string)
   ds.suppressedTriggerFinalTurns?.delete(turnId);
   if (ds.suppressedTriggerFinalTurns?.size === 0) ds.suppressedTriggerFinalTurns = undefined;
 }
+
+/** Carry internal-result isolation across a worker-confirmed live interruption.
+ * Keep the source entry for trailing events; later independent turns receive
+ * no inheritance event and retain their ordinary reply behavior. */
+export function inheritActiveTurnFinalSuppression(
+  ds: DaemonSession,
+  previousTurnId: string,
+  turnId: string,
+): void {
+  if (isTriggerFinalSuppressed(ds, previousTurnId)) {
+    armTriggerFinalSuppression(ds, turnId);
+  }
+}

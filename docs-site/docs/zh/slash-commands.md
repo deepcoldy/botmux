@@ -33,6 +33,7 @@
 | `/sessions` | 列出当前机器人在本群的活跃话题会话，可直接回到原话题（旧会话安全降级为定位通知） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
 | `@机器人 /project enable\|status\|roles\|disable` | 在当前普通群启用、查看、配置 Agent 角色或退出项目群模式（仅 owner/allowedUsers；不占用会话槽位） |
+| `@机器人 /context-sharing on\|off\|status` | 开启、关闭或查看当前群的后台上下文共享（默认关闭；仅 owner/allowedUsers；不创建会话或启动额外模型回合） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
 | `/introduce` | 让本群机器人互相登记 `open_id`，用于协作时精确 @ 对方 |
@@ -268,6 +269,24 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 - `@机器人 /project disable`：退出项目群模式；未启动的指引卡会取消置顶，已有项目数据会保留以便重新启用后继续。
 
 该命令只支持普通群，且仅 Bot 的 owner/allowedUsers 可以执行。重复执行 `enable` 不会覆盖已在 Dashboard 精选的 Worker 列表或自动纳入策略。Dashboard 可关闭“自动纳入新 Bot”，关闭后严格保留显式 Worker 名单；项目群配置区也会列出同一批 Agent，并可直接跳转到对应群角色编辑器。两种入口没有第二份角色配置。
+
+## 🧠 群上下文共享
+
+在真实飞书群中 @任一由当前部署管理的 Bot：
+
+```text
+@机器人 /context-sharing on
+@机器人 /context-sharing status
+@机器人 /context-sharing off
+```
+
+开关按群生效，默认关闭。开启后，当前部署管理的 Bot 会旁听并保存本群已发布的消息；未被 @ 的 Bot 不会因此启动。它在下一次按原有 @ 规则正常唤醒时，收到自己遗漏的、带来源标注的背景。开关不会改变 @ 提及策略，也不会为补背景额外创建模型回合或会话。
+
+只有该 Bot 的真人 owner/`allowedUsers` 可以查看或修改开关；普通对话授权和其他 Bot 均不具备权限。私聊、API 虚拟会话不支持。配置 `promptInjection=none` 的会话明确不接收自动背景。
+
+默认每轮背景上限为 24,000 字符；保存上限为每群 30 天或 10,000 条。背景占用被唤醒模型的输入 token，但旁听本身不调用模型。范围只含已发布的群消息和资源引用，不含私聊、隐藏推理、未发布工具结果或私有文件。平台历史补拉失败、权限不足或超出保留期时，背景会带不完整范围提示，不会把缺失内容伪装成完整历史。
+
+`status` 和开启结果还会显示撤回事件订阅诊断。只有诊断原因为 `subscribed` 才表示应用配置已验证包含 `im.message.recalled_v1`；这不承诺平台推送 100% 到达。`update_submitted` 表示更新已提交但仍须在飞书开放平台发布新版本。未知、登录会话不可用或过期结果表示历史背景可能暂时保留已撤回消息，应检查该事件订阅后重试。关闭操作不会触发订阅检查或设置流程。
 
 ## 📄 飞书文档评论入口
 

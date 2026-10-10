@@ -390,7 +390,10 @@ describe('target daemon consumes signed message authority', () => {
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
-    const code = ['dispatchUserForTurn', 'targetUserForDelegation', 'refreshTurnCliIdentity'].map(name => {
+    const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
+      'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
+      'delegatedScheduleCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
+      'refreshTurnCliIdentity'].map(name => {
       const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
       if (!fn) throw new Error('Missing production handler');
       return ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -419,9 +422,22 @@ describe('target daemon consumes signed message authority', () => {
         return options.member === false ? [] : ['ou_alice_target'];
       },
       publishTurnCliIdentity, localeForBot: () => 'en', logger: { warn: vi.fn() },
+      parseScheduledTurnId: (turnId: string) => {
+        const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
+        return match?.[1] ?? null;
+      },
+      scheduleAuthorityStore: undefined,
     };
-    const run = new Function('scope', 'with (scope) { ' + code + '; return refreshTurnCliIdentity; }')(scopeValues);
-    return { ds, scopeValues, run: (turnId = 'om_kickoff') => run(ds, turnId), resolveTargetAppOpenId };
+    const handlers = new Function('scope', 'with (scope) { ' + code
+      + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity }; }')(scopeValues);
+    return {
+      ds,
+      scopeValues,
+      run: (turnId = 'om_kickoff') => turnId.startsWith('schedule:')
+        ? handlers.prepareTurnCliIdentity(ds, turnId)
+        : handlers.refreshTurnCliIdentity(ds, turnId),
+      resolveTargetAppOpenId,
+    };
   }
   it.each(['live', 'restored'])('a proven human turn does not depend on the delegation store (%s)', async mode => {
     const h = await targetHarness();
@@ -489,6 +505,28 @@ describe('target daemon consumes signed message authority', () => {
     await h.run('om_unrelated');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).not.toContain('must-not-leak');
+  });
+  it('publishes the persisted bytedcli scope for an exact delegated scheduled turn', async () => {
+    const h = await targetHarness();
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = { id: 'a1b2c3d4', chatId: 'oc_chat' };
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => ({
+      kind: 'delegated', state: 'active', task,
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: ALICE, runScopes: ['bytedcli'], selfManage: true,
+      sourceMessageId: 'om_root',
+    }) };
+    h.scopeValues.authorizeDelegatedScheduleRun = vi.fn(async () => ({
+      task, targetOpenId: 'ou_alice_target',
+    }));
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: {
+      runEnabled: true, runScopes: ['bytedcli'],
+    } });
+    h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-original-user' });
+    await h.run(turnId);
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8'))
+      .toContain('scheduled-original-user');
   });
 });
 

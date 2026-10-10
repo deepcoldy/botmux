@@ -8,7 +8,8 @@ const safe = (text: string) => text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[men
 /** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0. */
 export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 'zh'): Array<Record<string, any>> {
   const { ask } = entry;
-  const submit = ask.questions.length > 1 || ask.questions.some(q => q.multiSelect);
+  const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
+  const submit = textReplyRequired || ask.questions.length > 1 || ask.questions.some(q => q.multiSelect || q.defaultSelectedKeys !== undefined);
   const elements: Array<Record<string, any>> = [];
   const button = (label: string, value: Record<string, string>, type = 'default') => ({
     tag: 'button', text: { tag: 'plain_text', content: label }, type,
@@ -25,7 +26,9 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   });
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   ask.questions.forEach((q, i) => {
-    elements.push({ tag: 'markdown', content: safe(q.prompt) });
+    elements.push({ tag: 'markdown', content: safe(textReplyRequired && q.options.length
+      ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt) });
+    if (textReplyRequired) return; // Keep the batch intact; answer it with one text reply.
     const selected = new Set(ask.selections?.[i] ?? []);
     const buttons = q.options.map(option => ({
       ...button(option.label,
@@ -40,14 +43,14 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
       for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
     }
   });
-  if (submit) {
+  if (submit && !textReplyRequired) {
     if (entry.confirmEmptyArmed) elements.push({ tag: 'markdown', content: t('card.ask.empty_warning', undefined, locale) });
     elements.push(row([button(t(entry.confirmEmptyArmed ? 'card.ask.submit_confirm_empty' : 'card.ask.submit', undefined, locale), {
       action: 'ask_submit', ...(entry.confirmEmptyArmed ? { confirm_empty: 'true' } : {}),
     }, entry.confirmEmptyArmed ? 'danger' : 'primary')]));
   }
   elements.push({ tag: 'markdown', text_size: 'notation', content: [
-    t('card.ask.custom_reply_hint', undefined, locale),
+    t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale),
     `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
     t('card.ask.answerable_talk_members', undefined, locale),
   ].join('\n') });

@@ -1,3 +1,8 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { config } from '../src/config.js';
+import { handleCotThinkingUpdate, abortCotMessage } from '../src/im/lark/cot-message.js';
 import { armTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
 /**
  * Verifies that the `case 'ready'` handler in worker-pool.ts sends
@@ -19,6 +24,7 @@ import { EventEmitter } from 'node:events';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
+const cotRequest = vi.fn();
 const updateMessageMock = vi.fn(async () => {});
 const deleteMessageMock = vi.fn(async () => {});
 const pinMessageMock = vi.fn(async (larkAppId: string, messageId: string) => ({
@@ -69,6 +75,8 @@ vi.mock('../src/bot-registry.js', () => ({
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  normalizeUsageDisplay: vi.fn(() => 'off'),
+  getBotClient: vi.fn(() => ({ request: cotRequest })),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -262,6 +270,70 @@ describe('Worker ready: set_display_mode re-sync', () => {
     setActiveSessionsRegistry(new Map());
   });
 
+  it.each(['ready', 'screen_update', 'fallback'].flatMap(source => ['publish', 'stop', 'replace'].map(outcome => ({ source, outcome }))))(
+    '$source registers the actual first card POST before CoT publication ($outcome)', async ({ source, outcome }) => {
+      getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', cliId: 'claude-code', cotEnabled: true } });
+      cotRequest.mockReset().mockImplementation(async () => ({ code: 0, data: { cot_id: 'cot_order', message_id: 'om_cot_order' } }));
+      let release!: (id: string) => void;
+      const post = new Promise<string>(resolve => { release = resolve; });
+      sessionReplyMock.mockImplementation(() => post);
+      if (source === 'fallback') sessionReplyMock.mockRejectedValueOnce(new Error('streaming POST failed'));
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker, workerReady: source === 'screen_update', workerPort: 9999,
+        streamCardPending: true, streamCardPendingTurnId: 'om_turn_1' });
+      setupActiveWorkerHandlers(ds, worker);
+      worker.emit('message', source === 'screen_update'
+        ? { type: 'screen_update', content: 'working', status: 'working', turnId: 'om_turn_1' }
+        : { type: 'ready', port: 9999, token: 'tok', turnId: 'om_turn_1' });
+      await flush();
+      expect(sessionReplyMock).toHaveBeenCalledTimes(source === 'fallback' ? 2 : 1);
+      expect(handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn_1', entries: [{ kind: 'thinking', text: 'thinking after first card' }] })).toBe(true);
+      await flush();
+      expect(cotRequest).not.toHaveBeenCalled();
+      if (outcome === 'stop') abortCotMessage(ds, 'om_turn_1');
+      if (outcome === 'replace') handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn_2', entries: [{ kind: 'thinking', text: 'new turn only' }] });
+      release('om_starting');
+      await flush(); await flush();
+      expect(cotRequest.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(outcome === 'stop' ? 0 : 1);
+      if (outcome === 'replace') {
+        expect(JSON.stringify(cotRequest.mock.calls)).toContain('new turn only');
+        expect(JSON.stringify(cotRequest.mock.calls)).not.toContain('thinking after first card');
+      }
+      abortCotMessage(ds, outcome === 'replace' ? 'om_turn_2' : 'om_turn_1');
+      await flush();
+    },
+  );
+
+  it.each([0, 1])('waits for both visible hot-start cards when POST %s finishes first', async first => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), 'hot-card-order-'));
+    config.session.dataDir = dataDir;
+    const releases: Array<() => void> = [];
+    const ds = makeDs({ workerReady: true, workerPort: 9999, cotForced: true, streamCardPending: true, streamCardPendingTurnId: 'om_hot' });
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', cliId: 'claude-code', cotEnabled: true, replyCardMode: 'unified' } });
+    cotRequest.mockReset().mockImplementation(async () => ({ code: 0, data: { cot_id: 'cot_hot', message_id: 'om_cot_hot' } }));
+    sessionReplyMock.mockImplementation(() => new Promise<string>(resolve => {
+      const id = `om_hot_card_${releases.length}`; releases.push(() => resolve(id));
+    }));
+    activate(ds);
+    try {
+      const post = postTurnStartingCard(ds, sessionReplyMock, 'om_hot');
+      await vi.waitFor(() => expect(releases).toHaveLength(2));
+      handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_hot', entries: [{ kind: 'thinking', text: 'after both cards' }] });
+      await flush(); expect(cotRequest).not.toHaveBeenCalled();
+      releases[first](); await flush();
+      expect(cotRequest).not.toHaveBeenCalled();
+      releases[1 - first](); await post;
+      await flush(); await flush();
+      expect(cotRequest.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
+      abortCotMessage(ds, 'om_hot'); await flush();
+    } finally {
+      releases.forEach(release => release());
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not let a stale ready Pin continuation recall the successor frozen cards', async () => {
     let resolvePin!: (value: ReturnType<typeof sameAppPin>) => void;
     pinMessageMock.mockImplementationOnce(() => new Promise((resolve) => { resolvePin = resolve; }));
@@ -322,7 +394,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     setupActiveWorkerHandlers(ds, fakeWorker);
     fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
     await primaryEffectsBarrier();
-    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String));
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String), { beforeWrite: expect.any(Function) });
     expect(pinMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card');
     expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_frozen_predecessor');
 
@@ -350,7 +422,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     setupActiveWorkerHandlers(ds, fakeWorker);
     fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
     await flush();
-    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String));
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_restored_card', expect.any(String), { beforeWrite: expect.any(Function) });
 
     ds.streamCardId = 'om_successor';
     rejectRestore(new Error('restored card rejected'));
@@ -1036,6 +1108,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       'app_test',
       'om_lane_restored',
       expect.any(String),
+      { beforeWrite: expect.any(Function) },
     );
     expect(sessionReplyMock).not.toHaveBeenCalled();
     expect(ds.streamCardId).toBe('om_lane_restored');
@@ -1489,6 +1562,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       'app_test',
       'om_fallback_card',
       expect.any(String),
+      { beforeWrite: expect.any(Function) },
     );
     expect(closeSessionMock).not.toHaveBeenCalled();
   });
@@ -1748,7 +1822,9 @@ describe('worker-authoritative handoff live card', () => {
     expect(effects.remove.mock.calls.every(([id]) => id === 'om_previous')).toBe(true);
     expect(ds.streamCardId).toBe('om_manual');
     worker.emit('message', { type: 'screen_update', content: 'manual update', status: 'idle', turnId: 'trg_review' });
-    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_manual', expect.any(String)));
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test', 'om_manual', expect.any(String), { beforeWrite: expect.any(Function) },
+    ));
     expect(reply).not.toHaveBeenCalled();
   });
 

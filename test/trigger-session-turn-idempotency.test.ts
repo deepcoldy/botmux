@@ -96,6 +96,7 @@ import { commitTriggerStreamingCard } from '../src/core/trigger-streaming-card.j
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { config } from '../src/config.js';
+import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 
 const APP = 'local_riff';
 const SID = 'sess_existing';
@@ -703,5 +704,90 @@ describe('exact trigger presentation keeps the persisted reply destination', () 
       nativeStore.init(APP, { owner: false });
       config.session.dataDir = previousDir;
     }
+  });
+});
+
+
+describe('async opt-in group messages', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => [true, false].map(live => ({ cliId, live }))))('scopes permission to one $cliId turn with live=$live, retaining idempotency', async ({ cliId, live }) => {
+    mockGetBot.mockReturnValue({ config: { cliId, apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', worker: live ? { killed: false, send: vi.fn() } as any : null });
+    ds.session.chatId = 'oc_real';
+    const active = activeWith(ds);
+    const req = followUpReq('chat-on'); req.options!.allowChatMessages = true;
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    if (!live) asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'completed result', Date.now(), APP);
+    const second = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(second.ok).toBe(true);
+    expect(second.idempotent).toBe(true);
+    expect(second.triggerId).toBe(first.triggerId);
+    const dispatch = live ? mockSendWorkerInput : mockForkWorker;
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(dispatch.mock.calls[0])).toContain('may call botmux send');
+    const normal = followUpReq('chat-default');
+    await triggerSessionTurn(normal, { larkAppId: APP, activeSessions: active });
+    expect(JSON.stringify(dispatch.mock.calls[1])).toContain('Do not call botmux send; do not post');
+    req.options!.allowChatMessages = false;
+    expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active })).errorCode).toBe('idempotency_conflict');
+  });
+  it.each(['group', 'p2p', 'missing'])('revalidates a reserved takeover for %s', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', chatType: kind === 'p2p' ? 'p2p' : 'group' });
+    ds.session.chatId = 'oc_real';
+    const req = followUpReq('takeover'); req.options!.allowChatMessages = true;
+    const { turnIdempotencyKey: _key, ...options } = req.options!;
+    const requestHash = computeInputHash({ seam: 'turn', sessionId: SID, instruction: req.instruction,
+      envelope: req.envelope, source: req.source, presentation: null, options });
+    idempotencyStore.claim({ ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_old', requestHash,
+      ownerBootId: 'boot-OLD', key: `${SID}\u0000takeover`, now: 1, kind: 'turn' });
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: kind === 'missing' ? new Map() : activeWith(ds) });
+    expect(result.ok).toBe(kind === 'group');
+    expect(mockForkWorker).toHaveBeenCalledTimes(kind === 'group' ? 1 : 0);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    if (kind !== 'group') expect(idempotencyStore.lookup(APP, `${SID}\u0000takeover`, 'turn')?.ownerBootId).toBe('boot-OLD');
+  });
+  it.each(['virtual', 'headless', 'apiOnly', 'p2p', 'missing', 'mismatched-chat', 'wrong-bot', 'steer', 'wait', 'non-async', 'wrong-kind', 'source-headless'])('rejects %s before dispatch', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: kind === 'apiOnly' } });
+    const ds = existingDs({ chatId: kind === 'virtual' ? CHAT : kind === 'headless' ? 'headless_test' : 'oc_real',
+      chatType: kind === 'p2p' ? 'p2p' : 'group', worker: { killed: false, send: vi.fn() } as any });
+    if (kind === 'wrong-bot') ds.larkAppId = 'other';
+    const req = followUpReq('invalid'); req.options!.allowChatMessages = true;
+    if (kind === 'steer') req.options!.steer = true;
+    if (kind === 'wait') req.options!.waitForFinalOutput = true;
+    if (kind === 'non-async') req.options!.asyncReturnSessionId = false;
+    if (kind === 'wrong-kind') req.target.kind = 'card';
+    if (kind === 'source-headless') req.source.type = 'headless';
+    if (kind === 'mismatched-chat') req.target.chatId = 'oc_other';
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: kind === 'missing' ? new Map() : activeWith(ds) });
+    expect(result.ok).toBe(false);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe('completed turn retry after session leaves active map', () => {
+  it.each([false, true])('allowChatMessages=%s retains completed receipt', async allowChatMessages => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_real'; existingRows[0].chatId = 'oc_real';
+    const active = activeWith(ds);
+    const req = followUpReq('completed-retry'); req.options!.allowChatMessages = allowChatMessages;
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'completed result', Date.now(), APP);
+    active.clear();
+    const retry = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(retry.ok).toBe(true);
+    expect(retry.idempotent).toBe(true);
+    expect(retry.triggerId).toBe(first.triggerId);
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result).toMatchObject({ status: 'completed', content: 'completed result' });
+    const changed = { ...req, instruction: 'changed payload' };
+    expect((await triggerSessionTurn(changed, { larkAppId: APP, activeSessions: active })).errorCode).toBe('idempotency_conflict');
+    const fresh = { ...req, options: { ...req.options, turnIdempotencyKey: 'new-key' } };
+    expect((await triggerSessionTurn(fresh, { larkAppId: APP, activeSessions: active })).ok).toBe(false);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mockForkWorker).not.toHaveBeenCalled();
   });
 });

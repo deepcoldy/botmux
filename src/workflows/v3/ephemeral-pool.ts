@@ -248,6 +248,7 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     envPolicy: req.botSnapshot.envPolicy,
     env: deps.resolveBotEnv ? deps.resolveBotEnv(req.botSnapshot.larkAppId)

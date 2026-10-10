@@ -125,8 +125,14 @@ function parseV1ByteValue(raw: string): number | 'max' | undefined {
   return parsed <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(parsed) : undefined;
 }
 
-function parseInactiveFile(raw: string): number | undefined {
-  const match = /^inactive_file\s+(\d+)$/m.exec(raw);
+function parseInactiveFile(raw: string, version: 1 | 2): number | undefined {
+  // cgroup v1's memory.usage_in_bytes is hierarchical. On kernels that expose
+  // both fields, `inactive_file` is local to this cgroup while
+  // `total_inactive_file` includes descendants and therefore matches the usage
+  // scope. Prefer the total only for v1; cgroup v2's `inactive_file` already
+  // describes the current cgroup tree and has no standard total_* twin.
+  const match = (version === 1 ? /^total_inactive_file\s+(\d+)$/m.exec(raw) : undefined)
+    ?? /^inactive_file\s+(\d+)$/m.exec(raw);
   if (!match) return undefined;
   const parsed = Number(match[1]);
   return Number.isSafeInteger(parsed) ? parsed : undefined;
@@ -267,7 +273,7 @@ function readBoundary(
     if (typeof current === 'number') {
       let inactiveFile = 0;
       try {
-        inactiveFile = parseInactiveFile(readFile(posix.join(directory, files.stat))) ?? 0;
+        inactiveFile = parseInactiveFile(readFile(posix.join(directory, files.stat)), version) ?? 0;
       } catch {}
       const workingSet = Math.max(0, current - Math.min(inactiveFile, current));
       availableMemoryBytes = Math.max(0, Math.min(memoryMax, memoryMax - workingSet));

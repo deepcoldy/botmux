@@ -111,6 +111,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
 import { config } from '../src/config.js';
+import { buildExternalEventApplicationContext, buildExternalEventDataContext, buildExternalEventVisibleText, buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
+import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { setBotLookup, setDefaultLocale } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -1294,4 +1296,43 @@ describe('per-bot zero prompt injection', () => {
       expect(buildFollowUpCliInput('原有 bot', 'sid', opts).content).toContain(cliId === 'ebsd' ? 'BotMux service user message' : '<botmux_reminder>');
     });
   }
+});
+
+
+describe('async group message input contract', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => [false, true].map(allowChatMessages => ({ cliId, allowChatMessages }))))(
+    '$cliId carries allowChatMessages=$allowChatMessages through the real builder', ({ cliId, allowChatMessages }) => {
+      const req: TriggerRequest = {
+        source: { type: 'ui', connectorId: 'test' },
+        target: { kind: 'turn', sessionId: 'sid' },
+        envelope: { format: 'text', sourceName: 'test', trusted: false, rawText: 'untrusted event data' },
+        instruction: 'Perform the authorized task',
+        options: { asyncReturnSessionId: true, allowChatMessages },
+      };
+      const application = buildExternalEventApplicationContext(req);
+      const out = buildFollowUpCliInput(buildUntrustedEventPrompt(req, 'trg_test'), 'sid', {
+        cliId, larkAppId: 'app_test', chatId: 'oc_group',
+        codexAppText: buildExternalEventVisibleText(req),
+        codexAppApplicationContext: application,
+        codexAppMessageContext: buildExternalEventDataContext(req, 'trg_test'),
+      });
+      const expected = allowChatMessages ? 'may call botmux send' : 'Do not call botmux send; do not post';
+      if (cliId === 'codex-app') {
+        const entries = Object.entries(out.codexAppInput!.additionalContext!);
+        const policy = entries.filter(([key]) => key.startsWith('botmux_application_context'));
+        expect(policy.every(([, entry]) => entry.kind === 'application')).toBe(true);
+        expect(policy.map(([, entry]) => entry.value).join('')).toBe(application);
+        expect(application).toContain(expected);
+        expect(application).not.toContain('untrusted event data');
+        const data = entries.filter(([key]) => key.startsWith('botmux_message_context'));
+        expect(data.every(([, entry]) => entry.kind === 'untrusted')).toBe(true);
+        expect(data.map(([, entry]) => entry.value).join('')).toContain('untrusted event data');
+        expect(out.codexAppInput!.text).not.toContain('botmux_http_response_mode');
+      } else {
+        expect(out.codexAppInput).toBeUndefined();
+        expect(out.content).toContain(expected);
+        expect(out.content).toContain('untrusted event data');
+        expect(out.content).toContain('BOTMUX_NOTHING_TO_SEND');
+      }
+    });
 });

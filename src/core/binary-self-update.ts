@@ -57,10 +57,9 @@
  *           the matching asset, verify its published SHA-256, then atomically
  *           rename over the target. Nothing else owns that path.
  *
- * A shape we cannot positively identify returns null, and every caller keeps its
- * existing "unsupported install" behaviour. Fail closed: guessing wrong here
- * means either writing into a tree npm owns, or downloading a binary for the
- * wrong libc.
+ * Other binary locations require a manual release installation at the default
+ * launcher path. The original binary is retained; scheduled updates are disabled
+ * until the installed release is running.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import {
@@ -182,7 +181,7 @@ export interface BinarySelfUpdateDeps {
   /** Read the published checksum for `asset`, or null when none is published. */
   fetchChecksum?: (url: string) => Promise<string | null>;
   /** Execute the downloaded candidate before activation (injected for tests). */
-  probeBinary?: (path: string) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stderr?: string | Buffer | null };
+  probeBinary?: (path: string) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stdout?: string | Buffer | null; stderr?: string | Buffer | null };
 }
 
 /**
@@ -280,6 +279,10 @@ export async function replaceStandaloneBinary(
       const raw = probe.error?.message || probe.stderr || `exit ${probe.status ?? probe.signal ?? 'unknown'}`;
       const detail = String(raw).trim().split('\n').slice(0, 8).join(' | ');
       throw new Error(`${asset} 与当前主机不兼容，保留现有版本：${detail || 'candidate probe failed'}`);
+    }
+    const candidateVersion = String(probe.stdout ?? '').trim();
+    if (candidateVersion !== version) {
+      throw new Error(`${asset} 版本校验失败（期望 ${version}，实际 ${candidateVersion || 'unknown'}），保留现有版本`);
     }
     // Atomic swap. NOT a write to `target` — that is ETXTBSY (see header).
     renameSync(tmp, target);

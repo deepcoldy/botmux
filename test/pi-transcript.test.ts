@@ -534,4 +534,18 @@ describe('drainPiTranscript: turn terminal contract', () => {
     expect(result.events.map((e) => e.kind)).toEqual(['user', 'assistant_final']);
     expect(result.pendingTail.startsWith('{"type":"message"')).toBe(true);
   });
+
+  it('parses numeric epoch milliseconds timestamp correctly', () => {
+    const numTs = 1791510055869;
+    const records = [
+      sessionHeader(),
+      { type: 'message', timestamp: numTs, message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } },
+      { type: 'message', timestamp: numTs + 1000, message: { role: 'assistant', content: [{ type: 'text', text: 'world' }], stopReason: 'stop' } },
+    ];
+    const path = writeTranscript(records);
+    const result = drainPiTranscript(path, 0);
+    expect(result.events).toHaveLength(2);
+    expect(result.events[0].timestampMs).toBe(numTs);
+    expect(result.events[1].timestampMs).toBe(numTs + 1000);
+  });
 });

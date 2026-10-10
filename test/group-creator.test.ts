@@ -59,6 +59,11 @@ vi.mock('../src/core/role-resolver.js', () => ({
   writeRoleFile: (...args: any[]) => mockWriteRoleFile(...args),
 }));
 
+const mockNameAvatar = vi.fn();
+const mockPersonalTag = vi.fn();
+vi.mock('../src/services/group-name-avatar.js', () => ({ applyGroupNameAvatar: (...args: any[]) => mockNameAvatar(...args) }));
+vi.mock('../src/services/feed-group-tagger.js', () => ({ addCreatedChatToFeedGroup: (...args: any[]) => mockPersonalTag(...args) }));
+
 import { createGroupWithBots, transferGroupOwner } from '../src/services/group-creator.js';
 
 const CREATOR = 'cli_creator_app';
@@ -89,6 +94,44 @@ describe('createGroupWithBots', () => {
     mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
       ids.map(id => ({ id, ok: true })),
     );
+  });
+
+  it('invites teammates before waiting for optional personal tagging', async () => {
+    let release!: () => void;
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_pending_tag', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    mockPersonalTag.mockReturnValueOnce(new Promise<void>(resolve => { release = resolve; }));
+    const task = createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, OTHER_BOT], name: 'Project',
+      transferOwnerTo: USER_OPEN_ID,
+      customization: { tag: 'Work', userOpenId: USER_OPEN_ID },
+    });
+    try {
+      await vi.waitFor(() => expect(mockPersonalTag).toHaveBeenCalled());
+      expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_pending_tag', [OTHER_BOT]);
+      expect(mockAddBotToChat.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockPersonalTag.mock.invocationCallOrder.at(-1)!);
+    } finally {
+      release();
+      await task;
+    }
+  });
+
+  it('runs avatar before transfer and personal tag after transfer, preserving the group on independent failures', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_custom', invalidBotIds: [], invalidUserIds: [] });
+    mockNameAvatar.mockRejectedValueOnce(new Error('no font'));
+    mockPersonalTag.mockRejectedValueOnce(new Error('no user token'));
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], name: 'Project', transferOwnerTo: USER_OPEN_ID,
+      customization: { tag: 'Work', avatar: 'name', userOpenId: USER_OPEN_ID },
+    });
+    expect(result.chatId).toBe('oc_custom');
+    expect(result.customization).toEqual({ avatarError: 'no font', tagError: 'no user token' });
+    expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+    expect(mockNameAvatar.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!);
+    expect(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockPersonalTag.mock.invocationCallOrder.at(-1)!);
+    expect(mockPersonalTag).toHaveBeenCalledWith(CREATOR, 'oc_custom', USER_OPEN_ID, 'Work');
+    expect(mockCreateChat).toHaveBeenCalledTimes(1);
   });
 
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {

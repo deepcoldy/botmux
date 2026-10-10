@@ -748,7 +748,9 @@ describe('public process and fallback compatibility', () => {
     }, { ...presentation, showProcess: false }));
     expect(card.config).toEqual(canonical.config);
     expect(card.header).toEqual(canonical.header);
-    for (const element of canonical.body.elements) expect(card.body.elements).toContainEqual(element);
+    // The shared-context purpose extends the invisible footer signature only.
+    const visibleElements = JSON.parse(JSON.stringify(card.body.elements).replace(/\u2063/g, ''));
+    for (const element of canonical.body.elements) expect(visibleElements).toContainEqual(element);
     expect(card.body.elements[0].content).toBe('✅ **已完成 · 1.2s**');
     const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
     expect(panel.header.title.content).toBe('📋 本轮记录');

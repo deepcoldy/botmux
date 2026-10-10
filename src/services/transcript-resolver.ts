@@ -295,7 +295,7 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'grok', 'antigravity',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).

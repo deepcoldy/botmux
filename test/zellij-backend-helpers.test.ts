@@ -18,7 +18,27 @@ import {
 import {
   parseZellijVersion,
   isZellijVersionSupported,
+  zellijEnv,
 } from '../src/setup/ensure-zellij.js';
+
+describe('zellij control namespace', () => {
+  it('keeps daemon and worker clients on the same temp namespace without XDG_RUNTIME_DIR', () => {
+    const daemonEnv = zellijEnv({ HOME: '/home/owner' });
+    const workerEnv = zellijEnv({ HOME: '/home/owner', TMPDIR: '/session/one', TMP: '/session/one', TEMP: '/session/one', ZELLIJ: '1' });
+    expect(workerEnv).toEqual(daemonEnv);
+    expect(workerEnv.TMPDIR).not.toBe('/session/one');
+    expect(workerEnv.ZELLIJ).toBeUndefined();
+  });
+
+  it('preserves XDG runtime and passes session temp only to the CLI pane', () => {
+    const env = { TMPDIR: '/session/two', TMP: '/session/two', TEMP: '/session/two', XDG_RUNTIME_DIR: '/run/user/1000' };
+    expect(zellijEnv(env).XDG_RUNTIME_DIR).toBe('/run/user/1000');
+    expect(zellijEnv(env).TMPDIR).not.toBe(env.TMPDIR);
+    const layout = buildLayoutString('/bin/echo', [], { cwd: '/work', cols: 80, rows: 24, env });
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(layout).toContain(`${key}=/session/two`);
+    expect(env.TMPDIR).toBe('/session/two');
+  });
+});
 
 describe('tmuxKeyToBytes', () => {
   it('maps named keys to terminal byte sequences', () => {

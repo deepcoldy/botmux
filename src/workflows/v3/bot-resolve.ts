@@ -78,6 +78,7 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     ...(bot.envPolicy ? { envPolicy: normalizeEnvPolicy(bot.envPolicy) } : {}),
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
+    ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.sandbox === true || bot.sandbox === 'oncall'
       ? { sandbox: true }
@@ -152,6 +153,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliRuntime',
     'cliId',
     'cliPathOverride',
+    'wrapperCli',
     'model',
     'envPolicy',
     'sandbox',
@@ -184,7 +186,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
     }
-    for (const field of ['cliPathOverride', 'model'] as const) {
+    for (const field of ['cliPathOverride', 'wrapperCli', 'model'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
@@ -235,6 +237,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.envPolicy ? { envPolicy: normalizeEnvPolicy(obj.envPolicy) } : {}),
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
       ...(obj.sandbox === 'scratch' ? { sandbox: 'scratch' as const }
         : obj.sandbox === true || obj.sandbox === 'oncall' ? { sandbox: true as const } : {}),

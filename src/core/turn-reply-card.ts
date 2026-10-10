@@ -11,7 +11,8 @@ import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
-import { MessageWithdrawnError, updateMessage, uploadFile } from '../im/lark/client.js';
+import { MessageWithdrawnError, uploadFile } from '../im/lark/client.js';
+import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import {
   normalizeReplyCardMode, TurnReplyCardStore,
@@ -19,9 +20,13 @@ import {
 } from '../services/turn-reply-card.js';
 import { isSubstituteTurn } from './reply-target.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { privateReplyEnabled } from './private-reply.js';
 import { isDocNativeSession, larkTransportEnabled, sessionAnchorId, type DaemonSession } from './types.js';
 
-export type ReplyCardSender = (content: string, msgType: string, uuid: string) => Promise<string>;
+/** Every native write, including overflow files, retains the record owner's gate. */
+export type ReplyCardSender = (
+  content: string, msgType: string, uuid: string, beforeWrite: () => void | Promise<void>,
+) => Promise<string>;
 const modes = new WeakMap<DaemonSession, Map<string, TurnReplyCardMode>>();
 const processStartedAtMs = Date.now();
 
@@ -52,7 +57,7 @@ export function replyCardSandboxBlocked(ds: DaemonSession): boolean {
 /** Freeze display mode per accepted turn. Unsupported entry points keep their
  * established delivery contract, including sandbox, API-only, v3, adoption and VC. */
 export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): TurnReplyCardMode {
-  if (!turnId || replyCardSandboxBlocked(ds)) return 'legacy';
+  if (!turnId || privateReplyEnabled(ds.session) || replyCardSandboxBlocked(ds)) return 'legacy';
   let snapshot = modes.get(ds);
   if (!snapshot) { snapshot = new Map(); modes.set(ds, snapshot); }
   const prior = snapshot.get(turnId);
@@ -91,8 +96,12 @@ export async function updateTurnReplyCard(
   const key = replyCardKey(ds, turnId, options.dispatchAttempt);
   const store = new TurnReplyCardStore(config.session.dataDir);
   const session = ds.session;
+  const chatId = ds.chatId;
+  const anchor = sessionAnchorId(ds);
   const beforeEffect = () => {
     if (ds.session !== session || session.status === 'closed' || options.owns?.() === false
+      || ds.larkAppId !== key.larkAppId || ds.session.sessionId !== key.sessionId
+      || ds.chatId !== chatId || sessionAnchorId(ds) !== anchor
       || getBot(ds.larkAppId).config.apiOnly || isSilentScheduledTurn(ds, turnId)) {
       throw new Error('Reply-card turn no longer owns delivery');
     }
@@ -101,6 +110,11 @@ export async function updateTurnReplyCard(
   if (event.kind === 'terminal' && !event.disconnected) invalidateReplyCardAsks(key, 'Turn finished');
   await store.prepare(key, { mode, chatId: ds.chatId, rootId: sessionAnchorId(ds) });
   const cfg = getBot(ds.larkAppId).config;
+  const groupContextAuthorOrigin = event.kind === 'final' ? readGroupContextAuthorOrigin({
+    appId: ds.larkAppId, chatId: ds.chatId, sessionId: session.sessionId, turnId,
+    nativeSessionId: session.cliSessionId, cliId: session.cliLaunchSnapshot?.cliId ?? session.cliId ?? cfg.cliId,
+    workerGeneration: session.workerGeneration,
+  }) : undefined;
   let usage;
   if (normalizeUsageDisplay(cfg) === 'streaming') {
     try {
@@ -114,7 +128,16 @@ export async function updateTurnReplyCard(
   }
   const transport = {
     usage,
-    beforeEffect, send: (body, uuid) => send(body, 'interactive', uuid), patch: (messageId, card) => updateMessage(ds.larkAppId, messageId, card),
+    beforeEffect,
+    send: async (body, uuid) => {
+      const messageId = await send(body, 'interactive', uuid, beforeEffect);
+      if (messageId && groupContextAuthorOrigin) await observeAcknowledgedGroupPublication(ds.larkAppId, {
+        message_id: messageId, chat_id: ds.chatId, root_id: sessionAnchorId(ds), msg_type: 'interactive', body: { content: body },
+      }, groupContextAuthorOrigin);
+      return messageId;
+    },
+    patch: (messageId, card) => patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, card, sessionAnchorId(ds),
+      groupContextAuthorOrigin, beforeEffect),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     forceVisible: options.forceVisible || ds.cotForced,
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {
@@ -132,7 +155,13 @@ export async function updateTurnReplyCard(
       atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
       const fileKey = await uploadFile(ds.larkAppId, file);
       beforeEffect();
-      return send(JSON.stringify({ file_key: fileKey }), 'file', uuid);
+      beforeEffect();
+      const content = JSON.stringify({ file_key: fileKey });
+      const messageId = await send(content, 'file', uuid, beforeEffect);
+      if (messageId && groupContextAuthorOrigin) await observeAcknowledgedGroupPublication(ds.larkAppId, {
+        message_id: messageId, chat_id: ds.chatId, root_id: sessionAnchorId(ds), msg_type: 'file', body: { content },
+      }, groupContextAuthorOrigin);
+      return messageId;
     },
   } satisfies import('../services/turn-reply-card.js').TurnReplyCardTransport;
   for (let attempt = 0; ; attempt++) {
@@ -217,7 +246,7 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
       if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
     },
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
-    patch: (id, card) => updateMessage(record.larkAppId, id, card),
+    patch: (id, card) => patchPublishedGroupCard(record.larkAppId, record.chatId, id, card, record.rootId),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     render: state => buildTurnReplyCard({ ...state, finalCard: state.finalDelivered ? state.finalCard : undefined }, {
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),

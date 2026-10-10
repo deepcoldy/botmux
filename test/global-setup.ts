@@ -1,8 +1,8 @@
 /**
  * Vitest globalSetup. Runs once before any test file.
  *
- * In e2e mode (BOTMUX_E2E=1, set by scripts/run-e2e.ts) it sweeps stale botmux
- * scheduled tasks left over by previous test runs — tasks whose name matches
+ * When BOTMUX_E2E=1 is set explicitly, it sweeps stale botmux scheduled tasks
+ * left over by previous Vitest-based runs — tasks whose name matches
  * `sched-<digits>` and whose createdAt is older than 1 day. Outside e2e mode
  * this is a no-op so unit tests don't touch the developer's daemon state.
  */

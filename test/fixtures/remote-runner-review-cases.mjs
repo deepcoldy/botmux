@@ -48,7 +48,11 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   }
 
   emit({ type: 'status', requestId: command.requestId, status: 'busy' });
-  if (command.content === 'post-ack-failure-both') {
+  if (command.content === 'progress-newlines') {
+    emit({ type: 'progress', turnId: command.turnId, content: 'line one\nline two\r\nline three\r' });
+    emit({ type: 'progress', turnId: command.turnId, content: '\nline four' });
+    emit({ type: 'final', turnId: command.turnId, content: 'done' });
+  } else if (command.content === 'post-ack-failure-both') {
     emit({ type: 'failure', requestId: command.requestId, turnId: command.turnId,
       code: 'provider_failed', message: 'failed after acknowledgement', status: 'failed', retryable: true });
   } else if (command.content === 'post-ack-failure-turn') {

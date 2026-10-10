@@ -5,7 +5,7 @@ import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type ResumableSession } from './types.js';
 import { opencodeDbPath } from '../../services/opencode-paths.js';
 
 import { delay } from '../../utils/timing.js';
@@ -425,7 +425,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
     // below the measured tmux ceiling.  Over-limit prompts defer to the
     // normal post-start input queue.
-    maxInitialPromptArgBytes: 8192,
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,

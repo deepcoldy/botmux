@@ -57,6 +57,8 @@ export interface ResolvedDashboardSettingsView {
   autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
+  /** Machine-wide reply-card footer brand signature switch. Default ON. */
+  cardBrandLabel: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -237,6 +239,7 @@ export type ApplySettingsWriteError =
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
+  | 'invalid_cardBrandLabel'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -476,6 +479,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_hideCodexRateLimitModelNudge' };
     }
     patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
+  }
+  if ('cardBrandLabel' in obj) {
+    if (typeof obj.cardBrandLabel !== 'boolean') {
+      return { ok: false, error: 'invalid_cardBrandLabel' };
+    }
+    patch.cardBrandLabel = obj.cardBrandLabel;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {

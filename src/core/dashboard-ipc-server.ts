@@ -1,3 +1,4 @@
+import { readTurnRegistration } from './trigger-registration.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
@@ -12,6 +13,7 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
+import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
 import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
 import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
@@ -88,6 +90,8 @@ import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
 import {
   CURRENT_ACTOR_ROUTE,
 } from '../cli/current-actor.js';
+import { CURRENT_EXECUTION_ROUTE, CURRENT_EXECUTION_SCHEMA } from '../cli/current-execution.js';
+import { resolveDaemonCurrentExecution } from './current-execution.js';
 import {
   attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
@@ -189,7 +193,21 @@ import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } fr
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
-import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleMeta, readRoleDispatchCompletionEnabled, writeRoleDispatchCompletionEnabled, type RoleInjectMode } from './role-resolver.js';
+import {
+  getDocSubscription,
+  listAllDocSubscriptions,
+  putDocSubscription,
+  removeDocSubscription,
+  setCommentTriggerMode,
+  setDocCommentPollCursor,
+  docWatchAnchor,
+  isDocNativeWatchSubscription,
+  isPollingDocTriggerMode,
+  type CommentTriggerMode,
+  type DocSubscription,
+} from '../services/doc-subs-store.js';
+import { fetchDocTitle, resolveDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleMeta, readRoleDispatchCompletionEnabled, writeRoleDispatchCompletionEnabled, readRoleReplyPrivately, writeRoleReplyPrivately, readRolePrivateReplyNotice, writeRolePrivateReplyNotice, type RoleInjectMode } from './role-resolver.js';
 import {
   deleteRoleProfileEntry,
   deleteRoleProfileIfEmpty,
@@ -307,6 +325,30 @@ export function setCrossPrincipalInterruptionDisableHandler(
   handler: (() => number | Promise<number>) | null,
 ): void {
   crossPrincipalInterruptionDisableHandler = handler;
+}
+
+export interface DurableSessionSendRequest {
+  daemonSession: DaemonSession;
+  turnId: string;
+  target: DurableLarkOutboxTarget;
+  content: string;
+  msgType: string;
+  providerUuid: string;
+  hookContext?: Record<string, unknown>;
+}
+
+export type DurableSessionSendResult =
+  | { kind: 'delivered'; messageId: string }
+  | { kind: 'ambiguous'; error: string };
+
+let durableSessionSendHandler: ((
+  request: DurableSessionSendRequest,
+) => Promise<DurableSessionSendResult>) | null = null;
+
+export function setDurableSessionSendHandler(
+  handler: ((request: DurableSessionSendRequest) => Promise<DurableSessionSendResult>) | null,
+): void {
+  durableSessionSendHandler = handler;
 }
 import {
   composeRowFromActive,
@@ -853,7 +895,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|durable-send|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -875,6 +917,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // and its private worker IPC state. It intentionally accepts no file/env
   // capability because those are writable by an unconfined same-UID Agent.
   if (method === 'POST' && pathname === CURRENT_ACTOR_ROUTE) return true;
+  if (method === 'POST' && pathname === CURRENT_EXECUTION_ROUTE) return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -1132,6 +1175,29 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
   }
 });
 
+// Like current-actor, even a host-signed request must prove the live socket peer.
+// This route does not resolve a human identity or grant an action permission.
+ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
+  const blocked = { schema: CURRENT_EXECUTION_SCHEMA, status: 'blocked', error: 'current_execution_unverified' };
+  let body: unknown;
+  try { body = await readBoundedJsonBody(req, 1024, 1000); }
+  catch (error) {
+    if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(res, error instanceof IpcBodyTooLargeError ? 413 : 400, blocked);
+  }
+  const sessionId = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as Record<string, unknown>).sessionId : undefined;
+  if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 256) return jsonRes(res, 400, blocked);
+  const peer = resolveLoopbackPeerProcesses({
+    remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
+  });
+  if (!peer.ok) return jsonRes(res, 403, blocked);
+  const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
+  return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
+});
+
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
   try {
@@ -1290,6 +1356,54 @@ ipcRoute('GET', '/api/sessions', (_req, res) => {
   jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
 });
 
+// Host-only, read-only. Reuses the same current talk evaluator as native Ask.
+ipcRoute('POST', '/api/sessions/:sessionId/interaction-context', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const { observeInteractionContext } = await import('./interaction-context.js');
+  const { evaluateAskAnswerTalk } = await import('../im/lark/event-dispatcher.js');
+  try {
+    const result = observeInteractionContext({ trustedHost: true, daemonAppId: cachedLarkAppId, sessionId: params.sessionId, body }, {
+      findActive(id) {
+        const ds = findActiveBySessionId(id);
+        return ds ? { ...ds.session, larkAppId: ds.larkAppId, chatType: ds.chatType } : undefined;
+      },
+      canTalk: evaluateAskAnswerTalk,
+    });
+    return jsonRes(res, result.status, result.body);
+  } catch {
+    return jsonRes(res, 503, { ok: false, error: 'interaction_context_unavailable' });
+  }
+});
+
+// Exact host-installed input bindings. Never added to the session relay allowlist.
+ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  if (!body || body.larkAppId !== cachedLarkAppId) return jsonRes(res, 400, { ok: false, error: 'invalid_input_capture_identity' });
+  const { getInputCaptureRuntime } = await import('./plugins/input-capture/runtime.js');
+  const runtime = getInputCaptureRuntime(cachedLarkAppId);
+  if (!runtime) return jsonRes(res, 503, { ok: false, error: 'input_capture_unavailable' });
+  try {
+    let result: unknown;
+    if (body.operation === 'register') result = runtime.register(params.sessionId, body);
+    else if (body.operation === 'revoke-set') result = runtime.revokeSet(params.sessionId, body.bindings);
+    else if (typeof body.bindingId === 'string' && /^[a-f0-9]{64}$/.test(body.bindingId)) {
+      if (body.operation === 'inspect') result = runtime.inspect(params.sessionId, body.bindingId, { after: body.after, through: body.through });
+      else if (body.operation === 'revoke' && Number.isSafeInteger(body.expectedRevision) && Number(body.expectedRevision) > 0) {
+        result = runtime.revoke(params.sessionId, body.bindingId, Number(body.expectedRevision));
+      } else return jsonRes(res, 400, { ok: false, error: 'invalid_input_capture_operation' });
+    } else return jsonRes(res, 400, { ok: false, error: 'invalid_input_capture_operation' });
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, schemaVersion: 1, result });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    const conflict = /^input_capture_(?:identity|anchor|revision|inputs)_conflict$/.test(message);
+    const invalid = ['invalid_input_capture_conditions', 'invalid_input_capture_page'].includes(message);
+    return jsonRes(res, invalid ? 400 : conflict ? 409 : 503, { ok: false, error: invalid || conflict ? message : 'input_capture_unavailable' });
+  }
+});
+
 // Host-authenticated, session-bound lookup: callers cannot supply arbitrary paths.
 ipcRoute('GET', '/api/sessions/:sessionId/workspace', async (req, res, params) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { error: 'trusted_host_required' });
@@ -1369,6 +1483,53 @@ ipcRoute('GET', '/api/sessions/:sessionId/usage', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { error: 'not_found' });
   jsonRes(res, 200, { usage: getDaemonReplyCardUsageSnapshot(ds) });
+});
+
+/** Session-bound single-message delivery through the primary durable outbox.
+ * The short-lived CLI never receives store credentials or a lease proof. */
+ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req)
+    .catch(() => undefined);
+  if (!body) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  }
+  if (!durableSessionSendHandler) {
+    return jsonRes(res, 409, { ok: false, error: 'durable_primary_unavailable' });
+  }
+  const target = body.target;
+  const hookContext = body.hookContext;
+  if (typeof body.turnId !== 'string'
+      || typeof body.content !== 'string'
+      || typeof body.msgType !== 'string'
+      || typeof body.providerUuid !== 'string'
+      || !target || typeof target !== 'object' || Array.isArray(target)
+      || (hookContext !== undefined
+        && (!hookContext || typeof hookContext !== 'object' || Array.isArray(hookContext)))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_durable_send' });
+  }
+  try {
+    const result = await durableSessionSendHandler({
+      daemonSession: ds,
+      turnId: body.turnId,
+      target: target as DurableLarkOutboxTarget,
+      content: body.content,
+      msgType: body.msgType,
+      providerUuid: body.providerUuid,
+      ...(hookContext === undefined ? {} : { hookContext: hookContext as Record<string, unknown> }),
+    });
+    return result.kind === 'delivered'
+      ? jsonRes(res, 200, { ok: true, ...result })
+      : jsonRes(res, 409, { ok: false, ...result });
+  } catch (error) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 /** Canonical daemon-side close used by the dashboard and `botmux delete`.
@@ -3548,6 +3709,14 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
   }
 });
 
+// Authenticated host API; deliberately outside the core-only public allowlist.
+ipcRoute('GET', '/api/sessions/:sessionId/trigger-registration', (req, res, params) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const keys = url.searchParams.getAll('turnIdempotencyKey');
+  const result = readTurnRegistration(cachedLarkAppId, params.sessionId, keys.length === 1 ? keys[0] : null);
+  jsonRes(res, result.status, result.body);
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const triggerId = url.searchParams.get('triggerId') ?? undefined;
@@ -5534,6 +5703,8 @@ function dashboardRolePayload(larkAppId: string, chatId: string): Record<string,
     hasRole: content !== null,
     injectMode: readRoleInjectMode(larkAppId, chatId),
     dispatchCompletionEnabled: readRoleDispatchCompletionEnabled(larkAppId, chatId),
+    replyPrivately: readRoleReplyPrivately(larkAppId, chatId),
+    privateReplyNotice: readRolePrivateReplyNotice(larkAppId, chatId),
     effectiveContent: effective.content,
     effectiveSource: effective.source,
     effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
@@ -5566,8 +5737,8 @@ ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
-  let body: { content?: unknown; injectMode?: unknown; dispatchCompletionEnabled?: unknown };
-  try { body = await readJsonBody<{ content?: string; injectMode?: string; dispatchCompletionEnabled?: boolean }>(req); }
+  let body: { content?: unknown; injectMode?: unknown; dispatchCompletionEnabled?: unknown; replyPrivately?: unknown; privateReplyNotice?: unknown };
+  try { body = await readJsonBody<{ content?: string; injectMode?: string; dispatchCompletionEnabled?: boolean; replyPrivately?: boolean; privateReplyNotice?: string }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   // injectMode is a per-chat setting that can be updated on its own (no content)
   // — e.g. toggling "inject once" for a chat whose effective role is the team
@@ -5577,13 +5748,23 @@ ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   const dispatchCompletionEnabled = typeof body.dispatchCompletionEnabled === 'boolean'
     ? body.dispatchCompletionEnabled
     : undefined;
+  if (body.replyPrivately !== undefined && typeof body.replyPrivately !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_reply_privately' });
+  }
+  if (body.privateReplyNotice !== undefined
+    && (typeof body.privateReplyNotice !== 'string' || body.privateReplyNotice.length > 500)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_private_reply_notice' });
+  }
   const hasContentField = typeof body.content === 'string';
   const content = hasContentField ? (body.content as string).trim() : '';
-  if (!hasContentField && injectMode === undefined && dispatchCompletionEnabled === undefined) {
+  if (!hasContentField && injectMode === undefined && dispatchCompletionEnabled === undefined
+    && body.replyPrivately === undefined && body.privateReplyNotice === undefined) {
     return jsonRes(res, 400, { ok: false, error: 'role_setting_required' });
   }
   if (hasContentField && !content) return jsonRes(res, 400, { ok: false, error: 'content_required' });
   try {
+    if (typeof body.replyPrivately === 'boolean') writeRoleReplyPrivately(cachedLarkAppId, p.chatId, body.replyPrivately);
+    if (typeof body.privateReplyNotice === 'string') writeRolePrivateReplyNotice(cachedLarkAppId, p.chatId, body.privateReplyNotice);
     if (hasContentField) writeRoleFile(cachedLarkAppId, p.chatId, content);
     if (injectMode !== undefined) writeRoleInjectMode(cachedLarkAppId, p.chatId, injectMode);
     if (dispatchCompletionEnabled !== undefined) writeRoleDispatchCompletionEnabled(cachedLarkAppId, p.chatId, dispatchCompletionEnabled);
@@ -5876,6 +6057,200 @@ ipcRoute('GET', '/api/message-listeners/:chatId/run-preview/:runId', async (_req
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     results: run.results,
+  });
+});
+
+
+// ─── 文档评论监听（doc-watches） ─────────────────────────────────────────────
+// 与飞书侧 `/watch-comment` 同一份存储、同一套语义，只是换了操作面。
+//
+// 授权边界：这些路由不在 dashboard 的 PUBLIC_READ_PATHS 白名单，未认证访客在
+// decideDashboardAuth 已被 401；写操作还要过 canManageHost。本 IPC 面整体挂 HMAC，
+// 唯一持密钥的调用方是 dashboard 进程。协管者能改（与 settings/schedules/groups 同
+// 口径）；要收紧成仅 owner 应在 dashboard 侧用 legacyAuthed，而不是在这里判。
+//
+// 单写者不变量：dashboard 是独立进程，而订阅表写者只有 daemon。所有写入必须像这样
+// 经 IPC 回到 daemon 执行，dashboard 侧绝不能直接 import store 写盘。
+
+/** file_token 形状闸（同 parseDocRef 的 RAW_TOKEN_RE，另收上限防超长键撑大订阅表）。 */
+const DOC_WATCH_FILE_TOKEN_RE = /^[A-Za-z0-9]{20,64}$/;
+function isValidDocFileToken(token: string): boolean {
+  return DOC_WATCH_FILE_TOKEN_RE.test(token);
+}
+
+/** 一行订阅投影给 dashboard，只暴露界面要的字段。 */
+function composeDocWatchRow(sub: DocSubscription): Record<string, unknown> {
+  return {
+    fileToken: sub.fileToken,
+    fileType: sub.fileType,
+    docTitle: sub.docTitle,
+    commentTriggerMode: sub.commentTriggerMode,
+    managedBy: sub.managedBy ?? 'subscribe-lark-doc',
+    workingDir: sub.workingDir,
+    chatId: sub.chatId,
+    scope: sub.scope,
+    // 落点锚：界面据此区分「绑在真实飞书话题/群」与「独立文档 watch 会话」。
+    sessionAnchor: sub.sessionAnchor,
+    sessionId: sub.sessionId,
+    ownerOpenId: sub.ownerOpenId,
+    createdAt: sub.createdAt,
+    lastActivityAt: sub.lastActivityAt,
+    lastOutcome: sub.lastOutcome,
+    lastError: sub.lastError,
+    lastDispatchAt: sub.lastDispatchAt,
+    dispatchCount: sub.dispatchCount ?? 0,
+    pollBaselineReady: sub.pollBaselineReady,
+    pollCursorAt: sub.pollCursorAt,
+    autoCreated: sub.autoCreated === true,
+    autoCreatedBy: sub.autoCreatedBy,
+    autoCreatedAt: sub.autoCreatedAt,
+    larkAppId: cachedLarkAppId,
+  };
+}
+
+ipcRoute('GET', '/api/doc-watches', (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let subs: DocSubscription[];
+  try {
+    subs = listAllDocSubscriptions(config.session.dataDir, cachedLarkAppId);
+  } catch (err) {
+    return jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+  const rows = subs
+    .slice()
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+    .map(composeDocWatchRow);
+  jsonRes(res, 200, { watches: rows });
+});
+
+ipcRoute('PUT', '/api/doc-watches/:fileToken', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidDocFileToken(p.fileToken)) return jsonRes(res, 400, { ok: false, error: 'invalid_file_token' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const mode = body?.commentTriggerMode;
+  if (mode !== 'all' && mode !== 'mention-only' && mode !== 'owner-mention') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  const existing = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
+  if (!existing) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  // 切到 'all' 必须**先清游标、后改 mode**：mention-only 从不进轮询、游标可能极旧，
+  // 若先改 mode 后清游标，两步不是一次原子写，一旦前者成功后者失败（ENOSPC/EIO），
+  // 会留下「mode=all + 陈旧游标 + baselineReady=true」，poller 下一轮就从远古游标
+  // 重放全部历史。先清游标则失败时 mode 仍是 mention-only、根本不进轮询，无重放窗口；
+  // 在 mention-only 上清游标本身也无害（那个模式不读游标）。基线交给 poller 既有建
+  // 基线分支重建，而不是在这里自取 latest（取失败会退化成重放全部历史）。
+  if (isPollingDocTriggerMode(mode) && !isPollingDocTriggerMode(existing.commentTriggerMode)) {
+    setDocCommentPollCursor(config.session.dataDir, cachedLarkAppId, p.fileToken, undefined, false);
+  }
+  if (!setCommentTriggerMode(config.session.dataDir, cachedLarkAppId, p.fileToken, mode)) {
+    return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  }
+  const updated = getDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
+  if (!updated) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  logger.info(`[doc-comment] dashboard set mode=${mode} file=${p.fileToken.slice(0, 12)}${isPollingDocTriggerMode(mode) && !isPollingDocTriggerMode(existing.commentTriggerMode) ? ' (poll baseline reset)' : ''}`);
+  jsonRes(res, 200, { ok: true, watch: composeDocWatchRow(updated) });
+});
+
+ipcRoute('DELETE', '/api/doc-watches/:fileToken', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidDocFileToken(p.fileToken)) return jsonRes(res, 400, { ok: false, error: 'invalid_file_token' });
+  const removed = removeDocSubscription(config.session.dataDir, cachedLarkAppId, p.fileToken);
+  if (!removed) return jsonRes(res, 404, { ok: false, error: 'unknown_doc_watch' });
+  // watch-comment 只依赖应用级评论事件、没有远端订阅可退；旧 subscribe-lark-doc 族
+  // 才有逐文件订阅。best-effort：远端退订失败也不该把本地记录留下（那才是幽灵监听）。
+  if (removed.managedBy !== 'watch-comment') {
+    try {
+      await unsubscribeDocFile(cachedLarkAppId, { fileToken: removed.fileToken, fileType: removed.fileType });
+    } catch (err) {
+      logger.warn(`[doc-comment] dashboard unwatch: remote unsubscribe failed for ${p.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  logger.info(`[doc-comment] dashboard unwatched file=${p.fileToken.slice(0, 12)} (managedBy=${removed.managedBy ?? 'subscribe-lark-doc'})`);
+  jsonRes(res, 200, { ok: true, removed: composeDocWatchRow(removed) });
+});
+
+ipcRoute('POST', '/api/doc-watches', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const docRef = typeof body?.docRef === 'string' ? body.docRef.trim() : '';
+  if (!docRef) return jsonRes(res, 400, { ok: false, error: 'doc_ref_required' });
+  const mode: CommentTriggerMode = body?.commentTriggerMode === 'all'
+    ? 'all'
+    : body?.commentTriggerMode === 'mention-only'
+      ? 'mention-only'
+      : (getBot(cachedLarkAppId).config.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
+
+  // workingDir 走与 /cd、/watch-comment --dir 同一个校验器；刻意不开 autoCreate，
+  // 贴错的路径不该被静默 mkdir 成空目录掩盖掉。
+  let workingDir: string | undefined;
+  if (typeof body?.workingDir === 'string' && body.workingDir.trim()) {
+    const v = validateWorkingDir(body.workingDir.trim());
+    if (!v.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_working_dir', message: v.error });
+    workingDir = v.resolvedPath;
+  }
+
+  let file: { fileToken: string; fileType: string };
+  try {
+    file = await resolveDocFile(cachedLarkAppId, docRef);
+  } catch (err) {
+    return jsonRes(res, 400, { ok: false, error: 'unresolvable_doc', message: err instanceof Error ? err.message : String(err) });
+  }
+  if (!isValidDocFileToken(file.fileToken)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_file_token' });
+  }
+
+  const existing = getDocSubscription(config.session.dataDir, cachedLarkAppId, file.fileToken);
+  // ⚠️ 已绑**真实飞书会话**（话题/群）的订阅必须保住（F3）。文档原生 watch 用内部
+  // anchor（旧 `doc:<token>` 或新 `doc:<token>:watch`），由 isDocNativeWatchSubscription
+  // 统一识别；除此之外（真实 om_/oc_ 绑定）一律沿用，本次登记只改可配置部分。否则
+  // 用户「改一下工作目录」就会把评论落点从群话题搬到独立文档会话，且界面无提示。
+  const keepsExistingBinding = !!existing && !isDocNativeWatchSubscription(existing);
+  const watchAnchor = docWatchAnchor(file.fileToken);
+
+  const reuseBaseline = isPollingDocTriggerMode(mode)
+    && existing?.managedBy === 'watch-comment'
+    && isPollingDocTriggerMode(existing.commentTriggerMode)
+    && existing.pollBaselineReady === true;
+
+  const subscription: DocSubscription = {
+    fileToken: file.fileToken,
+    fileType: file.fileType,
+    sessionAnchor: keepsExistingBinding ? existing!.sessionAnchor : watchAnchor,
+    sessionId: keepsExistingBinding ? existing!.sessionId : undefined,
+    scope: keepsExistingBinding ? existing!.scope : 'chat',
+    chatId: keepsExistingBinding ? existing!.chatId : watchAnchor,
+    commentTriggerMode: mode,
+    managedBy: 'watch-comment',
+    // 沿用原绑定时也沿用原 ownerOpenId（它会被 auto-create session 当 session owner）；
+    // 新建时记本 app 的真人 owner。open_id 是 app-scoped，不能搬别处的 ou_。
+    ownerOpenId: keepsExistingBinding ? existing!.ownerOpenId : getOwnerOpenId(cachedLarkAppId),
+    workingDir: workingDir ?? existing?.workingDir ?? getBot(cachedLarkAppId).config.docRepoMap?.[file.fileToken],
+    pollCursorAt: reuseBaseline ? existing?.pollCursorAt : undefined,
+    pollCursorReplyId: reuseBaseline ? existing?.pollCursorReplyId : undefined,
+    pollBaselineReady: isPollingDocTriggerMode(mode) ? (reuseBaseline ? true : false) : undefined,
+    createdAt: existing?.createdAt ?? Date.now(),
+    // 溯源显式透传（F2）：dashboard 只改配置、不改变「这一行怎么产生的」，陌生人 @
+    // 出来的 auto-sub 经此保存后仍是 auto-sub。对比 /watch-comment 接管刻意不传。
+    autoCreated: existing?.autoCreated,
+    autoCreatedBy: existing?.autoCreatedBy,
+    autoCreatedAt: existing?.autoCreatedAt,
+  };
+  const title = await fetchDocTitle(cachedLarkAppId, file);
+  if (title) subscription.docTitle = title;
+  else if (existing?.docTitle) subscription.docTitle = existing.docTitle;
+
+  // inheritRuntime：重新登记不清零投递计数/最近结局。未决 WS 投递由 put 内部另保。
+  const { previous } = putDocSubscription(config.session.dataDir, cachedLarkAppId, subscription, { inheritRuntime: true });
+  const reboundBinding = !!previous && previous.sessionAnchor !== subscription.sessionAnchor;
+  logger.info(`[doc-comment] dashboard watch → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${subscription.workingDir ? ` wd=${subscription.workingDir}` : ''}${reboundBinding ? ' (rebound)' : previous ? ' (updated)' : ''}${keepsExistingBinding ? ` keep-binding=${existing!.scope}:${existing!.sessionAnchor.slice(0, 12)}` : ''}`);
+  jsonRes(res, 200, {
+    ok: true,
+    watch: composeDocWatchRow(subscription),
+    rebound: reboundBinding,
+    // 界面据此提示「仍绑在原群话题，本次只改了模式/目录」。
+    keptBinding: keepsExistingBinding,
   });
 });
 
@@ -7591,10 +7966,13 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
 
 ipcRoute('PUT', '/api/bot-topic-unavailable-policy', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { topicUnavailablePolicy?: unknown };
-  try { body = await readJsonBody<{ topicUnavailablePolicy?: unknown }>(req); }
+  let body: unknown;
+  try { body = await readJsonBody<unknown>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const value = body.topicUnavailablePolicy;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_topic_unavailable_policy' });
+  }
+  const value = (body as Record<string, unknown>).topicUnavailablePolicy;
   if (value !== 'legacy' && value !== 'stop') return jsonRes(res, 400, { ok: false, error: 'invalid_topic_unavailable_policy' });
   const spec = findConfigField('topicUnavailablePolicy');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });

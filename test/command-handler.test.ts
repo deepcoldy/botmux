@@ -125,6 +125,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  loadBotConfigs: vi.fn(() => [{ larkAppId: 'app-1' }, { larkAppId: 'app-2' }]),
   normalizeUsageDisplay: (cfg: { usageDisplay?: string }) => cfg.usageDisplay ?? 'streaming',
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -309,6 +310,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
   getChatModeStrict: vi.fn(async () => 'topic' as const),
   getMessageThreadId: vi.fn(async () => 'omt_child'),
+  getMessageDetail: vi.fn(),
   // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
   // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
   // scenarios override with mockRejectedValueOnce to exercise the fallback.
@@ -472,11 +474,13 @@ vi.mock('../src/im/lark/doc-comment.js', () => {
     listDocComments: vi.fn(async () => []),
     subscribeDocFile: vi.fn(async () => {}),
     unsubscribeDocFile: vi.fn(async () => {}),
+    fetchDocTitle: vi.fn(async () => undefined),
   };
 });
 
 vi.mock('../src/services/doc-subs-store.js', () => ({
   docWatchAnchor: (fileToken: string) => `doc:${fileToken}:watch`,
+  isPollingDocTriggerMode: (mode?: string) => mode === 'all' || mode === 'owner-mention',
   putDocSubscription: vi.fn(() => ({})),
   removeDocSubscription: vi.fn(),
   listDocSubscriptionsForSession: vi.fn(() => []),
@@ -613,10 +617,10 @@ import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensur
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
-import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
+import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
@@ -780,7 +784,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/context-sharing', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -817,7 +821,7 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(43);
+    expect(DAEMON_COMMANDS.size).toBe(44);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
@@ -1696,6 +1700,7 @@ describe('parseSlashCommandInvocation', () => {
 
 describe('handleCommand', () => {
   beforeEach(() => {
+    vi.mocked(loadBotConfigs).mockReturnValue([{ larkAppId: 'app-1' }, { larkAppId: 'app-2' }] as any);
     vi.clearAllMocks();
     vi.mocked(tagClosedSessionGroup).mockResolvedValue({ status: 'skipped' });
     vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'a'.repeat(64) });
@@ -1753,6 +1758,138 @@ describe('handleCommand', () => {
     vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
     vi.mocked(sessionStore.listSessions).mockReturnValue([]);
     vi.mocked(resumeSession).mockReset();
+  });
+
+  describe('/fork source protection', () => {
+    const writes: string[] = [];
+    beforeEach(() => {
+      writes.length = 0;
+      vi.mocked(getBot).mockImplementation((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, topicUnavailablePolicy: 'stop' } } as any;
+      });
+      vi.mocked(getMessageDetail).mockReset().mockImplementation(async (_app, id) => ({
+        items: [{ message_id: id, deleted: false, ...(id === 'msg_001' ? { root_id: ROOT_ID } : {}) }],
+      }) as any);
+      // Execute the actual captured guard; a parameter-only assertion would
+      // miss callbacks that read mutable state or skip source queries.
+      vi.mocked(replyMessage).mockImplementation(async (...args) => {
+        await args[7]?.beforeWrite?.(); writes.push('reply'); return 'om_new_panel';
+      });
+      vi.mocked(sendMessage).mockImplementation(async (...args) => {
+        await args[6]?.beforeWrite?.(); writes.push('send'); return 'om_child_seed';
+      });
+    });
+    const parent = (scope: 'chat' | 'thread' = 'thread') => makeDaemonSession({ scope,
+      session: makeSession({ scope, forkPanelCardId: 'om_old_panel' }) });
+
+    it.each(['deleted', 'unknown', 'error'] as const)('keeps the old panel when the source is %s', async mode => {
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => {
+        if (mode === 'error') throw new Error('read timeout');
+        return { items: [{ message_id: id, ...(mode === 'unknown' ? {} : { deleted: true }) }] } as any;
+      });
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual([]); expect(sendMessage).not.toHaveBeenCalled();
+      expect(replyMessage).toHaveBeenCalledTimes(1); expect(deleteMessage).not.toHaveBeenCalled();
+      expect(ds.session.forkPanelCardId).toBe('om_old_panel');
+    });
+    it('does not switch to another reply or flat send after a provider error', async () => {
+      vi.mocked(replyMessage).mockImplementation(async (...args) => {
+        await args[7]?.beforeWrite?.(); throw new Error('provider timeout');
+      });
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(replyMessage).toHaveBeenCalledTimes(1); expect(sendMessage).not.toHaveBeenCalled();
+      expect(deleteMessage).not.toHaveBeenCalled();
+    });
+    it('only recalls the stale panel after confirmation of its replacement', async () => {
+      vi.mocked(deleteMessage).mockImplementation(async () => { writes.push('delete'); return true; });
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual(['reply', 'delete']); expect(ds.session.forkPanelCardId).toBe('om_new_panel');
+      expect(getMessageDetail).toHaveBeenCalledWith(LARK_APP_ID, ROOT_ID, expect.objectContaining({ timeoutMs: 10000 }));
+    });
+    it('does not treat a chat anchor as a message root', async () => {
+      const ds = parent('chat'); ds.session.rootMessageId = CHAT_ID;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: false }] }) as any);
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual(['reply']);
+      expect(vi.mocked(getMessageDetail).mock.calls.map(([, id]) => id)).toEqual(['msg_001']);
+    });
+    it.each(['', CHAT_ID])('refuses a thread with invalid source root %s', async root => {
+      const ds = parent(); ds.session.rootMessageId = root;
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual([]); expect(deleteMessage).not.toHaveBeenCalled();
+    });
+    it('retains legacy panel fallback and does not query source state', async () => {
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+      vi.mocked(replyMessage).mockRejectedValue(new Error('expired reply window'));
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(replyMessage).toHaveBeenCalledTimes(2); expect(writes).toEqual(['send']);
+      expect(getMessageDetail).not.toHaveBeenCalled();
+    });
+    it.each([ROOT_ID, CHAT_ID])('preserves legacy chat fallback for anchor %s', async rootId => {
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+      vi.mocked(replyMessage).mockRejectedValueOnce(new Error('preferred reply failed'));
+      const ds = parent('chat'); ds.session.rootMessageId = rootId;
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(vi.mocked(replyMessage).mock.calls.map(([, id]) => id))
+        .toEqual(rootId === ROOT_ID ? ['msg_001', ROOT_ID] : ['msg_001']);
+      expect(writes).toEqual([rootId === ROOT_ID ? 'reply' : 'send']);
+      expect(getMessageDetail).not.toHaveBeenCalled();
+    });
+    it.each(['codex', 'claude-code'] as const)('freezes the %s command source before attachment preparation', async cliId => {
+      const ds = parent(); ds.session.cliId = cliId;
+      const message = makeLarkMessage('/fork image', { msgType: 'post', threadId: 'omt_parent',
+        rawPostContent: JSON.stringify({ content: [[{ tag: 'img', image_key: 'img_original' }]] }) });
+      const { downloadResources } = await import('../src/core/session-manager.js');
+      vi.mocked(downloadResources).mockImplementationOnce(async () => {
+        message.messageId = 'om_later_command'; ds.session.rootMessageId = 'om_later_root';
+        return { attachments: [], needLogin: false };
+      });
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: id === ROOT_ID,
+        ...(id === 'msg_001' ? { root_id: ROOT_ID } : {}) }] }) as any);
+      const result = await startForkSubtopicSession('image', ds, message, LARK_APP_ID);
+      expect(result).toEqual({ ok: false, error: 'topic_creation_failed', orphanTopic: false });
+      expect(writes).toEqual([]); expect(forkSession).not.toHaveBeenCalled(); expect(deleteMessage).not.toHaveBeenCalled();
+      expect(vi.mocked(getMessageDetail).mock.calls.map(([, id]) => id)).toEqual(['msg_001', ROOT_ID]);
+    });
+    it('rechecks the frozen source when the transport retries the seed', async () => {
+      let unavailable = false;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: unavailable }] }) as any);
+      vi.mocked(sendMessage).mockImplementation(async (...args) => {
+        await args[6]?.beforeWrite?.(); writes.push('attempt'); unavailable = true;
+        await args[6]?.beforeWrite?.(); writes.push('retry'); return 'om_should_not_send';
+      });
+      const result = await startForkSubtopicSession('task', parent(), makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      expect(result.ok).toBe(false); expect(writes).toEqual(['attempt']); expect(forkSession).not.toHaveBeenCalled();
+    });
+    it.each(['thread lookup', 'bot lookup'] as const)('rechecks the source after %s before starting fork', async lookup => {
+      let unavailable = false;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: unavailable }] }) as any);
+      if (lookup === 'thread lookup') {
+        vi.mocked(getMessageThreadId).mockImplementationOnce(async () => { unavailable = true; return 'omt_child'; });
+      } else {
+        vi.mocked(getAvailableBots).mockImplementationOnce(async () => { unavailable = true; return []; });
+      }
+      const ds = parent();
+      const result = await startForkSubtopicSession('task', ds, makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      expect(result).toEqual({ ok: false, error: 'fork_subtopic_failed', orphanTopic: false });
+      expect(writes).toEqual(['send']);
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_child_seed');
+      expect(ds.session.forkPanelCardId).toBe('om_old_panel');
+    });
+    it('keeps the original command as the source of the post-fork panel refresh', async () => {
+      let forked = false;
+      vi.mocked(forkSession).mockImplementationOnce(async () => { forked = true; return { ok: true, childSessionId: 'child-sess-1' }; });
+      vi.mocked(sessionStore.getSession).mockReturnValue(makeSession({ sessionId: 'child-sess-1' }));
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: forked && id === 'msg_001' }] }) as any);
+      const result = await startForkSubtopicSession('task', parent(), makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      expect(result.ok).toBe(true); expect(writes).toEqual(['send']); expect(deleteMessage).not.toHaveBeenCalled();
+    });
   });
 
   describe('/fork sub-topic', () => {
@@ -2250,6 +2387,8 @@ describe('handleCommand', () => {
           workingDir: '/work/current-session',
           managedBy: 'watch-comment',
         }),
+        // 重新登记延续运行态诊断；溯源三字段刻意不传（owner 接管，不再是 auto-sub）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2297,6 +2436,8 @@ describe('handleCommand', () => {
         expect.any(String),
         LARK_APP_ID,
         expect.objectContaining({ workingDir: undefined }),
+        // watch-comment 重登记走 inheritRuntime。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2334,6 +2475,7 @@ describe('handleCommand', () => {
           workingDir: '/work/repo',
           managedBy: 'watch-comment',
         }),
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -5971,14 +6113,37 @@ describe('handleCommand', () => {
         expect(text).toContain('两边都要授权');
       });
 
-      it('completes the pending challenge on done', async () => {
+      it.each([
+        { name: 'absent', policy: undefined, enabled: false, git: false },
+        { name: 'disabled', policy: { enabled: false }, enabled: false, git: false },
+        { name: 'lark only', policy: { enabled: true, tools: ['lark-cli'], gitHost: 'code.example.com' }, enabled: false, git: false },
+        { name: 'bytedcli', policy: { enabled: true, tools: ['bytedcli'] }, enabled: true, git: false },
+        { name: 'bytedcli with git', policy: { enabled: true, tools: ['bytedcli'], gitHost: 'code.example.com' }, enabled: true, git: true },
+      ])('reports saved authorization and the $name policy on done', async ({ policy, enabled, git }) => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
-        const deps = makeDeps(makeDaemonSession());
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+        const bot = defaultGetBot();
+        vi.mocked(getBot).mockReturnValue({
+          ...bot,
+          config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig(policy) ?? undefined },
+        } as any);
+        for (const command of ['/login bytedcli done', '/login done']) {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
 
-        expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
-        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('授权成功');
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain('授权已保存');
+          if (enabled) {
+            expect(text).toContain('已为 bytedcli 启用');
+            expect(text).not.toContain('triggerUserAuth.enabled');
+          } else {
+            expect(text).toContain('triggerUserAuth.enabled');
+            expect(text).toContain('triggerUserAuth.tools');
+            expect(text).not.toContain('已为 bytedcli 启用');
+          }
+          expect(text.includes('code.example.com')).toBe(git);
+        }
       });
 
       // Not an error: they just have not clicked yet. Reporting a failure would
@@ -6995,6 +7160,74 @@ describe('handleCommand', () => {
     const mockedCreate = vi.mocked(createGroupWithBots);
     const mockedListBots = vi.mocked(listChatBotMembers);
     const mockedSend = vi.mocked(sendMessage);
+
+    it('applies opt-in defaults using the deployment registry, even without a source-chat peer', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { agents: ['Codex'], tag: 'Work', avatar: 'name' } } };
+      }) as any);
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project'), deps, LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0]).toMatchObject({
+        larkAppIds: ['app-1', 'app-2'], name: 'Project',
+        customization: { tag: 'Work', avatar: 'name', userOpenId: 'ou_sender' },
+      });
+      expect(mockedListBots).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { flag: '', expected: ['app-1', 'app-2'] },
+      { flag: ' --no-agents', expected: ['app-1'] },
+      { flag: ' --agents app-1', expected: ['app-1'] },
+    ])('completes the default team when only its creator is mentioned: $flag', async ({ flag, expected }) => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { agents: ['app-1', 'app-2'] } } };
+      }) as any);
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+      ]);
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g @Claude Project' + flag, {
+        chatId: CHAT_ID, mentions: [{ key: '@_user_1', name: 'Claude', openId: 'ou_claude' }],
+      }), deps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(expected);
+    });
+
+    it('rejects cached removed or core-only agents before creating a group', async () => {
+      vi.mocked(loadBotConfigs).mockReturnValueOnce([{ larkAppId: 'app-1' }] as any);
+      const removed = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents app-2'), removed, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(vi.mocked(removed.sessionReply).mock.calls[0][1]).toContain('Unknown agent');
+      vi.mocked(loadBotConfigs).mockReturnValueOnce([{ larkAppId: 'app-1' }, { larkAppId: 'app-2', apiOnly: true }] as any);
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents Codex'), makeDeps(), LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+    });
+
+    it.each(['{broken', '{}', '[]'])('resolves configured app IDs with an unavailable name cache: %s', async cache => {
+      const original = vi.mocked(readFileSync).getMockImplementation()!;
+      vi.mocked(readFileSync).mockImplementation(((path: any, ...rest: any[]) =>
+        typeof path === 'string' && path.includes('bots-info.json') ? cache : original(path, ...rest)) as any);
+      try {
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents app-2'), makeDeps(), LARK_APP_ID);
+        expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(['app-1', 'app-2']);
+      } finally { vi.mocked(readFileSync).mockImplementation(original); }
+    });
+
+    it('invites a configured app ID before it has appeared in the probe cache', async () => {
+      vi.mocked(loadBotConfigs).mockReturnValueOnce([{ larkAppId: 'app-1' }, { larkAppId: 'app-new' }] as any);
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents app-new'), makeDeps(), LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(['app-1', 'app-new']);
+    });
+
+    it('rejects unresolved configured agents before creating any group', async () => {
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents Missing'), deps, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('Missing');
+    });
 
     it('creates a solo group (creator only) when no bots are @-mentioned', async () => {
       const ds = makeDaemonSession();

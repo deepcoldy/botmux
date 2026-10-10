@@ -169,6 +169,27 @@ export interface SessionCleanupGlobalConfig {
   intervalMinutes?: number;
 }
 
+/** Host policy for delegating creation of persistent scheduled work across bots.
+ * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
+ * is a separate emergency revocation switch so stopping new grants does not
+ * silently change the meaning of already committed tasks. */
+export interface ScheduleDelegationGlobalConfig {
+  /** Allow a directly authenticated human turn to request schedule:create. Default off. */
+  createEnabled?: boolean;
+  /** Allow already committed delegated schedules to run. Missing means on. */
+  runEnabled?: boolean;
+  /** Source orchestrator app ids whose managed dispatches request schedule:create by default. */
+  defaultOnDispatchFromBotAppIds?: string[];
+  /** Maximum distinct delegated tasks one target turn may commit. Default 64. */
+  maxTasksPerTurn?: number;
+  /** Personal CLI scopes a delegated schedule may retain for future runs. */
+  runScopes?: Array<'bytedcli'>;
+  /** Let a delegated scheduled turn pause or remove its own task. Default off. */
+  selfManageEnabled?: boolean;
+}
+
+export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -242,6 +263,8 @@ export interface GlobalConfig {
    *  Stored lenient here; final IANA validity is enforced on write
    *  (settings-write-applier) and re-checked at resolve time. */
   scheduleTimeZone?: string;
+  /** Machine-wide cross-bot schedule delegation policy. */
+  scheduleDelegation?: ScheduleDelegationGlobalConfig;
 }
 
 export interface GlobalSkillConfig {
@@ -377,6 +400,12 @@ export interface DashboardGlobalConfig {
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
+  /** 机器级总开关：是否在回复卡片页脚渲染品牌签名（默认 botmux 链接 / 各 bot 自定义
+   *  brandLabel）。缺省 ON（absent ⇒ 显示）；显式 `false` 时**所有** bot 的页脚品牌
+   *  签名一律不渲染（等价于每 bot brandLabel 被置空），Dashboard 每个 bot 的签名
+   *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
+   *  Live 读取（见 config.ts `cardBrandLabelEnabled`），Settings 翻转后无需重启。 */
+  cardBrandLabel?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -531,6 +560,10 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
     && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
   }
+  // Round-trip an explicit boolean either way. Absent stays absent — the live
+  // getter (config.ts `cardBrandLabelEnabled`) treats absent as ON, so a stored
+  // `false` must be preserved to let an operator suppress footer brands fleet-wide.
+  if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -552,6 +585,30 @@ function readWorker(raw: unknown): WorkerConfig | undefined {
     && value.maxMemoryFullAvg10 > 0
     && value.maxMemoryFullAvg10 <= 100) {
     out.maxMemoryFullAvg10 = value.maxMemoryFullAvg10;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: ScheduleDelegationGlobalConfig = {};
+  if (typeof value.createEnabled === 'boolean') out.createEnabled = value.createEnabled;
+  if (typeof value.runEnabled === 'boolean') out.runEnabled = value.runEnabled;
+  const maxTasksPerTurn = readPositiveInteger(value.maxTasksPerTurn);
+  if (maxTasksPerTurn !== undefined) out.maxTasksPerTurn = Math.min(maxTasksPerTurn, 1024);
+  if (Array.isArray(value.runScopes)) {
+    const runScopes = [...new Set(value.runScopes.filter(
+      (item): item is 'bytedcli' => item === 'bytedcli',
+    ))];
+    if (runScopes.length > 0) out.runScopes = runScopes;
+  }
+  if (typeof value.selfManageEnabled === 'boolean') out.selfManageEnabled = value.selfManageEnabled;
+  if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
+    const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
+      (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
+    ))];
+    if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -815,6 +872,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.scheduleTimeZone === 'string' && raw.scheduleTimeZone.trim()) {
     out.scheduleTimeZone = raw.scheduleTimeZone.trim();
   }
+  const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
+  if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }

@@ -45,6 +45,9 @@ import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
+import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
+import { TopicSendError } from '../../cli/topic-send-guard.js';
+import { privateReplyEnabled } from '../../core/private-reply.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -61,6 +64,8 @@ interface CotEvent {
 }
 
 interface CotState {
+  /** A policy pause is not delivery proof; retain the existing restart marker. */
+  retainOrphanMarker?: boolean;
   turnKey: string;
   turnId: string;
   /** create failed / a push failed → thinking display off for the turn. */
@@ -156,7 +161,7 @@ function recordCotOrphanMarker(ds: DaemonSession, state: CotState): void {
 }
 
 function clearCotOrphanMarker(state: CotState): void {
-  if (!state.cotId) return;
+  if (!state.cotId || state.retainOrphanMarker) return;
   try { unlinkSync(join(cotOrphanDir(), `${state.cotId}.json`)); } catch { /* already gone */ }
 }
 
@@ -194,7 +199,11 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         // would label this abandoned progress stream as completed even though
         // the external CLI can still be executing the original task.
         try {
-          await c.request({
+          if (getBot(rec.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+            const { assertMessageWriteAllowed } = await import('./client.js');
+            await assertMessageWriteAllowed(rec.larkAppId, rec.messageId);
+          }
+          const noticeResponse = await c.request({
             method: 'PUT',
             url: '/open-apis/im/v1/message_cot',
             data: {
@@ -204,18 +213,29 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
             },
             timeout: COT_REQUEST_TIMEOUT_MS,
           } as any);
+          assertCotResponse(rec.larkAppId, noticeResponse);
         } catch (err) {
+          if (err instanceof TopicSendError) throw err;
           logger.warn(`[cot] orphan notice ${rec.cotId}: ${err instanceof Error ? err.message : String(err)}`);
         }
-        await c.request({
+        if (getBot(rec.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+          const { assertMessageWriteAllowed } = await import('./client.js');
+          await assertMessageWriteAllowed(rec.larkAppId, rec.messageId);
+        }
+        const completeResponse = await c.request({
           method: 'POST',
           url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(rec.cotId)}`,
           params: { message_id: rec.messageId, reason: 'error' },
           timeout: COT_REQUEST_TIMEOUT_MS,
         } as any);
+        assertCotResponse(rec.larkAppId, completeResponse);
         logger.info(`[cot] orphan closed cot=${rec.cotId}`);
       }
     } catch (err) {
+      if (err instanceof TopicSendError) {
+        logger.warn(`[cot] orphan retained while its topic is unavailable: ${err.message}`);
+        continue;
+      }
       // Already terminal / bot gone / transient — the marker is still consumed;
       // a bubble we can't close now won't become closable later.
       logger.warn(`[cot] orphan sweep ${f}: ${err instanceof Error ? err.message : String(err)}`);
@@ -233,11 +253,12 @@ function turnKeyOf(msg: { turnId: string; dispatchAttempt?: number }): string {
  *  `/cot off` (`noCotChats`). Read fresh from the in-memory registry so
  *  `/cot` toggles apply from the next update without a daemon restart.
  *  `/cot show` (`ds.cotForced`) overrides both switches for one turn —
- *  apiOnly stays a hard block (such bots must not emit IM messages). */
+ *  apiOnly and private replies stay hard blocks for this public channel. */
 export function cotEnabled(ds: DaemonSession): boolean {
   try {
     const cfg = getBot(ds.larkAppId).config;
     if (cfg.apiOnly === true) return false;
+    if (privateReplyEnabled(ds.session)) return false;
     if (ds.cotForced) return true;
     return cfg.cotEnabled !== false
       && !(ds.chatId && cfg.noCotChats?.includes(ds.chatId));
@@ -338,7 +359,35 @@ function cotPlacement(ds: DaemonSession, state: CotState): { origin_message_id?:
   return state.turnId.startsWith('om_') ? { origin_message_id: state.turnId } : {};
 }
 
+async function assertCotWriteAllowed(ds: DaemonSession, state: CotState, messageId?: string): Promise<void> {
+  try {
+    const { assertMessageWriteAllowed } = await import('./client.js');
+    await assertMessageWriteAllowed(ds.larkAppId, messageId);
+    state.retainOrphanMarker = false;
+  } catch (error) {
+    if (error instanceof TopicSendError) state.retainOrphanMarker = true;
+    throw error;
+  }
+}
+
+function assertCotResponse(larkAppId: string, response: any, state?: CotState): void {
+  if (response?.code == null || response.code === 0) return;
+  if (getBot(larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+    if (state) state.retainOrphanMarker = true;
+    throw new TopicSendError(response.code === 230011 ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED',
+      'CoT 写入未成功，保留恢复记录；不要更换目标。');
+  }
+  // Legacy keeps its existing response handling; strict business-code checks are opt-in.
+}
+
 async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
+  const placement = cotPlacement(ds, state);
+  if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+    const target = frozenReplyContextForTurn(ds, fallbackTurnId(ds, state.turnId)).target;
+    if (placement.origin_message_id || target.mode === 'thread' || target.mode === 'quote') {
+      await assertCotWriteAllowed(ds, state, placement.origin_message_id);
+    }
+  }
   const c = getBotClient(ds.larkAppId);
   const res = await c.request({
     method: 'POST',
@@ -346,10 +395,11 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
     params: { receive_id_type: 'chat_id' },
     data: {
       receive_id: ds.chatId,
-      ...cotPlacement(ds, state),
+      ...placement,
     },
     timeout: COT_REQUEST_TIMEOUT_MS,
   } as any);
+  assertCotResponse(ds.larkAppId, res, state);
   const cotId = res?.data?.cot_id;
   const messageId = res?.data?.message_id;
   if (typeof cotId !== 'string' || typeof messageId !== 'string' || !cotId || !messageId) {
@@ -364,24 +414,32 @@ async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[])
   const c = getBotClient(ds.larkAppId);
   // PUT body caps events at 50 per call.
   for (let i = 0; i < events.length; i += 50) {
-    await c.request({
+    if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+      await assertCotWriteAllowed(ds, state, state.messageId);
+    }
+    const response = await c.request({
       method: 'PUT',
       url: '/open-apis/im/v1/message_cot',
       data: { cot_id: state.cotId, message_id: state.messageId, events: events.slice(i, i + 50) },
       timeout: COT_REQUEST_TIMEOUT_MS,
     } as any);
+    assertCotResponse(ds.larkAppId, response, state);
   }
 }
 
 /** Best-effort error-path completion (normal completion rides RUN_FINISHED). */
 async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 'error'): Promise<void> {
+  if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+    await assertCotWriteAllowed(ds, state, state.messageId);
+  }
   const c = getBotClient(ds.larkAppId);
-  await c.request({
+  const response = await c.request({
     method: 'POST',
     url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(state.cotId!)}`,
     params: { message_id: state.messageId!, reason },
     timeout: COT_REQUEST_TIMEOUT_MS,
   } as any);
+  assertCotResponse(ds.larkAppId, response, state);
 }
 
 /** One reasoning message (= one rendered node) per thinking entry. */
@@ -577,6 +635,18 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   try {
     while (!state.disabled) {
       if (!state.cotId) {
+        const startingCard = pendingStartingCardPublication(ds);
+        if (startingCard) {
+          await startingCard;
+          // A newer turn/stop can arrive during the POST. Never resurrect its
+          // predecessor's not-yet-visible bubble below the current work card.
+          if (state.disabled || state.settled || states.get(ds) !== state
+            || state.finishStatus === 'interrupted'
+            || (ds.currentTurnId && ds.currentTurnId !== state.turnId)) {
+            state.disabled = true;
+            break;
+          }
+        }
         await apiCreate(ds, state);
         // Record the orphan marker the moment the bubble exists — before the
         // prologue append. If the prologue fails (or the daemon restarts

@@ -92,7 +92,7 @@ export interface CodexRpcEngineOpts {
   /** Generic process-scoped app-server config overrides. */
   appServerConfig?: string[];
   /** Bridge a native request_user_input server request to the host UI. */
-  onRequestUserInput?: (params: unknown) => Promise<unknown>;
+  onRequestUserInput?: (params: unknown, signal: AbortSignal, identity?: CodexRpcTurnIdentity) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
    *  Mainly for tests that assert the wedged-app-server recovery path. */
   requestTimeoutMs?: number;
@@ -178,6 +178,7 @@ export class CodexRpcEngine {
     timer: ReturnType<typeof setTimeout>;
     method: string;
     turnIdentity?: CodexRpcTurnIdentity;
+    resumeTimeout: () => void;
   }>();
   private readonly turnOwners = new Map<string, CodexRpcTurnIdentity>();
   private readonly nativeTurnByOwner = new Map<string, string>();
@@ -674,7 +675,7 @@ export class CodexRpcEngine {
     const fatalOnTimeout = opts?.fatalOnTimeout !== false; // default fatal
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const onTimeout = () => {
         if (!this.pending.has(id)) return;
         const err = new Error(`codex app-server request '${method}' timed out after ${timeoutMs}ms`);
         if (fatalOnTimeout) {
@@ -692,13 +693,24 @@ export class CodexRpcEngine {
           // correlated here because an attached TUI can start unrelated turns.
           this.pending.delete(id); reject(err);
         }
-      }, timeoutMs);
-      timer.unref?.();
+      };
+      const startTimer = () => {
+        const timer = setTimeout(onTimeout, timeoutMs);
+        timer.unref?.();
+        return timer;
+      };
+      const timer = startTimer();
       this.pending.set(id, {
         resolve,
         reject,
         timer,
         method,
+        resumeTimeout: () => {
+          const pending = this.pending.get(id);
+          if (!pending) return;
+          clearTimeout(pending.timer);
+          pending.timer = startTimer();
+        },
         ...(turnIdentity ? { turnIdentity: { ...turnIdentity } } : {}),
       });
       // onDispatch fires ONLY after send() succeeds (ws was OPEN + no throw) — the
@@ -713,7 +725,7 @@ export class CodexRpcEngine {
     this.send(params !== undefined ? { jsonrpc: '2.0', method, params } : { jsonrpc: '2.0', method });
   }
 
-  private respond(id: number, result: unknown): void {
+  private respond(id: number | string, result: unknown): void {
     try { this.send({ jsonrpc: '2.0', id, result }); } catch { /* connection gone */ }
   }
 
@@ -723,7 +735,7 @@ export class CodexRpcEngine {
    *  still completes (the ask is silently skipped). `turn/interrupt` is the only
    *  path that actually stops the turn (status → 'interrupted'); the pending
    *  server request is cancelled along with it, so we do NOT also respond. */
-  private interruptTurnFor(id: number, params: unknown, reason: string): void {
+  private interruptTurnFor(id: number | string, params: unknown, reason: string): void {
     const p = (params && typeof params === 'object') ? params as Record<string, unknown> : {};
     const threadId = typeof p.threadId === 'string' ? p.threadId : undefined;
     const turnId = typeof p.turnId === 'string' ? p.turnId : undefined;
@@ -747,7 +759,7 @@ export class CodexRpcEngine {
 
   /** Reply to a server→client request with a JSON-RPC error. Used only as a
    *  last resort when a failed requestUserInput has no turn to interrupt. */
-  private respondError(id: number, message: string): void {
+  private respondError(id: number | string, message: string): void {
     try { this.send({ jsonrpc: '2.0', id, error: { code: -32000, message } }); } catch { /* connection gone */ }
   }
 
@@ -758,17 +770,52 @@ export class CodexRpcEngine {
     return typeof value === 'string' && value ? value : undefined;
   }
 
+  private userInputRequests = new Map<number | string, { turnId?: string; controller: AbortController }>();
+
+  private cancelUserInputRequests(turnId?: string): void {
+    for (const [id, pending] of this.userInputRequests) {
+      if (turnId !== undefined && pending.turnId !== turnId) continue;
+      this.userInputRequests.delete(id);
+      pending.controller.abort();
+    }
+  }
+
   private handleOrdinaryServerRequest(msg: Json): void {
+    if (this.closed || this.deadNotified) return;
     if (msg.method === 'item/tool/requestUserInput' && this.opts.onRequestUserInput) {
       const requestParams = msg.params;
-      void this.opts.onRequestUserInput(requestParams).then(
-        result => this.respond(msg.id, result),
+      if (this.userInputRequests.has(msg.id)) return;
+      const p = requestParams && typeof requestParams === 'object' ? requestParams as Json : {};
+      if (p.threadId && this.threadId && p.threadId !== this.threadId) {
+        this.respondError(msg.id, 'requestUserInput belongs to a different thread');
+        return;
+      }
+      const nativeTurnId = this.serverRequestNativeTurnId(requestParams);
+      const identity = nativeTurnId ? this.turnOwners.get(nativeTurnId) : undefined;
+      // Some app-server versions hold turn/start's response until the human
+      // answers. Its ordinary transport deadline must not expire while a live
+      // native question is waiting on the separately bounded Ask deadline.
+      for (const pending of this.pending.values()) {
+        if (pending.method === 'turn/start') clearTimeout(pending.timer);
+      }
+      const controller = new AbortController();
+      this.userInputRequests.set(msg.id, { turnId: this.serverRequestNativeTurnId(requestParams), controller });
+      void Promise.resolve().then(() => this.opts.onRequestUserInput!(requestParams, controller.signal, identity)).then(
+        result => { if (!controller.signal.aborted && !this.closed && !this.deadNotified) this.respond(msg.id, result); },
         err => {
+          if (controller.signal.aborted || this.closed || this.deadNotified) return;
           const message = err instanceof Error ? err.message : String(err);
           this.log(`[codex-rpc] requestUserInput bridge failed: ${message}; interrupting turn`);
           this.interruptTurnFor(msg.id, requestParams, message);
         },
-      );
+      ).finally(() => {
+        if (this.userInputRequests.get(msg.id)?.controller === controller) this.userInputRequests.delete(msg.id);
+        if (!this.closed && !this.deadNotified && this.userInputRequests.size === 0) {
+          for (const pending of this.pending.values()) {
+            if (pending.method === 'turn/start') pending.resumeTimeout();
+          }
+        }
+      }).catch(err => { if (!controller.signal.aborted) this.failAll(err instanceof Error ? err : new Error(String(err))); });
       return;
     }
     this.respond(msg.id, autoApproval(String(msg.method ?? '')));
@@ -804,7 +851,7 @@ export class CodexRpcEngine {
       }
       return;
     }
-    if (typeof msg.id === 'number' && typeof msg.method === 'string') {
+    if ((typeof msg.id === 'number' || typeof msg.id === 'string') && typeof msg.method === 'string') {
       this.handleOrdinaryServerRequest(msg);
       return;
     }
@@ -820,6 +867,7 @@ export class CodexRpcEngine {
         return;
       }
       if (msg.method === 'turn/completed' && nativeTurnId) {
+        this.cancelUserInputRequests(nativeTurnId);
         const turn = params.turn ?? {};
         const rawStatus = String(turn.status ?? '').toLowerCase();
         const errorCode = turn.error ? rpcTurnErrorCode(turn.error) : '';
@@ -833,10 +881,12 @@ export class CodexRpcEngine {
         return;
       }
       if (['turn/aborted', 'turn/cancelled', 'turn/canceled'].includes(msg.method) && nativeTurnId) {
+        this.cancelUserInputRequests(nativeTurnId);
         this.emitTurnTerminal(nativeTurnId, 'aborted', msg.method.replace('turn/', 'rpc_turn_'));
         return;
       }
       if (['turn/failed', 'turn/error'].includes(msg.method) && nativeTurnId) {
+        this.cancelUserInputRequests(nativeTurnId);
         this.emitTurnTerminal(
           nativeTurnId,
           'failed',
@@ -849,6 +899,7 @@ export class CodexRpcEngine {
   }
 
   private failAll(err: Error): void {
+    this.cancelUserInputRequests();
     if (this.pending.size) this.log(`[codex-rpc] ${err.message}`);
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(err); }
     this.pending.clear();

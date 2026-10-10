@@ -227,6 +227,16 @@ describe('shouldHoldInputForHookReview', () => {
     expect(shouldHoldInputForHookReview(singularWithThirdSelected)).toBe(true);
   });
 
+  // codex ≥0.154 draws the selected option with » instead of ›. Without » in
+  // the cursor class the hold gate fails open and queued IM lands on this menu
+  // (can accidentally confirm "Trust all and continue").
+  it.each([1, 2, 3] as const)('holds input when codex 0.154 marks option %s with the » cursor', (option) => {
+    const snap = STARTUP_HOOKS_REVIEW_SNAPSHOT
+      .replace('› 1. Review hooks', '  1. Review hooks')
+      .replace(`  ${option}.`, `» ${option}.`);
+    expect(shouldHoldInputForHookReview(snap)).toBe(true);
+  });
+
   it('releases input on an ordinary Codex composer', () => {
     expect(shouldHoldInputForHookReview('› Ask Codex to do anything')).toBe(false);
   });

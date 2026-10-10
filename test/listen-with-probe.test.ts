@@ -324,4 +324,20 @@ describe('listenWithProbe', () => {
     // Let afterEach actually close the listener we stubbed.
     (server as unknown as { close: typeof realClose }).close = realClose;
   });
+
+  it('bounds portAvailable so a hung availability check times out and steps up instead of hanging forever', async () => {
+    const start = await reserveAdjacentPair();
+    const logs: string[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      portAvailableTimeoutMs: 50,
+      portAvailable: p => p === start ? new Promise(() => { /* hung promise */ }) : true,
+      log: m => logs.push(m),
+    });
+    expect(bound).toBe(start + 1);
+    expect(logs.some(l => /availability check timed out/.test(l))).toBe(true);
+  });
 });
+

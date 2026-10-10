@@ -225,6 +225,26 @@ describe('v3 ephemeral pool', () => {
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
   });
 
+  it('passes the frozen wrapperCli to worker init', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.wrapperCli = 'wrapper codex';
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init?.wrapperCli).toBe('wrapper codex');
+    worker.emitExit(0);
+    await promise;
+  });
+
   it('does not carry the PM2 graceful-exit sentinel into the ephemeral worker env', async () => {
     // The v3 ephemeral worker forks straight from the daemon (not via
     // workerForkEnv), so the daemon's PM2 graceful-exit sentinel would ride

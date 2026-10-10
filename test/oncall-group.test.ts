@@ -115,7 +115,7 @@ describe('Oncall and feedback card composition', () => {
     expect(card.body.elements[1].flex_mode).toBe('flow');
     expect(card.body.elements[1].columns.slice(0, -1)).toEqual((base.body.elements[1] as any).columns);
     expect(card.body.elements[1].columns.at(-1).elements[0]).toMatchObject({
-      text: { content: '拉起 Oncall 群' }, type: 'primary_text',
+      text: { content: '拉起 Oncall 群' }, type: 'primary',
       icon: { tag: 'standard_icon', token: 'chat_outlined' },
       behaviors: [{ type: 'callback', value: { action: 'oncall_group_create' } }],
     });

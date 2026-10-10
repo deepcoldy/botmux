@@ -47,6 +47,7 @@ import { TERMINAL_CANCEL_COOLDOWN_MS } from './critical-control-key.js';
 import { logger } from '../../utils/logger.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
+import { SESSION_TEMP_ENV_KEYS } from '../../utils/child-env.js';
 
 const EARLY_BUFFER_MAX = 1024 * 1024;
 const HISTORY_TAIL_DEBOUNCE_MS = 50;
@@ -2546,7 +2547,13 @@ export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.Proce
   const env = zmxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
   for (const assignment of buildBotmuxEnvAssignments(opts.env, opts.injectEnv)) {
     const equals = assignment.indexOf('=');
-    if (equals > 0) delete env[assignment.slice(0, equals)];
+    if (equals <= 0) continue;
+    const key = assignment.slice(0, equals);
+    // Scratch variables in opts.env belong to this session, not to the bot's
+    // injected payload. ZMX control clients also need the caller's TMPDIR when
+    // resolving a socket without an explicit ZMX_DIR.
+    if (SESSION_TEMP_ENV_KEYS.some(tempKey => tempKey === key) && opts.injectEnv?.[key] === undefined) continue;
+    delete env[key];
   }
   if (opts.injectEnv) {
     for (const key of Object.keys(opts.injectEnv)) delete env[key];

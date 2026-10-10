@@ -37,7 +37,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { getBot, getBotClient, effectiveBotDisplayName, type BotState } from '../bot-registry.js';
 import { config } from '../config.js';
-import { resolveOwnerUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { resolveOwnerUserToken, resolveUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { sendUserMessage } from '../im/lark/client.js';
 import { t, localeForBot } from '../i18n/index.js';
@@ -751,6 +751,46 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
   }
   setSessionGroupFeedGroup(chatId, ownerOpenId, group.groupId);
   logger.info(`[session-tag] tagged ${chatId.substring(0, 12)} into feed group "${group.actualName}" (${group.groupId})`);
+}
+
+/** Explicit /g tag: belongs to the invoking user, never the configured owner.
+ * No per-app cache: callers can request different names/users on every call. */
+export async function addCreatedChatToFeedGroup(larkAppId: string, chatId: string, openId: string, name: string): Promise<void> {
+  if (!openId || !name.trim() || [...name.trim()].length > 60) throw new Error('Invalid tag user or name');
+  const cfg = getBot(larkAppId).config;
+  const brand = normalizeBrand(cfg.brand);
+  const host = larkHosts(brand).openApi;
+  const signal = AbortSignal.timeout(10_000);
+  const token = await resolveUserToken(larkAppId, cfg.larkAppSecret, brand, openId, signal);
+  signal.throwIfAborted();
+  if (!token) throw new Error('User authorization required: /login --scope im:feed_group_v1:read im:feed_group_v1:write offline_access');
+  let groupId = await findFeedGroupByName(host, token, name, signal, true);
+  if (!groupId) {
+    const created = await callFeedGroupApi(host, token, 'POST', '/open-apis/im/v1/groups', {
+      feed_group_creator: { type: 'normal', name },
+    }, signal);
+    if (!created.ok) {
+      // Another request can have created the same name after our lookup.
+      if (created.code === PARAM_INVALID_CODE && /already exists/i.test(created.msg ?? '')) {
+        groupId = await findFeedGroupByName(host, token, name, signal, true);
+      }
+      if (!groupId) throw new Error(`Tag creation failed: ${created.code ?? ''} ${created.msg ?? ''}`);
+    } else groupId = created.data?.group_id;
+  }
+  if (!groupId) throw new Error('Tag creation returned no group ID');
+  const item = { feed_id: chatId, feed_type: 'chat' };
+  const path = `/open-apis/im/v1/groups/${encodeURIComponent(groupId)}`;
+  const added = await callFeedGroupApi(host, token, 'POST', `${path}/batch_add_item`, { items: [item] }, signal);
+  if (!added.ok || added.data?.failed_items?.length) throw new Error(`Tag insertion failed: ${added.code ?? ''} ${added.msg ?? ''}`);
+  const readback = await callFeedGroupApi(host, token, 'POST', `${path}/batch_query_item`, { items: [item] }, signal);
+  const items = readback.data?.items ?? readback.data?.feeds;
+  if (!readback.ok || readback.data?.failed_items?.length || !Array.isArray(items)
+    || !items.some((x: any) => {
+      const item = x.feed ?? x.item ?? x;
+      return item.feed_id === chatId && (item.feed_type === undefined || item.feed_type === 'chat');
+    })) {
+    throw new Error(`Tag membership could not be verified: ${readback.code ?? ''} ${readback.msg ?? ''}`);
+  }
 }
 
 // ─── entry point ─────────────────────────────────────────────────────────────

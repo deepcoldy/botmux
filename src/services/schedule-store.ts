@@ -437,6 +437,33 @@ function serializeTasks(map: ReadonlyMap<string, ScheduledTask>): string {
   return JSON.stringify(obj, null, 2);
 }
 
+/** Rewrite the untrusted JSON projection from a host-authoritative task row.
+ * This intentionally bypasses create idempotency: the authority store owns the
+ * exact runtime state and the projection is merely repaired to match it. */
+export function projectAuthoritativeTask(task: ScheduledTask, appId?: string): void {
+  mutateTasks(working => {
+    working.set(task.id, structuredClone(task));
+    return { result: undefined, changed: true };
+  }, appId ?? task.larkAppId);
+}
+
+/** Remove only the JSON projection. A protected tombstone remains in the
+ * authority database, preventing task-id reuse or legacy downgrade. */
+export function removeAuthoritativeTaskProjection(id: string, appId?: string): void {
+  mutateTasks(working => {
+    const changed = working.delete(id);
+    return { result: undefined, changed };
+  }, appId);
+}
+
+export function replaceAuthoritativeProjection(tasks: readonly ScheduledTask[], appId?: string): void {
+  mutateTasks(working => {
+    working.clear();
+    for (const task of tasks) working.set(task.id, structuredClone(task));
+    return { result: undefined, changed: true };
+  }, appId);
+}
+
 // Deliberately inert outside Vitest. This lets the durability regression test
 // inject a failure after the temp file is fsynced but before the atomic rename,
 // without weakening or monkey-patching Node's filesystem API in production.

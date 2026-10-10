@@ -119,6 +119,9 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   schedule: (delayMs: number, run: () => void) => TTimer;
   cancel: (timer: TTimer) => void;
   persist: (state: OrdinaryTurnRecoveryState) => void;
+  /** Complete asynchronous, turn-bound setup before the continuation can be
+   * enqueued. The coordinator re-checks ownership after this await. */
+  prepare?: (dispatch: OrdinaryTurnRecoveryDispatch) => void | Promise<void>;
   enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => boolean;
   warn: (state: OrdinaryTurnRecoveryState) => void;
   /** Identity for the next continuation of `logicalTurnId`. Return undefined
@@ -354,32 +357,52 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         status: 'dispatching',
         nextAttemptAt: undefined,
       });
-      let enqueued = false;
-      try {
-        enqueued = this.deps.enqueue({
-          logicalTurnId: dispatching.logicalTurnId,
-          turnId,
-          prompt: ORDINARY_TURN_RECOVERY_PROMPT,
-          continuation,
-          silent: isSilentLogicalTurn(dispatching, dispatching.logicalTurnId),
-        });
-      } catch {
-        enqueued = false;
-      }
-      if (!enqueued) {
+      const dispatch: OrdinaryTurnRecoveryDispatch = {
+        logicalTurnId: dispatching.logicalTurnId,
+        turnId,
+        prompt: ORDINARY_TURN_RECOVERY_PROMPT,
+        continuation,
+        silent: isSilentLogicalTurn(dispatching, dispatching.logicalTurnId),
+      };
+      const finish = (): void => {
+        const current = this.state;
+        if (!current || current.status !== 'dispatching' || current.currentTurnId !== turnId) return;
+        let enqueued = false;
+        try { enqueued = this.deps.enqueue(dispatch); }
+        catch { enqueued = false; }
+        if (!enqueued) {
+          const failed = this.commit({
+            ...current,
+            status: 'attention_required',
+            nextAttemptAt: undefined,
+            lastErrorCode: 'recovery_enqueue_failed',
+          });
+          this.warnOnce(failed);
+          return;
+        }
+        this.commit({ ...current, status: 'running' });
+      };
+      const failPreparation = (): void => {
+        const current = this.state;
+        if (!current || current.status !== 'dispatching' || current.currentTurnId !== turnId) return;
         const failed = this.commit({
-          ...dispatching,
+          ...current,
           status: 'attention_required',
           nextAttemptAt: undefined,
           lastErrorCode: 'recovery_enqueue_failed',
         });
         this.warnOnce(failed);
-        return;
+      };
+      try {
+        const preparation = this.deps.prepare?.(dispatch);
+        if (preparation && typeof (preparation as Promise<void>).then === 'function') {
+          void Promise.resolve(preparation).then(finish, failPreparation);
+        } else {
+          finish();
+        }
+      } catch {
+        failPreparation();
       }
-      this.commit({
-        ...dispatching,
-        status: 'running',
-      });
     });
   }
 

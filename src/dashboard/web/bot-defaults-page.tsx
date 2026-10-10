@@ -13,6 +13,7 @@ import {
   fallbackCliOptionsState,
   fetchBotDefaults,
   fetchCliOptions,
+  fetchCardBrandLabelEnabled,
   fetchDetectedModels,
   fetchDshProfiles,
   createDshProfile,
@@ -811,6 +812,10 @@ export function BotDefaultsPage() {
   const refreshGateRef = useRef(createRefreshGate());
   const [bots, setBots] = useState<BotDefaultsRow[]>([]);
   const [cliState, setCliState] = useState<CliOptionsState>(fallbackCliOptionsState);
+  // Machine-wide footer-brand switch; when false every per-bot brand editor is
+  // greyed out with a jump link to the global Settings page. Fail-open default
+  // true until GET /api/settings answers (see fetchCardBrandLabelEnabled).
+  const [brandEnabled, setBrandEnabled] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -826,7 +831,11 @@ export function BotDefaultsPage() {
     const req = refreshGateRef.current.begin();
     setLoading(true);
     try {
-      const [nextBots, nextCli] = await Promise.all([fetchBotDefaults(), fetchCliOptions()]);
+      const [nextBots, nextCli, nextBrandEnabled] = await Promise.all([
+        fetchBotDefaults(),
+        fetchCliOptions(),
+        fetchCardBrandLabelEnabled(),
+      ]);
       // Drop a stale response: a newer refresh() started after us (e.g. a
       // bots.changed fired while this request was in flight) — committing here
       // would overwrite the fresher roster and re-hide the new bot.
@@ -834,6 +843,7 @@ export function BotDefaultsPage() {
       setBots(nextBots.bots);
       setLoadError(nextBots.error);
       setCliState(nextCli);
+      setBrandEnabled(nextBrandEnabled);
     } finally {
       // Only the latest request owns the loading flag — an out-of-order earlier
       // response must not flip loading off while the newest is still pending.
@@ -917,6 +927,7 @@ export function BotDefaultsPage() {
         bots={bots}
         cliState={cliState}
         patchBot={patchBot}
+        brandEnabled={brandEnabled}
         activeTab={activeTab}
         onTabChange={setActiveTab}
       />
@@ -1045,6 +1056,7 @@ function BotDefaultsCard(props: {
   bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
+  brandEnabled: boolean;
   activeTab: BotDefaultsTab;
   onTabChange(tab: BotDefaultsTab): void;
 }) {
@@ -1183,7 +1195,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
             <section className="bd-tile bd-tile-wide"><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} brandEnabled={props.brandEnabled} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -7405,13 +7417,17 @@ function AskOptionLayoutSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   );
 }
 
-function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; brandEnabled: boolean }) {
   const tr = useT();
   const initial = props.bot.brandLabel ?? null;
   const [brand, setBrand] = useState<string | null>(initial);
   const [input, setInput] = useState(initial ?? '');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  // Global kill-switch (Settings → 卡片): when off the signature is hidden on
+  // every bot, so editing a per-bot label here has no visible effect — grey the
+  // whole editor out and point to the global toggle instead.
+  const brandDisabled = !props.brandEnabled;
 
   useEffect(() => {
     const next = props.bot.brandLabel ?? null;
@@ -7446,13 +7462,20 @@ function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       <div className="bd-row bd-brand">
         <label>
           <FieldTitle help={tr('botDefaults.brandLabelHelp')}>{tr('botDefaults.brandLabel')}</FieldTitle>
-          <input type="text" data-input="brandLabel" placeholder={tr('botDefaults.brandLabelPlaceholder')} value={input} disabled={busy} onChange={event => setInput(event.currentTarget.value)} />
+          <input type="text" data-input="brandLabel" placeholder={tr('botDefaults.brandLabelPlaceholder')} value={input} disabled={busy || brandDisabled} onChange={event => setInput(event.currentTarget.value)} />
         </label>
-        <small data-brand-state>{brandStateLabel(brand, tr)}</small>
+        {brandDisabled
+          ? (
+              <small className="muted" data-brand-global-off>
+                {tr('botDefaults.brandGloballyDisabled')}{' '}
+                <a href="#/settings">{tr('botDefaults.brandGloballyDisabledLink')}</a>
+              </small>
+            )
+          : <small data-brand-state>{brandStateLabel(brand, tr)}</small>}
       </div>
       <div className="actions">
-        <button type="button" className="primary" data-action="save-brand" disabled={busy} onClick={() => void save(input)}>{tr('botDefaults.brandSave')}</button>
-        <button type="button" data-action="reset-brand" disabled={busy} onClick={() => void save(null)}>{tr('botDefaults.brandReset')}</button>
+        <button type="button" className="primary" data-action="save-brand" disabled={busy || brandDisabled} onClick={() => void save(input)}>{tr('botDefaults.brandSave')}</button>
+        <button type="button" data-action="reset-brand" disabled={busy || brandDisabled} onClick={() => void save(null)}>{tr('botDefaults.brandReset')}</button>
         <StatusSpan status={status} attr={{ 'data-brand-status': '' }} />
       </div>
     </section>

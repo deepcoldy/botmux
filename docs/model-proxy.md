@@ -102,7 +102,7 @@ OCR v1.12.3 默认发送正整数 `max_completion_tokens`。接入 Codex 时，�
 | assistant `tool_calls` / tool `tool_call_id` | 保留历史 ID 和原始参数 JSON 字符串；拒绝重复 ID、缺失/重复/无对应调用的结果、在结果齐备前插入其他消息 |
 | `tools` | function 类型；只作为模型输入数据，Botmux 不执行。参数 schema 见下文 |
 | `tool_choice` | auto、none、required 或指定函数；响应会校验是否满足 |
-| `parallel_tool_calls` | false 时最多返回一个建议；默认允许最多 16 个 |
+| `parallel_tool_calls` | false 时最多返回一个建议；默认允许多个，不额外限制单条响应的调用数量 |
 | `response_format` | text、json_object，或下述 schema 子集的 json_schema；校验 content 中的 JSON，不改写工具参数 |
 | `stream` / `n` | 仅省略、`stream:false`、`n:1` |
 | `max_completion_tokens` | 省略或 null 均不指定上限，不生成 `maxOutputTokens`；1–128000 的整数仅 Claude 路径支持，传给原生 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`，其他路径明确拒绝；非法值返回 400 |
@@ -117,6 +117,8 @@ OCR v1.12.3 默认发送正整数 `max_completion_tokens`。接入 Codex 时，�
 输出上限作用于 Claude 原生生成请求，**不是整个 CLI 调用的总消耗上限**：序列化信封也占输出，CLI 可能内部重试。不能据此承诺与直接模型 API 相同的可见内容 token 数或费用上限。不会将事后字符串截断伪装成生成预算。不能完整生成有效结果时返回错误，不伪造 `finish_reason:length`。
 
 成功响应有 `choices[0].message.content` 和可选 `tool_calls`；工具调用 ID 根据请求 ID 与序号稳定生成，幂等重放不会换 ID。`finish_reason` 只在完整结果通过校验后返回 `stop` 或 `tool_calls`。未知工具、无效参数、违反 tool_choice 或无效 JSON 返回 502，不以成功结果交给客户端。
+
+模型透明代理不为单条 assistant 消息额外设置工具调用数量上限，生成响应和下一轮历史回传遵循同一规则；每个调用仍须通过校验，历史中的调用 ID 与结果必须完整对应。`tools` 最多 128 项约束的是可用函数定义数量，同一函数可以被多次调用。请求体、消息总数、序列化 prompt、原生输出大小和推理时限等既有资源限制继续生效；工具的实际执行与并发由调用方管理。
 
 ## 用量、生命周期与错误
 

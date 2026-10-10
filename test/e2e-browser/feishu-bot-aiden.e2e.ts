@@ -1,2 +1,4 @@
 import { createBotTest } from './bot-test-factory.js';
-createBotTest('Aiden');
+export function registerMidsceneSuites(): void {
+  createBotTest('Aiden');
+}

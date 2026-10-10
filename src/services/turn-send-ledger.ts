@@ -13,7 +13,7 @@ export interface TurnSendLedgerKey {
   dispatchAttempt?: number;
 }
 
-interface TurnSendLedgerRecord extends TurnSendLedgerKey {
+export interface TurnSendLedgerRecord extends TurnSendLedgerKey {
   version: 1;
   nonIdempotentSequence?: {
     fingerprint: string;
@@ -185,7 +185,7 @@ export class TurnSendLedger {
     return existsSync(legacy) ? legacy : undefined;
   }
 
-  private read(key: TurnSendLedgerKey): TurnSendLedgerRecord | undefined {
+  read(key: TurnSendLedgerKey): TurnSendLedgerRecord | undefined {
     const path = this.existingPath(key);
     return path ? this.readPath(path) : undefined;
   }

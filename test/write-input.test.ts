@@ -94,6 +94,7 @@ import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { codexHistoryPath } from '../src/services/codex-paths.js';
 import { codexTerminalSessionIsBound } from '../src/services/codex-terminal-session.js';
+import * as codexTranscript from '../src/services/codex-transcript.js';
 
 // ── Speed: collapse the adapters' real-time submit waits ───────────────────
 // writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
@@ -1684,9 +1685,9 @@ describe('codex writeInput submission confirmation', () => {
       sendSpecialKeys(key) { keys.push(key); appendCodexHistory(pasted, sid); },
     };
     const adapter = createCodexAdapter('/bin/codex');
-    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid });
+    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
     sid = other;
-    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other });
+    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other, ownershipProven: true });
     expect(keys).toEqual(['Enter', 'Enter']);
     expect(sendText).not.toHaveBeenCalled();
     expect(pty.captureCurrentScreen).not.toHaveBeenCalled();
@@ -1714,44 +1715,59 @@ describe('codex writeInput submission confirmation', () => {
       pasteText(text) { pasted = text; calls.push('paste:' + text); },
     };
     const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
-    expect(result).toEqual({ submitted: true, cliSessionId: sid });
+    // The live footer identity is positive ownership evidence.
+    expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
     expect(calls).toEqual(['paste:hi', 'Enter']);
     expect(codexTerminalSessionIsBound(pty, sid)).toBe(true);
     expect(codexTerminalSessionIsBound(pty, foreign)).toBe(false);
   });
 
-  it('explains the missing footer ID without writing a command or the message', async () => {
+  it('submits without a footer ID and confirms the owned history', async () => {
     resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    const owned = new Set<string>();
+    const ownership = vi.spyOn(codexTranscript, 'findCodexRolloutSetByPid').mockReturnValue(owned);
     const pty: PtyHandle = {
       cliPid: 43212,
-      write: vi.fn(), pasteText: vi.fn(), sendText: vi.fn(), sendSpecialKeys: vi.fn(),
-      captureInputState: () => ({
-        viewport: '\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used\n  ← for agents · ? for shortcuts',
-        cursor: { x: 2, y: 1 },
+      write: vi.fn(), pasteText: vi.fn(), sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => {
+        owned.add(sid);
+        appendCodexHistory('hi', foreign);
+        appendCodexHistory('hi', sid);
       }),
+      captureInputState: vi.fn(() => ({
+        viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+        cursor: { x: 2, y: 1 },
+      })),
     };
-    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
-    expect(result?.submitted).toBe(false);
-    if (!result || result.submitted !== false) throw new Error('Expected a rejected submission');
-    expect(result.failureReason).toContain('/statusline');
-    expect(result.failureReason).toContain('thread-id');
-    expect(pty.write).not.toHaveBeenCalled();
-    expect(pty.pasteText).not.toHaveBeenCalled();
-    expect(pty.sendText).not.toHaveBeenCalled();
-    expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    try {
+      const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+      expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+      expect(pty.captureInputState).toHaveBeenCalledTimes(1);
+      expect(pty.write).not.toHaveBeenCalled();
+      expect(pty.pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    } finally {
+      ownership.mockRestore();
+    }
   });
 
-  it('does not paste a message when the daemon-backed terminal identity is unavailable', async () => {
+  it('writes without a terminal snapshot and confirms history without ownership proof', async () => {
+    resetCodexHistory();
     const pasteText = vi.fn();
     const sendText = vi.fn();
     const pty: PtyHandle = {
-      cliPid: 43212, write: vi.fn(), pasteText, sendText, sendSpecialKeys: vi.fn(),
+      cliPid: 43212, write: vi.fn(), pasteText, sendText,
+      sendSpecialKeys: vi.fn(() => appendCodexHistory('hi', 'foreign-session')),
       captureCurrentScreen: () => '', captureInputState: () => null,
     };
     const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
-    expect(result).toMatchObject({ submitted: false, failureReason: expect.any(String) });
+    expect(result).toEqual({ submitted: true });
     expect(sendText).not.toHaveBeenCalled();
-    expect(pasteText).not.toHaveBeenCalled();
+    expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
   });
 
   it('buildArgs resumes with the persisted Codex thread id', () => {

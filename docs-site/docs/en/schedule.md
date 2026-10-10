@@ -17,6 +17,65 @@ botmux schedule add "0 18 * * *" "check deployment status" --topic
 
 `--topic` can infer the anchor from the current topic session. Use `--root-msg-id <om_...>` to specify a target topic explicitly.
 
+## Cross-bot delegated creation
+
+When a human explicitly asks Bot A to have Bot B create a schedule, A must request the persistent capability on the managed dispatch:
+
+```bash
+botmux dispatch --bot-app cli_target --title "Polling task" --brief "Create and maintain the poll" \
+  --delegate schedule:create
+```
+
+The host must also opt in through `~/.botmux/config.json` (off by default):
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "runEnabled": true,
+    "maxTasksPerTurn": 64,
+    "runScopes": ["bytedcli"],
+    "selfManageEnabled": true
+  }
+}
+```
+
+Enable the identity wrappers on both the source orchestrator and target
+generalist in `bots.json`. The target bot must govern both tools so a scheduled
+turn cannot inherit an ambient login through an unmanaged tool:
+
+```json
+"triggerUserAuth": {
+  "enabled": true,
+  "tools": ["lark-cli", "bytedcli"]
+}
+```
+
+The initial version is single-hop and bound to the target bot's current dispatch turn. It has no fixed five-minute deadline: multiple distinct tasks may be created while that turn is live, and the authority ends with the turn. A turn may create at most 64 tasks by default; `maxTasksPerTurn` accepts a host-configured limit from 1 through 1024. Each canonical request gets a deterministic task ID, so an identical retry returns the original task without consuming another slot. Tasks may run only in the original dispatch chat, at chat top level or in the current topic. `--new-topic`, `--follow-active`, multi-chat targets, and onward delegation are rejected. The dispatch grant authorizes creation only; optional task-local self-management is described below.
+
+To make every managed dispatch from a selected orchestrator request the capability without changing each SOP, configure the source bot id:
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "defaultOnDispatchFromBotAppIds": ["cli_spu_orchestrator"],
+    "runScopes": ["bytedcli"],
+    "selfManageEnabled": true
+  }
+}
+```
+
+Use `--no-delegate schedule:create` to opt out for one dispatch.
+
+`runScopes` is empty by default. Setting it to `["bytedcli"]` lets delegated tasks use the original human's bytedcli authorization on each future fire. Both source and target bots must enable `triggerUserAuth`, and the target must govern both `lark-cli` and `bytedcli`, so a reused session cannot inherit an earlier identity; creation or execution otherwise fails closed. This does not turn the scheduled turn into a general human current actor and never persists lark-cli authority.
+
+With `selfManageEnabled:true`, a delegated scheduled turn may stop its current task using `botmux schedule pause self` or `botmux schedule remove self`. It cannot change the prompt or target, resume or force-run a task, manage another task, or create a successor. `createEnabled:false` stops new grants, `runEnabled:false` revokes future runs of existing delegated tasks, and removing `runScopes` or disabling self-management revokes those persistent capabilities independently.
+
+The host SQLite store is authoritative for task definitions, grants, pause/completion state, and run claims; `schedules.json` is a rebuildable projection. The first upgraded start records the then-existing task inventory once as legacy. Later JSON additions, copies, or edits gain no execution authority. This boundary protects managed CLIs and the file sandbox; it does not claim to defend against a process running as the same OS user with unrestricted access to host keys and authority databases.
+
+Consequently, writes from `schedule add/update/remove/pause/resume/run` must reach the owning bot daemon. If that daemon is unavailable or its authority store failed to initialize, the command fails explicitly instead of editing `schedules.json` and leaving behind a task that appears to exist but can never run.
+
 ## Supported Formats
 
 ```bash
