@@ -87,9 +87,10 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'gpt-5.5-ptu',
   ],
   'minimax': [
-    'MiniMax-M3',
-    'MiniMax-M2.7',
-    'MiniMax-M2.7-highspeed',
+    'minimax/MiniMax-M3.1-Flash-Preview',
+    'minimax/MiniMax-M3',
+    'minimax/MiniMax-M2.7',
+    'minimax/MiniMax-M2.7-highspeed',
   ],
   'remote-runner': undefined,
 };

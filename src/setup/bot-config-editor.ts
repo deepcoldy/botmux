@@ -94,7 +94,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'dsh': 'DeepSeek Harness',
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
-  'minimax': 'MiniMax',
+  'minimax': 'MiniMax Code',
   'remote-runner': 'Remote Runner',
 };
 

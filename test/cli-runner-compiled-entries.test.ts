@@ -41,6 +41,7 @@ import { RUNNER_ENTRIES, runnerArgv0, type BotmuxEntry } from '../src/core/self-
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -49,11 +50,12 @@ const REAL_ARGV1 = process.argv[1];
 function asCompiledBinary() { process.argv[1] = '/$bunfs/root/cli.js'; }
 afterEach(() => { process.argv[1] = REAL_ARGV1; });
 
-/** The four adapters, each with the runner entry it must launch. */
+/** The runner adapters, each with the runner entry it must launch. */
 const ADAPTERS: ReadonlyArray<{ id: string; entry: BotmuxEntry; make: () => { buildArgs: (o: never) => string[] } }> = [
   { id: 'codex-app', entry: 'codex-app-runner', make: () => createCodexAppAdapter() as never },
   { id: 'dsh', entry: 'dsh-runner', make: () => createDshAdapter() as never },
   { id: 'mira', entry: 'mira-runner', make: () => createMiraAdapter() as never },
+  { id: 'minimax', entry: 'minimax-runner', make: () => createMinimaxAdapter('/bin/true') as never },
   { id: 'mir', entry: 'mir-runner', make: () => createMirAdapter() as never },
 ];
 
@@ -77,7 +79,7 @@ describe('CLI-adapter runners — compiled binary form', () => {
     // four would ship broken. RUNNER_ENTRIES is the single source of truth, so
     // iterate it and require each one to appear in cli.ts's dispatch.
     const cliSource = readFileSync(resolve(REPO_ROOT, 'src', 'cli.ts'), 'utf-8');
-    expect(RUNNER_ENTRIES.length).toBe(4);
+    expect(RUNNER_ENTRIES.length).toBe(5);
     for (const entry of RUNNER_ENTRIES) {
       asCompiledBinary();
       expect(runnerArgv0(entry, '/ignored')).toBe(`__${entry}`);
@@ -92,7 +94,7 @@ describe('CLI-adapter runners — compiled binary form', () => {
   it('does not mint tokens for non-runner entries', () => {
     // Guards the reverse error: RUNNER_ENTRIES must not quietly grow to include
     // fleet entries, whose launch path is resolveEntrySpawn, not this one.
-    expect([...RUNNER_ENTRIES]).toEqual(['codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner']);
+    expect([...RUNNER_ENTRIES]).toEqual(['codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner', 'minimax-runner']);
   });
 });
 

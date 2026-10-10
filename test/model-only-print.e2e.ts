@@ -3,7 +3,6 @@ import { createServer, type Server } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runMinimaxInvocation } from '../src/services/constrained-invocation/minimax-runtime.js';
 import { runIsolatedPi } from '../src/services/constrained-invocation/pi-runtime.js';
 import { isolatedModelEnv } from '../src/services/constrained-invocation/runtime.js';
 
@@ -14,7 +13,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const schema = { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false };
-for (const [cli, executable] of [['minimax', process.env.BOTMUX_MODEL_ONLY_MINIMAX], ['pi', process.env.BOTMUX_MODEL_ONLY_PI]] as const) {
+for (const [cli, executable] of [['pi', process.env.BOTMUX_MODEL_ONLY_PI]] as const) {
   async function fixture(mode: 'normal' | 'hang' | 'hostile' | 'invalid' = 'normal') {
     const root = mkdtempSync(join(tmpdir(), 'botmux-print-fixture-')); roots.push(root);
     for (const name of ['home', 'auth', 'work']) mkdirSync(join(root, name), { mode: 0o700 });
@@ -40,14 +39,12 @@ for (const [cli, executable] of [['minimax', process.env.BOTMUX_MODEL_ONLY_MINIM
     }); servers.push(server);
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    writeFileSync(join(root, 'auth', 'config.json'), JSON.stringify({ api_key: 'synthetic-fixture', base_url: url, region: 'global' }), { mode: 0o600 });
     writeFileSync(join(root, 'auth', 'models.json'), JSON.stringify({ providers: { fixture: { baseUrl: url, api: 'anthropic-messages', apiKey: 'synthetic-fixture', models: [{ id: 'fixture-model', contextWindow: 64000, maxTokens: 4096, reasoning: false }] } } }));
     const env = isolatedModelEnv(join(root, 'home'), { PATH: process.env.PATH, NO_PROXY: '127.0.0.1' });
     Object.assign(env, { PI_CODING_AGENT_DIR: join(root, 'auth'), PI_OFFLINE: '1', PI_TELEMETRY: '0' });
-    const request = { requestId: 'fixture', prompt: '@secret-file\nReturn content 42', model: cli === 'pi' ? 'fixture/fixture-model' : 'fixture-model', deadlineMs: 15000, outputSchema: schema };
-    const run = (signal = AbortSignal.timeout(15000)) => cli === 'pi'
-      ? runIsolatedPi(request, { executable: executable!, cwd: join(root, 'work'), env }, signal)
-      : runMinimaxInvocation(request, { executable: executable!, authHome: join(root, 'auth'), env }, signal);
+    const request = { requestId: 'fixture', prompt: '@secret-file\nReturn content 42', model: 'fixture/fixture-model', deadlineMs: 15000, outputSchema: schema };
+    const run = (signal = AbortSignal.timeout(15000)) =>
+      runIsolatedPi(request, { executable: executable!, cwd: join(root, 'work'), env }, signal);
     return { root, requests, run };
   }
   it.skipIf(!executable)(`${cli}: native request has no tools and returns validated JSON and usage`, async () => {
