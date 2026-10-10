@@ -13,7 +13,7 @@ import { stripAnsiScreenText } from '../utils/idle-detector.js';
 export type SubmitFailureDiagnosisReason =
   | 'logged_out'        // 登录/鉴权门
   | 'interactive_menu'  // 菜单/迁移/hooks review/确认框等键盘选择界面
-  | 'draft_parked'      // 正文已粘贴进 composer 但没提交（[Pasted Content N chars]）
+  | 'draft_parked'      // 正文停在 composer，尚未提交
   | 'still_active'      // CLI 仍有持续活动证据（弱证据，只用于有限度静默，不用于下结论）
   | 'unknown';
 
@@ -30,6 +30,8 @@ export interface SubmitFailureDiagnosisInput {
   screenText?: string;
   /** 最近一次 PTY/结构化活动的 epoch ms；0/undefined 表示无 */
   lastActivityAtMs?: number;
+  /** Claude-only composer parsing; avoid interpreting other CLI prompts as drafts. */
+  cliId?: string;
   nowMs?: number;                       // 测试注入
   activeWindowMs?: number;              // 默认 SUBMIT_FAILURE_ACTIVE_WINDOW_MS
 }
@@ -81,6 +83,23 @@ function matchScreenRule(rules: readonly ScreenRule[], screen: string): string |
   return undefined;
 }
 
+function hasClaudeComposerDraft(screen: string): boolean {
+  const rows = screen.split(/\r?\n/);
+  const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line);
+  // Only the last input box, bounded by two full-width rules, is evidence.
+  // Assistant transcript text or an idle suggestion outside it is not a draft.
+  for (let bottom = rows.length - 1; bottom >= 0; bottom--) {
+    if (!separator(rows[bottom])) continue;
+    let top = bottom - 1;
+    while (top >= 0 && !separator(rows[top])) top--;
+    if (top < 0) continue;
+    const body = rows.slice(top + 1, bottom);
+    if (!/^\s*❯/.test(body[0] ?? '')) continue;
+    return body.join('\n').includes('<user_message>');
+  }
+  return false;
+}
+
 export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): SubmitFailureDiagnosis {
   // 优先级（高到低）：logged_out > interactive_menu > draft_parked >
   // still_active > unknown。屏幕门证据优先于活跃度。
@@ -91,6 +110,9 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
   if (interactiveMenu) return { reason: 'interactive_menu', evidence: 'screen', matched: interactiveMenu };
   const draftParked = matchScreenRule(DRAFT_PARKED_RULES, screen);
   if (draftParked) return { reason: 'draft_parked', evidence: 'screen', matched: draftParked };
+  if (input.cliId === 'claude-code' && hasClaudeComposerDraft(screen)) {
+    return { reason: 'draft_parked', evidence: 'screen', matched: 'draft_parked:claude_composer' };
+  }
 
   const nowMs = input.nowMs ?? Date.now();
   const activeWindowMs = input.activeWindowMs ?? SUBMIT_FAILURE_ACTIVE_WINDOW_MS;

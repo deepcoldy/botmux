@@ -14,6 +14,9 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /** Deliver one explicit bracketed-paste frame, preserving embedded newlines.
+   * Unlike pasteText, this capability guarantees the boundary markers. */
+  sendBracketedPaste?(text: string): void | boolean;
   /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
   sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**
