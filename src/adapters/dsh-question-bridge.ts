@@ -5,6 +5,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { TURN_IDLE_PROTOCOL_VERSION } from '../utils/turn-idle-report.js';
+import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../core/managed-origin-capability.js';
 import { hookCommandParts } from './hook-command.js';
 
 const BRIDGE_VERSION = 1;
@@ -346,11 +348,32 @@ export function apply(ctx) {
  * one at boot — so `status === 'idle'` fires `BOTMUX_TURN_IDLE_COMMAND`, which
  * the worker turns into `idleDetector.fireIdle()`.
  *
+ * The turn identity is FROZEN INSIDE that callback, and carried in the payload
+ * (protocol v2, see utils/turn-idle-report.ts). It must not be resolved later,
+ * by the detached `botmux turn-idle` child: the worker rewrites the published
+ * (turn, dispatch generation) pair before every literal write, and dsh-tui
+ * steers busy-period input, so a report about turn A that reads the pair after
+ * the next dispatch would claim turn B — and satisfy the worker's exact-match
+ * fence while B was still running. Two CLI-visible sources are read
+ * synchronously, newest evidence first:
+ *   · `$BOTMUX_SEND_RELAY/${RELAY_ORIGIN_CAPABILITY_BASENAME}` — the
+ *     per-dispatch token the worker rotates for read-isolated/sandboxed
+ *     sessions, which also carries that generation's turn/attempt. Reporting it
+ *     as the capability binds the claim to the generation it was minted for.
+ *   · `$SESSION_DATA_DIR/cli-identity/<sessionId>.bin/.data/turn.json` — the
+ *     same pair published for the trigger-user identity wrapper (see
+ *     publishActiveTurn in core/cli-identity.ts). No token: the daemon still
+ *     binds the claim to the origin its live capability names.
+ * Neither readable ⇒ no report at all. "Late, never early": a lost edge only
+ * leaves that turn to the existing paths, while an early one writes into a busy
+ * CLI and settles the wrong turn.
+ *
  * Everything here is fail-quiet: a missing env var, an unreadable discovery
  * file, or a failed spawn must never break the TUI boot. The worker keeps its
- * own fallback timeout, so a lost readiness signal degrades to the previous
- * behaviour (and strictly improves on it: READY_SIGNAL_TIMEOUT_MS is 45s < the
- * 90s hard cap); a lost turn-idle just leaves that turn to the existing paths.
+ * own fallback timeout, so a lost readiness signal degrades to the adapter's own
+ * readyPattern / hard-cap path (the worker aligns its gate fallback with that
+ * cap — a missing signal must not pre-empt it); a lost turn-idle just leaves
+ * that turn to the existing paths.
  *
  * The inject path is resolved at RUNTIME through `homedir()` — the same way
  * dsh-tui itself computes `~/.dsh-tui` (utils/paths.js: `join(homedir(),
@@ -359,11 +382,19 @@ export function apply(ctx) {
  */
 function buildDshTuiStatusSnippet(): string {
   return `
+const BOTMUX_TURN_IDLE_PROTOCOL = ${TURN_IDLE_PROTOCOL_VERSION};
+const BOTMUX_RELAY_CAPABILITY_FILE = ${jsonLiteral(RELAY_ORIGIN_CAPABILITY_BASENAME)};
 const BOTMUX_READY_POLL_MS = 250;
 const BOTMUX_STATUS_SIGNAL_TIMEOUT_MS = 15_000;
 // Bounded: the worker's own ready-gate fallback is 45s, so polling much past
 // that only keeps a timer alive for a signal nobody is waiting for anymore.
 const BOTMUX_READY_POLL_LIMIT_MS = 120_000;
+// Our own process start as an epoch-ms instant. A discovery record published by
+// a PREVIOUS process that owned this same pid is not ours to claim: binding to
+// it would publish "UI ready" for a TUI that has not rendered, and its session
+// id would filter out every real agent/status event below.
+const BOTMUX_PROCESS_STARTED_AT_MS = Date.now() - Math.round(process.uptime() * 1000);
+const BOTMUX_PID_REUSE_TOLERANCE_MS = 1_000;
 
 let botmuxReadySignalled = false;
 let botmuxReadyPollTimer;
@@ -375,17 +406,46 @@ function botmuxStatusCommand(envKey) {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : '';
 }
 
+/** Best-effort birth check on a record's start instant. Only a plausible
+ *  epoch-ms value is comparable (a seconds/ISO stamp is left alone rather than
+ *  guessed at), so this can never reject a genuine record of ours. */
+function botmuxRecordIsOurs(entry) {
+  if (typeof entry.startedAt !== 'number' || !Number.isFinite(entry.startedAt)) return true;
+  if (entry.startedAt < 1_000_000_000_000) return true;
+  return entry.startedAt >= BOTMUX_PROCESS_STARTED_AT_MS - BOTMUX_PID_REUSE_TOLERANCE_MS;
+}
+
 /** The TUI process's own inject-channel record, or undefined while it has not
- *  published one yet (i.e. before its first frame). */
+ *  published one yet (i.e. before its first frame). Records for our pid that
+ *  carry a birth stamp older than this process are PID-reuse leftovers; when
+ *  several of ours exist (dsh-tui republishes on restart) the newest wins. */
 function readBotmuxInjectRecord() {
   try {
     const parsed = JSON.parse(readFileSync(join(homedir(), '.dsh-tui', 'inject', 'servers.json'), 'utf8'));
     if (!Array.isArray(parsed)) return undefined;
-    return parsed.find((entry) => entry && entry.pid === process.pid && typeof entry.sessionId === 'string');
+    const mine = parsed.filter((entry) => entry && entry.pid === process.pid
+      && typeof entry.sessionId === 'string' && botmuxRecordIsOurs(entry));
+    let best;
+    for (const entry of mine) {
+      const stamp = typeof entry.startedAt === 'number' ? entry.startedAt : -Infinity;
+      const bestStamp = best && typeof best.startedAt === 'number' ? best.startedAt : -Infinity;
+      if (!best || stamp >= bestStamp) best = entry;
+    }
+    return best;
   } catch {
     // Absent/corrupt discovery file, or the TUI has not rendered yet.
     return undefined;
   }
+}
+
+/** Bind — or RE-bind — this process to the session id of its own record. A
+ *  one-shot claim kept a stale/reused-pid record's session id forever, which
+ *  silently filtered out every real agent/status event afterwards. */
+function botmuxBindInjectSession(record) {
+  const live = record || readBotmuxInjectRecord();
+  if (!live) return botmuxInjectSessionId;
+  botmuxInjectSessionId = live.sessionId;
+  return botmuxInjectSessionId;
 }
 
 /** Fire-and-forget "botmux <status>" subcommand. Never awaited, never blocks
@@ -426,22 +486,90 @@ function pollBotmuxReady(startedAt) {
   if (botmuxReadySignalled) return;
   const record = readBotmuxInjectRecord();
   if (record) {
-    botmuxInjectSessionId = record.sessionId;
+    botmuxBindInjectSession(record);
     publishBotmuxReady();
     return;
   }
   if (Date.now() - startedAt >= BOTMUX_READY_POLL_LIMIT_MS) stopBotmuxReadyPoll();
 }
 
+/** Validate a published (turn, generation[, token]) triple. A missing/invalid
+ *  turn id means "no identity" — the report is dropped rather than guessed. */
+function botmuxFrozenTurnIdentity(rawTurnId, rawAttempt, rawCapability) {
+  const turnId = typeof rawTurnId === 'string' && rawTurnId.length > 0 && rawTurnId.length <= 256
+    ? rawTurnId
+    : undefined;
+  if (!turnId) return undefined;
+  const attempt = Number.isSafeInteger(rawAttempt) && rawAttempt > 0 ? rawAttempt : undefined;
+  const capability = typeof rawCapability === 'string' && /^[a-f0-9]{32,128}$/i.test(rawCapability)
+    ? rawCapability
+    : undefined;
+  return {
+    turnId,
+    ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
+    ...(capability ? { capability } : {}),
+  };
+}
+
+/** Per-dispatch token + turn/attempt, as rotated by the worker for isolated
+ *  sessions. This is the only source that also proves WHICH generation the
+ *  claim belongs to, so it is preferred when present. */
+function readBotmuxRelayTurnIdentity() {
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  if (!relayDir) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(join(relayDir, BOTMUX_RELAY_CAPABILITY_FILE), 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    if (typeof parsed.sessionId === 'string' && parsed.sessionId !== process.env.BOTMUX_SESSION_ID) {
+      return undefined;
+    }
+    const token = typeof parsed.capability === 'string' ? parsed.capability : parsed.token;
+    return botmuxFrozenTurnIdentity(parsed.turnId, parsed.dispatchAttempt, token);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The turn/attempt pair the worker published for the turn now executing
+ *  (publishActiveTurn, core/cli-identity.ts). Same layout, so keep in sync. */
+function readBotmuxPublishedTurnIdentity() {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  if (!dataDir || !sessionId || !/^[A-Za-z0-9._-]{1,200}$/.test(sessionId)) return undefined;
+  try {
+    const parsed = JSON.parse(
+      readFileSync(join(dataDir, 'cli-identity', sessionId + '.bin', '.data', 'turn.json'), 'utf8'),
+    );
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    return botmuxFrozenTurnIdentity(parsed.turnId, parsed.dispatchAttempt, undefined);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the identity AT THE EVENT. Called synchronously from the agent/status
+ *  handler, before anything is spawned: that instant is the only one where the
+ *  published pair is guaranteed to still name the turn that just ended. */
+function readBotmuxFrozenDispatchIdentity() {
+  return readBotmuxRelayTurnIdentity() || readBotmuxPublishedTurnIdentity();
+}
+
 /** Structured end-of-turn idle edge for BOTMUX_TURN_IDLE_COMMAND. */
-function reportBotmuxTurnIdle() {
+function reportBotmuxTurnIdle(identity) {
   const command = botmuxStatusCommand('BOTMUX_TURN_IDLE_COMMAND');
   // No inject binding means this process never published its discovery record,
   // so we cannot prove which session it owns. Stay silent: a mis-attributed
   // idle would settle a turn that is still running (never early).
-  if (!command || !botmuxInjectSessionId) return;
+  if (!command || !botmuxInjectSessionId || !identity) return;
   botmuxIdleSeq += 1;
-  spawnBotmuxStatusCommand(command, { seq: botmuxIdleSeq, pid: process.pid });
+  spawnBotmuxStatusCommand(command, {
+    v: BOTMUX_TURN_IDLE_PROTOCOL,
+    seq: botmuxIdleSeq,
+    pid: process.pid,
+    turnId: identity.turnId,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    ...(identity.capability ? { capability: identity.capability } : {}),
+  });
 }
 
 function installBotmuxStatusChannel(ctx) {
@@ -464,11 +592,13 @@ function installBotmuxStatusChannel(ctx) {
       // exactly one report per finished turn (the loop starts out idle and
       // emits nothing at boot).
       if (status !== 'idle' || wasIdle) return;
+      const identity = readBotmuxFrozenDispatchIdentity();
+      const boundSessionId = botmuxBindInjectSession();
       const agentSessionId = agent && agent.session && agent.session.id;
       // Bind to the agent that owns THIS process's TUI: a sibling session
       // mounted in the same process must not settle our turn.
-      if (!agentSessionId || agentSessionId !== botmuxInjectSessionId) return;
-      reportBotmuxTurnIdle();
+      if (!agentSessionId || agentSessionId !== boundSessionId) return;
+      reportBotmuxTurnIdle(identity);
     });
   } catch {
     // Event registration is best-effort; readiness keeps working without it.

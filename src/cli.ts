@@ -228,6 +228,7 @@ import {
   shouldApplySelfUpdate,
 } from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
+import { TURN_IDLE_PROTOCOL_VERSION } from './utils/turn-idle-report.js';
 import {
   resolveLocalDevCheckoutDir,
   isGitWorktree,
@@ -14858,6 +14859,12 @@ async function cmdSessionReady(): Promise<void> {
 async function postSessionScopedSignal(
   route: string,
   payload: Record<string, unknown>,
+  opts?: {
+    /** Frozen-at-the-event origin (turn-idle v2): transport it verbatim instead
+     *  of resolving the live marker here — the marker may already name the NEXT
+     *  dispatch by the time this child runs (see utils/turn-idle-report.ts). */
+    frozenOrigin?: { turnId: string; dispatchAttempt?: number; capability?: string };
+  },
 ): Promise<void> {
   const sessionId = process.env.BOTMUX_SESSION_ID;
   const larkAppId = process.env.BOTMUX_LARK_APP_ID;
@@ -14871,13 +14878,18 @@ async function postSessionScopedSignal(
     );
     if (!ipcPort) return;
     const relayDir = process.env.BOTMUX_SEND_RELAY;
-    const originCapability = readManagedOriginCapability(
-      resolveDataDir(),
-      sessionId,
-      relayDir,
-      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-    )?.capability;
-    const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);
+    const frozenOrigin = opts?.frozenOrigin;
+    const originCapability = frozenOrigin?.capability
+      ?? readManagedOriginCapability(
+        resolveDataDir(),
+        sessionId,
+        relayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      )?.capability;
+    // Frozen origins never consult the live marker nor its env fallback: the
+    // report must name the turn that was in flight AT THE EVENT, not whatever
+    // this child can read after the fact.
+    const liveOrigin = frozenOrigin ? undefined : resolveSessionContext(resolveDataDir(), sessionId);
     const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
     const init = {
       method: 'POST',
@@ -14885,9 +14897,13 @@ async function postSessionScopedSignal(
       body: JSON.stringify({
         sessionId,
         originCapability,
-        originTurnId: liveOrigin?.turnId ?? process.env.BOTMUX_TURN_ID,
-        originDispatchAttempt: liveOrigin?.dispatchAttempt
-          ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined),
+        originTurnId: frozenOrigin
+          ? frozenOrigin.turnId
+          : (liveOrigin?.turnId ?? process.env.BOTMUX_TURN_ID),
+        originDispatchAttempt: frozenOrigin
+          ? frozenOrigin.dispatchAttempt
+          : (liveOrigin?.dispatchAttempt
+            ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined)),
         ...payload,
       }),
     } satisfies RequestInit;
@@ -14907,24 +14923,50 @@ async function postSessionScopedSignal(
 //
 // CLI 进程内的**结构化回合空闲**上报客户端。当前唯一调用方是 dsh-tui 的 cordis
 // wrapper 插件：`agent/status` 落到 idle（一个回合真正结束）时执行
-// BOTMUX_TURN_IDLE_COMMAND，即本子命令。插件把小 JSON（seq/pid，纯诊断）写在
-// stdin 上；本命令把「上报者读到的活动回合」与 rotating per-turn capability 一起
-// POST 给 owning daemon，daemon 再转给 worker —— worker 侧用 turn/代际 fence 决定
-// 是否 fireIdle()（见 utils/turn-idle-report.ts）。
+// BOTMUX_TURN_IDLE_COMMAND，即本子命令。
+//
+// 协议 v2（见 utils/turn-idle-report.ts 的 TURN_IDLE_PROTOCOL_VERSION）：插件在
+// `agent/status` 回调里**当场冻结** (turnId, dispatchAttempt[, per-dispatch
+// capability]) 随 payload 送来，本命令只做搬运 —— **绝不**在此重新解析 worker
+// 发布的 active-turn marker：本命令跑在插件 fire-and-forget 的 detached 子进程里，
+// 从事件到 exec 之间 worker 完全可能已经写下 B 轮（dsh-tui 支持 busy 期 steer，
+// 且 worker 在真实写入前就改写 turn/attempt/marker/capability），于是 A 轮的报告
+// 会自称 B、反过来骗过 worker 的精确匹配 fence → B 仍在跑就 fireIdle()。
+// 缺协议版本 / 缺冻结身份（v1 插件只送 seq+pid / 读不到冻结来源）一律静默丢弃：
+// 宁可少一条 idle 边（该轮退回既有兜底），也绝不早判一轮为 idle。
 //
 // 与 session-ready 同一条 fail-open 铁律：env 缺失 / daemon 不可达 / 未授权都静默
-// exit 0，绝不产生用户可见输出，也绝不阻塞回合结算。丢一次上报只是让这一轮退回既有
-// 兜底路径，绝不误判成空闲。
+// exit 0，绝不产生用户可见输出，也绝不阻塞回合结算。capability 仍是唯一凭据
+// （冻结版本随 payload 走，缺省时按现行方式现场读本会话 rotating capability），
+// daemon 侧再把声明回合与该 capability 的 live origin 绑定校验。
 async function cmdTurnIdle(): Promise<void> {
   const payloadText = (await readStdinWithTimeout(2000)).toString('utf-8');
   let seq: number | undefined;
   let pid: number | undefined;
+  let frozenOrigin: { turnId: string; dispatchAttempt?: number; capability?: string } | undefined;
   try {
     const parsed = JSON.parse(payloadText);
     if (parsed && Number.isSafeInteger(parsed.seq) && parsed.seq > 0) seq = parsed.seq;
     if (parsed && Number.isSafeInteger(parsed.pid) && parsed.pid > 0) pid = parsed.pid;
-  } catch { /* 无 payload / 非 JSON → 只上报回合身份 */ }
-  await postSessionScopedSignal('/api/turn-idle', { seq, pid });
+    if (parsed && parsed.v === TURN_IDLE_PROTOCOL_VERSION) {
+      const turnId = typeof parsed.turnId === 'string' && parsed.turnId.length > 0
+        && parsed.turnId.length <= 256
+        ? parsed.turnId
+        : undefined;
+      const attempt = Number.isSafeInteger(parsed.dispatchAttempt) && parsed.dispatchAttempt > 0
+        ? parsed.dispatchAttempt as number
+        : undefined;
+      const capability = typeof parsed.capability === 'string' && /^[a-f0-9]{32,128}$/i.test(parsed.capability)
+        ? parsed.capability
+        : undefined;
+      if (turnId) frozenOrigin = { turnId, ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}), ...(capability ? { capability } : {}) };
+    }
+  } catch { /* 无 payload / 非 JSON → 没有冻结身份，静默丢弃 */ }
+  if (!frozenOrigin) {
+    process.exit(0);
+    return;
+  }
+  await postSessionScopedSignal('/api/turn-idle', { seq, pid }, { frozenOrigin });
   process.exit(0);
 }
 

@@ -60,9 +60,64 @@ describe('decideTurnIdleReport — turn fence', () => {
       .toEqual({ accept: false, reason: 'already-ready' });
   });
 
-  it('does not treat a side that could not read an attempt as a mismatch', () => {
-    expect(decideTurnIdleReport({ ...base, reportedDispatchAttempt: undefined })).toEqual({ accept: true });
-    expect(decideTurnIdleReport({ ...base, activeDispatchAttempt: undefined })).toEqual({ accept: true });
+  it('fails closed when the active attempt is known but the report omits one', () => {
+    // A report that cannot name the dispatch generation cannot be bound to the
+    // turn the worker is waiting on: an earlier retry/replay of the same turn id
+    // would otherwise settle the newer generation.
+    expect(decideTurnIdleReport({ ...base, reportedDispatchAttempt: undefined }))
+      .toEqual({ accept: false, reason: 'missing-attempt' });
+  });
+
+  it('fails closed when the report names an attempt this worker does not have', () => {
+    expect(decideTurnIdleReport({ ...base, activeDispatchAttempt: undefined }))
+      .toEqual({ accept: false, reason: 'attempt-mismatch' });
+  });
+
+  it('accepts only when neither side has an attempt (non-durable turn)', () => {
+    expect(decideTurnIdleReport({
+      ...base,
+      reportedDispatchAttempt: undefined,
+      activeDispatchAttempt: undefined,
+    })).toEqual({ accept: true });
+  });
+
+  it('fences a worker restart/retry of the same turn id by generation', () => {
+    // Same turn id, next dispatch generation: the older generation's report must
+    // not settle the newer one (and vice versa).
+    expect(decideTurnIdleReport({ ...base, reportedDispatchAttempt: 2, activeDispatchAttempt: 3 }))
+      .toEqual({ accept: false, reason: 'attempt-mismatch' });
+    expect(decideTurnIdleReport({ ...base, reportedDispatchAttempt: 4, activeDispatchAttempt: 3 }))
+      .toEqual({ accept: false, reason: 'attempt-mismatch' });
+  });
+});
+
+describe('/api/turn-idle claim ↔ capability binding', () => {
+  // The route reuses the same fence against the daemon's live origin (the
+  // publication the presented capability was minted for), so a caller holding a
+  // live token cannot name somebody else's turn.
+  const liveOrigin = { turnId: 'turn-a', dispatchAttempt: 1 };
+
+  function bind(claim: { turnId?: string; dispatchAttempt?: number }) {
+    return decideTurnIdleReport({
+      reportedTurnId: claim.turnId,
+      reportedDispatchAttempt: claim.dispatchAttempt,
+      activeTurnId: liveOrigin.turnId,
+      activeDispatchAttempt: liveOrigin.dispatchAttempt,
+      promptReady: false,
+    });
+  }
+
+  it('accepts a claim that names exactly the origin the token was minted for', () => {
+    expect(bind({ turnId: 'turn-a', dispatchAttempt: 1 })).toEqual({ accept: true });
+  });
+
+  it('refuses a live token presented with a different turn or generation', () => {
+    expect(bind({ turnId: 'turn-b', dispatchAttempt: 1 }))
+      .toEqual({ accept: false, reason: 'turn-mismatch' });
+    expect(bind({ turnId: 'turn-a', dispatchAttempt: 9 }))
+      .toEqual({ accept: false, reason: 'attempt-mismatch' });
+    expect(bind({ turnId: 'turn-a' })).toEqual({ accept: false, reason: 'missing-attempt' });
+    expect(bind({})).toEqual({ accept: false, reason: 'missing-turn' });
   });
 });
 
@@ -143,6 +198,35 @@ describe('turn-idle protocol wiring', () => {
   it('carries the report in the daemon→worker protocol', () => {
     const types = source('src/types.ts');
     expect(types).toMatch(/type: 'turn_idle'; turnId\?: string; dispatchAttempt\?: number/);
+  });
+
+  it('binds the claimed turn/attempt to the live origin before forwarding', () => {
+    const daemon = source('src/daemon.ts');
+    const route = daemon.indexOf("ipcRoute('POST', '/api/turn-idle'");
+    const routeBody = daemon.slice(route, daemon.indexOf("ipcRoute(", route + 10));
+    // The capability only proves "holds this session's current token"; the claim
+    // is bound to the origin that token was minted for, and a mismatch is
+    // refused instead of forwarded.
+    expect(routeBody).toContain('decideTurnIdleReport({');
+    expect(routeBody).toContain("error: 'origin_identity_mismatch'");
+    expect(routeBody.indexOf('authorizeSessionScopedIpc({'))
+      .toBeLessThan(routeBody.indexOf('decideTurnIdleReport({'));
+    expect(routeBody.indexOf('decideTurnIdleReport({'))
+      .toBeLessThan(routeBody.indexOf("type: 'turn_idle'"));
+  });
+
+  it('transports the frozen (event-time) identity instead of re-resolving the marker', () => {
+    const cli = source('src/cli.ts');
+    expect(cli).toContain('parsed.v === TURN_IDLE_PROTOCOL_VERSION');
+    expect(cli).toContain('frozenOrigin');
+    // The frozen path must not fall back to the live marker or its env fallback.
+    const frozen = cli.slice(cli.indexOf('const frozenOrigin = opts?.frozenOrigin'));
+    const originAssignment = frozen.slice(0, frozen.indexOf('satisfies RequestInit'));
+    expect(originAssignment).toContain('frozenOrigin');
+    expect(originAssignment).toContain('liveOrigin?.turnId');
+    expect(originAssignment).toContain('process.env.BOTMUX_TURN_ID');
+    // …and when a frozen origin is present the marker walk is skipped entirely.
+    expect(cli).toContain('const liveOrigin = frozenOrigin ? undefined : resolveSessionContext(');
   });
 
   it('registers `botmux turn-idle` and allowlists it inside workflow subagents', () => {

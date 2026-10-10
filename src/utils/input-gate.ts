@@ -291,6 +291,41 @@ export function shouldReleaseFirstPromptTimeout(state: {
 }
 
 /**
+ * How long the ready-gate waits for its signal before falling back.
+ *
+ * The gate's fallback is only allowed to remove the gate's OWN extra hold; it
+ * must never become the effective first-prompt deadline for an adapter that
+ * deferred the first prompt to a real readyPattern. For those adapters
+ * (`deferFirstPromptTimeoutUntilReady` + a readyPattern, currently dsh-tui) the
+ * gate's fallback flushes through `settleThenFlush` → `flushPending()`, and a
+ * type-ahead adapter admits that write while `isPromptReady` is still false —
+ * so a 45s fallback would deliver the first prompt at ~45-51s, straight into a
+ * TUI whose composer may not be mounted yet (dsh-tui boots in three stages and
+ * a first run also shells out to `dsh plugin add`). That silently pre-empts the
+ * adapter's own 90s hard cap, which exists precisely because no earlier
+ * evidence is trustworthy.
+ *
+ * Aligning the fallback with the adapter's hard cap keeps one deadline: the
+ * readyPattern still releases the gate as soon as it proves the input box, and
+ * an absent signal degrades to exactly the adapter's own hard-cap path.
+ */
+export function resolveReadySignalTimeoutMs(state: {
+  /** Adapter holds the first prompt until a real readyPattern (or its own cap). */
+  deferFirstPromptTimeoutUntilReady: boolean;
+  /** There is a readyPattern that can eventually prove the input box exists. */
+  hasReadyPattern: boolean;
+  /** Default fallback for adapters whose readiness signal is their only edge. */
+  readySignalTimeoutMs: number;
+  /** The adapter's own absolute cap for keeping the first prompt queued. */
+  firstPromptHardTimeoutMs: number;
+}): number {
+  if (!state.deferFirstPromptTimeoutUntilReady || !state.hasReadyPattern) {
+    return state.readySignalTimeoutMs;
+  }
+  return Math.max(state.readySignalTimeoutMs, state.firstPromptHardTimeoutMs);
+}
+
+/**
  * After the ready-gate releases (SessionStart/direct-ready signal OR the timeout
  * fallback), the worker settles for PTY quiescence and then decides whether to
  * mark the prompt ready (which flushes for ALL adapters) vs. just calling

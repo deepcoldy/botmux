@@ -16,6 +16,7 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const TURN_ID = 'turn-idle-under-test';
+const NEXT_TURN_ID = 'turn-idle-steered-next';
 const STALE_TURN_ID = 'turn-idle-someone-else';
 
 interface Harness {
@@ -219,5 +220,72 @@ describe('worker turn-idle channel', () => {
     await delay(1500);
     expect(readyCount(harness)).toBe(before);
     expect(harness.logs.join('')).toContain('Ignoring turn-idle report (attempt-mismatch)');
+
+    // A retry/restart of the same turn id under the NEW generation may settle:
+    // the fence is on the generation, not on the turn id alone.
+    harness.child.send({
+      type: 'turn_idle',
+      turnId: TURN_ID,
+      dispatchAttempt: 7,
+      seq: 2,
+    } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => readyCount(harness) > before,
+      'prompt_ready for the report naming the current generation',
+    );
+  }, 60_000);
+
+  it('rejects a report that omits the dispatch attempt while the active turn has one', async () => {
+    const harness = await startWorkerWaitingOnTurn(7);
+    const before = readyCount(harness);
+
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+    await delay(1500);
+    expect(readyCount(harness)).toBe(before);
+    expect(harness.logs.join('')).toContain('Ignoring turn-idle report (missing-attempt)');
+  }, 60_000);
+
+  /**
+   * The blocker this channel shipped with: the turn identity used to be read by
+   * the detached `botmux turn-idle` child, i.e. AFTER the event. dsh-tui steers
+   * busy-period input, so the worker can publish turn B while turn A is still
+   * running — and A's report then claimed B and passed the exact-match fence,
+   * firing idle while B was still working. Freezing the identity at the
+   * `agent/status` callback is what this barrier pins: A's frozen report must be
+   * dropped once the published identity has advanced to B.
+   */
+  it('drops a report frozen on turn A once the worker has published turn B', async () => {
+    const harness = await startWorkerWaitingOnTurn();
+    const before = readyCount(harness);
+
+    // Steer turn B while A is in flight (type-ahead write → new active turn).
+    harness.child.send({
+      type: 'message',
+      content: 'steered follow-up',
+      turnId: NEXT_TURN_ID,
+    } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => harness.messages.some(
+        message => message.type === 'managed_turn_origin' && message.turnId === NEXT_TURN_ID,
+      ),
+      'the worker to publish the steered turn as its active turn',
+    );
+
+    // Turn A's idle event, frozen at the moment A ended, now reaches the worker.
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 2 } satisfies DaemonToWorker);
+    await delay(1500);
+    expect(readyCount(harness)).toBe(before);
+    expect(harness.logs.join('')).toContain('Ignoring turn-idle report (turn-mismatch)');
+
+    // B's own end-of-turn report is still accepted — the rejected report never
+    // strands the newer turn.
+    harness.child.send({ type: 'turn_idle', turnId: NEXT_TURN_ID, seq: 3 } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => readyCount(harness) > before,
+      'prompt_ready for the steered turn after the stale report was dropped',
+    );
   }, 60_000);
 });

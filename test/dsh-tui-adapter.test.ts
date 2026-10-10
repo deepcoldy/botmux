@@ -24,7 +24,12 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
-import { decideHardTimeoutAction, shouldReleaseFirstPromptTimeout, shouldWriteNow } from '../src/utils/input-gate.js';
+import {
+  decideHardTimeoutAction,
+  resolveReadySignalTimeoutMs,
+  shouldReleaseFirstPromptTimeout,
+  shouldWriteNow,
+} from '../src/utils/input-gate.js';
 
 describe('dsh-tui adapter', () => {
   it('supports type-ahead so queued messages are written while the TUI is busy', () => {
@@ -85,5 +90,28 @@ describe('dsh-tui adapter', () => {
     // …and for a type-ahead adapter the hard-cap fallback is a safe flush
     // (the TUI is booted by then), not a forced mark-ready.
     expect(decideHardTimeoutAction(adapter.supportsTypeAhead === true)).toBe('flush');
+  });
+
+  it('aligns the ready-gate fallback with its own hard cap instead of the 45s default', () => {
+    const adapter = createDshTuiAdapter();
+    // The gate's fallback releases the gate and settles into flushPending(),
+    // which a type-ahead adapter admits while isPromptReady is still false. At
+    // the 45s default that would write the first prompt ~45-51s into a TUI whose
+    // composer may not be mounted yet (a first run also shells out to
+    // `dsh plugin add`), silently pre-empting the adapter's own 90s protection.
+    expect(resolveReadySignalTimeoutMs({
+      deferFirstPromptTimeoutUntilReady: adapter.deferFirstPromptTimeoutUntilReady === true,
+      hasReadyPattern: !!adapter.readyPattern,
+      readySignalTimeoutMs: 45_000,
+      firstPromptHardTimeoutMs: 90_000,
+    })).toBe(90_000);
+    // Nothing in the 45-51s window can be released by the adapter's own clock
+    // either: its soft timeout defers to the cap.
+    expect(shouldReleaseFirstPromptTimeout({
+      deferFirstPromptTimeoutUntilReady: adapter.deferFirstPromptTimeoutUntilReady === true,
+      hasReadyPattern: !!adapter.readyPattern,
+      elapsedMs: 51_000,
+      hardTimeoutMs: 90_000,
+    })).toBe(false);
   });
 });

@@ -20,10 +20,44 @@
  *
  * Derived from the same shape as the other worker-side authority checks:
  * `turnId` carries the identity (fresh random id per turn), and
- * `dispatchAttempt` only disambiguates a replay of the SAME turn id, so it is
- * compared only when both sides can see it — a report that simply could not
- * read an attempt is not treated as a mismatch.
+ * `dispatchAttempt` names the dispatch GENERATION of that turn id (a retry /
+ * replay / worker restart re-uses the turn id under a new attempt), so the two
+ * must agree exactly:
+ *
+ *   - active attempt known, report has none  → reject (`missing-attempt`).
+ *     The reporter is supposed to freeze the (turn, attempt) pair off the
+ *     worker's own publication at the event; an omitted attempt cannot be
+ *     bound to the generation the worker is actually waiting on, and accepting
+ *     it would let a retry of the same turn id settle through the older
+ *     generation's report.
+ *   - active attempt unknown, report has one → reject (`attempt-mismatch`).
+ *     The two sides disagree about which generation is in flight; only the
+ *     side with the publication can be right, and re-sending under the next
+ *     idle edge costs nothing.
+ *
+ * Legacy reporters that cannot carry an attempt are therefore NOT accepted
+ * wholesale: the transport (dsh-tui wrapper plugin → `botmux turn-idle`) is
+ * versioned, and a report without a frozen identity never reaches this fence
+ * (see cli.ts cmdTurnIdle).
  */
+/**
+ * Wire version of the in-CLI → daemon report envelope.
+ *
+ * v1 (shipped in the first cut of this channel) sent only `{seq, pid}`: the
+ * reporter read the turn identity LATER, inside the detached `botmux turn-idle`
+ * child, off the worker's mutable active-turn marker. That read can already name
+ * the NEXT dispatch (dsh-tui steers busy-period input), so a report about turn A
+ * could claim turn B and satisfy the exact-match fence while B was still
+ * running.
+ *
+ * v2 requires the plugin to freeze `(turnId, dispatchAttempt[, capability])`
+ * synchronously inside the `agent/status` callback and carry them in the
+ * payload; `cmdTurnIdle` transports them verbatim and never re-resolves the
+ * live marker. A v1 (or malformed) payload is dropped — fail-quiet, never early.
+ * The generated plugin interpolates this constant, so both sides cannot drift.
+ */
+export const TURN_IDLE_PROTOCOL_VERSION = 2;
+
 export type TurnIdleReportRejection =
   /** No turn id in the report → nothing can be attributed. */
   | 'missing-turn'
@@ -31,7 +65,9 @@ export type TurnIdleReportRejection =
   | 'no-active-turn'
   /** The report names a different turn than the one in flight. */
   | 'turn-mismatch'
-  /** Same turn id, different dispatch attempt (a replay of that turn). */
+  /** The report omits the dispatch attempt while this turn has one. */
+  | 'missing-attempt'
+  /** The two sides name different dispatch attempts (replay / retry / restart). */
   | 'attempt-mismatch'
   /** The worker is not waiting for a turn any more. */
   | 'already-ready';
@@ -50,9 +86,14 @@ export function decideTurnIdleReport(state: {
   if (!state.reportedTurnId) return { accept: false, reason: 'missing-turn' };
   if (!state.activeTurnId) return { accept: false, reason: 'no-active-turn' };
   if (state.reportedTurnId !== state.activeTurnId) return { accept: false, reason: 'turn-mismatch' };
-  if (state.reportedDispatchAttempt !== undefined
-    && state.activeDispatchAttempt !== undefined
-    && state.reportedDispatchAttempt !== state.activeDispatchAttempt) {
+  if (state.activeDispatchAttempt !== undefined) {
+    if (state.reportedDispatchAttempt === undefined) {
+      return { accept: false, reason: 'missing-attempt' };
+    }
+    if (state.reportedDispatchAttempt !== state.activeDispatchAttempt) {
+      return { accept: false, reason: 'attempt-mismatch' };
+    }
+  } else if (state.reportedDispatchAttempt !== undefined) {
     return { accept: false, reason: 'attempt-mismatch' };
   }
   if (state.promptReady) return { accept: false, reason: 'already-ready' };

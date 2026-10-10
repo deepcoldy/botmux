@@ -167,16 +167,23 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // `BOTMUX_READY_COMMAND` once dsh-tui publishes its inject-channel record —
     // i.e. right after `await render(tree)` flushed the first frame. The worker
     // arms its ready-gate on this flag and holds the first prompt until the
-    // signal (or READY_SIGNAL_TIMEOUT_MS = 45s) lands, which is strictly better
-    // than the 90s hard-timeout flush it replaces: cold start shows the composer
-    // at ~+5s, so the gate is released on evidence in ~10s total.
+    // signal lands — cold start shows the composer at ~+5s, so the gate is
+    // released on evidence in ~10s total.
+    //
+    // The gate's OWN fallback is aligned with this adapter's hard cap (see
+    // resolveReadySignalTimeoutMs): it must never release the first prompt at
+    // 45s, which — with supportsTypeAhead — would flush into a composer that may
+    // not be mounted yet and pre-empt the 90s protection above.
     injectsReadyHook: true,
     // Turn ends come from the same plugin, not from PTY silence: `agent/status`
     // flips to idle exactly once per finished turn (`dsh-agent-loop` only emits
     // on a real transition), which the worker turns into fireIdle() after
-    // matching the report against its own current turn. Without this the idle
-    // detector never fires again after the first turn, so a queued follow-up
-    // has no ready edge to wait for.
+    // matching the report against its own current turn. The plugin freezes the
+    // (turnId, dispatchAttempt[, per-dispatch token]) triple inside that callback
+    // and carries it end-to-end, so a report about turn A can never claim the
+    // turn B the worker wrote after A finished. Without this channel the idle
+    // detector never fires again after the first turn, so a queued follow-up has
+    // no ready edge to wait for.
     injectsTurnIdleHook: true,
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
