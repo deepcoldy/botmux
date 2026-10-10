@@ -1,0 +1,7 @@
+{
+  "name": "botmux-plugin-openviking-memory-example",
+  "version": "0.1.0",
+  "type": "module",
+  "keywords": ["botmux-plugin"],
+  "botmux": { "schemaVersion": 1, "id": "openviking", "displayName": "OpenViking 记忆" }
+}
