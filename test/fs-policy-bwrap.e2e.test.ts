@@ -129,6 +129,31 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(run(args, `echo x > ${JSON.stringify(join(S, 'ref/hack'))}`).status).not.toBe(0);
   });
 
+  it('per-session ready-signal trail: OWN file is writable at the kernel level, a sibling trail is not', () => {
+    // The generated dsh-tui wrapper plugin appends its ready-dispatch diagnostics
+    // from INSIDE the sandbox, so the per-session file grant has to hold at the
+    // kernel level, not just in accessForPath. The worker pre-creates the file
+    // (bwrap cannot bind a missing source), which is also why this builds the
+    // policy against an existing file.
+    const own = join(S, 'botmux-home/data/ready-signal/e2e-session.log');
+    const sibling = join(S, 'botmux-home/data/ready-signal/other.log');
+    mkdirSync(dirname(own), { recursive: true });
+    writeFileSync(own, '');
+    writeFileSync(sibling, 'SIBLING-SECRET\n');
+    const { args } = build({});
+    const wrote = run(args, `printf '{"event":"ready-dispatch-attempted"}\\n' >> ${JSON.stringify(own)}`);
+    expect(wrote.status).toBe(0);
+    expect(readFileSync(own, 'utf8')).toContain('ready-dispatch-attempted');
+    // A sibling session's trail is NOT bound: its real content is unreachable from
+    // inside, and an append aimed at it never reaches the host — the sandbox root
+    // is an empty tmpfs, so that redirect can only create a throwaway file in a
+    // sandbox-only parent dir (which is why the exit status alone proves nothing).
+    const read = run(args, `cat ${JSON.stringify(sibling)}`);
+    expect(read.out).not.toContain('SIBLING-SECRET');
+    run(args, `printf 'pwned' >> ${JSON.stringify(sibling)}`);
+    expect(readFileSync(sibling, 'utf8')).toBe('SIBLING-SECRET\n');
+  });
+
   it('deny DIR (existing): real content unreadable, and mask empty/unlistable for non-root (root may list but sees nothing real)', () => {
     const dir = join(S, 'proj/secrets');
     const { args } = build({ deny: [dir] });
