@@ -34,6 +34,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ReadyGate, shouldArmReadyGate } from '../src/utils/ready-gate.js';
 import { resolveReadySignalTimeoutMs, shouldReleaseFirstPromptTimeout } from '../src/utils/input-gate.js';
+import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 
 describe('shouldArmReadyGate', () => {
   const base = {
@@ -177,6 +178,10 @@ const READY_FLUSH_SETTLE_CAP_MS = 6_000;
  *  write past it. `settlePendingAtCap` reports whether that cancel was actually
  *  exercised in this run — an assertion that the timeline is not vacuous. */
 function runFirstPromptTimeline(opts: {
+  /** The adapter deliberately opts into the cap-aligned gate fallback
+   *  (CliAdapter.readyGateFallbackAlignedWithHardCap). */
+  alignReadyGateFallbackWithHardCap: boolean;
+  /** Feeds the independent soft-timeout decision (shouldReleaseFirstPromptTimeout). */
   deferFirstPromptTimeoutUntilReady: boolean;
   hasReadyPattern: boolean;
   signalAtMs?: number;
@@ -195,8 +200,7 @@ function runFirstPromptTimeline(opts: {
   // Anchor the fake clock at 0 so every instant below is an offset from spawn.
   vi.setSystemTime(0);
   const fallbackMs = resolveReadySignalTimeoutMs({
-    deferFirstPromptTimeoutUntilReady: opts.deferFirstPromptTimeoutUntilReady,
-    hasReadyPattern: opts.hasReadyPattern,
+    alignFallbackWithFirstPromptHardCap: opts.alignReadyGateFallbackWithHardCap,
     readySignalTimeoutMs: READY_SIGNAL_TIMEOUT_MS,
     firstPromptHardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
   });
@@ -249,6 +253,7 @@ describe('first-prompt fallback alignment', () => {
   it('dsh-tui: a missing signal writes at exactly 90s, settle cancelled at the cap', () => {
     vi.useFakeTimers();
     const timeline = runFirstPromptTimeline({
+      alignReadyGateFallbackWithHardCap: true,
       deferFirstPromptTimeoutUntilReady: true,
       hasReadyPattern: true,
     });
@@ -269,11 +274,13 @@ describe('first-prompt fallback alignment', () => {
     // a quiet PTY (settle satisfied after READY_FLUSH_SETTLE_MS): both are cut
     // off by the cap, so neither can delay the first write.
     const chatty = runFirstPromptTimeline({
+      alignReadyGateFallbackWithHardCap: true,
       deferFirstPromptTimeoutUntilReady: true,
       hasReadyPattern: true,
       settleMs: READY_FLUSH_SETTLE_CAP_MS,
     });
     const quiet = runFirstPromptTimeline({
+      alignReadyGateFallbackWithHardCap: true,
       deferFirstPromptTimeoutUntilReady: true,
       hasReadyPattern: true,
       settleMs: READY_FLUSH_SETTLE_MS,
@@ -287,6 +294,7 @@ describe('first-prompt fallback alignment', () => {
   it('dsh-tui: a real ready signal still releases the gate as soon as it lands', () => {
     vi.useFakeTimers();
     const timeline = runFirstPromptTimeline({
+      alignReadyGateFallbackWithHardCap: true,
       deferFirstPromptTimeoutUntilReady: true,
       hasReadyPattern: true,
       signalAtMs: 13_600, // measured spawn → ❯ on a cold dsh-tui boot
@@ -302,6 +310,7 @@ describe('first-prompt fallback alignment', () => {
   it('dsh-tui: evidence that lands just before the cap is still bounded by the cap', () => {
     vi.useFakeTimers();
     const timeline = runFirstPromptTimeline({
+      alignReadyGateFallbackWithHardCap: true,
       deferFirstPromptTimeoutUntilReady: true,
       hasReadyPattern: true,
       signalAtMs: 88_000,
@@ -315,6 +324,7 @@ describe('first-prompt fallback alignment', () => {
   it('legacy adapters keep the 45s fallback (its signal is their only ready edge)', () => {
     vi.useFakeTimers();
     const timeline = runFirstPromptTimeline({
+      alignReadyGateFallbackWithHardCap: false,
       deferFirstPromptTimeoutUntilReady: false,
       hasReadyPattern: true,
     });
@@ -328,6 +338,7 @@ describe('first-prompt fallback alignment', () => {
   it('a deferring adapter without a readyPattern is not aligned (release at 45s)', () => {
     vi.useFakeTimers();
     const timeline = runFirstPromptTimeline({
+      alignReadyGateFallbackWithHardCap: false,
       deferFirstPromptTimeoutUntilReady: true,
       hasReadyPattern: false,
     });
@@ -340,6 +351,27 @@ describe('first-prompt fallback alignment', () => {
       elapsedMs: FIRST_PROMPT_TIMEOUT_MS,
       hardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
     })).toBe(true);
+  });
+
+  it('grok keeps the 45s fallback: the 90s alignment is an explicit opt-in, not a shared-flags derivation', () => {
+    const grok = createGrokAdapter();
+    // Grok carries BOTH flags the old derivation keyed on…
+    expect(grok.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(!!grok.readyPattern).toBe(true);
+    // …so a flag-derived alignment silently moved its gate fallback from 45s to
+    // 90s, delaying every first prompt by ~45s whenever its SessionStart signal
+    // is missing. Counterfactual of that old derivation, on this same adapter:
+    const legacyDerivedFallbackMs = grok.deferFirstPromptTimeoutUntilReady === true && !!grok.readyPattern
+      ? Math.max(READY_SIGNAL_TIMEOUT_MS, FIRST_PROMPT_HARD_TIMEOUT_MS)
+      : READY_SIGNAL_TIMEOUT_MS;
+    expect(legacyDerivedFallbackMs).toBe(90_000);
+    // It never opted in, so it keeps the shared fallback.
+    expect(grok.readyGateFallbackAlignedWithHardCap).toBeUndefined();
+    expect(resolveReadySignalTimeoutMs({
+      alignFallbackWithFirstPromptHardCap: grok.readyGateFallbackAlignedWithHardCap === true,
+      readySignalTimeoutMs: READY_SIGNAL_TIMEOUT_MS,
+      firstPromptHardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
+    })).toBe(45_000);
   });
 
   it('the worker cancels a pending settle at the hard cap only, never at a soft timeout (source pin)', () => {

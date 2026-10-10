@@ -19522,10 +19522,11 @@ async function spawnCli(
     // its own deadline (FIRST_PROMPT_HARD_TIMEOUT_MS); releasing the gate
     // earlier would settle + flush through the type-ahead allowance into a
     // composer that may not be mounted yet, silently pre-empting the adapter's
-    // cap. Align the fallback with it instead (see resolveReadySignalTimeoutMs).
+    // cap. Such an adapter opts in explicitly
+    // (`readyGateFallbackAlignedWithHardCap`) — deriving it from the shared
+    // defer/readyPattern flags would also move grok from 45s to 90s.
     const readySignalTimeoutMs = resolveReadySignalTimeoutMs({
-      deferFirstPromptTimeoutUntilReady: cliAdapter.deferFirstPromptTimeoutUntilReady === true,
-      hasReadyPattern: !!cliAdapter.readyPattern,
+      alignFallbackWithFirstPromptHardCap: cliAdapter.readyGateFallbackAlignedWithHardCap === true,
       readySignalTimeoutMs: READY_SIGNAL_TIMEOUT_MS,
       firstPromptHardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
     });

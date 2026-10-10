@@ -599,6 +599,19 @@ export interface CliAdapter {
    *  undefined/false → no env, no channel (every other CLI is unchanged). */
   readonly injectsTurnIdleHook?: boolean;
 
+  /** Explicit opt-in for `injectsReadyHook` adapters whose ready-gate fallback
+   *  must not pre-empt their own first-prompt hard cap: the fallback is aligned
+   *  with FIRST_PROMPT_HARD_TIMEOUT_MS instead of the shared 45s (see
+   *  `resolveReadySignalTimeoutMs`). Only dsh-tui sets it — it defers the first
+   *  prompt to a readyPattern that a type-ahead write would otherwise bypass at
+   *  ~45-51s, into a composer that may not be mounted yet.
+   *
+   *  Deliberately NOT derived from `deferFirstPromptTimeoutUntilReady` +
+   *  readyPattern: grok carries both flags, and moving its fallback from 45s to
+   *  90s would delay every first prompt by ~45s whenever its SessionStart signal
+   *  is missing. undefined/false → the shared 45s fallback, unchanged. */
+  readonly readyGateFallbackAlignedWithHardCap?: boolean;
+
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */
   readonly systemHints: string[];

@@ -99,9 +99,12 @@ describe('dsh-tui adapter', () => {
     // the 45s default that would write the first prompt ~45-51s into a TUI whose
     // composer may not be mounted yet (a first run also shells out to
     // `dsh plugin add`), silently pre-empting the adapter's own 90s protection.
+    // The alignment is this explicit opt-in — NOT a derivation from
+    // deferFirstPromptTimeoutUntilReady + readyPattern, which grok also carries
+    // while it must keep 45s (see ready-gate.test.ts).
+    expect(adapter.readyGateFallbackAlignedWithHardCap).toBe(true);
     expect(resolveReadySignalTimeoutMs({
-      deferFirstPromptTimeoutUntilReady: adapter.deferFirstPromptTimeoutUntilReady === true,
-      hasReadyPattern: !!adapter.readyPattern,
+      alignFallbackWithFirstPromptHardCap: adapter.readyGateFallbackAlignedWithHardCap === true,
       readySignalTimeoutMs: 45_000,
       firstPromptHardTimeoutMs: 90_000,
     })).toBe(90_000);
