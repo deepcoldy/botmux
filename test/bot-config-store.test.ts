@@ -188,6 +188,45 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('normalizes noProgressNotify JSON and rejects out-of-range or unknown fields', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('noProgressNotify')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'immediate', clearable: true });
+    expect(store.coerceConfigValue(spec, '{}')).toEqual({ ok: true, value: { enabled: true } });
+    expect(store.coerceConfigValue(spec, '{"enabled":false}')).toEqual({ ok: true, value: { enabled: false } });
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":300000}')).toEqual({ ok: true, value: { enabled: true, timeoutMs: 300000 } });
+    expect(store.coerceConfigValue(spec, '{"enabled":false,"timeoutMs":300000}')).toEqual({ ok: true, value: { enabled: false, timeoutMs: 300000 } });
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":5000}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":3600001}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"timeoutMs":90.5}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"enabled":"yes"}').ok).toBe(false);
+    expect(store.coerceConfigValue(spec, '{"unknown":1}').ok).toBe(false);
+  });
+
+  it('persists, cold-loads and clears noProgressNotify through the shared field', async () => {
+    // bots.json hand-edit path: registry load normalizes the raw entry.
+    const { registry, store } = await loaded({ noProgressNotify: { timeoutMs: 300000 } });
+    expect(registry.getBot('app_default').config.noProgressNotify).toEqual({ enabled: true, timeoutMs: 300000 });
+
+    // /config set path: mute lands in the registry + on disk in one round-trip.
+    const spec = store.findConfigField('noProgressNotify')!;
+    const applied = await store.applyConfigField('app_default', spec, { enabled: false, timeoutMs: 300000 });
+    expect(applied).toMatchObject({ ok: true, effect: 'immediate' });
+    expect(registry.getBot('app_default').config.noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+    expect(readConfig().noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+
+    // Cold reload keeps the value (hand-edited bots.json with same content).
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config.noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+
+    // unset clears back to the built-in default (enabled, 90s).
+    const cleared = await store.applyConfigField('app_default', spec, null);
+    expect(cleared).toMatchObject({ ok: true });
+    expect(registry.getBot('app_default').config.noProgressNotify).toBeUndefined();
+    expect(readConfig().noProgressNotify).toBeUndefined();
+  });
+
   it('validates, persists, cold-loads and clears opt-in /g defaults', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('groupCreation')!;

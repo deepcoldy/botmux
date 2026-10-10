@@ -33,6 +33,7 @@ import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.j
 import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
+import { normalizeNoProgressNotifyPolicy } from './no-progress-notify-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 import {
   notifyPinStreamingCardChanged,
@@ -133,6 +134,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
+  { key: 'noProgressNotify', configKey: 'noProgressNotify', kind: 'json', effect: 'immediate', clearable: true, hint: 'Codex App 无进展提醒（#1162）：{"enabled":false} 仅静默 Lark 推送（看板 stalled 状态与 requires_attention 保留，立即生效）；{"timeoutMs":300000} 调整阈值（整数 10000–3600000ms，默认 90000，下一个 worker 进程生效，不影响对账超时）；unset 回默认' },
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
@@ -736,7 +738,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -785,6 +787,10 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
         if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
+        if (spec.configKey === 'noProgressNotify') {
+          try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }
+          catch (error) { return { ok: false, reason: `invalid_no_progress_notify: ${error instanceof Error ? error.message : String(error)}` }; }
+        }
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
