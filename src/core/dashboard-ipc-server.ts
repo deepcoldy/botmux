@@ -890,6 +890,14 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
+  // The dsh-tui wrapper plugin's structured end-of-turn report (`botmux
+  // turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
+  // secret either. The handler verifies this session's rotating per-turn
+  // capability AND binds the claimed (turn, dispatch generation) to the origin
+  // that token was minted for, refusing anything else with 403 — without this
+  // aperture the outer 401 makes that fence unreachable and the channel is
+  // silently dead in every isolated (bwrap / read-isolated) session.
+  if (method === 'POST' && pathname === '/api/turn-idle') return true;
   // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
   // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
   // 该会话的 rotating per-turn
