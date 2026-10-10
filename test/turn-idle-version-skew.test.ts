@@ -322,11 +322,11 @@ function usedRealShowHelp(stdout: string): boolean {
 
 describe('turn-idle version skew (v2 plugin → v1 CLI)', () => {
   it('names a subcommand v1 cannot interpret, and the frozen v1 snapshot proves it', () => {
-    expect(turnIdleHookCommand()).toMatch(/turn-idle-v2$/);
+    expect(turnIdleHookCommand()).toMatch(/__turn-idle-v2$/);
     const fixture = readFileSync(V1_CLI, 'utf8');
     // The snapshot's ONLY dispatch entry is the bare name; nothing versioned.
     expect(fixture).toContain("case 'turn-idle':");
-    expect(fixture).not.toContain('turn-idle-v2');
+    expect(fixture).not.toContain('__turn-idle-v2');
     // …and its default branch is the REAL one: plugin lookup by exact command
     // name, then showHelp — no fabricated "unknown command" output, and no
     // request either way.
@@ -335,8 +335,44 @@ describe('turn-idle version skew (v2 plugin → v1 CLI)', () => {
     expect(fixture).not.toContain('unknown command');
     const cli = readFileSync(join(REPO_ROOT, 'src', 'cli.ts'), 'utf8');
     // …and our CLI no longer answers the unversioned name either.
-    expect(cli).toContain("case 'turn-idle-v2':");
+    expect(cli).toContain("case '__turn-idle-v2':");
     expect(cli).not.toContain("case 'turn-idle':");
+  }, 30_000);
+
+  it('uses a subcommand no plugin can ever register (collision-proof by grammar)', async () => {
+    // The v1 default branch is `runPluginCommandByName(command, …)`: an EXACT
+    // match against CLI command names declared by installed plugins. So the
+    // versioned name must be outside the plugin-command grammar — otherwise a
+    // plugin that happens to declare it would be executed by our own hook
+    // (arbitrary third-party code fed our payload) instead of falling through to
+    // showHelp(). Prove both halves with the REAL scanner.
+    const { scanPluginContributions } = await import('../src/core/plugins/convention-scanner.js');
+    const manifest = { schemaVersion: 1 as const, id: 'probe-plugin' };
+    const runtimeWithCommand = (commandName: string): string => {
+      const dir = tmp();
+      mkdirSync(join(dir, 'cli'), { recursive: true });
+      writeFileSync(join(dir, 'cli', 'index.js'), 'export const probe = () => "ran";\n');
+      writeFileSync(join(dir, 'cli', 'commands.json'), JSON.stringify({
+        schemaVersion: 1,
+        commands: [{ name: commandName }],
+      }));
+      return dir;
+    };
+
+    // The shape we moved OFF was declarable — so the reviewer's concern was
+    // concrete, not theoretical.
+    const collidable = scanPluginContributions(runtimeWithCommand('turn-idle-v2'), manifest);
+    expect(collidable?.cli?.commands.map(command => command.name)).toEqual(['turn-idle-v2']);
+
+    // The shape we use now cannot even be installed: `^[a-z][a-z0-9._:-]{0,63}$`
+    // requires a lowercase first character (core/plugins/convention-scanner.ts),
+    // so no plugin can ever be reached by the command we emit.
+    expect(() => scanPluginContributions(runtimeWithCommand('__turn-idle-v2'), manifest))
+      .toThrow(/invalid_plugin_cli_command_name/);
+
+    const subcommand = argvTailOfV2Command();
+    expect(subcommand).toBe('__turn-idle-v2');
+    expect(subcommand.startsWith('__')).toBe(true);
   }, 30_000);
 
   it('v1 CLI receiving a v2 payload reports the LIVE (B) turn, not the frozen one — the bug', async () => {

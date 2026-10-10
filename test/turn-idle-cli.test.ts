@@ -1,5 +1,5 @@
 /**
- * CLI boundary for the structured turn-idle report (`botmux turn-idle-v2`).
+ * CLI boundary for the structured turn-idle report (`botmux __turn-idle-v2`).
  *
  * The dsh-tui wrapper plugin execs BOTMUX_TURN_IDLE_COMMAND on every
  * `agent/status === 'idle'`. Like the SessionStart hook client it runs inside a
@@ -32,7 +32,7 @@ function runTurnIdle(
   return new Promise((resolve, reject) => {
     const child = spawnTsScript(
       CLI_PATH,
-      ['turn-idle-v2'],
+      ['__turn-idle-v2'],
       { env, stdio: ['pipe', 'pipe', 'pipe'] },
     ) as ChildProcessWithoutNullStreams;
     let stdout = '';
@@ -90,7 +90,7 @@ function baseEnv(dataDir: string, relayDir: string, port: number): NodeJS.Proces
   return env;
 }
 
-describe('botmux turn-idle-v2 — isolated CLI report', () => {
+describe('botmux __turn-idle-v2 — isolated CLI report', () => {
   it('posts the FROZEN (event-time) identity and token, never the live marker', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-idle-data-'));
     const relayDir = mkdtempSync(join(tmpdir(), 'botmux-turn-idle-relay-'));

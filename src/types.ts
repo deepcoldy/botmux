@@ -1835,7 +1835,7 @@ type DaemonToWorkerBase =
   // source = SessionStart 的 startup/resume/… 。
   | { type: 'session_ready'; source?: string; requestId?: string }
   // 结构化「回合空闲」信号：CLI 进程内的集成（当前只有 dsh-tui 的 cordis
-  // wrapper 插件，在 agent/status 落到 idle 时）经 `botmux turn-idle-v2` 调到
+  // wrapper 插件，在 agent/status 落到 idle 时）经 `botmux __turn-idle-v2` 调到
   // daemon，daemon 再转给该会话的 worker → idleDetector.fireIdle()。
   //
   // turnId / dispatchAttempt 是**上报者在 agent/status 回调里当场冻结**的 worker

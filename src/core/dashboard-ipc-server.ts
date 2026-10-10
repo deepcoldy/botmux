@@ -891,7 +891,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
   // The dsh-tui wrapper plugin's structured end-of-turn report (`botmux
-  // turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
+  // __turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
   // secret either. The handler verifies this session's rotating per-turn
   // capability AND binds the claimed (turn, dispatch generation) to the origin
   // that token was minted for, refusing anything else with 403 — without this

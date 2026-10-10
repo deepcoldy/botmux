@@ -320,7 +320,7 @@ describe('dsh-tui structured readiness', () => {
     // The duplicate idle is a no-op (agent/status only fires on a transition),
     // so exactly the two real turn ends report — each with the frozen pair.
     // Each report is delivered by its OWN detached child (the plugin spawns one
-    // `botmux turn-idle-v2` per edge), so the order those two appends land in the
+    // `botmux __turn-idle-v2` per edge), so the order those two appends land in the
     // shared file is a scheduling artifact, not the report order: the reporter
     // counted seq 1 then 2, and the file has been observed holding [2, 1]
     // (same pid) on an idle machine. Order the raw file by seq before comparing.

@@ -229,16 +229,16 @@ describe('turn-idle protocol wiring', () => {
     expect(cli).toContain('const liveOrigin = frozenOrigin ? undefined : resolveSessionContext(');
   });
 
-  it('registers `botmux turn-idle-v2` and allowlists it inside workflow subagents', () => {
+  it('registers `botmux __turn-idle-v2` and allowlists it inside workflow subagents', () => {
     const cli = source('src/cli.ts');
-    expect(cli).toContain("case 'turn-idle-v2':");
+    expect(cli).toContain("case '__turn-idle-v2':");
     expect(cli).toContain('await cmdTurnIdle();');
-    expect(cli).toContain("'turn-idle-v2',");
+    expect(cli).toContain("'__turn-idle-v2',");
   });
 
   it('builds the shell command from the same launcher resolution as session-ready', () => {
-    expect(turnIdleHookCommand()).toMatch(/turn-idle-v2$/);
-    expect(source('src/adapters/hook-command.ts')).toContain("renderShellCommand(undefined, 'turn-idle-v2')");
+    expect(turnIdleHookCommand()).toMatch(/__turn-idle-v2$/);
+    expect(source('src/adapters/hook-command.ts')).toContain("renderShellCommand(undefined, '__turn-idle-v2')");
   });
 });
 

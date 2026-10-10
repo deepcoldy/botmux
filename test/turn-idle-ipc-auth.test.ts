@@ -2,7 +2,7 @@
 //
 // The dsh-tui wrapper plugin runs INSIDE the CLI process and (in a bwrap /
 // read-isolated session) cannot read the host HMAC secret, so `botmux
-// turn-idle-v2` presents this session's rotating per-turn capability in the
+// __turn-idle-v2` presents this session's rotating per-turn capability in the
 // body instead. That only works if the route is in the outer narrow aperture
 // `routeHasNarrowUntrustedAuth`: otherwise the server answers 401 before the
 // handler ever runs and the channel is silently dead for exactly the sessions
