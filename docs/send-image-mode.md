@@ -1,13 +1,16 @@
 # 发送图片的缩小预览
 
 ```sh
-botmux send --images /tmp/qrcode.png --image-mode small --mention-back "请扫码授权；若看不清，可点击图片放大。"
+# 当前任务等待扫码授权才能继续
+botmux send --images /tmp/qrcode.png --image-mode small --attention=authz --mention-back "需要你扫码授权才能继续；若看不清，可点击图片放大。"
 botmux send --images /tmp/screenshot.png --image-mode medium --mention-back "截图"
 ```
 
 `--image-mode` 控制独立单图的布局。缩小档位保留完整图片和原始宽高比，仍可点击预览。
 
 按图片用途选择尺寸：二维码、图标等小图优先使用 `small`，避免占满卡片；需要直接阅读文字或细节的截图、图表保留默认全宽，或使用 `medium`。用户明确要求的尺寸优先。二维码缩小后仍需清晰可扫，空间不足时选择更大档位或提示点击预览。
+
+当前任务必须等用户扫码授权才能继续时，同一条请求带 `--attention=authz`，将会话标进看板「需要你」列；发完结束本轮、等用户回复。只是展示二维码、任务还能继续时，不加举手标记。
 
 | 参数 | 行为 |
 | --- | --- |
