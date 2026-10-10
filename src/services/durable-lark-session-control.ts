@@ -103,7 +103,13 @@ export function durableLarkSessionControlEventId(larkAppId: string, stableEventI
 }
 
 export function durableLarkSessionControlPartition(larkAppId: string, sessionId: string): string {
-  return `lark-session-control:${bounded(larkAppId, 'larkAppId', 256)}:${bounded(sessionId, 'sessionId', 256)}`;
+  return `${durableLarkSessionControlPartitionPrefix(larkAppId)}${bounded(sessionId, 'sessionId', 256)}`;
+}
+
+/** Application-scoped fallback discovery prefix for controls whose prior
+ * runtime owner disappeared during a rolling replacement. */
+export function durableLarkSessionControlPartitionPrefix(larkAppId: string): string {
+  return `lark-session-control:${bounded(larkAppId, 'larkAppId', 256)}:`;
 }
 
 /**

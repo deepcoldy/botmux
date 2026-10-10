@@ -193,6 +193,34 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('claims inbox partitions by literal prefix without treating underscores as wildcards', async () => {
+    const store = makeStore(() => 10);
+    await store.enqueueInbox({
+      eventId: 'prefix-other', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'lark-session-control:cliXtest:remote', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    await store.enqueueInbox({
+      eventId: 'prefix-match', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'lark-session-control:cli_test:local', payload: {}, visibleAt: 0, createdAt: 2,
+    });
+
+    const claim = await store.claimNextInbox({
+      workerId: 'prefix-worker',
+      lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeyPrefix: 'lark-session-control:cli_test:',
+      leaseDurationMs: 20,
+    });
+    expect(claim?.event.eventId).toBe('prefix-match');
+    await expect(store.claimNextInbox({
+      workerId: 'invalid-filter',
+      lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['lark-session-control:cli_test:local'],
+      partitionKeyPrefix: 'lark-session-control:cli_test:',
+      leaseDurationMs: 20,
+    })).rejects.toThrow('mutually exclusive');
+    await store.close();
+  });
+
   it('orders one partition by store insertion sequence instead of client timestamps or ids', async () => {
     let now = 10;
     const store = makeStore(() => now);

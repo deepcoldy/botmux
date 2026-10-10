@@ -7,6 +7,7 @@ import {
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
+  durableLarkSessionControlPartitionPrefix,
 } from '../src/services/durable-lark-session-control.js';
 import { startDurableSessionControlConsumer } from '../src/services/durable-session-control-consumer.js';
 
@@ -108,6 +109,62 @@ describe('durable session control consumer', () => {
       leaseDurationMs: 100,
     });
     expect(claim?.event.eventId).toBe('card.action.trigger:cli_test:evt-a');
+    await store.close();
+  });
+
+  it('discovers a canonical control by application prefix after the local owner disappeared', async () => {
+    const store = makeStore(() => 10);
+    await store.enqueueInbox(controlEvent('session-a', 'evt-a', 1));
+    const dispatched: string[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-failover',
+      ownedPartitionKeys: () => [],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        return { kind: 'settled' };
+      },
+      concurrency: 1,
+      intervalMs: 60_000,
+    });
+    await consumer.ready;
+    expect(dispatched).toEqual(['session-a']);
+    await consumer.stop();
+    await store.close();
+  });
+
+  it('prefers an exact local owner before application-prefix fallback', async () => {
+    const store = makeStore(() => 10);
+    await store.enqueueInbox(controlEvent('session-remote', 'evt-remote', 1));
+    await store.enqueueInbox(controlEvent('session-local', 'evt-local', 2));
+    const dispatched: string[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-preferred',
+      ownedPartitionKeys: () => [
+        durableLarkSessionControlPartition('cli_test', 'session-local'),
+      ],
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        return { kind: 'settled' };
+      },
+      concurrency: 1,
+      batchSize: 1,
+      intervalMs: 60_000,
+    });
+    await consumer.ready;
+    expect(dispatched).toEqual(['session-local']);
+    await consumer.stop();
+
+    const remaining = await store.claimNextInbox({
+      workerId: 'proof',
+      lane: 'session-control',
+      partitionKeyPrefix: durableLarkSessionControlPartitionPrefix('cli_test'),
+      leaseDurationMs: 100,
+    });
+    expect(remaining?.event.eventId).toBe('card.action.trigger:cli_test:evt-remote');
     await store.close();
   });
 

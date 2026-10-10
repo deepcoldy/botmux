@@ -544,12 +544,18 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     if (input.partitionKeys !== undefined && !Array.isArray(input.partitionKeys)) {
       throw new Error('partitionKeys must be an array');
     }
+    if (input.partitionKeys !== undefined && input.partitionKeyPrefix !== undefined) {
+      throw new Error('partitionKeys and partitionKeyPrefix are mutually exclusive');
+    }
     const partitionKeys = input.partitionKeys === undefined
       ? undefined
       : [...new Set(input.partitionKeys.map(key => {
         if (typeof key !== 'string') throw new Error('partitionKey must be text');
         return nonempty(key, 'partitionKey');
       }))];
+    const partitionKeyPrefix = input.partitionKeyPrefix === undefined
+      ? undefined
+      : nonempty(input.partitionKeyPrefix, 'partitionKeyPrefix');
     if (partitionKeys && partitionKeys.length > 256) {
       throw new Error('partitionKeys must contain at most 256 unique values');
     }
@@ -559,7 +565,12 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     return this.transaction(() => {
       const partitionFilter = partitionKeys
         ? `AND i.partition_key IN (${partitionKeys.map(() => '?').join(', ')})`
-        : '';
+        : partitionKeyPrefix
+          ? 'AND substr(i.partition_key, 1, length(?)) = ?'
+          : '';
+      const partitionArgs = partitionKeys ?? (partitionKeyPrefix
+        ? [partitionKeyPrefix, partitionKeyPrefix]
+        : []);
       const candidate = this.db.prepare(
         `SELECT i.event_id
            FROM durable_inbox i
@@ -585,7 +596,7 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
             )
           ORDER BY i.visible_at, io.sequence
           LIMIT 1`,
-      ).get(lane, ...(partitionKeys ?? []), now, now, now) as { event_id: string } | undefined;
+      ).get(lane, ...partitionArgs, now, now, now) as { event_id: string } | undefined;
       if (!candidate) return undefined;
       this.db.prepare(
         `UPDATE durable_inbox

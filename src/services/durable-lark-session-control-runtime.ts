@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { DaemonSession } from '../core/types.js';
-import { sessionKey, storedSessionAnchorId } from '../core/types.js';
+import { sessionKey } from '../core/types.js';
 import type { Session } from '../types.js';
 import type { DurableCoordinationStore, DurableJson } from './durable-coordination.js';
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
@@ -34,6 +34,8 @@ export interface DurableLarkSessionControlRuntimeOptions {
   findActiveSession(sessionId: string): DaemonSession | undefined;
   listPersistedSessions(): Session[];
   getPersistedSession(sessionId: string): Session | undefined;
+  /** Import a canonical closed snapshot into this replica's local runtime store. */
+  materializeClosedSession(session: Session): Session;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
@@ -110,40 +112,59 @@ export function createDurableLarkSessionControlRuntime(
     if (control.larkAppId !== options.larkAppId) {
       return { kind: 'ignored', reason: 'control belongs to another Lark application' };
     }
-    const live = options.findActiveSession(control.sessionId);
-    const persisted = options.getPersistedSession(control.sessionId);
-    const session = live?.session ?? persisted;
-    if (!session || session.larkAppId !== options.larkAppId) {
-      return { kind: 'ignored', reason: 'control target is not owned by this bot' };
-    }
-    if (!options.canOperate(session.chatId, control.operatorOpenId)) {
-      return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
-    }
     const value = record(record(control.data)?.action)?.value;
     if (options.privateCard || record(value)?.visibility === 'private') {
       return { kind: 'ignored', reason: 'private lifecycle cards are not durable yet' };
     }
-    if (session.title?.startsWith('Adopt:') || session.adoptedFrom) {
-      return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
-    }
-    if (control.action === 'close') {
-      if (!live && session.status !== 'closed') {
-        return { kind: 'ignored', reason: 'active control target is not local to this replica' };
-      }
-      if (live?.streamCardId !== control.cardMessageId) {
-        return { kind: 'ignored', reason: 'close card no longer owns the active Session lifecycle' };
-      }
-    } else if (session.streamCardId !== control.cardMessageId) {
-      return { kind: 'ignored', reason: 'resume card no longer owns the closed Session lifecycle' };
-    }
-
-    const canonicalKey = sessionKey(storedSessionAnchorId(session), options.larkAppId);
+    const canonicalKey = sessionKey(control.rootId, options.larkAppId);
     const canonical = await options.store.readSession(canonicalKey);
     const canonicalSession = canonical
       ? parseDurablePrimarySessionRecord(canonical).session
       : undefined;
-    if (!canonicalSession || canonicalSession.sessionId !== control.sessionId) {
+    if (!canonicalSession
+        || canonicalSession.larkAppId !== options.larkAppId
+        || canonicalSession.sessionId !== control.sessionId) {
       throw new Error('durable lifecycle control canonical Session is unavailable');
+    }
+    if (control.action === 'resume' && canonicalSession.status !== 'closed') {
+      return { kind: 'ignored', reason: 'canonical Session is no longer closed' };
+    }
+    if (control.action === 'close' && canonicalSession.status !== 'active'
+        && canonicalSession.status !== 'closed') {
+      return { kind: 'ignored', reason: 'canonical Session cannot be closed' };
+    }
+    if (canonicalSession.streamCardId !== control.cardMessageId) {
+      return {
+        kind: 'ignored',
+        reason: `${control.action} card no longer owns the canonical Session lifecycle`,
+      };
+    }
+    if (!options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
+      return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
+    }
+    if (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom) {
+      return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
+    }
+
+    const live = options.findActiveSession(control.sessionId);
+    let persisted = options.getPersistedSession(control.sessionId);
+    if (control.action === 'resume' && !persisted) {
+      persisted = options.materializeClosedSession(structuredClone(canonicalSession));
+    }
+    const session = live?.session ?? persisted ?? canonicalSession;
+    if (control.action === 'close' && canonicalSession.status === 'active') {
+      if (!live) {
+        // Prefix fallback may discover an active Session owned by another Pod.
+        // Keep the Inbox row retryable; completing it as ignored would lose the
+        // user's close request before the exact runtime owner can claim it.
+        throw new Error('active control target is not local to this replica');
+      }
+      if (live.streamCardId !== control.cardMessageId) {
+        return { kind: 'ignored', reason: 'close card no longer owns the active Session lifecycle' };
+      }
+    }
+    if (control.action === 'resume' && !live && persisted?.status !== 'closed') {
+      throw new Error('canonical closed Session could not be materialized locally');
     }
     const resumeBaselineState = control.action === 'resume'
       ? normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState)

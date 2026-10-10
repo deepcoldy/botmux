@@ -120,6 +120,7 @@ import { durableLarkOutboxMessage } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import { parseDurablePrimarySessionRecord } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
+import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -29361,6 +29362,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             findActiveSession: findActiveBySessionId,
             listPersistedSessions: () => sessionStore.listSessions(),
             getPersistedSession: sessionId => sessionStore.getOwnedSession(sessionId),
+            materializeClosedSession: canonical => {
+              if (canonical.larkAppId !== cfg.larkAppId || canonical.status !== 'closed') {
+                throw new Error('refusing to materialize a non-canonical closed Session');
+              }
+              const existing = sessionStore.getOwnedSession(canonical.sessionId);
+              if (existing) {
+                if (existing.larkAppId !== canonical.larkAppId || existing.status !== 'closed') {
+                  throw new Error('local Session conflicts with canonical closed materialization');
+                }
+                return existing;
+              }
+              sessionStore.updateSession(canonical);
+              const materialized = sessionStore.getOwnedSession(canonical.sessionId);
+              if (!materialized || materialized.status !== 'closed') {
+                throw new Error('canonical closed Session materialization did not persist');
+              }
+              return materialized;
+            },
             canOperate: (chatId, operatorOpenId) =>
               canOperate(cfg.larkAppId, chatId, operatorOpenId),
             closeSession: sessionId => closeSessionHelper(sessionId, {
@@ -29397,6 +29416,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ),
             control: {
               ownedPartitionKeys: primaryControlRuntime.ownedPartitionKeys,
+              partitionKeyPrefix: durableLarkSessionControlPartitionPrefix(cfg.larkAppId),
               resolve: primaryControlRuntime.resolve,
             },
             onLeadershipAcquired: () => { eventRuntime.connect(); },

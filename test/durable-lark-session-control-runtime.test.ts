@@ -108,6 +108,7 @@ describe('durable Lark session control runtime', () => {
       findActiveSession: () => active || undefined,
       listPersistedSessions: () => [persisted],
       getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
       canOperate: () => true,
       closeSession,
       resumeSession: async () => ({ ok: false, error: 'not_closed' }),
@@ -172,6 +173,7 @@ describe('durable Lark session control runtime', () => {
       findActiveSession: () => undefined,
       listPersistedSessions: () => [],
       getPersistedSession: () => undefined,
+      materializeClosedSession: value => value,
       canOperate: () => true,
       closeSession: async () => ({ ok: false, error: 'not local' }),
       resumeSession: async () => ({ ok: false, error: 'not local' }),
@@ -182,6 +184,75 @@ describe('durable Lark session control runtime', () => {
 
     expect(await runtime.authorizeBeforeAck(control().data)).toBe(true);
     expect(runtime.ownedPartitionKeys()).toEqual([]);
+    await facade.stop();
+    await store.close();
+  });
+
+  it('materializes a canonical closed Session on a fresh replica before resolving resume', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-canonical-resume-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const canonicalClosed = session({
+      status: 'closed',
+      closedAt: '2026-10-09T00:01:00.000Z',
+      remoteBackendState: {
+        version: 1,
+        provider: 'test-runner',
+        generation: 2,
+        agentThreadId: 'thread-1',
+      },
+    });
+    let persisted: Session | undefined;
+    await admitDurableLarkSession({ facade, message: message(), session: canonicalClosed });
+    const materializeClosedSession = vi.fn((value: Session) => {
+      persisted = structuredClone(value);
+      return persisted;
+    });
+    const resumeSession = vi.fn(async () => ({
+      ok: false as const,
+      error: 'anchor_occupied',
+      activeSessionId: 'session-other',
+    }));
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted,
+      materializeClosedSession,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not active' }),
+      resumeSession,
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      resumeRefusedText: error => error,
+    });
+    expect(runtime.ownedPartitionKeys()).toEqual([]);
+    const input = control('resume');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(materializeClosedSession).toHaveBeenCalledOnce();
+    expect(resumeSession).toHaveBeenCalledWith('session-1');
+    expect(runtime.ownedPartitionKeys()).toEqual([
+      'lark-session-control:cli_test:session-1',
+    ]);
+    const canonical = await store.readSession('om_root::cli_test');
+    expect(parseDurablePrimarySessionRecord(canonical!)).toMatchObject({
+      session: { status: 'closed' },
+      controls: [{ action: 'resume', result: { applied: false, error: 'anchor_occupied' } }],
+    });
     await facade.stop();
     await store.close();
   });
@@ -202,6 +273,7 @@ describe('durable Lark session control runtime', () => {
       findActiveSession: () => undefined,
       listPersistedSessions: () => [persisted],
       getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
       canOperate: () => true,
       closeSession: async () => ({ ok: false, error: 'not active' }),
       resumeSession: async () => ({
@@ -282,6 +354,7 @@ describe('durable Lark session control runtime', () => {
       findActiveSession: () => active,
       listPersistedSessions: () => [persisted],
       getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
       canOperate: () => true,
       closeSession: async () => ({ ok: false, error: 'not active' }),
       resumeSession,
@@ -381,6 +454,7 @@ describe('durable Lark session control runtime', () => {
       findActiveSession: () => active,
       listPersistedSessions: () => [persisted],
       getPersistedSession: () => persisted,
+      materializeClosedSession: value => value,
       canOperate: () => true,
       closeSession: async () => ({ ok: false, error: 'not active' }),
       resumeSession,

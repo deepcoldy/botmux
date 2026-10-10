@@ -22,6 +22,12 @@ export interface DurableSessionControlConsumerOptions {
   store: DurableInboxStore;
   /** 每次 claim 前回读；只返回当前 Pod 可以执行的 session-control 分区。 */
   ownedPartitionKeys(): readonly string[];
+  /**
+   * Optional failover discovery scope. Exact locally-owned partitions are
+   * always attempted first; the prefix is only consulted when no exact claim
+   * is available.
+   */
+  partitionKeyPrefix?: string;
   dispatch(
     control: DurableLarkSessionControlClaim,
     context: DurableSessionControlDispatchContext,
@@ -124,6 +130,11 @@ export function startDurableSessionControlConsumer(
   const batchSize = boundedInteger(options.batchSize ?? 32, 'batchSize', 1, 1_000);
   const shutdownMs = boundedInteger(options.shutdownMs ?? 5_000, 'shutdownMs', 0, 300_000);
   const now = options.now ?? Date.now;
+  const partitionKeyPrefix = options.partitionKeyPrefix?.trim();
+  if (options.partitionKeyPrefix !== undefined
+      && (!partitionKeyPrefix || partitionKeyPrefix.length > 1_024 || /[\r\n\0]/.test(partitionKeyPrefix))) {
+    throw new Error('partitionKeyPrefix must contain at most 1024 non-empty characters');
+  }
   const slots: Slot[] = Array.from({ length: concurrency }, (_, index) => ({ index }));
   const controllers = new Set<AbortController>();
   let stopped = false;
@@ -209,13 +220,23 @@ export function startDurableSessionControlConsumer(
       let claim: InboxClaim | undefined;
       try {
         const partitionKeys = normalizedPartitionKeys(options.ownedPartitionKeys());
-        if (partitionKeys.length === 0) return;
-        claim = await options.store.claimNextInbox({
-          workerId: slotWorkerId,
-          lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
-          partitionKeys,
-          leaseDurationMs,
-        });
+        if (partitionKeys.length > 0) {
+          claim = await options.store.claimNextInbox({
+            workerId: slotWorkerId,
+            lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+            partitionKeys,
+            leaseDurationMs,
+          });
+        }
+        if (!claim && partitionKeyPrefix) {
+          claim = await options.store.claimNextInbox({
+            workerId: slotWorkerId,
+            lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+            partitionKeyPrefix,
+            leaseDurationMs,
+          });
+        }
+        if (partitionKeys.length === 0 && !partitionKeyPrefix) return;
       } catch (error) {
         reportError(error);
         return;
