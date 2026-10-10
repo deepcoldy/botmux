@@ -19,6 +19,7 @@ import {
   waitForCodexSideResponse,
   closeSession,
 } from './helpers.js';
+import { publishLabeledPageVideo } from './e2e-video.js';
 
 export function registerMidsceneSuites(): void {
   createBotTest('Codex', { allowCodexUsageLimitResponse: true });
@@ -48,6 +49,11 @@ export function registerMidsceneSuites(): void {
       await closeSession(agent, page);
       await agent?.destroy();
       await context?.close();
+      try {
+        await publishLabeledPageVideo(page);
+      } catch (error) {
+        console.error('Feishu video publish failed:', error);
+      }
       await browser?.close();
     });
 

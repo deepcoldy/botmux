@@ -162,7 +162,44 @@ function caseTarget(testCase) {
     : testCase.reportPath;
 }
 
-function landingPage(cases) {
+function replayCell(testCase, videosByCase) {
+  const src = videosByCase[testCase.name];
+  if (!src) return '<span class="unavailable">Not available</span>';
+  return `<video controls preload="metadata" src="${escapeHtml(src)}"></video>`;
+}
+
+async function videoSources(videosDir, output) {
+  if (!videosDir) return {};
+  const root = path.resolve(videosDir);
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(path.join(root, 'manifest.json'), 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return {};
+    throw error;
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return {};
+  const sources = {};
+  await mkdir(path.join(output, 'videos'), { recursive: true });
+  for (const [caseName, fileName] of Object.entries(manifest)) {
+    if (typeof fileName !== 'string') continue;
+    const base = path.basename(fileName);
+    if (base !== fileName || !base.endsWith('.webm')) continue;
+    const source = path.join(root, base);
+    try {
+      const info = await stat(source);
+      if (!info.isFile()) continue;
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    await cp(source, path.join(output, 'videos', base));
+    sources[caseName] = `videos/${base}`;
+  }
+  return sources;
+}
+
+function landingPage(cases, videosByCase) {
   const passed = cases.filter((testCase) => testCase.status === 'success').length;
   const failed = cases.filter((testCase) => testCase.status === 'failed').length;
   const skipped = cases.filter((testCase) => testCase.status === 'skipped').length;
@@ -182,7 +219,8 @@ function landingPage(cases) {
     const preview = testCase.previewPath && target
       ? `<a href="${escapeHtml(target)}"><img src="${escapeHtml(testCase.previewPath)}" alt="${escapeHtml(testCase.name)} screenshot" loading="lazy"></a>`
       : '<span class="unavailable">Not available</span>';
-    return `<tr><td>${icon}</td><td>${name}</td><td>${escapeHtml(testCase.project)}</td><td>${escapeHtml(testCase.status)}</td><td>${formatDuration(testCase.durationMs)}</td><td>${preview}</td></tr>`;
+    const replay = replayCell(testCase, videosByCase);
+    return `<tr><td>${icon}</td><td>${name}</td><td>${escapeHtml(testCase.project)}</td><td>${escapeHtml(testCase.status)}</td><td>${formatDuration(testCase.durationMs)}</td><td>${preview}</td><td>${replay}</td></tr>`;
   }).join('\n');
   return `<!doctype html>
 <html lang="en">
@@ -199,14 +237,14 @@ function landingPage(cases) {
     table { width: 100%; border-collapse: collapse; background: #131722; border: 1px solid #2b3142; }
     th, td { padding: 12px 14px; border-bottom: 1px solid #2b3142; text-align: left; vertical-align: top; }
     th { color: #aeb4c6; font-size: 13px; text-transform: uppercase; }
-    img { width: 260px; max-height: 160px; object-fit: cover; border-radius: 8px; border: 1px solid #343b50; }
+    img, video { width: 260px; max-height: 160px; object-fit: cover; border-radius: 8px; border: 1px solid #343b50; background: #000; }
   </style>
 </head>
 <body><main>
   <h1>Botmux × Midscene</h1>
   <p class="summary"><strong>${passed}/${cases.length} cases passed</strong> · ${failed} failed · ${skipped} skipped · ${notRun} not run</p>
   <table>
-    <thead><tr><th></th><th>Case</th><th>Project</th><th>Status</th><th>Duration</th><th>Node screenshot</th></tr></thead>
+    <thead><tr><th></th><th>Case</th><th>Project</th><th>Status</th><th>Duration</th><th>Node screenshot</th><th>Replay</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>
 </main></body>
@@ -219,6 +257,7 @@ export async function prepareMidscenePages(options) {
   const skippedCasesDir = required(options, 'skipped-cases-dir');
   const output = required(options, 'output');
   await mkdir(output, { recursive: true });
+  const videosByCase = await videoSources(options['videos-dir'], output);
 
   const cases = await loadProjectReport({
     reportRoot: dashboardReportRoot,
@@ -262,7 +301,7 @@ export async function prepareMidscenePages(options) {
 
   const manifest = { schemaVersion: 1, cases };
   await writeFile(path.join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-  await writeFile(path.join(output, 'index.html'), landingPage(cases));
+  await writeFile(path.join(output, 'index.html'), landingPage(cases, videosByCase));
   process.stdout.write(`Prepared ${cases.length} Midscene cases for publication.\n`);
   return manifest;
 }

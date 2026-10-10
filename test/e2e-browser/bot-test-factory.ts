@@ -39,6 +39,7 @@ import {
   closeSession,
   type BotName,
 } from './helpers.js';
+import { publishLabeledPageVideo } from './e2e-video.js';
 
 type BotTestOptions = {
   allowCodexUsageLimitResponse?: boolean;
@@ -67,6 +68,11 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
       await closeSession(agent, page);
       await agent?.destroy();
       await context?.close();
+      try {
+        await publishLabeledPageVideo(page);
+      } catch (error) {
+        console.error('Feishu video publish failed:', error);
+      }
       await browser?.close();
     });
 

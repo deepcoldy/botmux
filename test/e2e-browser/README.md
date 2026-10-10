@@ -20,6 +20,14 @@ bun run test:e2e-browser
 The command writes each run below `midscene_run/runs/<run-id>/`. Use
 `bun run report:dashboard` to browse historical reports.
 
+Set `BOTMUX_E2E_RECORD_VIDEO=1` to record a Playwright WebM for each browser
+context. Clips are written under `test/e2e-browser/midscene_run/videos/`
+(gitignored) and the report index embeds them when that directory exists.
+The CI core Feishu cases use `feishu.openAndSend`, `feishu.waitForStreamingCard`,
+`feishu.waitForBotResponse`, `feishu.showStreamingOutput`, and `feishu.close`
+so each phase keeps its own Midscene snapshots. The full catalog still uses
+`feishu.runScenario`.
+
 ## GitHub Actions
 
 The `Midscene E2E` workflow runs the Dashboard project without Feishu login

@@ -139,6 +139,7 @@ jobs:
         id: dashboard_midscene
         env:
           MIDSCENE_RUN_DIR: ${{ github.workspace }}/midscene_run/dashboard
+          BOTMUX_E2E_RECORD_VIDEO: "1"
         run: bun run test:midscene
 
       - name: Detect Feishu live-test configuration
@@ -185,6 +186,7 @@ jobs:
           BOTMUX_MOCK_LLM: "1"
           BOTMUX_START_DAEMON: ${{ steps.feishu_config.outputs.has_bots }}
           BOTS_CONFIG: test-bots.json
+          BOTMUX_E2E_RECORD_VIDEO: "1"
         run: bun run test:midscene:feishu
 
       - name: Prepare linked Midscene evidence site
@@ -205,6 +207,9 @@ jobs:
           )
           if [[ "$feishu_outcome" != "skipped" ]]; then
             arguments+=(--feishu-report-root test/e2e-browser/midscene_run)
+          fi
+          if [[ -d test/e2e-browser/midscene_run/videos ]]; then
+            arguments+=(--videos-dir test/e2e-browser/midscene_run/videos)
           fi
           node scripts/prepare-midscene-pages.mjs "${arguments[@]}"
 

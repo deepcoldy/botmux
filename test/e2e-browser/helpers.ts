@@ -1,9 +1,17 @@
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type BrowserContextOptions,
+  type Page,
+} from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import 'dotenv/config';
+import { E2E_VIDEO_DIR, e2eVideoRecordingEnabled } from './e2e-video.js';
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '../..');
 
@@ -105,13 +113,25 @@ export async function createBrowser(headless = true): Promise<Browser> {
 export async function createPage(
   browser: Browser,
 ): Promise<{ context: BrowserContext; page: Page }> {
-  const contextOpts: Record<string, unknown> = {
+  const contextOpts: BrowserContextOptions = {
     viewport: BROWSER_CONFIG.viewport,
     deviceScaleFactor: BROWSER_CONFIG.deviceScaleFactor,
     locale: BROWSER_CONFIG.locale,
   };
   if (existsSync(STORAGE_STATE_PATH)) {
     contextOpts.storageState = STORAGE_STATE_PATH;
+  }
+  // Continuous WebM of this context. Enabled only for Midscene runs
+  // (`BOTMUX_E2E_RECORD_VIDEO=1`); the file is saved when the context closes.
+  if (e2eVideoRecordingEnabled()) {
+    await mkdir(E2E_VIDEO_DIR, { recursive: true });
+    contextOpts.recordVideo = {
+      dir: E2E_VIDEO_DIR,
+      size: {
+        width: BROWSER_CONFIG.viewport.width,
+        height: BROWSER_CONFIG.viewport.height,
+      },
+    };
   }
   const context = await browser.newContext(contextOpts);
   const page = await context.newPage();

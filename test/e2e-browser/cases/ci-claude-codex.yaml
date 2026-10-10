@@ -1,13 +1,58 @@
+# CI core cases are split so each phase keeps its own Midscene snapshots.
+# Assertion order matches the passing TypeScript flows: Claude waits for the
+# ACK bubble rather than 「等待输入」; Codex clicks 「直接开启会话」 before any
+# streaming-card wait. The full catalog still uses feishu.runScenario.
 cases:
   - name: Claude basic bot flow
     tags: [bot, smoke, ci-core]
     steps:
-      - feishu.runScenario: { scenario: bot-claude-basic }
+      - feishu.openAndSend:
+          scenario: bot-claude-basic
+          $:
+            timeout: 300_000
+      - feishu.waitForStreamingCard:
+          scenario: bot-claude-basic
+          $:
+            timeout: 300_000
+      - feishu.waitForBotResponse:
+          scenario: bot-claude-basic
+          $:
+            timeout: 300_000
+      - feishu.showStreamingOutput:
+          scenario: bot-claude-basic
+          $:
+            timeout: 180_000
+      - feishu.close:
+          scenario: bot-claude-basic
+          $:
+            timeout: 60_000
   - name: Codex basic bot flow
     tags: [bot, smoke, ci-core]
     steps:
-      - feishu.runScenario: { scenario: bot-codex-basic }
+      - feishu.openAndSend:
+          scenario: bot-codex-basic
+          $:
+            timeout: 300_000
+      - feishu.waitForBotResponse:
+          scenario: bot-codex-basic
+          $:
+            timeout: 300_000
+      - feishu.close:
+          scenario: bot-codex-basic
+          $:
+            timeout: 60_000
   - name: Codex prompt submission
     tags: [bot, codex, ci-core]
     steps:
-      - feishu.runScenario: { scenario: bot-codex-prompt }
+      - feishu.openAndSend:
+          scenario: bot-codex-prompt
+          $:
+            timeout: 300_000
+      - feishu.waitForBotResponse:
+          scenario: bot-codex-prompt
+          $:
+            timeout: 300_000
+      - feishu.close:
+          scenario: bot-codex-prompt
+          $:
+            timeout: 60_000
