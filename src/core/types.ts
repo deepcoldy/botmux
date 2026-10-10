@@ -356,6 +356,22 @@ export interface DaemonSession {
   streamCardTurnGeneration?: number;
   /** Exact newest turn awaiting its own streaming card. In-memory only. */
   streamCardPendingTurnId?: string;
+  /** In-memory proof of the last streaming card this daemon itself published
+   * (successful POST behind the publication fence, or a verified PATCH of the
+   * persisted current card). Recorded only by worker-pool publication paths —
+   * never derived from a card callback or a frozen-card self-heal, because an
+   * old card that self-healed carries the current nonce/session_id too. Used
+   * solely to prove that a clicked message may be re-bound as the current card
+   * after the runtime card id was lost. */
+  lastPublishedStreamingCardIdentity?: {
+    messageId: string;
+    nonce: string;
+    sessionId: string;
+    larkAppId: string;
+    anchorId: string;
+    runtimeKey: string;
+    turnGeneration: number;
+  };
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
@@ -407,6 +423,50 @@ export interface DaemonSession {
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
+  /** In-memory provenance of `currentImageKey` (the worker turn/attempt that
+   * captured it). Trusted only while `imageKey === currentImageKey`; a cache
+   * restored from disk has no provenance and is treated as legacy. */
+  currentImageSource?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
+  /** The worker's actual screenshot capture identity, from capture_identity
+   * events emitted at real CLI write points (never from input ACKs). Scoped to
+   * one worker generation: once a generation announced it, that generation's
+   * frames must carry a matching revision + full tuple. `lastSource` is the
+   * last non-empty tuple — clearing to (undefined, undefined) does not clear
+   * the terminal's pixels, so suppression of that source still applies.
+   * In-memory only. */
+  captureIdentity?: {
+    workerGeneration: number;
+    revision: number;
+    turnId?: string;
+    dispatchAttempt?: number;
+    /** Mirror of `retainedCaptureSource` at commit time (see below). */
+    lastSource?: { turnId?: string; dispatchAttempt?: number };
+  };
+  /** Last NON-EMPTY capture tuple ever written to this session's terminal —
+   * evidence of whose pixels may still be on screen. Deliberately NOT scoped
+   * to a worker generation: a worker restart/reattach keeps the persistent
+   * terminal's pixels, and an initial empty identity from the replacement
+   * does not prove the screen was cleared. Replaced only by a new non-empty
+   * write. Grants no execution or frame-sending authority; it only restricts
+   * what may be displayed. In-memory only. */
+  retainedCaptureSource?: { turnId?: string; dispatchAttempt?: number };
+  /** Display target of the current streaming card, bound to its exact
+   * messageId and publication sequence. `waiting-exact-turn` accepts only
+   * frames positively matching `turnId`; it flips to `follow-live` (CAS on
+   * messageId + publication) once that turn's capture identity is observed.
+   * Revision ordering alone never proves target ownership. In-memory only. */
+  streamCardDisplayTarget?: {
+    messageId: string;
+    publication: number;
+    mode: 'waiting-exact-turn' | 'follow-live';
+    turnId?: string;
+  };
+  /** Highest dispatch attempt the daemon has observed for one turn (from
+   * managed_turn_origin publications and accepted frames). Monotonic per
+   * turn and deliberately NOT cleared with managedTurnOrigin at a worker
+   * generation change: it grants no authority, it only lets the screenshot
+   * fence reject a frame from an older attempt of the same turn. In-memory. */
+  turnDispatchAttemptHighWater?: { turnId: string; dispatchAttempt: number };
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /**
@@ -615,6 +675,10 @@ export interface DaemonSession {
   pendingSubstituteControlCard?: boolean;
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
+  /** Exact message id targeted by the in-flight PATCH (pendingCardId is cleared
+   * before the HTTP request completes, so it cannot identify this). Cleared in
+   * the same finally that clears cardPatchInFlight. In-memory only. */
+  cardPatchInFlightMessageId?: string;
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
   pendingCardUserInitiated?: boolean; // latest queued PATCH came from an explicit card action; failures are surfaced at warn level

@@ -64,6 +64,7 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 Relayed away',
   'card.status.selected': 'Selected',
   'card.status.waiting_screenshot': '_(Waiting for first screenshot…)_',
+  'card.status.screenshot_unavailable': '_(No screenshot is available. Refresh after the session resumes.)_',
   'card.status.truncated_prefix': '… (truncated)',
   'card.pending.detoured_title': 'Sent',
   'card.pending.detoured_body': 'The final reply was sent to another target.',
@@ -1709,6 +1710,7 @@ export const messages: Record<string, string> = {
   'toast.action_received_no_repeat': 'Action received — please don’t click again',
   'toast.action_in_progress': 'Action in progress — please wait',
   'toast.action_received_bg': 'Action received — processing in the background',
+  'toast.card_update_busy_retry': 'The card is updating — please tap again in a moment',
   'toast.not_in_approver_list': 'You’re not on the approver list — no action taken',
 
   // Quote hint (injected into the CLI prompt)

@@ -2087,7 +2087,15 @@ export type WorkerToDaemon =
   | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; turnId?: string; dispatchAttempt?: number; cliLifetime?: number }
   | { type: 'stuck_warning_expired'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }
-  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
+  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+      /** capture_identity revision this frame was captured under (bound before
+       *  the first await). Absent only from pre-capture-identity workers. */
+      captureRevision?: number }
+  /** The worker's actual screenshot capture identity changed (a real CLI write
+   *  point, CLI exit/clear) or its initial snapshot. `revision` is monotonic per
+   *  worker process; undefined turnId/attempt is a meaningful tuple. Not an
+   *  input receipt: input_received/input_committed keep their own semantics. */
+  | { type: 'capture_identity'; revision: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'turn_interrupt_result'; requestId: string; turnId: string; delivered: boolean; reason?: 'stale_turn' | 'unsupported' | 'delivery_failed' }
   /** A normal success acknowledgement for one app-server accepted steer.

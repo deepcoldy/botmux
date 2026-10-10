@@ -72,6 +72,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
       _imageKey?: string,
       adoptMode?: boolean,
       showTakeover?: boolean,
+      ...rest: any[]
     ) =>
       JSON.stringify({
         config: { wide_screen_mode: true, update_multi: true },
@@ -81,6 +82,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
         content,
         status,
         cardNonce,
+        // Positional tail: rest[10] is the 23rd argument (screenshotUnavailable).
+        imageKey: _imageKey ?? null,
+        screenshotUnavailable: rest[10] === true,
         adoptMode: !!adoptMode,
         showTakeover: !!showTakeover,
       }),
@@ -101,6 +105,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptResolvedCard: vi.fn(() => JSON.stringify({ type: 'tui-resolved' })),
   truncateContent: vi.fn((s: string) => s),
   getCliDisplayName: vi.fn(() => 'Claude'),
+  frozenIdleLabel: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -118,7 +123,8 @@ vi.mock('../src/bot-registry.js', () => ({
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
-    session: { dataDir: '/tmp/test-sessions' },
+    // unit-setup supplies a per-file temporary directory, including concurrent runs.
+    session: { dataDir: process.env.SESSION_DATA_DIR! },
     daemon: { backendType: 'pty', cliId: 'claude-code' },
   },
 }));
@@ -145,6 +151,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
     forkWorker: vi.fn(),
     killWorker: vi.fn(),
     initWorkerPool: vi.fn(),
+    isSessionTransferring: vi.fn((...args: Parameters<typeof orig.isSessionTransferring>) => orig.isSessionTransferring(...args)),
     requestSessionRestart: vi.fn((_ds: any, observer: any) => {
       void observer.notify('in_progress');
       return { attemptId: 'attempt-card', joined: false };
@@ -186,12 +193,16 @@ import {
   setActiveSessionsRegistry,
   forkWorker,
   requestSessionRestart,
+  isSessionTransferring,
+  CARD_POSTING_SENTINEL,
 } from '../src/core/worker-pool.js';
+import { getBot } from '../src/bot-registry.js';
 import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
+import { deleteFrozenCards } from '../src/services/frozen-card-store.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -283,6 +294,16 @@ function parseCard(json: string): any {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
+
+// This file deliberately uses the REAL frozen-card store (session-manager is
+// mocked, frozen-card-store is not), and every scenario shares the session id
+// 'uuid-integ-test'. A scenario whose card POST intentionally fails after
+// parkStreamCard (e.g. the R5 failed-repost port) leaves its parked entry on
+// disk, and the first test of the NEXT run would lazy-load and withdraw it as
+// an extra card. Reset the on-disk map before every test so runs are isolated.
+beforeEach(() => {
+  deleteFrozenCards('uuid-integ-test');
+});
 
 describe('Card integration: full event flow', () => {
   beforeEach(() => {
@@ -540,7 +561,7 @@ describe('Card integration: full event flow', () => {
       expect(fakeLark.patches[0].args[1]).toBe('om_new_card');
     });
 
-    it('stale-nonce toggle with clicked message id migrates the legacy card via updateMessage', async () => {
+    it('stale-nonce toggle with clicked message id repaints the legacy card through the callback only', async () => {
       const NONCE_TURN1 = 'nonce_turn1';
       const NONCE_TURN2 = 'nonce_turn2';
       const LEGACY_MSG_ID = 'om_card_turn1';
@@ -554,11 +575,11 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      // Click on the older turn's card (turn1 nonce + its message id).
-      // Self-heal should PATCH that *clicked* card, not the live one, so the
-      // visible chrome on the legacy card gets re-bound to the current
-      // session and CLI.
-      await handleCardAction(
+      // Click on the older turn's card (turn1 nonce + its message id). The
+      // clicked card is re-bound to the current session/CLI by the callback
+      // response alone: a parallel updateMessage would be an unqueued second
+      // channel whose late arrival can undo the next click.
+      const result = await handleCardAction(
         makeToggleEvent(ROOT_ID, NONCE_TURN1, 'ou_user', LEGACY_MSG_ID),
         deps,
         APP_ID,
@@ -566,16 +587,17 @@ describe('Card integration: full event flow', () => {
       await flush();
 
       expect(ds.displayMode).toBe('screenshot');
-      expect(fakeLark.patches).toHaveLength(1);
-      expect(fakeLark.patches[0].args[1]).toBe(LEGACY_MSG_ID);
+      expect(result).toMatchObject({ type: 'streaming', expanded: true, cardNonce: NONCE_TURN2 });
+      expect(fakeLark.patches).toHaveLength(0);
+      expect(ds.streamCardId).toBe('om_card_turn2');
 
       // Current-nonce click still works after a stale-nonce migration.
       await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_TURN2), deps, APP_ID);
       await flush();
 
       expect(ds.displayMode).toBe('hidden');
-      expect(fakeLark.patches).toHaveLength(2);
-      expect(fakeLark.patches[1].args[1]).toBe('om_card_turn2');
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(fakeLark.patches[0].args[1]).toBe('om_card_turn2');
     });
   });
 
@@ -1332,7 +1354,7 @@ describe('Card integration: full event flow', () => {
       expect(fakeLark.patches).toHaveLength(1);
     });
 
-    it('toggle with no workerPort should toggle state but not PATCH', async () => {
+    it('toggle with no workerPort still PATCHes the current card (worker readiness only gates fresh frames)', async () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_card_no_port',
         workerPort: null,
@@ -1341,11 +1363,146 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
+      const result = await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_card_no_port'),
+        deps,
+        APP_ID,
+      );
       await flush();
 
       expect(ds.displayMode).toBe('screenshot');
-      expect(fakeLark.patches).toHaveLength(0);
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(fakeLark.patches[0].args[1]).toBe('om_card_no_port');
+      const card = parseCard(fakeLark.patches[0].args[2]);
+      expect(card.expanded).toBe(true);
+      // Worker never reported ready and there is no cached frame: the card
+      // must say so instead of waiting forever.
+      expect(card.screenshotUnavailable).toBe(true);
+      expect(result).toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+    });
+
+    it('a ready backend without Web Terminal (workerReady=true, workerPort=null) PATCHes and waits for the next frame', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_card_ready_no_port',
+        workerPort: null,
+        workerReady: true,
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_card_ready_no_port'),
+        deps,
+        APP_ID,
+      );
+      await flush();
+
+      expect(ds.displayMode).toBe('screenshot');
+      expect(fakeLark.patches).toHaveLength(1);
+      const card = parseCard(fakeLark.patches[0].args[2]);
+      expect(card.expanded).toBe(true);
+      expect(card.screenshotUnavailable).toBe(false);
+      expect((ds.worker as any).send).toHaveBeenCalledWith({ type: 'set_display_mode', mode: 'screenshot' });
+    });
+
+    it('hides cached output on the clicked current card while worker is unavailable', async () => {
+      const cardId = 'om_current_sleeping';
+      const ds = makeDaemonSession({
+        streamCardId: cardId,
+        worker: null,
+        workerReady: false,
+        workerPort: null,
+        displayMode: 'screenshot',
+        currentImageKey: 'img_cached',
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const result = await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', cardId),
+        makeDeps(sessions), APP_ID,
+      );
+      await flush();
+      expect(ds.displayMode).toBe('hidden');
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(fakeLark.patches[0].args[1]).toBe(cardId);
+      expect(parseCard(fakeLark.patches[0].args[2]).expanded).toBe(false);
+      expect(result).not.toHaveProperty('elements');
+      expect(result).not.toHaveProperty('type');
+      expect(result?.toast?.type).toBe('info');
+    });
+
+    it('shows cached output on the clicked current card while worker is unavailable', async () => {
+      const cardId = 'om_current_sleeping_show';
+      const ds = makeDaemonSession({
+        streamCardId: cardId,
+        worker: null,
+        workerReady: false,
+        workerPort: null,
+        displayMode: 'hidden',
+        currentImageKey: 'img_cached',
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const result = await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', cardId),
+        makeDeps(sessions), APP_ID,
+      );
+      await flush();
+      expect(ds.displayMode).toBe('screenshot');
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(fakeLark.patches[0].args[1]).toBe(cardId);
+      const card = parseCard(fakeLark.patches[0].args[2]);
+      expect(card.expanded).toBe(true);
+      expect(card.imageKey).toBe('img_cached');
+      expect(card.screenshotUnavailable).toBe(false);
+      expect(result).not.toHaveProperty('type');
+      // No implicit CLI start from a display button.
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('shows an explicit unavailable state when worker is unavailable and nothing is cached', async () => {
+      const cardId = 'om_current_sleeping_empty';
+      const ds = makeDaemonSession({
+        streamCardId: cardId,
+        worker: null,
+        workerReady: false,
+        workerPort: null,
+        displayMode: 'hidden',
+        currentImageKey: undefined,
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', cardId),
+        makeDeps(sessions), APP_ID,
+      );
+      await flush();
+      expect(fakeLark.patches).toHaveLength(1);
+      const card = parseCard(fakeLark.patches[0].args[2]);
+      expect(card.expanded).toBe(true);
+      expect(card.imageKey).toBeNull();
+      expect(card.screenshotUnavailable).toBe(true);
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('updates an unknown frozen card from cache while the worker is unavailable (never rebinds it)', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_live_card',
+        streamCardNonce: NONCE_CURRENT,
+        worker: null,
+        workerReady: false,
+        workerPort: null,
+        displayMode: 'hidden',
+        currentImageKey: 'img_cached',
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const result = await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_OLD, 'ou_user', 'om_unknown_frozen'),
+        makeDeps(sessions), APP_ID,
+      );
+      await flush();
+      expect(ds.displayMode).toBe('screenshot');
+      expect(result).toMatchObject({ type: 'streaming', expanded: true, imageKey: 'img_cached' });
+      expect(ds.streamCardId).toBe('om_live_card');
+      expect(ds.streamCardNonce).toBe(NONCE_CURRENT);
     });
 
     it('returns the rebuilt card when a substitute turn declines the PATCH queue', async () => {
@@ -1539,6 +1696,359 @@ describe('Card integration: full event flow', () => {
 
   });
 
+  // ── Scenario 9: display toggle target identity (V2 strict rules) ─────────
+  //
+  // Real-shaped callback fixtures: root_id is the session's visible anchor
+  // (chat-scope → chatId), session_id is the real session id, and the message
+  // id comes from the Lark callback context — exactly what buildStreamingCard
+  // embeds, so the positive case cannot pass on a field the fixture omits.
+  describe('Scenario 9: toggle target identity and source isolation', () => {
+    const CHAT_ANCHOR = 'oc_chat';
+    const SESSION_ID = 'uuid-integ-test';
+    const NONCE_N = 'nonce_N';
+    const MSG_A = 'om_card_A_published';
+    const MSG_B = 'om_card_B_old_selfhealed';
+
+    function realToggleEvent(opts: {
+      messageId?: string; nonce?: string; sessionId?: string; rootId?: string;
+    }) {
+      return {
+        action: {
+          value: {
+            action: 'toggle_display',
+            root_id: opts.rootId ?? CHAT_ANCHOR,
+            session_id: opts.sessionId ?? SESSION_ID,
+            cli_id: 'claude-code',
+            stream_card_version: '1',
+            ...(opts.nonce === undefined ? { card_nonce: NONCE_N } : opts.nonce ? { card_nonce: opts.nonce } : {}),
+          },
+        },
+        operator: { open_id: 'ou_user' },
+        ...(opts.messageId ? { context: { open_message_id: opts.messageId } } : {}),
+      };
+    }
+
+    /** A/N was published by this daemon, then its runtime id was lost. */
+    function lostIdSession(overrides?: Partial<DaemonSession>): { ds: DaemonSession; deps: CardHandlerDeps } {
+      const ds = makeDaemonSession({
+        streamCardId: undefined,
+        streamCardNonce: NONCE_N,
+        workerReady: true,
+        displayMode: 'hidden',
+        currentImageKey: 'img_cached',
+        currentTurnId: 'om_turn_current',
+        streamCardTurnGeneration: 4,
+        ...overrides,
+      });
+      if (!overrides || !('lastPublishedStreamingCardIdentity' in overrides)) {
+        ds.lastPublishedStreamingCardIdentity = {
+          messageId: MSG_A,
+          nonce: NONCE_N,
+          sessionId: SESSION_ID,
+          larkAppId: APP_ID,
+          anchorId: CHAT_ANCHOR,
+          runtimeKey: activeSessionKey(ds),
+          turnGeneration: 4,
+        };
+      }
+      const sessions = new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]);
+      return { ds, deps: makeDeps(sessions) };
+    }
+
+    it('positive: the exact proven publication A is restored as the current card and patched via the queue', async () => {
+      const { ds, deps } = lostIdSession();
+      const result = await handleCardAction(realToggleEvent({ messageId: MSG_A }), deps, APP_ID);
+      await flush();
+      expect(ds.streamCardId).toBe(MSG_A);
+      expect(ds.displayMode).toBe('screenshot');
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(fakeLark.patches[0].args[1]).toBe(MSG_A);
+      expect(parseCard(fakeLark.patches[0].args[2])).toMatchObject({ expanded: true, imageKey: 'img_cached' });
+      expect(result).toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+    });
+
+    it('A/N current → old B self-healed with N → A id lost → clicking B never rebinds B', async () => {
+      const { ds, deps } = lostIdSession();
+      const result = await handleCardAction(realToggleEvent({ messageId: MSG_B }), deps, APP_ID);
+      await flush();
+      // Same nonce, same session, same root — still not proof of identity.
+      expect(ds.streamCardId).toBeUndefined();
+      expect(ds.streamCardNonce).toBe(NONCE_N);
+      expect(ds.lastPublishedStreamingCardIdentity?.messageId).toBe(MSG_A);
+      // Only the clicked card updates, via the callback (no queue PATCH).
+      expect(fakeLark.patches).toHaveLength(0);
+      expect(result).toMatchObject({ type: 'streaming', expanded: true, imageKey: 'img_cached' });
+      // A late screenshot cannot reach B either (no current card).
+      expect(ds.pendingCardJson).toBeUndefined();
+    });
+
+    const negatives: Array<[string, () => { ds: DaemonSession; deps: CardHandlerDeps }, Parameters<typeof realToggleEvent>[0]]> = [
+      ['no proof (pre-fix session / history)', () => lostIdSession({ lastPublishedStreamingCardIdentity: undefined }), { messageId: MSG_A }],
+      ['session_id mismatch', () => lostIdSession(), { messageId: MSG_A, sessionId: 'uuid-other-session' }],
+      ['root_id mismatch', () => lostIdSession(), { messageId: MSG_A, rootId: 'om_other_root' }],
+      ['missing session_id field', () => lostIdSession(), { messageId: MSG_A, sessionId: '' }],
+      ['turn generation advanced', () => lostIdSession({ streamCardTurnGeneration: 5 }), { messageId: MSG_A }],
+      ['streamCardPending (new turn awaiting its card)', () => lostIdSession({ streamCardPending: true }), { messageId: MSG_A }],
+      ['pending turn id', () => lostIdSession({ streamCardPendingTurnId: 'om_turn_next' }), { messageId: MSG_A }],
+      ['parked predecessor', () => lostIdSession({ parkedStreamCardNonce: NONCE_N }), { messageId: MSG_A }],
+      ['restart-recovery silence', () => lostIdSession({ suppressRecoveryCard: true }), { messageId: MSG_A }],
+      ['silent scheduled current turn', () => lostIdSession({ silentScheduledTurns: new Map([['om_turn_current', Date.now()]]) }), { messageId: MSG_A }],
+      ['chat-scope substitute current turn (even when forced)', () => lostIdSession({
+        streamingCardForced: true,
+        currentReplyTarget: { rootMessageId: 'om_sub', turnId: 'om_turn_current', updatedAt: new Date().toISOString(), substitute: true },
+      }), { messageId: MSG_A }],
+      ['meeting-driven (managed) current turn', () => {
+        const made = lostIdSession();
+        (made.ds.session as any).vcMeetingReceiver = true;
+        (made.ds.session as any).vcMeetingImTurnOrigins = {
+          om_turn_current: { larkMessageId: 'om_turn_current', receiverSessionId: SESSION_ID },
+        };
+        return made;
+      }, { messageId: MSG_A }],
+    ];
+    for (const [label, make, event] of negatives) {
+      it(`negative: ${label} → no rebind`, async () => {
+        const { ds, deps } = make();
+        await handleCardAction(realToggleEvent(event), deps, APP_ID);
+        await flush();
+        expect(ds.streamCardId).toBeUndefined();
+        expect(fakeLark.patches).toHaveLength(0);
+      });
+    }
+
+    it('negative: nonce mismatch goes through the historical path and never rebinds', async () => {
+      const { ds, deps } = lostIdSession();
+      const result = await handleCardAction(realToggleEvent({ messageId: MSG_A, nonce: 'nonce_other' }), deps, APP_ID);
+      await flush();
+      expect(ds.streamCardId).toBeUndefined();
+      expect(ds.streamCardNonce).toBe(NONCE_N);
+      expect(result).toMatchObject({ type: 'streaming' });
+    });
+
+    it('negative: POST sentinel is never replaced by the clicked message', async () => {
+      const { ds, deps } = lostIdSession({ streamCardId: CARD_POSTING_SENTINEL });
+      const result = await handleCardAction(realToggleEvent({ messageId: MSG_A }), deps, APP_ID);
+      await flush();
+      expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+      expect(fakeLark.patches).toHaveLength(0);
+      expect(result).toMatchObject({ type: 'streaming' });
+    });
+
+    it('negative: another session owns the registry slot', async () => {
+      const { ds, deps } = lostIdSession();
+      const usurper = makeDaemonSession({ session: { ...ds.session, sessionId: 'uuid-usurper' } as any });
+      // Callback lookup still resolves ds, but the active registry slot is
+      // owned by a different object.
+      setActiveSessionsRegistry(new Map([[activeSessionKey(ds), usurper]]));
+      await handleCardAction(realToggleEvent({ messageId: MSG_A }), deps, APP_ID);
+      await flush();
+      expect(ds.streamCardId).toBeUndefined();
+      expect(fakeLark.patches).toHaveLength(0);
+    });
+
+    it('negative: an in-flight PATCH of the same target blocks both rebind and the raw callback', async () => {
+      const { ds, deps } = lostIdSession({ cardPatchInFlight: true, cardPatchInFlightMessageId: MSG_A });
+      const result = await handleCardAction(realToggleEvent({ messageId: MSG_A }), deps, APP_ID);
+      await flush();
+      expect(ds.streamCardId).toBeUndefined();
+      expect(result).toEqual({ toast: { type: 'warning', content: '卡片正在更新，请稍后再点一次' } });
+      // The optimistic flip is rolled back so a retry requests the same transition.
+      expect(ds.displayMode).toBe('hidden');
+    });
+
+    it('negative: an in-flight PATCH whose target is unknown conservatively refuses the raw callback', async () => {
+      const { ds, deps } = lostIdSession({ cardPatchInFlight: true, lastPublishedStreamingCardIdentity: undefined });
+      const result = await handleCardAction(realToggleEvent({ messageId: MSG_B }), deps, APP_ID);
+      expect(result?.toast?.type).toBe('warning');
+      expect(ds.displayMode).toBe('hidden');
+    });
+
+    it('negative: closed session returns a failure toast and changes nothing', async () => {
+      const { ds, deps } = lostIdSession();
+      ds.session.status = 'closed' as any;
+      const result = await handleCardAction(realToggleEvent({ messageId: MSG_A }), deps, APP_ID);
+      expect(result?.toast?.type).toBe('warning');
+      expect(ds.displayMode).toBe('hidden');
+      expect(ds.streamCardId).toBeUndefined();
+    });
+
+    it('negative: transferring session refuses the raw callback with an explicit toast', async () => {
+      const { ds, deps } = lostIdSession({ lastPublishedStreamingCardIdentity: undefined });
+      vi.mocked(isSessionTransferring).mockImplementation((candidate: DaemonSession) => candidate === ds);
+      try {
+        const result = await handleCardAction(realToggleEvent({ messageId: MSG_B }), deps, APP_ID);
+        expect(result?.toast?.type).toBe('warning');
+        expect(result?.toast?.content).toContain('接力');
+        expect(ds.streamCardId).toBeUndefined();
+        expect(ds.displayMode).toBe('hidden');
+      } finally {
+        vi.mocked(isSessionTransferring).mockImplementation(() => false);
+      }
+    });
+
+    it('negative: apiOnly (no Lark transport) never repaints or rebinds', async () => {
+      const { ds, deps } = lostIdSession();
+      const normalBot = vi.mocked(getBot).getMockImplementation();
+      vi.mocked(getBot).mockImplementation((() => ({
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', apiOnly: true },
+        resolvedAllowedUsers: [], resolvedBlockedUsers: [], botOpenId: 'ou_bot',
+      })) as any);
+      try {
+        const result = await handleCardAction(realToggleEvent({ messageId: MSG_A }), deps, APP_ID);
+        expect(result?.toast?.type).toBe('warning');
+        expect(ds.streamCardId).toBeUndefined();
+        expect(fakeLark.patches).toHaveLength(0);
+      } finally {
+        vi.mocked(getBot).mockImplementation(normalBot as any);
+      }
+    });
+
+    it('a cached frame from a silent scheduled turn is not shown; the card says unavailable instead', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_live_silent',
+        worker: null,
+        workerReady: false,
+        workerPort: null,
+        displayMode: 'hidden',
+        currentImageKey: 'img_silent_frame',
+        currentImageSource: { imageKey: 'img_silent_frame', turnId: 'om_turn_silent' },
+        currentTurnId: 'om_turn_user',
+        silentScheduledTurns: new Map([['om_turn_silent', Date.now()]]),
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_live_silent'), makeDeps(sessions), APP_ID);
+      await flush();
+      expect(fakeLark.patches).toHaveLength(1);
+      const card = parseCard(fakeLark.patches[0].args[2]);
+      expect(card.imageKey).toBeNull();
+      expect(card.screenshotUnavailable).toBe(true);
+    });
+
+    it('a cached frame with normal provenance is shown on a sleeping card', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_live_normal',
+        worker: null,
+        workerReady: false,
+        workerPort: null,
+        displayMode: 'hidden',
+        currentImageKey: 'img_user_frame',
+        currentImageSource: { imageKey: 'img_user_frame', turnId: 'om_turn_user' },
+        currentTurnId: 'om_turn_user',
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_live_normal'), makeDeps(sessions), APP_ID);
+      await flush();
+      expect(parseCard(fakeLark.patches[0].args[2])).toMatchObject({ imageKey: 'img_user_frame', screenshotUnavailable: false });
+    });
+
+    it('a legacy cache (no provenance) is withheld while the current turn is a substitute turn', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_sub_card',
+        displayMode: 'hidden',
+        currentImageKey: 'img_unknown_source',
+        currentTurnId: 'om_turn_sub',
+        currentReplyTarget: { rootMessageId: 'om_sub', turnId: 'om_turn_sub', updatedAt: new Date().toISOString(), substitute: true },
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const result = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_sub_card'), makeDeps(sessions), APP_ID);
+      await flush();
+      // Substitute turn declines the queue → callback, but without the image.
+      expect(result).toMatchObject({ type: 'streaming', expanded: true, imageKey: null, screenshotUnavailable: true });
+    });
+
+    it('does not promise a fresh frame when the display-mode IPC cannot be delivered', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_ipc_broken', workerReady: true, displayMode: 'hidden', currentImageKey: undefined,
+      });
+      (ds.worker as any).send.mockImplementation(() => { throw new Error('ERR_IPC_CHANNEL_CLOSED'); });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_ipc_broken'), makeDeps(sessions), APP_ID);
+      await flush();
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(parseCard(fakeLark.patches[0].args[2])).toMatchObject({ expanded: true, screenshotUnavailable: true });
+    });
+
+    it('does not promise a fresh frame from an exited or disconnected worker', async () => {
+      for (const broken of [{ connected: false }, { exitCode: 1 }, { signalCode: 'SIGKILL' }]) {
+        fakeLark.reset();
+        const ds = makeDaemonSession({
+          streamCardId: 'om_worker_gone', workerReady: true, displayMode: 'hidden', currentImageKey: undefined,
+        });
+        Object.assign(ds.worker as any, broken);
+        const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+        await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_worker_gone'), makeDeps(sessions), APP_ID);
+        await flush();
+        expect(parseCard(fakeLark.patches[0].args[2]), JSON.stringify(broken)).toMatchObject({ screenshotUnavailable: true });
+      }
+    });
+
+    it('cross-turn: in-flight PATCH to old card A refuses a raw update of A but still queues the current card B', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_card_A',
+        streamCardNonce: 'nonce_A',
+        displayMode: 'hidden',
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const deps = makeDeps(sessions);
+      // A PATCH to A goes in flight…
+      scheduleCardPatch(ds, buildStreamingCard(
+        ds.session.sessionId, ROOT_ID, '', 'T', 'A content', 'working', 'claude-code', 'hidden' as any, 'nonce_A',
+      ));
+      await flush();
+      expect(ds.cardPatchInFlightMessageId).toBe('om_card_A');
+      // …then a new turn publishes B (A is frozen under its nonce).
+      ds.frozenCards = new Map([['nonce_A', { messageId: 'om_card_A', content: '', title: 'T', displayMode: 'hidden' } as any]]);
+      ds.streamCardId = 'om_card_B';
+      ds.streamCardNonce = 'nonce_B';
+
+      const onA = await handleCardAction(makeToggleEvent(ROOT_ID, 'nonce_A', 'ou_user', 'om_card_A'), deps, APP_ID);
+      expect(onA).toEqual({ toast: { type: 'warning', content: '卡片正在更新，请稍后再点一次' } });
+      expect(ds.displayMode).toBe('hidden');
+      expect(ds.frozenCards!.has('nonce_A')).toBe(true);
+
+      const onB = await handleCardAction(makeToggleEvent(ROOT_ID, 'nonce_B', 'ou_user', 'om_card_B'), deps, APP_ID);
+      expect(onB).toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+      expect(ds.pendingCardId).toBe('om_card_B');
+
+      fakeLark.resolveCall('updateMessage', 0);
+      await flush();
+      expect(ds.cardPatchInFlightMessageId).toBe('om_card_B');
+      expect(fakeLark.patches[1].args[1]).toBe('om_card_B');
+      fakeLark.resolveCall('updateMessage', 1);
+      await flush();
+      expect(ds.cardPatchInFlight).toBe(false);
+      expect(ds.cardPatchInFlightMessageId).toBeUndefined();
+
+      // Once A is no longer in flight, the historical click repaints A.
+      const retryA = await handleCardAction(makeToggleEvent(ROOT_ID, 'nonce_A', 'ou_user', 'om_card_A'), deps, APP_ID);
+      expect(retryA).toMatchObject({ type: 'streaming', expanded: false });
+    });
+
+    it('rapid clicks on a sleeping current card stay serialized through the queue (latest wins)', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_rapid', worker: null, workerReady: false, workerPort: null,
+        displayMode: 'hidden', currentImageKey: 'img_cached',
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const deps = makeDeps(sessions);
+      const r1 = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_rapid'), deps, APP_ID);
+      const r2 = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_rapid'), deps, APP_ID);
+      const r3 = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_rapid'), deps, APP_ID);
+      for (const r of [r1, r2, r3]) expect(r).toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+      expect(ds.displayMode).toBe('screenshot');
+      // First click is in flight; the later two coalesce in the latest-wins slot.
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(parseCard(fakeLark.patches[0].args[2])).toMatchObject({ expanded: true, imageKey: 'img_cached' });
+      expect(parseCard(ds.pendingCardJson!)).toMatchObject({ expanded: true, imageKey: 'img_cached' });
+      fakeLark.resolveCall('updateMessage', 0);
+      await flush();
+      // Final queued state equals the delivered one → adjacent duplicate dropped.
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(ds.pendingCardJson).toBeUndefined();
+      expect(ds.cardPatchInFlight).toBe(false);
+    });
+  });
+
   describe('Scenario 8: usage-limit retry action', () => {
     it('resends the stored CLI input and clears the limit state when retry is ready', async () => {
       const ds = makeDaemonSession({
@@ -1589,5 +2099,305 @@ describe('Card integration: full event flow', () => {
       expect((ds.worker as any).send).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalled();
     });
+  });
+});
+
+// ─── Ported from Alex's independent acceptance review (round 1) ───────────
+describe('Independent review: historical callback ordering', () => {
+  beforeEach(() => {
+    fakeLark.reset();
+    vi.clearAllMocks();
+  });
+
+  it.each([false, true])('REVIEW historical double-click must keep last visible mode (known=%s)', async known => {
+    const clickedId = 'om_review_historical_B';
+    const ds = makeDaemonSession({
+      streamCardId: 'om_review_current_A',
+      streamCardNonce: NONCE_CURRENT,
+      displayMode: 'hidden',
+      worker: null,
+      workerReady: false,
+      workerPort: null,
+      currentImageKey: 'img_review_cached',
+      frozenCards: new Map(known ? [[NONCE_OLD, {
+        messageId: clickedId, content: 'old output', title: 'old title', displayMode: 'hidden',
+      }]] : []),
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+    const deps = makeDeps(sessions);
+    let visibleCard: any;
+
+    const first = await handleCardAction(
+      makeToggleEvent(ROOT_ID, NONCE_OLD, 'ou_user', clickedId), deps, APP_ID,
+    );
+    visibleCard = first; // Lark applies the first raw callback immediately.
+    expect(visibleCard).toMatchObject({ expanded: true, cardNonce: NONCE_CURRENT });
+    const olderPatch = fakeLark.patches[0];
+    if (olderPatch) {
+      expect(olderPatch.args[1]).toBe(clickedId);
+      // Hold the first API PATCH so it can finish after the next callback.
+      void olderPatch.promise.then(() => { visibleCard = parseCard(olderPatch.args[2]); });
+    }
+
+    const second = await handleCardAction(
+      makeToggleEvent(ROOT_ID, visibleCard.cardNonce, 'ou_user', clickedId), deps, APP_ID,
+    );
+    visibleCard = second; // The newly rebased card's second click hides output.
+    expect(visibleCard).toMatchObject({ expanded: false });
+    expect(ds.displayMode).toBe('hidden');
+    if (olderPatch) olderPatch.resolve();
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_review_current_A');
+    expect(visibleCard, 'older historical API PATCH must not undo the later hide callback')
+      .toMatchObject({ expanded: false });
+  });
+});
+
+
+// ─── Ported from Alex's R2 review (fixtures adjusted to capture_identity) ──
+// capture_identity establishes the real capture identity; Alex's original
+// turn_input_committed events stay in place as distractors.
+
+describe('Independent review R2: capture identity vs display target', () => {
+  beforeEach(() => {
+    fakeLark.reset();
+    vi.clearAllMocks();
+  });
+
+  async function livePool(overrides: Partial<DaemonSession>) {
+    const pool = await vi.importActual<typeof import('../src/core/worker-pool.js')>('../src/core/worker-pool.js');
+    const ds = makeDaemonSession({ displayMode: 'screenshot', workerReady: true, ...overrides });
+    const worker = ds.worker as any;
+    worker.stdout = new EventEmitter();
+    worker.stderr = new EventEmitter();
+    return { pool, ds, worker };
+  }
+
+  it('REVIEW R2 running predecessor must not paint a posted type-ahead successor', async () => {
+    const { pool, ds, worker } = await livePool({
+      streamCardId: 'om_review_card_A', streamCardNonce: 'nonce_review_A',
+      currentTurnId: 'om_review_turn_A', streamCardTurnGeneration: 1, frozenCards: new Map(),
+    });
+    const reply = vi.fn(async () => 'om_review_card_B');
+    pool.initWorkerPool({ sessionReply: reply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    pool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    pool.__testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'capture_identity', revision: 1, turnId: 'om_review_turn_A' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_review_turn_A' }); // distractor
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 1, turnId: 'om_review_turn_A' });
+
+    ds.currentTurnId = 'om_review_turn_B';
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_review_turn_B';
+    ds.currentImageKey = undefined;
+    expect(await pool.postTurnStartingCard(ds, reply as any, 'om_review_turn_B')).toBe(true);
+    await flush();
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardId).toBe('om_review_card_B');
+    expect(ds.captureIdentity).toMatchObject({ revision: 1, turnId: 'om_review_turn_A' });
+    fakeLark.reset();
+
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_review_predecessor_A',
+      status: 'working', turnId: 'om_review_turn_A', captureRevision: 1,
+    });
+    await flush();
+    expect(fakeLark.patches.map(call => ({ messageId: call.args[1], imageKey: parseCard(call.args[2]).imageKey })))
+      .not.toContainEqual({ messageId: 'om_review_card_B', imageKey: 'img_review_predecessor_A' });
+    expect(ds.currentImageKey).toBeUndefined();
+
+    // B's own write unlocks B's card.
+    worker.emit('message', { type: 'capture_identity', revision: 2, turnId: 'om_review_turn_B' });
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_review_B', status: 'working',
+      turnId: 'om_review_turn_B', captureRevision: 2,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_review_B');
+  });
+
+  it('REVIEW R2 untagged frame must not expose a known suppressed managed attempt', async () => {
+    const { pool, ds, worker } = await livePool({
+      streamCardId: 'om_review_visible', streamCardNonce: NONCE_CURRENT,
+      currentTurnId: 'om_review_prior_public',
+      suppressedFinalOutputTurns: new Map([['trg_review_managed', 2]]),
+    });
+    pool.initWorkerPool({ sessionReply: vi.fn(async () => 'om_unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    pool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    pool.__testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'test-cap', turnId: 'trg_review_managed', dispatchAttempt: 2 });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review_managed' }); // distractor
+    await flush();
+    expect(ds.managedTurnOrigin).toMatchObject({ turnId: 'trg_review_managed', dispatchAttempt: 2 });
+    // Legacy (pre-protocol) worker: no capture_identity, untagged frame.
+    expect(ds.captureIdentity).toBeUndefined();
+    expect(pool.screenshotSourceSuppressed(ds, 'trg_review_managed', 2)).toBe(true);
+    fakeLark.reset();
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_review_suppressed_untagged', status: 'working' });
+    await flush();
+    expect(ds.currentImageKey, 'known suppressed producer must fence even a legacy untagged frame').toBeUndefined();
+    expect(fakeLark.patches).toHaveLength(0);
+  });
+
+  it('REVIEW R2 replayed old commit ACK must not disown current producer', async () => {
+    const { pool, ds, worker } = await livePool({
+      streamCardId: 'om_review_current_B', streamCardNonce: NONCE_CURRENT, currentTurnId: 'om_review_turn_B',
+    });
+    pool.initWorkerPool({ sessionReply: vi.fn(async () => 'om_unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    pool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    pool.__testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'capture_identity', revision: 1, turnId: 'om_review_turn_A' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_review_turn_A' });
+    worker.emit('message', { type: 'capture_identity', revision: 2, turnId: 'om_review_turn_B' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_review_turn_B' });
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 2, turnId: 'om_review_turn_B' });
+    // Re-ACK of already committed A (worker.ts deliberately re-ACKs duplicates).
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_review_turn_A' });
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_review_current_B', status: 'working', turnId: 'om_review_turn_B', captureRevision: 2 });
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 2, turnId: 'om_review_turn_B' });
+    expect(ds.currentImageKey, 'replayed historical receipt must not freeze current screenshots').toBe('img_review_current_B');
+  });
+});
+
+// ─── Ported verbatim from Alex's R3 review ────────────────────────────────
+
+describe('Independent review: R3 identity lifetime boundaries', () => {
+  it.each(['om_review_previous_public', 'sch_review_private'])('REVIEW R3 initial empty replacement identity must not expose retained private pixels (lineage=%s)', async currentTurnId => {
+    fakeLark.reset(); vi.clearAllMocks();
+    const pool=await vi.importActual<typeof import('../src/core/worker-pool.js')>('../src/core/worker-pool.js');
+    const ds=makeDaemonSession({streamCardId:'om_review_public_card',displayMode:'screenshot',workerReady:true,currentTurnId,silentScheduledTurns:new Map([['sch_review_private',Date.now()]])});
+    const attach=(worker:any)=>{worker.stdout=new EventEmitter();worker.stderr=new EventEmitter();ds.worker=worker;pool.__testOnly_setupWorkerHandlers(ds,worker);};
+    pool.initWorkerPool({sessionReply:vi.fn(async()=> 'om_unused'),getSessionWorkingDir:()=>'/tmp',getActiveCount:()=>1,closeSession:vi.fn()});
+    pool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds),ds]]));
+    const oldWorker=ds.worker as any; attach(oldWorker);
+    oldWorker.emit('message',{type:'capture_identity',revision:3,turnId:'sch_review_private'});
+    oldWorker.emit('message',{type:'capture_identity',revision:4});
+    await flush();
+    expect(ds.captureIdentity?.lastSource?.turnId).toBe('sch_review_private');
+    oldWorker.emit('message',{type:'screenshot_uploaded',imageKey:'img_old_private',status:'idle',captureRevision:4});
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+
+    // Worker restart/reattach keeps the persistent terminal's pixels. The new
+    // process starts with revision0/empty, as required by the new protocol.
+    const replacement=makeDaemonSession().worker as any; attach(replacement);
+    replacement.emit('message',{type:'capture_identity',revision:0});
+    replacement.emit('message',{type:'screenshot_uploaded',imageKey:'img_retained_private_pixels',status:'idle',captureRevision:0});
+    await flush();
+    expect(ds.currentImageKey,'changing worker generation does not prove old private pixels were cleared').toBeUndefined();
+    expect(fakeLark.patches).toHaveLength(0);
+  });
+
+  it('REVIEW R3 missing current ID must not bypass a waiting target before proven recovery', async () => {
+    fakeLark.reset(); vi.clearAllMocks();
+    const pool=await vi.importActual<typeof import('../src/core/worker-pool.js')>('../src/core/worker-pool.js');
+    const ds=makeDaemonSession({streamCardId:'om_review_original_A',streamCardNonce:'nonce_A',displayMode:'hidden',workerReady:true,currentTurnId:'om_review_turn_A',streamCardTurnGeneration:1,frozenCards:new Map()});
+    const worker=ds.worker as any;worker.stdout=new EventEmitter();worker.stderr=new EventEmitter();
+    const reply=vi.fn(async()=> 'om_review_waiting_B');
+    pool.initWorkerPool({sessionReply:reply,getSessionWorkingDir:()=>'/tmp',getActiveCount:()=>1,closeSession:vi.fn()});
+    const sessions=new Map([[activeSessionKey(ds),ds]]);pool.setActiveSessionsRegistry(sessions);
+    pool.__testOnly_setupWorkerHandlers(ds,worker);
+    worker.emit('message',{type:'capture_identity',revision:1,turnId:'om_review_turn_A'});
+    ds.currentTurnId='om_review_turn_B';ds.streamCardTurnGeneration=2;ds.streamCardPending=true;ds.streamCardPendingTurnId='om_review_turn_B';
+    await pool.postTurnStartingCard(ds,reply as any,'om_review_turn_B');await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({messageId:'om_review_waiting_B',mode:'waiting-exact-turn',turnId:'om_review_turn_B'});
+    const proof=ds.lastPublishedStreamingCardIdentity!;
+    ds.streamCardId=undefined; // The exact publication proof remains recoverable.
+    worker.emit('message',{type:'screenshot_uploaded',imageKey:'img_predecessor_during_missing_id',status:'working',turnId:'om_review_turn_A',captureRevision:1});
+    await flush();
+    fakeLark.reset();
+    const event=makeToggleEvent(proof.anchorId,proof.nonce,'ou_user',proof.messageId);
+    (event.action.value as any).session_id=ds.session.sessionId;
+    await handleCardAction(event,makeDeps(sessions),APP_ID);await flush();
+    expect(ds.streamCardId).toBe(proof.messageId);
+    expect(fakeLark.patches.map(call=>({messageId:call.args[1],imageKey:parseCard(call.args[2]).imageKey})))
+      .not.toContainEqual({messageId:proof.messageId,imageKey:'img_predecessor_during_missing_id'});
+  });
+});
+
+// ─── Ported verbatim from Alex's R4 review ────────────────────────────────
+
+describe('Independent review: R4 waiting target during manual repost', () => {
+  it('REVIEW R4 held manual POST must not cache predecessor frame for waiting successor', async () => {
+    fakeLark.reset(); vi.clearAllMocks();
+    const pool=await vi.importActual<typeof import('../src/core/worker-pool.js')>('../src/core/worker-pool.js');
+    const ds=makeDaemonSession({streamCardId:'om_review_live_A',streamCardNonce:'nonce_A',displayMode:'screenshot',workerReady:true,currentTurnId:'om_review_turn_A',streamCardTurnGeneration:1,frozenCards:new Map()});
+    const worker=ds.worker as any;worker.stdout=new EventEmitter();worker.stderr=new EventEmitter();
+    const reply=vi.fn(async()=> 'om_review_waiting_B');
+    pool.initWorkerPool({sessionReply:reply,getSessionWorkingDir:()=>'/tmp',getActiveCount:()=>1,closeSession:vi.fn()});
+    pool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds),ds]]));
+    pool.__testOnly_setupWorkerHandlers(ds,worker);
+    worker.emit('message',{type:'capture_identity',revision:1,turnId:'om_review_turn_A'});
+    ds.currentTurnId='om_review_turn_B';ds.streamCardTurnGeneration=2;ds.streamCardPending=true;ds.streamCardPendingTurnId='om_review_turn_B';
+    await pool.postTurnStartingCard(ds,reply as any,'om_review_turn_B');await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({messageId:'om_review_waiting_B',mode:'waiting-exact-turn',turnId:'om_review_turn_B'});
+    expect(ds.streamCardPending).toBe(false);
+    let resolveManual!: (id:string)=>void;
+    const manualReply=vi.fn(()=> new Promise<string>(resolve=>{resolveManual=resolve;}));
+    const manualPost=pool.postFreshStreamingCard(ds,manualReply as any);
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+    expect(ds.streamCardPending).toBe(false);
+    worker.emit('message',{type:'screenshot_uploaded',imageKey:'img_A_during_B_repost',status:'working',turnId:'om_review_turn_A',captureRevision:1});
+    await flush();
+    resolveManual('om_review_waiting_B_repost');
+    expect(await manualPost).toBe(true);await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({messageId:'om_review_waiting_B_repost',mode:'waiting-exact-turn',turnId:'om_review_turn_B'});
+    fakeLark.reset();
+    // The next ordinary screen render uses the daemon's cached image key.
+    worker.emit('message',{type:'screen_update',content:'A completed before queued B starts',status:'idle',turnId:'om_review_turn_A'});
+    await flush();
+    expect(fakeLark.patches.map(call=>({messageId:call.args[1],imageKey:parseCard(call.args[2]).imageKey})))
+      .not.toContainEqual({messageId:'om_review_waiting_B_repost',imageKey:'img_A_during_B_repost'});
+    expect(ds.currentImageKey).toBeUndefined();
+  });
+});
+
+// ─── Ported verbatim from Alex's R5 review ────────────────────────────────
+
+describe('Independent review: R5 failed repost activation', () => {
+  it.each([false, true])('REVIEW R5 own turn activated during failed manual POST must unlock restored card (D before rollback=%s)', async dStartsBeforeRollback => {
+    fakeLark.reset(); vi.clearAllMocks();
+    const pool=await vi.importActual<typeof import('../src/core/worker-pool.js')>('../src/core/worker-pool.js');
+    const ds=makeDaemonSession({streamCardId:'om_review_A',streamCardNonce:'nonce_A',displayMode:'screenshot',workerReady:true,currentTurnId:'om_review_A_turn',streamCardTurnGeneration:1,frozenCards:new Map()});
+    const worker=ds.worker as any;worker.stdout=new EventEmitter();worker.stderr=new EventEmitter();
+    const reply=vi.fn(async()=> 'om_review_B');
+    pool.initWorkerPool({sessionReply:reply,getSessionWorkingDir:()=>'/tmp',getActiveCount:()=>1,closeSession:vi.fn()});
+    pool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds),ds]]));
+    pool.__testOnly_setupWorkerHandlers(ds,worker);
+    worker.emit('message',{type:'capture_identity',revision:1,turnId:'om_review_A_turn'});
+    ds.currentTurnId='om_review_B_turn';ds.streamCardTurnGeneration=2;ds.streamCardPending=true;ds.streamCardPendingTurnId='om_review_B_turn';
+    await pool.postTurnStartingCard(ds,reply as any,'om_review_B_turn');await flush();
+    expect(ds.streamCardDisplayTarget?.mode).toBe('waiting-exact-turn');
+    let rejectPost!:(error:Error)=>void;
+    const held=vi.fn(()=>new Promise<string>((_resolve,reject)=>{rejectPost=reject;}));
+    const repost=pool.postFreshStreamingCard(ds,held as any);
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+    // B really starts while its manual successor is still being POSTed.
+    worker.emit('message',{type:'capture_identity',revision:2,turnId:'om_review_B_turn'});
+    worker.emit('message',{type:'screenshot_uploaded',imageKey:'img_review_B',status:'working',turnId:'om_review_B_turn',captureRevision:2});
+    await flush();
+    expect(ds.currentImageKey).toBe('img_review_B');
+    if (dStartsBeforeRollback) {
+      worker.emit('message',{type:'capture_identity',revision:3,turnId:'trg_review_D'});
+      await flush();
+      expect(ds.captureIdentity?.turnId).toBe('trg_review_D');
+    }
+    rejectPost(new Error('review simulated transient POST failure'));
+    expect(await repost).toBe(false);await flush();
+    expect(ds.streamCardId).toBe('om_review_B');
+    fakeLark.reset();
+    // B matched during the reservation. In the second case D is already current
+    // when rollback happens, so rechecking only the current tuple is too late.
+    if (!dStartsBeforeRollback) worker.emit('message',{type:'capture_identity',revision:3,turnId:'trg_review_D'});
+    worker.emit('message',{type:'screenshot_uploaded',imageKey:'img_review_D',status:'working',turnId:'trg_review_D',captureRevision:3});
+    await flush();
+    expect(ds.currentImageKey,'restoring the prior message must retain B activation observed during POST').toBe('img_review_D');
+    expect(fakeLark.patches.map(call=>({messageId:call.args[1],imageKey:parseCard(call.args[2]).imageKey})))
+      .toContainEqual({messageId:'om_review_B',imageKey:'img_review_D'});
   });
 });
