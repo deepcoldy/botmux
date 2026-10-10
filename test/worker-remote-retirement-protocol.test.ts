@@ -93,7 +93,9 @@ describe('worker remote retirement protocol', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     expect(workerPoolSource).toContain('MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS');
-    expect(prepare).toContain("backendType === 'mojo'\n      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS\n      : 23_000");
+    expect(prepare).toContain("backendType === 'mojo'\n      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS\n      : backendType === 'remote-runner'");
+    expect(prepare).toContain("Math.min(305_000, Math.max(5_000, remoteRunnerOperationTimeoutMs! + 5_000))");
+    expect(prepare).toContain(': 23_000;');
   });
 
   it('refuses request-less Riff suspend before teardown or process exit', () => {
@@ -125,7 +127,10 @@ describe('worker remote retirement protocol', () => {
     const rawCount = prepare.indexOf('pendingRawInputs: pendingRawInputs.length', readiness);
     const initFence = prepare.indexOf('initPromptMaterialized', readiness);
     const refusal = prepare.indexOf('worker_inputs_not_drained:', readiness);
-    const backendPrepare = prepare.indexOf('backend?.prepareShutdownDetach?.()', refusal);
+    const backendPrepare = prepare.indexOf(
+      'backend?.prepareShutdownDetach?.(msg.drainTimeoutMs)',
+      refusal,
+    );
     const remotePrepareGate = prepare.indexOf('if (!isRemoteBackendType(effectiveBackendType))');
 
     expect(readiness).toBeGreaterThanOrEqual(0);
@@ -135,6 +140,7 @@ describe('worker remote retirement protocol', () => {
     expect(rawCount).toBeGreaterThan(queueCount);
     expect(refusal).toBeGreaterThan(rawCount);
     expect(backendPrepare).toBeGreaterThan(refusal);
+    expect(prepare).toContain('msg.drainTimeoutMs');
 
     const commitStart = workerSource.indexOf("case 'remote_shutdown_commit':", prepareEnd);
     const commitEnd = workerSource.indexOf("case 'remote_shutdown_abort':", commitStart);

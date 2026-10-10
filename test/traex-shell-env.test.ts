@@ -26,9 +26,11 @@ describe('TraeX trigger-user shell environment', () => {
       resumeSessionId: resume ? 'native-session' : undefined,
       workingDir: '/tmp/project',
       shellSubprocessEnv: shellEnv,
+      hideRateLimitModelNudge: true,
     });
 
     expect(shellOverrides(args)).toMatchObject(shellEnv);
+    expect(args).toContain('notice.hide_rate_limit_model_nudge=true');
     expect(args).not.toContain('shell_environment_policy.inherit="all"');
     expect(args).not.toContain('shell_environment_policy.ignore_default_excludes=true');
     expect(args[args.indexOf('-C') + 1]).toBe('/tmp/project');
@@ -52,9 +54,11 @@ describe('TraeX trigger-user shell environment', () => {
       disableCliBypass: true,
       bypassHookTrust: true,
       shellSubprocessEnv: shellEnv,
+      hideRateLimitModelNudge: true,
     });
 
     expect(shellOverrides(args)).toMatchObject(shellEnv);
+    expect(args).toContain('notice.hide_rate_limit_model_nudge=true');
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });

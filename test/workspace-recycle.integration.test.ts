@@ -26,7 +26,7 @@ afterEach(async () => {
     }
   }
   pool.setActiveSessionsRegistry(new Map());
-  store.init(); config.session.dataDir = originalDataDir;
+  store.init('app-recycle-fixture'); config.session.dataDir = originalDataDir;
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 

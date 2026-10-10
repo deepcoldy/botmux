@@ -54,6 +54,7 @@ import {
   ROLE_WARN_BYTES,
   saveInjectMode,
   saveDispatchCompletionEnabled,
+  saveReplyPrivately,
   saveMessageListener,
   saveProfileEntry,
   saveRole,
@@ -94,12 +95,12 @@ function sameStringList(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
-type FlashState = { text: string; isError?: boolean; id: number } | null;
+export type FlashState = { text: string; isError?: boolean; id: number } | null;
 type ApplyStatus =
   | { kind: 'idle' }
   | { kind: 'text'; text: string }
   | { kind: 'results'; preview: boolean; results: RoleProfileApplyResult[] };
-type ListenerPreviewStatus =
+export type ListenerPreviewStatus =
   | { kind: 'idle' }
   | { kind: 'loading'; mode: 'preview' | 'run' }
   | { kind: 'result'; response: MessageListenerPreviewResponse; mode: 'preview' | 'run' }
@@ -119,7 +120,7 @@ const DEFAULT_LISTENER: MessageListenerData = {
   },
 };
 
-function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
+export function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
   // Mirror the backend storage default: persisted configs OMIT `mode` when it
   // equals 'all_except_excluded' (see message-listener-store sanitize +
   // bot-registry normalize), so an ABSENT mode means all_except_excluded, NOT
@@ -147,6 +148,7 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
       includeMsgTypes: [...(listener?.messagePolicy?.includeMsgTypes ?? DEFAULT_LISTENER.messagePolicy?.includeMsgTypes ?? [])],
       scope: 'top_level',
     },
+    replyPolicy: { mode: listener?.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
     ...(listener?.contentPolicy ? {
       contentPolicy: {
         ...(listener.contentPolicy.includeKeywords ? { includeKeywords: [...listener.contentPolicy.includeKeywords] } : {}),
@@ -258,6 +260,8 @@ function RolesPage(props: { tab: RolesTab }) {
   const [editingContent, setEditingContent] = useState('');
   const [editingInjectMode, setEditingInjectMode] = useState<RoleInjectMode>('every');
   const [editingDispatchCompletionEnabled, setEditingDispatchCompletionEnabled] = useState(false);
+  const [privateReplySaving, setPrivateReplySaving] = useState(false);
+  const [editingPrivateReplyNotice, setEditingPrivateReplyNotice] = useState('');
   const [roleSaving, setRoleSaving] = useState(false);
   const [roleDeleting, setRoleDeleting] = useState(false);
   const [injectSaving, setInjectSaving] = useState(false);
@@ -423,7 +427,7 @@ function RolesPage(props: { tab: RolesTab }) {
           const requestedBot = requestedBotId
             ? requestedGroup.memberBots.find(bot => bot.inChat && bot.larkAppId === requestedBotId)
             : undefined;
-          if (requestedBot) setSelectedBotId(requestedBot.larkAppId);
+          if (requestedBot) void handleSelectBot(requestedGroup.chatId, requestedBot.larkAppId);
         }
       }
       setLoadingTree(false);
@@ -474,6 +478,7 @@ function RolesPage(props: { tab: RolesTab }) {
     if (!alive.current || serial !== selectSerial.current) return;
     setSelectedRole(role);
     setEditingContent(role.content ?? '');
+    setEditingPrivateReplyNotice(role.privateReplyNotice ?? '');
     setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
     setEditingDispatchCompletionEnabled(role.dispatchCompletionEnabled === true);
     await loadListenerForSelection(botId, groupId, serial);
@@ -489,6 +494,7 @@ function RolesPage(props: { tab: RolesTab }) {
       if (!alive.current || serial !== selectSerial.current) return;
       setSelectedRole(role);
       setEditingContent(role.content ?? '');
+      setEditingPrivateReplyNotice(role.privateReplyNotice ?? '');
       setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
       setEditingDispatchCompletionEnabled(role.dispatchCompletionEnabled === true);
       await loadListenerForSelection(selectedBotId, selectedGroupId, serial);
@@ -562,6 +568,26 @@ function RolesPage(props: { tab: RolesTab }) {
       flash(setInjectFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
     } finally {
       if (alive.current) setInjectSaving(false);
+    }
+  }
+
+  async function handleReplyPrivatelyChange(settings: { replyPrivately?: boolean; privateReplyNotice?: string }): Promise<void> {
+    if (!selectedGroupId || !selectedBotId) return;
+    const serial = selectSerial.current;
+    setPrivateReplySaving(true);
+    try {
+      const ok = await saveReplyPrivately(selectedBotId, selectedGroupId, settings);
+      if (!alive.current || serial !== selectSerial.current) return;
+      if (ok) {
+        const role = await loadRole(selectedBotId, selectedGroupId);
+        if (!alive.current || serial !== selectSerial.current) return;
+        setSelectedRole(role);
+      }
+      flash(setRoleFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
+    } catch {
+      if (alive.current && serial === selectSerial.current) flash(setRoleFlash, tr('roles.saveFailed'), true);
+    } finally {
+      if (alive.current) setPrivateReplySaving(false);
     }
   }
 
@@ -757,6 +783,7 @@ function RolesPage(props: { tab: RolesTab }) {
         scope: 'top_level',
       },
       ...(contentPolicy ? { contentPolicy } : {}),
+      replyPolicy: { mode: editingListener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
     };
   }
 
@@ -1147,14 +1174,6 @@ function RolesPage(props: { tab: RolesTab }) {
                 >
                   {tr('roles.roleTab')}
                 </button>
-                <button
-                  type="button"
-                  className={groupEditorSection === 'listener' ? 'active' : ''}
-                  aria-pressed={groupEditorSection === 'listener'}
-                  onClick={() => setGroupEditorSection('listener')}
-                >
-                  {tr('roles.listenerTab')}
-                </button>
               </div>
               {groupEditorSection === 'role' ? (
                 <>
@@ -1191,6 +1210,31 @@ function RolesPage(props: { tab: RolesTab }) {
                     </label>
                     <span className="roles-editor-inject-hint">{tr('roles.dispatchCompletionHint')}</span>
                     <Flash flash={dispatchCompletionFlash} />
+                  </div>
+                  <div className="roles-editor-inject">
+                    <label className="filter-toggle roles-listener-enabled">
+                      <input id="roles-editor-reply-privately" type="checkbox"
+                        checked={selectedRole?.replyPrivately === true} disabled={privateReplySaving}
+                        onChange={event => void handleReplyPrivatelyChange({ replyPrivately: event.currentTarget.checked })} />
+                      <span className="filter-toggle-switch" aria-hidden="true"></span>
+                      <span className="filter-toggle-label">{tr('roles.replyPrivately')}</span>
+                    </label>
+                    <span className="roles-editor-inject-hint">{tr('roles.replyPrivatelyHint')}</span>
+                    <div className="roles-private-reply-notice">
+                      <label className="roles-field-label" htmlFor="roles-editor-private-reply-notice">{tr('roles.privateReplyNotice')}</label>
+                      <input id="roles-editor-private-reply-notice" type="text" maxLength={500}
+                        value={editingPrivateReplyNotice}
+                        placeholder={tr('roles.privateReplyNoticePlaceholder')}
+                        disabled={privateReplySaving || selectedRole?.replyPrivately !== true}
+                        onChange={event => setEditingPrivateReplyNotice(event.currentTarget.value)}
+                        onBlur={() => {
+                          const notice = editingPrivateReplyNotice.trim();
+                          if (notice !== (selectedRole?.privateReplyNotice ?? '')) {
+                            void handleReplyPrivatelyChange({ privateReplyNotice: notice });
+                          }
+                        }} />
+                      <span className="roles-editor-inject-hint">{tr('roles.privateReplyNoticeHint')}</span>
+                    </div>
                   </div>
                   <textarea
                     id="roles-editor-textarea"
@@ -1546,7 +1590,7 @@ function GroupProfileStatus(props: {
   );
 }
 
-function MessageListenerEditor(props: {
+export function MessageListenerEditor(props: {
   listener: MessageListenerData;
   members: GroupMemberDisplay[];
   memberById: Map<string, GroupMemberDisplay>;
@@ -1556,6 +1600,7 @@ function MessageListenerEditor(props: {
   flash: FlashState;
   previewLimit: number;
   previewStatus: ListenerPreviewStatus;
+  previewScope?: string;
   tr: Translator;
   onPatch(patch: Partial<MessageListenerData>): void;
   onSenderPolicyPatch(patch: NonNullable<MessageListenerData['senderPolicy']>): void;
@@ -1700,6 +1745,19 @@ function MessageListenerEditor(props: {
           />
         </label>
       </div>
+      <div className="roles-listener-reply-placement">
+        <label className="roles-listener-field" style={{ maxWidth: 320 }}>
+          <span className="roles-field-label">{tr('roles.listenerReplyPlacement')}</span>
+          <select
+            value={listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread'}
+            onChange={ev => props.onPatch({ replyPolicy: { mode: ev.currentTarget.value === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' } })}
+          >
+            <option value="thread">{tr('roles.listenerReplyPlacementThread')}</option>
+            <option value="chat">{tr('roles.listenerReplyPlacementChat')}</option>
+          </select>
+        </label>
+        <small className="roles-listener-reply-placement-help">{tr('roles.listenerReplyPlacementHelp')}</small>
+      </div>
       <div className="roles-listener-policy-row">
         <div className="roles-listener-policy">
           <div className="roles-field-label">{tr('roles.listenerSenderTypes')}</div>
@@ -1814,7 +1872,7 @@ function MessageListenerEditor(props: {
         </span>
         <Flash flash={props.flash} />
       </div>
-      <div className="roles-listener-preview-panel">
+      <div className="roles-listener-preview-panel" data-listener-preview-scope={props.previewScope}>
         <div className="roles-listener-preview-head">
           <div>
             <div className="roles-profile-section-title">{tr('roles.listenerPreviewTitle')}</div>

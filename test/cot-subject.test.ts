@@ -30,6 +30,14 @@ describe('subjectFromInputObject', () => {
     expect(subjectFromInputObject({ query: 'feishu cot' })).toBe('feishu cot');
     expect(subjectFromInputObject({ type: 'open_page', url: 'https://x.y/z' })).toBe('https://x.y/z');
   });
+  it('picks Antigravity tool parameters (CommandLine, TargetFile, AbsolutePath, Url, toolAction)', () => {
+    expect(subjectFromInputObject({ CommandLine: 'git status', toolAction: 'Checking status' })).toBe('git status');
+    expect(subjectFromInputObject({ AbsolutePath: '/workspace/src/app.ts' })).toBe('/workspace/src/app.ts');
+    expect(subjectFromInputObject({ TargetFile: '/workspace/src/index.ts', CodeContent: '...' })).toBe('/workspace/src/index.ts');
+    expect(subjectFromInputObject({ Url: 'https://example.com' })).toBe('https://example.com');
+    expect(subjectFromInputObject({ toolAction: 'Analyzing repository' })).toBe('Analyzing repository');
+    expect(subjectFromInputObject({ toolSummary: 'Repo analysis' })).toBe('Repo analysis');
+  });
   it('description / prompt as last resort', () => {
     expect(subjectFromInputObject({ description: '子任务', prompt: '做点事' })).toBe('子任务');
     expect(subjectFromInputObject({ prompt: '做点事' })).toBe('做点事');

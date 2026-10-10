@@ -27,11 +27,27 @@ describe('mergeQueuedCliInput', () => {
   });
 
   it('merges incremental queued messages into the pending tail', () => {
-    const pending = [{ content: 'first', turnId: 't1' }];
+    const trustedCaller = {
+      requestUserOpenId: 'ou_same', requestUserUnionId: 'on_same',
+      requestLarkAppId: 'app', senderType: 'user' as const,
+    };
+    const pending = [{ content: 'first', turnId: 't1', trustedCaller }];
 
-    expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2' })).toBe(true);
+    expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2', trustedCaller })).toBe(true);
 
-    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2' }]);
+    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2', trustedCaller }]);
+  });
+
+  it('never merges queue items across trusted caller boundaries', () => {
+    const pending = [{
+      content: 'first', turnId: 't1',
+      trustedCaller: { requestUserUnionId: 'on_a', requestLarkAppId: 'app', senderType: 'user' as const },
+    }];
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second', turnId: 't2',
+      trustedCaller: { requestUserUnionId: 'on_b', requestLarkAppId: 'app', senderType: 'user' as const },
+    })).toBe(false);
+    expect(pending).toHaveLength(1);
   });
 
   it('never merges across a durable envelope boundary in either direction', () => {
@@ -213,7 +229,12 @@ describe('durable turn queue boundary', () => {
     expect(pendingInputAllowsTypeAhead(true, false, { content: 'delivery', dispatchAttempt: 1 })).toBe(false);
   });
 
-  it('forces separate idle edges on both sides of a durable attempt', () => {
+  it('disables type-ahead while a direct RPC turn is still active', () => {
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'follow-up' }, true)).toBe(false);
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'follow-up' }, false)).toBe(true);
+  });
+
+  it('forces separate idle edges for durable attempts and explicit serial batches', () => {
     expect(shouldStopPendingBatch(
       { content: 'delivery', dispatchAttempt: 1 },
       { content: 'user follow-up' },
@@ -222,6 +243,16 @@ describe('durable turn queue boundary', () => {
       { content: 'user turn' },
       { content: 'delivery', dispatchAttempt: 1 },
     )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'serial turn 1' },
+      { content: 'serial turn 2' },
+      false,
+    )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'ordinary turn 1' },
+      { content: 'ordinary turn 2' },
+      true,
+    )).toBe(false);
     expect(shouldStopPendingBatch({ content: 'user 1' }, { content: 'user 2' })).toBe(false);
   });
 
@@ -345,4 +376,17 @@ describe('resetPreservingPendingCliInputs', () => {
 
     expect(pending.map(item => item.content)).toEqual(['queued', 'reset-added']);
   });
+});
+
+it('keeps collaborative messages separate even from the same sender', () => {
+  const trustedCaller = { requestUserOpenId: 'ou_a', requestLarkAppId: 'app', senderType: 'user' as const };
+  for (const flags of [[true, false], [false, true], [true, true]]) {
+    const tail = { content: 'first', turnId: 'a', trustedCaller,
+      ...(flags[0] ? { queueAfterActiveTurn: true as const } : {}) };
+    const next = { content: 'second', turnId: 'b', trustedCaller,
+      ...(flags[1] ? { queueAfterActiveTurn: true as const } : {}) };
+    expect(mergeQueuedCliInput([tail], next)).toBe(false);
+    expect(tail.content).toBe('first');
+    expect(tail.turnId).toBe('a');
+  }
 });

@@ -62,6 +62,17 @@ prompt 是到点时会被执行的内容，就像用户新开一个话题向你�
 botmux schedule list
 \`\`\`
 
+### 修改提示词
+
+修改已有任务的 prompt 必须原地更新，不要先删除再创建：
+
+\`\`\`
+botmux schedule update <id> --prompt-file <UTF-8 文件路径>
+botmux schedule update <id> --prompt "新的完整提示词"
+\`\`\`
+
+两种输入方式只能选一种。更新成功保留任务 ID、执行时间、启停状态、每次新话题设置和运行记录；已开始的执行沿用原 prompt，后续执行使用新版，不会自动补跑。文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 时先升级，不要把修改降级为先删后建。若提示任务绑定了守护前置条件（precondition），说明该任务只能在 Dashboard 修改，不要删除重建，告知用户去 Dashboard 的定时任务页编辑。
+
 ### 管理
 
 \`\`\`
@@ -70,6 +81,10 @@ botmux schedule resume <id>    # 恢复
 botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
+
+委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
+\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+\`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
 
 ## 典型用法
 
@@ -140,6 +155,37 @@ botmux chat rename "支付链路排障｜待验证" --proactive
 
 常见错误：\`not_group_chat\`、\`bot_not_in_chat\`、\`invalid_chat_name\`、
 \`permission_denied\`、\`rate_limited\`、\`lark_api_error\`。
+`;
+
+const SESSION_RENAME_SKILL = `---
+name: botmux-session-rename
+description: 给当前任务/botmux 会话改名时触发——用户明确要求给当前任务或会话改名，或任务进入新阶段、现有标题已不准确时由 agent 主动规范命名。改的是 botmux/Dashboard 的会话标题，不是飞书群名，也不是飞书话题名。
+---
+
+# botmux-session-rename — 更新当前会话的 botmux 标题
+
+在会话内执行（会话自动识别，只能改**当前会话**，没有也不允许 \`--session-id\` 之类参数指定他人会话）：
+
+\`\`\`bash
+botmux session rename "排障｜支付链路超时"
+\`\`\`
+
+## 命名规范
+
+- 格式「类型｜具体事项」，例如：
+  - \`排障｜支付链路超时\`
+  - \`开发｜权限黑名单\`
+  - \`调研｜调度幂等设计\`
+- 简短、稳定、可读，让人在 Dashboard 和 \`/sessions\` 列表里一眼认出任务。
+- 只在**任务阶段发生实质变化**时改（排障 → 验证 → 收尾等），不要因细小进度反复改名。
+- 不写精确百分比、敏感信息（密钥/内部标识）、评价性措辞。
+- 不确定任务主线、只是临时支线时，不主动改名。
+
+## 改名后的生效范围
+
+- 立即生效于 botmux 侧：Dashboard 各视图与 \`/sessions\` 列表；运行中的 CLI 若支持会 best-effort 同步原生会话名（resume picker），CLI 不在线或不支持时命令仍成功，回执会说明。
+- **飞书话题（omt）标题改不了**：开放平台没有话题改名接口，话题列表始终显示首条消息；本命令只改 botmux/Dashboard 标题，不要承诺"飞书里的话题名会变"。
+- **不要与 \`botmux-chat-rename\` 混用**：\`botmux chat rename\` 改的是**整个飞书群**的群名（话题群里是整个群，不是单个话题），影响所有话题和全部成员。只想规范当前任务标题时一律用 \`botmux session rename\`。
 `;
 
 const HISTORY_SKILL = `---
@@ -278,6 +324,8 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 
 **核心规则**：用户在飞书上阅读，看不到你的终端输出。想让用户看到的内容**必须**通过 \`botmux send\` 发送。
 
+**话题不可用时遵循机器人配置**：默认保持原有发送和兜底行为。返回 \`TOPIC_SEND_BLOCKED\` 时停止发送，不得改用其他位置绕过；返回 \`TOPIC_SEND_CHECK_FAILED\` 表示查询失败，不代表话题已失效，可以重试原话题查询。
+
 **发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）就代表消息**已经送达**用户——即使你的终端里看不到任何回执，也不用再发一遍。发完 \`botmux send\` 后，本轮「终端没有可见文本、直接安静结束」是正常且预期的。如果之后看到类似「你上一条回复没有可见输出，请继续并产出用户可见回复」这样的提示，那是底层 CLI（Claude Code 等）的误判——**不要重发**，只有当 \`botmux send\` 自己报错（非零退出或打印「发送失败」）时才需要重试。
 
 **格式自动处理**：普通回复统一用飞书卡片（schema 2.0）发送；单句纯文本仍保持轻量正文，Markdown 标题和表格转换为独立组件，代码块由富文本组件原生渲染。**该用 md 就用 md**——结构化内容不要手撸成纯文本或 ASCII 表格。
@@ -336,6 +384,22 @@ botmux send --attention=blocked --mention-back "缺 TOS 上传密钥，拿不到
 - **只用于回复当前会话的文本/卡片消息**：不能与 \`--top-level\` / \`--chat-id\` / \`--into\` / \`--voice\` 混用（否则消息发到别处、撤下绑定会裂，或绕过举手置位路径）。也必须有文本正文（看板要显示 reason）。
 
 **什么时候不要 \`--attention\`**：常规进度汇报、你自己查得到/能合理假设的事、只是想确认一下——都用普通 \`send\`。这是"我真卡住了、必须人来"的信号，不是闲聊也不是汇报。需要用户在**给定选项里二选一**那种用 \`botmux ask\`（发按钮、阻塞等结果）。
+
+## 加急本轮触发者：\`--urgent\`
+
+只有用户明确要求加急时才用；不要把它当普通通知。加急固定只发给
+\`--mention-back\` 解析出的本轮触发者，不会把其他 \`--mention\` 对象一起加急。
+
+\`\`\`bash
+botmux send --urgent --mention-back "发布窗口将在 10 分钟后关闭，请尽快确认"
+botmux send --urgent=sms --mention-back "线上故障需要立即确认"
+botmux send --urgent=phone --mention-back "P0 故障，请立即上线处理"
+\`\`\`
+
+- \`--urgent\` 等价于 \`--urgent=app\`（应用内加急）。
+- \`sms\` / \`phone\` 会消耗租户额度，必须由用户明确要求。
+- 只能用于当前会话回复，不能与 \`--top-level\` / \`--chat-id\` / \`--into\` / \`--voice\` / \`--slash\` 混用。
+- 主消息先发、加急后调；加急失败时命令会返回 \`urgent.sent=false\`，不要重发主消息。
 
 ## 用法
 
@@ -408,7 +472,7 @@ botmux send --content-file $msg
 
 \`\`\`bash
 # 单图：默认追加到末尾
-botmux send --images /tmp/screenshot.png "截图如上，红框部分是问题所在。"
+botmux send --images "$TMPDIR/screenshot.png" "截图如上，红框部分是问题所在。"
 
 # 图文混排：占位符控制图片位置
 botmux send --images chart.png --images table.png <<'EOF'
@@ -431,7 +495,7 @@ EOF
 ### 带文件附件
 
 \`\`\`bash
-botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
+botmux send --files "$TMPDIR/report.pdf" "报告已生成，请查收附件。"
 \`\`\`
 
 ### 带视频预览
@@ -439,8 +503,32 @@ botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 \`--videos <path>\` 发送本地 H.264 MP4 预览消息，可重复；\`--video-covers <path>\` 按顺序提供每个视频的封面图片（当前必须显式提供 cover）。视频会作为飞书/Lark media message 单独发送；正文存在时先发正文卡片，再发视频。
 
 \`\`\`bash
-botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "RRH replay preview"
+botmux send --videos "$TMPDIR/replay.mp4" --video-covers "$TMPDIR/cover.png" --no-mention "RRH replay preview"
 \`\`\`
+
+### 图表（vega-lite）
+
+正文里的 \`\`\`vega-lite 代码块会渲染成飞书原生图表（柱状 / 条形 / 折线 / 面积 / 散点 / 饼或环图），Web 等其它通道可以直接用同一段 Vega-Lite 渲染。只支持一个子集：
+
+- 数据只能用 \`data.values\` 内联（≤500 行，值为字符串 / 数字 / 布尔 / null）；\`data.url\`、\`transform\`、\`params\`、\`expr\`、\`signal\`、\`datasets\`、\`layer\` 等一律不支持。
+- \`mark\` 取 \`bar\` / \`line\` / \`area\` / \`point\` / \`arc\`；编码只用 \`x\` / \`y\` / \`color\` / \`theta\`（字段写 \`field\`、\`type\`、\`title\`，不支持 \`aggregate\` 等，先把数据聚合好再画）。
+- 饼图用 \`mark: arc\` + \`theta\`（数值）+ \`color\`（类别），不要写 \`x\`/\`y\`，\`theta\` 不带 \`title\`；\`mark: {type: arc, innerRadius: 40}\` 是环图。
+- \`x\`/\`y\` 的 \`title\` 是坐标轴标题，\`color\` 的 \`title\` 是图例标题；\`temporal\` 不解析日期，按给定顺序当类别画，先排好序。
+- 每张卡片最多 5 个图表；整张卡片的飞书请求体上限是 30KB，放不下时图表会逐级降级（图表 → 50 行表 → 10 行表 → 只留说明）。不支持或降级的图表在 stderr 给出原因；消息照常发出。发之前可以用 \`--dry-run\` 看 \`bytes\` / \`fits\`。
+
+~~~bash
+botmux send --no-mention <<'EOF'
+## 近 5 天上账
+\`\`\`vega-lite
+{"title":"近 5 天上账（万 THB）","data":{"values":[{"d":"09-28","v":18},{"d":"09-29","v":14}]},
+ "mark":"bar","encoding":{"x":{"field":"d","type":"ordinal"},"y":{"field":"v","type":"quantitative"}}}
+\`\`\`
+EOF
+~~~
+
+### 发送前自查：--dry-run
+
+\`botmux send --dry-run\`（正文照常用位置参数 / stdin / \`--content-file\`）不发送任何消息，只把正文按卡片渲染后输出 JSON：\`{dryRun, bytes, fits, diagnostics, card}\`，\`bytes\` 按飞书真实请求体计算。\`diagnostics\` 列出被降级的图表及原因。它只渲染正文，不上传图片/附件、不解析 @、不加页脚，也不需要会话。
 
 ### 原始飞书/Lark 卡片 JSON
 
@@ -449,7 +537,7 @@ botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention 
 安全边界：自定义卡片是**纯展示 + open_url 跳转**——所有会触发回调的交互控件（回调按钮、下拉 select、person 选择、overflow、日期/时间选择、input、表单提交等）都会被拒绝，只保留展示元素（markdown/图片/多列/图表…）与 open_url 按钮。这样外部卡片无法误触 botmux 内部 close/restart/ask/relay/dashboard 等处理器。\`--card-file/--card-json\` 暂不和 \`--images\`/\`--files\`/\`--videos\`/\`--content-file\`/\`--voice\` 混用；素材需要先上传成飞书资源并写入卡片 JSON。
 
 \`\`\`bash
-botmux send --card-file /tmp/card.json --no-mention
+botmux send --card-file "$TMPDIR/card.json" --no-mention
 botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"**Done**"}]}}' --mention-back
 \`\`\`
 
@@ -460,8 +548,8 @@ botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","element
 流程是 \`send\` 拿 \`messageId\` → \`card patch\` 按它更新：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
-botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-file "$TMPDIR/progress-50.json"
 botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 100%"}]}}'
 \`\`\`
 
@@ -480,12 +568,12 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 需要连续输出感时，不要高频整卡 \`patch\`。先发送 Card 2.0 卡片，并给需要流式写入的 \`markdown\` 或 \`plain_text\` 组件设置唯一 \`element_id\`（字母开头、最多 20 字符），然后用 CardKit 原生流：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
 OPEN=$(botmux card stream open --message-id "$MID" --summary "执行中")
 STREAM_ID=$(printf '%s' "$OPEN" | jq -r .streamId)
 
 # write 传该 element 的完整最新内容；新增后缀由飞书原生打字机动画呈现
-botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file /tmp/work-log.md
+botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file "$TMPDIR/work-log.md"
 botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
 \`\`\`
 
@@ -532,6 +620,20 @@ botmux send --no-mention "后台任务还在跑，预计 5 分钟。"
 \`\`\`
 
 （可设环境变量 \`BOTMUX_REQUIRE_MENTION_DECISION=false\` 关闭此硬门。）
+
+### 对方正在执行任务时：\`--as\`
+
+你的消息如果碰上其他成员（人或另一个 bot）正在跑任务，**不会打断对方**，而是先暂存。这时必须二选一：
+
+| flag | 含义 |
+|---|---|
+| \`botmux send --as independent\` | **另开任务**：马上单独做，不打断当前任务 |
+| \`botmux send --as suggestion\` | **留给当前任务**：等对方结束后确认要不要采纳 |
+
+可以跟原文一起发：\`botmux send --as independent --mention <ou_xxx> "请帮我看这段 diff"\`。
+也可以先发出原文，再单独 \`botmux send --as independent\` 或 \`botmux send --as suggestion\`。
+
+人在飞书里会看到两个按钮（另开任务 / 留给当前任务）；agent 用上面的 flag 选，不要去点卡片。
 
 ### 引用串联（普通群）
 
@@ -594,6 +696,7 @@ sandbox dispatch 暂不支持
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
 | \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
 | \`--no-quote\` | 不引用，发独立消息（普通群） |
+| \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
 | \`--chat-id <oc_xxx>\` | 指定目标群（默认当前会话所在群）；常和 \`--top-level\` 一起用做跨群发布 |
 | \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
@@ -1144,24 +1247,41 @@ humanGate：
 
 export const ASK_SKILL = `---
 name: botmux-ask
-description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，stdout 只返回选中的 key，适合 shell 脚本和 CLI agent 继续执行。
+description: 在当前飞书/Lark 会话里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，单题返回选中的 key，多题可用 --questions-file 返回 JSON；支持推荐项预选与整卡提交。
 ---
+
+发送位置跟随真实会话：群级（chat）会话发到群顶层消息流（不进话题），话题级（thread）会话发到对应话题。群级会话允许没有 BOTMUX_ROOT_MESSAGE_ID；不要用项目卡或其他消息 ID 补填该变量。缺少身份变量时先核对当前会话，不猜测身份或发送位置。
 
 # botmux-ask — 阻塞式向用户提问
 
 当你需要用户在明确选项里做选择，并且后续步骤必须等用户回答后才能继续时，使用 \`botmux ask buttons\`。
 
+是否需要用户选择或批准，由当前任务授权和具体操作规则决定。已有授权覆盖的常规文件修改、只读 API 查询和执行步骤应继续推进；具体流程明确要求重新确认时，遵循该要求。
+
 ## 什么时候用
 
-- 发布、回滚、删除、写文件、调用外部 API 等风险动作前，需要用户选择
-- 需求存在 2-6 个清晰分支，继续执行前必须拿到其中一个 key
+- 具体操作规则要求批准，且当前授权尚未满足要求
+- 需求存在 2-6 个会实质改变目标、范围或影响的清晰分支，且无法依据已有要求确定，必须由用户选择
 - 你正在 shell / CLI 里执行任务，需要把用户选择赋给变量继续跑
 
 ## 不要用
 
 - 只是给用户汇报进展：用 \`botmux send\`
-- 需要自由文本长回答：v0.1.7 不支持，先用 \`botmux send\` 问用户
+- 无法提供有意义选项的长篇开放问题：直接向用户提问；选择卡也支持话题文字答复，用 JSON 的 comment 读取
 - workflow 节点审批：workflow 已经有 humanGate / decision，不要套两层 ask
+
+## 多题与推荐项预选
+
+需求澄清时把当前可独立回答的问题放进同一张卡，用户换选后点底部“提交”。将 JSON 数组保存到绝对路径，再运行 \`botmux ask buttons --questions-file /absolute/round.json --json --timeout 3600\`；文件模式总是返回 JSON，与 \`--options\`、\`--multi\` 和位置问题文本互斥。
+
+\`\`\`json
+[
+  {"prompt":"先覆盖哪些入口？","multiSelect":false,"options":[{"key":"editor","label":"当前编辑页（推荐）"},{"key":"all","label":"所有入口"}],"defaultSelectedKeys":["editor"]},
+  {"prompt":"验证哪些状态？","multiSelect":true,"options":[{"key":"pending","label":"待确认（推荐）"},{"key":"done","label":"已确认（推荐）"}],"defaultSelectedKeys":["pending","done"]}
+]
+\`\`\`
+
+每题的 \`defaultSelectedKeys\` 必须来自选项，单选最多一项；空数组表示无预选，也保留提交按钮。默认选择不是用户回答，必须等真人提交；超时或失效不能当作接受推荐。\`answers[i]\` 对应第 i 题。若用户文字回复，读取 \`comment\`，不得把未提交的推荐项混入答案。CLI 与 daemon 需同时升级才支持此功能。
 
 ## Canonical 用法
 
@@ -1359,10 +1479,14 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 建完把任务清单链接用 \`botmux send\` 发给用户，让他确认能在飞书任务里看到。
 
 ### 5. 逐个派活（开话题）
-对每个子项目，把简报写进 /tmp/brief-X.md，再：
+对每个子项目，把简报写进会话专属临时目录（如 \`$TMPDIR/brief-X.md\`），再：
 \`\`\`bash
-botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
+botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file "$TMPDIR/brief-X.md"
 \`\`\`
+若任务明确要求目标 Bot 创建持久定时任务，改用稳定 \`--bot-app\` 派发并显式加
+\`--delegate schedule:create\`；该权限必须由当前真人回合和宿主策略共同批准，
+只允许目标 Bot 在本群创建一个任务，不能转委托。普通派发不要附带此参数。
+
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
 - 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
@@ -1383,7 +1507,7 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 所有子项目完成 → 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
 
 ## 登记（别丢上下文）
-把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 /tmp/orchestrate-<项目>.json）；断点续跑/被唤起时据此恢复。
+把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 \`$TMPDIR/orchestrate-<项目>.json\`）；断点续跑/被唤起时据此恢复。
 
 ## 注意
 - **没通过用户审批不要建板/派活。**
@@ -1513,7 +1637,7 @@ botmux workflow architect <runId>
 
 > 编排好的流程是这样，对吗？确认就开跑。
 
-用户确认 → \`botmux workflow approve-dag <runId>\`，然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
+用户确认 → \`botmux workflow approve-dag <runId> [--working-dir <任务目录>]\`。可选 \`--working-dir\` 在首次 Gate-2 批准时冻结所有节点的工作目录；省略时使用各机器人的配置目录。已发布 run 重试复用原快照，后传目录不覆盖已有运行。然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
 ## 关键纪律
 - 全程飞书一问一答，用 botmux send 对话。
@@ -1652,6 +1776,7 @@ export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
+  { name: 'botmux-session-rename', content: SESSION_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },

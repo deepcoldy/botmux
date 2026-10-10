@@ -131,7 +131,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
     }
   });
 
-  it.skipIf(!canRunBwrap)('creates a schedule for the inferred session inside the real sandbox', () => {
+  it.skipIf(!canRunBwrap)('does not inherit owner from an un-attested real sandbox', () => {
     const f = fixture('home-link');
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
@@ -164,13 +164,9 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
         encoding: 'utf8', timeout: 15_000,
       });
       expect(result.error).toBeUndefined();
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain('已创建定时任务');
-      const store = JSON.parse(readFileSync(join(f.ownBotHome, 'schedules.json'), 'utf8'));
-      expect(Object.values(store)).toEqual([expect.objectContaining({
-        chatId: 'oc_own', larkAppId: 'app-a', ownerOpenId: 'ou_owner',
-        workingDir: f.workspace, prompt: 'fixture reminder',
-      })]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('无法验证本轮调用者');
+      expect(existsSync(join(f.ownBotHome, 'schedules.json'))).toBe(false);
     } finally {
       cleanup(f, plan);
     }

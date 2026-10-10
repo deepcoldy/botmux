@@ -40,10 +40,10 @@ export function makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode = null })
       // Replace lib/utils.js so loadNativeModule('pty') returns the embedded
       // native. The `require(<abs .node>)` here is what makes Bun embed it.
       // spawn-helper (macOS): node-pty computes it as `native.dir + '/spawn-helper'`
-      // and resolves relative to utils.js dir. We embed it as a file asset and
-      // expose its /$bunfs/ path via `dir` so unixTerminal's helperPath lands on
-      // the embedded copy. On linux spawnHelper is null (forkpty, no sidecar) and
-      // `dir` is irrelevant to spawning.
+      // and resolves relative to utils.js dir. We embed it as a file asset, then
+      // materialize it in a private content-addressed temp directory: the kernel
+      // cannot posix_spawn Bun's virtual /$bunfs/ path. On linux spawnHelper is
+      // null (forkpty, no sidecar) and `dir` is irrelevant to spawning.
       build.onLoad({ filter: /node-pty[\\/]lib[\\/]utils\.js$/ }, () => {
         // Compute the spawn-helper directory literal at BUILD time. On linux
         // spawnHelper is null (forkpty, no sidecar) so `dir` is only cosmetic and
@@ -52,8 +52,57 @@ export function makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode = null })
         // we derive its dir from the imported file path.
         const ptyDirLiteral = JSON.stringify(nodeDirname(ptyNode));
         const helperImport = spawnHelper
-          ? `import spawnHelperPath from ${JSON.stringify(spawnHelper)} with { type: 'file' };\nimport { dirname as __dirname_fn } from 'node:path';`
-          : `const spawnHelperPath = null;`;
+          ? `
+            import embeddedSpawnHelperPath from ${JSON.stringify(spawnHelper)} with { type: 'file' };
+            import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+            import { createHash } from 'node:crypto';
+            import { dirname as __dirname_fn, join as __join_fn } from 'node:path';
+            import { tmpdir as __tmpdir_fn } from 'node:os';
+
+            let materializedSpawnHelperPath = null;
+            function ensurePrivateDirectory(path, uid) {
+              mkdirSync(path, { recursive: true, mode: 0o700 });
+              const stat = lstatSync(path);
+              if (!stat.isDirectory() || stat.isSymbolicLink()
+                  || (typeof uid === 'number' && stat.uid !== uid)) {
+                throw new Error('botmux-native-embed: unsafe native cache directory ' + path);
+              }
+              chmodSync(path, 0o700);
+            }
+            function materializeSpawnHelper() {
+              if (materializedSpawnHelperPath) return materializedSpawnHelperPath;
+              const bytes = readFileSync(embeddedSpawnHelperPath);
+              const digest = createHash('sha256').update(bytes).digest('hex');
+              const uid = typeof process.getuid === 'function' ? process.getuid() : 'user';
+              const tempRoot = process.env.BOTMUX_NATIVE_TMPDIR || __tmpdir_fn();
+              const root = __join_fn(tempRoot, 'botmux-native-' + uid);
+              ensurePrivateDirectory(root, uid);
+              const dir = __join_fn(root, digest);
+              ensurePrivateDirectory(dir, uid);
+              const target = __join_fn(dir, 'spawn-helper');
+              let current = null;
+              try {
+                const targetStat = lstatSync(target);
+                if (targetStat.isFile() && !targetStat.isSymbolicLink()
+                    && (typeof uid !== 'number' || targetStat.uid === uid)) {
+                  current = readFileSync(target);
+                }
+              } catch {}
+              if (!current || !current.equals(bytes)) {
+                const temp = target + '.' + process.pid + '.tmp';
+                writeFileSync(temp, bytes, { mode: 0o700 });
+                chmodSync(temp, 0o700);
+                renameSync(temp, target);
+              }
+              chmodSync(target, 0o700);
+              materializedSpawnHelperPath = target;
+              return target;
+            }
+          `
+          : `
+            const materializedSpawnHelperPath = null;
+            function materializeSpawnHelper() { return null; }
+          `;
         const contents = `
           ${helperImport}
           const ptyNative = require(${JSON.stringify(ptyNode)});
@@ -64,10 +113,13 @@ export function makeNativeEmbedPlugin({ ptyNode, spawnHelper, skiaNode = null })
           export function loadNativeModule(name) {
             if (name !== 'pty') throw new Error('botmux-native-embed: unexpected native module ' + name);
             // node-pty derives the spawn-helper path from \`dir\`. With an embedded
-            // helper (macOS), hand back its directory so \`dir + '/spawn-helper'\`
-            // matches the embedded file path; on linux use the .node's dir literal.
-            const dir = spawnHelperPath ? __dirname_fn(spawnHelperPath) : ${ptyDirLiteral};
-            return { dir, module: ptyNative };
+            // helper (macOS), materialize it outside Bun's virtual /$bunfs before
+            // handing back its directory: posix_spawn is a kernel operation and
+            // cannot execute Bun's virtual file path. Linux uses forkpty and has
+            // no helper sidecar.
+            const helperPath = materializeSpawnHelper();
+            const dir = helperPath ? __dirname_fn(helperPath) : ${ptyDirLiteral};
+            return { dir, helperPath, module: ptyNative };
           }
         `;
         return { contents, loader: 'js' };

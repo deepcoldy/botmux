@@ -1,3 +1,4 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -88,7 +89,7 @@ export function createCopilotAdapter(pathOverride?: string): CliAdapter {
     // Curated model list per Copilot CLI docs: default is Claude Sonnet 4;
     // Sonnet 4.5 / GPT-5 available via /model. Setup always appends a free-form
     // "Other" option, so this is curation only.
-    modelChoices: ['claude-sonnet-4', 'claude-sonnet-4.5', 'gpt-5'],
+    modelChoices: CLI_MODEL_CHOICES['copilot'],
   };
 }
 

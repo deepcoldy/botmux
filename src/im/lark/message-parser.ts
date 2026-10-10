@@ -31,6 +31,7 @@ interface RawEventData {
     chat_id: string;
     chat_type: string;
     create_time: string;
+    update_time?: string;
     mentions?: Array<{
       key: string;       // e.g. "@_user_1"
       name: string;      // display name
@@ -458,6 +459,16 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
           }
         }
       }
+      // Rich-text uploads made through some Lark clients are not inline nodes.
+      // They arrive beside the localized post body as a top-level `files` array.
+      // Resolve that body first (above), then append these descriptors; pushIfNew
+      // collapses a file that Lark happens to represent in both places.
+      const topLevelFiles = Array.isArray(parsed.files) ? parsed.files : [];
+      for (const file of topLevelFiles) {
+        if (file?.file_key) {
+          pushIfNew(resources, { type: 'file', key: file.file_key, name: file.file_name ?? file.file_key });
+        }
+      }
       return resources;
     }
 
@@ -537,6 +548,7 @@ export function parseEventMessage(
     senderUnionId: sender.sender_id?.union_id,
     senderType: sender.sender_type,
     msgType: message.message_type,
+    ...(message.message_type === 'post' ? { rawPostContent: message.content } : {}),
     content: extractTextContent(message.message_type, message.content, message.mentions, numberer),
     createTime: message.create_time,
     mentions,
@@ -544,9 +556,15 @@ export function parseEventMessage(
   return { parsed, resources };
 }
 
-export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
+/** `resolveMentions`: render `@_user_N` placeholders with the message's own
+ *  structured `mentions[]` (the REST list/get shapes carry them) exactly as the
+ *  event parser does, instead of dropping them. Opt-in: default output is
+ *  unchanged for every existing caller. */
+export function parseApiMessage(msg: any, numberer?: ImgNumberer, options?: { resolveMentions?: boolean }): LarkMessage {
   const msgType = msg.msg_type ?? 'text';
   const rawContent = msg.body?.content ?? '';
+  const mentions = options?.resolveMentions && Array.isArray(msg.mentions) && msg.mentions.length > 0
+    ? msg.mentions as RawEventData['message']['mentions'] : undefined;
   // sender_name is only present when the fetch opted in via with_sender_name=true
   // (all client.ts message read paths do). Covers bot senders too — the one case
   // local rosters can't resolve for third-party bots.
@@ -560,9 +578,112 @@ export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
     senderType: msg.sender?.sender_type ?? 'unknown',
     ...(senderName ? { senderName } : {}),
     msgType,
-    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
+    ...(msgType === 'post' ? { rawPostContent: rawContent } : {}),
+    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), mentions, numberer),
     createTime: msg.create_time ?? '',
   };
+}
+
+/** Structured mention evidence from either Lark shape, for observers that
+ *  must compare representations across live events and history reads. */
+export function structuredMentionRefs(mentions: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  if (!Array.isArray(mentions) || !mentions.length) return undefined;
+  const out = mentions.flatMap((m: any) => {
+    if (!m || typeof m.key !== 'string' || typeof m.name !== 'string' || !m.key || !m.name) return [];
+    const identity = mentionIdentity(m);
+    const openId = mentionOpenId(m); const appId = mentionAppId(m);
+    return [{ key: m.key, name: m.name, ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+      ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) }];
+  });
+  return out.length ? out : undefined;
+}
+
+/** The body as the platform stores it, with `@_user_N` placeholders left in
+ *  place, for message types whose rendered text depends on the mention list.
+ *  Live events and history reads of one platform version share this form
+ *  regardless of whether a `mentions[]` list was attached, so it is the
+ *  canonical identity of the body; undefined for other message types. */
+export function rawPlaceholderText(msgType: string, rawContent: string): string | undefined {
+  try {
+    if (msgType === 'text') {
+      const parsed = JSON.parse(rawContent);
+      const text = typeof parsed?.text === 'string' ? parsed.text : rawContent;
+      return text.trim();
+    }
+    if (msgType === 'post') return postCanonicalBody(JSON.parse(rawContent));
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export const POST_CANONICAL_PREFIX = '{"post":';
+
+/** A post's identity as a typed node sequence: text nodes keep their literal
+ *  text, `at` nodes carry only their target id, other nodes their rendering.
+ *  Node boundaries are preserved, so literal prose can never collide with a
+ *  mention marker, and both observation paths (event with a top-level
+ *  `mentions[]`, history without one) derive the same body from the content. */
+function postCanonicalBody(parsed: any): string {
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs = content.map((paragraph: any[]) => (Array.isArray(paragraph) ? paragraph : [paragraph]).map((node: any) => {
+    if (node?.tag === 'at') return { at: postAtTargetId(node) };
+    if (node?.tag === 'text') return { t: String(node.text ?? '') };
+    return { x: renderPostNode(node) };
+  }));
+  return `${POST_CANONICAL_PREFIX}${JSON.stringify({ title: String(title ?? ''), content: paragraphs })}}`;
+}
+
+function postAtTargetId(node: any): string {
+  return typeof node?.user_id === 'string' && node.user_id ? node.user_id : `name:${String(node?.user_name ?? 'unknown')}`;
+}
+
+/** Target ids of a post's `at` nodes in document order, from its canonical body. */
+export function postCanonicalMentionOrder(canonical: string): string[] | undefined {
+  if (!canonical.startsWith(POST_CANONICAL_PREFIX)) return undefined;
+  try {
+    const parsed = JSON.parse(canonical).post;
+    const order: string[] = [];
+    for (const paragraph of parsed.content ?? []) for (const node of paragraph) if (typeof node?.at === 'string') order.push(node.at);
+    return order;
+  } catch { return undefined; }
+}
+
+/** Mention identities of a post, derived from its inline `at` nodes in
+ *  document order (the one source both observation paths share). A top-level
+ *  `mentions[]` list, when present, only enriches the entry whose id matches
+ *  the node target (display name, typed app/union/user ids); it never defines
+ *  the order or the set. Keys are `@_at:<target id>`. */
+export function postMentionRefs(rawContent: string, topLevel?: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  try {
+    const { content } = resolvePostBody(JSON.parse(rawContent));
+    const enrich = new Map<string, { name: string; openId?: string; appId?: string; userId?: string; unionId?: string }>();
+    for (const m of Array.isArray(topLevel) ? topLevel : []) {
+      if (!m || typeof m !== 'object') continue;
+      const identity = mentionIdentity(m); const openId = mentionOpenId(m); const appId = mentionAppId(m);
+      const entry = { name: String((m as any).name ?? ''), ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+        ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) };
+      for (const id of [openId, appId, identity.userId, identity.unionId]) if (id) enrich.set(id, entry);
+    }
+    const out: Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> = [];
+    const seen = new Set<string>();
+    for (const paragraph of content) {
+      for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+        if (node?.tag !== 'at') continue;
+        const target = postAtTargetId(node);
+        if (seen.has(target)) continue;
+        seen.add(target);
+        const known = enrich.get(target);
+        const name = String(node.user_name ?? known?.name ?? 'unknown');
+        if (known) { out.push({ key: `@_at:${target}`, ...known, name }); continue; }
+        const openId = typeof node.user_id === 'string' && node.user_id ? node.user_id : undefined;
+        out.push({ key: `@_at:${target}`, name, ...(openId ? { openId } : {}) });
+      }
+    }
+    return out.length ? out : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeApiMessageContent(msgType: string, rawContent: string): string {
@@ -571,7 +692,7 @@ function normalizeApiMessageContent(msgType: string, rawContent: string): string
 }
 
 /** Resolve post body from either wrapped {"zh_cn":{title,content}} or unwrapped {title,content} format */
-function resolvePostBody(parsed: any): { title: string; content: any[] } {
+export function resolvePostBody(parsed: any): { title: string; content: any[] } {
   // Unwrapped: has content array directly
   if (Array.isArray(parsed.content)) {
     return { title: parsed.title ?? '', content: parsed.content };
@@ -723,7 +844,14 @@ function renderPostCodeBlock(node: any): string {
 
 function renderPostNode(node: any, numberer?: ImgNumberer): string {
   if (node.tag === 'text') return node.text ?? '';
-  if (node.tag === 'a') return node.text ?? node.href ?? '';
+  if (node.tag === 'a') {
+    // Titled links keep their destination only in href. Preserve it just as
+    // card anchors do, without duplicating links whose label is already a URL.
+    const text = node.text ?? '';
+    return text && node.href && text !== node.href
+      ? `${text}(${node.href})`
+      : (text || node.href || '');
+  }
   if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
   if (node.tag === 'code_block') return renderPostCodeBlock(node);
   if (node.tag === 'img' || node.tag === 'media') {
@@ -752,6 +880,20 @@ function joinPostNodeText(parts: string[]): string {
  *  dispatched; paths the hook doesn't cover still get this safe placeholder
  *  instead of the raw {"file_key":...} JSON. */
 export const AUDIO_PLACEHOLDER = '[语音]';
+
+/** Authored text only: file names, media placeholders and forwarded content are
+ * resource metadata, not statements by the sender. Ordinary rendering is unchanged. */
+export function extractAuthoredMessageText(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions']): string {
+  if (msgType === 'text') return extractTextContent(msgType, rawContent, mentions);
+  if (msgType !== 'post') return '';
+  const { title, content } = resolvePostBody(JSON.parse(rawContent));
+  const body = content.map(paragraph => {
+    const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
+    return joinPostNodeText(nodes.filter(node => !['img', 'image', 'file', 'media', 'audio'].includes(node?.tag))
+      .map(node => renderPostNode(node)));
+  }).filter(Boolean).join('\n');
+  return title ? `${title}\n${body}` : body;
+}
 
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
@@ -1148,6 +1290,40 @@ const RESOLVED_TEXT_KEY = '__botmux_card_text__';
  */
 export const CARD_EMBEDDED_PLACEHOLDER = '[卡片内嵌组件，需在飞书客户端展开查看]';
 
+/**
+ * True when the text carries **no information beyond "an attachment was sent"**
+ * — i.e. it is nothing but bare placeholders emitted by the renderers above.
+ *
+ * Only the *bare* forms count as zero-information. A placeholder that carries
+ * real text — `[文件 1: 季度汇报.pdf]`, `[图片 2: 报警前30分钟同比]` (see
+ * {@link withImgAlt}), `[卡片: 发布单 #123]`, `[标签: P0]`, `[输入框: 收件人]`,
+ * or a button's own `[确认发布]` — is deliberately NOT stripped: that text is
+ * the whole point, and for an attachment-only message it is the only thing
+ * worth naming the chat after.
+ *
+ * Used as the AI-title gate for session groups: feeding `[图片 1]` to the
+ * titler yields a confident-but-content-free name ("图片内容分析请求") and,
+ * because a successful rename sets `titled` (see `markSessionGroupTitled`),
+ * permanently closes both the birth and the heal gate. Skipping instead leaves
+ * the group on its placeholder name until the user's next real message — ugly
+ * for a moment, but self-healing rather than wrong forever.
+ *
+ * ⚠️ Coupled to the placeholder literals rendered in this file (`renderPostNode`,
+ * `extractTextContent`, `extractCardContent` and {@link CARD_EMBEDDED_PLACEHOLDER}).
+ * Adding a new zero-information placeholder means adding it here too.
+ */
+export function isPlaceholderOnlyText(text: string): boolean {
+  if (!text.trim()) return false;
+  const stripped = text
+    // `[图片]` / `[图片 2]` / `[文件]` / `[文件 3]` / `[语音]` / `[卡片]`
+    .replace(/\[(?:图片|文件|语音|卡片)(?:\s+\d+)?\]/g, '')
+    .replace(/\[卡片 \(模板\)\]/g, '')
+    .replace(/\[合并转发消息\]/g, '')
+    .replaceAll(CARD_EMBEDDED_PLACEHOLDER, '')
+    .trim();
+  return stripped === '';
+}
+
 /** Wrap merged text so extractCardContent returns it verbatim downstream. */
 export function wrapResolvedCardText(text: string): string {
   return JSON.stringify({ [RESOLVED_TEXT_KEY]: text });
@@ -1270,7 +1446,7 @@ export function mergeCardText(textA: string, textB: string): string {
  */
 export async function resolveMergedCardContent(
   larkAppId: string, messageId: string, numberer?: ImgNumberer,
-): Promise<{ text: string; structuredContent: string; resources: MessageResource[] } | null> {
+): Promise<{ text: string; structuredContent: string; resources: MessageResource[]; updateTime?: number } | null> {
   const [aRes, bRes] = await Promise.all([
     getMessageDetail(larkAppId, messageId, { userCardContent: false }).catch(() => null),
     getMessageDetail(larkAppId, messageId, { userCardContent: true }).catch(() => null),
@@ -1279,6 +1455,8 @@ export async function resolveMergedCardContent(
   const bContent = bRes?.items?.[0]?.body?.content;
   if (!aContent && !bContent) return null;
   const structuredContent = (bContent ?? aContent)!;
+  const structuredMessage = bContent != null ? bRes?.items?.[0] : aRes?.items?.[0];
+  const updateTime = Number(structuredMessage?.update_time);
   // Resources BEFORE text so the shared numberer assigns [图片 N] in attachment
   // order and the text extraction below reuses those numbers (same ordering
   // contract as parseEventMessage / buildForwardedTree). Callers that don't
@@ -1291,7 +1469,8 @@ export async function resolveMergedCardContent(
   // Carry the structured card JSON (B preferred) alongside the merged text so
   // resource extraction (image_key/file_key) keeps working — extractResources
   // walks elements/body, extractCardContent short-circuits on the text key.
-  return { text: merged, structuredContent, resources };
+  return { text: merged, structuredContent, resources,
+    ...(Number.isFinite(updateTime) && updateTime > 0 ? { updateTime } : {}) };
 }
 
 /**
@@ -1302,13 +1481,14 @@ export async function resolveMergedCardContent(
  * by the live daemon path so forwarded cards reach the model fully parsed.
  */
 export async function resolveEventCard(data: RawEventData, larkAppId: string): Promise<void> {
-  let resolved: { text: string; structuredContent: string } | null = null;
+  let resolved: Awaited<ReturnType<typeof resolveMergedCardContent>> = null;
   try {
     resolved = await resolveMergedCardContent(larkAppId, data.message.message_id);
   } catch { /* fall through to local unwrap */ }
   if (resolved) {
     const structured = (() => { try { return JSON.parse(resolved!.structuredContent); } catch { return {}; } })();
     data.message.content = JSON.stringify({ ...structured, [RESOLVED_TEXT_KEY]: resolved.text });
+    if (resolved.updateTime !== undefined) data.message.update_time = String(resolved.updateTime);
     return;
   }
   unwrapUserDsl(data);

@@ -154,15 +154,23 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  envPolicy?: import('../../core/env-policy.js').EnvPolicy;
   cliInstanceBinding?: import('../../services/codex-instance-pool.js').SessionCliInstanceBindingV1;
   cliRuntime?: import('../../adapters/cli/runtime.js').CliRuntimeSnapshot;
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen configured launch prefix.  Workflow workers must use
+   *  the same gateway/runtime selection as ordinary bot sessions. */
+  wrapperCli?: string;
   model?: string;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
-   *  these fields when spawning outside the main forkWorker path. */
-  sandbox?: boolean;
+   *  these fields when spawning outside the main forkWorker path. Tri-state:
+   *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
+  scratchStorage?: 'tmpfs' | 'disk';
+  scratchTmpfsSizeMb?: number;
+  scratchDenyPaths?: string[];
   /** New three-tier fs-policy lists (deny-by-default). Carried alongside the
    *  legacy fields so a workflow worker builds the SAME policy as a normal
    *  session; without it the readWrite tier + user-expressed deny are lost. */
@@ -170,6 +178,7 @@ export interface BotSnapshot {
   sandboxHidePaths?: string[];
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /** The resolved working directory for this run. */
   workingDir: string;
 }

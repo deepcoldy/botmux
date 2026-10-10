@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { connect, type Socket } from 'node:net';
+import { connect, createServer as createTcpServer, type Socket } from 'node:net';
 import { PassThrough, type Duplex } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket, WebSocketServer } from './helpers/node-ws.js';
@@ -552,22 +552,30 @@ describe('session preview same-origin reverse proxy', () => {
   });
 
   it('returns a bounded 502 for unreachable HTTP and WebSocket targets without target details', async () => {
-    const reservation = createServer();
+    // Keep ownership of the port until both requests finish. Closing a port
+    // reservation before startFront lets the OS reuse it for the front itself,
+    // making the proxy request its own non-preview path and return 404.
+    // Resetting connections exercises the real upstream-error path without a
+    // released-port race against this front or other parallel test processes.
+    const reservation = createTcpServer(socket => socket.destroy());
     await new Promise<void>(resolve => reservation.listen(0, '127.0.0.1', resolve));
     const unreachablePort = (reservation.address() as { port: number }).port;
-    await new Promise<void>(resolve => reservation.close(() => resolve()));
-    const port = await startFront(() => okTarget(unreachablePort));
-    const headers = { cookie: managementCookie() };
+    try {
+      const port = await startFront(() => okTarget(unreachablePort));
+      const headers = { cookie: managementCookie() };
 
-    const response = await fetch(`http://127.0.0.1:${port}/preview/s1/`, { headers });
-    expect(response.status).toBe(502);
-    const text = await response.text();
-    expect(JSON.parse(text)).toEqual({ ok: false, error: 'preview_unreachable' });
-    expect(text).not.toContain(String(unreachablePort));
-    expect(text).not.toContain('127.0.0.1');
-    expect(await websocketStatus(`ws://127.0.0.1:${port}/preview/s1/ws`, {
-      Cookie: managementCookie(),
-    })).toBe(502);
+      const response = await fetch(`http://127.0.0.1:${port}/preview/s1/`, { headers });
+      expect(response.status).toBe(502);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({ ok: false, error: 'preview_unreachable' });
+      expect(text).not.toContain(String(unreachablePort));
+      expect(text).not.toContain('127.0.0.1');
+      expect(await websocketStatus(`ws://127.0.0.1:${port}/preview/s1/ws`, {
+        Cookie: managementCookie(),
+      })).toBe(502);
+    } finally {
+      await new Promise<void>(resolve => reservation.close(() => resolve()));
+    }
   });
 
   it('rejects malformed paths and dashboard query tokens before proxying', async () => {

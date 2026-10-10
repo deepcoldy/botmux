@@ -30,7 +30,10 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
-import { tmuxEnv } from '../../setup/ensure-tmux.js';
+import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
+import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneCommand } from './strict-env.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
@@ -81,6 +84,72 @@ function isRetryableStartupTmuxFailure(err: any): boolean {
     return isTmuxServerLevelErrorText((err.stderr?.toString?.() ?? '').trim());
   }
   return true;
+}
+
+/** Evidence about WHY the pane died, collected best-effort after a terminal
+ *  pipe-pane attach failure. All fields null/false when probes are inconclusive
+ *  (server-level outage) — the caller then degrades to the raw error. */
+export interface PipePaneDeathEvidence {
+  paneDead: boolean;
+  paneDeadStatus: string | null;
+  lastScreen: string | null;
+}
+
+const PANE_DEATH_PROBE_TIMEOUT_MS = 1000;
+const PANE_DEATH_SCREEN_TAIL_CHARS = 800;
+
+/** Build the readable startup error for a pane whose CLI process died
+ *  immediately. Pure (no tmux calls) so the wording is unit-testable. */
+export function buildPipePaneStartupError(rawErr: unknown, evidence: PipePaneDeathEvidence): Error {
+  const statusLine = evidence.paneDeadStatus
+    ? `exit status=${evidence.paneDeadStatus}`
+    : '进程已退出（无退出码，可能被信号终止）';
+  const rawFirstLine = (rawErr instanceof Error ? rawErr.message : String(rawErr ?? ''))
+    .split('\n').map(line => line.trim()).find(line => line.length > 0);
+  const lines = [
+    `tmux pane 中的进程启动后立即退出（${statusLine}），这通常是 CLI 本身启动失败，而不是 tmux 未安装。`,
+  ];
+  if (evidence.lastScreen) lines.push(`最后一屏摘要：\n${evidence.lastScreen}`);
+  if (rawFirstLine) lines.push(`原始 pipe-pane 错误：${rawFirstLine}`);
+  return new Error(lines.join('\n'));
+}
+
+/** Best-effort post-mortem after a terminal pipe-pane failure. Runs one
+ *  display-message and one capture-pane, each with a short timeout. Never
+ *  throws and never emits noise: any failure/timeout returns an inconclusive
+ *  evidence ({ paneDead: false }), and the caller keeps the raw error. */
+function collectPipePaneDeathEvidence(paneTarget: string): PipePaneDeathEvidence {
+  let paneDead = false;
+  let paneDeadStatus: string | null = null;
+  try {
+    const out = String(
+      execFileSync(
+        'tmux',
+        ['display-message', '-p', '-t', paneTarget, '#{pane_dead}:#{pane_dead_status}'],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+      ) ?? '',
+    ).trim();
+    const [dead, status] = out.split(':');
+    paneDead = dead === '1';
+    paneDeadStatus = status && status.trim() ? status.trim() : null;
+  } catch {
+    return { paneDead: false, paneDeadStatus: null, lastScreen: null };
+  }
+  let lastScreen: string | null = null;
+  try {
+    const out = String(
+      execFileSync(
+        'tmux',
+        ['capture-pane', '-p', '-t', paneTarget],
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv() },
+      ) ?? '',
+    );
+    const cleaned = stripAnsiForLog(out);
+    lastScreen = cleaned ? tailChars(cleaned, PANE_DEATH_SCREEN_TAIL_CHARS) : null;
+  } catch {
+    lastScreen = null;
+  }
+  return { paneDead, paneDeadStatus, lastScreen };
 }
 
 /** Convert `\n` to `\r\n` while leaving existing `\r\n` alone. Exported for
@@ -233,14 +302,8 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly paneTarget: string;
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
-  /** Read end of the fifo, kept so teardown can close it explicitly.
-   *  `createReadStream(..., { autoClose: false })` never closes it for us. */
+  /** Read end of the fifo. Once created, ReadStream alone owns its close. */
   private fifoFd: number | null = null;
-  /** Set once teardownFifoReader() has run, so the reader's own EBADF-on-close
-   *  (see the 'error' handler) is recognised as expected teardown noise. Not
-   *  `exited`: the spawn-failure path tears the reader down without ever
-   *  marking the backend exited. */
-  private fifoTornDown = false;
   /** Write end, opened at spawn() and held for the lifetime of the reader.
    *  Teardown writes one byte here to unblock the parked read (see
    *  teardownFifoReader). Acquired UP FRONT on purpose: opening it at teardown
@@ -341,6 +404,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // TmuxPipeBackend is the live backend on this path, so the scrub must be
     // triggered here — TmuxBackend is only used for its static helpers.
     TmuxBackend.scrubServerGlobalEnvOnce();
+    if (opts.strictEnv && !this.createSession && !opts.strictEnvReattach) throw new Error('Refusing unverified strict tmux-pipe reattach');
     this.cols = opts.cols;
     this.rows = opts.rows;
 
@@ -351,10 +415,17 @@ export class TmuxPipeBackend implements SessionBackend {
       // been upgraded since the session was originally created, and options
       // like set-clipboard / window-size largest are idempotent to re-apply.
       this.applySessionOptions();
+      this.restoreDetachedOwnedSessionSize();
     }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
-    spawnSync('mkfifo', [this.fifoPath], { stdio: 'ignore' });
+    const fifoCreation = spawnSync('mkfifo', [this.fifoPath], { encoding: 'utf8' });
+    if (fifoCreation.error || fifoCreation.status !== 0) {
+      const detail = fifoCreation.error?.message
+        || String(fifoCreation.stderr || '').trim()
+        || `exit=${fifoCreation.status}, signal=${fifoCreation.signal}`;
+      throw new Error(`Could not create tmux FIFO ${this.fifoPath}: ${detail}. Check temporary storage capacity and free inodes.`);
+    }
 
     // Step 2: open the read end with O_RDWR (no O_NONBLOCK).
     //
@@ -403,7 +474,7 @@ export class TmuxPipeBackend implements SessionBackend {
       try { fs.unlinkSync(this.fifoPath); } catch { /* best effort */ }
       throw err;
     }
-    this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
+    this.readStream = fs.createReadStream('', { fd, autoClose: true, highWaterMark: 64 * 1024 });
     // From here on a parked read can wedge process exit, so make this reader
     // reachable from the exit hook even if nothing ever calls kill().
     installFifoExitHook();
@@ -423,12 +494,6 @@ export class TmuxPipeBackend implements SessionBackend {
       }
     });
     this.readStream.on('error', (err: any) => {
-      // Teardown noise, not a fault: destroy() closes the read fd itself when
-      // no read is in flight (despite autoClose:false), so our own backstop
-      // close races it and the stream reports EBADF on a reader we are
-      // deliberately dismantling. Logging it would put a scary line in every
-      // worker's stderr on every normal close.
-      if (this.fifoTornDown && err?.code === 'EBADF') return;
       // Errors are best-effort logged via the worker's stderr (we can't
       // pull a logger in a backend without circular imports). Don't fire
       // exit — the user's CLI is still alive, we just lost realtime view.
@@ -462,7 +527,12 @@ export class TmuxPipeBackend implements SessionBackend {
           // failed spawn and has no handle to clean up.
           this.teardownFifoReader();
           this.fireExit(1, null);
-          throw err;
+          // Best-effort pane post-mortem BEFORE the throw: a pane whose CLI
+          // died instantly is a CLI startup failure, not "tmux missing", and
+          // the raw "Command failed: tmux pipe-pane" card said nothing useful.
+          // An inconclusive probe (server down / timeout) silently keeps err.
+          const evidence = collectPipePaneDeathEvidence(this.paneTarget);
+          throw evidence.paneDead ? buildPipePaneStartupError(err, evidence) : err;
         }
         const detail = (err?.stderr?.toString?.() ?? '').trim() || err?.message || String(err);
         process.stderr.write(
@@ -495,6 +565,27 @@ export class TmuxPipeBackend implements SessionBackend {
     this.exitCopyModeIfNeeded();
     return this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
       execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+    });
+  }
+
+  sendLines(lines: string[], softNewlineKey: string): boolean {
+    if (this.exited || lines.length === 0) return false;
+    this.exitCopyModeIfNeeded();
+    const args: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) args.push(';');
+      args.push('send-keys', '-t', this.paneTarget, '-l', '--', lines[i]);
+      if (i < lines.length - 1) {
+        args.push(';');
+        args.push('send-keys', '-t', this.paneTarget, softNewlineKey);
+      }
+    }
+    return this.guardedSend('send-lines', () => {
+      execFileSync('tmux', args, {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),
@@ -647,7 +738,16 @@ export class TmuxPipeBackend implements SessionBackend {
     this.cols = cols;
     this.rows = rows;
     if (this.ownsSession) {
-      execFileSync('tmux', ['resize-window', '-t', this.paneTarget, '-x', String(cols), '-y', String(rows)], {
+      // resize-window landed in tmux 2.9; on older builds (2.8) it fails
+      // silently under stdio:'ignore' and the window keeps its spawn size.
+      // resize-pane works on every version and sets the same geometry here
+      // (we own the pane's only window). Unknown version → keep the old
+      // command so behaviour is unchanged where the probe can't answer.
+      const version = getTmuxVersionCached();
+      const subcommand = version !== null && !tmuxVersionAtLeast(version, 2, 9)
+        ? 'resize-pane'
+        : 'resize-window';
+      execFileSync('tmux', [subcommand, '-t', this.paneTarget, '-x', String(cols), '-y', String(rows)], {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),
@@ -987,18 +1087,13 @@ export class TmuxPipeBackend implements SessionBackend {
 
   private teardownFifoReader(): void {
     liveFifoReaders.delete(this);
-    this.fifoTornDown = true;
-    if (this.readStream) {
-      const stream = this.readStream as fs.ReadStream & { close?: () => void; unref?: () => void };
-      this.readStream = null;
-      // Bun's ReadStream has close() and no unref() (verified bun 1.4.0).
-      // bun test waits for open handles after the last case; destroy()+unref
-      // is a no-op there and left test/tmux-startup-storm-recovery.test.ts
-      // wedged until the 720s FILE_WALL after both cases had already passed.
-      try { stream.close?.(); } catch { /* already closed */ }
-      try { stream.destroy(); } catch { /* already closed */ }
-      try { stream.unref?.(); } catch { /* not a handle anymore */ }
-    }
+    // destroy() stops delivery now and closes the fd after any in-flight read
+    // finishes. Never closeSync that fd as well: its number can be reused by
+    // the next spawn before the stream's queued close runs (Bun and Node).
+    const stream = this.readStream;
+    this.readStream = null;
+    this.fifoFd = null;
+    stream?.destroy();
     if (this.fifoWakeFd !== null) {
       // EAGAIN (pipe full) is fine: a full pipe means the read already has data
       // to return, so it is not parked. Any other error is equally non-fatal —
@@ -1006,18 +1101,6 @@ export class TmuxPipeBackend implements SessionBackend {
       try { fs.writeSync(this.fifoWakeFd, '\0'); } catch { /* already unblocked */ }
       try { fs.closeSync(this.fifoWakeFd); } catch { /* already closed */ }
       this.fifoWakeFd = null;
-    }
-    if (this.fifoFd !== null) {
-      // Closing the read fd is nominally ours (autoClose:false), but destroy()
-      // DOES close it itself when no read is in flight — verified: after a
-      // synchronous destroy() the fd is already EBADF. So this close is a
-      // best-effort backstop for the in-flight case, and EBADF here is the
-      // normal, expected outcome rather than a fault. Clear the field first so
-      // a late 'error' handler re-entering teardown cannot close it twice (by
-      // then the number could name a freshly-opened unrelated file).
-      const fd = this.fifoFd;
-      this.fifoFd = null;
-      try { fs.closeSync(fd); } catch { /* stream already closed it */ }
     }
     try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
   }
@@ -1037,7 +1120,7 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
-    const shellSpec = resolveUserShell(process.env, opts.launchShell);
+    const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
     const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
     const script = shellWrapperScript(
       resolveBotmuxWrapperBinDir(opts.env ?? process.env),
@@ -1050,11 +1133,11 @@ export class TmuxPipeBackend implements SessionBackend {
       '-x', String(opts.cols),
       '-y', String(opts.rows),
       '--',
-      ...shellCommandArgv(shellSpec, script, [
+      ...(opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, script, [
         opts.cwd,
         ...envAssignments,
         bin, ...args,
-      ]),
+      ])),
     ];
     // Bounded retries against a stalled shared server (instant clean
     // ECONNREFUSED under backlog overflow), a command timeout, or a
@@ -1068,15 +1151,21 @@ export class TmuxPipeBackend implements SessionBackend {
           cwd: opts.cwd,
           stdio: ['ignore', 'ignore', 'pipe'],
           timeout: 5000,
-          env: tmuxEnv(opts.env),
+          env: tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env),
         });
         break;
       } catch (err: any) {
         const stderrText = (err?.stderr?.toString?.() ?? '').trim();
-        if (attempt > 0 && /duplicate session/i.test(stderrText)) break;
-        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) throw err;
+        if (attempt > 0 && /duplicate session/i.test(stderrText)) {
+          if (opts.strictEnv) throw new Error('Refusing unverified strict tmux-pipe generation after a startup retry');
+          break;
+        }
+        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
+          if (opts.strictEnv) throw new Error('Strict tmux pane startup failed (command environment redacted)');
+          throw err;
+        }
         process.stderr.write(
-          `[tmux-pipe-backend] new-session failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${stderrText || err?.message || err}\n`,
+          `[tmux-pipe-backend] new-session failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${opts.strictEnv ? 'strict command environment redacted' : stderrText || err?.message || err}\n`,
         );
         startupRetrySleepFn(STARTUP_TMUX_RETRY_DELAYS_MS[attempt]);
       }
@@ -1103,8 +1192,39 @@ export class TmuxPipeBackend implements SessionBackend {
       execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env, timeout: 5000 });
       execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env, timeout: 5000 });
       execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env, timeout: 5000 });
-      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
+      // window-size largest exists since tmux 3.1; older builds reject the
+      // option (and the shared try/catch would then skip nothing else — the
+      // failing line is the last one). Unknown version: keep trying.
+      const version = getTmuxVersionCached();
+      if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
+        execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
+      }
     } catch { /* session may not be ready yet — benign */ }
+  }
+
+  /**
+   * Repair geometry left behind by an old Web Terminal viewer before this
+   * worker reattaches. A detached owned session has no human client whose
+   * layout we could disrupt, so the worker's configured render dimensions are
+   * authoritative. An attached session is left untouched.
+   */
+  private restoreDetachedOwnedSessionSize(): void {
+    try {
+      const attached = execFileSync(
+        'tmux',
+        ['display-message', '-p', '-t', this.paneTarget, '#{session_attached}'],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000,
+          env: tmuxEnv(),
+        },
+      ).trim();
+      if (attached === '0') this.resize(this.cols, this.rows);
+    } catch {
+      // Reattach already proved the pane exists. Geometry repair is best-effort
+      // and must not turn a transient tmux control failure into session loss.
+    }
   }
 
   /** Snapshot the full pane history WITH ANSI escapes (`-S - -E -`).

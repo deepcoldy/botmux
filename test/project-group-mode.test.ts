@@ -1,3 +1,4 @@
+import { buildProjectGroupStartedNoticeCard } from '../src/im/lark/project-group-card.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,6 +33,7 @@ function fixture() {
     unpinMessage: vi.fn(async () => true),
     resolveThreadId: vi.fn(async (_appId, root) => root === 'om_subtask' ? 'omt_topic' : null),
     isMessageWithdrawn: error => error instanceof Error && error.message === 'withdrawn',
+    isMessageUpdateExpired: error => error instanceof Error && error.name === 'MessageUpdateExpiredError',
     brand: () => 'feishu',
   };
   return {
@@ -77,7 +79,15 @@ describe('project group mode', () => {
       'om_card_1',
       expect.stringContaining('引导卡切换验收'),
     );
-    expect(f.cards.at(-1)).toContain('引导卡切换验收');
+    expect(f.transport.updateCard).toHaveBeenCalledWith(
+      'cli_coordinator', 'om_card_1', expect.stringContaining('项目已启动'),
+    );
+    const retiredGuide = vi.mocked(f.transport.updateCard).mock.calls
+      .filter(call => call[1] === 'om_card_1').at(-1)![2];
+    expect(JSON.parse(retiredGuide).header.title.content).toBe('项目已启动');
+    expect(JSON.parse(retiredGuide).config.summary.content).toBe('项目已启动，请查看项目进度卡');
+    expect(retiredGuide).not.toContain('待启动');
+    expect(retiredGuide).not.toContain('直接执行');
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
   });
 
@@ -113,6 +123,69 @@ describe('project group mode', () => {
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
   });
 
+  it('keeps the guide reference when updating its obsolete text fails and retries on refresh', async () => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error('temporary_update_failure'));
+    await expect(f.coordinator.run(f.context, {
+      action: 'init', title: '启动测试', goal: '保留重试入口',
+    })).resolves.toMatchObject({ card: { messageId: 'om_card_2' } });
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card?.messageId).toBe('om_card_2');
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard?.messageId).toBe('om_card_1');
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it.each(['withdrawn', 'temporary_unpin_failure'])('keeps project startup successful when guide retirement hits %s', async reason => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId, workerAppIds: [],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    if (reason === 'withdrawn') vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error(reason));
+    else vi.mocked(f.transport.unpinMessage).mockResolvedValueOnce(false);
+    await expect(f.coordinator.run(f.context, { action: 'init', title: 'Project', goal: 'Start' }))
+      .resolves.toMatchObject({ card: { messageId: 'om_card_2' } });
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it.each([true, false])('retires an expired guide and retries a failed unpin (first unpin=%s)', async unpinned => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId, workerAppIds: [],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    vi.mocked(f.transport.updateCard).mockImplementation(async (_app, id) => {
+      if (id === 'om_card_1') throw Object.assign(new Error('expired'), { name: 'MessageUpdateExpiredError' });
+    });
+    vi.mocked(f.transport.unpinMessage).mockResolvedValueOnce(unpinned);
+    await f.coordinator.run(f.context, { action: 'init', title: 'Project', goal: 'Start' });
+    expect(f.transport.unpinMessage).toHaveBeenCalledWith('cli_coordinator', 'om_card_1');
+    expect(!!readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBe(!unpinned);
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+    const retiredAttempts = vi.mocked(f.transport.updateCard).mock.calls.filter(call => call[1] === 'om_card_1').length;
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(vi.mocked(f.transport.updateCard).mock.calls.filter(call => call[1] === 'om_card_1')).toHaveLength(retiredAttempts);
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders the started notice in the requested locale without assuming pin success', () => {
+    const english = JSON.stringify(buildProjectGroupStartedNoticeCard('en'));
+    expect(JSON.parse(english).header.title.content).toBe('Project started');
+    expect(JSON.parse(english).config.summary.content).toBe('Project started. See the project progress card.');
+    expect(english).toContain('do not need to send the start command again');
+    expect(english).not.toContain('pinned');
+    expect(JSON.stringify(buildProjectGroupStartedNoticeCard('zh'))).toContain('无需再次发送启动指令');
+  });
+
   it('unpins and clears an unused onboarding guide when project mode is disabled', async () => {
     const f = fixture();
     await writeGroupCollaborationMode(f.dataDir, {
@@ -141,9 +214,13 @@ describe('project group mode', () => {
     expect(f.cards[0]).not.toContain('总体进度');
     expect(f.cards[0]).not.toContain('%');
     expect(f.cards[0]).toContain('推进概况');
+    expect(f.cards[0]).toContain('项目按当前阶段推进');
     expect(f.cards[0]).toContain('当前推进');
-    expect(f.cards[0]).toContain('待办计划');
-    expect(f.cards[0]).toContain('完成记录');
+    expect(f.cards[0]).not.toContain('待办计划');
+    expect(f.cards[0]).not.toContain('完成记录');
+    expect(f.cards[0]).not.toContain('等待拆解首批任务');
+    expect(f.cards[0]).not.toContain('子任务状态（0）');
+    expect(f.cards[0]).not.toContain('最近里程碑（0 项）');
     const heroText = rendered.body.elements
       .filter((element: { tag?: string }) => element.tag === 'interactive_container')
       .flatMap((element: { elements?: Array<{ text_size?: string }> }) => element.elements ?? []);
@@ -151,6 +228,57 @@ describe('project group mode', () => {
     expect(f.cards[0]).not.toContain('示例数据');
     expect(rendered.config.summary.content.length).toBeLessThanOrEqual(60);
     expect(readFileSync(join(f.dataDir, 'project-groups.json'), 'utf8')).not.toContain('larkAppSecret');
+  });
+
+  it.each(['status-dashboard', 'compact-list'] as const)('renders and clears a next-only milestone in %s', async (templateId) => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'],
+      progressCard: { schemaVersion: 1, templateId, sections: ['milestones'], milestonesExpanded: false },
+    });
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', nextMilestone: '发布' });
+    expect(f.cards.at(-1)).toContain('最近里程碑（0 项 · 下一节点 发布）');
+    const parsed = parseProjectArgs('update', ['--clear-next-milestone']);
+    if (!parsed.ok || parsed.help) throw new Error('expected update action');
+    await f.coordinator.run(f.context, parsed.action);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)).not.toHaveProperty('nextMilestone');
+    expect(f.cards.at(-1)).not.toContain('最近里程碑');
+    await f.coordinator.run(f.context, { action: 'update', milestone: '设计完成' });
+    expect(f.cards.at(-1)).toContain('最近里程碑（1 项）');
+    expect(f.cards.at(-1)).toContain('设计完成');
+  });
+
+  it('clears the next milestone on close while retaining completion evidence', async () => {
+    const f = fixture();
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', nextMilestone: '发布' });
+    await f.coordinator.run(f.context, { action: 'close', milestone: '用户验收通过' });
+    const stored = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(stored).not.toHaveProperty('nextMilestone');
+    expect(stored.milestones.at(-1)?.content).toBe('用户验收通过');
+    expect(f.cards.at(-1)).not.toContain('下一节点');
+  });
+
+  it('summarizes blockers without inventing subtask counts', async () => {
+    const f = fixture();
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', blocker: '等待依赖', focus: '等待依赖' });
+    const card = JSON.parse(f.cards.at(-1)!);
+    expect(card.config.summary.content).toContain('1 项阻塞');
+    expect(card.config.summary.content).not.toContain('子任务');
+    await f.coordinator.run(f.context, { action: 'update', clearBlockers: true });
+    expect(JSON.parse(f.cards.at(-1)!).config.summary.content).toContain('项目按当前阶段推进');
+  });
+
+  it('does not point remaining-plan overflow at a missing subtask table', async () => {
+    const f = fixture();
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '完成目标' });
+    await f.coordinator.run(f.context, { action: 'update', remaining: '一·二·三·四·五' });
+    expect(f.cards.at(-1)).toContain('另有 1 项');
+    expect(f.cards.at(-1)).not.toContain('见下方子任务表');
+    expect(JSON.parse(f.cards.at(-1)!).body.elements.some((e: { tag: string }) => e.tag === 'table')).toBe(false);
   });
 
   it('registers dispatch topics, resolves real topic links, and applies report progress', async () => {
@@ -279,7 +407,10 @@ describe('project group mode', () => {
     await f.coordinator.run(f.context, { action: 'refresh' });
     expect(f.transport.updateCard).toHaveBeenCalledTimes(1);
     expect(f.cards.at(-1)).toContain('compact-list');
-    expect(f.cards.at(-1)).toContain('等待拆解首批任务');
+    expect(f.cards.at(-1)).toContain('项目按当前阶段推进');
+    expect(f.cards.at(-1)).not.toContain('等待拆解首批任务');
+    expect(f.cards.at(-1)).not.toContain('尚未派发子任务');
+    expect(f.cards.at(-1)).not.toContain('子任务（0）');
     expect(f.cards.at(-1)).not.toContain('%');
     expect(f.cards.at(-1)).not.toContain('目标：完成目标');
     expect(f.cards.at(-1)).not.toContain('最近里程碑');
@@ -297,5 +428,9 @@ describe('project CLI parser', () => {
 
   it('rejects unknown options instead of silently changing project state', () => {
     expect(parseProjectArgs('update', ['--foucs', 'typo'])).toEqual({ ok: false, error: '未知选项: --foucs' });
+    expect(parseProjectArgs('update', ['--clear-next-milestone'])).toMatchObject({
+      ok: true,
+      action: { action: 'update', nextMilestone: '' },
+    });
   });
 });

@@ -361,6 +361,134 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(true);
   });
 
+  it('non-adopt: a non-unified --response-kind final marker suppresses a differing-length fallback (CN/EN double-post)', () => {
+    // The plain (non unified-reply) `botmux send --response-kind final` path
+    // writes only responseKind='final' (replyCardResponseKind is absent). The
+    // turn's answer was already delivered (e.g. Chinese); the transcription
+    // fallback carries a different-length summary (e.g. English). The length
+    // heuristic alone judged it uncovered and re-posted; the final marker now
+    // suppresses it directly.
+    const delivered = '这是已经发到飞书的最终答案正文。';
+    const fallback = 'This is the English final summary that the terminal transcription '
+      + 'fallback would post after the Chinese answer already went out through an '
+      + 'explicit final send, and it is materially longer than what was delivered.';
+    expect(normalise(delivered).length).not.toBe(normalise(fallback).length);
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      contentLength: normalise(delivered).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: a progress / kind-less marker still defers to the length heuristic', () => {
+    const shortSend = 'Working on it.';
+    const longFinal = 'Here is the complete, substantive answer that is materially '
+      + 'longer than the short progress note I sent earlier, with real content '
+      + 'that clearly exceeds the material-longer threshold by a wide margin here.';
+    // Explicit progress kind: not a final delivery → no kind-based suppression.
+    const progressMarker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'progress',
+      contentLength: normalise(shortSend).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: longFinal },
+      500,
+      [progressMarker],
+      false,
+    )).toBe(false);
+    // Legacy marker with no responseKind at all behaves the same (unchanged).
+    const legacyMarker: BridgeSendMarker = {
+      sentAtMs: 200,
+      contentLength: normalise(shortSend).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: longFinal },
+      500,
+      [legacyMarker],
+      false,
+    )).toBe(false);
+  });
+
+  it('never lets a terminal-independent outbound message replace the turn final', () => {
+    const final = 'final answer';
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'progress',
+      terminalIndependent: true,
+      contentLength: normalise(final).length,
+      previewText: final,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: final },
+      500,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: managed-card final suppresses; managed-card progress/auxiliary does not', () => {
+    const fallback = 'A materially different and longer English summary text that the '
+      + 'terminal transcription fallback would otherwise double post onto the thread today.';
+    const finalCard: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      replyCardResponseKind: 'final',
+      contentLength: 10,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [finalCard],
+      false,
+    )).toBe(true);
+    const progressCard: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'progress',
+      replyCardResponseKind: 'progress',
+      contentLength: 10,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [progressCard],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: a final marker outside the turn window does not suppress by kind', () => {
+    const marker: BridgeSendMarker = { sentAtMs: 600, responseKind: 'final', contentLength: 5 };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: 'some longer fallback text emitted here' },
+      500,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('transcript delivery: a non-unified final marker suppresses the fallback too', () => {
+    const delivered = '已经投递的最终答案。';
+    const fallback = 'A different-length English final summary under transcript delivery.';
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      contentLength: normalise(delivered).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [marker],
+      false,
+      'transcript',
+    )).toBe(true);
+  });
+
   it('non-adopt: exact nothing-to-send sentinel suppresses without a send marker', () => {
     expect(shouldSuppressBridgeEmit(
       { ...turn(100), finalText: `  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n` },
@@ -488,6 +616,177 @@ describe('shouldSuppressBridgeEmit', () => {
 
   it('non-adopt: isLocal turn always suppressed (skip web-terminal echo to Lark)', () => {
     expect(shouldSuppressBridgeEmit(turn(100, true), 200, [], false)).toBe(true);
+  });
+
+  describe('built-in scheduled turns (isScheduled)', () => {
+    it('a scheduled turn with a real answer and no send is forwarded', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: '波次进度：r01 全部 rankable' },
+        200, [], false,
+      )).toBe(false);
+    });
+
+    it('still suppressed in adopt mode never comes up, and ambient local typing without isScheduled stays silent', () => {
+      // Regression guard: the isScheduled bypass must not weaken the
+      // local-typing gate for ordinary isLocal turns.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, finalText: 'pwd' }, 200, [], false,
+      )).toBe(true);
+    });
+
+    it('deliberate NOTHING_TO_SEND silence still suppresses a scheduled turn', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
+        200, [], false,
+      )).toBe(true);
+    });
+
+    it('an explicit final botmux send in-window dedups the scheduled fallback', () => {
+      const body = '波次进度：r01 全部 rankable';
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent(body)! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: body },
+        200, markers, false,
+      )).toBe(true);
+    });
+
+    it('a materially longer scheduled final is still delivered despite a progress send', () => {
+      const longFinal = '完整简报：' + 'r01 七个 trial 全部 rankable，' .repeat(20);
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: longFinal },
+        200, markers, false,
+      )).toBe(false);
+    });
+
+    it('does NOT suppress a scheduled turn before its final text is read, even with an in-window send', () => {
+      // Must-fix regression: the worker runs a pre-text gate for every ready
+      // turn. For a scheduled turn a short progress note is a legit in-window
+      // marker, but suppressing here drops the real (longer) final that is only
+      // produced afterwards — the materially-longer check never runs because
+      // there is no finalText to compare. Without finalText the gate must defer
+      // the decision; the caller re-runs with the transcript final.
+      const progress: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中，稍后汇报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, progress, false,
+      )).toBe(false);
+      // Same in an OPEN window (no next boundary yet): a legacy marker with no
+      // content length must likewise not pre-suppress without the final.
+      const legacy: BridgeSendMarker[] = [{ sentAtMs: 150, messageId: 'om_x' }];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        undefined, legacy, false,
+      )).toBe(false);
+      // …and under transcript delivery too.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, progress, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('an explicit final marker STILL suppresses a scheduled turn even without finalText', () => {
+      // A declared --response-kind final is an unconditional delivery signal;
+      // the no-finalText deferral must not resurrect a duplicate when the model
+      // explicitly marked its send as final.
+      const finalMarker: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent('最终简报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, finalMarker, false,
+      )).toBe(true);
+    });
+  });
+
+  describe('transcript mode — final is the delivery channel, not a fallback (F1)', () => {
+    // Markers MUST come from the real builder: hand-writing { sentAtMs,
+    // contentLength } always produces the structured shape and would test the
+    // no-contentLength path as a false negative. `--images` with no body and
+    // the `--voice` path both yield a marker with no contentLength, because
+    // buildBridgeSendMarkerContent returns undefined for empty content.
+    const realMarker = (sentAtMs: number, body: string): BridgeSendMarker =>
+      ({ sentAtMs, ...(buildBridgeSendMarkerContent(body) ?? {}) });
+
+    const ANSWER = '这是本轮真正的答案，比中途那条进度消息长一些，但远没到两倍加一百二十字。';
+
+    it('a short mid-turn send no longer swallows the real answer', () => {
+      // send mode: the length ratio gate (2x + 120) suppresses this final...
+      const markers = [realMarker(150, '好的，我看一下')];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, markers, false,
+      )).toBe(true);
+      // ...transcript mode delivers it: the lengths differ, so it is not the
+      // same content that already went out.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, markers, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('a body-less send (--images / --voice shape) never suppresses', () => {
+      const imagesOnly = realMarker(150, '');
+      expect(imagesOnly.contentLength).toBeUndefined();   // the shape under test
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, [imagesOnly], false, 'transcript',
+      )).toBe(false);
+      // Mixing one body-less marker with a structured one must not resurrect
+      // the old back-compat "suppress everything" behaviour either.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200,
+        [imagesOnly, realMarker(160, '进度')], false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('prose + trailing sentinel is delivered as the prose, even after a send', () => {
+      const markers = [realMarker(150, '附件发你了')];
+      const finalText = `${ANSWER}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}`;
+      // send mode suppresses this regardless of length; transcript must not.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText }, 200, markers, false,
+      )).toBe(true);
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText }, 200, markers, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('identical content is still suppressed — dedup must survive the fix', () => {
+      const markers = [realMarker(150, ANSWER)];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: ANSWER }, 200, markers, false, 'transcript',
+      )).toBe(true);
+      // Same length but different text: the preview prefix rejects the match,
+      // so it is delivered rather than mistaken for the same message.
+      const other = 'X'.repeat(ANSWER.length);
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: other }, 200, markers, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('an empty final is delivered when nothing was sent — synthesised failure cards depend on it', () => {
+      // emitReadyCodexTurns re-runs this gate for synthesised failure / empty-turn
+      // diagnostics, whose visible text is in `content`, not finalText. Suppressing
+      // on empty finalText would swallow the failure reason — and would not even
+      // match send mode, which delivers on "empty final + zero markers".
+      const empty = { markTimeMs: 100, isLocal: false, finalText: '' };
+      expect(shouldSuppressBridgeEmit(empty, 200, [], false, 'transcript')).toBe(false);
+      expect(shouldSuppressBridgeEmit(empty, 200, [], false)).toBe(false);  // send parity
+      // But a mid-turn send in the window still suppresses, same as send mode.
+      const markers = [realMarker(150, '进度更新')];
+      expect(shouldSuppressBridgeEmit(empty, 200, markers, false, 'transcript')).toBe(true);
+    });
+
+    it('a bare sentinel final stays suppressed in transcript mode too', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: false, finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
+        200, [], false, 'transcript',
+      )).toBe(true);
+    });
   });
 
   it('non-adopt: emits when no marker landed in window', () => {

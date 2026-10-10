@@ -6,6 +6,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneCommand } from './strict-env.js';
 import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
@@ -218,6 +220,7 @@ export class ZellijBackend implements SessionBackend {
         this.reattaching = false;
       }
     }
+    if (opts.strictEnv && this.reattaching && !opts.strictEnvReattach) throw new Error('Refusing unverified strict zellij reattach');
     logger.debug(
       `[zellij:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
       `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
@@ -225,7 +228,7 @@ export class ZellijBackend implements SessionBackend {
 
     const { configPath, layoutPath } = this.writeRuntimeFiles(bin, args, opts);
     this.configPath = configPath;
-    const childEnv = zellijEnv(opts.env);
+    const childEnv = zellijEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
 
     // Fresh: `--new-session-with-layout <file>` FORCES a new named session with
     // our layout (plain `--session … --layout-string` instead ATTACHES to the
@@ -370,7 +373,7 @@ keybinds clear-defaults=true {
 
 /** Escape a string for a KDL double-quoted value. */
 export function kdlString(s: string): string {
-  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
 }
 
 /**
@@ -383,10 +386,10 @@ export function kdlString(s: string): string {
  * layouts omit the `_` sentinel because fish exposes post-script args as $argv.
  */
 export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts): string {
-  const shellSpec = resolveUserShell(process.env, opts.launchShell);
+  const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
   const kind = shellKindForPath(shellSpec.shell);
-  const [cmd, ...paneArgs] = shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind), [
+  const [cmd, ...paneArgs] = opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind), [
     opts.cwd,
     ...envAssignments,
     bin, ...args,

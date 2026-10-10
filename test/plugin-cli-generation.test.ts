@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
@@ -33,6 +33,38 @@ describe('CLI plugin generation', () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('zero injection emits no replacement or deferred skill catalog on resume', () => {
+    for (const prompt of ['', '只运行测试']) {
+      const result = prepareCliPluginGeneration({ sessionId: 'zero', bot: { larkAppId: 'sub' },
+        cliId: 'claude-code', adapter: { id: 'claude-code' } as CliAdapter,
+        workingDir: home, dataDir, global: { plugins: [] }, prompt,
+        replacesPriorGeneration: true, promptInjection: 'none' });
+      expect(result.prompt).toBe(prompt);
+      expect(result.skillCatalog).toBeUndefined();
+      expect(result.skillPluginDir).toBeUndefined();
+      expect(result.deferredSkillCatalog).toBeUndefined();
+      expect(readSessionSkillManifest('zero')).toBeNull();
+    }
+  });
+
+  it('protects shared global skills for every CLI using the common spawn preparation', () => {
+    const skillsDir = join(home, '.shared', 'skills');
+    const shared = join(skillsDir, 'botmux-send', 'SKILL.md');
+    const user = join(skillsDir, 'user-skill', 'SKILL.md');
+    write(shared, 'shared rules');
+    write(user, 'native user skill');
+    const opts = { sessionId: 'sub', bot: { larkAppId: 'sub' }, cliId: 'traex' as const,
+      adapter: { id: 'traex', skillsDir } as CliAdapter, workingDir: home,
+      dataDir, global: { plugins: [] }, prompt: 'task', replacesPriorGeneration: false,
+      promptInjection: 'none' as const };
+    expect(() => prepareCliPluginGeneration(opts)).toThrow('全局 botmux 技能');
+    expect(existsSync(shared)).toBe(true);
+    expect(existsSync(user)).toBe(true);
+    rmSync(join(skillsDir, 'botmux-send'), { recursive: true });
+    expect(prepareCliPluginGeneration(opts).prompt).toBe('task');
+    expect(existsSync(user)).toBe(true);
   });
 
   it('replaces Skills and MCP plugin bindings when the same session starts a new CLI process', () => {

@@ -40,7 +40,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import { stripComments } from './helpers/bun-leg-selectors.js';
 
 const REAL_ARGV1 = process.argv[1];
@@ -192,7 +192,13 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
 // prepareDirectSandbox returns null off Linux (bwrap DIRECT mode), so on macOS
 // every overlayTargets() call is vacuously [] — the "skips" case passes for the
 // wrong reason and the "still overlays" case can only fail. Linux-only by design.
-describe.skipIf(process.platform !== 'linux')('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
+const bwrapUsable = probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
+// Also skip on a Linux runner whose unprivileged userns/bwrap is unavailable
+// (GitHub hosted runners can stay `bwrap --unshare-user`-broken even after the
+// workflow relaxes apparmor): prepareDirectSandbox then returns null and the
+// "still overlays" cases would fail instead of skip. Uses the SAME production
+// probe as plugin-mcp-sandbox.test.ts / session-store-bwrap.test.ts.
+describe.skipIf(process.platform !== 'linux' || !bwrapUsable)('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
   function overlayTargets(trusted: string): string[] {
     const root = mkdtempSync(join(tmpdir(), 'sbx-overlay-'));
     const proj = join(root, 'proj');
@@ -276,5 +282,22 @@ describe.skipIf(process.platform !== 'linux')('sandbox shim overlay — install.
     expect(callRegion).toContain('trustedBotmuxCommandPaths: [defaultGatewayEntry().command],');
     expect(callRegion).not.toContain('resolveNativeSubagentRuntimeHookWrapperPath');
     expect(callRegion).not.toContain('botmux-native-subagent-runtime-hook');
+  });
+
+  it('SOURCE PIN: worker uses compact bwrap argument transport only for tmux', () => {
+    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
+    const callStart = src.indexOf('const sbx = prepareDirectSandbox({');
+    expect(callStart).toBeGreaterThanOrEqual(0);
+    const callEnd = src.indexOf('      });', callStart);
+    expect(callEnd).toBeGreaterThan(callStart);
+    const callRegion = stripComments(src.slice(callStart, callEnd));
+    expect(callRegion).toContain("useBwrapArgsFile: effectiveBackendType === 'tmux',");
+
+    const scratchStart = src.indexOf('const sbx = prepareScratchSandbox({');
+    expect(scratchStart).toBeGreaterThanOrEqual(0);
+    const scratchEnd = src.indexOf('      });', scratchStart);
+    expect(scratchEnd).toBeGreaterThan(scratchStart);
+    const scratchRegion = stripComments(src.slice(scratchStart, scratchEnd));
+    expect(scratchRegion).toContain("useBwrapArgsFile: effectiveBackendType === 'tmux',");
   });
 });

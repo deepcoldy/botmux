@@ -19,6 +19,8 @@ export interface SelectItem {
   readonly label: string;
   /** 暗色后缀（如 cliId / 命令前缀），仅展示用。 */
   readonly hint?: string;
+  /** 仅用于搜索的隐藏文本，例如二级菜单 child 的 key/label。 */
+  readonly searchText?: string;
   /** 选中后还有二级菜单（渲染 ▸）。 */
   readonly submenu?: boolean;
 }
@@ -51,6 +53,11 @@ export function truncateToWidth(s: string, max: number): string {
   return out;
 }
 
+export function matchesSelectItem(item: SelectItem, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  return !q || `${item.label} ${item.hint ?? ''} ${item.searchText ?? ''}`.toLowerCase().includes(q);
+}
+
 /**
  * 计算视口首行，保证光标始终可见：列表超过 capacity 时窗口跟随光标滚动
  * （含首尾 wrap-around），并 clamp 到合法范围。纯函数，单测覆盖。
@@ -81,10 +88,9 @@ export function interactiveSelect(opts: {
   let filtered: number[] = items.map((_, i) => i);
 
   function refilter(): void {
-    const q = query.trim().toLowerCase();
     filtered = items
       .map((_, i) => i)
-      .filter((i) => !q || `${items[i].label} ${items[i].hint ?? ''}`.toLowerCase().includes(q));
+      .filter((i) => matchesSelectItem(items[i], query));
     if (cursor >= filtered.length) cursor = Math.max(0, filtered.length - 1);
     if (cursor < 0) cursor = 0;
   }
@@ -247,6 +253,9 @@ export async function pickCliSelection(
     const topItems: SelectItem[] = CLI_SELECT_TREE.map((g) => ({
       label: g.label,
       hint: g.children ? '' : g.option?.key,
+      searchText: g.children
+        ? [g.key, ...g.children.flatMap((c) => [c.key, c.label, c.wrapperCli ?? ''])].join(' ')
+        : g.option?.key,
       submenu: !!g.children,
     }));
     const ti = await interactiveSelect({ title, items: topItems, footer: '带 ▸ 的项目可进入子菜单选择具体版本或形态' });

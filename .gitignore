@@ -17,6 +17,7 @@ docs/superpowers/
 docs/specs/
 storageState.json
 midscene_run/
+.midscene/
 .codex
 .claude/
 .antigravitycli/

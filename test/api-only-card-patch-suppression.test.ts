@@ -75,7 +75,7 @@ describe('API-only: aux-UI card patch produces zero Feishu calls', () => {
 
   it('scheduleCardPatch is a no-op for an apiOnly session (no updateMessage)', () => {
     const ds = makeNoTransportSession();
-    scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', content: 'x' }));
+    expect(scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', content: 'x' }))).toBe(false);
     expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
@@ -86,7 +86,7 @@ describe('API-only: aux-UI card patch produces zero Feishu calls', () => {
       resolvedAllowedUsers: [], botOpenId: 'ou_bot',
     } as any);
     const ds = makeNoTransportSession({ larkAppId: 'app_normal', chatId: 'http_wait_xyz' });
-    scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', content: 'x' }));
+    expect(scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', content: 'x' }))).toBe(false);
     expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
@@ -96,7 +96,7 @@ describe('API-only: aux-UI card patch produces zero Feishu calls', () => {
       resolvedAllowedUsers: [], botOpenId: 'ou_bot',
     } as any);
     const ds = makeNoTransportSession({ larkAppId: 'app_normal', chatId: 'oc_real', streamCardId: 'om_real_card' });
-    scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', content: 'x' }));
+    expect(scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', content: 'x' }))).toBe(true);
     expect(updateMessageMock).toHaveBeenCalledTimes(1);
   });
 });

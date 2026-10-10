@@ -74,12 +74,17 @@ const CONSUMERS: Record<string, Rule> = {
     count: 3,
   },
   // ── user surfaces: must render refusal AND residual ──────────────────────
+  'core/dismiss-command.ts::dismissSessionGroup::closeSession': {
+    category: 'user_surface',
+    why: '/dismiss returns refusal/residual details to the command handler and '
+      + 'preserves the group unless closure is known and clean; test/dismiss-command.test.ts covers both.',
+  },
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
-    why: '/close plus shared-adopt /detach and /disconnect all branch on '
-      + 'refused/residual results; none report an ordinary close/disconnect while '
-      + 'cleanup is unproven.',
-    count: 4,
+    why: '/close, /lane close, shared-adopt /detach and /disconnect, and same-daemon '
+      + '/close wt siblings all branch on refused/residual results; none report '
+      + 'ordinary success or remove a worktree while cleanup is unproven.',
+    count: 6,
   },
   'core/command-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',
@@ -123,10 +128,10 @@ const CONSUMERS: Record<string, Rule> = {
     count: 2,
   },
   'core/session-manager.ts::resumeSession::closeSession': {
-    category: 'impossible_by_invariant',
-    why: 'Closes only a worker:null daemon-command scratch placeholder occupying '
-      + 'the anchor (isRelayableRealSession is excluded), which has no CLI session '
-      + 'and therefore no remote lineage to leave behind.',
+    category: 'user_surface',
+    why: 'All three calls close only worker:null daemon-command scratch/registration '
+      + 'losers with no remote lineage. A rejected Remote Runner rebuild now rolls '
+      + 'the row back directly, so it cannot recursively wake a second provider.',
     count: 3,
   },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
@@ -161,6 +166,11 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Deferred-schedule settlement injection: settlement returns close_refused '
       + 'rather than closed.',
+  },
+  'daemon.ts::cleanupFailedDelivery::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Document-comment admission rollback has no direct user surface; the '
+      + 'background wrapper logs refused cleanup and any remote residual.',
   },
   'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::runIdempotencyFailClose': {
     category: 'background',
@@ -331,6 +341,10 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
     why: 'Idle cleanup close callback forwards residual separately from failures.',
     mustParse: true,
   },
+  'dashboard.ts::closeCandidate::close-route': {
+    why: 'Scheduled auto-cleanup forwards residual, counted apart from failures.',
+    mustParse: true,
+  },
   'dashboard/web/sessions-page.tsx::SessionsPage::close-route': {
     why: 'Web single + bulk close: residual alert, counted apart from failures.',
     mustParse: true,
@@ -341,6 +355,10 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
   },
   'im/lark/sessions-card.ts::handleSessionsCardAction::close-route': {
     why: 'Sessions board card: residual banner on the closed detail card.',
+    mustParse: true,
+  },
+  'core/command-handler.ts::handleCommand::close-route': {
+    why: 'Cross-daemon /close wt parses residual and refuses worktree removal when remote teardown is incomplete.',
     mustParse: true,
   },
   'core/dashboard-ipc-server.ts::<module>::close-route': {

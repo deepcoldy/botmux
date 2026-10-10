@@ -1198,14 +1198,17 @@ describe('createV3GateRunner — in-flight 锁 + coldAttach 顺序', () => {
         postCard: async () => {},
       };
       const runnerA = createV3GateRunner(common);
-      const runnerB = createV3GateRunner(common);
+      const runnerBEnded = Promise.withResolvers<void>();
+      const runnerB = createV3GateRunner({ ...common, onDriveEnd: () => runnerBEnded.resolve() });
       const a = runnerA.drive('lease-cancel');
       await vi.waitFor(() => expect(workerStarted).toBe(true));
 
       const request = requestV3RunCancel(base, 'lease-cancel', { by: 'ou_user' });
       if (request.kind !== 'requested') throw new Error(`unexpected cancel outcome ${request.kind}`);
       runnerB.cancelAndDrive('lease-cancel', request.cancelRequestId);
-      await a;
+      // cancelAndDrive detaches its drive; journal settlement alone does not
+      // mean the second runner has released the lease and stopped writing.
+      await Promise.all([a, runnerBEnded.promise]);
       await vi.waitFor(() => {
         expect(readJournal(journalPath).filter((event) => event.type === 'runCancelled')).toHaveLength(1);
       });

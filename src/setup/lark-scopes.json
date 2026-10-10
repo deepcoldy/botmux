@@ -6,6 +6,8 @@
       "application:bot.menu:write",
       "audio_video_ai:meeting_assistance",
       "auth:user_access_token:read",
+      "base:app:create",
+      "bitable:app",
       "board:whiteboard:node:create",
       "board:whiteboard:node:delete",
       "board:whiteboard:node:read",
@@ -115,6 +117,9 @@
       "im:message.pins:write_only",
       "im:message.reactions:read",
       "im:message.reactions:write_only",
+      "im:message.urgent",
+      "im:message.urgent:phone",
+      "im:message.urgent:sms",
       "im:message:readonly",
       "im:message:recall",
       "im:message:send_as_bot",
@@ -168,6 +173,8 @@
       "wiki:wiki:readonly"
     ],
     "user": [
+      "base:app:create",
+      "bitable:app",
       "board:whiteboard:node:create",
       "board:whiteboard:node:delete",
       "board:whiteboard:node:read",

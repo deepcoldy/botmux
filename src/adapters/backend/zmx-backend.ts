@@ -30,6 +30,8 @@ import {
   type SpawnOpts,
   type SessionProbe,
 } from './types.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneEnvArgs } from './strict-env.js';
 import { zmxEnv, probeZmxFunctional } from '../../setup/ensure-zmx.js';
 import {
   buildBotmuxEnvAssignments,
@@ -45,6 +47,7 @@ import { TERMINAL_CANCEL_COOLDOWN_MS } from './critical-control-key.js';
 import { logger } from '../../utils/logger.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
+import { SESSION_TEMP_ENV_KEYS } from '../../utils/child-env.js';
 
 const EARLY_BUFFER_MAX = 1024 * 1024;
 const HISTORY_TAIL_DEBOUNCE_MS = 50;
@@ -336,6 +339,7 @@ export class ZmxBackend implements SessionBackend {
       isReattach?: boolean;
       sessionId?: string;
       recoveryStateDir?: string;
+      socketDir?: string;
     } = {},
   ) {
     this.reattaching = opts.isReattach ?? false;
@@ -615,13 +619,13 @@ export class ZmxBackend implements SessionBackend {
     );
   }
 
-  static listBotmuxSessions(): string[] {
-    const probe = ZmxBackend.probeSessions();
+  static listBotmuxSessions(env: NodeJS.ProcessEnv = zmxEnv()): string[] {
+    const probe = ZmxBackend.probeSessions(env);
     return probe.ok ? probe.sessions.filter(s => s.startsWith('bmx-')) : [];
   }
 
-  static listDetails(): string {
-    const probe = ZmxBackend.probeSessions();
+  static listDetails(env: NodeJS.ProcessEnv = zmxEnv()): string {
+    const probe = ZmxBackend.probeSessions(env);
     return probe.ok ? probe.raw : '';
   }
 
@@ -950,13 +954,17 @@ export class ZmxBackend implements SessionBackend {
     this.lastInjectedCancelAtMs = Date.now();
   }
 
+  private controlEnv(opts: SpawnOpts): NodeJS.ProcessEnv {
+    return zmxControlEnv(opts, this.opts.socketDir);
+  }
+
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     const frozenOpts: SpawnOpts = {
       ...opts,
       env: { ...opts.env },
       injectEnv: opts.injectEnv ? { ...opts.injectEnv } : undefined,
     };
-    const controlEnv = zmxControlEnv(frozenOpts);
+    const controlEnv = this.controlEnv(frozenOpts);
     const probe = ZmxBackend.probeManagedSession(
       this.sessionName,
       this.opts.sessionId,
@@ -972,6 +980,7 @@ export class ZmxBackend implements SessionBackend {
       );
     }
 
+    if (opts.strictEnv && this.reattaching && !opts.strictEnvReattach) throw new Error('Refusing unverified strict zmx reattach');
     if (probe.state === 'compatible') {
       // Reattach/fresh is frozen by worker before plugin, startup-command and
       // isolation decisions. A late same-name winner must not silently turn a
@@ -1137,7 +1146,7 @@ export class ZmxBackend implements SessionBackend {
         this.sessionName,
         this.opts.sessionId,
         this.backingPid,
-        zmxControlEnv(this.lastOpts),
+        this.controlEnv(this.lastOpts),
       );
     } catch (err) {
       this.preserveSessionOnDestroy = true;
@@ -1161,12 +1170,12 @@ export class ZmxBackend implements SessionBackend {
         timeout: ZMX_COMMAND_TIMEOUT_MS,
         // The session PTY inherits THIS env — zmxFreshSessionEnv pins TERM,
         // which the pm2-boundary scrub removed from the daemon/worker env.
-        env: zmxFreshSessionEnv(opts),
+        env: zmxFreshSessionEnv(opts, this.opts.socketDir),
       });
 
       const ready = this.waitForFreshReady(launch);
       if (!ready) {
-        const details = sessionDetails(this.sessionName, zmxControlEnv(opts));
+        const details = sessionDetails(this.sessionName, this.controlEnv(opts));
         if (!details?.command?.includes(launch.bootstrapPath)) {
           this.preserveSessionOnDestroy = true;
         }
@@ -1176,7 +1185,7 @@ export class ZmxBackend implements SessionBackend {
         );
       }
 
-      const created = sessionDetails(this.sessionName, zmxControlEnv(opts));
+      const created = sessionDetails(this.sessionName, this.controlEnv(opts));
       if (!created || !created.command?.includes(launch.bootstrapPath)) {
         this.preserveSessionOnDestroy = true;
         throw new Error(`ZMX 会话 ${this.sessionName} 的 fresh 所有权握手失效；已保留同名会话`);
@@ -1198,7 +1207,7 @@ export class ZmxBackend implements SessionBackend {
       const managed = ZmxBackend.probeManagedSession(
         this.sessionName,
         this.opts.sessionId,
-        zmxControlEnv(opts),
+        this.controlEnv(opts),
         { allowGated: true },
       );
       if (managed.state !== 'compatible' || managed.pid !== this.backingPid) {
@@ -1253,7 +1262,7 @@ export class ZmxBackend implements SessionBackend {
             this.sessionName,
             this.opts.sessionId,
             this.backingPid,
-            zmxControlEnv(opts),
+            this.controlEnv(opts),
           );
         } catch (killErr) {
           this.preserveSessionOnDestroy = true;
@@ -1357,7 +1366,7 @@ export class ZmxBackend implements SessionBackend {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 3000,
-        env: zmxControlEnv(opts),
+        env: this.controlEnv(opts),
       }).trim();
     } catch (err) {
       throw new Error(
@@ -1376,7 +1385,7 @@ export class ZmxBackend implements SessionBackend {
     const after = ZmxBackend.probeManagedSession(
       this.sessionName,
       this.opts.sessionId,
-      zmxControlEnv(opts),
+      this.controlEnv(opts),
     );
     if (after.state !== 'compatible' || after.pid !== expectedBackingPid) {
       throw new Error(`ZMX 会话 ${this.sessionName} 在 launch PID 校验期间发生变化`);
@@ -1412,7 +1421,7 @@ export class ZmxBackend implements SessionBackend {
     while (Date.now() < deadline) {
       const details = sessionDetails(
         this.sessionName,
-        this.lastOpts ? zmxControlEnv(this.lastOpts) : zmxEnv(),
+        this.lastOpts ? this.controlEnv(this.lastOpts) : zmxEnv(process.env, this.opts.socketDir),
       );
       if (details && this.backingPid != null && details.pid !== this.backingPid) {
         this.preserveSessionOnDestroy = true;
@@ -1421,7 +1430,7 @@ export class ZmxBackend implements SessionBackend {
       if (details?.clients != null && details.clients >= 1) return true;
       if (!details && ZmxBackend.probeSession(
         this.sessionName,
-        this.lastOpts ? zmxControlEnv(this.lastOpts) : zmxEnv(),
+        this.lastOpts ? this.controlEnv(this.lastOpts) : zmxEnv(process.env, this.opts.socketDir),
       ) === 'missing') return false;
       sleepSync(25);
     }
@@ -1441,7 +1450,7 @@ export class ZmxBackend implements SessionBackend {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: ZMX_COMMAND_TIMEOUT_MS,
-      env: zmxControlEnv(opts),
+      env: this.controlEnv(opts),
     });
     if (stdout.trim()) {
       throw new Error(`ZMX 协议标签写入返回异常：${stdout.trim()}`);
@@ -1457,7 +1466,7 @@ export class ZmxBackend implements SessionBackend {
     let transport: string;
     let sessionId: string;
     try {
-      const env = zmxControlEnv(this.lastOpts);
+      const env = this.controlEnv(this.lastOpts);
       transport = execFileSync('zmx', ['get', this.sessionName, ZMX_TRANSPORT_LABEL], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -1501,7 +1510,7 @@ export class ZmxBackend implements SessionBackend {
     const probe = ZmxBackend.probeManagedSession(
       this.sessionName,
       this.opts.sessionId,
-      zmxControlEnv(this.lastOpts),
+      this.controlEnv(this.lastOpts),
     );
     if (probe.state === 'missing') {
       this.fireExit(0, null);
@@ -1561,7 +1570,7 @@ export class ZmxBackend implements SessionBackend {
         encoding: 'utf8',
         timeout: ZMX_HISTORY_TIMEOUT_MS,
         maxBuffer: 64 * 1024,
-        env: zmxControlEnv(this.lastOpts),
+        env: this.controlEnv(this.lastOpts),
       }, (err, stdout, stderr) => {
         if (this.historyProcess === child) this.historyProcess = null;
         if (generation !== this.historyGeneration) {
@@ -1653,7 +1662,7 @@ export class ZmxBackend implements SessionBackend {
         rmSync(historyPath);
         child = spawn('zmx', ['history', this.sessionName], {
           stdio: ['ignore', historyFd, 'pipe'],
-          env: zmxControlEnv(this.lastOpts),
+          env: this.controlEnv(this.lastOpts),
         });
         this.historyProcess = child;
         child.stderr?.on('data', (chunk: Buffer | string) => {
@@ -1985,7 +1994,7 @@ export class ZmxBackend implements SessionBackend {
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: ZMX_COMMAND_TIMEOUT_MS,
             maxBuffer: 1024 * 1024,
-            env: zmxControlEnv(this.lastOpts),
+            env: this.controlEnv(this.lastOpts),
           });
         } finally {
           if (injectedCancelAttempt) this.noteInjectedCancelAttemptSettled();
@@ -2114,7 +2123,7 @@ export class ZmxBackend implements SessionBackend {
           stdio: ['pipe', 'pipe', 'pipe'],
           timeout: ZMX_COMMAND_TIMEOUT_MS,
           maxBuffer: 1024 * 1024,
-          env: zmxControlEnv(this.lastOpts),
+          env: this.controlEnv(this.lastOpts),
         });
       } finally {
         // A timeout is ambiguous: the Ctrl+C may have landed at any point
@@ -2149,7 +2158,7 @@ export class ZmxBackend implements SessionBackend {
     const child = spawn('zmx', ['tail', this.sessionName], {
       cwd: this.lastOpts?.cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: this.lastOpts ? zmxControlEnv(this.lastOpts) : zmxEnv(),
+      env: this.lastOpts ? this.controlEnv(this.lastOpts) : zmxEnv(process.env, this.opts.socketDir),
     });
     this.tailProcess = child;
     this.state = 'observing';
@@ -2351,11 +2360,11 @@ export function buildZmxLaunchFiles(
   releasePath: string,
   releaseToken: string,
 ): { bootstrap: string; payload: string } {
-  const shellSpec = resolveUserShell(process.env, opts.launchShell);
+  const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
   const shellKind = shellKindForPath(shellSpec.shell);
-  const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv)
+  const envAssignments = (opts.strictEnv ? strictPaneEnvArgs(opts) : buildBotmuxEnvAssignments(opts.env, opts.injectEnv))
     .filter(assignment => !/^ZMX_(?:SESSION|SESSION_PREFIX)=/.test(assignment));
-  const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
+  const debugKeepShell = !opts.strictEnv && process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
   const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
   const wrapped = debugKeepShell
     ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind)
@@ -2529,20 +2538,29 @@ function createZmxLaunchPayload(bin: string, args: string[], opts: SpawnOpts): Z
  * constant every other backend PTY already forces. Control clients (get/set/
  * list/kill) and a user's own `zmx attach` from a real terminal are untouched.
  */
-export function zmxFreshSessionEnv(opts: SpawnOpts): NodeJS.ProcessEnv {
-  return { ...zmxControlEnv(opts), TERM: 'xterm-256color' };
+export function zmxFreshSessionEnv(opts: SpawnOpts, socketDir?: string): NodeJS.ProcessEnv {
+  return { ...zmxControlEnv(opts, socketDir), TERM: 'xterm-256color' };
 }
 
 /** Strip every payload-delivered key from ZMX control subprocesses. */
-export function zmxControlEnv(opts: SpawnOpts): NodeJS.ProcessEnv {
-  const env = zmxEnv(opts.env);
+export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.ProcessEnv {
+  const env = zmxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
   for (const assignment of buildBotmuxEnvAssignments(opts.env, opts.injectEnv)) {
     const equals = assignment.indexOf('=');
-    if (equals > 0) delete env[assignment.slice(0, equals)];
+    if (equals <= 0) continue;
+    const key = assignment.slice(0, equals);
+    // Scratch variables in opts.env belong to this session, not to the bot's
+    // injected payload. ZMX control clients also need the caller's TMPDIR when
+    // resolving a socket without an explicit ZMX_DIR.
+    if (SESSION_TEMP_ENV_KEYS.some(tempKey => tempKey === key) && opts.injectEnv?.[key] === undefined) continue;
+    delete env[key];
   }
   if (opts.injectEnv) {
     for (const key of Object.keys(opts.injectEnv)) delete env[key];
   }
+  // Apply the recorded address AFTER stripping payload keys: per-bot env
+  // must not redirect a control command or remove its frozen namespace.
+  if (socketDir !== undefined) env.ZMX_DIR = socketDir;
   return env;
 }
 

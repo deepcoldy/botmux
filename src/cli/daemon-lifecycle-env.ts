@@ -59,6 +59,19 @@ export const DAEMON_ENV_KEYS = [
   // keeps them on the deterministic resolveDaemonEnv snapshot semantics.
   'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
   'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
+  // Machine-wide rollout switch and emergency brake for automatic task continuation. The
+  // old read-only key remains a compatibility alias during rollout.
+  'BOTMUX_TASK_CONTINUATION_ENABLED',
+  'BOTMUX_READONLY_CONTINUATION_ENABLED',
+  // Provider-neutral durable coordination bootstrap. Secrets remain in
+  // provider-owned environment/files; the executable path and JSON argv must
+  // stay credential-free as required by the public provider contract.
+  'BOTMUX_COORDINATION_MODE',
+  'BOTMUX_COORDINATION_PROVIDER_BIN',
+  'BOTMUX_COORDINATION_PROVIDER_ARGS_JSON',
+  'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS',
+  'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS',
+  'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS',
   // Merlin Devbox auto-export switch (platform/devbox-dashboard-export.ts).
   // The dashboard resolves it (dashboard-url / control-csrf run there), so it
   // has to survive the allowlist copy — same reason BOTMUX_PUBLIC_URL is here.

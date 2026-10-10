@@ -117,10 +117,28 @@ describe('workspace ownership discovery', () => {
     expect(result.targets).toEqual([]);
     expect(result.errors).toHaveLength(2);
     writeFileSync(join(f.dataDir, 'sessions-app-a.json'), 'null');
-    expect(() => loadAllSessionsStrict(f.dataDir)).toThrow('Invalid session store');
+    expect(() => loadAllSessionsStrict(f.dataDir)).toThrow('Unmigrated session stores');
     writeFileSync(join(f.dataDir, 'sessions-app-a.json'), JSON.stringify({ duplicate: a }));
     writeFileSync(join(f.dataDir, 'sessions-app-b.json'), '{broken');
     expect(() => loadAllSessionsStrict(f.dataDir)).toThrow();
+  });
+
+  it('ignores frozen per-bot JSON after migration and uses only authoritative SQLite rows', () => {
+    const f = fixture(); const session = f.add('migrated');
+    writeFileSync(join(f.dataDir, 'sessions-app-a.json'), '{stale snapshot');
+    const dir = join(f.dataDir, 'session-stores', 'app-a'); mkdirSync(dir, { recursive: true });
+    const db = new DatabaseSync(join(dir, 'sessions.db'));
+    db.exec('CREATE TABLE sessions (session_id TEXT PRIMARY KEY, row TEXT NOT NULL)');
+    db.prepare('INSERT INTO sessions VALUES (?, ?)').run(session.sessionId, JSON.stringify(session)); db.close();
+    expect(loadAllSessionsStrict(f.dataDir)).toEqual([session]);
+    expect(readFileSync(join(f.dataDir, 'sessions-app-a.json'), 'utf8')).toBe('{stale snapshot');
+  });
+
+  it('fails closed on an unindexed shared legacy store without migrating it', () => {
+    const f = fixture();
+    writeFileSync(join(f.dataDir, 'sessions.json'), '{unreadable legacy');
+    expect(() => loadAllSessionsStrict(f.dataDir)).toThrow('Legacy session store');
+    expect(readFileSync(join(f.dataDir, 'sessions.json'), 'utf8')).toBe('{unreadable legacy');
   });
 
   it('refuses malformed SQLite rows instead of silently dropping coverage', () => {

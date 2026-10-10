@@ -19,9 +19,13 @@
  *   message in the input box. Submit is verified via CoCo's platform-specific
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
- * - Other adapters (Aiden/Codex/Gemini): use plain sendText + Enter
+ * - Other adapters (Aiden/Gemini): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
+ * - Hermes: single pasteText with the whole content + delayed Enter. Its
+ *   prompt_toolkit composer handles a bracketed paste in one event, while the
+ *   old sendText burst's trailing Enter is swallowed by the 50ms anti-paste
+ *   guard on a cold start (opening prompt stranded until manual Enter).
  * - OpenCode: short single-line prompts use sendText + Enter; multiline or
  *   large prompts use pasteText + Enter so OpenTUI receives bracketed paste.
  *
@@ -60,8 +64,12 @@ vi.mock('node:fs', () => {
 
 import {
   CLAUDE_INPUT_CHUNK_BYTES,
+  CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN,
   chunkTextByUtf8Bytes,
   createClaudeCodeAdapter,
+  extractMessageContentForFingerprint,
+  makeSubmitFingerprint,
+  sanitizeClaudeInput,
 } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -85,6 +93,8 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { codexHistoryPath } from '../src/services/codex-paths.js';
+import { codexTerminalSessionIsBound } from '../src/services/codex-terminal-session.js';
+import * as codexTranscript from '../src/services/codex-transcript.js';
 
 // ── Speed: collapse the adapters' real-time submit waits ───────────────────
 // writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
@@ -203,15 +213,18 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, Genius, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS; its
+ *  Gemini, Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
- *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
+ *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.
+ *  Hermes moved to PASTE_BUFFER_ADAPTERS too: on a cold start its prompt_toolkit
+ *  composer drains the send-keys burst together with the trailing Enter, and
+ *  Hermes' 50ms anti-paste window (#10994) then drops that Enter as a pasted
+ *  newline, stranding the opening prompt until a manual Enter.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
   ['genius', createGeniusAdapter('/bin/genius')],
   ['mtr', createMtrAdapter('/bin/mtr')],
-  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
 const OPENCODE_ADAPTER: AdapterEntry = ['opencode', createOpenCodeAdapter('/bin/opencode')];
@@ -227,15 +240,20 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, and Pi. See coco.ts for the
+ *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, Pi, and Hermes. See coco.ts for the
  *  Trae 0.120.31 burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
  *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
- *  bracketed paste" note was true only for a much earlier build). */
+ *  bracketed paste" note was true only for a much earlier build).
+ *  Hermes: its prompt_toolkit composer's 50ms anti-paste guard (issue #10994)
+ *  eats the trailing Enter of the old send-keys burst on cold start, so the
+ *  opening prompt strands until a manual Enter; a single bracketed-paste
+ *  event keeps embedded newlines inert and submits reliably. */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
   ['codex', createCodexAdapter('/bin/codex')],
   ['kimi', createKimiAdapter('/bin/kimi')],
   ['pi', createPiAdapter('/bin/pi')],
+  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
@@ -328,9 +346,10 @@ describe('writeInput: single-line, non-tmux mode', () => {
 
 // =========================================================================
 // 2. Multiline content
-//    - Claude Code / CoCo / Codex: bracketed paste (pasteText) with the whole
-//      string — the embedded \n stay content, only the trailing Enter submits.
-//    - PLAIN adapters (Aiden/Gemini/MTR/Hermes): sendText with the
+//    - CLAUDE_CODE / CoCo / Codex / Kimi / Pi / Hermes: bracketed paste
+//      (pasteText) with the whole string — the embedded \n stay content, only
+//      the trailing Enter submits.
+//    - PLAIN adapters (Aiden/Gemini/MTR): sendText with the
 //      whole string (including \n) — those CLIs treat literal LF as a newline,
 //      not a submit, so only the trailing Enter submits.
 //    - OpenCode: pasteText for multiline/large prompts so its TUI receives
@@ -672,6 +691,12 @@ describe('supportsTypeAhead flag', () => {
 
   it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
+  });
+
+  it('hermes: supportsTypeAhead undefined even though writeInput uses pasteText', () => {
+    // Hermes moved to PASTE_BUFFER_ADAPTERS (write mechanics) without opting
+    // into type-ahead: the adapter still relies on deferFirstPromptTimeoutUntilReady.
+    expect(createHermesAdapter('/bin/hermes').supportsTypeAhead).toBeUndefined();
   });
 });
 
@@ -1276,6 +1301,305 @@ describe('claude-code writeInput submission confirmation', () => {
     );
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
   });
+
+  it('extractMessageContentForFingerprint strips envelopes and metadata to isolate user payload', () => {
+    const prompt = `<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>
+
+<user_message>
+[用户引用了消息 用 botmux quoted om_123456 查看]
+[来自 协作Bot 的 @mention]
+19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。
+</user_message>`;
+
+    const payload = extractMessageContentForFingerprint(prompt);
+    expect(payload).toBe('19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。');
+
+    const fp = makeSubmitFingerprint(prompt, 30);
+    expect(fp).toBe('19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。'.substring(0, 30));
+    expect(fp).not.toContain('botmux_reminder');
+  });
+
+  it('extractMessageContentForFingerprint strips English metadata headers and hook mode context blocks', () => {
+    // English metadata headers
+    const enPrompt = `<user_message>
+[@mention from ReviewerBot]
+[User quoted a message — run \`botmux quoted om_123456\` to view it]
+Please review this implementation.
+</user_message>`;
+    expect(extractMessageContentForFingerprint(enPrompt)).toBe('Please review this implementation.');
+
+    // Hook mode context blocks (no <user_message> wrapper)
+    const hookPrompt = `<role context="group" chat_id="oc_123">Software Engineer</role>
+
+<summary_memory>
+Read summary.md first.
+</summary_memory>
+
+<whiteboard id="wb_123" hint="whiteboard">
+Active whiteboard content
+</whiteboard>
+
+<chat_context_policy>Group chat context policy</chat_context_policy>
+
+<chat_context source="lark" trust="untrusted">
+  <name>Project Group</name>
+</chat_context>
+
+Fix the test suite failure on CI
+
+<sender type="user" id="ou_123" />
+<attachments hint="attachments">test.log</attachments>`;
+
+    const hookPayload = extractMessageContentForFingerprint(hookPrompt);
+    expect(hookPayload).toBe('Fix the test suite failure on CI');
+    expect(hookPayload).not.toContain('summary_memory');
+    expect(hookPayload).not.toContain('chat_context');
+    expect(hookPayload).not.toContain('whiteboard');
+    expect(hookPayload).not.toContain('attachments');
+
+    // ReDoS safety on unclosed <user_message>
+    const unclosed = '<user_message>'.repeat(3000) + 'safe content';
+    const t0 = Date.now();
+    const res = extractMessageContentForFingerprint(unclosed);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(100);
+    expect(res).toContain('safe content');
+  });
+
+  it('stripBotmuxEnvelopeBlocks stays linear and preserves later blocks on malformed tag soup', () => {
+    // An unclosed recognized open tag must NOT make the scanner give up: later,
+    // independent well-formed blocks are still stripped (a naive "break on
+    // missing close tag" would wrongly keep the attachments block).
+    const unclosedThenBlock =
+      '<summary_memory>unclosed head <attachments hint="x">attached</attachments>\nReal user prompt';
+    expect(extractMessageContentForFingerprint(unclosedThenBlock)).toBe(
+      '<summary_memory>unclosed head \nReal user prompt',
+    );
+
+    // Repeated recognized open tags without close tags: dead-tag short-circuit
+    // keeps the scan linear (old scanner did an indexOf-to-tail per occurrence,
+    // ~3s at 80k repeats). Payload after the soup is preserved.
+    const openTagSoup = '<summary_memory>x'.repeat(80000) + '\nReal user prompt';
+    let t0 = Date.now();
+    const soupRes = extractMessageContentForFingerprint(openTagSoup);
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(soupRes).toContain('Real user prompt');
+
+    // A long run of bare '<' followed by a single delimiter: '<' terminates the
+    // tag-name scan so each '<' costs O(1) (old scanner: ~18s at 120k '<').
+    const angleRun = '<'.repeat(120000) + ' > payload';
+    t0 = Date.now();
+    extractMessageContentForFingerprint(angleRun);
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('extractMessageContentForFingerprint fingerprint begins at user payload over well-formed hook blocks', () => {
+    // Realistic opening/follow-up hook-mode PTY shape: attributed/self-closing
+    // pre-user blocks, mixed with an unclosed-tag-in-payload edge, then payload.
+    const ptyText = `<role context="group">Engineer</role>
+
+<summary_memory>
+Read summary.md first.
+</summary_memory>
+
+<chat_context_policy>policy text</chat_context_policy>
+
+<chat_context source="lark" trust="untrusted" fetch_status="ok">
+  <name>Review group</name>
+</chat_context>
+
+Fix the failing test now
+<sender type="user" open_id="ou_x" />`;
+    expect(extractMessageContentForFingerprint(ptyText)).toBe('Fix the failing test now');
+  });
+
+  it('makeSubmitFingerprint generates distinct fingerprints for prompts with identical botmux_reminder envelopes', () => {
+    const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
+    const promptA = `${reminder}\n\n<user_message>First user instruction for session A</user_message>`;
+    const promptB = `${reminder}\n\n<user_message>Second user instruction for session B</user_message>`;
+
+    const fpA = makeSubmitFingerprint(promptA);
+    const fpB = makeSubmitFingerprint(promptB);
+
+    expect(fpA).not.toBe(fpB);
+    expect(fpA).toContain('First user instruction');
+    expect(fpB).toContain('Second user instruction');
+  });
+
+  it('makeSubmitFingerprint sanitizes invisible characters and CRLF to match normalized jsonl content', () => {
+    const raw = '<user_message>clean\u200B line one\r\nsecond\uFEFF line</user_message>';
+    const fp = makeSubmitFingerprint(raw, 30);
+    expect(fp).toBeDefined();
+    expect(fp).not.toContain('\u200B');
+    expect(fp).not.toContain('\uFEFF');
+    expect(fp).not.toContain('\r');
+    expect(fp).toContain('clean line one');
+  });
+
+  it('writeInput sanitizes CRLF and invisible characters before typing into tmux pane', async () => {
+    const cwd = '/tmp/sanitized-input';
+    const sessionId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const path = makeJsonlForSession('sanitized-input', sessionId, cwd);
+    writeClaudePidFile(44444, { sessionId, cwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const sentChunks: string[] = [];
+    const pty: PtyHandle = {
+      claudeJsonlPath: path,
+      cliPid: 44444,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn((chunk: string) => {
+        sentChunks.push(chunk);
+      }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'Enter') {
+          appendFileSync(
+            path,
+            JSON.stringify({ type: 'user', message: { role: 'user', content: 'clean line 1\nclean line 2' } }) + '\n',
+          );
+        }
+      }),
+    };
+
+    // Prompt contains Windows CRLF (\r\n) and invisible zero-width space (\u200B) and BOM (\uFEFF)
+    const rawContent = 'clean\u200B line 1\r\nclean\uFEFF line 2';
+    const result = await adapter.writeInput(pty, rawContent);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: sessionId });
+    // Verify no \r was sent via sendText
+    for (const chunk of sentChunks) {
+      expect(chunk).not.toContain('\r');
+      expect(chunk).not.toContain('\u200B');
+      expect(chunk).not.toContain('\uFEFF');
+    }
+  });
+
+  it('writeInput confirms submit via fingerprint when prompt contains zero-width characters in first 30 chars', async () => {
+    const { oldPath, newPath } = makeClaudeJsonlPaths('sanitized-fp-rotation');
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+
+    // Raw prompt has zero-width space inside the first 30 chars of payload
+    const rawPrompt = '<user_message>clean\u200B prefix payload line</user_message>';
+    const sanitizedPrompt = sanitizeClaudeInput(rawPrompt);
+
+    let wroteNewTranscript = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: 98765, // No pid file -> falls back to fingerprint search
+      cliCwd: '/tmp/sanitized-fp-cwd',
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteNewTranscript) return;
+        wroteNewTranscript = true;
+        // Claude writes sanitized content into newPath
+        writeFileSync(
+          newPath,
+          JSON.stringify({
+            type: 'user',
+            timestamp: new Date().toISOString(),
+            message: { role: 'user', content: sanitizedPrompt },
+          }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, rawPrompt);
+    expect(result).toBeUndefined();
+    // Successfully confirmed via fingerprint and repointed claudeJsonlPath to newPath
+    expect(pty.claudeJsonlPath).toBe(newPath);
+  });
+
+  it('writeInput fallback fingerprint search does not match sibling session for short inputs (< 10 chars)', async () => {
+    const cwd = '/tmp/sibling-short-nomatch';
+    const sidA = '11111111-aaaa-4aaa-8aaa-111111111111';
+    const sidB = '22222222-bbbb-4bbb-8bbb-222222222222';
+    const pathA = makeJsonlForSession('sibling-short-nomatch', sidA, cwd);
+    const pathB = makeJsonlForSession('sibling-short-nomatch', sidB, cwd);
+
+    const shortPrompt = '<user_message>ok</user_message>';
+
+    // Sibling session B recently logged "ok"
+    writeFileSync(
+      pathB,
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content: 'ok' },
+      }) + '\n',
+    );
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: pathA,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(), // Simulate swallowed Enter -> no write to pathA
+    };
+
+    const result = await adapter.writeInput(pty, shortPrompt);
+
+    // Because fingerprint is shorter than CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN (10),
+    // it must NOT hijack sibling session B's pathB!
+    expect(result).toMatchObject({ submitted: false });
+    expect(pty.claudeJsonlPath).toBe(pathA);
+  });
+
+  it('writeInput does not false-match sibling session JSONL sharing the same botmux_reminder envelope', async () => {
+    const cwd = '/tmp/sibling-jsonl-nomatch';
+    const sidA = 'aaaaaaaa-1111-4111-8111-111111111111';
+    const sidB = 'bbbbbbbb-2222-4222-8222-222222222222';
+    const pathA = makeJsonlForSession('sibling-jsonl-nomatch', sidA, cwd);
+    const pathB = makeJsonlForSession('sibling-jsonl-nomatch', sidB, cwd);
+
+    const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
+    const promptA = `${reminder}\n\n<user_message>Session A specific prompt text</user_message>`;
+    const promptB = `${reminder}\n\n<user_message>Session B specific prompt text</user_message>`;
+
+    // Sibling session B recently logged its own turn with the same reminder envelope
+    writeFileSync(
+      pathB,
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content: promptB },
+      }) + '\n',
+    );
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let enterCount = 0;
+    const pty: PtyHandle = {
+      claudeJsonlPath: pathA,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        enterCount++;
+        // Enter 1 & 2 are soft-newlines during typing (promptA has 2 newlines).
+        // Enter 3 is the initial submit Enter (simulates review barrier / swallowed Enter -> no write to pathA).
+        // Enter 4 is retry submit Enter -> Claude logs the submit to pathA.
+        if (enterCount >= 4) {
+          appendFileSync(
+            pathA,
+            JSON.stringify({
+              type: 'user',
+              timestamp: new Date().toISOString(),
+              message: { role: 'user', content: promptA },
+            }) + '\n',
+          );
+        }
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, promptA);
+
+    // It should NOT match pathB on the first submit Enter.
+    // It must retry Enter and succeed on pathA on the second submit Enter.
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(pathA);
+    expect(enterCount).toBe(4);
+  });
 });
 
 describe('genius writeInput submission confirmation', () => {
@@ -1343,24 +1667,128 @@ describe('genius writeInput submission confirmation', () => {
 });
 
 describe('codex writeInput submission confirmation', () => {
+  it('uses live footer identity for consecutive messages without adding any status command', async () => {
+    resetCodexHistory();
+    let sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const other = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const sendText = vi.fn();
+    const keys: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), sendText,
+      captureCurrentScreen: vi.fn(() => ''),
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      pasteText(text) { pasted = text; },
+      sendSpecialKeys(key) { keys.push(key); appendCodexHistory(pasted, sid); },
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    sid = other;
+    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other, ownershipProven: true });
+    expect(keys).toEqual(['Enter', 'Enter']);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pty.captureCurrentScreen).not.toHaveBeenCalled();
+  });
+
+  it('confirms daemon-backed tmux input against its live footer, rejecting another pane with identical text', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const calls: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write() { throw new Error('Unexpected raw write'); },
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      sendText(text) { calls.push(text); },
+      sendSpecialKeys(key) {
+        calls.push(key);
+        appendCodexHistory(pasted, foreign);
+        appendCodexHistory(pasted, sid);
+      },
+      pasteText(text) { pasted = text; calls.push('paste:' + text); },
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    // The live footer identity is positive ownership evidence.
+    expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    expect(calls).toEqual(['paste:hi', 'Enter']);
+    expect(codexTerminalSessionIsBound(pty, sid)).toBe(true);
+    expect(codexTerminalSessionIsBound(pty, foreign)).toBe(false);
+  });
+
+  it('submits without a footer ID and confirms the owned history', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    const owned = new Set<string>();
+    const ownership = vi.spyOn(codexTranscript, 'findCodexRolloutSetByPid').mockReturnValue(owned);
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write: vi.fn(), pasteText: vi.fn(), sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => {
+        owned.add(sid);
+        appendCodexHistory('hi', foreign);
+        appendCodexHistory('hi', sid);
+      }),
+      captureInputState: vi.fn(() => ({
+        viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+        cursor: { x: 2, y: 1 },
+      })),
+    };
+    try {
+      const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+      expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+      expect(pty.captureInputState).toHaveBeenCalledTimes(1);
+      expect(pty.write).not.toHaveBeenCalled();
+      expect(pty.pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    } finally {
+      ownership.mockRestore();
+    }
+  });
+
+  it('writes without a terminal snapshot and confirms history without ownership proof', async () => {
+    resetCodexHistory();
+    const pasteText = vi.fn();
+    const sendText = vi.fn();
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), pasteText, sendText,
+      sendSpecialKeys: vi.fn(() => appendCodexHistory('hi', 'foreign-session')),
+      captureCurrentScreen: () => '', captureInputState: () => null,
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    expect(result).toEqual({ submitted: true });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+  });
+
   it('buildArgs resumes with the persisted Codex thread id', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1370,20 +1798,21 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
       workingDir: '/repo/root',
     })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1395,16 +1824,16 @@ describe('codex writeInput submission confirmation', () => {
     appendCodexHistory('<session_id>botmux-session</session_id>', 'new-codex-session');
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       'new-codex-session',
     ]);
   });
@@ -1417,16 +1846,16 @@ describe('codex writeInput submission confirmation', () => {
       resetCodexHistory();
       appendCodexHistory('<session_id>custom-botmux-session</session_id>', 'custom-codex-session');
       const adapter = createCodexAdapter('/bin/codex');
-      expect(adapter.buildArgs({ sessionId: 'custom-botmux-session', resume: true })).toEqual([
-        'resume',
-        '--dangerously-bypass-approvals-and-sandbox',
-        '--no-alt-screen',
+      expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'custom-botmux-session', resume: true })).toEqual([
         '-c',
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         '-c',
         'check_for_update_on_startup=false',
         '-c',
         'notice.hide_rate_limit_model_nudge=true',
+        'resume',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--no-alt-screen',
         'custom-codex-session',
       ]);
 
@@ -1445,7 +1874,7 @@ describe('codex writeInput submission confirmation', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
       '-c',
@@ -1462,6 +1891,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       workingDir: '/repo/root',
@@ -1474,6 +1904,8 @@ describe('codex writeInput submission confirmation', () => {
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);

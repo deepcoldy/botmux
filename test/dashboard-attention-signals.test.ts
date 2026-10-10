@@ -435,7 +435,8 @@ describe('attention signals', () => {
       'handleV3SavedWorkflowCommandIfAny',
       'parseWorkflowGrillTrigger',
       'isLegacyTemplateCommand',
-      'parseSlashCommandInvocation',
+      // 斜杠命令的分类+执行段已搬到 executeThreadSlash（PR-4 ①），入口里剩下这一处调用点
+      'await executeThreadSlash(',
       'findPendingAskByAnchor',
     ]) {
       const markerIdx = region.indexOf(marker);

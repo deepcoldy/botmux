@@ -80,6 +80,8 @@ Botmux 不调用工作区删除程序。外部生命周期系统通过显式配�
 
 ## 结果与资源证据
 
+发现只读取权威 SQLite 会话库。存在尚未迁移的 `sessions-<appId>.json`、无法证明归属覆盖的共享 `sessions.json` 或损坏的 SQLite 行时，返回覆盖不完整并拒绝准备回收；不会读取旧 JSON 作为会话现状，也不会代为迁移。已有对应 SQLite 库的每 Bot 冻结 JSON 快照不参与发现。
+
 返回 JSON 中保留 exact `sessionId`、`larkAppId`、`chatId`、`rootMessageId`、scope、工作目录原值与规范化路径、身份指纹，以及 `session.workingDir` 关联依据。目录包含关系使用路径段边界，`/work/a-other` 不属于 `/work/a`。存活祖先目录的符号链接会被规范化；悬空或被改变的别名不能被猜测为原工作区。
 
 证据位于 `<dataDir>/workspace-recycle/<operationId>/`：`operation.json` 为协调记录，按 Bot/session 键散列命名的 JSON 为各 daemon 的持久关闭记录。写入使用锁、临时文件、原子 rename 与 fsync；日志不包含 prompt、原始 transcript、附件或凭据。标准关闭继续保留历史会话记录，并沿用原有临时资源清理行为。

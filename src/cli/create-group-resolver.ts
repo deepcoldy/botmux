@@ -13,6 +13,8 @@
  * keeping first occurrence. Unresolvable ref → reported in `invalid` list.
  */
 
+import type { ChatMode } from '../services/groups-store.js';
+
 export interface BotConfigForResolve {
   larkAppId: string;
   cliId: string;
@@ -84,6 +86,24 @@ export function shouldWriteCreateGroupCompletionStatus(
   explicitJsonStatus: boolean,
 ): boolean {
   return explicitJsonStatus;
+}
+
+export type ResolvedChatMode =
+  | { ok: true; chatMode?: ChatMode }
+  | { ok: false; error: string };
+
+/**
+ * Parse the optional `--chat-mode` flag for `botmux create-group`.
+ *
+ * Absent/empty → `{ ok: true }` with no `chatMode`, so the request omits
+ * `chat_mode` and keeps Feishu's default (普通群). Only the two creation-time
+ * topologies are accepted; `p2p` is a direct message, not a creatable group.
+ */
+export function resolveChatMode(raw: string | undefined): ResolvedChatMode {
+  const value = raw?.trim().toLowerCase();
+  if (!value) return { ok: true };
+  if (value === 'group' || value === 'topic') return { ok: true, chatMode: value };
+  return { ok: false, error: `--chat-mode 只支持 group 或 topic，收到: "${raw}"。` };
 }
 
 export function resolveBotRefs(

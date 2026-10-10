@@ -45,8 +45,8 @@ describe('worker-budget CLI', () => {
     expect(status.status).toBe(0);
     expect(status.stdout).toContain('memory admission: disabled (config)');
     expect(status.stdout).toContain('effective total memory:');
-    expect(status.stdout).toMatch(/available memory: .*\((host|cgroup-v2|unavailable)\)/);
-    expect(status.stdout).toMatch(/memory full PSI avg10: .*\((host|cgroup-v2|unavailable)\)/);
+    expect(status.stdout).toMatch(/available memory: .*\((host|cgroup-v2|cgroup-v1|unavailable)\)/);
+    expect(status.stdout).toMatch(/memory full PSI avg10: .*\((host|cgroup-v2|cgroup-v1|unavailable)\)/);
     expect(status.stdout).toContain('admission: disabled');
 
     const unset = runCli(['worker-budget', 'unset']);

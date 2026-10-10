@@ -163,6 +163,7 @@ describe('grant-prefs store', () => {
       restrictGrantCommands: false,
       autoGrantRequestCards: true,
       p2pOpen: false,
+      grantRequestToOwnerDm: false,
       messageQuotaDefaultLimit: null,
       grantDefaultDurationMs: null,
     });
@@ -217,6 +218,55 @@ describe('grant-prefs store', () => {
     expect(disk.restrictGrantCommands).toBe(true);
     expect(disk.p2pOpen).toBe(true);
     expect(registry.getBot('app_default').config.p2pOpen).toBe(true);
+  });
+
+  it('defaults grantRequestToOwnerDm to false when unset', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').grantRequestToOwnerDm).toBe(false);
+  });
+
+  it('persists grantRequestToOwnerDm=true and syncs in-memory config', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotGrantPrefs('app_default', { grantRequestToOwnerDm: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.grantRequestToOwnerDm).toBe(true);
+
+    expect(readConfig().grantRequestToOwnerDm).toBe(true);
+    // 申请卡路由逐条读内存 config：不同步这里，开关要等 daemon 重启才生效。
+    expect(registry.getBot('app_default').config.grantRequestToOwnerDm).toBe(true);
+  });
+
+  it('removes the grantRequestToOwnerDm key when toggled off (keeps bots.json tidy)', async () => {
+    writeConfig({ grantRequestToOwnerDm: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotGrantPrefs('app_default').grantRequestToOwnerDm).toBe(true);
+
+    const r = await store.updateBotGrantPrefs('app_default', { grantRequestToOwnerDm: false });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.grantRequestToOwnerDm).toBe(false);
+
+    expect(readConfig().grantRequestToOwnerDm).toBeUndefined();
+    expect(registry.getBot('app_default').config.grantRequestToOwnerDm).toBeUndefined();
+  });
+
+  it('partial patch preserves an explicit grantRequestToOwnerDm=true', async () => {
+    writeConfig({ grantRequestToOwnerDm: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    await store.updateBotGrantPrefs('app_default', { autoGrantRequestCards: false });
+
+    const disk = readConfig();
+    expect(disk.autoGrantRequestCards).toBe(false);
+    expect(disk.grantRequestToOwnerDm).toBe(true);
+    expect(registry.getBot('app_default').config.grantRequestToOwnerDm).toBe(true);
   });
 
   it('null defaultLimit deletes messageQuota but preserves quotaState counters', async () => {

@@ -32,4 +32,18 @@ export interface HookAskAdapter {
 
   /** hook 接管失败时的"放行/无操作" directive（让 CLI 回退原生终端提问）。 */
   passthrough(payload: unknown): string;
+
+  /**
+   * 可选：CLI 即将弹出终端权限确认框（Claude `PermissionRequest`，含 bypass 模式下
+   * 仍会触发的「Dangerous rm」这类内置安全检查）时，把它转成一问两选（允许/拒绝）。
+   * 非权限确认事件返回 null。未实现 = 该 CLI 不桥接权限确认。
+   */
+  parsePermissionRequest?(payload: unknown): ParsedAsk | null;
+
+  /** 可选：把权限裁决写回 CLI 期望的 directive；deny 时 message 会回给模型。 */
+  formatPermissionDecision?(allow: boolean, message?: string): string;
 }
+
+/** 权限确认问题里两个选项的稳定 key（hook 客户端据此判定裁决）。 */
+export const PERMISSION_ALLOW_KEY = 'allow';
+export const PERMISSION_DENY_KEY = 'deny';

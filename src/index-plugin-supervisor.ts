@@ -77,7 +77,8 @@ async function main(): Promise<void> {
       statePath: pluginSupervisorStatePath(), distDir: '', cwd: botmuxHome(),
       daemonEnv: { ...process.env }, logDir: join(pluginSupervisorDir(), 'logs'),
     });
-    supervisor.start([]);
+    // The lifetime owner lock above already excludes a second live owner.
+    if (!supervisor.start([])) throw new Error('plugin_supervisor_state_owned_by_live_supervisor');
     let shuttingDown = false;
     const requestShutdown = () => { shuttingDown = true; };
     process.on('SIGTERM', requestShutdown);

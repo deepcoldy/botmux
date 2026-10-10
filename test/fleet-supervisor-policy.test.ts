@@ -3,6 +3,7 @@ import {
   FLEET_GRACEFUL_EXIT_CODE,
   isGracefulExit,
   decideOnExit,
+  decideCrashExit,
   assertProjectionIdentity,
   planStart,
   freshProc,
@@ -79,6 +80,25 @@ describe('fleet-supervisor-policy — decideOnExit (invariants 1 + 2)', () => {
     }
     expect(restarts).toBe(p.maxRestarts); // 10 successful restarts
     expect(parked).toBe(true);            // then parked
+  });
+});
+
+describe('fleet-supervisor-policy — decideCrashExit (post-intent-guards path)', () => {
+  it('restarts even on code 90 — the sentinel must NOT self-heal-skip here', () => {
+    // This is the decision the live supervisor uses AFTER its own stopping /
+    // explicitStop guards failed to match. A 90 at that point is unsolicited
+    // (an external pkill/kill -TERM), so it restarts instead of retiring.
+    expect(decideCrashExit(proc({ restarts: 0 })))
+      .toEqual({ action: 'restart', nextRestarts: 1 });
+  });
+  it('can never return stop (no graceful outcome exists on this path)', () => {
+    for (let restarts = 0; restarts <= 12; restarts++) {
+      expect(decideCrashExit(proc({ restarts })).action).not.toBe('stop');
+    }
+  });
+  it('parks once the cap is exceeded, identical to decideOnExit for a crash', () => {
+    expect(decideCrashExit(proc({ restarts: 10 })))
+      .toEqual({ action: 'park', reason: 'max_restarts', atRestarts: 10 });
   });
 });
 

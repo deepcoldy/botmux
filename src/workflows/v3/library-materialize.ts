@@ -39,7 +39,8 @@ import { isValidRunId } from './ops-projection.js';
 import {
   computeSavedWorkflowGateDigest,
   computeSavedWorkflowSideEffects,
-  assertNoSavedWorkflowChatSideEffects,
+  collectSavedWorkflowChatSideEffectProblems,
+  formatSavedWorkflowChatSideEffectProblems,
   validateDagTemplate,
   validateSpecTemplate,
   type LoadedSavedWorkflowRevision,
@@ -98,7 +99,7 @@ export interface CompileSavedWorkflowFromRunOptions {
   inputs?: Record<string, SavedWorkflowParamDef>;
   contextRefs?: SavedWorkflowBuiltinContextRef[];
   specStatus?: 'current' | 'stale';
-  /** Explicit user confirmation after reviewing free-text secret/path lint. */
+  /** Explicit user confirmation after reviewing free-text lint warnings. */
   acknowledgeUnsafeLiterals?: boolean;
 }
 
@@ -192,16 +193,14 @@ export function buildSavedWorkflowRevisionBaseline(
   }
   const normalizedNodes = canonicalizeNodeBots(cloneNodes(loaded.dag.nodes), snapshots);
   const dagTemplate = validateDagTemplate({ schemaVersion: 2, nodes: normalizedNodes });
-  // Authoring boundary: a freshly compiled definition must be free of
-  // chat-facing side effects in goal nodes. This does NOT run on the read path
-  // (loadSavedWorkflowRevision), so existing revisions stay loadable.
-  assertNoSavedWorkflowChatSideEffects(dagTemplate);
   const { runId: _runId, ...specWithoutRunId } = loaded.spec;
   const specTemplate = validateSpecTemplate(specWithoutRunId);
   const inputs = opts.inputs ?? {};
   const contextRefs = opts.contextRefs ?? collectSavedWorkflowTemplateBindings(dagTemplate).context;
   assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs);
-  const lintWarnings: string[] = [];
+  const lintWarnings = formatSavedWorkflowChatSideEffectProblems(
+    collectSavedWorkflowChatSideEffectProblems(dagTemplate),
+  );
   collectSavedWorkflowReusableTextWarnings(dagTemplate, 'dagTemplate', lintWarnings);
   collectSavedWorkflowReusableTextWarnings(specTemplate, 'specTemplate', lintWarnings);
   const revision: SavedWorkflowRevisionDraft = {

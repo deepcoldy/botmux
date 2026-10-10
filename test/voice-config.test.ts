@@ -24,8 +24,31 @@ describe('evaluateVoiceConfig — button gating', () => {
     expect(ok?.engine).toBe('openai');
   });
 
-  it('infers engine from creds when engine omitted', () => {
-    const v = evaluateVoiceConfig({ sami: { accessKey: 'a', secretKey: 'b', appkey: 'c' } }, undefined);
+  it('MiniMax needs an API key and accepts the built-in endpoint and model defaults', () => {
+    expect(evaluateVoiceConfig({ engine: 'minimax', minimax: {} }, undefined)).toBeNull();
+    const ok = evaluateVoiceConfig({ engine: 'minimax', minimax: { apiKey: 'key', region: 'cn' } }, undefined);
+    expect(ok).toMatchObject({ engine: 'minimax', minimax: { apiKey: 'key', region: 'cn' } });
+  });
+
+  it('infers engine from creds when engine omitted (sami / openai / minimax)', () => {
+    expect(evaluateVoiceConfig({ sami: { accessKey: 'a', secretKey: 'b', appkey: 'c' } }, undefined)?.engine).toBe('sami');
+    expect(evaluateVoiceConfig({ openai: { baseUrl: 'http://x/v1', model: 'tts-1' } }, undefined)?.engine).toBe('openai');
+    expect(evaluateVoiceConfig({ minimax: { apiKey: 'k' } }, undefined)?.engine).toBe('minimax');
+  });
+
+  it('does not infer an engine from empty / partial credential blocks', () => {
+    expect(evaluateVoiceConfig({}, undefined)).toBeNull();
+    expect(evaluateVoiceConfig({ minimax: {} }, undefined)).toBeNull();
+    expect(evaluateVoiceConfig({ openai: { apiKey: 'k' } }, undefined)).toBeNull();
+    expect(evaluateVoiceConfig({ sami: { accessKey: 'a' } }, undefined)).toBeNull();
+  });
+
+  it('inference precedence is sami → openai → minimax', () => {
+    const v = evaluateVoiceConfig({
+      sami: { accessKey: 'a', secretKey: 'b', appkey: 'c' },
+      openai: { baseUrl: 'http://x/v1', model: 'm' },
+      minimax: { apiKey: 'k' },
+    }, undefined);
     expect(v?.engine).toBe('sami');
   });
 

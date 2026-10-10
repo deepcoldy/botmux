@@ -12,7 +12,10 @@
  *
  * What this module authenticates:
  *   1. The turn id is a well-formed scheduled turn.
- *   2. The task still exists, is enabled, and carries a creator (ownerOpenId).
+ *   2. The task still exists and carries a creator (ownerOpenId). An enabled
+ *      task is accepted directly. A one-shot that the scheduler auto-disabled
+ *      after dispatch is accepted only while the daemon independently proves
+ *      this exact turn is still live. Manual/legacy disables stay denied.
  *   3. The session presenting the turn is bound to the task's target
  *      (larkAppId/chatId) — the task cannot authorize a workflow command in a
  *      session belonging to another chat/bot.
@@ -31,12 +34,17 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { effectiveScheduleChatIds } from '../services/schedule-store.js';
 import type { ScheduledTask, TrustedCaller } from '../types.js';
 
-/** Scheduled turn ids: `schedule:<8-hex-taskId>:<uuid>`. Task ids are minted
- *  by schedule-store as `randomUUID().substring(0, 8)`; the strict shape keeps
- *  a crafted marker turnId from smuggling through the exemption. */
-const SCHEDULED_TURN_RE = /^schedule:([0-9a-f]{8}):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Scheduled turn ids: `schedule:<taskId>:<uuid>`. Task ids come from two
+ *  producers (see schedule-store.createTask): legacy `randomUUID().substring(0,
+ *  8)` hex ids and workflow idempotency keys `wf_<47hex>` / `wf3_<46hex>`
+ *  (total width 50). The strict [0-9a-z_]{1,50} shape keeps a crafted marker
+ *  turnId from smuggling through the exemption; parsing alone never authorizes
+ *  — the task is still looked up by id in the presenting bot's own
+ *  schedules.json, so a forged id simply misses. */
+const SCHEDULED_TURN_RE = /^schedule:([0-9a-z_]{1,50}):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Returns the task id embedded in a scheduled turn id, or null for any other
  *  turn id shape. */
@@ -140,6 +148,8 @@ export function authorizeScheduledTurn(input: {
   sessionLarkAppId: string;
   sessionChatId: string;
   isOwnerAllowed: (larkAppId: string, ownerOpenId: string) => boolean;
+  /** Daemon-owned exact-turn liveness. Omit on paths that cannot prove it. */
+  isScheduledTurnLive?: (turnId: string) => boolean;
 }): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
   const taskId = parseScheduledTurnId(input.turnId);
   if (!taskId) return { error: 'task_not_found' };
@@ -147,7 +157,12 @@ export function authorizeScheduledTurn(input: {
 
   const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
-  if (task.enabled === false) return { error: 'task_disabled' };
+  if (task.enabled === false) {
+    const autoCompletedStillLive = task.parsed?.kind === 'once'
+      && task.disabledReason === 'once_completed'
+      && input.isScheduledTurnLive?.(input.turnId) === true;
+    if (!autoCompletedStillLive) return { error: 'task_disabled' };
+  }
 
   const ownerOpenId = typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '';
   if (!ownerOpenId) return { error: 'task_owner_missing' };
@@ -158,7 +173,18 @@ export function authorizeScheduledTurn(input: {
   if (task.larkAppId && task.larkAppId !== input.sessionLarkAppId) {
     return { error: 'binding_mismatch' };
   }
-  if (task.chatId !== input.sessionChatId) {
+  // Multi-chat tasks may legitimately fire into any of their target chats, so
+  // bind against the full effective list (single-chat legacy rows collapse to
+  // their one chatId). The provenance reader does not migrate rows, so a
+  // hand-corrupted chatIds shape must fail closed as a binding mismatch rather
+  // than throw out of the error-code contract.
+  let boundChatIds: string[];
+  try {
+    boundChatIds = effectiveScheduleChatIds(task);
+  } catch {
+    return { error: 'binding_mismatch' };
+  }
+  if (!boundChatIds.includes(input.sessionChatId)) {
     return { error: 'binding_mismatch' };
   }
 

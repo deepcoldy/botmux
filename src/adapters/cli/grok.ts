@@ -1,8 +1,9 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import {
@@ -162,6 +163,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       larkAppId,
       noTransport,
       triggerUserAuth,
+      promptInjection,
     }) {
       const args: string[] = [];
       if (!disableCliBypass) {
@@ -209,7 +211,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       // Claude: --append-system-prompt. Grok: --rules (append; docs alias).
       // Do NOT use --system-prompt-override — that replaces Grok's agent prompt.
-      args.push(
+      if (promptInjection !== 'none') args.push(
         '--rules',
         buildBotmuxSystemPromptText({
           locale,
@@ -232,6 +234,9 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // Tighter than TMUX_INITIAL_PROMPT_ARG_BUDGET: `--rules` is already in this
+    // command. See GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET.
+    maxInitialPromptArgBytes: GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
     buildResumeCommand({ sessionId, cliSessionId }) {
       const sid = cliSessionId || sessionId;
@@ -383,10 +388,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       format: 'grok-hooks',
       sessionStartCommand: sessionReadyHookCommand(),
     },
-    modelChoices: [
-      'grok-4.6',
-      'grok-4.5',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['grok'],
   };
 }
 

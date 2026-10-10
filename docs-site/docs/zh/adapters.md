@@ -40,6 +40,14 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 
 > `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
 
+## Pi 执行过程气泡
+
+使用 `cliId: "pi"` 的机器人会将 Pi 已写入会话记录的思考文本、执行说明、工具调用和结果显示在飞书执行过程气泡中。工具节点展示命令或文件路径，结束时随当前回合收尾；最终答复仍通过回复消息发送。
+
+默认开启，沿用 `cotEnabled` 和群内 `/cot on`、`/cot off` 开关；`/cot show` 可在当前回合中显示已累计的过程。
+
+更新以 Pi 完整消息落盘为粒度：工具调用在执行前出现，结果在工具结束后出现；不逐 token 显示尚未落盘的内容。历史记录不会重放到新回合的气泡里。
+
 ## DeepSeek Harness（dsh）
 
 `cliId: "dsh"` 通过内置 runner 驱动本机的 `dsh` CLI（[deepseek-harness](https://github.com/deepseekai/deepseek-harness)），走 `dsh --profile <name>` 的 SDK JSON-RPC 协议。前置条件：

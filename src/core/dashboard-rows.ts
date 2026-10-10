@@ -1,3 +1,4 @@
+import type { WorkspaceMetadata } from './workspace-metadata.js';
 // src/core/dashboard-rows.ts
 //
 // Pure-data row composers shared between the dashboard IPC server (which
@@ -6,7 +7,7 @@
 // module so worker-pool can import the composer without pulling in the IPC
 // server (which itself imports worker-pool — that would be a cycle).
 import type { DaemonSession } from './types.js';
-import type { Session, StreamStatus } from '../types.js';
+import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
@@ -27,6 +28,7 @@ export interface SessionRow extends SessionMessagePreview {
   cliInstanceId?: string;
   cliInstanceSource?: string;
   creationSource?: string;
+  workspace?: WorkspaceMetadata | null;
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -56,6 +58,8 @@ export interface SessionRow extends SessionMessagePreview {
    *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
+  /** Explicit whiteboard binding; absent when the session is unbound. */
+  whiteboardId?: Session['whiteboardId'];
   headless?: Session['headless'];
   title?: string;
   titleUpdatedAt?: string;
@@ -128,6 +132,29 @@ export interface SessionRow extends SessionMessagePreview {
   repoName?: string;
   /** Current branch of workingDir; absent for detached HEAD / non-repo. */
   gitBranch?: string;
+  /** Per-turn reply anchors — `botmux send` prefers these over the topic root. */
+  replyTargets?: Record<string, ReplyTargetEntry>;
+  currentReplyTarget?: Session['currentReplyTarget'];
+  quoteTargetId?: string;
+  quoteTargetSenderOpenId?: string;
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+}
+
+function composeSendRoutingFields(
+  s: Session,
+  runtimeCurrentReplyTarget?: Session['currentReplyTarget'],
+): Pick<
+  SessionRow,
+  'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'codexAppDispatchLedger'
+> {
+  const currentReplyTarget = runtimeCurrentReplyTarget ?? s.currentReplyTarget;
+  return {
+    ...(s.replyTargets ? { replyTargets: s.replyTargets } : {}),
+    ...(currentReplyTarget ? { currentReplyTarget } : {}),
+    ...(s.quoteTargetId ? { quoteTargetId: s.quoteTargetId } : {}),
+    ...(s.quoteTargetSenderOpenId ? { quoteTargetSenderOpenId: s.quoteTargetSenderOpenId } : {}),
+    ...(s.codexAppDispatchLedger ? { codexAppDispatchLedger: s.codexAppDispatchLedger } : {}),
+  };
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -140,6 +167,16 @@ function sessionThreadLink(
 ): string | undefined {
   if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
   return threadAppLink(session.chatId, session.larkThreadId, brand);
+}
+
+// The native Lark topic id is a durable identity fact for thread-scope sessions.
+// Row producers publish it so downstream normalizers (including botmux observe)
+// can surface `identity.threadId` without re-deriving the validation rule.
+function sessionThreadId(
+  session: Pick<Session, 'scope' | 'larkThreadId'>,
+): string | undefined {
+  if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
+  return session.larkThreadId;
 }
 
 function sessionFeishuChatLink(session: Pick<Session, 'chatId' | 'headless'>, brand: Brand): string {
@@ -247,6 +284,7 @@ function maybeSessionTokenUsage(
 export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
+  const topicId = sessionThreadId(ds.session);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -280,6 +318,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     rootMessageId: ds.session.rootMessageId,
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
+    whiteboardId: ds.session.whiteboardId,
     headless: ds.session.headless,
     title: ds.session.title,
     titleUpdatedAt: ds.session.titleUpdatedAt,
@@ -303,6 +342,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     hasHistory: ds.hasHistory,
     feishuChatLink: sessionFeishuChatLink(ds.session, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     pendingRepo: !!ds.pendingRepo,
     queued: !!ds.session.queued,
     tuiPromptActive: !!ds.tuiPromptCardId,
@@ -314,12 +354,14 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
     ...buildSessionMessagePreview(ds.session),
+    ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
   };
 }
 
 export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
@@ -341,6 +383,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
@@ -355,8 +398,10 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
     feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
   };
 }
 
@@ -371,6 +416,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
 export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
@@ -391,6 +437,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
@@ -404,10 +451,12 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     webPort: null,
     feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
     tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
   };
 }

@@ -22,6 +22,8 @@ import {
 } from '../../services/grant-policy.js';
 import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
+import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -29,6 +31,128 @@ export const CONFIG_UNSET = '__unset__';
 /** 流式卡片上下文占用百分比变色/高亮的缺省阈值（dashboard.contextCompactThreshold
  *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
 export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
+
+export type TurnTerminalReceiptKind = 'completed' | 'silent';
+
+/** Independent, low-visual-weight terminal marker used when auto mode cannot
+ * patch the last visible carrier (for example a file, voice, or custom card).
+ * It is deliberately headerless and action-free: the answer/progress messages
+ * keep their own presentation while this final strip only answers whether the
+ * agent is still working or has returned control to the user. */
+export function buildTurnTerminalReceiptCard(
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
+    body: {
+      direction: 'vertical',
+      padding: '8px 12px 8px 12px',
+      elements: [{
+        tag: 'markdown',
+        text_size: 'notation_small_v2',
+        content: `<font color='grey'>${t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)}</font>`,
+      }],
+    },
+  });
+}
+
+const TURN_TERMINAL_RECEIPT_ELEMENT_ID = 'botmux_turn_terminal_receipt';
+
+function findCardElementById(value: unknown, elementId: string): any | undefined {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = findCardElementById(child, elementId);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+  const element = value as Record<string, unknown>;
+  if (element.element_id === elementId) return element;
+  for (const key of ['elements', 'columns', 'actions', 'extra'] as const) {
+    const found = findCardElementById(element[key], elementId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function withoutKnownTurnTerminalReceipt(content: string): string {
+  const known = [
+    t('worker.turn_terminal_receipt.completed', undefined, 'zh'),
+    t('worker.turn_terminal_receipt.silent', undefined, 'zh'),
+    t('worker.turn_terminal_receipt.completed', undefined, 'en'),
+    t('worker.turn_terminal_receipt.silent', undefined, 'en'),
+  ];
+  let result = content;
+  for (const label of known) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    result = result.replace(new RegExp(`\\s*·\\s*(?:<font color=['\"]grey['\"]>)?${escaped}(?:<\\/font>)?\\s*$`), '');
+  }
+  return result.trimEnd();
+}
+
+function appendTurnTerminalReceiptToFooter(content: string, label: string): string {
+  const outerGrey = /^(<font color=['"]grey['"]>)([\s\S]*)(<\/font>)$/.exec(content);
+  if (outerGrey) {
+    const base = withoutKnownTurnTerminalReceipt(outerGrey[2]);
+    return `${outerGrey[1]}${base} · ${label}${outerGrey[3]}`;
+  }
+  const base = withoutKnownTurnTerminalReceipt(content);
+  return `${base} · <font color='grey'>${label}</font>`;
+}
+
+/** Merge the daemon-owned terminal state into an existing standard BotMux
+ * reply card. Prefer the canonical footer so the card keeps one bottom divider
+ * and one compact metadata/status line. Cards without a footer receive only a
+ * small trailing line, without another divider. The source card is read back
+ * from Lark immediately before this patch, so late feedback/control mutations
+ * are preserved. Undefined means the message is no longer a patchable Card 2.0
+ * payload and the caller must use the independent-strip fallback instead. */
+export function appendTurnTerminalReceiptToCard(
+  cardJson: string,
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): string | undefined {
+  let card: any;
+  try {
+    card = JSON.parse(cardJson);
+  } catch {
+    return undefined;
+  }
+  if (!card || card.schema !== '2.0' || !card.body || !Array.isArray(card.body.elements)) {
+    return undefined;
+  }
+  const label = t(`worker.turn_terminal_receipt.${kind}`, undefined, locale);
+  const terminalElement = {
+    tag: 'markdown',
+    element_id: TURN_TERMINAL_RECEIPT_ELEMENT_ID,
+    text_size: 'notation_small_v2',
+    content: `<font color='grey'>${label}</font>`,
+  };
+
+  // Migrate cards patched by the first implementation: remove its standalone
+  // terminal line and the immediately preceding divider before folding the
+  // same state into the canonical footer.
+  const existing = card.body.elements.findIndex(
+    (element: any) => element?.element_id === TURN_TERMINAL_RECEIPT_ELEMENT_ID,
+  );
+  if (existing >= 0) {
+    card.body.elements.splice(existing, 1);
+    if (existing > 0 && card.body.elements[existing - 1]?.tag === 'hr') {
+      card.body.elements.splice(existing - 1, 1);
+    }
+  }
+
+  const footer = findCardElementById(card.body.elements, REPLY_CARD_FOOTER_ELEMENT_ID);
+  if (footer && typeof footer.content === 'string' && footer.content.trim()) {
+    footer.content = appendTurnTerminalReceiptToFooter(footer.content, label);
+  } else {
+    card.body.elements.push(terminalElement);
+  }
+  return JSON.stringify(card);
+}
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
  *  校验 finite 且 1..100，否则回退默认 80（与 readDashboard 的 lenient 读法一致）。 */
@@ -42,7 +166,7 @@ export function contextCompactThreshold(): number {
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
   { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -292,6 +416,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
+  'mimocode': 'MiMoCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -311,6 +436,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
   'minimax': 'MiniMax',
+  'remote-runner': 'Remote Runner',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -602,15 +728,7 @@ export function buildForkPanelCard(
       elements: [{
         tag: 'table',
         page_size: 10,
-        row_height: 'low',
-        header_style: {
-          text_align: 'left',
-          text_size: 'normal',
-          background_style: 'grey',
-          text_color: 'default',
-          bold: true,
-          lines: 1,
-        },
+        ...TABLE_AUTO_ROW_STYLE,
         columns: [
           { name: 'instruction', display_name: t('card.fork_panel.col_instruction', undefined, locale), data_type: 'text', width: 'auto' },
           { name: 'status', display_name: t('card.fork_panel.col_status', undefined, locale), data_type: 'text', width: '90px' },
@@ -696,15 +814,7 @@ export function buildSlashListCard(
     elements.push({
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left',
-        text_size: 'normal',
-        background_style: 'grey',
-        text_color: 'default',
-        bold: true,
-        lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'cmd', display_name: t('slashlist.col_cmd', undefined, locale), data_type: 'lark_md', width: '200px' },
         { name: 'desc', display_name: t('slashlist.col_desc', undefined, locale), data_type: 'text', width: 'auto' },
@@ -851,16 +961,46 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
  *  card limit, leaving room for JSON escaping + the card's structural overhead. */
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
+/** idle 状态下卡头的替代标签：
+ *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
+ *  - 'completed'：transcript 模式下最终回复卡已投递成功。
+ *  只对 idle 生效，其它状态一律忽略。 */
+export type IdleCardLabel = 'silent' | 'completed' | 'failed';
+
+/** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
+function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
+  if (v === true) return 'silent';
+  if (v === 'silent' || v === 'completed' || v === 'failed') return v;
+  return undefined;
+}
+
+/** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
+ *  `silentIdle: true` 时按 'silent' 处理。结构化参数，避免 card-builder 反向依赖 core。 */
+export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: boolean }): IdleCardLabel | undefined {
+  return fc.idleLabel ?? (fc.silentIdle ? 'silent' : undefined);
+}
+
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | IdleCardLabel): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // idleLabel 'silent': the turn completed as DELIBERATE silence (bare
     // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
     // from a hung session; say "handled, judged no reply needed" instead.
-    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
+    // 'completed': transcript 模式下最终回复卡已投递，卡头改「已完成」。
+    case 'idle': {
+      const label = normalizeIdleLabel(idleLabel);
+      return t(
+        label === 'failed' ? 'card.status.idle_failed'
+          : label === 'completed' ? 'card.status.idle_completed'
+          : label === 'silent' ? 'card.status.idle_silent'
+            : 'card.status.idle',
+        undefined,
+        locale,
+      );
+    }
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
@@ -942,6 +1082,8 @@ function pushStreamBody(
  * Quick-action buttons (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½屏 ↑/↓) appear
  * whenever displayMode !== 'hidden'.
  */
+export const STREAMING_CARD_PATCH_VERSION = '1';
+
 export function buildStreamingCard(
   sessionId: string,
   rootId: string,
@@ -962,7 +1104,8 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
-  silentIdle?: boolean,
+  /** idle 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link IdleCardLabel}。 */
+  silentIdle?: boolean | IdleCardLabel,
   /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
    *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
    *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
@@ -975,7 +1118,13 @@ export function buildStreamingCard(
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
-  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
+  const actionBase = {
+    root_id: rootId,
+    session_id: sessionId,
+    cli_id: effectiveCliId,
+    stream_card_version: STREAMING_CARD_PATCH_VERSION,
+    ...(cardNonce ? { card_nonce: cardNonce } : {}),
+  };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
 
   const elements: any[] = [];
@@ -1109,6 +1258,24 @@ export function buildStreamingCard(
     });
   }
   if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
+  const effortControl = !adoptMode && usage?.reasoningControl;
+  if (effortControl && effortControl.choices.length > 0) {
+    // Display executor truth; keep CAS bound to the saved session setting.
+    const displayedEffort = effortControl.choices.find(effort => effort === usage?.reasoningEffort) ?? effortControl.selected;
+    elements.push({ tag: 'action', actions: [{
+      tag: 'select_static',
+      placeholder: { tag: 'plain_text', content: t('card.effort.select', undefined, locale) },
+      ...(displayedEffort ? { initial_option: displayedEffort } : {}),
+      options: effortControl.choices.map(effort => ({
+        text: { tag: 'plain_text', content: `${t('card.effort.select', undefined, locale)}: ${t(`card.effort.${effort}`, undefined, locale)}` },
+        value: effort,
+      })),
+      value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
+    }] });
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: t(
+      effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale,
+    ) + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '') }] });
+  }
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
@@ -1186,7 +1353,10 @@ export function buildStreamingCard(
   }
 
   const card = {
-    config: { wide_screen_mode: true },
+    // Lark's ordinary message PATCH endpoint only updates cards whose original
+    // and replacement payloads both opt into shared updates. Streaming cards
+    // are group-visible mutable UI, so this is part of their wire contract.
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
       template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
@@ -1641,13 +1811,24 @@ export interface GrantCardOpts {
   /** 当前卡片暂存的限制；缺省使用产品默认值。 */
   durationMs?: number;
   quota?: number;
+  /** 申请卡转投管理员私聊时的来源：'dm_p2p' = 申请人在私聊里申请；'dm_group' = 群里没有管理员。
+   *  缺省 = 卡片就在原会话里（原行为）。 */
+  delivery?: GrantCardDelivery;
+  /** delivery='dm_group' 时展示的来源群名（查不到时由调用方传占位）。 */
+  chatName?: string;
 }
+
+export type GrantCardDelivery = 'dm_p2p' | 'dm_group';
 
 /** 授权卡片：有效期与消息额度并列展示，owner 一次提交两项限制。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
-  const body = o.mode === 'request'
+  const body = o.mode === 'request' && o.delivery === 'dm_p2p'
+    ? t('card.grant.body_request_p2p', { name: escapeMd(single?.name ?? '') }, locale)
+    : o.mode === 'request' && o.delivery === 'dm_group'
+    ? t('card.grant.body_request_remote', { name: escapeMd(single?.name ?? ''), chat: escapeMd(o.chatName ?? '') }, locale)
+    : o.mode === 'request'
     ? t('card.grant.body_request', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale)
     : o.targets.length > 1
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
@@ -1663,6 +1844,9 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     chat_id: o.chatId,
     nonce: o.nonce,
     mode: o.mode,
+    // 私聊转投的卡：处置时据此选终态文案，并回告原会话里的申请人（申请人看不到这张卡）。
+    ...(o.delivery ? { delivery: o.delivery } : {}),
+    ...(o.delivery === 'dm_group' && o.chatName ? { chat_name: o.chatName } : {}),
   };
   const button = (action: string, text: string, type: string): Record<string, unknown> => ({
     tag: 'button',
@@ -1675,8 +1859,11 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     action_type: 'form_submit',
     value: { action, ...v },
   });
+  const chatBtnKey = o.delivery === 'dm_p2p'
+    ? 'card.grant.btn_chat_p2p'
+    : o.delivery === 'dm_group' ? 'card.grant.btn_chat_remote' : 'card.grant.btn_chat';
   const grantButtons: Array<Record<string, unknown>> = [
-    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary'),
+    button('grant_chat', t(chatBtnKey, undefined, locale), 'primary'),
   ];
   if (o.mode === 'owner') {
     grantButtons.push(button('grant_global', t('card.grant.btn_global', undefined, locale), 'default'));
@@ -1810,10 +1997,42 @@ export function buildGrantNotifyCard(
   return JSON.stringify(card);
 }
 
-/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。 */
-export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale): string {
+/** 申请卡转投管理员私聊后，给原会话里申请人的处置结果回告（申请人看不到那张卡）。
+ *  p2p 不 @（会话里只有 ta）；群里 @ 申请人。授权成功带额度/有效期后缀，拒绝不带。 */
+export function buildGrantRequesterNoticeCard(
+  outcome: 'chat' | 'global' | 'deny',
+  delivery: GrantCardDelivery,
+  targets: GrantTargetEntry[],
+  locale?: Locale,
+  quota?: number,
+  expiresAt?: number,
+): string {
+  let content: string;
+  if (delivery === 'dm_p2p') {
+    content = t(outcome === 'deny' ? 'card.grant.requester_denied_p2p' : 'card.grant.requester_granted_p2p', undefined, locale);
+  } else {
+    const at = renderGrantAtMentions(targets);
+    content = outcome === 'deny'
+      ? t('card.grant.requester_denied_chat', { at }, locale)
+      : t(outcome === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+  }
+  if (outcome !== 'deny') {
+    if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+    if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  }
+  const card = {
+    config: { wide_screen_mode: true },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
+  };
+  return JSON.stringify(card);
+}
+
+/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。
+ *  `autoReapply`：开了 grantRequestToOwnerDm 时，下一条消息会自动再弹申请卡（私聊也会），
+ *  不必让被授权人去「联系 owner 重新 /grant」（私聊陌生人既不知道 owner 是谁也不会用 /grant）。 */
+export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale, autoReapply = false): string {
   const at = `<at id=${targetOpenId}></at>`;
-  const content = t('quota.exhausted_notify', { at, limit }, locale);
+  const content = t(autoReapply ? 'quota.exhausted_notify_reapply' : 'quota.exhausted_notify', { at, limit }, locale);
   const card = {
     config: { wide_screen_mode: true },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
@@ -2028,13 +2247,19 @@ export function buildGrantResultCard(
   quota?: number,
   expiresAt?: number,
   targets?: string | string[] | GrantTargetEntry[],
+  origin?: { delivery?: GrantCardDelivery; chatName?: string },
 ): string {
   let content: string;
   const at = targets !== undefined ? renderGrantAtMentions(targets) : '';
   if (kind !== 'deny' && at) {
     // 授权成功且有被授权人：复用 notify 文案（{at} 已获授权，发消息 @ 我即可 + 额度/有效期后缀），
     // 让就地 patch 的原卡直接把授权成功通知 + @ping 合为一张。
-    content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+    // 转投私聊的卡只有管理员看得到，「在本群」说法不成立，改用标明来源的文案。
+    content = kind === 'chat' && origin?.delivery === 'dm_p2p'
+      ? t('card.grant.notify_owner_p2p', { at }, locale)
+      : kind === 'chat' && origin?.delivery === 'dm_group'
+      ? t('card.grant.notify_owner_remote', { at, chat: escapeMd(origin.chatName ?? '') }, locale)
+      : t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
     if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
     if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
   } else {

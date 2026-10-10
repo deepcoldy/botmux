@@ -17,14 +17,18 @@ import {
   beginReplyTargetTurn,
   buildTurnParticipantsFrom,
   collectTurnWindowParticipants,
+  cronPinnedTurnIds,
+  CRON_TASK_ANCHORS_MAX,
   fallbackTurnId,
   frozenReplyContextForTurn,
   isSubstituteTurn,
   pickTurnReplyTarget,
+  reconcileCronTaskReplyAnchors,
   rehomeReplyTargetState,
   resolveInboundReplyTarget,
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
+import { readFileSync } from 'node:fs';
 import type { DaemonSession } from '../src/core/types.js';
 
 const NOW = new Date().toISOString();
@@ -484,6 +488,160 @@ describe('per-turn replyTargets — queued/concurrent turns keep their own ancho
     expect(resolveSessionReplyTarget(ds, 'turn-0')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
     expect(pickTurnReplyTarget(ds.session, 'turn-0')).toBeUndefined();
     expect(pickTurnReplyTarget(ds.session, 'turn-39')?.senderOpenId).toBe('ou_39');
+  });
+
+  // ── Round-4 Must fix: a live cron task's create-turn must not be LRU-evicted ──
+
+  it('pins the cron create-turn: 32+ newer turns still route the fire into topic A', () => {
+    // Reviewer replay, exact boundary: create the task in topic A (turn-cron),
+    // then run 40 newer ordinary turns in the same chat-scope session. Without
+    // the pin, turn-cron is the 41st-oldest and gets evicted; the scheduled
+    // fire resolves to the group top level.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    ds.session.cronTaskReplyAnchors = {
+      jobA: { turnId: 'turn-cron', createdAtMs: t0 },
+    };
+    for (let i = 1; i <= 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString(), { senderOpenId: `ou_${i}` });
+    }
+    const keys = Object.keys(ds.session.replyTargets ?? {});
+    // 32 ordinary slots + 1 pinned extra slot.
+    expect(keys.length).toBe(33);
+    expect(keys).toContain('turn-cron');
+    expect(keys).not.toContain('turn-1'); // oldest unpinned evicted (40 - 32 = 8: turn-1..turn-8)
+    expect(keys).toContain('turn-40');
+    // The fire carries replyTurnId=turn-cron: still a thread reply into A.
+    expect(resolveSessionReplyTarget(ds, 'turn-cron')).toEqual({ mode: 'thread', rootMessageId: 'om_topicA' });
+  });
+
+  it('without the pin the same 32-turn boundary drops the fire to the group top level', () => {
+    // Control: proves the regression the pin fixes. No cronTaskReplyAnchors →
+    // identical map, identical boundary, turn-cron is evicted and routes plain.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    for (let i = 1; i <= 32; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    const keys = Object.keys(ds.session.replyTargets ?? {});
+    expect(keys.length).toBe(32);
+    expect(keys).not.toContain('turn-cron');
+    expect(resolveSessionReplyTarget(ds, 'turn-cron')).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('deleting the task from the anchor snapshot un-pins its turn on the next prune', () => {
+    // Worker is the authority: when the task expires/delete-syncs away, the
+    // extra slot becomes evictable again instead of leaking forever.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    ds.session.cronTaskReplyAnchors = { jobA: { turnId: 'turn-cron', createdAtMs: t0 } };
+    for (let i = 1; i <= 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    expect(Object.keys(ds.session.replyTargets ?? {})).toContain('turn-cron');
+    // Worker snapshot no longer contains jobA (full-snapshot replace).
+    ds.session.cronTaskReplyAnchors = reconcileCronTaskReplyAnchors(undefined, []).anchors;
+    beginReplyTargetTurn(ds, 'om_41', 'turn-41', new Date(t0 + 41_000).toISOString());
+    expect(Object.keys(ds.session.replyTargets ?? {})).not.toContain('turn-cron');
+  });
+
+  it('pinned eviction leaves the prune watermark driven only by actually evicted unpinned turns', () => {
+    // The --mention-back ambiguity gate reads replyTargetsPrunedThrough: pins
+    // must not suppress the watermark update for the unpinned records that DO
+    // get evicted alongside the pinned extra slot.
+    const ds = makeDs() as DaemonSession;
+    const t0 = Date.parse(NOW);
+    beginReplyTargetTurn(ds, 'om_topicA', 'turn-cron', new Date(t0).toISOString());
+    ds.session.cronTaskReplyAnchors = { jobA: { turnId: 'turn-cron', createdAtMs: t0 } };
+    for (let i = 1; i <= 40; i++) {
+      beginReplyTargetTurn(ds, `om_${i}`, `turn-${i}`, new Date(t0 + i * 1000).toISOString());
+    }
+    // 8 unpinned evicted: turn-1..turn-8 → watermark at turn-8 (same math as
+    // the unpinned case, the pinned record simply is not a candidate).
+    expect(ds.session.replyTargetsPrunedThrough).toBe(new Date(t0 + 8 * 1000).toISOString());
+  });
+});
+
+describe('cron task reply anchors (daemon-side mirror)', () => {
+  it('cronPinnedTurnIds collects distinct non-null turn ids', () => {
+    expect(cronPinnedTurnIds(undefined).size).toBe(0);
+    const pinned = cronPinnedTurnIds({
+      a: { turnId: 'om_A', createdAtMs: 1 },
+      b: { turnId: 'om_A', createdAtMs: 1 }, // duplicate, deduped
+      c: { turnId: null, createdAtMs: 1 },   // local-created task pins nothing
+    });
+    expect([...pinned]).toEqual(['om_A']);
+  });
+
+  it('full-snapshot replace drops absent tasks and nulls are preserved', () => {
+    const first = reconcileCronTaskReplyAnchors(undefined, [
+      { taskId: 'jobA', turnId: 'om_A' },
+      { taskId: 'jobLocal', turnId: null },
+    ], 1000);
+    expect(Object.keys(first.anchors).sort()).toEqual(['jobA', 'jobLocal']);
+    // Next snapshot: jobA survives, jobLocal gone, jobB added.
+    const next = reconcileCronTaskReplyAnchors(first.anchors, [
+      { taskId: 'jobA', turnId: 'om_A' },
+      { taskId: 'jobB', turnId: 'om_B' },
+    ], 2000);
+    expect(Object.keys(next.anchors).sort()).toEqual(['jobA', 'jobB']);
+    expect(next.anchors.jobA.createdAtMs).toBe(1000); // known task keeps original stamp
+    expect(next.anchors.jobB.createdAtMs).toBe(2000);
+  });
+
+  it('is bounded to 64 oldest-first and every retained id is pinnable', () => {
+    const incoming = Array.from({ length: CRON_TASK_ANCHORS_MAX + 10 }, (_, i) =>
+      ({ taskId: `job${i}`, turnId: `om_${i}` }));
+    const { anchors, pinned } = reconcileCronTaskReplyAnchors(undefined, incoming, 1000);
+    expect(Object.keys(anchors)).toHaveLength(CRON_TASK_ANCHORS_MAX);
+    expect(anchors.job0).toBeUndefined();          // oldest 10 shed
+    expect(anchors[`job${CRON_TASK_ANCHORS_MAX + 9}`]).toBeDefined();
+    expect(pinned.size).toBe(CRON_TASK_ANCHORS_MAX);
+  });
+
+  it('re-attaches keep FIFO order via preserved createdAtMs even when the snapshot reorders', () => {
+    const first = reconcileCronTaskReplyAnchors(undefined, [
+      { taskId: 'jobA', turnId: 'om_A' },
+      { taskId: 'jobB', turnId: 'om_B' },
+    ], 1000);
+    const shuffled = reconcileCronTaskReplyAnchors(first.anchors, [
+      { taskId: 'jobB', turnId: 'om_B' },
+      { taskId: 'jobA', turnId: 'om_A' },
+    ], 5000);
+    expect(shuffled.anchors.jobA.createdAtMs).toBe(1000);
+    expect(shuffled.anchors.jobB.createdAtMs).toBe(1000);
+  });
+
+  it('worker-pool wires the snapshot IPC into reconcile + persistence (source contract)', () => {
+    // Pins the daemon half of the round-4 wiring: the IPC case must reconcile
+    // the worker snapshot onto the session and persist it, so subsequent
+    // beginReplyTargetTurn prunes see the exemptions.
+    const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
+    const caseStart = source.indexOf("case 'cron_task_anchors_sync'");
+    expect(caseStart).toBeGreaterThan(0);
+    const caseBody = source.slice(caseStart, source.indexOf('case ', caseStart + 10));
+    expect(caseBody).toContain('reconcileCronTaskReplyAnchors');
+    expect(caseBody).toContain('cronTaskReplyAnchors');
+    expect(caseBody).toContain('sessionStore.updateSession(ds.session)');
+    // The union member exists with the full-snapshot shape.
+    const types = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
+    expect(types).toMatch(/cron_task_anchors_sync';\s*anchors:\s*Array<\{\s*taskId:\s*string;\s*turnId:\s*string\s*\|\s*null\s*\}>/);
+    // Session carries the persisted mirror.
+    expect(types).toMatch(/cronTaskReplyAnchors\?:\s*Record<string,\s*\{\s*turnId:\s*string\s*\|\s*null;\s*createdAtMs:\s*number\s*\}>/);
+  });
+
+  it('worker sends the snapshot on ack and after disk restore (source contract)', () => {
+    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    expect(source).toMatch(/function syncCronTaskAnchorsToDaemon\(\): void \{[\s\S]*?send\(\{\s*type: 'cron_task_anchors_sync'/);
+    // The one-shot restore must re-assert pins even when the file is empty.
+    const restoreFn = source.slice(
+      source.indexOf('function restoreScheduledTaskAnchorsOnce('),
+      source.indexOf('function journalBridgeTurnMark('),
+    );
+    expect(restoreFn).toContain('syncCronTaskAnchorsToDaemon()');
   });
 });
 

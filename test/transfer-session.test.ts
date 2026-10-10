@@ -515,6 +515,22 @@ describe('transferSession', () => {
     expect(registry.get(newKey)).toBe(ds);
   });
 
+  it('keeps a validated principal-lane runtime slot while its display target moves', async () => {
+    const runtimeAnchor = 'lane:source:principal-b';
+    const runtimeKey = sessionKey(runtimeAnchor, 'cli_app_test');
+    const ds = makeDs({ runtimeRoutingAnchor: runtimeAnchor });
+    registry.set(runtimeKey, ds);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result.ok).toBe(true);
+    expect(ds.chatId).toBe('oc_target');
+    expect(ds.scope).toBe('chat');
+    expect(registry.get(runtimeKey)).toBe(ds);
+    expect(registry.has(sessionKey('om_source_root', 'cli_app_test'))).toBe(false);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+  });
+
   it('persists session record via sessionStore.updateSession', async () => {
     const ds = makeDs();
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
@@ -1158,7 +1174,17 @@ describe('transferSession', () => {
     expect(ds.session.status).toBe('closed');
     expect(registry.has(sourceKey)).toBe(false);
     expect(replacementFork).not.toHaveBeenCalled();
-    expect(updateMessageMock).not.toHaveBeenCalled();
+    // Explicit close freezes the original card; the cancelled transfer must
+    // neither replace it with a relocated card nor publish to the target chat.
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'cli_app_test',
+      'om_old_card',
+      expect.any(String),
+      { beforeWrite: expect.any(Function) },
+    );
+    const closedCard = JSON.parse(updateMessageMock.mock.calls[0][2]);
+    expect(closedCard.header.title.content).toContain('会话已关闭');
   });
 
   it('keeps a committed transfer successful when replacement fork and replay throw', async () => {
@@ -1193,7 +1219,7 @@ describe('transferSession', () => {
     expect(isSessionTransferring(ds)).toBe(true);
   });
 
-  it('preserves pending raw input through an empty refork requested during transfer', async () => {
+  it('preserves the session owner on pending raw input through a routing transfer', async () => {
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
       getSessionWorkingDir: () => '/tmp/project',
@@ -1209,6 +1235,9 @@ describe('transferSession', () => {
       session: {
         ...makeDs().session,
         streamCardId: undefined,
+        ownerOpenId: 'ou_user',
+        lastCallerOpenId: 'ou_other',
+        creatorOpenId: 'ou_creator',
       },
     });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
@@ -1248,6 +1277,7 @@ describe('transferSession', () => {
     releaseDetach(true);
     await expect(moving).resolves.toEqual({ ok: true });
     expect(replacementFork).toHaveBeenCalledTimes(1);
+    expect(ds.session.ownerOpenId).toBe('ou_user');
 
     __testOnly_setupWorkerHandlers(ds, replacement);
     replacement.emit('message', { type: 'prompt_ready' });
@@ -1257,6 +1287,12 @@ describe('transferSession', () => {
       type: 'raw_input',
       content: '/goal ship it',
       turnId: 'turn-goal',
+      followUpContent: undefined,
+      trustedController: {
+        requestLarkAppId: 'cli_app_test',
+        requestUserOpenId: 'ou_user',
+        senderType: 'user',
+      },
     });
     expect(ds.pendingRawInput).toBeUndefined();
     expect(ds.pendingRawTurnId).toBeUndefined();

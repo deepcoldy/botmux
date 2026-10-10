@@ -3,9 +3,11 @@ import { execSync, execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
-import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv } from '../../setup/ensure-tmux.js';
-import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } from '../../utils/child-env.js';
+import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
+import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneCommand } from './strict-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
@@ -56,6 +58,70 @@ let serverGlobalEnvScrubbed = false;
  */
 export function isTmuxServerLevelErrorText(stderrText: string): boolean {
   return /error connecting to|lost server|server exited unexpectedly/i.test(stderrText);
+}
+
+/**
+ * True when the connection failure is specifically "the socket file does not
+ * exist" (ENOENT on connect). This is still a server-level error (see
+ * {@link isTmuxServerLevelErrorText}) — on its own it cannot tell "no server at
+ * all" from "a live server whose socket was cleaned from /tmp" — but it is the
+ * ONLY shape a cold machine produces: a reboot wipes /tmp (macOS /private/tmp,
+ * Linux tmpfs / boot-time tmpfiles), so before anything has started a server
+ * every probe reads exactly this. A server that merely exited leaves its socket
+ * file behind and reads "no server running" instead.
+ */
+export function isTmuxSocketMissingErrorText(stderrText: string): boolean {
+  return /error connecting to .*\(No such file or directory\)/i.test(stderrText);
+}
+
+/**
+ * Evidence that NO tmux process (server or client) of the current user is
+ * visible. Used ONLY by {@link TmuxBackend.serverAbsentOnColdMachine} to break the
+ * read-isolation cold-start tie; it is a heuristic (a renamed tmux binary or a
+ * server in another PID namespace is invisible to it), so it must never feed
+ * the general probeSession that kill-verify / close / wake paths consume.
+ *
+ * Deliberately coarse and fail-closed:
+ *   - matches ANY tmux process of this uid (any socket, client or server), so a
+ *     live server whose socket was deleted is never missed, whatever its argv
+ *     or proctitle looks like on this platform;
+ *   - returns false (⇒ caller stays 'unknown') whenever `ps` fails, times out,
+ *     prints nothing parseable, or the uid is unavailable.
+ * A concurrent sibling probe's short-lived client can make this false — that
+ * only keeps today's 'unknown', the safe direction.
+ */
+export function noTmuxProcessForCurrentUser(): boolean {
+  // Both real and effective uid: a setuid launcher must not let a server owned
+  // by the other one slip past the comparison.
+  const uids = new Set<number>();
+  if (typeof process.getuid === 'function') uids.add(process.getuid());
+  if (typeof process.geteuid === 'function') uids.add(process.geteuid());
+  if (uids.size === 0) return false;
+  let out: string;
+  try {
+    out = execFileSync('ps', ['-A', '-o', 'uid=,comm='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+    });
+  } catch {
+    return false;
+  }
+  if (typeof out !== 'string') return false;
+  let rows = 0;
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    rows++;
+    if (!uids.has(Number(m[1]))) continue;
+    // Prefix, not equality: on Linux tmux renames its threads via
+    // prctl(PR_SET_NAME) ("tmux: server", "tmux: client"); macOS keeps "tmux"
+    // (or the full path). Over-matching only keeps 'unknown'.
+    if (basename(m[2]!).startsWith('tmux')) return false;
+  }
+  // `ps -A` always lists at least this process itself; zero parseable rows
+  // means the output format is not what we expect — no evidence either way.
+  return rows > 0;
 }
 
 /**
@@ -209,6 +275,36 @@ export class TmuxBackend implements SessionBackend {
     }
   }
 
+  /**
+   * Cold-machine check for the read-isolation pre-spawn gate ONLY (see
+   * resolveReadIsolationPaneProbe). True when the default server's socket file
+   * does not exist ("error connecting to <socket> (No such file or directory)")
+   * AND no tmux process of this user is visible — the state a reboot leaves
+   * (/tmp wiped) before anything has started a server.
+   *
+   * A server that merely exited leaves its socket behind and reads "no server
+   * running" ⇒ probeSession already answers 'missing'. Anything else — a live
+   * reply, timeout, spawn failure, ECONNREFUSED, lost server, any visible tmux
+   * process, a failing `ps` — is false (stay inconclusive).
+   */
+  static serverAbsentOnColdMachine(): boolean {
+    try {
+      execFileSync('tmux', ['list-sessions'], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: tmuxEnv(),
+        timeout: 3000,
+      });
+      return false;
+    } catch (e: any) {
+      if (isExecTimeoutError(e)) return false;
+      if (!e || typeof e.status !== 'number' || e.signal) return false;
+      const stderrText = (e.stderr?.toString?.() ?? '').trim();
+      if (!isTmuxSocketMissingErrorText(stderrText)) return false;
+    }
+    // ps AFTER tmux: a server started in between has a visible process.
+    return noTmuxProcessForCurrentUser();
+  }
+
   /** Kill a named tmux session (no-op if it doesn't exist). */
   static killSession(name: string): void {
     try {
@@ -307,6 +403,7 @@ export class TmuxBackend implements SessionBackend {
     // (once per daemon process; no-op on a server this build booted clean).
     TmuxBackend.scrubServerGlobalEnvOnce();
     this.reattaching = TmuxBackend.hasSession(this.sessionName);
+    if (opts.strictEnv && this.reattaching && !opts.strictEnvReattach) throw new Error('Refusing unverified strict tmux reattach');
     const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
     if (this.reattaching && instanceIdentity) TmuxBackend.assertInstanceIdentity(this.sessionName, instanceIdentity);
     logger.debug(
@@ -319,7 +416,7 @@ export class TmuxBackend implements SessionBackend {
     // session's socket. After the user's terminal tmux dies, every call
     // here would print `error connecting to <stale-socket>` to the PTY and
     // flood the daemon log via the leaked-stderr path.
-    const childEnv = tmuxEnv(opts.env);
+    const childEnv = tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
 
     if (this.reattaching) {
       // Re-attach to surviving tmux session (CLI is still running)
@@ -361,7 +458,7 @@ export class TmuxBackend implements SessionBackend {
       //     session env (visible to the shell), which means the user's rcfile
       //     could `unset` or `export` over it before the CLI sees it. env(1)
       //     injection happens after rcfile load and is authoritative.
-      const shellSpec = resolveUserShell(process.env, opts.launchShell);
+      const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
       const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
       // Debug knob — when on, the wrapper does NOT `exec` the CLI; it runs the
       // CLI as a child and then drops into an interactive `$shell -i` so the
@@ -369,7 +466,7 @@ export class TmuxBackend implements SessionBackend {
       // the CLI with Ctrl-C. Worker will still think the CLI is alive (it
       // can't see the child-vs-exec distinction), so don't send messages
       // through the bot while in this mode — type into the web terminal directly.
-      const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
+      const debugKeepShell = !opts.strictEnv && process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
       // Host-resolve the wrapper bin dir from opts.env (BOTMUX_CORE_ONLY /
       // SESSION_DATA_DIR are scrubbed inside the pane before the script runs, so it
       // MUST be baked in host-side — codex P1). opts.env is the authoritative
@@ -393,11 +490,11 @@ export class TmuxBackend implements SessionBackend {
         '-y', String(opts.rows),
         ...(instanceIdentity ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
         '--',
-        ...shellCommandArgv(shellSpec, script, [
+        ...(opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, script, [
           opts.cwd,
           ...envAssignments,
           bin, ...args,
-        ]),
+        ])),
       ];
       this.process = pty.spawn('tmux', tmuxArgs, {
         name: 'xterm-256color',
@@ -456,6 +553,25 @@ export class TmuxBackend implements SessionBackend {
   sendSpecialKeys(...keys: string[]): void {
     this.exitCopyModeIfNeeded();
     execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, ...keys], {
+      stdio: 'ignore',
+      timeout: 5000,
+      env: tmuxEnv(),
+    });
+  }
+
+  sendLines(lines: string[], softNewlineKey: string): void {
+    if (lines.length === 0) return;
+    this.exitCopyModeIfNeeded();
+    const args: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) args.push(';');
+      args.push('send-keys', '-t', this.cmdTarget, '-l', '--', lines[i]);
+      if (i < lines.length - 1) {
+        args.push(';');
+        args.push('send-keys', '-t', this.cmdTarget, softNewlineKey);
+      }
+    }
+    execFileSync('tmux', args, {
       stdio: 'ignore',
       timeout: 5000,
       env: tmuxEnv(),
@@ -757,6 +873,26 @@ export function buildBotmuxEnvAssignments(
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
     }
+    // Session scratch must be pane-local. In particular, never rely on the
+    // shared tmux server's ambient TMPDIR: one bot can otherwise write into
+    // another session's scratch tree (or back into a tmpfs-backed /tmp).
+    for (const key of SESSION_TEMP_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
+    // Workflow (v3 goal-mode) identity: BOTMUX_WORKFLOW / BOTMUX_GOAL_* etc.
+    // These are NOT in BOTMUX_INJECTED_ENV_KEYS (they belong to the ephemeral
+    // pool, not general sessions), so like proxy/CA they must be forwarded
+    // explicitly here — otherwise a v3 worker on the tmux backend loses its
+    // whole workflow env and the CLI can't see the goal (the PTY backend passed
+    // the full env, so it never hit this). Emitted only when defined, so
+    // non-workflow panes are unaffected.
+    for (const key of WORKFLOW_WORKER_ENV_KEYS) {
+      const val = env[key];
+      if (val === undefined) continue;
+      out.push(`${key}=${val}`);
+    }
   }
   // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
   // bot's provider creds win over any same-named leftover, and emitted ONLY
@@ -943,7 +1079,12 @@ function configureTmuxSessionOptions(sessionName: string): void {
     // tmux window. If a web client at 80x24 causes tmux to resize the window
     // down, reflowed content shifts buffer positions and historical output
     // leaks into the streaming card.
-    execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+    // window-size largest exists since tmux 3.1; skip on known-older builds.
+    // Unknown version: keep trying (best-effort inside the try/catch).
+    const version = getTmuxVersionCached();
+    if (version === null || tmuxVersionAtLeast(version, 3, 1)) {
+      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+    }
   } catch { /* session may not be ready yet — benign */ }
 }
 

@@ -70,6 +70,7 @@ const sendWorkerSessionInputMock = vi.fn();
 const isSessionTransferringMock = vi.fn(() => false);
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  setSessionReasoningEffort: vi.fn(() => 'saved'),
   forkWorker: vi.fn(),
   sendWorkerInput: vi.fn(),
   sendWorkerSessionInput: (...args: any[]) => sendWorkerSessionInputMock(...args),
@@ -92,8 +93,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
   isSessionTransferring: (...args: any[]) => isSessionTransferringMock(...args),
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_map: any, _key: string, action: () => any) => action()),
-  buildStreamingCardJson: vi.fn(),
+  buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
   silentIdleCardFlag: vi.fn(() => false),
+  idleCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
 
@@ -219,6 +221,38 @@ beforeEach(() => {
 // ─── stop_turn ────────────────────────────────────────────────────────────
 
 describe('stop_turn card action', () => {
+  it('stops the verified reply-card turn without replacing its answer with a terminal card', async () => {
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const replyCards = await import('../src/core/turn-reply-card.js');
+    const ds = makeDs({ replyCardRunningTurnId: 'om_running' });
+    const read = vi.spyOn(TurnReplyCardStore.prototype, 'read').mockReturnValue({
+      messageId: 'om_clicked', phase: 'working', finalDelivered: false,
+    } as any);
+    const update = vi.spyOn(replyCards, 'updateTurnReplyCard').mockResolvedValue(undefined);
+    try {
+      const data = actionData('stop_turn');
+      data.action.value.reply_card_turn_id = 'om_running';
+      const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+      expect(sendWorkerSessionInputMock).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+      expect(result.card).toBeUndefined();
+      expect(update).toHaveBeenCalled();
+    } finally { read.mockRestore(); update.mockRestore(); }
+  });
+
+  it('rejects a stale reply-card Stop button while a later turn is running', async () => {
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const ds = makeDs({ replyCardRunningTurnId: 'om_new_turn' });
+    const read = vi.spyOn(TurnReplyCardStore.prototype, 'read').mockReturnValue({
+      messageId: 'om_clicked', phase: 'working', finalDelivered: false,
+    } as any);
+    try {
+      const data = actionData('stop_turn');
+      data.action.value.reply_card_turn_id = 'om_old_turn';
+      const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+      expect(result.toast.type).toBe('warning');
+      expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+    } finally { read.mockRestore(); }
+  });
   it('sends term_action ctrlc to the worker and re-renders the card as interrupted', async () => {
     const ds = makeDs();
     const result = await handleCardAction(actionData('stop_turn'), depsWith(ds), LARK_APP_ID);
@@ -378,5 +412,39 @@ describe('stop_turn / compact_session permission gate (source lock)', () => {
     expect(line).toBeTruthy();
     expect(line!).toContain('stop_turn');
     expect(line!).toContain('compact_session');
+  });
+});
+
+
+describe('reasoning selector card callback', () => {
+  function setup() {
+    const ds = makeDs({ streamCardId: 'om_clicked', streamCardNonce: 'nonce', sessionOverrides: { reasoningEffort: 'ultra' } });
+    const data = actionData('set_reasoning_effort');
+    Object.assign(data.action.value, { card_nonce: 'nonce', expected_effort: 'ultra' });
+    data.action.option = 'high';
+    return { ds, data };
+  }
+
+  it('dispatches a verified current-card selection and returns updated card data', async () => {
+    const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
+    vi.mocked(setSessionReasoningEffort).mockClear();
+    const { ds, data } = setup();
+    const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(result).toMatchObject({ toast: { type: 'success' }, card: { type: 'raw' } });
+    expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['nonce', 'session', 'message', 'selection', 'operator'])('rejects stale or unauthorized %s without mutation', async field => {
+    const { setSessionReasoningEffort } = await import('../src/core/worker-pool.js');
+    vi.mocked(setSessionReasoningEffort).mockClear();
+    const { ds, data } = setup();
+    if (field === 'nonce') data.action.value.card_nonce = 'old';
+    if (field === 'session') data.action.value.session_id = 'other';
+    if (field === 'message') data.context.open_message_id = 'old';
+    if (field === 'selection') data.action.value.expected_effort = 'low';
+    if (field === 'operator') vi.mocked(canOperate).mockReturnValue(false);
+    await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(setSessionReasoningEffort).not.toHaveBeenCalled();
   });
 });

@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -58,6 +59,103 @@ function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-0
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'codex-transcript-'));
   path = join(dir, 'rollout.jsonl');
+});
+
+describe('Codex environment updates in adopted turns', () => {
+  const nativeTurnId = 'native-active-turn';
+  const environment = '<environment_context>\n  <current_date>2026-10-06</current_date>\n  <timezone>Asia/Singapore</timezone>\n</environment_context>';
+  const metadata = (kinds: readonly string[]) => ({
+    turn_id: nativeTurnId,
+    content_item_kinds: kinds,
+  });
+
+  it.each([
+    ['structured', metadata(['environments.environment_context'])],
+    ['legacy', undefined],
+  ])('keeps the original thinking timeline and final reply for a %s environment update', (_name, contextMetadata) => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    const thinkingTurns: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('lark-turn', 'Keep working', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    q.setCotObserver((_entries, turn) => thinkingTurns.push(turn.turnId));
+    const prompt = userResponseItem('Keep working');
+    const context = userResponseItem(environment, '2026-04-29T07:00:02.000Z');
+    writeFileSync(path, [
+      { timestamp: '2026-04-29T07:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: nativeTurnId } },
+      { ...prompt, payload: { ...prompt.payload, internal_chat_message_metadata_passthrough: metadata(['user.text']) } },
+    ].map(ev).join(''));
+    const initial = drainCodexRollout(path, 0);
+    q.ingest(initial.events);
+    appendFileSync(path, [
+      { ...context, payload: { ...context.payload, ...(contextMetadata ? { internal_chat_message_metadata_passthrough: contextMetadata } : {}) } },
+      { timestamp: '2026-04-29T07:00:03.000Z', type: 'response_item', payload: { type: 'function_call', name: 'read_file', call_id: 'read-1', arguments: '{}' } },
+    ].map(ev).join(''));
+    const update = drainCodexRollout(path, initial.newOffset, initial.state);
+    q.ingest(update.events);
+    expect(retired).toEqual([]);
+    expect(thinkingTurns).toEqual(['lark-turn']);
+    expect(q.peek()).toMatchObject([{ turnId: 'lark-turn', sourceTurnId: nativeTurnId }]);
+    expect(q.hasBlockingTurn()).toBe(true);
+    expect(q.drainEmittable()).toEqual([]);
+
+    appendFileSync(path, ev({ timestamp: '2026-04-29T07:00:04.000Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: nativeTurnId, last_agent_message: 'Finished' } }));
+    q.ingest(drainCodexRollout(path, update.newOffset, update.state).events);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'lark-turn', finalText: 'Finished' }]);
+    expect(q.hasBlockingTurn()).toBe(false);
+  });
+
+  it.each([
+    ['typed environment example', environment, metadata(['user.text'])],
+    ['mixed user and environment content', environment, metadata(['environments.environment_context', 'user.text'])],
+    ['unknown content kind', environment, metadata(['future.content'])],
+    ['empty content kinds', environment, metadata([])],
+    ['malformed content kinds', environment, { content_item_kinds: 'environments.environment_context' }],
+    ['legacy local input', 'Keep working on the next part', undefined],
+    ['legacy incomplete wrapper', '<environment_context>', undefined],
+    ['legacy quoted block with a request', `${environment}\nExplain this configuration`, undefined],
+    ['legacy request between blocks', `${environment}\nExplain this\n${environment}`, undefined],
+  ])('preserves real input and steer behavior for %s', (_name, text, contextMetadata) => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('lark-turn', 'Keep working', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    const successor = userResponseItem(text, '2026-04-29T07:00:02.000Z');
+    writeFileSync(path, [userResponseItem('Keep working'),
+      { ...successor, payload: { ...successor.payload, ...(contextMetadata ? { internal_chat_message_metadata_passthrough: contextMetadata } : {}) } },
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(retired).toEqual(['lark-turn']);
+    expect(q.peek()).toMatchObject([{ isLocal: true, userText: text }]);
+  });
+
+  it('attributes a real same-native-turn Lark steer after an environment update', () => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('first', 'First request', now);
+    q.mark('second', 'Additional request', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    const rows = [
+      ['First request', ['user.text']],
+      [environment, ['environments.environment_context']],
+      ['Additional request', ['user.text']],
+    ] as const;
+    writeFileSync(path, rows.map(([text, kinds]) => {
+      const item = userResponseItem(text);
+      return ev({ ...item, payload: { ...item.payload, internal_chat_message_metadata_passthrough: metadata(kinds) } });
+    }).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(retired).toEqual(['first']);
+    expect(q.peek()).toMatchObject([{ turnId: 'second' }]);
+    expect(q.peek()[0].isLocal).not.toBe(true);
+  });
 });
 
 afterEach(() => {
@@ -273,6 +371,14 @@ describe('extractLastCodexTurn', () => {
 });
 
 describe('codexTaskFailureCode (shared Codex-family failure classifier)', () => {
+  it('keeps the exact output-limit discriminator separate from the shared classifier', () => {
+    const exact = 'model output limit exceeded: max_output_tokens';
+    expect(isExactCodexOutputLimitError(exact)).toBe(true);
+    expect(isExactCodexOutputLimitError({ message: `  ${exact.toUpperCase()}  ` })).toBe(true);
+    expect(isExactCodexOutputLimitError(`${exact}: extra`)).toBe(false);
+    expect(codexTaskFailureCode(exact)).toBe(CODEX_TASK_FAILED_ERROR_CODE);
+  });
+
   it('classifies model gateway / upstream failures as codex_upstream_error', () => {
     // Live incident shape: the model gateway cancelled the stream mid-turn.
     expect(codexTaskFailureCode(
@@ -323,6 +429,426 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('hello there');
     expect(r.events[1].kind).toBe('assistant_final');
     expect(r.events[1].text).toBe('hi back');
+  });
+
+  it('surfaces task_started before a delayed user record', () => {
+    writeFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'native-turn-1' },
+      })
+      + ev(userResponseItem('delayed prompt', '2026-04-29T07:01:40.000Z'))
+      + ev(assistantFinalResponseItem('done', '2026-04-29T07:02:00.000Z')));
+
+    expect(drainCodexRollout(path, 0).events).toEqual([
+      expect.objectContaining({ kind: 'turn_started', sourceTurnId: 'native-turn-1' }),
+      expect.objectContaining({ kind: 'user', text: 'delayed prompt' }),
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: 'done',
+        sourceTurnId: 'turn-2026-04-29T07:02:00.000Z',
+      }),
+    ]);
+  });
+
+  it('renders native CommandExecution and hides its outer JavaScript exec wrapper', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect the readme'))
+      + ev({
+        timestamp: '2026-04-29T07:00:00.100Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-1',
+          input: 'await tools.exec_command({ cmd: "sed -n 1,20p README.md" })',
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.150Z',
+        type: 'event_msg',
+        payload: { type: 'item_completed', item: { type: 'Reasoning', id: 'reasoning-1' } },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.160Z',
+        type: 'event_msg',
+        payload: { type: 'item_completed', item: { type: 'AgentMessage', id: 'message-1' } },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.200Z',
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'native-1',
+            command: ['/bin/bash', '-lc', "sed -n '1,20p' README.md"],
+            parsed_cmd: [{ type: 'read', cmd: "sed -n '1,20p' README.md" }],
+            formatted_output: '# BotMux\nNative output',
+          },
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.300Z',
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-1', output: '{"output":"wrapper output"}' },
+      })
+      + ev(assistantFinalResponseItem('done')));
+
+    const result = drainCodexRollout(path, 0);
+    const cot = result.events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries).toEqual([
+      {
+        kind: 'tool_call', id: 'native-1', name: 'shell',
+        args: JSON.stringify({ command: ['/bin/bash', '-lc', "sed -n '1,20p' README.md"] }),
+        subject: "sed -n '1,20p' README.md",
+      },
+      { kind: 'tool_result', id: 'native-1', result: '# BotMux\nNative output' },
+    ]);
+  });
+
+  it('suppresses exec outputs across incremental drains and polling wrappers', () => {
+    writeFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-run',
+          input: 'await tools.exec_command({ cmd: "code --list-extensions --show-versions 2>/dev/null | rg -i \'openai|codex|chatgpt|continue|cline\' | head -35" })',
+        },
+      }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events).toEqual([]);
+
+    appendFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.150Z', type: 'event_msg',
+        payload: { type: 'ignored', blob: 'x'.repeat(70 * 1024) },
+      })
+      +
+      ev({
+        timestamp: '2026-04-29T07:00:00.200Z', type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-run', output: 'control output' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.300Z', type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-poll',
+          input: 'await tools.exec_command({ cmd: "code --list-extensions --show-versions 2>/dev/null | rg -i \'openai|codex|chatgpt|continue|cline\' | head -35" })',
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.400Z', type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-poll', output: 'poll output' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.500Z', type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'native-2',
+            command: ['bash', '-lc', "code --list-extensions --show-versions 2>/dev/null | rg -i 'openai|codex|chatgpt|continue|cline' | head -35"],
+            parsed_cmd: [{ type: 'unknown', cmd: "code --list-extensions --show-versions 2>/dev/null | rg -i 'openai|codex|chatgpt|continue|cline' | head -35" }],
+            stdout: 'passed', stderr: '',
+          },
+        },
+      }));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.events).toHaveLength(1);
+    expect(second.events[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'native-2', name: 'shell', subject: "code --list-extensions --show-versions 2>/dev/null | rg -i 'openai|codex|chatgpt|continue|cline' | head -35" },
+      { kind: 'tool_result', id: 'native-2', result: 'passed' },
+    ]);
+  });
+
+  it('preserves non-exec custom tools', () => {
+    writeFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'patch-1', input: '*** Begin Patch' },
+      }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events.filter(event => event.kind === 'cot')).toHaveLength(1);
+
+    appendFileSync(path, ev({
+        timestamp: '2026-04-29T07:00:00.200Z', type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'patch-1', output: 'Done' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.300Z', type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'stale-exec',
+          input: 'await tools.exec_command({ cmd: "echo stale" })',
+        },
+      })
+      + ev(assistantFinalResponseItem('complete')));
+    const completed = drainCodexRollout(path, first.newOffset);
+    expect(completed.events.filter(event => event.kind === 'cot')).toHaveLength(1);
+    expect(completed.events.find(event => event.kind === 'cot')?.cotEntries).toEqual([
+      { kind: 'tool_result', id: 'patch-1', result: 'Done' },
+    ]);
+  });
+
+  it('restores an exec wrapper at turn completion when no native command arrives', () => {
+    writeFileSync(path, ev(userResponseItem('run a custom tool')) + ev({
+      type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'fallback-1',
+        input: 'await tools.exec_command({ cmd: "echo fallback" })',
+      },
+    }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+    appendFileSync(path, ev({
+      type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'fallback-1', output: '{"output":"ok"}'
+      },
+    }) + ev({ type: 'event_msg', payload: { type: 'ignored', blob: 'x'.repeat(70 * 1024) } }));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.events).toEqual([]);
+    appendFileSync(path, ev(assistantFinalResponseItem('done')));
+    const third = drainCodexRollout(path, second.newOffset);
+    expect(third.events.map(event => event.kind)).toEqual(['cot', 'assistant_final']);
+    expect(third.events[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'fallback-1', name: 'exec' },
+      { kind: 'tool_result', id: 'fallback-1', result: 'ok' },
+    ]);
+  });
+
+  it('closes an empty native command result and ignores wrappers from prior turns', () => {
+    writeFileSync(path,
+      ev(userResponseItem('first'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'old',
+        input: 'await tools.exec_command({ cmd: "echo old" })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'old', output: 'old output'
+      } })
+      + ev(assistantFinalResponseItem('first done'))
+      + ev(userResponseItem('second'))
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-empty', command: ['true'], formatted_output: ''
+      } } })
+      + ev(assistantFinalResponseItem('second done')));
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(2);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'old' });
+    expect(cot[1].cotEntries).toEqual([
+      { kind: 'tool_call', id: 'native-empty', name: 'shell', args: '{"command":["true"]}', subject: 'true' },
+      { kind: 'tool_result', id: 'native-empty', result: '' },
+    ]);
+  });
+
+  it('keeps an exec fallback when the same turn includes a file change', () => {
+    writeFileSync(path,
+      ev(userResponseItem('edit and inspect'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'mixed', input: 'await tools.apply_patch(...)'
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'FileChange', id: 'file-1'
+      } } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'mixed', output: 'Patch applied'
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-3', command: ['git', 'diff'], stdout: 'diff'
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const calls = cot.flatMap(event => event.cotEntries ?? []).filter(entry => entry.kind === 'tool_call');
+    expect(calls.map(entry => entry.id)).toEqual(['mixed', 'native-3']);
+  });
+
+  it('keeps non-command exec wrappers that precede a native shell command', () => {
+    writeFileSync(path,
+      ev(userResponseItem('plan then inspect'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'plan-wrapper',
+        input: 'await tools.update_plan({ plan: [] })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'plan-wrapper', output: '{"output":"updated"}',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'shell-wrapper',
+        input: 'await tools.exec_command({ cmd: "git status --short" })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'shell-wrapper', output: '{"output":"wrapper"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-status', command: ['bash', '-lc', 'git status --short'], stdout: 'clean',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot.flatMap(event => event.cotEntries ?? [])).toEqual([
+      expect.objectContaining({ kind: 'tool_call', id: 'plan-wrapper', name: 'exec' }),
+      { kind: 'tool_result', id: 'plan-wrapper', result: 'updated' },
+      expect.objectContaining({ kind: 'tool_call', id: 'native-status', name: 'shell' }),
+      { kind: 'tool_result', id: 'native-status', result: 'clean' },
+    ]);
+  });
+
+  it('splits mixed exec wrappers and suppresses only the matched command', () => {
+    writeFileSync(path,
+      ev(userResponseItem('run and poll'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'mixed-wrapper',
+        input: 'await Promise.allSettled([tools.web__run({ query: "status" }), tools.exec_command({ cmd: "sleep 1" }), tools.write_stdin({ session_id: 7, chars: "" })])',
+      } }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+
+    appendFileSync(path, ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'mixed-wrapper', output: '{"output":"poll complete"}',
+      } }));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.events).toEqual([]);
+
+    appendFileSync(path, ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-sleep', command: ['bash', '-lc', 'sleep 1'], stdout: '',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const entries = drainCodexRollout(path, second.newOffset).events
+      .filter(event => event.kind === 'cot')
+      .flatMap(event => event.cotEntries ?? []);
+    expect(entries).toEqual([
+      expect.objectContaining({ kind: 'tool_call', id: 'native-sleep', name: 'shell', subject: 'sleep 1' }),
+      { kind: 'tool_result', id: 'native-sleep', result: '' },
+      expect.objectContaining({ kind: 'tool_call', id: 'mixed-wrapper:0', name: 'web__run' }),
+      { kind: 'tool_result', id: 'mixed-wrapper:0', result: '' },
+      expect.objectContaining({ kind: 'tool_call', id: 'mixed-wrapper:2', name: 'write_stdin' }),
+      { kind: 'tool_result', id: 'mixed-wrapper:2', result: 'poll complete' },
+    ]);
+    expect(entries.some(entry => entry.kind === 'tool_call' && entry.name === 'exec')).toBe(false);
+  });
+
+  it('does not treat tool names inside strings as nested calls', () => {
+    writeFileSync(path,
+      ev(userResponseItem('show an example'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'example-wrapper',
+        input: 'const example = "tools.exec_command({ cmd: \\\"fake\\\" })"; text(example)',
+      } }));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'example-wrapper', name: 'exec' });
+  });
+
+  it('keeps an unmatched command wrapper when another native command exists', () => {
+    writeFileSync(path,
+      ev(userResponseItem('run both'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'early-wrapper',
+        input: 'await tools.exec_command({ cmd: "echo early" })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'early-wrapper', output: '{"output":"early"}',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'late-wrapper',
+        input: 'await tools.exec_command({ cmd: "echo late" })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'late-wrapper', output: '{"output":"late"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-late', command: ['bash', '-lc', 'echo late'], stdout: 'late',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot.map(event => event.cotEntries?.[0]?.id)).toEqual(['native-late', 'early-wrapper']);
+  });
+
+  it('does not let injected user records truncate terminal fallbacks', () => {
+    writeFileSync(path,
+      ev(userResponseItem('first'))
+      + ev(assistantFinalResponseItem('first done'))
+      + ev(userResponseItem('run legacy command'))
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call', name: 'exec_command', call_id: 'legacy-unmatched',
+        arguments: '{"cmd":"echo legacy"}',
+      } })
+      + ev(userResponseItem('<session_id>abc</session_id><botmux_reminder>continue</botmux_reminder>'))
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call_output', call_id: 'legacy-unmatched', output: '{"output":"legacy"}',
+      } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries).toEqual([
+      expect.objectContaining({ kind: 'tool_call', id: 'legacy-unmatched', name: 'exec_command' }),
+      { kind: 'tool_result', id: 'legacy-unmatched', result: 'legacy' },
+    ]);
+  });
+
+  it('does not duplicate a shell command merely because it also changes files', () => {
+    const command = 'mkdir -p tmp && cp a tmp/a';
+    writeFileSync(path,
+      ev(userResponseItem('copy the file'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'copy-wrapper',
+        input: `await tools.exec_command({ cmd: ${JSON.stringify(command)} })`,
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-copy', command: ['bash', '-lc', command], stdout: '',
+      } } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'FileChange', id: 'copy-files',
+      } } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'copy-wrapper', output: '{"output":""}',
+      } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'native-copy' });
+  });
+
+  it('deduplicates legacy exec_command function calls by call id', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect'))
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call', name: 'exec_command', call_id: 'legacy-call',
+        arguments: '{"cmd":"pwd"}',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call_output', call_id: 'legacy-call', output: '{"output":"/repo"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'legacy-call', command: ['bash', '-lc', 'pwd'], stdout: '/repo',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'legacy-call', name: 'shell' });
+  });
+
+  it('matches a native command produced from a wrapper template literal', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect docs'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'template-wrapper',
+        input: 'const doc = "abc"; await tools.exec_command({ cmd: `fetch --doc ${doc} --format json` })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'template-wrapper', output: '{"output":"wrapper"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-template',
+        command: ['bash', '-lc', 'fetch --doc abc --format json'], stdout: 'native',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'native-template' });
   });
 
   it('skips developer role messages', () => {
@@ -776,6 +1302,47 @@ describe('drainCodexRollout', () => {
     expect(r2.events[0].kind).toBe('assistant_final');
   });
 
+  it('reuses the turn lower bound when tool calls and outputs cross ticks', () => {
+    writeFileSync(path, ev(userResponseItem('long running turn')) + ev({
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'cross-tick-0',
+        input: 'await tools.exec_command({ cmd: "echo 0" })',
+      },
+    }));
+    let drained = drainCodexRollout(path, 0);
+
+    const startedAt = performance.now();
+    for (let i = 0; i < 128; i++) {
+      appendFileSync(path,
+        ev({ type: 'event_msg', payload: { type: 'progress', blob: 'x'.repeat(64 * 1024) } })
+        + ev({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output', call_id: `cross-tick-${i}`, output: 'ok',
+          },
+        })
+        + ev({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call', name: 'exec', call_id: `cross-tick-${i + 1}`,
+            input: `await tools.exec_command({ cmd: "echo ${i + 1}" })`,
+          },
+        }));
+      drained = drainCodexRollout(path, drained.newOffset, drained.state);
+      expect(drained.events).toEqual([]);
+      expect(drained.state).toEqual({
+        nextOffset: drained.newOffset,
+        turnStartOffset: 0,
+      });
+    }
+    const elapsedMs = performance.now() - startedAt;
+
+    // This reads roughly 8 MiB in total. Eagerly reverse-scanning from every
+    // tick made the same fixture quadratic and took several seconds.
+    expect(elapsedMs).toBeLessThan(2_000);
+  });
+
   it('partial trailing line is held back as pendingTail', () => {
     writeFileSync(path, ev(userResponseItem('complete')) + '{"type":"response_item",partial');
     const r = drainCodexRollout(path, 0);
@@ -805,9 +1372,10 @@ describe('drainCodexRollout', () => {
     // Simulate truncation: rewrite with strictly shorter content so the new
     // size is below r1.newOffset and the re-drain branch fires.
     writeFileSync(path, ev(userResponseItem('s')));
-    const r2 = drainCodexRollout(path, r1.newOffset);
+    const r2 = drainCodexRollout(path, r1.newOffset, r1.state);
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0].text).toBe('s');
+    expect(r2.state).toEqual({ nextOffset: r2.newOffset, turnStartOffset: 0 });
   });
 });
 

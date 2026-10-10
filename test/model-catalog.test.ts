@@ -8,6 +8,7 @@ import {
   staticModelChoices,
 } from '../src/services/model-catalog.js';
 import { TTADK_MODEL_SUGGESTIONS } from '../src/setup/cli-selection.js';
+import { parseAidenCodexModelsJson } from '../src/services/aiden-model-catalog.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 
 /** 只带 detectModels 的最小适配器 fake（其余字段本服务不碰）。 */
@@ -29,6 +30,10 @@ describe('staticModelChoices（静态候选，shell-free）', () => {
 
   it('codex-app 与 codex 共享同一模型目录快照', () => {
     expect(staticModelChoices('codex-app')).toEqual(staticModelChoices('codex'));
+  });
+
+  it('aiden-x-codex 不回退原生 Codex 静态模型', () => {
+    expect(staticModelChoices('aiden-x-codex')).toEqual([]);
   });
 
   it('traex returns a curated model list that includes reasoning-capable models', () => {
@@ -91,6 +96,19 @@ describe('mergeModelChoices（合并去重）', () => {
 });
 
 describe('detectModels（live 探测，fail-soft）', () => {
+  it('aiden-x-codex 使用 Aiden 专用探测器，不构造 Codex adapter', async () => {
+    const catalog = createModelCatalog();
+    let adapterCalls = 0;
+    let aidenCalls = 0;
+    const models = await catalog.detectModels('aiden-x-codex', {
+      adapterFactory: () => { adapterCalls++; return fakeAdapter(async () => ['native-codex']); },
+      aidenCodexDetector: async () => { aidenCalls++; return ['deepseek-v4-pro', 'gpt-6-astra']; },
+    });
+    expect(models).toEqual(['deepseek-v4-pro', 'gpt-6-astra']);
+    expect(aidenCalls).toBe(1);
+    expect(adapterCalls).toBe(0);
+  });
+
   it('适配器无 detectModels（claude-code）→ null', async () => {
     expect(await detectModels('claude-code')).toBeNull();
   });
@@ -189,6 +207,26 @@ describe('detectModels（live 探测，fail-soft）', () => {
     const catalog = createModelCatalog();
     const factory = () => ({}) as CliAdapter;
     expect(await catalog.detectModels('codex', { adapterFactory: factory })).toBeNull();
+  });
+});
+
+describe('parseAidenCodexModelsJson', () => {
+  it('extracts unique codex ids and ignores malformed or foreign entries', () => {
+    expect(parseAidenCodexModelsJson(JSON.stringify({
+      schema_version: 1,
+      models: [
+        { cli_type: 'codex', id: 'deepseek-v4-pro' },
+        { cli_type: 'claudecode', id: 'claude-only' },
+        { cli_type: 'codex', id: 'deepseek-v4-pro' },
+        { cli_type: 'codex', id: 'gpt-6-astra' },
+        { cli_type: 'codex', id: '' },
+      ],
+    }))).toEqual(['deepseek-v4-pro', 'gpt-6-astra']);
+  });
+
+  it('returns [] for invalid JSON or schema', () => {
+    expect(parseAidenCodexModelsJson('not json')).toEqual([]);
+    expect(parseAidenCodexModelsJson(JSON.stringify({ schema_version: 2, models: [] }))).toEqual([]);
   });
 });
 

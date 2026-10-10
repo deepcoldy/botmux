@@ -12,7 +12,7 @@
  *  修复 — daemon 发 restart IPC 时捎带 daemon 侧最新 bots.json `env`
  *  （latestPerBotEnvForRestart，三分态：对象=最新 / null=已清空 / undefined=
  *  取不到保持旧行为）；worker 在 respawn 前全量覆盖 lastInitConfig.env，
- *  spawnCli 的 sanitizePerBotEnv(cfg.env) 每次 spawn 都重跑即生效。
+ *  spawnCli 的 botInjectedEnv(cfg.env, cfg.envPolicy) 每次 spawn 都重跑即生效。
  *
  *  覆盖：
  *  1. latestPerBotEnvForRestart 纯函数三分态（最新 / 清空 / 取不到兜底）。
@@ -263,7 +263,7 @@ describe('worker restart case merges env into lastInitConfig (source pin)', () =
   });
 
   it('spawnCli re-derives the inject set from cfg.env on every spawn (no cached copy)', () => {
-    const spawnCfg = workerSource.indexOf('const perBotInjectEnv = sanitizePerBotEnv(cfg.env);');
+    const spawnCfg = workerSource.indexOf('const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);');
     expect(spawnCfg).toBeGreaterThanOrEqual(0);
   });
 });

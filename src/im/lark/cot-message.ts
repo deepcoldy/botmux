@@ -18,27 +18,26 @@
  *   2. Subsequent updates → PUT AG-UI events. The worker sends the FULL
  *      cumulative ENTRY LIST (thinking paragraphs + tool calls/results in
  *      transcript order, append-only); this module pushes each unseen entry
- *      as its own node — thinking as a reasoning message (START/CONTENT/END
- *      with a distinct messageId), tool calls as TOOL_CALL_START/ARGS/END,
+ *      as its own node — thinking AND interim assistant narration as reasoning
+ *      messages (START/CONTENT/END with a distinct messageId; a turn that
+ *      starts straight into tooling gets one placeholder node first, see
+ *      {@link thinkingPlaceholderEvents}), tool calls as TOOL_CALL_START/ARGS/END,
  *      tool output as TOOL_CALL_RESULT. The client does not render
  *      TOOL_CALL_ARGS (verified by live A/B: sending full args and sending
  *      none render identically), so the command line / file path travels in
  *      TOOL_CALL_START.title — see {@link toolTitleSubject}. Single
  *      in-flight PUT per session, latest-wins.
- *   3. `turn_terminal` → final PUT: REASONING_END / RUN_FINISHED.
- *      RUN_FINISHED auto-completes the CoT server-side (verified: later
- *      appends fail with "COT already in terminal state"), so no separate
- *      complete call is needed; the explicit complete endpoint is kept as the
- *      error-path fallback so a failed terminal batch can't leave the bubble
- *      spinning forever.
+ *   3. Successful `turn_terminal` → final PUT: REASONING_END / RUN_FINISHED.
+ *      RUN_FINISHED auto-completes as Completed, including status=interrupted
+ *      with matching thread/run IDs (verified against the live endpoint).
+ *      Failed, cancelled, ambiguous and disconnected streams therefore use
+ *      the explicit error-completion endpoint, also the fallback on PUT failure.
  *
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
  *
- * Per-bot master switch `thinkingCard` (default ON — only an explicit false
- * disables; per-chat opt-out via `/cot off`). `thinkingCardToolResult: false`
- * additionally drops the TOOL_CALL_RESULT code blocks, see
- * {@link cotToolResultEnabled}.
+ * Per-bot master switch `cotEnabled` (default ON — only an explicit false
+ * disables; per-chat opt-out via `/cot off`).
  */
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -46,6 +45,9 @@ import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
+import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
+import { TopicSendError } from '../../cli/topic-send-guard.js';
+import { privateReplyEnabled } from '../../core/private-reply.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
@@ -62,6 +64,8 @@ interface CotEvent {
 }
 
 interface CotState {
+  /** A policy pause is not delivery proof; retain the existing restart marker. */
+  retainOrphanMarker?: boolean;
   turnKey: string;
   turnId: string;
   /** create failed / a push failed → thinking display off for the turn. */
@@ -81,6 +85,8 @@ interface CotState {
   pumping: boolean;
   /** Set when turn_terminal arrives; consumed by the pump's final flush. */
   finishStatus?: 'done' | 'interrupted';
+  /** Worker loss is not evidence that an external adopted CLI stopped. */
+  workerDisconnected?: boolean;
 }
 
 const states = new WeakMap<DaemonSession, CotState>();
@@ -103,14 +109,14 @@ function rememberRecentState(ds: DaemonSession, state: CotState): void {
 }
 
 /**
- * 新 turn 的 thinking 到来时，上一轮的气泡若还活着（已创建、未收尾），必须在这里
+ * 新 turn 的 thinking 到来，或队列确认 steer 替换旧 turn 时，旧气泡若还活着，必须在这里
  * 主动收尾，而不是把 state 一丢了之：丢掉之后没有任何路径会再给它 RUN_FINISHED——
  * 它自己的 turn_terminal 已经（或将要）因 state 被替换而找不到对象，气泡就永远停在
  * 「执行中」。实测触发场景：上一轮跑得久，用户 type-ahead 发了下一条，Claude 无缝
  * 接着跑，两轮之间没有 idle 边沿。
  *
- * 下一轮的 thinking 已经出现，本身就证明上一轮结束了，所以按 done 收尾；若上一轮
- * 曾经推送失败（disabled），走显式 complete 让它停止转圈。
+ * done 只表示旧时间线的展示结束，不证明旧任务执行成功；steer 会把工作合入新回合。
+ * 若上一轮曾经推送失败（disabled），走显式 complete 让它停止转圈。
  */
 function settleSupersededState(ds: DaemonSession, state: CotState): void {
   if (state.settled) return;
@@ -155,7 +161,7 @@ function recordCotOrphanMarker(ds: DaemonSession, state: CotState): void {
 }
 
 function clearCotOrphanMarker(state: CotState): void {
-  if (!state.cotId) return;
+  if (!state.cotId || state.retainOrphanMarker) return;
   try { unlinkSync(join(cotOrphanDir(), `${state.cotId}.json`)); } catch { /* already gone */ }
 }
 
@@ -189,14 +195,15 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         // complete below, since an un-terminated bubble spins on「执行中」
         // forever, which is strictly worse than an unannotated one.
         //
-        // The note ends in RUN_FINISHED, which already auto-completes the CoT
-        // server-side (verified: a later append is refused as terminal), so
-        // the complete below is redundant on the happy path. It is kept
-        // deliberately: it is idempotent, it is the ONLY terminator when the
-        // note fails, and dropping it would rewrite pre-existing assertions
-        // for a saving on a fire-and-forget startup path that blocks nothing.
+        // Use the error completion endpoint after the notice. RUN_FINISHED
+        // would label this abandoned progress stream as completed even though
+        // the external CLI can still be executing the original task.
         try {
-          await c.request({
+          if (getBot(rec.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+            const { assertMessageWriteAllowed } = await import('./client.js');
+            await assertMessageWriteAllowed(rec.larkAppId, rec.messageId);
+          }
+          const noticeResponse = await c.request({
             method: 'PUT',
             url: '/open-apis/im/v1/message_cot',
             data: {
@@ -206,18 +213,29 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
             },
             timeout: COT_REQUEST_TIMEOUT_MS,
           } as any);
+          assertCotResponse(rec.larkAppId, noticeResponse);
         } catch (err) {
+          if (err instanceof TopicSendError) throw err;
           logger.warn(`[cot] orphan notice ${rec.cotId}: ${err instanceof Error ? err.message : String(err)}`);
         }
-        await c.request({
+        if (getBot(rec.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+          const { assertMessageWriteAllowed } = await import('./client.js');
+          await assertMessageWriteAllowed(rec.larkAppId, rec.messageId);
+        }
+        const completeResponse = await c.request({
           method: 'POST',
           url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(rec.cotId)}`,
-          params: { message_id: rec.messageId, reason: 'done' },
+          params: { message_id: rec.messageId, reason: 'error' },
           timeout: COT_REQUEST_TIMEOUT_MS,
         } as any);
+        assertCotResponse(rec.larkAppId, completeResponse);
         logger.info(`[cot] orphan closed cot=${rec.cotId}`);
       }
     } catch (err) {
+      if (err instanceof TopicSendError) {
+        logger.warn(`[cot] orphan retained while its topic is unavailable: ${err.message}`);
+        continue;
+      }
       // Already terminal / bot gone / transient — the marker is still consumed;
       // a bubble we can't close now won't become closable later.
       logger.warn(`[cot] orphan sweep ${f}: ${err instanceof Error ? err.message : String(err)}`);
@@ -230,18 +248,19 @@ function turnKeyOf(msg: { turnId: string; dispatchAttempt?: number }): string {
   return `${msg.turnId}|${msg.dispatchAttempt ?? ''}`;
 }
 
-/** Effective per-session gate: bot-level master switch (`thinkingCard`,
+/** Effective per-session gate: bot-level master switch (`cotEnabled`,
  *  default ON — only explicit false disables) AND the chat not opted out via
  *  `/cot off` (`noCotChats`). Read fresh from the in-memory registry so
  *  `/cot` toggles apply from the next update without a daemon restart.
  *  `/cot show` (`ds.cotForced`) overrides both switches for one turn —
- *  apiOnly stays a hard block (such bots must not emit IM messages). */
+ *  apiOnly and private replies stay hard blocks for this public channel. */
 export function cotEnabled(ds: DaemonSession): boolean {
   try {
     const cfg = getBot(ds.larkAppId).config;
     if (cfg.apiOnly === true) return false;
+    if (privateReplyEnabled(ds.session)) return false;
     if (ds.cotForced) return true;
-    return cfg.thinkingCard !== false
+    return cfg.cotEnabled !== false
       && !(ds.chatId && cfg.noCotChats?.includes(ds.chatId));
   } catch {
     return false;
@@ -264,25 +283,30 @@ function ev(eventType: string, content: unknown): CotEvent {
 }
 
 /**
- * Terminal batch for a bubble the daemon is abandoning mid-turn: a visible
- *「因重启中断」node followed by RUN_FINISHED(interrupted).
+ * Visible notice for a progress stream abandoned during restart or worker loss.
+ * RUN_FINISHED is deliberately omitted: even with matching thread/run IDs,
+ * status=interrupted rendered as Completed in a live probe. Callers append this
+ * notice before closing through the explicit error-completion endpoint.
  *
- * Shared by both abandonment paths so they render identically:
- *   - graceful shutdown (still holds the in-memory state), and
- *   - the next generation's orphan sweep (only has the marker file).
+ * Shared by abandonment paths, with cause-specific copy:
+ *   - graceful shutdown (still holds the in-memory state),
+ *   - the next generation's orphan sweep (only has the marker file),
+ *   - worker loss while the daemon stays alive.
  *
  * Callers MUST send this BEFORE terminating the CoT. Completing first is
  * irreversible: a later append is rejected with "COT already in terminal
  * state" (verified against the live endpoint), so the note would silently
  * never appear.
  */
-function interruptedNoticeEvents(larkAppId: string, lastReasoningId?: string): CotEvent[] {
+function interruptedNoticeEvents(
+  larkAppId: string, lastReasoningId?: string,
+  noticeKey: 'cot.interrupted' | 'cot.worker_disconnected' = 'cot.interrupted',
+): CotEvent[] {
   const mid = `reasoning-interrupted-${lastReasoningId ?? 'orphan'}`;
   return [
     ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
-    ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t('cot.interrupted', {}, localeForBot(larkAppId)) }),
+    ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t(noticeKey, {}, localeForBot(larkAppId)) }),
     ev('REASONING_MESSAGE_END', { messageId: mid }),
-    ev('RUN_FINISHED', { threadId: 'cot-interrupted', runId: mid, status: 'interrupted' }),
   ];
 }
 
@@ -335,7 +359,35 @@ function cotPlacement(ds: DaemonSession, state: CotState): { origin_message_id?:
   return state.turnId.startsWith('om_') ? { origin_message_id: state.turnId } : {};
 }
 
+async function assertCotWriteAllowed(ds: DaemonSession, state: CotState, messageId?: string): Promise<void> {
+  try {
+    const { assertMessageWriteAllowed } = await import('./client.js');
+    await assertMessageWriteAllowed(ds.larkAppId, messageId);
+    state.retainOrphanMarker = false;
+  } catch (error) {
+    if (error instanceof TopicSendError) state.retainOrphanMarker = true;
+    throw error;
+  }
+}
+
+function assertCotResponse(larkAppId: string, response: any, state?: CotState): void {
+  if (response?.code == null || response.code === 0) return;
+  if (getBot(larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+    if (state) state.retainOrphanMarker = true;
+    throw new TopicSendError(response.code === 230011 ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED',
+      'CoT 写入未成功，保留恢复记录；不要更换目标。');
+  }
+  // Legacy keeps its existing response handling; strict business-code checks are opt-in.
+}
+
 async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
+  const placement = cotPlacement(ds, state);
+  if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+    const target = frozenReplyContextForTurn(ds, fallbackTurnId(ds, state.turnId)).target;
+    if (placement.origin_message_id || target.mode === 'thread' || target.mode === 'quote') {
+      await assertCotWriteAllowed(ds, state, placement.origin_message_id);
+    }
+  }
   const c = getBotClient(ds.larkAppId);
   const res = await c.request({
     method: 'POST',
@@ -343,10 +395,11 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
     params: { receive_id_type: 'chat_id' },
     data: {
       receive_id: ds.chatId,
-      ...cotPlacement(ds, state),
+      ...placement,
     },
     timeout: COT_REQUEST_TIMEOUT_MS,
   } as any);
+  assertCotResponse(ds.larkAppId, res, state);
   const cotId = res?.data?.cot_id;
   const messageId = res?.data?.message_id;
   if (typeof cotId !== 'string' || typeof messageId !== 'string' || !cotId || !messageId) {
@@ -361,24 +414,32 @@ async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[])
   const c = getBotClient(ds.larkAppId);
   // PUT body caps events at 50 per call.
   for (let i = 0; i < events.length; i += 50) {
-    await c.request({
+    if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+      await assertCotWriteAllowed(ds, state, state.messageId);
+    }
+    const response = await c.request({
       method: 'PUT',
       url: '/open-apis/im/v1/message_cot',
       data: { cot_id: state.cotId, message_id: state.messageId, events: events.slice(i, i + 50) },
       timeout: COT_REQUEST_TIMEOUT_MS,
     } as any);
+    assertCotResponse(ds.larkAppId, response, state);
   }
 }
 
 /** Best-effort error-path completion (normal completion rides RUN_FINISHED). */
 async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 'error'): Promise<void> {
+  if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
+    await assertCotWriteAllowed(ds, state, state.messageId);
+  }
   const c = getBotClient(ds.larkAppId);
-  await c.request({
+  const response = await c.request({
     method: 'POST',
     url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(state.cotId!)}`,
     params: { message_id: state.messageId!, reason },
     timeout: COT_REQUEST_TIMEOUT_MS,
   } as any);
+  assertCotResponse(ds.larkAppId, response, state);
 }
 
 /** One reasoning message (= one rendered node) per thinking entry. */
@@ -394,7 +455,7 @@ function reasoningId(state: CotState, index: number): string {
  *  MCP-style names without a per-CLI table. */
 function toolMeta(name: string): { icon: string; labelKey: string } {
   const n = name.toLowerCase();
-  if (n.includes('bash') || n.includes('shell') || n.includes('command')) return { icon: 'bash', labelKey: 'cot.tool.bash' };
+  if (n.includes('bash') || n.includes('shell') || n.includes('command') || /(^|[^a-z])exec([^a-z]|$)/.test(n)) return { icon: 'bash', labelKey: 'cot.tool.bash' };
   if (n.includes('write') || n.includes('edit') || n.includes('patch')) return { icon: 'write', labelKey: 'cot.tool.write' };
   if (n.includes('read') || n.includes('notebook')) return { icon: 'read', labelKey: 'cot.tool.read' };
   if (n.includes('grep') || n.includes('glob') || n.includes('search') || n.includes('fetch')) return { icon: 'search', labelKey: 'cot.tool.search' };
@@ -474,11 +535,41 @@ function resultLanguage(toolName: string | undefined, subject: string | undefine
   return ext ? COT_EXT_LANGUAGES[ext] : undefined;
 }
 
-/** AG-UI events for one CoT entry. Thinking → a complete reasoning message
- *  (its own node); tool_call → START(+ARGS)+END; tool_result → RESULT in
- *  code style (tool output is command/file content — monospace fits). */
+/**
+ * The bubble's opening node for a turn that starts straight into tooling.
+ *
+ * Extended thinking is OFF by default on Claude Code, so a plain turn ships
+ * no `thinking` block at all — its first entry is a tool_call. That left the
+ * bubble with two defects at once: nothing readable at the head (just a row
+ * of tool nodes), and no reasoning node for those nodes to hang under, since
+ * `parentMessageId` is only attached when `lastReasoningId` is set. One
+ * placeholder reasoning node fixes both.
+ *
+ * Inserted at most once per turn — `lastReasoningId` being unset IS the
+ * "this turn has produced no reasoning node yet" test, so a turn whose real
+ * thinking or narration arrives first never sees it. It claims index 0's id,
+ * which is free in exactly that case (no entry-0 reasoning node exists) and
+ * is the same id the prologue's REASONING_START opened the section with.
+ */
+function thinkingPlaceholderEvents(ds: DaemonSession, state: CotState): CotEvent[] {
+  const mid = reasoningId(state, 0);
+  state.lastReasoningId = mid;
+  return [
+    ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
+    ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t('cot.thinking_placeholder', undefined, localeForBot(ds.larkAppId)) }),
+    ev('REASONING_MESSAGE_END', { messageId: mid }),
+  ];
+}
+
+/** AG-UI events for one CoT entry. Thinking and interim narration (`text`)
+ *  → a complete reasoning message (its own node); tool_call → START(+ARGS)+END,
+ *  preceded by the placeholder node when the turn has no reasoning node yet;
+ *  tool_result → RESULT in code style (tool output is command/file content —
+ *  monospace fits). */
 function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index: number): CotEvent[] {
-  if (entry.kind === 'thinking') {
+  // 两者在气泡里同为 reasoning 段落：thinking 是模型的内心独白，text 是它在工具
+  // 之间写给用户的旁白。渲染一致，但协议上分开，占位判据与未来的差异化留有余地。
+  if (entry.kind === 'thinking' || entry.kind === 'text') {
     const mid = reasoningId(state, index);
     state.lastReasoningId = mid;
     return [
@@ -488,6 +579,9 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
     ];
   }
   if (entry.kind === 'tool_call') {
+    // 必须在构造 TOOL_CALL_START 之前求值：它会补上 lastReasoningId，
+    // 下面的 parentMessageId 才挂得住。
+    const placeholder = state.lastReasoningId ? [] : thinkingPlaceholderEvents(ds, state);
     const meta = toolMeta(entry.name);
     const subject = toolTitleSubject(entry);
     // A tool_result entry carries only {id, result} — no tool name — so the
@@ -495,13 +589,13 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
     // in hand, and remembered for the matching result. Detection uses the
     // UNTRUNCATED subject: a path longer than the title cap still ends in its
     // extension, which the display string has already lost to the ellipsis.
-    // 工具输出关闭时结果不会发出，语言也无需记。
     const lang = resultLanguage(entry.name, subject.full);
-    if (lang && cotToolResultEnabled(ds)) {
+    if (lang) {
       if (!state.resultLanguages) state.resultLanguages = new Map();
       state.resultLanguages.set(entry.id, lang);
     }
     return [
+      ...placeholder,
       ev('TOOL_CALL_START', {
         toolCallId: entry.id,
         icon: meta.icon,
@@ -513,11 +607,8 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
       ev('TOOL_CALL_END', { toolCallId: entry.id }),
     ];
   }
-  // 工具节点在 TOOL_CALL_END 之后处于「执行中」状态（官方 COT 事件文档对 22 的定义），
-  // 只有 TOOL_CALL_RESULT 才让它落定。所以「关掉工具输出」不能简单地不发 RESULT——
-  // 那会让每个工具节点永远转圈；结果串本身为空时同理。两种情况都改发一条极简 text
-  // 结果收尾：气泡里只留「工具名 · 命令/路径」加一个完成标记，与 Claude Code 自身
-  // 界面一致，又不会留下未落定的节点。
+  // TOOL_CALL_RESULT settles the tool node. Empty results still need a compact
+  // completion marker so the Feishu renderer does not leave the node spinning.
   const omitResult = !cotToolResultEnabled(ds) || entry.result.length === 0;
   const language = omitResult ? undefined : state.resultLanguages?.get(entry.id);
   return [
@@ -535,8 +626,8 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
 /**
  * Single-in-flight pump: creates the CoT entity on first run, then drains
  * pendingEntries — each unseen entry becomes its own node; when finishStatus
- * is set and all entries are drained, sends the terminal event batch
- * (RUN_FINISHED auto-completes).
+ * is set and all entries are drained, closes through RUN_FINISHED on success
+ * or explicit error completion for interrupted streams.
  */
 async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   if (state.pumping) return;
@@ -544,6 +635,18 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   try {
     while (!state.disabled) {
       if (!state.cotId) {
+        const startingCard = pendingStartingCardPublication(ds);
+        if (startingCard) {
+          await startingCard;
+          // A newer turn/stop can arrive during the POST. Never resurrect its
+          // predecessor's not-yet-visible bubble below the current work card.
+          if (state.disabled || state.settled || states.get(ds) !== state
+            || state.finishStatus === 'interrupted'
+            || (ds.currentTurnId && ds.currentTurnId !== state.turnId)) {
+            state.disabled = true;
+            break;
+          }
+        }
         await apiCreate(ds, state);
         // Record the orphan marker the moment the bubble exists — before the
         // prologue append. If the prologue fails (or the daemon restarts
@@ -571,10 +674,16 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         continue; // re-check for newer entries queued during the push
       }
       if (state.finishStatus && !state.settled) {
-        await apiAppend(ds, state, [
+        const terminalEvents = [
+          ...(state.workerDisconnected
+            ? interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId, 'cot.worker_disconnected') : []),
           ev('REASONING_END', { messageId: state.lastReasoningId ?? reasoningId(state, 0) }),
-          ev('RUN_FINISHED', { threadId: ds.session.sessionId, runId: state.turnId, status: state.finishStatus }),
-        ]);
+        ];
+        if (state.finishStatus === 'done') {
+          terminalEvents.push(ev('RUN_FINISHED', { threadId: ds.session.sessionId, runId: state.turnId, status: 'done' }));
+        }
+        await apiAppend(ds, state, terminalEvents);
+        if (state.finishStatus === 'interrupted') await apiComplete(ds, state, 'error');
         state.settled = true;
         clearCotOrphanMarker(state);
         logger.info(`[cot] finished cot=${state.cotId} turn=${state.turnId.substring(0, 24)} status=${state.finishStatus}`);
@@ -612,7 +721,7 @@ export function handleCotThinkingUpdate(
 ): boolean {
   // Thinking bubbles are outbound messages too. Keep silent fires quiet even
   // when /cot show is armed, without suppressing another turn in this session.
-  if (isSilentScheduledTurn(ds, msg.turnId)) return false;
+  if (isSilentScheduledTurn(ds, msg.turnId) || ds.session.hiddenThinkingTurns?.includes(msg.turnId)) return false;
   if (!cotEnabled(ds)) return false;
   const key = turnKeyOf(msg);
   let state = states.get(ds);
@@ -637,6 +746,26 @@ export function handleCotThinkingUpdate(
   }
   state.pendingEntries = msg.entries;
   void pump(ds, state);
+  return true;
+}
+
+/** Retire only the timeline that a confirmed steer replaced. The worker sends
+ * its final cumulative update first, so the pump drains remaining results
+ * before RUN_FINISHED. No new bubble is created and no task is settled here. */
+export function handleCotThinkingSuperseded(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'thinking_superseded' }>,
+): boolean {
+  if (msg.sessionId !== ds.session.sessionId) return false;
+  const key = turnKeyOf(msg);
+  if (ds.lastThinkingUpdate && turnKeyOf(ds.lastThinkingUpdate) === key) {
+    ds.lastThinkingUpdate = undefined;
+  }
+  let state = states.get(ds);
+  if (state?.turnKey !== key) state = recentStates.get(ds)?.get(msg.turnId);
+  if (!state || state.turnKey !== key) return false;
+  // Still close a created bubble if /cot was turned off after its last update.
+  settleSupersededState(ds, state);
   return true;
 }
 
@@ -669,11 +798,8 @@ export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<vo
   try {
     if (!state.disabled) {
       await apiAppend(ds, state, interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId));
-    } else {
-      // A mid-turn failure already disabled pushes for this turn; appending
-      // would fail too. Just terminate so it stops spinning.
-      await apiComplete(ds, state, 'error');
     }
+    await apiComplete(ds, state, 'error');
   } catch {
     // Notice failed — still terminate, for the same reason the sweep does:
     // an unannotated closed bubble beats one that spins forever.
@@ -703,6 +829,7 @@ export function abortCotMessage(ds: DaemonSession): void {
   }
   if (!state.finishStatus) {
     state.finishStatus = 'interrupted';
+    state.workerDisconnected = true;
     void pump(ds, state);
   }
 }

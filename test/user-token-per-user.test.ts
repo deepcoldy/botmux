@@ -112,6 +112,40 @@ describe('resolveUserToken — per-user isolation', () => {
     expect(await resolveUserToken(APP, 'sec', 'feishu', ALICE)).toBeNull();
   });
 
+  it('cancels an expired-token refresh without overwriting the stored credential', async () => {
+    const original = tokenFor({ appId: APP, brand: 'feishu', openId: ALICE }, -3_600_000);
+    files.set(perUserPath(APP, ALICE), original);
+    const controller = new AbortController();
+    const fetchMock = vi.fn((_url: unknown, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { resolveUserToken } = await fresh();
+    const task = resolveUserToken(APP, 'sec', 'feishu', ALICE, controller.signal);
+    const rejected = expect(task).rejects.toThrow('refresh budget expired');
+    expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
+    controller.abort(new Error('refresh budget expired'));
+    await rejected;
+    expect(files.get(perUserPath(APP, ALICE))).toBe(original);
+  });
+
+  it('does not persist a late refresh body after cancellation', async () => {
+    const original = tokenFor({ appId: APP, brand: 'feishu', openId: ALICE }, -3_600_000);
+    files.set(perUserPath(APP, ALICE), original);
+    let release!: (body: unknown) => void;
+    const json = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json })));
+    const controller = new AbortController();
+    const { resolveUserToken } = await fresh();
+    const task = resolveUserToken(APP, 'sec', 'feishu', ALICE, controller.signal);
+    const rejected = expect(task).rejects.toThrow('cancelled');
+    await vi.waitFor(() => expect(json).toHaveBeenCalled());
+    controller.abort(new Error('cancelled'));
+    release({ access_token: 'LATE', refresh_token: 'NEW_RT', expires_in: 7200, refresh_token_expires_in: 1000, token_type: 'Bearer' });
+    await rejected;
+    expect(files.get(perUserPath(APP, ALICE))).toBe(original);
+  });
+
   it('refreshes into the same person\'s file, never the per-app path', async () => {
     // Access token already expired, refresh token still good.
     files.set(perUserPath(APP, ALICE), tokenFor(

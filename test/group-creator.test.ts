@@ -21,6 +21,7 @@ const mockGetChatOwner = vi.fn();
 const mockGetChatShareLink = vi.fn();
 const mockAddUsersByUnionId = vi.fn();
 const mockAddBotToChat = vi.fn();
+const mockAddChatManagers = vi.fn();
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: (...args: any[]) => mockCreateChat(...args),
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
@@ -28,6 +29,7 @@ vi.mock('../src/services/groups-store.js', () => ({
   getChatShareLink: (...args: any[]) => mockGetChatShareLink(...args),
   addUsersToChatByUnionId: (...args: any[]) => mockAddUsersByUnionId(...args),
   addBotToChat: (...args: any[]) => mockAddBotToChat(...args),
+  addChatManagers: (...args: any[]) => mockAddChatManagers(...args),
 }));
 
 const SHARE_LINK = 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=tok';
@@ -57,6 +59,11 @@ vi.mock('../src/core/role-resolver.js', () => ({
   writeRoleFile: (...args: any[]) => mockWriteRoleFile(...args),
 }));
 
+const mockNameAvatar = vi.fn();
+const mockPersonalTag = vi.fn();
+vi.mock('../src/services/group-name-avatar.js', () => ({ applyGroupNameAvatar: (...args: any[]) => mockNameAvatar(...args) }));
+vi.mock('../src/services/feed-group-tagger.js', () => ({ addCreatedChatToFeedGroup: (...args: any[]) => mockPersonalTag(...args) }));
+
 import { createGroupWithBots, transferGroupOwner } from '../src/services/group-creator.js';
 
 const CREATOR = 'cli_creator_app';
@@ -75,16 +82,56 @@ describe('createGroupWithBots', () => {
     mockBindOncall.mockReset();
     mockAddUsersByUnionId.mockReset();
     mockAddBotToChat.mockReset();
+    mockAddChatManagers.mockReset();
     mockReadRoleProfileEntry.mockReset();
     mockWriteRoleFile.mockReset();
     // Default: share-link fetch succeeds. group-creator always calls this after
     // createChat; individual tests override to exercise the fallback path.
     mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
+    mockAddChatManagers.mockResolvedValue({ ok: true, addedManagers: [] });
     mockResolveAllowedUsersWithMap.mockResolvedValue({ resolved: [], map: new Map() });
     mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) =>
       ids.map(id => ({ id, ok: true })),
     );
+  });
+
+  it('invites teammates before waiting for optional personal tagging', async () => {
+    let release!: () => void;
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_pending_tag', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    mockPersonalTag.mockReturnValueOnce(new Promise<void>(resolve => { release = resolve; }));
+    const task = createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, OTHER_BOT], name: 'Project',
+      transferOwnerTo: USER_OPEN_ID,
+      customization: { tag: 'Work', userOpenId: USER_OPEN_ID },
+    });
+    try {
+      await vi.waitFor(() => expect(mockPersonalTag).toHaveBeenCalled());
+      expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_pending_tag', [OTHER_BOT]);
+      expect(mockAddBotToChat.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockPersonalTag.mock.invocationCallOrder.at(-1)!);
+    } finally {
+      release();
+      await task;
+    }
+  });
+
+  it('runs avatar before transfer and personal tag after transfer, preserving the group on independent failures', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_custom', invalidBotIds: [], invalidUserIds: [] });
+    mockNameAvatar.mockRejectedValueOnce(new Error('no font'));
+    mockPersonalTag.mockRejectedValueOnce(new Error('no user token'));
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], name: 'Project', transferOwnerTo: USER_OPEN_ID,
+      customization: { tag: 'Work', avatar: 'name', userOpenId: USER_OPEN_ID },
+    });
+    expect(result.chatId).toBe('oc_custom');
+    expect(result.customization).toEqual({ avatarError: 'no font', tagError: 'no user token' });
+    expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+    expect(mockNameAvatar.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!);
+    expect(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockPersonalTag.mock.invocationCallOrder.at(-1)!);
+    expect(mockPersonalTag).toHaveBeenCalledWith(CREATOR, 'oc_custom', USER_OPEN_ID, 'Work');
+    expect(mockCreateChat).toHaveBeenCalledTimes(1);
   });
 
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {
@@ -123,7 +170,7 @@ describe('createGroupWithBots', () => {
     expect(mockSendMessage).toHaveBeenCalledWith(
       CREATOR,
       'oc_team',
-      `<at user_id="${USER_OPEN_ID}"></at>`,
+      expect.stringMatching(new RegExp(`^<at user_id="${USER_OPEN_ID}"></at> (群已创建|The group is ready)`)),
       'text',
     );
     expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
@@ -184,6 +231,8 @@ describe('createGroupWithBots', () => {
       invalidOwnerUnionIds: [],
       ownerTransferredTo: USER_OPEN_ID,
       transferError: null,
+      managersAdded: [],
+      managerError: null,
       notifyMessageId: 'om_notify_1',
       notifyError: null,
       shareLink: SHARE_LINK,
@@ -219,6 +268,24 @@ describe('createGroupWithBots', () => {
     expect(args[0]).toBe(CREATOR);
     expect(args[1].botIds).toEqual([]);  // bots are added after createChat
     expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_x', [OTHER_BOT]);
+  });
+
+  it('forwards chatMode to createChat (topic group)', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_topic', invalidBotIds: [], invalidUserIds: [] });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      chatMode: 'topic',
+    });
+    expect(result.chatId).toBe('oc_topic');
+    expect(mockCreateChat).toHaveBeenCalledTimes(1);
+    expect(mockCreateChat.mock.calls[0][1].chatMode).toBe('topic');
+  });
+
+  it('leaves chatMode undefined when the caller does not ask for a topology', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_default', invalidBotIds: [], invalidUserIds: [] });
+    await createGroupWithBots({ creatorLarkAppId: CREATOR, larkAppIds: [CREATOR] });
+    expect(mockCreateChat.mock.calls[0][1].chatMode).toBeUndefined();
   });
 
   it('reports chatId immediately after chat.create before invite and transfer work', async () => {
@@ -696,6 +763,66 @@ describe('createGroupWithBots', () => {
     expect(mockSendMessage).not.toHaveBeenCalled();
     expect(result.roleProfileBootstrapMessageId).toBeNull();
     expect(result.roleProfileBootstrapError).toBeNull();
+  });
+
+  it('adds group managers when managerUserIds is provided', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_mgr', invalidBotIds: [], invalidUserIds: [] });
+    mockAddChatManagers.mockResolvedValue({ ok: true, addedManagers: [USER_OPEN_ID] });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      userOpenIds: [USER_OPEN_ID],
+      managerUserIds: [USER_OPEN_ID],
+    });
+    expect(mockAddChatManagers).toHaveBeenCalledWith(CREATOR, 'oc_mgr', [USER_OPEN_ID]);
+    expect(result.managersAdded).toEqual([USER_OPEN_ID]);
+    expect(result.managerError).toBeNull();
+  });
+
+  it('skips adding manager if user was successfully transferred ownership', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_mgr2', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      userOpenIds: [USER_OPEN_ID],
+      transferOwnerTo: USER_OPEN_ID,
+      managerUserIds: [USER_OPEN_ID],
+    });
+    expect(mockAddChatManagers).not.toHaveBeenCalled();
+    expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+    expect(result.managersAdded).toEqual([]);
+  });
+
+  it('falls back to addChatManagers when owner transfer fails', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_mgr3', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: false, error: 'transfer_rejected' });
+    mockAddChatManagers.mockResolvedValue({ ok: true, addedManagers: [USER_OPEN_ID] });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      userOpenIds: [USER_OPEN_ID],
+      transferOwnerTo: USER_OPEN_ID,
+      managerUserIds: [USER_OPEN_ID],
+    });
+    expect(mockTransferChatOwner).toHaveBeenCalled();
+    expect(result.transferError).toBe('transfer_rejected');
+    expect(mockAddChatManagers).toHaveBeenCalledWith(CREATOR, 'oc_mgr3', [USER_OPEN_ID]);
+    expect(result.managersAdded).toEqual([USER_OPEN_ID]);
+  });
+
+  it('records managerError gracefully when addChatManagers fails', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_mgr4', invalidBotIds: [], invalidUserIds: [] });
+    mockAddChatManagers.mockResolvedValue({ ok: false, error: 'permission_denied' });
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      userOpenIds: [USER_OPEN_ID],
+      managerUserIds: [USER_OPEN_ID],
+    });
+    expect(result.chatId).toBe('oc_mgr4');
+    expect(result.managerError).toBe('permission_denied');
+    expect(result.managersAdded).toEqual([]);
   });
 });
 

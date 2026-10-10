@@ -30,6 +30,7 @@ import { resolve } from 'node:path';
 
 const CI = readFileSync(resolve(import.meta.dirname, '../.github/workflows/ci.yml'), 'utf-8');
 const RELEASE = readFileSync(resolve(import.meta.dirname, '../.github/workflows/release.yml'), 'utf-8');
+const SMOKE = readFileSync(resolve(import.meta.dirname, '../scripts/smoke-bun-binary.mjs'), 'utf-8');
 
 /** Strip `#` comments so a claim can never be satisfied by prose ABOUT the claim.
  *  (A comment mentioning `--target bun-linux-x64-musl` would otherwise pass an
@@ -136,6 +137,12 @@ describe('ci.yml — the musl artifact is gated on PRs, not only at release', ()
 });
 
 describe('release.yml — the musl legs stay wired into the publish chain', () => {
+  it('gives slow ARM64 runners enough time to bind the dashboard HTTP listener', () => {
+    const timeout = SMOKE.match(/const DASHBOARD_HTTP_TIMEOUT_MS = ([\d_]+);/)?.[1];
+    expect(timeout, 'dashboard HTTP smoke timeout constant is missing').toBeTruthy();
+    expect(Number(timeout!.replaceAll('_', ''))).toBeGreaterThanOrEqual(40_000);
+  });
+
   it('still builds BOTH musl arches (ci.yml only canaries x64)', () => {
     // The PR gate deliberately covers one arch (arm64 needs a separate, slower
     // runner). The release must not quietly shrink to match it.

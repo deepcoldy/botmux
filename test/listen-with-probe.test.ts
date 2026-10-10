@@ -11,7 +11,8 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer, get, type Server } from 'node:http';
-import { listenWithProbe } from '../src/utils/listen-with-probe.js';
+import { connect, type Socket } from 'node:net';
+import { listenWithProbe, LISTEN_RELEASE_WEDGED_CODE } from '../src/utils/listen-with-probe.js';
 
 const open: Server[] = [];
 function mk(): Server { const s = createServer((_q, r) => r.end('ok')); open.push(s); return s; }
@@ -150,4 +151,193 @@ describe('listenWithProbe', () => {
     expect(bound).not.toBe(sport);                 // did not settle on the shadowed port
     expect(await selfCheck(bound)).toBe(true);     // loopback to the bound port reaches US
   });
+
+  it('steps up even when a client is still parked on the rejected port', async () => {
+    // Regression, 2026-09: the dashboard silently stopped binding 7891 — no
+    // LISTEN, no step to 7892, not one log line. Cause: a stale process from an
+    // older checkout kept dialing 127.0.0.1:7891; our listen() accepted it and
+    // it then sat there without reading. server.close() only stops ACCEPTING —
+    // it waits for every already-accepted socket to drain — and the probe's
+    // tryNext() (the only thing that logs or steps) runs inside that callback.
+    // One parked socket therefore wedged the entire probe, invisibly.
+    //
+    // MEASURED on this shape: close() alone never fires its callback on either
+    // runtime (node 22 and bun both still pending at 10s); with
+    // closeAllConnections() it fires in 0-1ms. Hence the 4s budget below —
+    // generous for the fix, unreachable for the bug.
+    const start = await reserveAdjacentPair();
+    const parked: Socket[] = [];
+
+    const verified: number[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      maxProbe: 3,
+      verifyBound: async (p) => {
+        verified.push(p);
+        if (verified.length > 1) return true;
+        // Land a real connection on the port we are about to reject, and leave
+        // it open with an unanswered request — exactly what the stale process did.
+        await new Promise<void>((resolve) => {
+          const sock = connect(p, '127.0.0.1', () => {
+            sock.write('GET /__selfcheck HTTP/1.1\r\nHost: x\r\n\r\n');
+            parked.push(sock);
+            resolve();
+          });
+          sock.on('error', () => resolve());
+        });
+        return false;
+      },
+    });
+
+    try {
+      expect(verified[0]).toBe(start);        // it really bound and rejected `start`
+      expect(bound).toBeGreaterThan(start);   // …and still got past it
+    } finally {
+      for (const sock of parked) sock.destroy();
+    }
+  }, 4000);
+
+  it('steps up past a parked client even when the http layer does not track it', async () => {
+    // Second 2026-09 wedge: closeAllConnections() was already in place and the
+    // dashboard STILL parked — one CLOSE-WAIT loopback socket the http layer never
+    // closed, no LISTEN, 29 minutes of silence. Whatever the runtime's bookkeeping
+    // misses, the probe must be able to tear down on its own: it keeps handles to
+    // every socket accepted while probing and destroys them itself on release.
+    // Simulate "the http layer can't see it" by making closeAllConnections a no-op.
+    const start = await reserveAdjacentPair();
+    const server = mk();
+    (server as unknown as { closeAllConnections: () => void }).closeAllConnections = () => { /* runtime blind spot */ };
+    const parked: Socket[] = [];
+
+    const verified: number[] = [];
+    const bound = await listenWithProbe({
+      server,
+      port: start,
+      host: '127.0.0.1',
+      maxProbe: 3,
+      releaseTimeoutMs: 500,
+      verifyBound: async (p) => {
+        verified.push(p);
+        if (verified.length > 1) return true;
+        await new Promise<void>((resolve) => {
+          const sock = connect(p, '127.0.0.1', () => {
+            sock.write('GET /__selfcheck HTTP/1.1\r\nHost: x\r\n\r\n');
+            parked.push(sock);
+            resolve();
+          });
+          sock.on('error', () => resolve());
+        });
+        return false;
+      },
+    });
+
+    try {
+      expect(verified[0]).toBe(start);
+      expect(bound).toBeGreaterThan(start);
+    } finally {
+      for (const sock of parked) sock.destroy();
+    }
+  }, 4000);
+
+  it('retries an unconfirmed verification and keeps the port instead of releasing it', async () => {
+    // "Nobody answered my self-check in time" is what a starved event loop looks
+    // like from inside the process, not evidence of a shadow. Releasing a port we
+    // own on that signal is the path that wedged the dashboard; the probe must
+    // retry and, if still unconfirmed, keep the bind — loudly.
+    const start = await reserveAdjacentPair();
+    const logs: string[] = [];
+    const verified: number[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      verifyRetries: 2,
+      verifyRetryDelayMs: 10,
+      verifyBound: (p) => { verified.push(p); return 'unconfirmed'; },
+      log: m => logs.push(m),
+    });
+    expect(bound).toBe(start);                      // never stepped
+    expect(verified).toEqual([start, start, start]); // 1 + 2 retries, all on the same port
+    expect(logs.some(l => /unconfirmed.*retrying/.test(l))).toBe(true);
+    expect(logs.some(l => /still unconfirmed.*keeping the bind/.test(l))).toBe(true);
+  });
+
+  it('accepts the port as soon as a retry confirms it', async () => {
+    const start = await reserveAdjacentPair();
+    let calls = 0;
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      verifyRetryDelayMs: 10,
+      verifyBound: () => (++calls < 2 ? 'unconfirmed' : true),
+    });
+    expect(bound).toBe(start);
+    expect(calls).toBe(2);
+  });
+
+  it('treats a throwing verifier as unconfirmed, not as a shadow', async () => {
+    // The old code released the port on a verifier exception ("verify-failed").
+    // An exception means the check could not run; it says nothing about who owns
+    // the port, so it must follow the unconfirmed path (retry, then keep).
+    const start = await reserveAdjacentPair();
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      verifyRetries: 1,
+      verifyRetryDelayMs: 10,
+      verifyBound: () => { throw new Error('probe exploded'); },
+    });
+    expect(bound).toBe(start);
+  });
+
+  it('gives up with ERR_LISTEN_RELEASE_WEDGED instead of hanging when close() never completes', async () => {
+    // The failure the whole release path exists to make visible: server.close()
+    // parks forever. Force it by stubbing close() to never call back. The probe
+    // must reject with a distinct code within its bounded budget so the caller
+    // (dashboard.ts) can log and exit for a supervisor restart.
+    const start = await reserveAdjacentPair();
+    const server = mk();
+    const realClose = server.close.bind(server);
+    (server as unknown as { close: (cb?: () => void) => Server }).close = () => server; // swallow the callback
+    (server as unknown as { closeAllConnections: () => void }).closeAllConnections = () => { /* no-op */ };
+    const logs: string[] = [];
+    let err: NodeJS.ErrnoException | null = null;
+    const startedAt = Date.now();
+    await listenWithProbe({
+      server,
+      port: start,
+      host: '127.0.0.1',
+      releaseTimeoutMs: 100,
+      verifyBound: () => false,           // definitive shadow → release
+      log: m => logs.push(m),
+    }).catch(e => { err = e; });
+    const elapsed = Date.now() - startedAt;
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe(LISTEN_RELEASE_WEDGED_CODE);
+    expect(elapsed).toBeLessThan(2000);   // bounded: 2 × releaseTimeoutMs, not forever
+    expect(logs.some(l => /release still pending/.test(l))).toBe(true);
+    expect(logs.some(l => /release wedged/.test(l))).toBe(true);
+    // Let afterEach actually close the listener we stubbed.
+    (server as unknown as { close: typeof realClose }).close = realClose;
+  });
+
+  it('bounds portAvailable so a hung availability check times out and steps up instead of hanging forever', async () => {
+    const start = await reserveAdjacentPair();
+    const logs: string[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      portAvailableTimeoutMs: 50,
+      portAvailable: p => p === start ? new Promise(() => { /* hung promise */ }) : true,
+      log: m => logs.push(m),
+    });
+    expect(bound).toBe(start + 1);
+    expect(logs.some(l => /availability check timed out/.test(l))).toBe(true);
+  });
 });
+

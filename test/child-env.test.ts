@@ -56,6 +56,9 @@ describe('redactChildEnv()', () => {
     const out = redactChildEnv({
       LARK_APP_ID: 'cli_bot',
       LARK_APP_SECRET: 'secret',
+      ONCALL_SERVICE_SECRET: 'oncall-secret',
+      NODE_CHANNEL_FD: '3',
+      NODE_CHANNEL_SERIALIZATION_MODE: 'json',
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
@@ -67,6 +70,10 @@ describe('redactChildEnv()', () => {
     // just falsy value.
     expect('LARK_APP_ID' in out).toBe(false);
     expect('LARK_APP_SECRET' in out).toBe(false);
+    expect('ONCALL_SERVICE_SECRET' in out).toBe(false);
+    expect('NODE_CHANNEL_FD' in out).toBe(false);
+    expect('NODE_CHANNEL_SERIALIZATION_MODE' in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain('ONCALL_SERVICE_SECRET');
     expect('CLAUDECODE' in out).toBe(false);
     // Unrelated vars pass through untouched.
     expect(out.KEEP).toBe('v');
@@ -553,6 +560,8 @@ describe('scrubSessionTurnMarkerEnv()', () => {
       'BOTMUX_LARK_APP_ID',
       'BOTMUX_SESSION_SCOPE',
       'BOTMUX_SEND_RELAY',
+      // per-session shadowed user statusLine command (worker-computed from cwd)
+      'BOTMUX_STATUSLINE_CHAIN',
     ]) {
       expect(SESSION_TURN_MARKER_ENV_KEYS, key).toContain(key);
     }
@@ -675,16 +684,16 @@ describe('session CLI home scrub call sites', () => {
     expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
   });
 
-  it('every CLI-child spawn boundary builds its env from redactChildEnv (source pin)', () => {
+  it('every CLI-child spawn boundary uses the shared inheritance and redaction builder (source pin)', () => {
     // The H5 secret leak was a missing KEY, not a missing call — but the deny
     // list only protects boundaries that actually route through it. Pin the
     // non-obvious ones: the daemon-side one-shot that titles a session group,
     // and worker.ts's own child/engine envs.
     const oneShot = read('services/session-group-title.ts');
     const fn = oneShot.slice(oneShot.indexOf('export function buildOneShotEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('redactChildEnv(process.env)');
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('buildSessionChildEnv(process.env, envPolicy)');
     const worker = read('worker.ts');
-    expect(worker).toContain('const childEnv = redactChildEnv(process.env)');
+    expect(worker).toContain('const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy)');
     // The zellij web-terminal viewer used the raw process.env (zellijEnv only
     // drops ZELLIJ*), unlike the tmux viewer whose tmuxEnv folds in
     // REDACTED_CHILD_ENV_KEYS.
@@ -762,6 +771,10 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
+    // `botmux statusline` runs inside the pane and needs the worker-computed chain
+    // command; without transport it would silently drop the user's own statusLine.
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
   });
 
   it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {

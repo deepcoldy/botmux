@@ -2,6 +2,8 @@
 
 支持三种调度类型 + 中文自然语言，到点按任务配置的执行位置运行。**群内默认在群消息顶层执行，即使从话题内创建也不会自动继承原话题。** 要在当前话题继续，请在 CLI 创建时显式传 `--topic`，或在 Dashboard 将「执行位置」设为原话题。
 
+执行位置共有四种：**群消息顶层**（默认，一群内所有顶层任务共享群级会话上下文）、**指定话题**（`--topic`，绑定一个已有话题）、**每次新话题**（`--new-topic`，每次触发各自独立）、**任务独立话题**（opt-in，每个任务拥有自己的专属话题会话，见下文）。
+
 ## 两种创建方式
 
 - **斜杠命令**（快捷）：`/schedule 每日17:50 帮我看看AI圈有什么新闻`
@@ -14,6 +16,64 @@ botmux schedule add "每日18:00" "检查部署状态" --topic
 ```
 
 `--topic` 可从当前话题会话推断锚点，也可用 `--root-msg-id <om_...>` 指定目标话题。
+
+## 跨 Bot 委托创建
+
+当真人在 Bot A 的当前回合中明确要求 Bot B 建立定时任务时，A 必须在受管派发中显式请求：
+
+```bash
+botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并维护状态轮询" \
+  --delegate schedule:create
+```
+
+宿主还必须在 `~/.botmux/config.json` 显式开启新签发（默认关闭）：
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "runEnabled": true,
+    "maxTasksPerTurn": 64,
+    "runScopes": ["bytedcli"],
+    "selfManageEnabled": true
+  }
+}
+```
+
+来源 orchestrator 与目标 generalist 的 `bots.json` 均应启用身份 wrapper；为保证
+scheduled turn 不从未受管工具继承机器登录态，目标 Bot 必须同时覆盖两种工具：
+
+```json
+"triggerUserAuth": {
+  "enabled": true,
+  "tools": ["lark-cli", "bytedcli"]
+}
+```
+
+首版委托严格单跳，并绑定目标 Bot 的当前 dispatch turn；不设固定的 5 分钟期限，turn 存活期间可创建多个不同任务，turn 结束即失效。每个 turn 默认最多创建 64 个任务，可通过 `maxTasksPerTurn` 在 1–1024 间调整。每个 canonical request 会得到确定性 task ID，相同请求重试返回原任务且不重复计数。任务只允许落在原派发群的顶层或当前话题；不支持 `--new-topic`、`--follow-active`、多群或继续转委托。dispatch grant 只允许创建任务；可选的 task-local 自管理权限见下文。
+
+若某个 orchestrator 的所有受管 dispatch 都应默认附带该能力，可按来源 Bot 配置，无需修改每条 SOP：
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "defaultOnDispatchFromBotAppIds": ["cli_spu_orchestrator"],
+    "runScopes": ["bytedcli"],
+    "selfManageEnabled": true
+  }
+}
+```
+
+单次派发可用 `--no-delegate schedule:create` 明确降权。
+
+`runScopes` 默认空；配置为 `["bytedcli"]` 后，委托任务可在未来每次触发时使用原真人的 bytedcli 授权。来源 Bot 和目标 Bot 都必须启用 `triggerUserAuth`，且目标 Bot 应让 `lark-cli`、`bytedcli` 都经过隔离 wrapper，以保证复用会话不会继承历史身份；否则创建或执行会 fail-closed。该能力不会让 scheduled turn 变成通用真人 current actor，也不会持久化 lark-cli 权限。
+
+`selfManageEnabled:true` 允许 delegated scheduled turn 用 `botmux schedule pause self` 或 `botmux schedule remove self` 停止当前任务，不能修改 prompt/目标、恢复或强制运行任务，也不能管理其他任务或创建后继任务。`createEnabled:false` 只停止新签发，`runEnabled:false` 撤销已有委托任务的后续运行；删除 `runScopes` 或关闭 `selfManageEnabled` 会分别收回对应的持久权限。
+
+任务定义、授权、启停/完成状态和运行 claim 以宿主侧 SQLite 为准，`schedules.json` 只是可重建投影。首次升级会把当时已有任务清单一次性登记为 legacy；之后新增、复制或改写 JSON 记录不会获得执行资格。该边界保护受管 CLI 与文件沙盒，不承诺抵御能以同一系统用户任意读取宿主密钥和授权库的进程。
+
+因此 `schedule add/update/remove/pause/resume/run` 的写操作必须到达所属 Bot daemon；daemon 不可用或权威库初始化失败时命令会明确报错，不会只改写 `schedules.json` 后制造一个看似存在但永不执行的任务。
 
 ## 支持的格式
 
@@ -104,7 +164,31 @@ botmux schedule add "每日17:30" "生成日报" --new-topic
 botmux schedule add "每日17:30" "生成日报" --deliver new-topic
 ```
 
-也可以在 Dashboard 的「定时任务」页编辑任务，通过「执行位置」切换原话题、群消息顶层或每次新话题。
+也可以在 Dashboard 的「定时任务」页编辑任务，通过「执行位置」切换原话题、群消息顶层、每次新话题或任务独立话题。
+
+## 任务独立话题
+
+「每次新话题」让同一任务的每次触发都互不相干；群消息顶层则反过来，一群里所有顶层任务共用同一个群级会话。**任务独立话题**给每个任务一个只属于它自己的话题会话：
+
+- 同一任务的每次触发都落在**同一个话题**里，上下文连续，和固定话题任务一样；
+- 同一群里的不同任务各用各的话题，**彼此隔离、互不共享上下文**——巡检任务和日报任务不会串进同一段会话历史；
+- 话题在**首次触发时才创建**：非静默任务先发一条种子消息（任务开始横幅），并以这条消息作为话题 root；静默任务则延迟到机器人首次 `botmux send` 发言时才物化话题，与「每次新话题 + 静默」的行为一致。
+
+设置方式：
+
+- **自然语言**：在 prompt 前加「独立话题」或「专属话题」关键字（英文用 dedicated topic），可与「静默」组合、先后顺序不限，例如：
+
+```bash
+/schedule 每日18:00 独立话题 汇总今天的服务巡检结果
+/schedule 工作日9:00 静默 专属话题 生成晨报，有异常才说话
+```
+
+- **飞书定时卡片 / Dashboard**：卡片上点执行位置按钮循环切换，顺序为 **群消息顶层 → 每次新话题 → 任务独立话题 → 群消息顶层**；Dashboard「定时任务」表单的「执行位置」可直接选择。
+
+限制与注意：
+
+- 仅支持**单群任务**；多群任务不能选择任务独立话题。
+- 每任务模型与 `--topic` 相同：只有首次触发（创建该会话那次）生效，之后复用会话启动时的模型，详见下节。
 
 ## 跟随活跃话题
 
@@ -152,7 +236,7 @@ Dashboard 的「定时任务」页也有这两个字段，留空即跟随 Bot �
 | 执行位置 | 效果 |
 | --- | --- |
 | `--new-topic` | 每次触发都新起会话，模型**每次生效** |
-| `--topic` / `--top-level` | 只有创建该会话的那次触发生效；之后复用同一会话时，沿用它启动时的模型 |
+| 任务独立话题 / `--topic` / `--top-level` | 只有创建该会话的那次触发生效；之后复用同一会话时，沿用它启动时的模型 |
 
 需要每次都生效就用 `--new-topic`。CLI 和 Dashboard 在保存时都会按执行位置提示这一点。
 
@@ -165,4 +249,128 @@ Dashboard 的「定时任务」页也有这两个字段，留空即跟随 Bot �
 /schedule remove|enable|disable|run <id>
 ```
 
-> 执行行为：任务先按执行位置确定目标。显式设置 `--topic` 时，若目标话题的会话还活着，prompt 直接注入现有会话（不另起 worker）；否则新拉一个 worker，使用任务保存的工作目录。群顶层任务按 Bot / 群的会话模式选择会话。`--new-topic` 每次使用全新会话；配合 `--silent` 时，仅在首次 `botmux send` 需要发送内容时创建话题。
+> 执行行为：任务先按执行位置确定目标。显式设置 `--topic` 时，若目标话题的会话还活着，prompt 直接注入现有会话（不另起 worker）；否则新拉一个 worker，使用任务保存的工作目录。群顶层任务按 Bot / 群的会话模式选择会话。`--new-topic` 每次使用全新会话；配合 `--silent` 时，仅在首次 `botmux send` 需要发送内容时创建话题。任务独立话题在首次触发时创建该任务专属话题（非静默先发种子消息并以其为话题 root，静默延迟到首次 `botmux send` 才物化），此后每次触发都续入这同一个会话。
+
+## 原地修改提示词
+
+修改已有任务时使用 `update`，无需先删除再创建：
+
+```bash
+botmux schedule update <id> --prompt-file report-prompt.md
+# 短提示词也可以直接传入（两种方式只能选一种）
+botmux schedule update <id> --prompt "新的完整提示词"
+```
+
+文件按 UTF-8 读取，保留换行。更新只修改 prompt，保留任务 ID、定时规则、启停状态、执行位置和运行记录；不触发补跑。已经开始的执行继续使用原 prompt，后续执行采用新版。输入或权限校验失败不会删除旧任务；更新使用与其他任务操作相同的加锁原子存储。
+
+在定时任务创建的无 owner 话题中，Botmux 通过宿主 daemon 验证当前操作者，无需向沙盒开放机器人配置或凭据。CLI 与 daemon 应配套升级；旧 daemon 缺少此授权能力时会明确拒绝，而不会删除任务或绕过验证。
+
+绑定了守护前置条件（precondition）的任务不能用 `update` 修改：前置条件记录了任务输入的校验哈希，而其定义文件保存在宿主侧、沙盒内无法重绑；直接改 prompt 会让任务之后每次触发都校验失败、静默停止。这类任务请在 Dashboard 的定时任务页修改。
+
+## 自定义工作日历
+
+发布、日报和提醒可以按任务绑定工作日历。未绑定的存量任务保持原有行为；调度 tick 读取本地数据，不访问网络，也不让模型判断节假日。
+
+每份日历是独立实体，以稳定的 ID 绑定任务；界面显示名称与 ID 分开。任务可选择“仅工作日”或“仅休息日”，未选择日历则沿用原计划。未指定执行日期类型的已有绑定保持“仅工作日”。“休息日”包含该日历确认的非工作日期，例如未补班的周末和放假日；未知日期不属于可执行的休息日。内置 `cn`、未来增加的地区日历以及用户定义的 `company-shifts` 等日历，都使用相同的时区、覆盖区间、工作星期和日期覆盖规则。地区只是描述日历的可选元数据，不是调度器的分支或全局开关；不要求用户自定义日历归属于某个地区。同一 Bot 可拥有多份日历，不同任务可分别选择。
+
+新增内置日历只需添加数据并在 `src/services/work-calendars/catalog.ts` 注册实体，随后核实来源、日期及测试；解析与调度逻辑无需增加地区分支。用户自定义日历只需在本 Bot 的 `work-calendars.json` 添加命名数据，然后按名称绑定，不需要修改代码。
+
+### 中国大陆全国统一工作日历
+
+首期内置的法定日历显示为“中国法定工作日历 / China Statutory Work Calendar”（ID 为 `cn`）：中国大陆全国统一放假调休安排，时区为 `Asia/Shanghai`，包含平日放假和周末补班。**当前已核实覆盖 2026-01-01 至 2026-12-31**，无需创建 Bot 本地日历文件即可使用：
+
+```bash
+botmux schedule add "0 9 * * *" "生成日报" --calendar cn
+botmux schedule calendars
+```
+
+2026 年的权威依据是[国务院办公厅关于2026年部分节假日安排的通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)（国办发明电〔2025〕7号，2025-11-04 发布）；也可通过[北京市政府转载全文](https://www.beijing.gov.cn/zhengce/zhengcefagui/202511/t20251104_4258873.html)逐项核对。仓库的 `src/services/work-calendars/cn-2026.json` 保存日期、地区、适用范围、来源链接、文号、发布日期和数据版本；`schedule calendars` 输出这些来源信息。
+
+这里的“工作日”采用周一至周五基准，应用官方年度通知中的放假和补班覆盖，表示全国统一调休日历，不是所有单位、人员的实际出勤安排。地方额外节日、部分人群半日假、企业排班、港澳台及其他国家日历均不在首期内置范围内；通用本地 profile 保留为扩展能力，时区不能代替地区选择。
+
+年度数据通过读取官方通知、核对全部放假区间和补班日期、更新仓库快照及日期测试后随版本发布。更新入口与调度执行分开，不将网页抓取或第三方在线 API 放进 tick。覆盖范围外（包括尚未核实的 2027 年）返回 `calendar_out_of_coverage` 并停止自动执行，不推算或沿用上一年的安排；跨年前需升级包含下一年已核实数据的版本。
+
+`cn` 是保留的内置名称，Bot 本地文件无法覆盖它。缺失或损坏的本地扩展文件不会影响 `cn`，也不会把其他缺失名称自动降级成 `cn`。
+
+### 用户自定义日历
+
+在默认配置下，将下面格式的文件保存到 `~/.botmux/bots/<appId>/work-calendars.json`（与该 Bot 的 `schedules.json` 同目录）。自定义数据目录时仍使用任务存储所在目录；不同 Bot 的日历各自隔离，可以使用相同名称。建议将源文件纳入自己的版本管理，通过原子替换更新部署文件；下一次自动检查会读取新内容，无需重启 daemon。
+
+以下是**虚构演示数据，不是任何年份的法定放假或调休安排**：
+
+```json
+{
+  "version": 1,
+  "calendars": {
+    "demo": {
+      "timeZone": "Asia/Shanghai",
+      "displayNames": { "zh": "演示工作日历", "en": "Demo Work Calendar" },
+      "coverage": { "start": "2027-12-30", "end": "2028-12-31" },
+      "workWeek": [1, 2, 3, 4, 5],
+      "restDates": ["2028-01-04"],
+      "workDates": ["2028-01-01", "2028-01-08"]
+    }
+  }
+}
+```
+
+可在同一 `calendars` 对象中继续添加自己的日历，例如 `company-shifts`；每份定义独立设置时区、工作星期、休息和补班日期，任务通过 `--calendar company-shifts` 选择。内置日历的 ID 保留，自定义公司日历应使用自己的 ID，避免与内置官方数据混淆。
+
+| 字段 | 含义 |
+| --- | --- |
+| `version` | 文件 schema 版本，目前为 `1` |
+| `calendars` | 日历名到定义的映射，名称为 1–64 个字母、数字、`_` 或 `-`，首字符须为字母或数字 |
+| `displayNames` | 可选的中英文显示名称（`zh`、`en`）；未提供时显示日历 ID，界面语言切换不会改变绑定 |
+| `timeZone` | 日历使用的 IANA 时区；按实际执行瞬间换算当地日期，与 cron 的 `scheduleTimeZone` 分开配置 |
+| `coverage.start/end` | 已确认数据覆盖的闭区间，必须是有效 `YYYY-MM-DD` 日期 |
+| `workWeek` | 默认工作星期，`0` 是周日、`1` 是周一，以此类推；可为空数组 |
+| `restDates` | 覆盖默认星期的明确休息日期 |
+| `workDates` | 覆盖默认星期的明确工作日期（如周末补班） |
+
+除可选 `displayNames` 外，所有定义字段均必填；日期必须有效且处于覆盖范围内。重复日期、同一天同时列入休息和工作、重复星期、非法时区或反向覆盖区间都会拒绝该定义。文件最大 1 MiB。某个定义损坏不影响其他有效定义，但整个文件格式损坏会阻止所有绑定该文件的自动任务；内置 `cn` 不受影响。
+
+### 绑定和回读
+
+```bash
+# 每天产生 9:00 的候选触发，再按日历过滤
+botmux schedule add "0 9 * * *" "生成日报" --calendar cn
+
+# 读取本 Bot 日历定义与任务的日历预览
+botmux schedule calendars
+botmux schedule list
+
+# 更新或移除绑定，保留原来的 prompt、投递位置和 owner
+botmux schedule update <task-id> --calendar cn
+# 仅在休息日执行（工作日任务的默认值为 workday）
+botmux schedule update <task-id> --calendar-day-type restday
+botmux schedule update <task-id> --calendar none
+```
+
+CLI 的 `--calendar none` 是移除绑定的保留值，不作为日历名使用。绑定了受保护 Bash precondition 的任务需在 Dashboard 编辑，以便同时更新其 canonical input 绑定。
+
+Dashboard 的“自定义工作日历”区域通过下拉框选择日历，内置日历显示正式中英文名称；“执行日期”可选“仅工作日 / Workdays only”或“仅休息日 / Rest days only”。选择“不使用工作日历”取消绑定。日历列表按所属 Bot 加载，包含本地自定义日历。任务行显示原始“下次”触发、日历名称、日历判断原因和“日历允许的下次触发”。API 的创建/更新 DTO 使用 `calendar: "cn"` 和 `calendarDayType: "workday" | "restday"`（默认 `workday`），更新时 `calendar: null` 清除；列表回读包含 `calendar`、`calendarCheck`、`nextEligibleRunAt`，以及最近一次检查的 `lastCalendarCheck`。
+
+日历允许的下次触发是预览：它只过滤已有 cron/interval 候选，不保证 Bash precondition 通过、模型成功或消息投递成功。原始 `nextRunAt` 保留原调度语义。扫描最多 10,000 个候选本地日期；无法确认时返回 `null` 和明确原因（如 `search_limit` / `calendar_out_of_coverage`），不退化成周一至周五，也不会把未知日期当作休息日。
+
+### 自动、一次性和手动执行语义
+
+| 触发方式 | 日历行为 |
+| --- | --- |
+| 自动 cron | 在执行入口判断实际当地日期；只有所选的工作日或休息日允许执行，其他日期跳过，继续等待原 cron 的下一次候选 |
+| 自动 interval | 同样过滤；跳过后继续原 interval 调度，不累积补跑；预览从当前计划保持间隔相位 |
+| once | 本 MVP 不支持绑定；创建或更新时拒绝，损坏/外部写入的 once 绑定也不会自动执行 |
+| Dashboard“立即执行” / `schedule run` | 显式手动执行绕过日历，保留原有 precondition 和执行规则；记录 `manual_bypass`。CLI 请求意图持久化并由所属 Bot 消费；停机超过补偿窗口后重启仍执行一次并消费意图，后续自动到期重新检查日历 |
+
+暂停任务会取消尚未消费的 CLI 手动执行请求；暂停态的 `schedule run` 会拒绝并提示先恢复任务。恢复暂停任务时也清理历史残留请求，随后按原计划和日历判断，不会继承暂停前的日历绕过。对已启用任务重复恢复，不会延后它已有的有效手动请求。修改调度规则会取消旧规则下尚未消费的手动请求，新规则的自动触发重新检查日历；仅修改名称等字段或保存相同规则会保留有效请求。Dashboard“立即执行”仍是当次直接执行，不排队到未来，也不恢复任务的自动计划。
+
+自动判断先于可能产生宿主副作用的 Bash precondition、模型调用、话题创建和消息通知。不符合所选日期类型时记录 `lastStatus: skipped`、执行日志 `calendar_skipped`、`schedule.fired` hook 的 `status: skipped`，不会被计作执行失败，也不消耗有限重复次数。日历缺失、损坏、Bot scope 缺失或日期超覆盖时不执行，记录错误原因，不扣重复次数、不自动禁用任务；修复数据后可在后续候选继续执行。未绑定任务不受这些错误影响。
+
+常见原因：`work_date` / `work_week` 表示允许，`rest_date` / `rest_week` 表示跳过；`calendar_missing`、`calendar_invalid`、`calendar_out_of_coverage` 分别表示定义不存在、不可解析/验证、日期没有已确认覆盖。实际日期类型、所选执行日期、是否匹配、显示名称、日期和时区随执行日志记录，正常允许与手动绕过也保留检查结果。
+
+### 业务迁移
+
+要按中国大陆全国统一工作日运行，核对内置 `cn` 的覆盖年份，再用 **daily cron + calendar**。本地扩展需自行核实来源和日期。`0 9 * * 1-5` 本身没有周末候选，绑定日历不能创造周末触发。
+
+如果业务 worker 自己硬编码 `weekday < 5`，后续还需去除重复的星期过滤，否则调度器允许的周末补班仍会被 worker 跳过。本功能不会修改业务 worker。
+
+发布后的延迟补偿、既有版本验收或其他需要跨非工作日继续的流程，使用另一个**不绑定日历**的任务表达。日历按任务选择，不引入全局工作日开关或重试框架。

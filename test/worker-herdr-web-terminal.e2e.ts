@@ -299,4 +299,104 @@ herdr pane report-agent "$HERDR_PANE_ID" \\
     },
     35_000,
   );
+
+  it.skipIf(!HerdrBackend.isAvailable())(
+    'publishes the adopted Herdr pane CLI pid and start identity before ready',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-adopt-attest-'));
+      tempDirs.add(root);
+      const paneMarker = `botmux-adopt-attest-${Date.now().toString(36)}`;
+      const fakeAgent = join(root, 'pi');
+      writeFileSync(fakeAgent, `#!/bin/bash
+export HERDR_AGENT=pi
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-worker-e2e --agent pi --state idle >/dev/null 2>&1
+/bin/bash "$@"
+`);
+      chmodSync(fakeAgent, 0o755);
+      const externalSession = `adopt-attest-${Date.now().toString(36)}`;
+      sessions.add(externalSession);
+      const external = new HerdrBackend(externalSession);
+      external.spawn(fakeAgent, ['-lc', `echo ${paneMarker}; while :; do sleep 1; done`], {
+        cwd: root,
+        cols: 100,
+        rows: 30,
+        env: { ...process.env } as Record<string, string>,
+      });
+      await waitFor(
+        () => external.captureCurrentScreen().includes(paneMarker),
+        10_000,
+        'external pane initial marker',
+      );
+      // The Herdr backend never records the external pane's CLI pid, so resolve
+      // the live pane process from the OS by its unique marker command instead
+      // of falling back to this test runner's pid.
+      const panePid = await waitFor(
+        () => {
+          try {
+            const out = execFileSync('pgrep', ['-f', paneMarker], { encoding: 'utf8' }).trim();
+            const pid = out.split('\n').map(Number).find(n => Number.isInteger(n) && n > 1 && n !== process.pid);
+            return pid ?? null;
+          } catch { return null; }
+        },
+        10_000,
+        'external pane process pid',
+      );
+      expect(Number.isInteger(panePid) && panePid > 1).toBe(true);
+
+      const sessionId = `hratt${Date.now().toString(36)}`;
+      const logs: string[] = [];
+      const messages: WorkerToDaemon[] = [];
+      const child = spawnWorker(root, sessionId, logs);
+      child.on('message', raw => messages.push(raw as WorkerToDaemon));
+      const paneId = agentPaneId(externalSession);
+      child.send({
+        type: 'init',
+        sessionId,
+        chatId: 'oc_herdr_adopt_attest',
+        rootMessageId: 'om_herdr_adopt_attest',
+        workingDir: root,
+        cliId: 'claude-code',
+        backendType: 'herdr',
+        prompt: '',
+        larkAppId: 'app_worker_herdr_e2e',
+        larkAppSecret: 'secret',
+        turnId: 'om_turn',
+        adoptMode: true,
+        adoptSource: 'herdr',
+        adoptHerdrSessionName: externalSession,
+        adoptHerdrTarget: paneId,
+        adoptHerdrPaneId: paneId,
+        adoptCliPid: panePid,
+        adoptPaneCols: 100,
+        adoptPaneRows: 30,
+      } satisfies DaemonToWorker);
+
+      const ready = await waitForReady(child, logs);
+      const attestation = messages.find(
+        (m): m is Extract<WorkerToDaemon, { type: 'local_process_attestation' }> =>
+          m.type === 'local_process_attestation',
+      );
+      expect(attestation, JSON.stringify(messages)).toBeDefined();
+      expect(attestation!.cliPid).toBe(panePid);
+      expect(typeof attestation!.cliProcStart === 'string' && attestation!.cliProcStart!.length > 0).toBe(true);
+      expect(attestation!.backendType).toBe('herdr');
+      const attestationIndex = messages.findIndex(m => m.type === 'local_process_attestation');
+      const readyIndex = messages.findIndex(m => m.type === 'ready');
+      expect(attestationIndex).toBeGreaterThanOrEqual(0);
+      expect(attestationIndex).toBeLessThan(readyIndex);
+      // The attestation must precede the current turn's origin snapshot: the
+      // daemon records this CLI pid before it snapshots the turn's pre-existing
+      // descendants, so a managed_turn_origin for om_turn follows the attestation.
+      const originAfter = messages.findIndex(
+        (m, i) => i > attestationIndex && m.type === 'managed_turn_origin' && m.turnId === 'om_turn',
+      );
+      expect(originAfter).toBeGreaterThan(attestationIndex);
+
+      void ready;
+      child.send({ type: 'close' } satisfies DaemonToWorker);
+      external.destroySession();
+    },
+    35_000,
+  );
 });

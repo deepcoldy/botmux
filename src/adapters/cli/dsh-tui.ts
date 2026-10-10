@@ -1,3 +1,4 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
@@ -167,7 +168,7 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // its own profile config / persisted /model choice, and the bot's model
     // field carries no provider — hardcoding deepseek-official would break
     // multi-provider setups. Users pick the model in the TUI (/model).
-    modelChoices: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+    modelChoices: CLI_MODEL_CHOICES['dsh-tui'],
   };
 }
 

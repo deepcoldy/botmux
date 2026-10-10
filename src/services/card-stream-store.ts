@@ -38,6 +38,8 @@ export class CardStreamStoreError extends Error {
 }
 
 export interface CardStreamSequenceLease {
+  /** Bound while holding the existing stream lock, including after restart. */
+  messageId: string;
   cardId: string;
   sequence: number;
   uuid: string;
@@ -191,7 +193,7 @@ export class CardStreamStore {
       const sequence = nextSequence(record);
       record = { ...record, sequence, updatedAt: now };
       this.writeRecord(path, record);
-      await enableStreaming({ cardId, sequence, uuid: this.uuidFor(streamId, sequence) });
+      await enableStreaming({ messageId: record.messageId, cardId, sequence, uuid: this.uuidFor(streamId, sequence) });
       record = { ...record, status: 'open', updatedAt: new Date().toISOString() };
       this.writeRecord(path, record);
       return { record, alreadyOpen: false };
@@ -221,6 +223,7 @@ export class CardStreamStore {
       const reserved = { ...record, sequence, updatedAt: new Date().toISOString() };
       this.writeRecord(path, reserved);
       await writeContent({
+        messageId: record.messageId,
         cardId: record.cardId,
         sequence,
         uuid: this.uuidFor(streamId, sequence),
@@ -265,6 +268,7 @@ export class CardStreamStore {
       const reserved = { ...record, sequence, updatedAt: new Date().toISOString() };
       this.writeRecord(path, reserved);
       await disableStreaming({
+        messageId: record.messageId,
         cardId: record.cardId,
         sequence,
         uuid: this.uuidFor(streamId, sequence),

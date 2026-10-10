@@ -84,6 +84,52 @@ describe('card-prefs store — 主动开工 fields', () => {
     return JSON.parse(readFileSync(configPath, 'utf-8'))[0];
   }
 
+  it('preserves legacy CoT opt-out across unrelated edits and migrates only an explicit toggle', async () => {
+    writeConfig({ thinkingCard: false });
+    const { registry, store, botConfigStore } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotCardPrefs('app_default').cotEnabled).toBe(false);
+    const unrelated = await store.updateBotCardPrefs('app_default', { privateCard: true });
+    expect(unrelated).toMatchObject({ ok: true, prefs: { cotEnabled: false } });
+    expect(readConfig().thinkingCard).toBe(false);
+    const on = await store.updateBotCardPrefs('app_default', { cotEnabled: true });
+    expect(on).toMatchObject({ ok: true, prefs: { cotEnabled: true } });
+    expect(readConfig().thinkingCard).toBeUndefined();
+    expect(registry.loadBotConfigs()[0].cotEnabled).not.toBe(false);
+    // Old command syntax remains usable and writes the canonical preference.
+    await botConfigStore.applyConfigField('app_default', botConfigStore.findConfigField('thinkingCard')!, false);
+    expect(registry.loadBotConfigs()[0].cotEnabled).toBe(false);
+  });
+
+  it('canonical CoT booleans override legacy values and config enable survives cold loading', async () => {
+    writeConfig({ thinkingCard: false, cotEnabled: true });
+    const { registry, botConfigStore } = await freshModules();
+    expect(registry.loadBotConfigs()[0].cotEnabled).not.toBe(false);
+    writeConfig({ thinkingCard: false });
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    await botConfigStore.applyConfigField('app_default', botConfigStore.findConfigField('cotEnabled')!, true);
+    expect(readConfig().thinkingCard).toBeUndefined();
+    expect(registry.loadBotConfigs()[0].cotEnabled).not.toBe(false);
+    writeConfig({ thinkingCard: true, cotEnabled: false });
+    expect(registry.loadBotConfigs()[0].cotEnabled).toBe(false);
+  });
+
+  it('persists per-bot exclusions, keeps them on unrelated saves, and clears them', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual([]);
+    await store.updateBotCardPrefs('app_default', { autoStartExcludedChats: ['oc_quiet'] });
+    await store.updateBotCardPrefs('app_default', { autoStartOnNewTopic: true });
+    expect(readConfig().autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(registry.loadBotConfigs()[0].autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(registry.getBot('app_default').config.autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual(['oc_quiet']);
+    await store.updateBotCardPrefs('app_default', { autoStartExcludedChats: [] });
+    expect(readConfig().autoStartExcludedChats).toBeUndefined();
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual([]);
+  });
+
   it('defaults to false/empty when unset (FR-10)', async () => {
     writeConfig();
     const { registry, store } = await freshModules();
@@ -91,14 +137,44 @@ describe('card-prefs store — 主动开工 fields', () => {
 
     const prefs = store.getBotCardPrefs('app_default');
     expect(prefs.pinStreamingCard).toBe(false);
+    expect(prefs.replyCardMode).toBe('legacy');
     expect(prefs.hiddenStreamingCardButtons).toEqual([]);
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.codexAppCleanInput).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
     expect(prefs.autoStartOnGroupJoinSeed).toBe('');
+    expect(prefs.groupJoinCommandEnabled).toBe(false);
+    expect(prefs.groupJoinCommand).toBe('');
     expect(prefs.regularGroupReplyMode).toBe('chat-topic');
     expect(prefs.regularGroupMentionMode).toBe('always');
+  });
+
+  it('persists reply mode through registry reload without changing other card preferences', async () => {
+    writeConfig({ cotEnabled: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect((await store.updateBotCardPrefs('app_default', { replyCardMode: 'unified' })).ok).toBe(true);
+    expect(store.getBotCardPrefs('app_default').replyCardMode).toBe('unified');
+    expect(registry.loadBotConfigs()[0].replyCardMode).toBe('unified');
+    expect(readConfig()).toMatchObject({ cotEnabled: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
+    await store.updateBotCardPrefs('app_default', { replyCardMode: 'legacy' });
+    expect(readConfig().replyCardMode).toBeUndefined();
+  });
+
+  it('preserves the retired status-card opt-out until that independent switch is changed', async () => {
+    writeConfig({ replyCardMode: 'final-only', noCardChats: ['oc_quiet'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotCardPrefs('app_default')).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    await store.updateBotCardPrefs('app_default', { cotEnabled: false });
+    expect(readConfig()).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
+    await store.updateBotCardPrefs('app_default', { replyCardMode: 'unified' });
+    expect(store.getBotCardPrefs('app_default').disableStreamingCard).toBe(true);
+    await store.updateBotCardPrefs('app_default', { disableStreamingCard: false });
+    expect(store.getBotCardPrefs('app_default')).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: false });
+    expect(registry.loadBotConfigs()[0].disableStreamingCard).toBeUndefined();
+    expect(readConfig().noCardChats).toEqual(['oc_quiet']);
   });
 
   it('persists toggles + prompt to bots.json and syncs in-memory config (FR-9)', async () => {
@@ -138,6 +214,28 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(cfg.autoStartOnGroupJoinPrompt).toBe('  先做代码审查再回答 ');
     expect(cfg.regularGroupReplyMode).toBe('shared');
     expect(cfg.regularGroupMentionMode).toBe('never');
+  });
+
+  it('group-join command round-trips (trimmed) and clears to absent keys', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const on = await store.updateBotCardPrefs('app_default', {
+      groupJoinCommandEnabled: true,
+      groupJoinCommand: '  bash /opt/on-join.sh --fast ',
+    });
+    expect(on.ok && on.prefs).toMatchObject({ groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh --fast' });
+    expect(readConfig()).toMatchObject({ groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh --fast' });
+    const cfg = registry.getBot('app_default').config;
+    expect(cfg.groupJoinCommandEnabled).toBe(true);
+    expect(cfg.groupJoinCommand).toBe('bash /opt/on-join.sh --fast');
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh --fast' });
+
+    await store.updateBotCardPrefs('app_default', { groupJoinCommandEnabled: false, groupJoinCommand: '   ' });
+    expect(readConfig().groupJoinCommandEnabled).toBeUndefined();
+    expect(readConfig().groupJoinCommand).toBeUndefined();
+    expect(registry.getBot('app_default').config.groupJoinCommand).toBeUndefined();
   });
 
   it('silentTurnReactions round-trips through the dashboard card-prefs store', async () => {

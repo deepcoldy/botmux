@@ -25,8 +25,8 @@ export const MAX_SCHEDULE_RUN_LOG_ENTRIES = 100;
 export const MAX_SCHEDULE_RUN_LOG_ERROR_BYTES = 2 * 1024;
 
 export type ScheduleRunTrigger = 'scheduler' | 'dashboard';
-export type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'error';
-export type ScheduleRunPrecondition = 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
+export type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'calendar_skipped' | 'error';
+export type ScheduleRunPrecondition = 'not_checked' | 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
 export type ScheduleRunTargetOutcome = 'model_dispatched' | 'error';
 
 export interface ScheduleRunTargetResult {
@@ -46,6 +46,7 @@ export interface ScheduleRunLogEntry {
   durationMs: number;
   /** Whether the Bash gate supplied extra prompt content; never stores it. */
   additionalPrompt: boolean;
+  calendarCheck?: import('./work-calendar.js').CalendarCheck;
   errorCode?: string;
   error?: string;
   /** Per-chat dispatch results for multi-chat tasks. Absent on legacy records. */
@@ -69,9 +70,11 @@ const TRIGGERS = new Set<ScheduleRunTrigger>(['scheduler', 'dashboard']);
 const OUTCOMES = new Set<ScheduleRunOutcome>([
   'model_dispatched',
   'precondition_skipped',
+  'calendar_skipped',
   'error',
 ]);
 const PRECONDITIONS = new Set<ScheduleRunPrecondition>([
+  'not_checked',
   'none',
   'disabled',
   'passed',
@@ -188,6 +191,20 @@ function assertRegularFile(path: string): boolean {
   return true;
 }
 
+function projectCalendarCheck(value: unknown): ScheduleRunLogEntry['calendarCheck'] {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.calendar !== 'string' || typeof raw.reason !== 'string'
+    || !['working', 'rest', 'error', 'bypassed'].includes(String(raw.status))) return undefined;
+  return { calendar: raw.calendar, status: raw.status as 'working' | 'rest' | 'error' | 'bypassed',
+    ...(raw.dayType === 'workday' || raw.dayType === 'restday' ? { dayType: raw.dayType } : {}),
+    ...(typeof raw.matches === 'boolean' ? { matches: raw.matches } : {}),
+    ...(raw.displayNames && typeof raw.displayNames === 'object' ? { displayNames: Object.fromEntries(Object.entries(raw.displayNames).filter(([key, value]) => ['zh', 'en'].includes(key) && typeof value === 'string' && value.length <= 120)) } : {}),
+    reason: raw.reason as NonNullable<ScheduleRunLogEntry['calendarCheck']>['reason'],
+    ...(typeof raw.date === 'string' ? { date: raw.date } : {}),
+    ...(typeof raw.timeZone === 'string' ? { timeZone: raw.timeZone } : {}) };
+}
+
 function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEntry | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
@@ -220,6 +237,7 @@ function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEn
     finishedAt: raw.finishedAt,
     durationMs: raw.durationMs,
     additionalPrompt: raw.additionalPrompt,
+    ...(projectCalendarCheck(raw.calendarCheck) ? { calendarCheck: projectCalendarCheck(raw.calendarCheck)! } : {}),
     ...(raw.errorCode !== undefined ? { errorCode: raw.errorCode } : {}),
     ...(raw.error !== undefined
       ? { error: truncateUtf8(raw.error, MAX_SCHEDULE_RUN_LOG_ERROR_BYTES) }

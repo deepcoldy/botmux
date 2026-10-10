@@ -59,10 +59,19 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
   else process.env.SESSION_DATA_DIR = prevDataDir;
   rmSync(dataDir, { recursive: true, force: true });
 });
+
+/** Fake /proc identities must never authorize signals to host PIDs. A forked
+ * test has its own JS globals, but still shares the host PID namespace with
+ * every other test worker. Real-process cases below keep the real kill(). */
+function isolatedSyntheticProc(name: string) {
+  vi.spyOn(process, 'kill').mockReturnValue(true);
+  return syntheticProcRoot({ parent: dataDir, name });
+}
 
 /** A weak handle naming a pid that is definitely NOT the recorded process. */
 function staleWeakHandle(sessionId: string, rootPid: number): ContainmentHandle {
@@ -165,7 +174,7 @@ describe('A3: rootPid === null no longer means "no subtree"', () => {
     // synthetic /proc keeps reporting it, which is what an uninterruptible or
     // otherwise unkillable process looks like from here.
     const sessionId = 'sess-inherited-unkillable';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-unkillable' });
+    const proc = isolatedSyntheticProc('proc-unkillable');
     proc.addProcess({ pid: 7000, state: 'S', pgid: 7000, startTime: 555 });
     recordContainmentHandle({
       kind: 'tree-identity', sessionId, generation: 0,
@@ -306,7 +315,7 @@ describe('A5: a workerless close must prove the local subtree', () => {
     // The workerless path must use the SAME definition of "running" as teardown,
     // or a dead worker's reaped subtree would block the close forever.
     const sessionId = 'sess-workerless-zombie';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-workerless-zombie' });
+    const proc = isolatedSyntheticProc('proc-workerless-zombie');
     proc.addProcess({ pid: 5150, state: 'Z', pgid: 5150, startTime: 999 });
 
     recordContainmentHandle({
@@ -325,7 +334,7 @@ describe('A5: a workerless close must prove the local subtree', () => {
 
   it('still refuses a workerless close when a live member remains beside a zombie', () => {
     const sessionId = 'sess-workerless-zombie-live';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-workerless-mixed' });
+    const proc = isolatedSyntheticProc('proc-workerless-mixed');
     proc.addProcess({ pid: 5150, state: 'Z', pgid: 5150, startTime: 999 });
     proc.addProcess({ pid: 5151, name: 'kid', state: 'S', ppid: 5150, pgid: 5150, startTime: 1000 });
 
@@ -439,7 +448,7 @@ describe('A3: a failed scan is not an empty subtree (backend teardown path)', ()
     // into `pids: []` the handle would be released on evidence that never
     // existed — this is the one shape where fail-open is invisible.
     const sessionId = 'sess-teardown-scan-fails';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-scan-fails' });
+    const proc = isolatedSyntheticProc('proc-scan-fails');
     // The recorded root, with a starttime the handle will agree with.
     proc.addProcess({ pid: 4242, state: 'S', pgid: 4242, startTime: 777 });
     // A SECOND pid whose stat is unparsable, which fails the whole scan.
@@ -581,7 +590,7 @@ describe('the handle proof and the in-memory ladder must agree about zombies', (
     // could never be discharged — a permanent, unrecoverable block on a process
     // that executes nothing.
     const sessionId = 'sess-zombie-agree';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-zombie' });
+    const proc = isolatedSyntheticProc('proc-zombie');
     // The recorded root, still present but REAPED (state Z).
     proc.addProcess({ pid: 4242, state: 'Z', pgid: 4242, startTime: 777 });
 
@@ -604,7 +613,7 @@ describe('the handle proof and the in-memory ladder must agree about zombies', (
 
   it('still refuses when a non-zombie member remains alongside a zombie', async () => {
     const sessionId = 'sess-zombie-plus-live';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-zombie-live' });
+    const proc = isolatedSyntheticProc('proc-zombie-live');
     proc.addProcess({ pid: 4242, state: 'Z', pgid: 4242, startTime: 777 });
     // A descendant in the same group that is genuinely running.
     proc.addProcess({ pid: 4243, name: 'kid', state: 'R', ppid: 4242, pgid: 4242, startTime: 778 });
@@ -618,6 +627,8 @@ describe('the handle proof and the in-memory ladder must agree about zombies', (
     }
     const backend = new ZombiePlusLive({ model: 'default' } as never, sessionId);
     const outcome = await backend['terminateChildProven']();
+    expect(process.kill).toHaveBeenCalledWith(-4242, 'SIGKILL');
+    expect(process.kill).toHaveBeenCalledWith(4243, 'SIGKILL');
     expect(outcome.ok).toBe(false);
     expect(outcome.boundaryProven).toBe(false);
     expect(outcome.residual?.deviceIsolation).toBe(true);
@@ -651,7 +662,7 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     // meant "signal nothing", that survivor would be re-proven alive on every retry
     // and the session could never be closed at all.
     const sessionId = 'sess-escaped-member';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-escaped' });
+    const proc = isolatedSyntheticProc('proc-escaped');
     // The recorded root is GONE from /proc entirely...
     // ...but an escaped descendant survives in its own session, found by the nonce.
     proc.addProcess({
@@ -665,12 +676,7 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     recordContainmentHandle(handle);
 
     const sent: number[] = [];
-    const realKill = process.kill.bind(process);
-    const spy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
-      sent.push(pid);
-      if (Math.abs(pid) === 9100 || Math.abs(pid) === 9000) return true;   // synthetic
-      return realKill(pid, sig as NodeJS.Signals);
-    }) as typeof process.kill);
+    const spy = vi.mocked(process.kill).mockImplementation(pid => { sent.push(pid); return true; });
     try {
       class FakeProc extends MojoBackend {
         protected get procRoot(): string { return proc.path; }
@@ -691,7 +697,7 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     // recycled pid that is a stranger's group, which is unrecoverable — so it must
     // be sent ONLY when the recorded identity still verifies.
     const sessionId = 'sess-group-gate';
-    const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-group-gate' });
+    const proc = isolatedSyntheticProc('proc-group-gate');
     // The live process wears the recorded pid but a DIFFERENT starttime — a
     // recycled root. It still carries the tree nonce so per-member attribution
     // (the only signal a failed identity leaves) can claim it.
@@ -705,12 +711,7 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     } as const;
 
     const sent: number[] = [];
-    const realKill = process.kill.bind(process);
-    const spy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
-      sent.push(pid);
-      if (pid === 8000 || pid === -8000) return true;   // synthetic; never really signal
-      return realKill(pid, sig as NodeJS.Signals);
-    }) as typeof process.kill);
+    const spy = vi.mocked(process.kill).mockImplementation(pid => { sent.push(pid); return true; });
     try {
       class FakeProc extends MojoBackend {
         protected get procRoot(): string { return proc.path; }

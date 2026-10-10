@@ -20,6 +20,7 @@ import {
   type PreparedRemoteShutdown,
 } from '../src/core/remote-shutdown-detach.js';
 import { sendWorkerInput } from '../src/core/worker-pool.js';
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { mutatePersistedSessionRow } from './helpers/session-store-disk.js';
 
@@ -49,14 +50,14 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     config.session.dataDir = previousDataDir;
-    sessionStore.init();
+    sessionStore.init('test-app');
     rmSync(dataDir, { recursive: true, force: true });
   });
 
   function fixture(
     initialTaskId: string | undefined,
     onSend: (worker: FakeWorker, message: any) => void,
-    backendType: 'riff' | 'mojo' = 'riff',
+    backendType: 'riff' | 'mojo' | 'remote-runner' = 'riff',
   ): { ds: DaemonSession; worker: FakeWorker; messages: any[] } {
     const session = sessionStore.createSession('oc_riff', 'om_riff', 'riff shutdown', 'group');
     session.larkAppId = 'app';
@@ -83,6 +84,7 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       workerPort: 4100,
       workerToken: 'write',
       workerViewToken: 'view',
+      workerCardViewToken: 'card-view',
       managedTurnOrigin: { capability: 'cap' },
       initConfig: { backendType },
     } as unknown as DaemonSession;
@@ -167,6 +169,107 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       'remote_shutdown_commit',
     ]);
     expect(f.ds.worker).toBeNull();
+    expect(f.ds.workerViewToken).toBeNull();
+    expect(f.ds.workerCardViewToken).toBeNull();
+  });
+
+  it('detaches a generic remote runner without aliasing its state into Riff lineage', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: null,
+        }));
+      }
+    }, 'remote-runner');
+    f.ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'test-provider',
+      generation: 2,
+      remoteSessionId: 'remote-2',
+      agentThreadId: 'thread-1',
+    };
+    sessionStore.updateSession(f.ds.session);
+
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
+    expect(prepared.taskId).toBeNull();
+    expect(persistPreparedRemoteShutdown(f.ds, prepared)).toEqual({ ok: true });
+    const persisted = sessionStore.getSessionFresh(f.ds.session.sessionId);
+    expect(persisted?.riffParentTaskId).toBeUndefined();
+    expect(persisted).toMatchObject({
+      remoteBackendState: {
+        remoteSessionId: 'remote-2',
+        agentThreadId: 'thread-1',
+      },
+    });
+    expect(commitPreparedRemoteShutdown(f.ds, prepared)).toBe(true);
+    expect(f.messages.map(message => message.type)).toEqual([
+      'remote_shutdown_prepare',
+      'remote_shutdown_commit',
+    ]);
+  });
+
+  it('keeps the prepared remote generation fenced until its final reply delivery settles', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: null,
+        }));
+      }
+    }, 'remote-runner');
+    const finishDelivery = beginFinalOutputDelivery(f.ds);
+    let prepared = false;
+    const preparing = prepareRemoteSessionForShutdown(f.ds, {
+      finalOutputDrainTimeoutMs: 1_000,
+    }).then(result => {
+      prepared = true;
+      return result;
+    });
+
+    await vi.waitFor(() => {
+      expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(prepared).toBe(false);
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'preparing' });
+
+    finishDelivery();
+    await expect(preparing).resolves.toMatchObject({ ok: true, fence: 'prepared' });
+  });
+
+  it('keeps the remote fence explicit when final reply delivery misses its drain budget', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: null,
+        }));
+      }
+    }, 'remote-runner');
+    const finishDelivery = beginFinalOutputDelivery(f.ds);
+
+    const result = await prepareRemoteSessionForShutdown(f.ds, {
+      finalOutputDrainTimeoutMs: 5,
+    });
+    finishDelivery();
+
+    expect(result).toMatchObject({
+      ok: false,
+      fence: 'possible',
+      error: 'final_output_delivery_drain_timeout',
+      expectedAbortTaskId: null,
+    });
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'preparing' });
   });
 
   it('retains only the ambiguous session fence and restores an unrelated prepared peer', async () => {

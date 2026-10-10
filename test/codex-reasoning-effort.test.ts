@@ -5,9 +5,24 @@ import {
   cliModelSupportsReasoningEffort,
   codexModelSupportsReasoningEffort,
   codexReasoningEffortsForModel,
+  isBackendVariantCliId,
   isConfigurableReasoningCliId,
   reasoningEffortsForCliModel,
 } from '../src/services/codex-reasoning-effort.js';
+
+describe('Kimi managed K3 reasoning efforts', () => {
+  it('accepts only the native K3 levels on managed K3 model aliases', () => {
+    expect(isConfigurableReasoningCliId('kimi')).toBe(true);
+    for (const model of ['kimi-code/k3', 'kimi-code/k3-256k']) {
+      expect(reasoningEffortsForCliModel('kimi', model)).toEqual(['low', 'high', 'max']);
+      expect(cliModelSupportsReasoningEffort('kimi', model, 'max')).toBe(true);
+      expect(cliModelSupportsReasoningEffort('kimi', model, 'medium')).toBe(false);
+    }
+    for (const model of [undefined, 'custom-provider/model', 'kimi-code/kimi-for-coding-highspeed']) {
+      expect(reasoningEffortsForCliModel('kimi', model)).toEqual([]);
+    }
+  });
+});
 
 describe('Codex model-aware reasoning efforts', () => {
   it('exposes six levels only for sol and terra', () => {
@@ -26,10 +41,18 @@ describe('Codex model-aware reasoning efforts', () => {
   });
 });
 describe('Grok model-aware reasoning efforts', () => {
+  it('limits backend variants to local or remote TraeX launch paths', () => {
+    expect(isBackendVariantCliId('traex')).toBe(true);
+    expect(isBackendVariantCliId('remote-runner')).toBe(true);
+    expect(isBackendVariantCliId('codex')).toBe(false);
+    expect(isBackendVariantCliId(undefined)).toBe(false);
+  });
+
   it('treats grok as a configurable reasoning CLI', () => {
     expect(isConfigurableReasoningCliId('grok')).toBe(true);
     expect(isConfigurableReasoningCliId('codex')).toBe(true);
     expect(isConfigurableReasoningCliId('traex')).toBe(true);
+    expect(isConfigurableReasoningCliId('remote-runner')).toBe(true);
     expect(isConfigurableReasoningCliId('claude-code')).toBe(true);
     expect(isConfigurableReasoningCliId('gemini')).toBe(false);
   });
@@ -66,6 +89,11 @@ describe('TraeX model-aware reasoning efforts', () => {
     expect(reasoningEffortsForCliModel('traex', 'custom-model')).toEqual(['low', 'medium', 'high']);
     expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'medium')).toBe(true);
     expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'xhigh')).toBe(false);
+    expect(reasoningEffortsForCliModel('remote-runner', 'GPT-5.6-Sol'))
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    expect(cliModelSupportsReasoningEffort('remote-runner', 'GPT-5.6-Sol', 'xhigh')).toBe(true);
+    expect(reasoningEffortsForCliModel('remote-runner', 'provider-specific-model'))
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
   });
 });
 

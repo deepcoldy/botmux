@@ -698,7 +698,7 @@ describe('Agent Workbench 未读与分组维度', () => {
     // 默认维度是「状态」，也就是改版前那套分组。
     expect(select.props.value).toBe('status');
     expect(select.findAllByType('option').map(textOf))
-      .toEqual(['状态', '机器人', '会话位置', '类型', 'CLI', '活跃时间']);
+      .toEqual(['状态', '机器人', '会话位置', '类型', 'CLI', '活跃时间', 'Worktree']);
     expect(groupHeaderLabels(renderer)).toEqual(['进行中']);
 
     // 切到「机器人」：组头换成机器人名，按最新活跃排序（session-1 更新）。

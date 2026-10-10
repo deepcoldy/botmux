@@ -20,6 +20,10 @@ import {
   buildBotmuxSystemPromptText,
 } from '../src/adapters/cli/shared-hints.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
+import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+
+const policy = parseTriggerUserAuthConfig({ enabled: true })!;
 
 /** Stub only getBot: the credential block is gated on this bot's config, and
  *  everything else session-manager imports from the registry must stay real. */
@@ -33,8 +37,39 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => ({
 }));
 
 describe('buildCredentialBoundaryBlock', () => {
+  it.each(['zh', 'en'] as const)('names the governed tools and configured git host in %s', (locale) => {
+    const lark = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli'], gitHost: 'code.example.com' }, locale);
+    expect(lark).toContain(locale === 'zh' ? '已为 lark-cli 启用' : 'credentials for lark-cli.');
+    expect(lark).not.toContain('code.example.com');
+    expect(lark).not.toContain('/login bytedcli');
+
+    const byted = buildCredentialBoundaryBlock({ ...policy, tools: ['bytedcli'] }, locale);
+    expect(byted).toContain(locale === 'zh' ? '已为 bytedcli 启用' : 'credentials for bytedcli.');
+    expect(byted).not.toContain('git');
+    expect(byted).not.toContain('missing_scope');
+    expect(byted).toContain(locale === 'zh' ? 'stderr 已附授权链接' : 'If stderr carries an authorization link');
+    expect(byted).toContain(locale === 'zh' ? '只需授权一次、自动续期' : 'authorize just once, it renews automatically');
+    // The Feishu-specific failure flow must follow the same gate as lark-cli.
+    // Discriminate on that line itself: on_auth_link is emitted for every tool
+    // and also mentions `botmux auth request`, so the shared phrase cannot tell
+    // the two branches apart.
+    const feishuFailureLine = locale === 'zh' ? '遇到飞书鉴权失败' : 'On a Feishu auth failure';
+    expect(byted).not.toContain(feishuFailureLine);
+    expect(lark).toContain(feishuFailureLine);
+
+    const git = buildCredentialBoundaryBlock({ ...policy, gitHost: 'code.example.com' }, locale);
+    expect(git).toContain('git');
+    expect(git).toContain('code.example.com');
+  });
+
+  it('omits the block for disabled or empty policies', () => {
+    expect(buildCredentialBoundaryBlock(undefined, 'en')).toBe('');
+    expect(buildCredentialBoundaryBlock({ ...policy, enabled: false }, 'en')).toBe('');
+    expect(buildCredentialBoundaryBlock({ ...policy, tools: [] }, 'en')).toBe('');
+  });
+
   it('names the exact files an agent must not read', () => {
-    const zh = buildCredentialBoundaryBlock('zh');
+    const zh = buildCredentialBoundaryBlock(policy, 'zh');
     // A vague "don't touch credentials" is unactionable; the path is what makes
     // the rule checkable by the agent itself.
     expect(zh).toContain('user-token-');
@@ -42,36 +77,48 @@ describe('buildCredentialBoundaryBlock', () => {
   });
 
   it('tells the agent what to do instead of hunting for credentials', () => {
-    const zh = buildCredentialBoundaryBlock('zh');
+    const zh = buildCredentialBoundaryBlock(policy, 'zh');
     expect(zh).toContain('/login');
   });
 
   it('covers forwarding, not just reading', () => {
     // Reading is one leak path; pasting a token the agent legitimately holds
     // into a message or a commit is another, and far easier to do by accident.
-    const en = buildCredentialBoundaryBlock('en');
+    const en = buildCredentialBoundaryBlock(policy, 'en');
     expect(en.toLowerCase()).toContain('commit');
     expect(en.toLowerCase()).toContain('log');
   });
 
   it('is wrapped in one tagged block so it reads as policy, not prose', () => {
-    const zh = buildCredentialBoundaryBlock('zh');
+    const zh = buildCredentialBoundaryBlock(policy, 'zh');
     expect(zh.startsWith('<botmux_credentials>')).toBe(true);
     expect(zh.trimEnd().endsWith('</botmux_credentials>')).toBe(true);
   });
 
   it('renders in both locales', () => {
     for (const locale of ['zh', 'en'] as const) {
-      expect(buildCredentialBoundaryBlock(locale)).toContain('user-token-');
+      expect(buildCredentialBoundaryBlock(policy, locale)).toContain('user-token-');
     }
   });
 });
 
 describe('buildBotmuxSystemPromptText — claude-family path', () => {
+  it.each(['claude-code', 'genius', 'grok'] as const)('%s forwards the selected tools into its system prompt', (cli) => {
+    const args = createCliAdapterSync(cli).buildArgs({
+      sessionId: 'sess-cred', resume: false, locale: 'en',
+      triggerUserAuth: { ...policy, tools: ['bytedcli'], gitHost: 'code.example.com' },
+    });
+    const text = args.find(arg => arg.includes('<botmux_credentials>'))!;
+    expect(text).toContain('credentials for bytedcli.');
+    expect(text).toContain('code.example.com');
+    expect(text).not.toContain('missing_scope');
+  });
+
   it('adds the block when trigger-user auth is on', () => {
-    const text = buildBotmuxSystemPromptText({ locale: 'zh', triggerUserAuth: true });
+    const text = buildBotmuxSystemPromptText({ locale: 'zh', triggerUserAuth: { ...policy, tools: ['lark-cli'] } });
     expect(text).toContain('<botmux_credentials>');
     expect(text).toContain('user-token-');
+    expect(text).not.toContain('/login bytedcli');
   });
 
   // A bot that never enabled the feature must not pay for prompt text about a
@@ -86,14 +133,14 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
     // No Feishu channel does not mean no credentials: the CLI still runs as a
     // person and the token store still holds everyone else's files.
     const text = buildBotmuxSystemPromptText({
-      locale: 'zh', triggerUserAuth: true, noTransport: true,
+      locale: 'zh', triggerUserAuth: policy, noTransport: true,
     });
     expect(text).toContain('<botmux_credentials>');
   });
 
   it('emits the block exactly once', () => {
     const text = buildBotmuxSystemPromptText({
-      locale: 'zh', botName: 'b', botOpenId: 'ou_x', triggerUserAuth: true,
+      locale: 'zh', botName: 'b', botOpenId: 'ou_x', triggerUserAuth: policy,
     });
     expect(text.match(/<botmux_credentials>/g)).toHaveLength(1);
   });
@@ -139,7 +186,9 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
 
   it('includes the credential boundary when the policy is on', () => {
     withTriggerUserAuth(true, () => {
-      expect(opening(APP)).toContain('<botmux_credentials>');
+      const text = opening(APP);
+      expect(text).toContain('<botmux_credentials>');
+      expect(text).not.toContain('/login bytedcli');
     });
   });
 

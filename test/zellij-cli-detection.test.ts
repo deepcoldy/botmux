@@ -6,6 +6,7 @@ describe('cliIdFromCommArgv', () => {
     expect(cliIdFromCommArgv('codex', ['/usr/local/bin/codex'])).toBe('codex');
     expect(cliIdFromCommArgv('claude', ['claude'])).toBe('claude-code');
     expect(cliIdFromCommArgv('cursor-agent', ['cursor-agent'])).toBe('cursor');
+    expect(cliIdFromCommArgv('mimo', ['mimo'])).toBe('mimocode');
   });
 
   it('detects a node-wrapped CLI by argv (fnm shim: comm is "node")', () => {

@@ -1,6 +1,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
@@ -102,13 +103,14 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  *    "Thinking…", "Reasoning through it…", "Mulling it over…",
  *    "Pondering…", "Working it out…", "Piecing it together…".
  *  - Spinner label set 2 (approval/working/queue): "Reviewing approval
- *    request", "Working…", "Working on it…", "Queued for capacity".
+ *    request", "Working…", "Working on it…", "Queued for capacity",
+ *    "Queued for next turn".
  *  - Standalone queue notice: "Too many requests right now. You're in the
  *    queue."
  *
- * TraeX forked from Codex and DELETED the "esc to interrupt" footer hint —
- * `grep -a -c "esc to interrupt"` returns 0 across every local release and
- * the 94MB TUI logs — so the Codex pattern's second anchor is invalid here.
+ * Older local releases had deleted Codex's "esc to interrupt" footer, but
+ * TraeX 0.207.x renders it again while a turn is active. Keep it line-anchored
+ * with the standalone queue states so quoted prose does not become busy proof.
  *
  * Three branches:
  *  1. Spinner-anchored labels: "<braille frame><space><label>". The frame
@@ -160,12 +162,15 @@ const TRAEX_SPINNER_LABELS = [
   'Working…',
   'Working on it…',
   'Queued for capacity',
+  'Queued for next turn',
 ] as const;
 
-/** Line-anchored standalone capacity-queue strings. Shared by the active
+/** Line-anchored standalone busy/queue strings. Shared by the active
  *  busy pattern and the pre-idle static latch (see below). */
 const TRAEX_QUEUE_STATIC_ARMS = [
   'Queued for capacity',
+  'Queued for next turn',
+  'esc to interrupt',
   "Too many requests right now\\. You're in the queue",
 ];
 
@@ -227,7 +232,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+      // TraeX shares Codex's low-quota picker and notice setting. Disable it
+      // per process so a message-submit Enter cannot confirm a model switch.
+      const modelNudgeArgs = hideRateLimitModelNudge
+        ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -236,7 +246,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
         // so an interactive update dialog would freeze the resume. TraeX shares
         // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
       }
       const baseArgs = [
         ...(!disableCliBypass ? [
@@ -252,11 +262,13 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         ] : []),
         '--no-alt-screen',
+        ...modelNudgeArgs,
         ...goalEnvConfigArgs(),
       ];
       // Keep trigger-user identity wrappers available in tool shells. Set only
       // the requested keys, without inheriting the entire worker environment.
       for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        if (value === undefined) continue;
         baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
       }
       if (model && model.trim()) baseArgs.push('--model', model.trim());
@@ -270,7 +282,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
       const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!traeSessionId) return baseArgs;
-      return ['resume', ...baseArgs, traeSessionId];
+      // Session fork: TraeX exposes the same native subcommand shape as Codex
+      // (`traecli fork <id>`). It mints a new thread while leaving the source
+      // untouched. The worker sets forkSession only for a fork child's first
+      // spawn; later restarts use ordinary resume against the child's new id.
+      return [forkSession ? 'fork' : 'resume', ...baseArgs, traeSessionId];
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
@@ -415,33 +431,48 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // exclude numbered selector rows; otherwise botmux flushes the first prompt
     // into the advisory instead of TRAE's real composer.
     readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // Skeleton composer gate, same cells and regexes as Codex (fork). Real
+    // PTY samples from traex 0.205.1-alpha.3 (node-pty + xterm-headless):
+    // the 0.6s frame already draws the `❯ Ask TraeCode CLI …` line and the
+    // `100% context left` bar (both match readyPattern above) while the banner
+    // cell is still `model:     loading` (directory already resolved); the
+    // 1.5s frame has both `model:` and `directory:` cells resolved. The ready
+    // banner on 0.201.1-alpha.6 has the identical two-cell shape. The `›` and
+    // 2s of silence therefore do not prove submit readiness on cold start.
+    // deferFirstPromptTimeoutUntilReady is already set below, so the worker's
+    // first-prompt timeouts wait for this gate without worker-side changes.
+    startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
+    startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
     systemHints: BOTMUX_SHELL_HINTS,
-    // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
-    // a turn is running is parked and merged into the active turn.
-    supportsTypeAhead: true,
+    // TraeX 0.207.x can display a parked message without durably appending it
+    // to history.jsonl, especially after transcript/TUI state desynchronizes.
+    // Keep PTY delivery serial until the real composer is visible.
+    supportsTypeAhead: false,
     // task_complete in the per-session rollout is an explicit durable turn
     // boundary; worker.ts drains it independently of screen-idle detection.
     reliableTurnTerminal: true,
+    // task_complete closes the business turn, not the TUI generation. Require
+    // a real ›/❯ composer on authoritative PTY screens before releasing input.
+    postTerminalPromptFence: true,
+    // A missing history receipt is ambiguous: block successors in this backend
+    // generation and never replay the unconfirmed message automatically.
+    quarantineUnconfirmedSubmits: true,
     // TRAE's trust/advisory startup screens can accept stdin before the real
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.
     deferFirstPromptTimeoutUntilReady: true,
-    buildSessionRenameCommand: (title) => `/rename ${title}`,
+    // TraeX treats a literal "@" in the composer as a file-mention trigger.
+    // If an automatic title contains a Lark mention (for example "@Bot"), the
+    // Enter meant to submit /rename selects a file instead and the next user
+    // message is appended to the still-open rename command. Preserve the title
+    // text with a full-width at sign so the command remains a single submit.
+    buildSessionRenameCommand: (title) => `/rename ${title.replaceAll('@', '＠')}`,
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`
     // lists the rest; the setup flow always appends an "Other / custom"
     // free-text option so users aren't locked out.
-    modelChoices: [
-      'Seed-Dogfooding-2.0',
-      'Doubao-Seed-2.0-Code',
-      'gpt-5.5',
-      'gpt-5',
-      'o3',
-      'Doubao_1_8',
-      'DeepSeek-V4-Pro',
-      'kimi-k2.6',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['traex'],
     // Live 模型枚举：`traex debug models` 输出单行 JSON（全量目录 24+ 个模型，
     // 每条带长 description，整包可达数百 KB），故 maxBuffer 给到 16MB、8s 超时
     // 兜底。仅 dashboard 在用户选中 traex 时按需调用，不在 daemon/worker 启动

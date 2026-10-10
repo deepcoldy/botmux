@@ -30,10 +30,11 @@ afterEach(() => {
 });
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-async function waitFor(fn: () => boolean, timeoutMs = 8_000): Promise<boolean> {
+async function waitFor<T>(fn: () => T, timeoutMs = 8_000): Promise<T> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (fn()) return true;
+    const result = fn();
+    if (result) return result;
     await delay(50);
   }
   return fn();
@@ -64,7 +65,7 @@ describe('quota fallback process boundaries', () => {
     expect(resolveFleetBotsFromEntries(cyclicBots()).map(bot => bot.appId)).toEqual(['cli_safebot']);
   });
 
-  it('supervisor cold boot brings up the dashboard while skipping cyclic bot daemons', async () => {
+  it('supervisor cold boot starts a dashboard process while skipping cyclic bot daemons', async () => {
     const home = tmp();
     const configDir = join(home, '.botmux');
     mkdirSync(configDir, { recursive: true });
@@ -83,15 +84,17 @@ describe('quota fallback process boundaries', () => {
     });
     try {
       const statePath = join(configDir, 'fleet-state.json');
-      const dashboardOnline = await waitFor(() => {
-        if (!existsSync(statePath)) return false;
+      const state = await waitFor(() => {
+        if (!existsSync(statePath)) return null;
         const state = JSON.parse(readFileSync(statePath, 'utf8'));
         return state.procs.length === 1
           && state.procs[0].name === 'botmux-dashboard'
-          && state.procs[0].status === 'online';
+          && state.procs[0].status === 'online' ? state : null;
       });
-      expect(dashboardOnline).toBe(true);
-      const state = JSON.parse(readFileSync(statePath, 'utf8'));
+      // 'online' records a spawn, not Dashboard readiness. Assert the observed
+      // snapshot: a child exit can move the on-disk state to 'launching' before
+      // a second read, even though this cold-boot observation succeeded.
+      expect(state).not.toBeNull();
       expect(state.procs.map((proc: any) => proc.name)).toEqual(['botmux-dashboard']);
       expect(state.procs[0].status).toBe('online');
     } finally {
@@ -135,11 +138,19 @@ describe('quota fallback process boundaries', () => {
       supervisor.start(specs);
       const recovered = await waitFor(() => {
         const state = readFleetState(statePath);
-        const observations = join(observationDir, 'bot-0.ndjson');
-        return state?.procs.every(proc => proc.status === 'online') === true
+        // Supervisor 'online' means spawned, not that the child has loaded its
+        // config. Wait for every observation we read below, including slower
+        // unrelated bots, instead of treating bot-0's respawn as their readiness.
+        const observationsReady = [2, 1, 1].every((expectedRows, index) => {
+          const path = join(observationDir, `bot-${index}.ndjson`);
+          if (!existsSync(path)) return false;
+          const content = readFileSync(path, 'utf8');
+          return content.endsWith('\n') && content.trim().split('\n').length >= expectedRows;
+        });
+        return state?.procs.length === specs.length
+          && state.procs.every(proc => proc.status === 'online')
           && (state.procs.find(proc => proc.name === 'botmux-0')?.restarts ?? 0) >= 1
-          && existsSync(observations)
-          && readFileSync(observations, 'utf8').trim().split('\n').length >= 2;
+          && observationsReady;
       });
       expect(recovered).toBe(true);
 

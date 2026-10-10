@@ -421,8 +421,8 @@ describe('every turn-starting IPC carries the mojo credential snapshot', () => {
    */
   const EXEMPT: Record<string, { reason: string; proof: string }> = {
     'src/workflows/v3/ephemeral-pool.ts': {
-      reason: 'v3 ephemeral pool hardcodes a PTY worker and has no DaemonSession',
-      proof: "backendType: 'pty' as const",
+      reason: 'v3 ephemeral pool only runs local tmux/PTY workers (never riff/mojo) and has no DaemonSession',
+      proof: "return daemonBackend === 'tmux' ? 'tmux' : 'pty';",
     },
   };
 

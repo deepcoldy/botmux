@@ -65,6 +65,14 @@ describe('shouldWriteNow', () => {
   it('queues when the CLI is busy and does not support type-ahead', () => {
     expect(shouldWriteNow({ ...base, supportsTypeAhead: false, awaitingFirstPrompt: false })).toBe(false);
   });
+
+  it('admits later type-ahead arrivals after initialization without declaring the first prompt ready', () => {
+    const initialized = { ...base, supportsTypeAhead: true, awaitingFirstPrompt: true, startupComplete: true };
+    expect(shouldWriteNow(initialized)).toBe(true);
+    expect(shouldWriteNow({ ...initialized, startupComplete: false })).toBe(false);
+    expect(shouldWriteNow({ ...initialized, supportsTypeAhead: false })).toBe(false);
+    expect(shouldWriteNow({ ...initialized, holdForRunnerReload: true })).toBe(false);
+  });
 });
 
 describe('shouldReleaseFirstPromptTimeout', () => {

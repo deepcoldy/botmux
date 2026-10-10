@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
@@ -141,7 +142,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, model, disableCliBypass, hideRateLimitModelNudge }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
@@ -149,6 +150,8 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
         args.push('--session-id', sessionId);
       }
       if (!disableCliBypass) args.push('--yolo');
+      // CoCo on traecli shares the low-quota picker; use its long config flag.
+      if (hideRateLimitModelNudge) args.push('--config', 'notice.hide_rate_limit_model_nudge=true');
       if (model && model.trim()) {
         // CoCo expects nested key path for model override. `model=...` exits 1,
         // while `model.name=...` starts correctly.
@@ -318,12 +321,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     ensureAskHook() { installCocoAskPlugin(this.resolvedBin); },
     // CoCo/Trae CLI reads the same skill root as the Trae-flavoured adapter.
     skillsDir: '~/.trae/skills',
-    modelChoices: [
-      'Seed-Dogfooding-2.0',
-      'Doubao-Seed-2.0-Code',
-      'Doubao-Seed-Code',
-      'Gemini-3.1-Pro-Preview',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['coco'],
     // Live 模型枚举：coco 与 traex 共用同一 traecli 二进制（见 coco.ts 顶部
     // 说明），`coco debug models` 输出与 `traex debug models` 同构的 JSON 目录，
     // 复用共享解析。整包可达数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。

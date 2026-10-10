@@ -15,12 +15,14 @@ import {
   renameSync,
   statSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -87,6 +89,28 @@ export function chunkTextByUtf8Bytes(
 export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string {
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   return join(dataDir, 'projects', projectHash, `${sessionId}.jsonl`);
+}
+
+/** Resolve the actual jsonl path, handling Claude's long-cwd truncation: for a
+ *  >200-char slug the project dir is `slug[0:200]-<opaque6>`, so glob by the
+ *  session UUID (collision-free) instead of guessing the hash. Returns the
+ *  exact slug path when it exists (normal case), the unique glob hit for long
+ *  slugs, or null when absent/ambiguous. */
+export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | null {
+  const exact = claudeJsonlPathForSession(sessionId, cwd, dataDir);
+  if (existsSync(exact)) return exact;
+  const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
+  if (projectHash.length <= 200) return null;
+  const projectsDir = join(dataDir, 'projects');
+  const target = `${sessionId}.jsonl`;
+  let entries: string[];
+  try { entries = readdirSync(projectsDir); } catch { return null; }
+  const prefix = projectHash.slice(0, 200);
+  const hits = entries
+    .filter(name => name === projectHash || name.startsWith(`${prefix}-`))
+    .map(name => join(projectsDir, name, target))
+    .filter(p => existsSync(p));
+  return hits.length === 1 ? hits[0]! : null;
 }
 
 /** The `<dataDir>/projects/<cwd-hash>` dir holding this cwd's transcripts (and its
@@ -412,8 +436,171 @@ async function waitForSubmit(path: string, baseByte: number, timeoutMs: number):
   return false;
 }
 
-function makeSubmitFingerprint(content: string, len = 30): string | undefined {
-  const collapsed = normaliseForFingerprint(content);
+export const CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN = 10;
+
+/**
+ * Normalize line endings and strip invisible/formatting characters that trigger
+ * Claude Code 2.1's "Removed X invisible characters · review and press Enter to send"
+ * barrier.
+ *
+ * Note on ZWJ/ZWNJ: Stripping \u200C (ZWNJ) and \u200D (ZWJ) here is an intentional
+ * trade-off: it simplifies TUI input sanitization and eliminates review prompts,
+ * even though it may decompose emoji sequences or certain non-Latin ligatures in TUI input.
+ */
+export function sanitizeClaudeInput(content: string): string {
+  if (typeof content !== 'string') return '';
+  return content
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[\u200B-\u200D\u2060\uFEFF\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+}
+
+/** Lark metadata headers prepended to user messages (e.g. quote hint and foreign bot handoff).
+ *  Supports both Chinese and English i18n templates. */
+const LARK_METADATA_HEADER_RE = /^\[(?:(?:用户引用了消息|User quoted a message)[^\]\n]*|来自\s+[^\]\n]+?\s+的 @mention|@mention from\s+[^\]\n]+?)\]\s*/gm;
+
+/**
+ * Known BotMux envelope tags to strip when extracting user payload in fallback
+ * mode (e.g. hook injection mode or bare transcript mode where <user_message> is absent).
+ * Covers both pre-userMessage blocks (summary_memory, chat_context, role, whiteboard, etc.)
+ * and post-userMessage blocks (substitute, attachments, mentions, available_bots, etc.).
+ */
+const BOTMUX_ENVELOPE_TAGS = new Set([
+  'botmux_routing',
+  'botmux_builtin_skills',
+  'botmux_skill_help',
+  'identity',
+  'botmux_credentials',
+  'session_id',
+  'role',
+  'summary_memory',
+  'botmux_reminder',
+  'whiteboard',
+  'chat_context_policy',
+  'chat_context',
+  'substitute_trigger',
+  'substitute_target',
+  'substitute_policy',
+  'attachments',
+  'mentions',
+  'available_bots',
+  'botmux_task',
+  'botmux_http_response_mode',
+]);
+
+/**
+ * Strip BotMux envelope blocks using a linear cursor walk (O(N), no regex backtracking).
+ */
+function stripBotmuxEnvelopeBlocks(text: string): string {
+  let i = 0;
+  let out = '';
+  // Tags that already appeared once without a matching close tag. Their next
+  // occurrences are treated as ordinary text: retrying the close-tag search for
+  // each of them would rescan the whole tail every time (quadratic on inputs
+  // like '<summary_memory>x'.repeat(N)). Malformed inputs only — every block
+  // botmux itself renders is well-formed, so this never triggers in production.
+  const deadTags = new Set<string>();
+  while (i < text.length) {
+    if (text[i] !== '<') {
+      out += text[i];
+      i++;
+      continue;
+    }
+    let nameEnd = -1;
+    for (let j = i + 1; j < text.length; j++) {
+      const ch = text[j];
+      // '<' is also a name delimiter: a legal tag name never contains '<'.
+      // Including it bounds the inner scan when a run of '<' is followed by a
+      // single delimiter (otherwise every '<' rescans the whole run — quadratic
+      // on inputs like '<'.repeat(N) + ' >').
+      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r' || ch === '/' || ch === '<') {
+        nameEnd = j;
+        break;
+      }
+    }
+    if (nameEnd === -1) {
+      out += text.slice(i);
+      break;
+    }
+    const tagName = text.slice(i + 1, nameEnd);
+    const recognized = tagName === 'sender' || BOTMUX_ENVELOPE_TAGS.has(tagName);
+    if (recognized && !deadTags.has(tagName)) {
+      const openTagEnd = text.indexOf('>', nameEnd);
+      if (openTagEnd === -1) {
+        out += text.slice(i);
+        break;
+      }
+      if (text[openTagEnd - 1] === '/') {
+        i = openTagEnd + 1;
+        continue;
+      }
+      const closeTag = `</${tagName}>`;
+      const closeIdx = text.indexOf(closeTag, openTagEnd + 1);
+      if (closeIdx === -1) {
+        // No close tag for this open tag. Mark it dead so later same-named open
+        // tags skip the tail-rescan, then emit the leading '<' and advance by
+        // one — do NOT break: later, *other* well-formed blocks must still be
+        // stripped (e.g. '<summary_memory>x<attachments>f</attachments>' keeps
+        // stripping the attachments block).
+        deadTags.add(tagName);
+        out += text[i];
+        i++;
+        continue;
+      }
+      i = closeIdx + closeTag.length;
+      continue;
+    }
+    out += text[i];
+    i++;
+  }
+  return out;
+}
+
+/** Strip BotMux system envelopes and metadata headers from prompt content
+ *  to extract the unique user payload for submit fingerprinting.
+ *
+ *  All BotMux turns share identical XML wrappers (<botmux_reminder>,
+ *  <botmux_routing>, <identity>, etc.) and header annotations ([用户引用了消息...],
+ *  [来自...的 @mention], [@mention from ...]). Using the raw envelope causes all sessions
+ *  across the machine to share the exact same 30-char fingerprint, leading to false-positive
+ *  submit confirmations against sibling/other sessions and leaving prompts
+ *  stuck unsubmitted in the CLI input box.
+ *
+ *  Semantics: exact for every well-formed block shape botmux renders (plain / attributed /
+ *  self-closing open tags, matched close tags). Inputs whose *user text itself* contains
+ *  malformed nests of these tag literals (e.g. a literal '<role <sender/>' soup botmux never
+ *  emits) are handled on a best-effort basis with no byte-for-byte guarantee; the scanner is
+ *  linear (O(N)) even on such pathological input. */
+export function extractMessageContentForFingerprint(content: string): string {
+  if (typeof content !== 'string') return '';
+
+  // 1. Fast, linear search for <user_message>...</user_message> (avoids regex quadratic backtracking)
+  const openTag = '<user_message>';
+  const closeTag = '</user_message>';
+  const openIdx = content.indexOf(openTag);
+  if (openIdx !== -1) {
+    const closeIdx = content.indexOf(closeTag, openIdx + openTag.length);
+    if (closeIdx !== -1) {
+      const inner = content.slice(openIdx + openTag.length, closeIdx);
+      const cleaned = inner.replace(LARK_METADATA_HEADER_RE, '').trim();
+      if (cleaned.length > 0) return cleaned;
+      const rawCleaned = inner.trim();
+      if (rawCleaned.length > 0) return rawCleaned;
+    }
+  }
+
+  // 2. Fallback for hook injection mode or bare transcript mode where <user_message> is omitted.
+  //    Walks all known envelope blocks (<summary_memory>, <chat_context_policy>, <chat_context>, etc.)
+  //    and strips metadata headers.
+  const stripped = stripBotmuxEnvelopeBlocks(content);
+  const cleaned = stripped.replace(LARK_METADATA_HEADER_RE, '').trim();
+  return cleaned.length > 0 ? cleaned : content.trim();
+}
+
+export function makeSubmitFingerprint(content: string, len = 30): string | undefined {
+  const sanitized = sanitizeClaudeInput(content);
+  const payload = extractMessageContentForFingerprint(sanitized);
+  const collapsed = normaliseForFingerprint(payload || sanitized);
   return collapsed.length > 0 ? collapsed.substring(0, len) : undefined;
 }
 
@@ -559,8 +746,9 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
 function findJsonlAcrossProjectsRoot(
   searchPath: string,
   fingerprint: string,
-  options: { minMtimeMs?: number; includeQueueOperations?: boolean },
+  options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
 ): string | null {
+  if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
   const primaryDir = dirname(searchPath);
   const primary = findJsonlContainingFingerprint(primaryDir, fingerprint, {
     excludePath: searchPath,
@@ -715,6 +903,56 @@ function resolveClaudeChatKeybindings(keybindingsPath: string): ClaudeChatKeybin
  *  across multiple adapter instances shares the warmup state. */
 const claudeFirstWriteSeen = new WeakSet<PtyHandle>();
 
+/** 用户自己配置的 statusLine（被 botmux 进程级 --settings 遮蔽的那一条）。 */
+export interface ShadowedStatusLine {
+  command?: string;
+  padding?: number;
+  refreshInterval?: number;
+}
+
+/**
+ * 找回被 botmux 进程级 `--settings` 遮蔽的用户 statusLine。
+ *
+ * 背景：Claude 的 settings 里 `statusLine` 是**单值**（不像 hooks 按事件合并数组），
+ * 而 --settings 优先级最高，所以 botmux 一注入，用户在项目 / 用户 settings 里配的
+ * statusline 命令就再也不会被 Claude 调用。为了不吞掉它，worker 在 spawn 前按 Claude
+ * 自己的优先级找到那条命令，经 `BOTMUX_STATUSLINE_CHAIN` 交给 `botmux statusline`：
+ * 落盘之后把**原始 stdin 字节**转发给它并透传其 stdout / 退出码——对用户的终端来说
+ * 状态栏行为不变。
+ *
+ * 优先级（高 → 低，取第一个 `type === 'command'` 且 command 非空的）：
+ *   `<cwd>/.claude/settings.local.json` > `<cwd>/.claude/settings.json` > `userSettingsPath`
+ * （后者通常是 `~/.claude/settings.json`；read-isolation 下是 `<BOT_HOME>/claude/settings.json`）。
+ * 不看 managed / enterprise 策略层：那一层 botmux 本来就无权覆盖，Claude 会自行处理。
+ *
+ * 纯函数、fail-open：任何读 / parse 失败视为该层无配置，继续向下找；全部没有 ⇒ `{}`。
+ * 不做全局 settings 兜底写入——全局只能有一个 statusLine，写进去就覆盖用户自己的。
+ * wrapperCli=aiden 会把 --settings 整个剥掉，此时 Claude 直接用用户自己的 statusLine，
+ * `botmux statusline` 不会被调用，worker 照常算出的 BOTMUX_STATUSLINE_CHAIN 只是闲置无害
+ * （cjadk / ccr / ttadk 会透传 --settings，沙盒开启时 wrapperCli 又被整体忽略，都需要链）。
+ */
+export function resolveShadowedStatusLine(opts: { workingDir: string; userSettingsPath?: string }): ShadowedStatusLine {
+  const candidates = [
+    join(opts.workingDir, '.claude', 'settings.local.json'),
+    join(opts.workingDir, '.claude', 'settings.json'),
+    ...(opts.userSettingsPath ? [opts.userSettingsPath] : []),
+  ];
+  for (const path of candidates) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(readFileSync(path, 'utf-8')); } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const sl = (parsed as Record<string, unknown>).statusLine;
+    if (!sl || typeof sl !== 'object' || Array.isArray(sl)) continue;
+    const o = sl as Record<string, unknown>;
+    if (o.type !== 'command' || typeof o.command !== 'string' || o.command.trim() === '') continue;
+    const out: ShadowedStatusLine = { command: o.command };
+    if (typeof o.padding === 'number' && Number.isFinite(o.padding)) out.padding = o.padding;
+    if (typeof o.refreshInterval === 'number' && Number.isFinite(o.refreshInterval)) out.refreshInterval = o.refreshInterval;
+    return out;
+  }
+  return {};
+}
+
 /** A member of the Claude-family CLIs: Claude Code itself and forks that share
  *  its on-disk session layout (per-project JSONL transcripts, `sessions/<pid>.json`
  *  pid-state, `tasks/` fd locks, keybindings.json, settings.json hooks) but
@@ -769,7 +1007,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
     // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
     // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
-    modelChoices: ['fable', 'opus', 'sonnet', 'haiku', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
+    modelChoices: CLI_MODEL_CHOICES['claude-code'],
   }, pathOverride ?? 'claude');
 }
 
@@ -852,7 +1090,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -908,11 +1146,48 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         inlineSettings.skipDangerousModePermissionPrompt = true;
         inlineSettings.permissions = { defaultMode: 'bypassPermissions' };
       }
-      // 仅在有内容（bypass 键）时才传 --settings；disableCliBypass 下没东西可传就不传。
+      // Per-bot env（bots.json `env`，如 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL）提升进
+      // --settings：Claude 会把 settings 源的 `env` 覆盖到进程环境之上（用户级
+      // ~/.claude/settings.json 的 env 会盖掉 pane 注入的进程 env），只走进程 env
+      // 的 bot 供应商配置会被用户全局 settings 静默改写。--settings 优先级高于
+      // 用户/项目 settings 文件，是能把 bot env 顶到最上面的最稳渠道。
+      const hasSettingsEnv = !!settingsEnv && Object.keys(settingsEnv).length > 0;
+      if (hasSettingsEnv) inlineSettings.env = settingsEnv;
+      // statusLine（仅 claude-code）：Claude 把 context_window / rate_limits 等 JSON 喂给
+      // 这条命令的 stdin，`botmux statusline` 落盘到 `<DATA_DIR>/statusline/<sid>/`，
+      // 卡片用量段据此渲染 `ctx 23% · 5h 18% · 7d 5%`。它**必须**走进程级 --settings 而
+      // 不能像就绪 hook 那样写全局：settings 里 statusLine 只能有一个（不是 hooks 那样按
+      // 事件合并的数组），写全局会覆盖用户自己的 statusline。进程级这份优先级最高，会
+      // **遮蔽**用户在项目 / 用户 settings 里的 statusLine——worker 用
+      // resolveShadowedStatusLine 找回它并经 BOTMUX_STATUSLINE_CHAIN 交给 `botmux
+      // statusline` 转发，用户终端里的状态栏不受影响。wrapperCli=aiden 会剥掉本
+      // --settings ⇒ 无数据 ⇒ 卡片省略配额段（fail-open），不做全局兜底。
+      // refreshInterval=60：实测冷启动 0.24–0.34s，每分钟一次可承受，且能在无消息时
+      // 跟上 5h/7d 窗口滚动；快照 10 min 陈旧自动失效（STATUSLINE_STALE_MS）。
+      if (variant.id === 'claude-code') {
+        inlineSettings.statusLine = { type: 'command', command: statuslineHookCommand(), refreshInterval: 60 };
+      }
+      // claude-code 恒传 --settings（statusLine 总在）；其它 variant 仅在有内容（bypass
+      // 键 / env）时才传，disableCliBypass 且无 env 下没东西可传就不传。
       // （读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入任何 sandbox 设置——
       // 注入内置 sandbox 会嵌套沙箱且 permissions deny>allow 会挡掉 memory carve-out。）
       if (Object.keys(inlineSettings).length > 0) {
-        args.push('--settings', JSON.stringify(inlineSettings));
+        if (hasSettingsEnv && settingsFilePath) {
+          // env 含 AUTH_TOKEN 类密钥：写文件（0600）传路径，不走 inline JSON——
+          // argv 可被 `ps` 读到。同 bot 内容恒定，覆写幂等。
+          try {
+            mkdirSync(dirname(settingsFilePath), { recursive: true });
+            writeFileSync(settingsFilePath, JSON.stringify(inlineSettings), { mode: 0o600 });
+            args.push('--settings', settingsFilePath);
+          } catch {
+            // 写不进去则放弃 --settings：env 仍经 pane injectEnv 走进程环境（旧行为），
+            // 绝不把密钥 fallback 进 argv。
+          }
+        } else if (!hasSettingsEnv) {
+          args.push('--settings', JSON.stringify(inlineSettings));
+        }
+        // hasSettingsEnv 但 worker 没给 settingsFilePath：不内联（防密钥进 argv），
+        // env 仍经进程 env 传递，与旧行为一致。
       }
       const disallowedTools = ['EnterPlanMode', 'ExitPlanMode'];
       if (process.env[GOAL_ENV.V3_MARKER] === '1') {
@@ -922,9 +1197,13 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
+      if (promptInjection === 'none') return args;
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth }));
+      // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
+      // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, replyDelivery: effectiveReplyDelivery, solo }));
       return args;
     },
 
@@ -1002,8 +1281,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // so future writes are measured against the right transcript. Inside
       // confirmSubmit a mid-flight rotation does NOT advance baseByte — the
       // submit may already be in the rotated jsonl from before our re-resolve.
+      const sanitizedContent = sanitizeClaudeInput(content);
       let baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
-      const submitFingerprint = makeSubmitFingerprint(content);
+      const submitFingerprint = makeSubmitFingerprint(sanitizedContent);
       const submitSearchMinMtime = Date.now() - 60_000;
       const buildResult = (submitted: boolean, failureReason?: string): { submitted: boolean; cliSessionId?: string; failureReason?: string } => {
         const result = observedCliSessionId
@@ -1019,7 +1299,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       }
 
       if (pty.sendText && pty.sendSpecialKeys) {
-        const lines = content.split('\n');
+        const lines = sanitizedContent.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) {
             for (const chunk of chunkTextByUtf8Bytes(lines[i])) {
@@ -1041,7 +1321,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write('\x1b[200~' + content + '\x1b[201~');
+        pty.write('\x1b[200~' + sanitizedContent + '\x1b[201~');
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
@@ -1083,7 +1363,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
             const newPath = pty.claudeJsonlPath;
             const rotatedBaseByte = switched && newPath ? currentFileSize(newPath) : baseByte;
             if (switched && newPath && submitFingerprint) {
-              if (jsonlContainsFingerprint(newPath, submitFingerprint, { includeQueueOperations: true })) {
+              if (jsonlContainsFingerprint(newPath, submitFingerprint, {
+                includeQueueOperations: true,
+                minEventTimestampMs: submitSearchMinMtime,
+              })) {
                 // Sync baseByte to end-of-file so subsequent confirms in
                 // this writeInput pass don't re-trigger on the same line.
                 baseByte = currentFileSize(newPath);
@@ -1106,11 +1389,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // Per-attempt scope is intentionally narrow (dirname only) — the
         // cross-project fan-out only runs once at end-of-writeInput and in
         // the recheck closure, not per retry, to keep the worst case bounded.
-        if (submitFingerprint) {
+        if (submitFingerprint && submitFingerprint.length >= CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) {
           const searchPath = pty.claudeJsonlPath ?? startPath;
           const matched = findJsonlContainingFingerprint(dirname(searchPath), submitFingerprint, {
             excludePath: searchPath,
             minMtimeMs: submitSearchMinMtime,
+            minEventTimestampMs: submitSearchMinMtime,
             includeQueueOperations: true,
           });
           if (matched) {
@@ -1148,6 +1432,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (submitFingerprint && pty.claudeJsonlPath) {
         const matched = findJsonlAcrossProjectsRoot(pty.claudeJsonlPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });
         if (matched) {
@@ -1173,7 +1458,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           if (resolved) applyResolved(resolved);
         }
         const currentPath = pty.claudeJsonlPath;
-        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, { includeQueueOperations: true })) {
+        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
+          includeQueueOperations: true,
+          minEventTimestampMs: submitSearchMinMtime,
+        })) {
           return true;
         }
         // Fan out to sibling jsonls in the project dir, then across every
@@ -1185,6 +1473,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });
         return !!matched;

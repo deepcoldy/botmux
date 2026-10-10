@@ -277,7 +277,7 @@ export function resolveAutoUpdateSupport(
   strategy: UpdateStrategy,
 ): { supported: boolean; plan: GlobalInstallPlan | null } {
   if (strategy.kind === 'self-replace') return { supported: true, plan: null };
-  if (strategy.kind === 'unsupported') return { supported: false, plan: null };
+  if (strategy.kind === 'unsupported' || strategy.kind === 'install-release') return { supported: false, plan: null };
   const plan = tryResolveGlobalInstallPlan(strategy.packageRoot);
   return { supported: plan !== null, plan };
 }

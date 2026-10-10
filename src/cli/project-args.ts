@@ -41,7 +41,7 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
   const allowedByCommand: Record<string, Set<string>> = {
     init: new Set(['--title', '--goal', '--phase', '--focus', '--remaining', '--session-id', '--json']),
     status: new Set(['--session-id', '--json']),
-    update: new Set(['--goal', '--phase', '--focus', '--progress', '--remaining', '--blocker', '--clear-blockers', '--milestone', '--next-milestone', '--session-id', '--json']),
+    update: new Set(['--goal', '--phase', '--focus', '--progress', '--remaining', '--blocker', '--clear-blockers', '--milestone', '--next-milestone', '--clear-next-milestone', '--session-id', '--json']),
     close: new Set(['--milestone', '--session-id', '--json']),
     resume: new Set(['--phase', '--focus', '--session-id', '--json']),
   };
@@ -52,7 +52,7 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
     if (!token.startsWith('-')) return { ok: false, error: `不支持位置参数: ${token}` };
     const flag = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
     if (!allowed.has(flag)) return { ok: false, error: `未知选项: ${flag}` };
-    if ((flag === '--json' || flag === '--clear-blockers')) {
+    if ((flag === '--json' || flag === '--clear-blockers' || flag === '--clear-next-milestone')) {
       if (token.includes('=')) return { ok: false, error: `${flag} 不接受值` };
       continue;
     }
@@ -80,7 +80,7 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
       action: 'update', goal: one(args, '--goal'), phase: one(args, '--phase'), focus: one(args, '--focus'),
       progress, remaining: one(args, '--remaining'), blocker: one(args, '--blocker'),
       clearBlockers: has(args, '--clear-blockers'), milestone: one(args, '--milestone'),
-      nextMilestone: one(args, '--next-milestone'),
+      nextMilestone: has(args, '--clear-next-milestone') ? '' : one(args, '--next-milestone'),
     };
     const changed = Object.entries(action).some(([key, value]) => key !== 'action' && value !== undefined && value !== false);
     if (!changed) return { ok: false, error: 'project update 至少需要一个更新选项' };

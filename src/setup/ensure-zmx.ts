@@ -7,6 +7,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import { isAbsolute } from 'node:path';
 
 /**
  * Lowest zmx release whose `send` only queues input instead of taking client
@@ -47,11 +48,12 @@ function withZmxSearchPath(pathValue: string | undefined): string {
  * selection. ZMX_SESSION_PREFIX is stripped so botmux's deterministic bmx-*
  * names stay literal and dashboard/API probes can match them.
  */
-export function zmxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function zmxEnv(env: NodeJS.ProcessEnv = process.env, socketDir?: string): NodeJS.ProcessEnv {
   const { ZMX_SESSION: _session, ZMX_SESSION_PREFIX: _prefix, ...rest } = env;
   return {
     ...rest,
     PATH: withZmxSearchPath(rest.PATH),
+    ...(socketDir !== undefined ? { ZMX_DIR: socketDir } : {}),
   };
 }
 
@@ -96,8 +98,7 @@ function zmxProbeFailureReason(command: string, failure: any, timeoutMs: number,
   return `${command} 启动/探测失败${message ? `：${message}` : ''}`;
 }
 
-export function probeZmxVersion(): { ok: true; version: string } | { ok: false; reason: string } {
-  const env = zmxEnv();
+export function probeZmxRuntime(env: NodeJS.ProcessEnv = zmxEnv()): { ok: true; version: string; socketDir?: string } | { ok: false; reason: string } {
   let version: string;
   try {
     version = execFileSync('zmx', ['version'], {
@@ -128,7 +129,27 @@ export function probeZmxVersion(): { ok: true; version: string } | { ok: false; 
   // the Dashboard backend-availability API — returning the raw blob would leak
   // local socket/log paths and render as a multi-line smear next to peers like
   // "tmux 3.5".
-  return { ok: true, version: `zmx ${parsedVersion.join('.')}` };
+  const socketDir = parseZmxSocketDir(version);
+  return { ok: true, version: `zmx ${parsedVersion.join('.')}`, ...(socketDir ? { socketDir } : {}) };
+}
+
+/** Use zmx's own resolver rather than duplicating its platform/env precedence. */
+export function parseZmxSocketDir(output: string): string | undefined {
+  const dir = output.match(/^socket_dir[\t ]+(.+)$/m)?.[1]?.trim();
+  return dir && isAbsolute(dir) && !dir.includes('\0') ? dir : undefined;
+}
+
+export function resolveZmxSocketDir(env: NodeJS.ProcessEnv = zmxEnv()): string {
+  const probe = probeZmxRuntime(env);
+  if (!probe.ok) throw new Error(probe.reason);
+  if (!probe.socketDir) throw new Error('无法解析 zmx version 的 socket_dir，已拒绝创建未固定地址的会话');
+  return probe.socketDir;
+}
+
+/** Availability APIs expose the version, never local socket paths. */
+export function probeZmxVersion(): { ok: true; version: string } | { ok: false; reason: string } {
+  const probe = probeZmxRuntime();
+  return probe.ok ? { ok: true, version: probe.version } : probe;
 }
 
 export function probeZmxFunctional(): { ok: true; version: string } | { ok: false; reason: string } {

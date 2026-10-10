@@ -11,6 +11,11 @@ export interface GroupMemberBot extends GroupBot {
   pinStreamingCardMasterEnabled?: boolean;
   pinStreamingCardChatEnabled?: boolean;
   pinStreamingCardEffectiveEnabled?: boolean;
+  agentCliId?: string;
+  agentModel?: string;
+  agentReasoningEffort?: string;
+  serialInput?: boolean;
+  defaultModels?: import('../../core/group-default-models.js').GroupDefaultModels;
   oncallChat?: { workingDir?: string } | null;
 }
 

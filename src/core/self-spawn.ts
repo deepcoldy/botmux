@@ -29,7 +29,7 @@ import { join, dirname } from 'node:path';
 
 export type BotmuxEntry =
   | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard'
-  | 'plugin-supervisor'
+  | 'plugin-supervisor' | 'sandbox-network-runner'
   // CLI-adapter runners. Unlike the entries above these are not fleet processes:
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
@@ -44,6 +44,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'supervisor': '__supervisor',
   'dashboard': '__dashboard',
   'plugin-supervisor': '__plugin-supervisor',
+  'sandbox-network-runner': '__sandbox-network-runner',
   'codex-app-runner': '__codex-app-runner',
   'dsh-runner': '__dsh-runner',
   'mira-runner': '__mira-runner',
@@ -58,6 +59,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'supervisor': 'index-supervisor.js',
   'dashboard': 'index-dashboard.js',
   'plugin-supervisor': 'index-plugin-supervisor.js',
+  'sandbox-network-runner': 'sandbox-network-runner.js',
   'codex-app-runner': 'codex-app-runner.js',
   'dsh-runner': 'dsh-runner.js',
   'mira-runner': 'mira-runner.js',

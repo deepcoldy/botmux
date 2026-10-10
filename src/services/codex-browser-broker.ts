@@ -232,6 +232,11 @@ interface BrowserPluginModules {
   handleRpc(request: { method: string; params?: unknown }): Promise<unknown>;
 }
 
+interface BrowserTurnEndedHandler {
+  timeoutMs?: number;
+  run(event: { session_id: string; turn_id: string }): unknown;
+}
+
 export interface CodexBrowserBrokerOptions {
   sessionId: string;
   codexBin?: string;
@@ -577,6 +582,7 @@ export class CodexBrowserBroker {
   private readonly configStore = new Map<string, Json>();
   private readonly sessionApprovals = new Set<string>();
   private readonly pendingApprovals = new Map<string, Promise<BrowserElicitationResponse>>();
+  private readonly turnEndedHandlers = new Set<BrowserTurnEndedHandler>();
   private previousNodeRepl: unknown;
   private runtimeShim?: Json;
   private authenticatedFetch?: CodexBrowserAuthenticatedFetch;
@@ -596,6 +602,25 @@ export class CodexBrowserBroker {
     } catch (error) {
       return errorResult(error);
     }
+  }
+
+  /** Bridge the owning app-server's terminal turn notification into the
+   * lifecycle contract expected by the bundled browser runtime. */
+  async handleTurnEnded(turnId: string): Promise<void> {
+    const event = { session_id: this.opts.sessionId, turn_id: turnId };
+    const results = await Promise.allSettled([...this.turnEndedHandlers].map(handler => {
+      const timeoutMs = typeof handler.timeoutMs === 'number'
+        && Number.isFinite(handler.timeoutMs)
+        && handler.timeoutMs > 0
+        ? handler.timeoutMs
+        : 4_000;
+      return withTimeout(
+        Promise.resolve().then(() => handler.run(event)),
+        timeoutMs,
+      );
+    }));
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failure) throw failure.reason;
   }
 
   private async execute(input: Json): Promise<DynamicToolCallResponse> {
@@ -1202,6 +1227,13 @@ export class CodexBrowserBroker {
       createElicitation: (request: BrowserElicitationRequest) => this.requestBrowserApproval(request),
       setResponseMeta: () => {},
       addAfterSubmittedCodeHook: () => {},
+      addTurnEndedHandler: (handler: BrowserTurnEndedHandler) => {
+        if (!handler || typeof handler.run !== 'function') {
+          throw new Error('browser turn-ended handler must provide run()');
+        }
+        this.turnEndedHandlers.add(handler);
+        return () => { this.turnEndedHandlers.delete(handler); };
+      },
       emitContentItem: () => {},
       fetch: this.authenticatedFetch.fetch,
       emitImage: () => {},
@@ -1241,6 +1273,7 @@ export class CodexBrowserBroker {
 
   /** Test/process cleanup; production runner teardown exits the process. */
   close(): Promise<void> {
+    this.turnEndedHandlers.clear();
     if ((globalThis as Json).nodeRepl === this.runtimeShim) {
       if (this.previousNodeRepl === undefined) delete (globalThis as Json).nodeRepl;
       else (globalThis as Json).nodeRepl = this.previousNodeRepl;

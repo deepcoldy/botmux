@@ -63,8 +63,10 @@ if (!existsSync(binary)) {
 const PORTS = { ipc: 19950, proxy: 19800, dashboard: 19891 };
 const DASHBOARD_ONLINE_TIMEOUT_MS = 30_000;
 /** Separate budget for "the HTTP listener is bound": fleet-state `online` only
- *  proves the process spawned, so this waits on the socket after that. */
-const DASHBOARD_HTTP_TIMEOUT_MS = 20_000;
+ *  proves the process spawned, so this waits on the socket after that. ARM64
+ *  musl release runners have taken longer than 20s to load the compiled binary
+ *  and bind the listener, so keep enough headroom for the slow shipped leg. */
+const DASHBOARD_HTTP_TIMEOUT_MS = 40_000;
 
 const home = mkdtempSync(join(tmpdir(), 'botmux-bun-smoke-'));
 mkdirSync(join(home, '.botmux'), { recursive: true });

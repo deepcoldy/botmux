@@ -1,10 +1,15 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { isLinuxIsolationLauncher, linuxIsolationDetected, linuxIsolationLaunch } from '../src/core/linux-isolation.js';
+import {
+  isLinuxIsolationLauncher,
+  linuxIsolationDetected,
+  linuxIsolationLaunch,
+  linuxIsolationLaunchViaArgsFile,
+} from '../src/core/linux-isolation.js';
 import { prepareCredentialOnlySandbox } from '../src/adapters/backend/sandbox.js';
 import { tsEvalArgs, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { readPersistedSessionRows, seedPersistedSessionRows } from './helpers/session-store-disk.js';
@@ -72,6 +77,40 @@ describe.skipIf(!supported)('Linux isolation filter', () => {
     expect(isLinuxIsolationLauncher(missingFilter)).toBe(false);
   });
 
+  it('recognizes the fixed args-file launcher without trusting a copied label', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-isolation-args-file-shape-'));
+    try {
+      const launch = linuxIsolationLaunchViaArgsFile(
+        '/usr/bin/bwrap',
+        ['--ro-bind', '/', '/'],
+        ['/bin/true'],
+        root,
+      );
+      const commandLine = [launch.bin, ...launch.args];
+      expect(isLinuxIsolationLauncher(commandLine)).toBe(true);
+      const replacedScript = [...commandLine];
+      replacedScript[2] = 'rm -f -- "$1"; shift; exec "$@"';
+      expect(isLinuxIsolationLauncher(replacedScript)).toBe(false);
+      launch.cleanup();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('creates the args file with mode 0600 even under a restrictive process umask', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-isolation-args-file-mode-'));
+    const previousUmask = process.umask(0o777);
+    let launch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | undefined;
+    try {
+      launch = linuxIsolationLaunchViaArgsFile('bwrap', ['--ro-bind', '/', '/'], ['/bin/true'], root);
+      expect(statSync(launch.argsFile).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(previousUmask);
+      launch?.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     [0xc000003e, 140, 0], [0xc000003e, 140, 0x40000000],
     [0xc00000b7, 141, 0], [0x40000003, 96, 0], [0x40000028, 96, 0],
@@ -116,6 +155,50 @@ describe.skipIf(!canRunBwrap || !supported)('Linux isolation kernel probe', () =
     expect(result.status, result.stderr).toBe(0);
     return JSON.parse(result.stdout);
   }
+
+  it('keeps long bwrap options out of tmux-facing argv and preserves CLI argv exactly', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-isolation-long-args-'));
+    const specialArgs = [
+      'plain',
+      'space value',
+      'single\'quote',
+      'double"quote',
+      '$dollar `backtick` \\ slash',
+      'line\nbreak',
+      '',
+    ];
+    const longOptions = [
+      '--ro-bind', '/', '/',
+      '--unshare-user', '--unshare-pid', '--proc', '/proc', '--dev', '/dev',
+      ...Array.from({ length: 512 }, (_, index) => [
+        '--setenv',
+        `BOTMUX_LONG_OPTION_${index}`,
+        `padding-${index}-${'x'.repeat(40)}`,
+      ]).flat(),
+    ];
+    const command = ['/bin/sh', '-c', 'printf \'%s\\0\' "$@"', 'botmux-argv', ...specialArgs];
+    const originalBytes = Buffer.byteLength(['bwrap', '--seccomp', '3', ...longOptions, '--', ...command].join('\0'));
+    expect(originalBytes).toBeGreaterThan(16 * 1024);
+
+    const launch = linuxIsolationLaunchViaArgsFile('bwrap', longOptions, command, root);
+    try {
+      const tmuxFacingBytes = Buffer.byteLength([launch.bin, ...launch.args].join('\0'));
+      expect(tmuxFacingBytes).toBeLessThan(8 * 1024);
+      expect(statSync(launch.argsFile).mode & 0o777).toBe(0o600);
+
+      const result = spawnSync(launch.bin, launch.args, {
+        cwd: repoRoot,
+        timeout: 15_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr.toString()).toBe(0);
+      expect(result.stdout).toEqual(Buffer.from(`${specialArgs.join('\0')}\0`));
+      expect(existsSync(launch.argsFile)).toBe(false);
+    } finally {
+      launch.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it('keeps an ordinary host unmarked, including a bare HOME', () => {
     expect(linuxIsolationDetected()).toBe(false);

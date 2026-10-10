@@ -200,6 +200,7 @@ export function dashboardFailureIsTerminal(failure: Extract<DashboardResult, { o
  *  • online → only true if the pid is actually alive
  *
  * @param state  parsed fleet state, or null when absent/unreadable
+ * @param supervisorAlive identity-aware supervisor liveness decision
  * @param pidAlive  liveness probe, injected so tests need no real processes
  */
 export function dashboardComingUpFromState(
@@ -208,12 +209,11 @@ export function dashboardComingUpFromState(
     procs?: ReadonlyArray<{ name: string; pid?: number; status?: string }>;
   } | null,
   dashboardProcessName: string,
+  supervisorAlive: () => boolean,
   pidAlive: (pid: number) => boolean,
 ): boolean | null {
   if (!state) return null;
-  const sup = state.supervisorPid;
-  const supervisorAlive = Number.isSafeInteger(sup) && (sup as number) > 1 && pidAlive(sup as number);
-  if (!supervisorAlive) return false;
+  if (!supervisorAlive()) return false;
   const proc = state.procs?.find((p) => p.name === dashboardProcessName);
   if (!proc) return null;
   if (proc.status === 'stopped' || proc.status === 'errored') return false;

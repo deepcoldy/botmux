@@ -167,6 +167,13 @@ describe('normalizeAskDispatch', () => {
 });
 
 describe('findMissingAskEnv', () => {
+  it('chat scope has no message root, while thread and legacy callers require one', () => {
+    const env = { BOTMUX_SESSION_ID: 'sess-1', BOTMUX_CHAT_ID: 'oc_1', BOTMUX_LARK_APP_ID: 'cli_1' };
+    expect(findMissingAskEnv({ ...env, BOTMUX_SESSION_SCOPE: 'chat' })).toBeNull();
+    expect(findMissingAskEnv({ ...env, BOTMUX_SESSION_SCOPE: 'thread' })).toBe('BOTMUX_ROOT_MESSAGE_ID');
+    expect(findMissingAskEnv(env)).toBe('BOTMUX_ROOT_MESSAGE_ID');
+  });
+
   it('returns null when all four env vars are present', () => {
     expect(
       findMissingAskEnv({

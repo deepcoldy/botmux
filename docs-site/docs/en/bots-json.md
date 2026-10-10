@@ -45,8 +45,10 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 |------|------|
 | `name` | Process name suffix, e.g. `claude-main` → `botmux-claude-main`; leave empty to default to `botmux-<index>` |
 | `cliId` | CLI adapter, defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) |
-| `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup`. **Resolved from the current config on every CLI launch**, resume included: a change (dashboard or this file) also applies to **existing sessions**, from their next launch/resume onward. Unlike `cliId` / `cliRuntime` / `wrapperCli`, which are frozen when the session is created so a live conversation never has its runtime swapped underneath it |
+| `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup`. **Resolved from the current config on every CLI launch**, resume included: a change (dashboard or this file) also applies to **existing sessions without a captured group override**, from their next launch/resume onward. Unlike `cliId` / `cliRuntime` / `wrapperCli`, which are frozen when the session is created so a live conversation never has its runtime swapped underneath it |
+| `groupDefaultModels` | Per-chat defaults for new topics, e.g. `{ "oc_team": { "codex": { "model": "your-codex-model", "reasoningEffort": "high" } } }`. Supports Codex and Claude; configure each bot from Dashboard group management |
 | `reasoningEffort` | Default reasoning effort for new sessions. Only applies to CLIs with structured reasoning controls (`codex` / `codex-app` / `traex` / `grok`); values are validated against the selected CLI/model, and unsupported or undeclared combinations are rejected or ignored |
+| `modelBackendVariant` | TraeX-only backend variant: `standard` / `max`; omit it to inherit the user's TraeX global configuration. An explicit value is frozen on a new session's first launch, and non-TraeX CLIs clear the field. A session that explicitly selected its CLI through `/cli` does not inherit the bot-level variant; it only uses a TraeX value saved in that `/cli` snapshot |
 | `nativeSubagentRuntime` | Trae-only native subagent runtime policy. Configure `model` and `reasoningEffort` independently as `{ "mode": "custom", "value": "..." }`; an absent dimension passes through the value from the subagent request. Remove the whole field when both dimensions pass through. `inherit` is not a supported mode |
 | `cliRuntime` | Structured runtime descriptor for a Codex-compatible distribution: `{ id, displayName?, executable, update? }`. It reuses the `codex` adapter while retaining its own version, update source, and session identity. See [Codex-compatible distributions](/en/adapters#codex-compatible-distributions) |
 | `cliPathOverride` | Legacy CLI entry-point override, retained for wrappers / routers and existing custom binaries. Prefer `cliRuntime` for a new Codex-compatible distribution. To support downgrading BotMux, writers also persist an exact compatibility shadow of `cliRuntime.executable`; do not manually configure mismatched values |
@@ -55,12 +57,19 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `fish` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`, or `~/.config/fish/config.fish` for fish). fish is a first-class launch shell: `launchShell: "fish"` and absolute fish paths (e.g. `/usr/bin/fish`) are supported, and the desktop PATH probe reads fish when `$SHELL` is fish, so fish users don't need to mirror PATH / env into `.bashrc` / `.zshrc`. Empty = use `$SHELL`. Takes effect next session for shell-wrapped persistent backends (`tmux` / `zellij` / `zmx`); `pty` execs the CLI directly and is unaffected. Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
+| `envPolicy` | Explicit process inheritance policy: inherit by default; strict retains only baseline, approved names and this bot env (see below). |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
 | `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
 | `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
-| `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Set to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
+| `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Toggle it under Dashboard **Advanced → Codex App**, or set it to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
 
 `nativeSubagentRuntime` rewrites only new subagents created through Trae's native `spawn_agent`; it does not alter the parent agent itself. An absent dimension passes through the subagent request, while `custom` replaces it with a fixed value. When both a custom model and custom effort are configured, BotMux validates that Trae supports the combination. Switching the bot to another CLI removes this field automatically. In the Dashboard, “Pass through request” corresponds to an absent dimension. This policy is behavior configuration and is copied when cloning a bot, but it is intentionally excluded from portable Agent presets. Legacy `mode: "inherit"` values are invalid and are not applied.
+
+### Per-group defaults for new topics
+
+Each bot owns its own `groupDefaultModels`, keyed by chat ID and CLI. The Dashboard follows the bot’s Agent CLI and shows only its model and reasoning-effort dropdowns, reusing Agent model discovery and effort validation. Both fields can inherit the Agent defaults. Custom models and legacy string-valued entries remain supported. A new topic captures these settings when its session is created; later edits or clearing the group configuration do not alter that topic on restart or resume. Selecting a CLI uses only its matching entry. Topics without a group override retain the existing live bot-model fallback. Direct messages, chat-scoped group sessions, and adopted external sessions do not use the snapshot.
+
+Precedence: explicit trigger model > captured group model > matching bot model > existing cross-CLI fallback. Reasoning effort is also captured for new topics; explicit trigger settings can override it. The CLI and runtime remain unchanged. Dashboard saves apply without restarting the daemon. Choosing inheritance removes the corresponding override for future topics while retaining historical settings for other CLIs; manual file edits follow the existing configuration-loading procedure.
 
 ### Automatic CLI quota handoff
 
@@ -133,7 +142,7 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 - For GLM in China, use `https://open.bigmodel.cn/api/anthropic` for `ANTHROPIC_BASE_URL`.
 - For an OpenAI-protocol CLI like Codex, set `OPENAI_BASE_URL` / `OPENAI_API_KEY` (the provider's OpenAI-compatible endpoint) instead of `ANTHROPIC_*`.
 - **Isolation**: env is injected per-session into the CLI process, consistently across backends (tmux / zellij inject it per-pane, never into the shared server env), so one bot's provider config can't leak into another's.
-- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat surfaces like `/config get` mask the values (the owner-authenticated dashboard editor shows real values).
+- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat configuration queries mask values and Dashboard returns names only.
 - Takes effect from the next **session**.
 
 ### Clean Codex App input (experimental)
@@ -207,6 +216,8 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `messageQuota` | Message-quota override `{ "defaultLimit": N }`: **applies only to grantees admitted by grant cards or self-service requests** — once a positive integer is configured, new grant cards use an N-message quota; when unset they default to 3 messages per person. **Oncall groups are always unmetered and never read this value.** An explicit `/grant @user N` always uses N. Only constrains talk authorization, does not affect `canOperate` |
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
+| `grantRequestToOwnerDm` | Off by default. When `true` and no admin in the conversation can click the request card (no admin in the group, or a rejected DM), the card is sent to the primary owner's DM instead; the requester gets a neutral acknowledgement and the outcome is posted back to the original conversation. Capped per owner (20 cards per hour; failed sends do not count); over the cap or on a send failure no card is posted and the next message retries. Requires `autoGrantRequestCards` to stay on. See [Permissions & Access · Grant request cards](/en/permissions#grant-request-cards) |
+| `blockedUsers` | Block list (same identifier forms as `allowedUsers`: email / mobile / `on_xxx` / `ou_xxx`), a sender-dimension global deny: effective in both groups and DMs, and evaluated before every allow leg — on-call, whole-group open, guest grants, team trust. A blocked sender gets no grant request card. Owners / admins cannot be blocked (the write entry refuses it). It does not affect message-listener matching. Also maintained in Dashboard **Bot Config** and the group-member modal. See [Permissions & Access · Block list](/en/permissions#block-list-blockedusers) |
 
 ## File sandbox
 
@@ -223,8 +234,9 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 
 | Field | Description |
 |------|------|
-| `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
+| `brandLabel` | Branding text at the bottom of the card (rendered on final replies and top-level broadcasts only). `undefined` = default `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`; `""` = hidden; any other string = rendered as-is (supports markdown). Also gated by the machine-wide `dashboard.cardBrandLabel` switch (Dashboard "Settings → Feishu Cards", on by default): when off, no bot shows a footer signature and this field is greyed out on the bot config page. Purely cosmetic, does not affect routing / permissions |
 | `showUsageInCardFooter` | Whether reply-card footers show native Context / Token usage from the Agent CLI. Missing / `true` = show; `false` = hide both metrics. A missing individual metric is still omitted independently. This controls card display only and does not disable the Usage Ledger or other accounting |
+| `modelBackendVariant` display | A frozen TraeX backend variant appears only in the runtime identity on the live streaming session card. Reply-card footers show Context / Token usage only; they do not show the variant |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
 | `hiddenStreamingCardButtons` | Hides selected main controls on live streaming cards. Values: `output` (also hides text export and screenshot refresh), `terminal`, `writeLink`, `compact`, `stop`, and `close` (`Disconnect` on adopted sessions). Missing or empty shows every control, for example `["terminal", "writeLink", "close"]`. Hot-update with `/botconfig set hiddenStreamingCardButtons terminal,writeLink,close`; `unset` restores all controls |
 | `pinStreamingCard` | When `true`, the bot **pins the current public live-status card**. It is opt-in and default-off: only an explicit `true` enables it. Only the current public live-status real `streamCardId` participates; repo-picker cards, private `/card` snapshots, final reply cards, CoT, closed cards, and every other interactive card stay out of scope. The switch is hot-updated: once dashboard or `/botconfig set pinStreamingCard on/off` successfully writes local config and changes the effective value, Botmux runs a best-effort reconciliation across this bot's **existing active sessions**, and after a daemon restart it also schedules one fire-and-forget recovery pass for the current bot after `restoreActiveSessions`. The configuration response and daemon readiness do **not wait** for Feishu Pin/Unpin calls. Failures never interrupt publication, transfer, resume, close, startup, or configuration itself; during exceptional periods there may temporarily be zero or multiple Pins. This feature adds **no durable retry journal and no broad remote cleanup**: restart recovery only trusts Feishu Pins whose operator provenance is `app_id === current larkAppId`, then narrows cleanup to the strict intersection with the enqueue-time local candidate IDs. A colliding current Pin with human, other-app, mixed, or malformed provenance is neither claimed nor re-pinned; an absent current Pin is claimed only when create returns the exact message ID and same-app provenance. Explicit off cleans process-owned IDs plus freshly proven local candidates, while ordinary disable, close, and transfer remain process-ownership-only |
@@ -240,7 +252,31 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | Field | Description |
 |-------|-------------|
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
-| `thinkingCardToolResult` | Boolean, default `true` (on). Whether tool nodes in the native thinking bubble (bot-level master switch `thinkingCard`, default on) carry the command output / file content code block. `false` keeps only thinking paragraphs and tool node titles (tool · command / path) and degrades the result to a single `✓ Done` line (a tool node only leaves the “running” state once a result event arrives, so the event cannot simply be dropped), matching Claude Code's own UI; toggle via `/botconfig set thinkingCardToolResult off` or the dashboard card sub-switch, effective immediately |
+| `replyDelivery` | `"transcript"` or `"send"`; **every CLI defaults to `send`** (matching upstream behaviour), and `transcript` must be turned on explicitly. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
+
+### `replyDelivery: "transcript"`
+
+`claude-code` defaults to `transcript`; the other supported CLIs need it set explicitly. Once active it changes three things for that bot's sessions:
+
+1. **The system prompt never mentions `botmux send`**: the intro becomes "your final assistant message is automatically forwarded back to Lark by botmux — just answer directly"; the heredoc rule, the @ decision gate, the attachment usage and the `<identity>` rule "collaboration requires `botmux send --mention`" are all dropped, leaving only `botmux history` / `botmux bots list` and the `BOTMUX_NOTHING_TO_SEND` silence sentinel. For the cases that genuinely need `botmux send` (attachments, cross-bot @) the model can discover the built-in skill (`botmux-send` under `--plugin-dir`) on its own;
+2. **The per-turn `<botmux_reminder>` is no longer injected** (one less reminder block per prompt);
+3. **Solo sessions are unwrapped**: in a DM, or a plain 1:1 group whose only participants are the owner and this bot, each turn drops the `<user_message>` wrapper and the `<sender/>` tag, so the model sees bare text. Topic groups, multi-member groups, and turns spoken by anyone other than the owner never count as solo; wrapper and tag stay as before.
+
+Supported CLIs: `claude-code`, plus the structured-transcript bridge CLIs `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`. Other CLIs (e.g. `cursor`, `gemini`) have no transcript capture, so both `/botconfig set` and the dashboard reject the value (`reply_delivery_unsupported`); if the field is already persisted and `cli` is later switched to an unsupported CLI, the runtime falls back to `send` (one warn in the log) rather than losing replies.
+
+Hot-updatable by the owner / `allowedUsers` via `/botconfig`:
+
+```text
+/botconfig set replyDelivery transcript   # enable explicitly on the other supported CLIs
+/botconfig set replyDelivery send         # put claude-code back on the old behavior (model runs botmux send itself)
+/botconfig unset replyDelivery            # back to the CLI default
+```
+
+- **Two activation points**: the per-turn envelope (reminder / wrapper / `<sender/>`) applies from the next turn; the system prompt is injected at spawn time, so a running session needs `/restart` to pick up the new value, while new sessions use it directly.
+- **Observability cost**: the bare-text shape of a solo session has no `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes such sessions as botmux's own (the same class of cost as `senderTag: false`).
+- The dashboard "Reply Delivery → Transcript reply mode" toggle saves this field; it is disabled with an explanation when the current CLI does not support it.
+
+### `senderTag: false`
 
 With it off the model cannot see speaker identity: in a multi-person chat it cannot tell participants apart or address them by name. Useful for a CLI whose model copies the tag into its reply body (e.g. cursor — see the `<sender_note>` anti-echo hint, which disappears together with the tag), or when you do not want per-message identity written into the CLI transcript.
 
@@ -268,9 +304,12 @@ Or write it directly into the bot's config:
 
 | Field | Description |
 |------|------|
+| `autoInviteOwnerOnGroupAdd` | On by default: when the bot is added to a new chat, its owner is automatically added to the same chat so the bot never ends up somewhere its owner cannot see; set `false` to turn it off (useful when an alert/on-call platform batch-adds the bot to incident chats). Applies only to the bot being passively added. Editable in Dashboard → Bot defaults → Proactive start or via `/botconfig set autoInviteOwnerOnGroupAdd off`; switching it back on clears the key to the default |
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+| `groupJoinCommandEnabled` | When `true` and `groupJoinCommand` is non-empty, the bot runs that command on this host whenever it is added to **any** chat — no session, no model. Independent of `autoStartOnGroupJoin` (no `allowedUsers` membership requirement). Also requires the `im.chat.member.bot.added_v1` event. Editable in Dashboard → Bot defaults → Auto-start |
+| `groupJoinCommand` | The command to run on join. Same execution contract as [Hooks](./hooks.md): no shell (use `bash -c '…'` for pipes/redirects), minimal environment (no app secret); stdin is JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`, plus `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` env vars; the process group is killed after 10 minutes |
 
 ## Group message listener
 
@@ -393,3 +432,40 @@ The following fields are written by botmux itself and persisted into `bots.json`
 | `noCardChats` | The "don't send streaming cards in this group" list written by `/card off\|on` |
 
 > **Configuration precedence**: the `BOTS_CONFIG` environment variable → `~/.botmux/bots.json`. Run `botmux restart` after editing to take effect.
+
+
+### Strict process environment inheritance (opt in)
+
+![Dashboard strict inheritance and write-only environment example](/img/strict-env-policy-dashboard.png)
+
+Omit `envPolicy` or use `{ "mode": "inherit" }` to retain historical host inheritance and mandatory credential/session-marker filtering. Strict mode uses exact approved names:
+
+```json
+{
+  "envPolicy": { "mode": "strict", "inherit": ["HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "TOOLCHAIN_ROOT"] },
+  "env": { "OPENAI_API_KEY": "<this bot's model credential>" }
+}
+```
+
+The fixed baseline contains PATH, HOME, user identity, temporary directories, standard locale, terminal and XDG paths; see `src/core/env-policy.ts` for the complete list. `inherit` adds exact names without wildcards. Proxy, CA, toolchain and model-auth variables require explicit approval here or this bot's `env`. Configured `env` wins over inherited values and stays per child/pane. Botmux injects its own identity/control variables; reserved names including `BOTMUX*`, `__OWNER_OPEN_ID` and `CODEX_HOME` cannot be overridden or inherited as user grants. Non-reserved adapter variables such as `TRAE_HOME` and `CLI_EXTRA_ARGS` also require an explicit `inherit` grant or a value in this bot's `env`. Process-level `GROK_HOME`, `DSH_HOME` and `LARKSUITE_CLI_DATA_DIR` may be explicitly inherited. Mandatory sensitive-variable filtering remains enforced in strict mode.
+
+Set the policy in Dashboard under “Process environment inheritance”, with `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'` with --bot to select the target bot, or `/botconfig set envPolicy {"mode":"strict"}`. Unset restores historical inheritance. Malformed policies, unknown fields and reserved names fail closed.
+
+**Combining network policies:** When using a version that provides `sandboxNetworkPolicy`, the `HTTPS_PROXY` example above must also satisfy this table. An exact environment grant controls whether a value reaches the CLI; it does not authorize network access or silently remove/rewrite a proxy.
+
+| Network configuration | HTTP/HTTPS/ALL proxy and lowercase equivalents |
+| --- | --- |
+| No network policy; or omitted `proxyMode` with both zones set to `allow` | No network-policy proxy rejection; strict mode still requires an `inherit` grant or this bot's explicit `env` |
+| Omitted `proxyMode` with either zone set to `block`, `allowlist` or `denylist` | Non-empty proxy values reject launch, including inherited and per-bot configured values |
+| `proxyMode: "reject"` | Non-empty proxy values reject launch even when both zones use `allow` |
+| `proxyMode: "trusted-egress"` | Explicitly granted proxies may remain; rules must permit the actual proxy endpoint IP/port; final model destinations, proxy DNS and CONNECT/HTTP rules belong to deployment-layer proxy ACLs |
+
+`trusted-egress` neither creates a proxy, grants environment variables nor guarantees the CLI uses it. Authorizing an exit does not restrict destinations behind it. If a model requires a proxy, do not simply remove its `inherit` grant to pass validation: explicitly trust the exit and configure endpoint rules plus deployment-layer ACLs, or first establish direct model authentication, permitted destination CIDRs/ports and DNS. Network policies still require Linux, a fresh local PTY and `sandbox: true` / `"oncall"`; persistent backends such as tmux, adopt and external App Servers remain rejected regardless of `trusted-egress` or `envPolicy`. See [network sandbox documentation](sandbox.md).
+
+Online changes apply on the next **worker cold start**. The offline terminal command updates bots.json; an already running daemon must be restarted to reload an offline edit. CLI restarts within a live worker retain its frozen policy. Persistent restore compares a secret-free policy fingerprint: absent, corrupt or mismatched strict generations must terminate with a confirmed missing probe before cold start; unconfirmed teardown refuses launch. Environment already read by a live CLI cannot be revoked through a hot update.
+
+Strict mode covers Botmux-owned PTY, tmux, tmux-pipe, zellij, zmx, local Codex/TraeX RPC App Servers and title subprocesses. tmux/zellij exec `/usr/bin/env -i` directly and skip `launchShell` profiles. zmx uses a fixed shell without user profiles and an empty-environment exec. Supply PATH/nvm/mise configuration explicitly. Shared-server globals are not cleared wholesale; existing mandatory sensitive-variable scrubbing still applies. Strict panes reset inherited environments and granted credentials never seed shared globals. Strict panes default to `TERM=xterm-256color` when it is absent and preserve explicitly configured values. v3 workflows freeze the secret-free policy and resolve per-bot env at execution time rather than persist credentials into bot snapshots.
+
+Herdr, Riff, Mojo, Forge launch mode, adopted processes and externally owned App Servers cannot currently establish this boundary, so strict mode refuses those paths. Shells/profiles deliberately invoked by a CLI, credential/config files, OS file permissions and cloud identities remain outside this feature. Per-bot CODEX_HOME, codexAuthSync and file sandbox behavior remain independent.
+
+Dashboard reads only configured names. Its env form is write-only: saving replaces the complete map and saving blank clears it. Strict sessions do not return credential-bearing reproduction commands. Diagnostics show names/policy only. Explicit bot values are still plaintext in bots.json and process environments; this is not a secret vault.

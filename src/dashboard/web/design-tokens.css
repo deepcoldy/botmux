@@ -233,4 +233,7 @@ body {
 }
 
 /* ═══ 选中 ═══ */
-::selection { background: var(--accent-soft); }
+::selection {
+  background: var(--accent);
+  color: var(--on-accent);
+}

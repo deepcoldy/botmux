@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "calendars": {
+    "demo": {
+      "timeZone": "Asia/Shanghai",
+      "coverage": { "start": "2027-12-30", "end": "2028-12-31" },
+      "workWeek": [1, 2, 3, 4, 5],
+      "restDates": ["2028-01-04"],
+      "workDates": ["2028-01-01", "2028-01-08"]
+    }
+  }
+}

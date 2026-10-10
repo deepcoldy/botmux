@@ -10,6 +10,7 @@ import { readManagedOriginCapability } from '../core/managed-origin-capability.j
 import { loopbackFetch } from '../core/loopback-fetch.js';
 
 export const HOOK_EVENTS = [
+  'chat.bot_added',
   'topic.new',
   'thread.reply',
   'prompt.submit',
@@ -109,6 +110,8 @@ export type HookRunResult = {
 type RunHookCommandOptions = {
   fireAndForget?: boolean;
   captureStdout?: boolean;
+  /** Extra non-secret env merged over the allowlist (never overrides BOTMUX_HOOK_EVENT). */
+  extraEnv?: Record<string, string>;
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -388,6 +391,7 @@ async function runHookCommand(
         LOGNAME: process.env.LOGNAME,
         LANG: process.env.LANG,
         LC_ALL: process.env.LC_ALL,
+        ...options.extraEnv,
         BOTMUX_HOOK_EVENT: payload.event,
       },
     });
@@ -570,6 +574,45 @@ function runHooksLocally(payload: HookPayload): void {
     && filterMatches(hook.filter, payload));
   if (hooks.length === 0) return;
   runHooksFireAndForget(event, payload, hooks);
+}
+
+/** 入群命令（bots.json `groupJoinCommand`）的超时上限。它不是通知型 hook：
+ *  典型用法是「读群消息 → 查数据 → 发结果」这类要跑几十秒的脚本。 */
+export const GROUP_JOIN_COMMAND_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * 主动开工 — 入群执行命令：bot 被拉进群时直接跑 bot 配置的命令，不经 CLI/LLM。
+ *
+ * 与 hooks.json 的 `chat.bot_added` 同一套执行契约（无 shell、按参数切分、最小 env
+ * 白名单、payload JSON 走 stdin、超时杀整个进程组），区别只在配置入口是按 bot 的
+ * bots.json 字段（Dashboard 可编辑），以及超时放宽到 {@link GROUP_JOIN_COMMAND_TIMEOUT_MS}。
+ * 群 id 等再以 BOTMUX_JOIN_* 环境变量给一份，方便 shell 脚本直接取用；不注入
+ * BOTMUX_SESSION_ID / 应用密钥，命令里的 `botmux` 调用不会被误认成会话上下文。
+ * fire-and-forget，绝不抛。
+ */
+export function runGroupJoinCommand(
+  command: string,
+  body: { larkAppId: string; chatId: string; operatorOpenId?: string },
+): void {
+  const payload: HookPayload = { ...body, event: 'chat.bot_added', emittedAt: new Date().toISOString() };
+  const tag = `[group-join-command:${body.larkAppId}] chat=${body.chatId.substring(0, 12)}`;
+  const hook: HookConfig = { event: 'chat.bot_added', command, timeoutMs: GROUP_JOIN_COMMAND_TIMEOUT_MS };
+  const extraEnv: Record<string, string> = {
+    BOTMUX_JOIN_LARK_APP_ID: body.larkAppId,
+    BOTMUX_JOIN_CHAT_ID: body.chatId,
+    ...(body.operatorOpenId ? { BOTMUX_JOIN_OPERATOR_OPEN_ID: body.operatorOpenId } : {}),
+  };
+  try {
+    logger.info(`${tag} running (${command.slice(0, 80)})`);
+    void runHookCommand(hook, payload, { fireAndForget: true, extraEnv }).then(result => {
+      if (result.ok) logger.info(`${tag} completed`);
+      else logger.warn(`${tag} failed: ${result.error ?? `code=${result.code} signal=${result.signal ?? 'none'}`}`);
+    }).catch((err: any) => {
+      logger.warn(`${tag} crashed: ${err?.message ?? String(err)}`);
+    });
+  } catch (err: any) {
+    logger.warn(`${tag} failed to start: ${err?.message ?? String(err)}`);
+  }
 }
 
 export function runHookCommandForTest(

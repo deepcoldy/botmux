@@ -9,10 +9,15 @@ import { isMojoFullyRemote } from './sandbox.js';
 import { mojoRemoteProofFailureReason } from './mojo-types.js';
 import type { EffectiveMojoConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
+import { RemoteRunnerBackend } from './remote-runner-backend.js';
+import type { RemoteRunnerConfig } from './remote-runner-config.js';
+import type { RemoteRunnerBackendState } from './remote-runner-protocol.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
+import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
+import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
 import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
@@ -179,6 +184,19 @@ export function decideBackendGate(opts: {
 
 /** User-facing card shown when {@link decideBackendGate} gates a session. */
 export function backendGateUserMessage(backend: BackendType, reason: string): string {
+  // tmux is installed but the daemon's runtime (container seccomp/sandbox)
+  // blocks clone3/clone: install instructions cannot help, so the card must
+  // not show any — point at the sandbox policy and the PTY escape hatch.
+  if (backend === 'tmux' && classifyTmuxProbeFailure(reason) === 'env-denied') {
+    return [
+      '⚠️ 本机 tmux 不可用，无法启动会话。',
+      `原因：${reason}`,
+      'tmux 已经安装，问题出在 daemon 的运行环境：容器的 seccomp/沙箱策略禁止 clone3/clone 进程克隆，tmux server 无法启动。',
+      '处置：在容器/沙箱配置中放行 clone3（及 clone）系统调用后重试；'
+        + '或临时给该 bot 设置环境变量 BACKEND_TYPE=pty 用 PTY 后端兜底'
+        + '（PTY 会话不跨 daemon 重启存活，仅作应急）。',
+    ].join('\n');
+  }
   const installHint =
     backend === 'tmux'
       ? 'macOS: brew install tmux ｜ Debian/Ubuntu: sudo apt-get install -y tmux ｜ 其它发行版用对应包管理器安装 tmux'
@@ -228,6 +246,7 @@ export function backendSandboxCompatibilityError(opts: {
     opts.backendType === 'pty'
     || opts.backendType === 'tmux'
     || opts.backendType === 'riff'
+    || opts.backendType === 'remote-runner'
   ) return undefined;
   if (opts.backendType === 'mojo') {
     // A fully-remote mojo session (cloud on, localDaemon off) executes nothing
@@ -280,7 +299,8 @@ export interface SelectedSessionBackend {
 export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
-  backendConfig?: RiffBackendConfig | EffectiveMojoConfig;
+  backendConfig?: RiffBackendConfig | EffectiveMojoConfig | RemoteRunnerConfig;
+  remoteBackendState?: RemoteRunnerBackendState;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
   herdrOwnershipScope?: string;
@@ -291,6 +311,19 @@ export function selectSessionBackend(opts: {
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
+  if (opts.backendType === 'remote-runner') {
+    return {
+      backend: new RemoteRunnerBackend(
+        (opts.backendConfig ?? {}) as RemoteRunnerConfig,
+        opts.sessionId,
+        opts.remoteBackendState,
+      ),
+      isTmuxMode: false,
+      isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
   if (opts.backendType === 'mojo') {
     // Unlike riff, an absent config is FINE: every mojo field is optional and
     // the bare `mojo` binary on PATH with an ambient login is a valid setup.
@@ -318,14 +351,18 @@ export function selectSessionBackend(opts: {
   }
 
   if (opts.backendType === 'zmx') {
-    const sessionName = ZmxBackend.sessionName(opts.sessionId);
-    const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName);
+    const recorded = opts.persistentBackendTarget?.backendType === 'zmx'
+      ? opts.persistentBackendTarget : undefined;
+    const sessionName = recorded?.sessionName ?? ZmxBackend.sessionName(opts.sessionId);
+    const socketDir = recorded?.socketDir ?? resolveZmxSocketDir();
+    const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName, zmxEnv(process.env, socketDir));
     return {
       backend: new ZmxBackend(sessionName, {
         ownsSession: true,
         isReattach: reattach,
         sessionId: opts.sessionId,
         recoveryStateDir: opts.zmxRecoveryStateDir,
+        socketDir,
       }),
       isTmuxMode: false,
       // ZMX is observed out-of-band (`zmx tail`) and driven independently
@@ -334,7 +371,7 @@ export function selectSessionBackend(opts: {
       isPipeMode: true,
       isZellijMode: false,
       persistentSessionName: sessionName,
-      persistentBackendTarget: { backendType: 'zmx', sessionName },
+      persistentBackendTarget: { backendType: 'zmx', sessionName, socketDir },
       isReattach: reattach,
     };
   }

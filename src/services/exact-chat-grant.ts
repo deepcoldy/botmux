@@ -24,6 +24,11 @@ export interface ExactChatGrantInput {
   receiverLarkAppId: string;
   chatId: unknown;
   subjectOpenIds: unknown;
+  /** Optional per-subject message quota (already normalized to a positive integer). */
+  quota?: unknown;
+  /** Optional relative validity window in ms (already normalized to a positive
+   * integer); converted server-side to an absolute expiresAt. */
+  durationMs?: unknown;
 }
 
 export interface ExactChatGrantByLarkAppIdsInput {
@@ -31,6 +36,8 @@ export interface ExactChatGrantByLarkAppIdsInput {
   receiverLarkAppId: string;
   chatId: unknown;
   subjectLarkAppIds: unknown;
+  quota?: unknown;
+  durationMs?: unknown;
 }
 
 export type ExactChatGrantRequestInput = ExactChatGrantInput | ExactChatGrantByLarkAppIdsInput;
@@ -82,7 +89,13 @@ export interface ExactChatGrantDeps {
     chatId: string,
     subjectLarkAppIds: string[],
   ): Promise<CurrentChatBotAppResolution>;
-  addChatGrant(larkAppId: string, chatId: string, openId: string): Promise<GrantMutationResult>;
+  addChatGrant(
+    larkAppId: string,
+    chatId: string,
+    openId: string,
+    quota?: number,
+    expiresAt?: number,
+  ): Promise<GrantMutationResult>;
   removeChatGrant(larkAppId: string, chatId: string, openId: string): Promise<RevokeMutationResult>;
   listGrantedOpenIds(larkAppId: string, chatId: string): string[];
 }
@@ -250,10 +263,22 @@ export async function applyExactChatGrant(
     };
   }
 
+  // Optional quota/expiry. The route normalizes the raw option strings; here we
+  // only accept positive finite numbers, so direct callers can never smuggle an
+  // expiry through a crafted type. durationMs is relative — the absolute
+  // expiresAt is anchored once here (before the loop) so a batch shares one
+  // timestamp. undefined on either means "no limit / permanent".
+  const quota = typeof input.quota === 'number' && Number.isFinite(input.quota) && input.quota > 0
+    ? Math.floor(input.quota)
+    : undefined;
+  const expiresAt = typeof input.durationMs === 'number' && Number.isFinite(input.durationMs) && input.durationMs > 0
+    ? Date.now() + Math.floor(input.durationMs)
+    : undefined;
+
   const subjects: ExactChatGrantSubjectResult[] = [];
   for (const subjectOpenId of subjectOpenIds) {
     if (operation === 'grant') {
-      const result = await deps.addChatGrant(input.receiverLarkAppId, chatId, subjectOpenId);
+      const result = await deps.addChatGrant(input.receiverLarkAppId, chatId, subjectOpenId, quota, expiresAt);
       if (!result.ok) {
         return failure(500, 'grant_write_failed', result.reason, { partial: subjects });
       }
@@ -370,6 +395,8 @@ export async function applyExactChatGrantByLarkAppIds(
     receiverLarkAppId: input.receiverLarkAppId,
     chatId: input.chatId,
     subjectOpenIds: completeMappings.map(mapping => mapping.subjectOpenId),
+    quota: input.quota,
+    durationMs: input.durationMs,
   }, deps);
   if (!result.ok) return result;
   return { ...result, subjectMappings: completeMappings };

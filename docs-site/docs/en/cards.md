@@ -10,6 +10,35 @@ Every conversation turn produces a live-updating Lark card, your primary window 
 - **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive (buttons removed).
 - **A "recoverable" card on close**: it carries a "▶️ Resume session" button to click back in anytime; **if the CLI supports native resume** (the adapter implements `buildResumeCommand` and a native session id exists), it also includes the native command (e.g. `claude --resume <id>`) for manual recovery; when unsupported, only botmux's resume button plus a short note is shown.
 
+## The four display layers of a turn
+
+botmux's "presence" in Lark has four independently switched layers:
+
+| Layer | What it is | How to turn it off |
+|-------|------------|--------------------|
+| **Streaming status card** | The per-turn live-screenshot card (the main subject of this page) | Bot-level `disableStreamingCard`, or `/card off` for this chat |
+| **Thinking bubble (CoT)** | Intermediate narration / thinking messages while the CLI works | Bot-level `cotEnabled: false`, or `/cot off` for this chat; `/cot show` reveals one round on demand |
+| **✋ → ✅ reactions** | Progress reactions on **your triggering message**: ✋ when accepted, flipped to ✅ when the worker goes idle | Bot-level `silentTurnReactions: true` |
+| **Proactive CLI messages** | Rich-text / image messages the agent sends via `botmux send` | No switch — sent on demand (see below) |
+
+Reactions and streaming cards are **mutually exclusive per turn**: the ✋→✅ reactions appear only when "streaming cards are off for this chat" — with no live status window, the reaction is the only lightweight progress signal; a card-enabled chat gets no reactions.
+
+## Card / thinking switches: bot-level vs per-chat
+
+| Display layer | Bot-level default (Bot config / Dashboard **Bot Defaults**) | Per-chat override (in-group slash command) | Default |
+|---------------|-------------------------------------------------------------|--------------------------------------------|---------|
+| Streaming status card | `disableStreamingCard` | `/card off` / `/card on` (writes `noCardChats`); bare `/card` summons one immediately; `/card pin …` controls pinning | On |
+| Thinking bubble | `cotEnabled` | `/cot off` / `/cot on` (writes `noCotChats`); `/cot show` reveals one round; bare `/cot` shows status | On |
+| ✋ → ✅ reactions | `silentTurnReactions` | No per-chat command | Card-off chats get reactions automatically; `silentTurnReactions: true` silences even those |
+| Card controls | `hiddenStreamingCardButtons` (choose which buttons to hide) | — | All shown |
+| Card pinning | `pinStreamingCard` (default off) | `/card pin off｜on｜status` | Off |
+
+A per-chat override wins over the bot-level default and affects only that chat.
+
+**`/card` and `/cot` are admin-only (`allowedUsers`, canOperate)**, status subcommands included. The reason: Lark cards have no "show different views per person" capability — these switches are bot-level / chat-wide, so one change alters what **everyone in the group** sees; guests (talk access, no operate rights) get an "authorized users only" notice.
+
+**Quiet preset** (Dashboard **Bot Defaults** page, new in this batch): one click performs a **one-time linked write** — `cotEnabled:false` + `silentTurnReactions:true` + `disableStreamingCard:true` — for groups that only want the conclusion, quietly. It is **not a persistent binding**: it simply writes those three existing switches to the values above once and shows a toast; turning the preset off later does **not** revert the three values, so re-enable each switch manually if you want it back.
+
 ## Pinning The Current Live Card
 
 When a bot enables `pinStreamingCard`, Botmux tries to pin the **current public live-status card** to the top of the chat so the close-session and terminal entry points stay easy to reach.
@@ -36,6 +65,19 @@ To stop or correct it mid-turn, **don't wait for it to finish**: in screenshot m
 The card body is a **live screenshot (image)** of the terminal, not text rendering. Messages the CLI proactively sends (via `botmux send`) are separate rich-text / image-and-text messages that can carry images, files, and @mentions; for fully custom display, `--card-file` / `--card-json` can send raw interactive card JSON.
 
 > ⚠️ Raw cards allow **display-only elements + open_url buttons only**: any callback-firing control — callback buttons (with a `value`), dropdown / person selects, date-time pickers, inputs, form submits — is rejected. This prevents custom cards from forging interactive callbacks.
+
+## Charts in messages (vega-lite)
+
+A ` ```vega-lite ` fence in a `botmux send` body renders as a native Feishu Card 2.0 chart; other channels such as a Web view can render the same Vega-Lite directly. Supported subset:
+
+- Inline `data.values` only, at most 500 rows, values are string / number / boolean / null.
+- `mark`: `bar` (horizontal when only x is quantitative), `line`, `area`, `point`, `arc` (pie; `innerRadius > 0` for a donut). A pie takes only `theta` (value) + `color` (category); `x`/`y` are rejected and `theta` has no `title`.
+- Encoding channels: `x`, `y`, `color` (series), `theta` (pie value); each channel accepts only `field`, `type`, `title`. `x`/`y` titles become axis titles and the `color` title becomes the legend title. `type: temporal` is not parsed as a date: values are shown as categories in the given order, so sort them first.
+- At most 5 charts per card. The real limit is Feishu's **30KB card message request body** (including the envelope and the re-serialized `content`): once the card is assembled, charts that do not fit step down chart → 50-row data table → 10-row data table → notice only until the card fits. A single spec source is also capped at 30KB for parsing.
+
+Safety: the host **rebuilds** the VChart spec from recognised fields and never forwards the source JSON. `data.url`, `transform`, `params`, `expr`, `signal`, `datasets`, `layer` and similar are rejected. Unsupported or over-budget charts degrade to a one-line notice plus a plain-text data table (cells never become links or mentions), `botmux send` prints the reason on stderr, and the message is still delivered.
+
+`botmux send --dry-run` previews the rendering: it prints `{dryRun, bytes, fits, diagnostics, card}` (`bytes` is the Feishu request body size) without sending and without a session. It renders the body only (no image/file upload, mentions or footer).
 
 ## Updating a card after sending (card patch)
 

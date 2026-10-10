@@ -184,14 +184,14 @@ describe('readCriticalScopesFromApplicationInfo', () => {
 });
 
 describe('checkRequiredScopes (helper, not in main path)', () => {
-  it('lists granted scopes and computes missing critical/optional via grant_status===2', async () => {
+  it('lists granted scopes and computes missing critical/optional (grant_status 1 OR 2 both granted)', async () => {
     scopeListMock.mockResolvedValue({
       code: 0,
       data: {
         scopes: [
           { scope_name: 'im:message', grant_status: 2 },
-          { scope_name: 'im:resource', grant_status: 1 }, // 已申请未生效, 算 missing
-          { scope_name: 'unrelated:scope', grant_status: 2 },
+          { scope_name: 'im:resource', grant_status: 1 }, // spike: 已开通 scope 返回 1, 算 granted
+          { scope_name: 'unrelated:scope', grant_status: 1 },
         ],
       },
     });
@@ -199,12 +199,30 @@ describe('checkRequiredScopes (helper, not in main path)', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.granted).toContain('im:message');
-      expect(r.granted).not.toContain('im:resource');
-      // missingCritical 应该包含 im:resource (critical=true, granted_status!=2)
-      expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(true);
-      // im:message 已 granted, 不应该在 missingCritical 里
+      expect(r.granted).toContain('im:resource');
+      // im:message / im:resource 已 granted, 不应该在 missingCritical 里
+      expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(false);
       expect(r.missingCritical.some(s => s.name === 'im:message')).toBe(false);
+      // 未出现在 scope.list 里的 critical 项（如 im:chat.members:read）仍算 missing
+      expect(r.missingCritical.some(s => s.name === 'im:chat.members:read')).toBe(true);
     }
+  });
+
+  it('treats grant_status===1 as granted — Lark 国际版真机实证 status=1 的 scope API 直调可用', async () => {
+    // 自建应用已开通的 scope 在 scope.list 返回 grant_status=1（tenant token 直调
+    // im/v1/messages 与 im/v1/chats/{id}/members 均 code 0）。全量 critical scope
+    // 以 status=1 返回时, missingCritical 必须为空, 不能持续误报缺权限。
+    scopeListMock.mockResolvedValue({
+      code: 0,
+      data: {
+        scopes: BOTMUX_REQUIRED_SCOPES
+          .filter(s => s.critical)
+          .map(s => ({ scope_name: s.name, grant_status: 1 })),
+      },
+    });
+    const r = await checkRequiredScopes('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.missingCritical).toEqual([]);
   });
 
   it('treats im:chat.members:write_only as CRITICAL (拉群刚需) so its absence is surfaced', async () => {
@@ -338,6 +356,25 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     const entry = BOTMUX_REQUIRED_SCOPES.find(s => s.name === 'im:message.group_msg');
     expect(entry, 'im:message.group_msg should be in BOTMUX_REQUIRED_SCOPES').toBeDefined();
     expect(entry?.critical).toBe(true);
+  });
+
+  it('checks the optional chat-tab scopes at startup', () => {
+    const scopes = new Map(BOTMUX_REQUIRED_SCOPES.map(scope => [scope.name, scope]));
+    expect(scopes.get('im:chat.tabs:read')?.critical).toBe(false);
+    expect(scopes.get('im:chat.tabs:write_only')?.critical).toBe(false);
+  });
+
+  it('declares all Buzz channels as optional auto-top-up scopes', () => {
+    for (const name of [
+      'im:message.urgent',
+      'im:message.urgent:sms',
+      'im:message.urgent:phone',
+    ]) {
+      expect(BOTMUX_REQUIRED_SCOPES.find(scope => scope.name === name)).toMatchObject({
+        name,
+        critical: false,
+      });
+    }
   });
 
   it('every required scope exists in lark-scopes.json manifest (no bare names that Lark API would never return)', async () => {

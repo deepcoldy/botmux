@@ -73,7 +73,7 @@ describe('closeSession leaves the streaming card alone', () => {
   });
   afterEach(() => {
     workerPool.setActiveSessionsRegistry(new Map());
-    sessionStore.init();
+    sessionStore.init('test-app');
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
@@ -99,6 +99,42 @@ describe('closeSession leaves the streaming card alone', () => {
       expect(unpinMessage).not.toHaveBeenCalled();
       expect(sessionStore.getSession(s.sessionId)?.status).toBe('closed');
     } finally {
+      config.session.dataDir = prev;
+    }
+  });
+
+  it.each(['claude-code', 'codex'])('cancels live XPI work and its timer when closing %s', async (cliId) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-xpi-'));
+    tempDirs.push(dataDir);
+    const prev = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-card');
+    let ds: ReturnType<typeof makeDs> | undefined;
+    try {
+      const s = sessionStore.createSession('oc_close_xpi', 'om_close_xpi', 'close XPI', 'group');
+      s.larkAppId = 'app-close-card';
+      s.cliId = cliId;
+      s.crossPrincipalInterruptions = [{
+        version: 1, id: 'xpi_pending', ownerTurnId: 'om_owner', phase: 'awaiting_classification',
+        owner: { requestUserOpenId: 'ou_owner', senderType: 'user' },
+        proposer: { requestUserOpenId: 'ou_peer', senderType: 'bot' }, messages: [],
+      }];
+      sessionStore.updateSession(s);
+      ds = makeDs(s.sessionId, 'app-close-card', 'om_stream_card');
+      // Model a driver that holds a separate live snapshot from the store row.
+      ds.session = structuredClone(ds.session);
+      const timer = setTimeout(() => {}, 60_000);
+      ds.crossPrincipalWaitTimer = timer;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+
+      await workerPool.closeSession(s.sessionId, { awaitWorkerExit: false });
+
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+      expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+      expect((timer as unknown as { _destroyed: boolean })._destroyed).toBe(true);
+      expect(sessionStore.getSession(s.sessionId)?.crossPrincipalInterruptions).toBeUndefined();
+    } finally {
+      if (ds?.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
       config.session.dataDir = prev;
     }
   });
@@ -167,7 +203,7 @@ describe('closeSession leaves the streaming card alone', () => {
       });
 
       await expect(workerPool.closeSession(s.sessionId, { awaitWorkerExit: false })).resolves.toEqual({
-        ok: true, outcome: 'closed', alreadyClosed: false, known: true,
+        ok: true, outcome: 'closed', alreadyClosed: false, known: true, closedCardPatchQueued: true,
       });
       await unpinStarted.promise;
       expect(unpinMessage).toHaveBeenCalledWith('app-close-card', 'om_stream_card');

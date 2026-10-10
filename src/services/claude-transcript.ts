@@ -70,6 +70,30 @@ export interface TranscriptEvent {
   originalModel?: string;
   fallbackModel?: string;
   apiRefusalCategory?: string;
+  /** Claude Code writes `isMeta:true` on internal user records (tool results,
+   *  slash-command wrappers, compact summaries). Most are NOT real prompts and
+   *  stay filtered by isMeaningfulUserEvent, but the built-in scheduler's fire
+   *  record additionally carries `turnOrigin:"scheduled"` and DOES start a
+   *  real model turn — see {@link isScheduledTurnStartEvent}. */
+  isMeta?: boolean;
+  /** Turn-origin discriminator written by Claude Code ≥2.1.281. The built-in
+   *  CronCreate scheduler fires turns as user records with
+   *  `turnOrigin:"scheduled"` (plus `scheduledTaskId` / `scheduledFireId`).
+   *  Older builds (≤2.1.280) omit it; those fires are recognised via
+   *  `promptSource === "system"` — see {@link isScheduledTurnStartEvent}. */
+  turnOrigin?: string;
+  /** Provenance of a user record. Built-in scheduler fire records on older
+   *  Claude Code builds (≤2.1.280) carry `promptSource:"system"` but no
+   *  turnOrigin. NOTE this field is NOT unique to scheduler fires (cross-
+   *  session messages, task_notification on some builds also set it), so it
+   *  is only consulted after the isMeta guard AND with scheduledFireId set. */
+  promptSource?: string;
+  scheduledTaskId?: string;
+  scheduledFireId?: string;
+  /** Sidechain (sub-agent / Task tool) records and compact-boundary summary
+   *  records — both excluded from meaningful turn attribution. */
+  isSidechain?: boolean;
+  isCompactSummary?: boolean;
   /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
    *  a FORKED session: the record is history the fork inherited, and the switch
    *  it describes does NOT apply to this conversation. Treated as positive
@@ -617,6 +641,146 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
     && reason !== 'pause_turn';
 }
 
+/** The launch-ack a background Agent/Task tool_result carries the moment it is
+ *  dispatched: the tool call returns immediately with "launched"/"in the
+ *  background" text and an `agentId:` line, and the real result only arrives
+ *  later as a re-injected `<task-notification>`. Anchored on both markers so an
+ *  ordinary synchronous tool_result that merely mentions "background" is not
+ *  mistaken for an async dispatch. */
+const BACKGROUND_LAUNCH_ACK_RE = /launched|in the background/i;
+const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
+
+/** Identify a background Agent/Task dispatch from an assistant event: returns
+ *  the tool_use ids that dispatched async work. Empty when the event dispatched
+ *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
+ *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
+export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && (block.name === 'Agent' || block.name === 'Task')) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Read a background launch-ack out of a user event's tool_result blocks. Maps
+ *  each async-dispatch tool_use_id to the durable agent id minted in its ack
+ *  text (the id `<task-notification>` later reports under `<task-id>`). Only
+ *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
+ *  line qualify, so a synchronous tool result is never counted. */
+export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; agentId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    if (!BACKGROUND_LAUNCH_ACK_RE.test(text)) continue;
+    const m = BACKGROUND_LAUNCH_AGENT_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, agentId: m[1] });
+  }
+  return acks;
+}
+
+/** A `<task-notification>` re-injected when a background agent stops. It is a
+ *  synthetic event whose payload STARTS WITH the tag — a tool_result that
+ *  merely contains the literal string (e.g. grep over this source) is not one.
+ *  Two on-disk shapes carry it: the legacy `role:user` event (text in
+ *  `message.content`) and the type-ahead `attachment(queued_command)` form
+ *  (text in `attachment.prompt`, `commandMode:'task-notification'`) that
+ *  current CLI builds write — mirroring {@link extractTurnStartText}.
+ *  `status` is the agent's terminal state; the same task-id may notify more
+ *  than once (a resumed agent stops again), so a completed/failed notice only
+ *  ever RETIRES a tracked id, it never adds one. */
+export function parseTaskNotification(ev: TranscriptEvent):
+  { taskId: string; toolUseId?: string; status: string } | undefined {
+  if (!ev) return undefined;
+  let text: string;
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+  } else {
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'user') return undefined;
+    const raw = ev.message?.content;
+    text = typeof raw === 'string'
+      ? raw
+      : Array.isArray(raw)
+        ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
+        : '';
+  }
+  if (!text.trimStart().startsWith('<task-notification>')) return undefined;
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
+  if (!taskId) return undefined;
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1]?.trim();
+  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim() ?? 'completed';
+  return { taskId, ...(toolUseId ? { toolUseId } : {}), status };
+}
+
+/** Live count of background Agent/Task dispatches whose completion notification
+ *  has not yet arrived, folded from a transcript event stream. The worker keeps
+ *  one per session and consults `pending()` at the PTY idle edge: while a main
+ *  turn is only idle because it is awaiting a background sub-agent, the session
+ *  card must stay `working` rather than freezing to idle (which Lark surfaces as
+ *  「已完成」). State is intentionally id-keyed, not a bare counter, so a
+ *  duplicate notification or a re-drained dispatch cannot double-count. */
+export class BackgroundTaskTracker {
+  /** agentId → toolUseId that dispatched it, for the ids still in flight. */
+  private readonly live = new Map<string, string>();
+  /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
+  private readonly ackByToolUse = new Map<string, string>();
+  /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
+  private readonly awaitingAck = new Set<string>();
+
+  observe(ev: TranscriptEvent): void {
+    // A genuine user-typed prompt starts a new turn and supersedes any prior
+    // turn's background waits — whether it lands as a `role:user` event or the
+    // type-ahead `attachment(queued_command)` form the CLI writes when it
+    // dequeues a submission (a resumed agent's `<task-notification>` is
+    // synthetic and both predicates exclude it, so it never trips this).
+    // Resetting here bounds the tracker: even if a completion notification is
+    // somehow never parsed, the account cannot leak past the next real prompt
+    // and wedge the card in `working`.
+    if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
+      this.reset();
+      return;
+    }
+    for (const toolUseId of backgroundTaskDispatchToolUseIds(ev)) {
+      const agentId = this.ackByToolUse.get(toolUseId);
+      if (agentId) this.live.set(agentId, toolUseId);
+      else this.awaitingAck.add(toolUseId);
+    }
+    for (const ack of backgroundTaskDispatchAcks(ev)) {
+      this.ackByToolUse.set(ack.toolUseId, ack.agentId);
+      if (this.awaitingAck.delete(ack.toolUseId)) this.live.set(ack.agentId, ack.toolUseId);
+    }
+    const note = parseTaskNotification(ev);
+    if (note) this.live.delete(note.taskId);
+  }
+
+  /** Number of background agents still in flight. */
+  pending(): number {
+    return this.live.size;
+  }
+
+  reset(): void {
+    this.live.clear();
+    this.ackByToolUse.clear();
+    this.awaitingAck.clear();
+  }
+}
+
 /** Extract the user-typed prompt text for a "turn start" event — works for
  *  both legacy `role:user` events (text in `message.content`) and the
  *  type-ahead `attachment(queued_command)` form (text in `attachment.prompt`).
@@ -804,6 +968,9 @@ function truncateForCot(s: string, max: number): string {
  *  redeclared structurally here to keep this module dependency-free. */
 export type TranscriptCotEntry =
   | { kind: 'thinking'; text: string }
+  /** Interim assistant narration (a `text` block that is not the turn's
+   *  closing answer). Kept distinct from `thinking`: see CotEntry. */
+  | { kind: 'text'; text: string }
   | {
     kind: 'tool_call'; id: string; name: string; args: string;
     /** 截断前从完整 input 提取的单行主题（≤1000）；无可用字段时不带此键。 */
@@ -825,12 +992,21 @@ function stringifyToolResultContent(content: unknown): string {
 /**
  * Extract the CoT (thinking process) entries from one transcript event, in
  * content-block order:
- *   - assistant events → `thinking` blocks and `tool_use` blocks
- *     (id + name + JSON-stringified input, truncated);
+ *   - assistant events → `thinking` blocks, `text` blocks and `tool_use`
+ *     blocks (id + name + JSON-stringified input, truncated);
  *   - user events → `tool_result` blocks (tool_use_id + flattened text,
  *     truncated).
  * Returns [] for events carrying neither. Sidechain / error filtering is the
  * caller's job (bridge-turn-queue applies it before attribution).
+ *
+ * `text` blocks are the model's mid-turn narration. They are deliberately
+ * INCLUDED even though the turn's closing answer is a `text` block too: the
+ * transcript is consumed as a stream, so "is this the last one" is not
+ * knowable at extraction time, and a bubble that repeats the final answer at
+ * its tail is far cheaper than one that silently drops every interim line —
+ * without them a turn with extended thinking off (Claude Code's default)
+ * renders as a bare row of tool nodes. Per-entry length is left uncapped like
+ * `thinking`; the worker's accumulated cap bounds the payload.
  */
 export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
   const content = event.message?.content;
@@ -840,6 +1016,8 @@ export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] 
     if (!block || typeof block !== 'object') continue;
     if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
       entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      entries.push({ kind: 'text', text: block.text });
     } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
       // 主题必须在 stringify + 截断之前从对象上取：截断后的 JSON 解析不出来。
       const subject = boundSubjectForTransport(subjectFromInputObject(block.input));
@@ -961,6 +1139,108 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   return true;
 }
 
+/** Claude Code's built-in CronCreate tool name. Its tool_result ack carries
+ *  the session-scoped job id that later fire records report as
+ *  `scheduledTaskId`. */
+export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
+
+/** Assistant-event tool_use block ids that called the built-in CronCreate.
+ *  The scheduled job id only comes back in the FOLLOWING user tool_result, so
+ *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
+ *  as background Task dispatches. */
+export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && block.name === CLAUDE_CRON_CREATE_TOOL) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Parse the CronCreate success ack. Real Claude Code (2.1.276 / 2.1.284,
+ *  and a scan of 821 local session transcripts) uses DISTINCT nouns:
+ *   - recurring: "Scheduled recurring job 02b077c4 (Every hour at :11) ..."
+ *   - one-shot:  "Scheduled one-shot task bf15f538 (34 18 20 9 *) ..."
+ *  An earlier regex only accepted `job`, so 13/16 real one-shot creates in
+ *  the corpus never paired and their fires routed as unknown tasks. The
+ *  `one-shot job` alternative stays for older builds that printed it. The
+ *  caller gates acceptance on a pending CronCreate tool_use id, so a quoted
+ *  ack inside unrelated output can never register a task; the tight shape
+ *  here is defence in depth. */
+const CRON_CREATE_ACK_TASK_ID_RE =
+  /Scheduled\s+(?:recurring\s+job|one-shot\s+(?:job|task))\s+([0-9A-Za-z_-]{4,})\b/i;
+
+export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
+  Array<{ toolUseId: string; taskId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; taskId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    const m = CRON_CREATE_ACK_TASK_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, taskId: m[1] });
+  }
+  return acks;
+}
+
+/** True when a `type:'user'` event is the fire record of a Claude Code
+ *  **built-in** CronCreate scheduled turn. Two transcript shapes qualify:
+ *
+ *   - Claude Code ≥2.1.281: `isMeta:true` + `turnOrigin:"scheduled"`;
+ *   - Claude Code ≤2.1.280: `isMeta:true` + `promptSource:"system"` with
+ *     NO `turnOrigin`.
+ *
+ *  Both additionally require a non-empty `scheduledFireId`. These records are
+ *  deliberately excluded from isMeaningfulUserEvent — they are scheduler
+ *  machinery, not human typing — but they DO open a genuine model turn whose
+ *  final answer the user expects in the originating Lark thread.
+ *
+ *  The guards are deliberately tight (validated against 820 real session
+ *  transcripts): the isMeta check MUST precede the promptSource fallback —
+ *  many non-scheduler records (incl. task_notification) carry
+ *  `promptSource:"system"` with isMeta NOT true; and scheduledFireId is
+ *  mandatory — cross-session-message records are isMeta:true +
+ *  promptSource:"system" but have no fire id. A future build that drops
+ *  scheduledFireId fails closed (silent bucket, never mis-delivered). A
+ *  present turnOrigin other than "scheduled" (human/sdk/task_notification)
+ *  is rejected outright. Distinct from botmux's own native scheduler
+ *  (`botmux schedule add`), whose turns carry daemon-assigned
+ *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
+export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  // Hard guard: only internal meta records. Must stay ahead of the
+  // promptSource fallback below.
+  if (ev.isMeta !== true) return false;
+  if (ev.turnOrigin !== undefined) {
+    // Newer builds stamp the discriminator explicitly.
+    if (ev.turnOrigin !== 'scheduled') return false;
+  } else {
+    // Older builds (≤2.1.280) omit turnOrigin; recognise the fire via
+    // promptSource. isMeta already passed; scheduledFireId still required.
+    if (ev.promptSource !== 'system') return false;
+  }
+  // Require the fire identity: every real CronCreate fire carries it, and it
+  // rules out isMeta + promptSource:'system' lookalikes (cross-session
+  // messages) that happen to lack it.
+  if (typeof ev.scheduledFireId !== 'string' || ev.scheduledFireId.length === 0) return false;
+  if (ev.isSidechain === true || ev.isCompactSummary === true) return false;
+  return true;
+}
+
 /** True when a `type:'attachment'` line carries a queued-command payload
  *  representing a real submitted prompt. Claude writes one of these when it
  *  dequeues a type-ahead submission (right before the assistant's reply for
@@ -974,6 +1254,15 @@ export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
   if ((ev as any).isSidechain === true) return false;
+  // Mid-turn absorbed message (Claude Code 2.1+): when the user types while
+  // a turn is running, Claude Code logs an attachment(queued_command) rendered
+  // as a system reminder (`renderedRole: "system"`, `<system-reminder>`).
+  // This is intra-turn context, NOT a new conversation turn boundary.
+  if ((ev as any).renderedRole === 'system') return false;
+  const rendered = (ev as any).rendered;
+  if (Array.isArray(rendered) && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'))) {
+    return false;
+  }
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;

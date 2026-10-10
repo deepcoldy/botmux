@@ -21,14 +21,11 @@
  */
 import { getBot, type CommandTriggerCommand, type CommandTriggerConfig } from '../bot-registry.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../core/passthrough-commands.js';
+// 路由元命令（`/t` `/topic`）：`parseTopicHeader` 在命令表之前拦截，不在 DAEMON_COMMANDS
+// 里，所以必须单列，否则 `/t` 会成为一个可配置的免@ 命令并强制开新话题。
+import { FORCE_TOPIC_COMMANDS } from '../core/command-schema.js';
 
 export type ReservedCommandKind = 'daemon' | 'passthrough' | 'force-topic';
-
-/**
- * 路由元命令：`parseTopicHeader` 在命令表之前拦截，不在 DAEMON_COMMANDS
- * 里，所以必须单列，否则 `/t` 会成为一个可配置的免@ 命令并强制开新话题。
- */
-const FORCE_TOPIC_COMMANDS = new Set(['/t', '/topic']);
 
 /**
  * 该命令是否属于 botmux 保留命令（→ 必须 @ 才能触发）。

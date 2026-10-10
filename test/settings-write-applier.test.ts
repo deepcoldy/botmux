@@ -25,8 +25,10 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     enableLocalCliOpen: false,
     localCliOpenMode: 'attach',
     chatBotDiscovery: true,
+    cardBrandLabel: true,
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
+    autoUpgradeCodexSessions: true,
     codexNotifier: {
       enabled: false,
       targetBotAppId: null,
@@ -42,6 +44,8 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     },
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
+    sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
+    multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
   };
@@ -170,11 +174,25 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
   });
 
+  it.each([false, true])('writes cardBrandLabel=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ cardBrandLabel: enabled });
+  });
+
   it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
+  });
+
+  it.each([false, true])('writes autoUpgradeCodexSessions=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ autoUpgradeCodexSessions: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ autoUpgradeCodexSessions: enabled });
   });
 
   it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
@@ -190,6 +208,61 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ bypassCodexHookTrust: true }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: true });
+  });
+
+  it.each([true, false])('persists hideCodexRateLimitModelNudge=%s', async (enabled) => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ hideCodexRateLimitModelNudge: enabled }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ hideCodexRateLimitModelNudge: enabled });
+  });
+
+  it('terminalises daemon queues only after persisting XPI=false', async () => {
+    const calls: string[] = [];
+    const deps = makeDeps({
+      mergeDashboardConfig: vi.fn((patch) => {
+        calls.push(`persist:${String(patch.crossPrincipalInterruption)}`);
+        return patch;
+      }),
+      disableCrossPrincipalInterruptionOnAllDaemons: vi.fn(async () => {
+        calls.push('disable-runtime');
+      }),
+    });
+    const r = await applySettingsWrite({ crossPrincipalInterruption: false }, deps);
+    expect(r.ok).toBe(true);
+    expect(calls).toEqual(['persist:false', 'disable-runtime']);
+  });
+
+  it('does not run disable cleanup when XPI is enabled or unrelated settings change', async () => {
+    const disable = vi.fn(async () => undefined);
+    const deps = makeDeps({ disableCrossPrincipalInterruptionOnAllDaemons: disable });
+    expect((await applySettingsWrite({ crossPrincipalInterruption: true }, deps)).ok).toBe(true);
+    expect((await applySettingsWrite({ publicReadOnly: true }, deps)).ok).toBe(true);
+    expect(disable).not.toHaveBeenCalled();
+  });
+
+  it('does not claim success when runtime XPI cleanup fails after persistence', async () => {
+    const calls: string[] = [];
+    const deps = makeDeps({
+      mergeDashboardConfig: vi.fn((patch) => {
+        calls.push(`persist:${String(patch.crossPrincipalInterruption)}`);
+        return patch;
+      }),
+      disableCrossPrincipalInterruptionOnAllDaemons: vi.fn(async () => {
+        calls.push('disable-runtime');
+        throw new Error('daemon cleanup incomplete');
+      }),
+    });
+    await expect(applySettingsWrite({ crossPrincipalInterruption: false }, deps))
+      .rejects.toThrow('daemon cleanup incomplete');
+    expect(calls).toEqual(['persist:false', 'disable-runtime']);
+  });
+
+  it('rejects malformed model-nudge settings without writing', async () => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ hideCodexRateLimitModelNudge: 'false' }, deps);
+    expect(result).toMatchObject({ ok: false, error: 'invalid_hideCodexRateLimitModelNudge' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('writes herdrTraexPlugin opt-in and trims source/ref through the dashboard segment', async () => {
@@ -256,6 +329,23 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ workflow: { enabled: 'yes' } }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_workflow_enabled' });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('writes multiTopic.enabled toggle while preserving sibling keys', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ multiTopic: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ multiTopic: { enabled: false, futureFlag: 1 } });
+  });
+
+  it('rejects invalid multiTopic patches', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ multiTopic: 'off' }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic' });
+    expect(await applySettingsWrite({ multiTopic: { enabled: 'no' } }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic_enabled' });
   });
 
   it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {
@@ -447,12 +537,28 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.error).toBe('invalid_chatBotDiscovery');
   });
 
+  it('rejects non-boolean cardBrandLabel → invalid_cardBrandLabel (no merge)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: 'off' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_cardBrandLabel');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
   it('rejects non-boolean noVisibleOutputHint → invalid_noVisibleOutputHint', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ noVisibleOutputHint: 'yes' }, deps);
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_noVisibleOutputHint');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('rejects invalid autoUpgradeCodexSessions=%s without writing settings', async (value) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ autoUpgradeCodexSessions: value }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_autoUpgradeCodexSessions' });
     expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
@@ -1051,5 +1157,70 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
     }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
+  });
+});
+
+describe('applySettingsWrite sessionCleanup', () => {
+  it('writes a full sessionCleanup block', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    });
+  });
+
+  it('merges a partial patch over the stored block (toggle only keeps threshold)', async () => {
+    const deps = makeDeps();
+    // Seed stored config with an existing block.
+    deps.mergeGlobalConfig({ sessionCleanup: { enabled: false, olderThanHours: 24, intervalMinutes: 15 } });
+    (deps.mergeGlobalConfig as ReturnType<typeof vi.fn>).mockClear();
+    const r = await applySettingsWrite({ sessionCleanup: { enabled: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { enabled: true, olderThanHours: 24, intervalMinutes: 15 },
+    });
+  });
+
+  it('rejects an unsupported olderThanHours', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { olderThanHours: 12 } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_olderThanHours' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a sub-floor intervalMinutes', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { intervalMinutes: 1 } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_intervalMinutes' });
+  });
+
+  it('rejects a non-boolean enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { enabled: 'yes' } as never }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_enabled' });
+  });
+
+  it('rejects a non-object sessionCleanup', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: 'nope' as never }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup' });
+  });
+
+  it('rejects an empty sessionCleanup patch', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: {} }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup' });
+  });
+
+  it('floors a fractional intervalMinutes', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { intervalMinutes: 90.7 } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { intervalMinutes: 90 },
+    });
   });
 });

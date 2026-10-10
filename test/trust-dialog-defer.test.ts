@@ -94,6 +94,24 @@ describe('trust dialog Enter deferral (Codex 0.149 key-handler race)', () => {
     expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
+  it('recognizes the Codex 0.155 trust-dialog wording', () => {
+    const sendSpecialKeys = vi.fn();
+    installGlobals({ sendSpecialKeys });
+    const handler = extractTrustHandler();
+
+    const screen = [
+      'Trust this folder?',
+      '› 1. Trust and continue',
+      '  2. Quit',
+      'Press enter to continue; esc to quit',
+    ].join('\n');
+
+    expect(handler(screen)).toBe(true);
+    expect(trustHandledValue).toBe(true);
+    vi.advanceTimersByTime(400);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
   it('does not re-enter when the same trust text arrives again within the window', () => {
     const sendSpecialKeys = vi.fn();
     installGlobals({ sendSpecialKeys });

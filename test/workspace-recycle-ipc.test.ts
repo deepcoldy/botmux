@@ -18,7 +18,7 @@ const secret = 'isolated-workspace-recycle-ipc-secret';
 const originalDataDir = config.session.dataDir;
 afterEach(async () => {
   await server?.close(); server = undefined;
-  store.init(); config.session.dataDir = originalDataDir;
+  store.init('fixture-app'); config.session.dataDir = originalDataDir;
   setIpcAuthSecret(null); setLarkAppId(''); pool.setActiveSessionsRegistry(new Map());
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   generateCodexAppThreadTitle,
   setCodexAppThreadName,
@@ -159,7 +159,13 @@ describe('generateCodexAppThreadTitle', () => {
     const logPath = join(dir, 'requests.jsonl');
     const pidPath = join(dir, 'pid');
 
-    const title = await generateCodexAppThreadTitle({
+    // Keep the deadline still while the real subprocess starts. Its response to
+    // the fixture's tool request proves turn/started has reached the client;
+    // only then expire the title deadline, independently of machine load.
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let forceClose: (() => void) | undefined;
+    let completed = false;
+    const pendingTitle = generateCodexAppThreadTitle({
       sourceText: '这个标题生成永远不会完成',
       codexBin: FAKE_CODEX,
       env: fakeCodexEnv(dir, {
@@ -169,12 +175,32 @@ describe('generateCodexAppThreadTitle', () => {
       }),
       timeoutMs: 100,
       detached: true,
+      registerForceClose: close => {
+        forceClose = close;
+        return () => { forceClose = undefined; };
+      },
     });
-
-    expect(title).toBeUndefined();
-    if (!existsSync(logPath)) {
-      expect(existsSync(pidPath)).toBe(false);
-      return;
+    try {
+      const readyDeadline = performance.now() + 5000;
+      let ready = false;
+      while (performance.now() < readyDeadline) {
+        if (existsSync(logPath)) {
+          ready = readFileSync(logPath, 'utf8').trim().split('\n')
+            .some(line => JSON.parse(line).id === 9001);
+          if (ready) break;
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      expect(ready, 'fake app-server must reach the active title turn').toBe(true);
+      vi.advanceTimersByTime(100);
+      // Cleanup still exercises real RPC and process reaping with real timers.
+      vi.useRealTimers();
+      expect(await pendingTitle).toBeUndefined();
+      completed = true;
+    } finally {
+      vi.useRealTimers();
+      if (!completed) forceClose?.();
+      await pendingTitle;
     }
     const requests = readFileSync(logPath, 'utf8')
       .trim()
@@ -185,7 +211,7 @@ describe('generateCodexAppThreadTitle', () => {
       'thread/unsubscribe',
     ]));
 
-    if (!existsSync(pidPath)) return;
+    expect(existsSync(pidPath)).toBe(true);
     const pid = Number(readFileSync(pidPath, 'utf8'));
     const reapDeadline = Date.now() + 2000;
     while (Date.now() < reapDeadline) {
@@ -197,7 +223,7 @@ describe('generateCodexAppThreadTitle', () => {
       }
     }
     throw new Error(`title generator fake Codex app-server ${pid} was not reaped`);
-  });
+  }, 15_000);
 });
 
 describe('setCodexAppThreadName', () => {

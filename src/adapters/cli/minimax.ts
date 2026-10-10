@@ -1,3 +1,4 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
@@ -114,11 +115,7 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
     // mmx repl redraws its input line in place (cursor hide + line clears)
     // but does NOT switch into the alternate screen buffer.
     altScreen: false,
-    modelChoices: [
-      'MiniMax-M3',
-      'MiniMax-M2.7',
-      'MiniMax-M2.7-highspeed',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['minimax'],
   };
 }
 

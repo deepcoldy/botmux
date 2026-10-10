@@ -27,6 +27,7 @@ import {
   buildTuiPromptFailedCard,
   buildSlashListCard,
   getCliDisplayName,
+  frozenIdleLabel,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
@@ -385,6 +386,25 @@ describe('buildSlashListCard', () => {
     expect(markdown).toContain('Forge \\*Codex\\* \\<at id=all\\>\\</at\\>');
     expect(markdown).not.toContain('<at id=all></at>');
   });
+
+  it('renders discovered commands in an auto-height table', () => {
+    const card = parse(buildSlashListCard({
+      cliName: 'codex',
+      builtin: [],
+      custom: [],
+      discovered: [{ name: 'review', description: 'review the current diff' }],
+      workingDir: '/workspace',
+      mcpServers: [],
+      discoverySupported: true,
+    }, 'en'));
+
+    const table = card.body.elements.find((element: any) => element.tag === 'table');
+    expect(table).toBeTruthy();
+    expect(table.row_height).toBe('auto');
+    expect(table.row_max_height).toBe('300px');
+    expect(table.header_style.lines).toBeGreaterThanOrEqual(2);
+    expect(table.rows).toEqual([{ cmd: '`review`', desc: 'review the current diff' }]);
+  });
 });
 
 describe('buildConfigCard', () => {
@@ -454,6 +474,24 @@ describe('buildConfigCard', () => {
       .find((e: any) => (e.actions ?? []).some((a: any) => a.value?.field === 'p2pOpen'));
     expect((securityRow.actions ?? []).map((a: any) => a.value?.field))
       .toEqual(['disableCliBypass', 'restrictGrantCommands', 'p2pOpen']);
+  });
+
+  it('renders the grantRequestToOwnerDm quick-toggle in the security section with a real label', () => {
+    const data = configData(null);
+    data.booleans = [...data.booleans, { key: 'grantRequestToOwnerDm', on: false }];
+    const en = parse(buildConfigCard(data, 'en'));
+    const toggle = allActions(en).find((a: any) => a.value?.field === 'grantRequestToOwnerDm');
+    expect(toggle.value.action).toBe('config_toggle');
+    expect(toggle.type).toBe('default');
+    expect(toggle.text.content).toBe('⚪ Forward requests to owner DM');
+    const zh = parse(buildConfigCard(data, 'zh'));
+    expect(allActions(zh).find((a: any) => a.value?.field === 'grantRequestToOwnerDm').text.content).toBe('⚪ 申请卡转投私聊');
+
+    const securityRow = en.elements
+      .filter((e: any) => e.tag === 'action')
+      .find((e: any) => (e.actions ?? []).some((a: any) => a.value?.field === 'grantRequestToOwnerDm'));
+    expect((securityRow.actions ?? []).map((a: any) => a.value?.field))
+      .toEqual(['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm']);
   });
 
   it('shows the p2pOpen toggle as off when the bot has not opted in', () => {
@@ -532,6 +570,8 @@ describe('buildForkPanelCard', () => {
     ], 'en'));
     const table = card.body.elements.find((element: any) => element.tag === 'table');
 
+    expect(table.row_height).toBe('auto');
+    expect(table.row_max_height).toBe('300px');
     expect(table.rows).toEqual([
       {
         instruction: 'investigate cleanup',
@@ -895,6 +935,18 @@ describe('buildStreamingCard', () => {
   it('should have wide_screen_mode config', () => {
     const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working'));
     expect(card.config.wide_screen_mode).toBe(true);
+    expect(card.config.update_multi).toBe(true);
+  });
+
+  it('marks every callback action with the patchable streaming-card version', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'screenshot',
+    ));
+    const callbackActions = allActions(card).filter((action: any) => action.value?.action);
+    expect(callbackActions.length).toBeGreaterThan(0);
+    for (const action of callbackActions) {
+      expect(action.value.stream_card_version).toBe('1');
+    }
   });
 
   // ── Header / status / template color ───────────────────────────────────
@@ -931,15 +983,14 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+    it('idle + silentIdle flag renders the silent turn terminal receipt', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, true,
       ));
       expect(card.header.template).toBe('green');
-      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
-      expect(card.header.title.content).not.toContain('等待输入');
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
@@ -949,6 +1000,69 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, true,
       ));
       expect(card.header.title.content).toContain('工作中');
+    });
+
+    // transcript 模式：最终回复卡已投递 → idle 卡头展示本轮终态。颜色沿用 idle 的绿色。
+    it("idle + 'completed' label renders the completed turn terminal receipt", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.template).toBe('green');
+      expect(card.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
+      expect(card.header.title.content).not.toContain('AI 判断无需回复');
+    });
+
+    it("idle + 'completed' label renders the completed turn terminal receipt in English", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.title.content).toContain('✓ Turn ended · Awaiting input');
+    });
+
+    it("idle + 'silent' string label equals the legacy boolean flag", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'silent',
+      ));
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
+    });
+
+    it("'completed' label is inert for non-idle statuses (working keeps its label)", () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, 'completed',
+      ));
+      expect(card.header.title.content).toContain('工作中');
+      expect(card.header.title.content).not.toContain('已完成');
+    });
+
+    // 冻结卡回读：新字段 idleLabel 优先；旧盘只有 silentIdle:true 仍按 silent 渲染。
+    it('frozenIdleLabel: idleLabel wins, legacy silentIdle maps to silent, neither → undefined', () => {
+      expect(frozenIdleLabel({ idleLabel: 'completed' })).toBe('completed');
+      expect(frozenIdleLabel({ idleLabel: 'completed', silentIdle: true })).toBe('completed');
+      expect(frozenIdleLabel({ silentIdle: true })).toBe('silent');
+      expect(frozenIdleLabel({ silentIdle: false })).toBeUndefined();
+      expect(frozenIdleLabel({})).toBeUndefined();
+
+      const completed = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, frozenIdleLabel({ idleLabel: 'completed' }),
+      ));
+      expect(completed.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
+
+      const legacySilent = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, frozenIdleLabel({ silentIdle: true }),
+      ));
+      expect(legacySilent.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
@@ -1929,6 +2043,18 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.type).toBe('primary');
   });
 
+  it('keeps Resume available for a closed remote session', () => {
+    const card = parse(buildSessionClosedCard(
+      'sess-remote', 'om_root_remote', 'remote topic', 'remote-runner', '/srv/app',
+      null, 'en', 'Remote Runner', false,
+    ));
+    const action = card.elements.find((element: any) => element.tag === 'action');
+    const resumeBtn = action.actions.find((item: any) => item.value?.action === 'resume');
+    expect(resumeBtn).toBeDefined();
+    expect(resumeBtn.value.session_id).toBe('sess-remote');
+    expect(resumeBtn.type).toBe('primary');
+  });
+
   it('escapes a configured runtime name in markdown copy', () => {
     const card = parse(buildSessionClosedCard(
       'sess-5', 'om_root', '', 'codex', undefined, null, 'en',
@@ -2252,6 +2378,10 @@ describe('buildPrivateSnapshotCard', () => {
       .filter((e: any) => e.tag === 'action')
       .flatMap((e: any) => e.actions ?? []);
   }
+
+  it('does not opt private one-shot snapshots into shared PATCH updates', () => {
+    expect(build().config.update_multi).toBeUndefined();
+  });
 
   it('exposes open-terminal link, get_write_link, close for non-Codex/TRAE sessions, with no patch-driven controls', () => {
     const card = build({ screen: 'hello' });

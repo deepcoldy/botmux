@@ -1,0 +1,21 @@
+
+╭───────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.154.0)                        │
+│                                                   │
+│ model:       gpt-6-astra xhigh   /model to change │
+│ directory:   ~/Code/example                       │
+│ permissions: YOLO mode                            │
+╰───────────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+⚠ 1 startup issue · ctrl + t for details
+
+⚠ `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.
+
+• You have 3 usage limit resets available. Run /usage to use one.
+
+
+› Ask Codex to do anything
+
+  gpt-6-astra xhigh · ~/Code/example · Ready · Context 0% used · weekly 54% left

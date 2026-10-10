@@ -72,7 +72,7 @@ describe('worker raw_input handler', () => {
 });
 
 describe('worker adopt/native-rename coordination', () => {
-  const messageRegion = caseRegion(workerSrc, "case 'message':", 6500);
+  const messageRegion = caseRegion(workerSrc, "case 'message':", 8500);
   const flushRegion = caseRegion(workerSrc, 'async function flushPending()', 16000);
 
   it('parks ordinary adopt messages for the full native-rename settle window', () => {
@@ -140,11 +140,19 @@ describe('worker adopt/native-rename coordination', () => {
 });
 
 describe('worker raw_input delivery', () => {
-  // The span only has to cover deliverRawInput's body; it is not itself an
-  // assertion. Kept comfortably ahead of the last anchor below (the previous
-  // 7000 left ~2 chars of slack, so any added line broke these tests for
-  // reasons that had nothing to do with what they check).
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 7600);
+  // Bound the region to the deliverRawInput function body (up to the next
+  // top-level function) instead of a fixed char span. The previous 7600 window
+  // had only ~150 chars of slack, so unrelated lines merged into this body on
+  // master pushed the sendToPty anchor past the end and failed these ordering
+  // assertions for reasons that had nothing to do with what they check.
+  const deliverStart = workerSrc.indexOf('async function deliverRawInput');
+  expect(deliverStart).toBeGreaterThanOrEqual(0);
+  // turnAuthorityIdentity is the next top-level function on the supported
+  // baselines (master later inserted markTurnRetired between the two, which
+  // only widens this slice by a few unrelated lines).
+  const deliverEnd = workerSrc.indexOf('function turnAuthorityIdentity', deliverStart);
+  expect(deliverEnd).toBeGreaterThan(deliverStart);
+  const region = workerSrc.slice(deliverStart, deliverEnd);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
     const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');
@@ -677,7 +685,7 @@ describe('late bare-shell launch recovery', () => {
   });
 
   it('generation-fences PTY data before it can feed the active idle detector', () => {
-    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 3400);
+    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 6500);
     const onData = wiring.indexOf('observedBackend.onData((data) =>');
     const fence = wiring.indexOf('if (backend !== observedBackend) return;', onData);
     const feed = wiring.indexOf('onPtyData(data)', fence);

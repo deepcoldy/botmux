@@ -57,6 +57,7 @@ import {
   type BinaryInstallShape,
   type UpdateStrategy,
 } from './binary-self-update.js';
+import { compareVersions } from './update-check.js';
 import { globalWrapperPath } from '../utils/local-dev-update.js';
 import {
   captureDetachedRestartEnvFallback,
@@ -281,11 +282,12 @@ export async function applyBotmuxUpdate(
   if (strategy.kind === 'unsupported') {
     throw new UnsupportedGlobalInstallError('unknown', process.execPath);
   }
-  if (strategy.kind === 'self-replace') {
+  if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     const r = await replaceStandaloneBinary(version, strategy.target);
-    return { strategy: 'self-replace', detail: `${r.asset} → ${r.target}` };
+    return { strategy: strategy.kind, detail: `${r.asset} → ${r.target}` };
   }
-  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, `botmux@${version}`);
+  const spec = version.startsWith('botmux@') ? version : `botmux@${version}`;
+  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, spec);
   installLatestBotmuxSync(plan);
   return { strategy: 'package-manager', detail: formatGlobalInstallCommand(plan) };
 }
@@ -530,12 +532,30 @@ export function resolveRestartInvocation(
   launcherPath: string,
   launcherExists: boolean,
   localDev = false,
+  updatedBinary?: string,
 ): { executable: string; selfDispatching: boolean } {
+  if (updatedBinary) return { executable: updatedBinary, selfDispatching: true };
   const executable = resolveStandaloneRestartExecutable(
     standalone, execPath, shape, launcherPath, launcherExists, localDev,
   );
   // The compiled binary IS the CLI; the launcher shim `exec`s it with "$@".
   return { executable, selfDispatching: standalone || executable === launcherPath };
+}
+
+/**
+ * 校验待重启目标仍是可用的官方二进制，返回它实际报告的版本。精确匹配是安装后的
+ * 常态；若重启前被带外升级（如手动跑了更新的 install.sh），接受不低于预期的版
+ * 本并交调用方刷新 pending；更旧、无法执行或不报告合法 semver 版本一律拒绝。
+ */
+export function verifyBinaryRestartTarget(update: { target: string; version: string }): string {
+  const result = spawnSync(update.target, ['--version'], {
+    encoding: 'utf-8',
+    timeout: 30_000,
+    env: { ...process.env, BOTMUX_INSTALL_PROBE: '1' },
+  });
+  const actual = result.error || result.status !== 0 ? '' : result.stdout.trim();
+  if (actual && compareVersions(actual, update.version) >= 0) return actual;
+  throw new Error(`待重启的二进制未通过版本校验：${update.target}（预期不低于 ${update.version}，实际 ${actual || '无法执行'}）`);
 }
 
 /**
@@ -551,6 +571,7 @@ export function spawnDetachedRestart(
   reason: string,
   activePackageRoot?: string,
   restartLeaseId?: string,
+  updatedBinary?: string,
 ): ReturnType<typeof spawn> {
   const logFile = maintenanceRestartLogPath();
   let fd: number | undefined;
@@ -579,6 +600,7 @@ export function spawnDetachedRestart(
     launcher,
     existsSync(launcher),
     isLocalDevInstall(),
+    updatedBinary,
   );
   const { cmd, args } = buildRestartLauncher(executable, cliEntry, setsidAvailable(), selfDispatching);
   const child = spawn(cmd, args, {
@@ -662,7 +684,7 @@ function productionDeps(): MaintenanceDeps {
     runUpdate: () => {
       installedTo = '';
       const strategy = currentUpdateStrategy(botmuxInstallRoot());
-      if (strategy.kind === 'unsupported') {
+      if (strategy.kind === 'unsupported' || strategy.kind === 'install-release') {
         throw new UnsupportedGlobalInstallError('unknown', process.execPath);
       }
       if (strategy.kind === 'self-replace') {

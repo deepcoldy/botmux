@@ -496,11 +496,14 @@ export async function revokeGrant(
     // post-revoke config) so a later restart during an API blip cannot revive
     // the just-revoked user from a stale cache. republish so create-group's
     // creator picker doesn't keep offering the removed open_id.
+    // retainKeys 必须并上 blockedUsers：sidecar 与黑名单共用，/revoke 写回不得
+    // 把黑名单的 raw→ou_ 缓存剪掉（否则 contact API 降级期重启会让 email/on_
+    // 形式的黑名单条目解析为空而漏拦，P1c）。
     if (rawEntry) {
       writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
         map: {},
         deleteEntries: [rawEntry],
-        retainKeys: bot.config.allowedUsers ?? [],
+        retainKeys: [...new Set([...(bot.config.allowedUsers ?? []), ...(bot.config.blockedUsers ?? [])])],
       });
     }
     republishResolvedAllowedUsersDescriptor(larkAppId, bot.resolvedAllowedUsers);

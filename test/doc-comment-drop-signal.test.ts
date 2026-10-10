@@ -5,8 +5,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 /**
  * #1260：文档评论事件被丢弃时给触发回复打 ❌，让「这条 @ 我没能处理」看得见。
  *
- * 背景：事件已 ACK ⇒ 飞书不重投；mention-only 订阅不进轮询（poller 只收
- * commentTriggerMode==='all'）⇒ 没有兜底。所以事件链路一丢就是终点，而用户侧
+ * 背景：事件已 ACK ⇒ 飞书不重投。通过 @/审计门的投递现在有持久 pending；
+ * 但本文件覆盖的是更早、连安全投递上下文都构造不出的失败，所以仍是终点。用户侧
  * 原本零感知 —— doc 发起的会话在飞书整个不可见，只能去 dashboard 翻 terminal。
  */
 
@@ -228,7 +228,7 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
     return src.slice(start, end);
   }
 
-  const region = regionBetween('async function processCommentEvent', 'const LARK_WS_PROXY_ENV_KEYS');
+  const region = regionBetween('async function processCommentEvent', 'export function startLarkEventDispatcher');
 
   it('三个该打的丢弃点都接上了：拉不到评论 / 触发回复不在回复里 / 纯 @bot 无正文', () => {
     expect(region.match(/await markCommentEventDropped\(/g) ?? []).toHaveLength(3);
@@ -245,8 +245,8 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
 
   /**
    * 三个打点的闸口必须一致，且**只在 mention-only 下打**。
-   * 'all' 有 poller 兜底（pollWatchedDocComments 只轮 'all'，且不经过
-   * processCommentEvent），push 这次没读到的评论下轮 poll 很可能被正常处理；
+   * 'all' 有列表 poller 兜底；mention-only 的 pending 要到正文/@/审计均通过后
+   * 才建立，所以本文件覆盖的 pre-dispatch 读失败仍不能靠 pending 恢复；
    * 而 ❌ 是终态不清理，在 'all' 下打就会永久挂在一条根本没丢的评论上。
    */
   it("收窄谓词只认 mention-only + is_mentioned（'all' 有轮询兜底，不该打)", () => {
@@ -267,6 +267,14 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
     // 这个调用在 markCommentEventDropped 里，位于 processCommentEvent **之前**，
     // 不在 region 切片内 —— 用整份源码断言，别锚错范围（锚错就又是一条假绿）。
     expect(src).toContain("rollbackAutoSub, 'dropped-signal')");
+  });
+
+  it('WS 未接纳或抛错都先交给持久重试，再结束 ACK-safe 任务', () => {
+    expect(region).toContain('accepted = await handlers.handleDocComment(delivery)');
+    expect(region.indexOf('const retryOutcome = settleDocCommentWsDelivery(')).toBeGreaterThan(
+      region.indexOf('accepted = await handlers.handleDocComment(delivery)'),
+    );
+    expect(region).toContain('if (deliveryError) throw deliveryError');
   });
 
   it('每个未打标记的早退都回滚 auto-sub（不留 owner 不知情的订阅）', () => {
@@ -305,5 +313,64 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
 
   it('removeDocSubscription 只在那一个闭包里被调用，没有旁路', () => {
     expect(region.match(/removeDocSubscription\(/g) ?? []).toHaveLength(1);
+  });
+
+
+  /**
+   * 运行态观测：六个丢弃出口 + 一个真接纳成功各记一种结局。dispatched 只能在
+   * daemon 真接纳（accepted）后记，未接纳落 pending 重试，提前记成功是假结局。
+   */
+  it('六个丢弃出口各记对应结局：no-comment / trigger-missing / self-authored / not-mentioned / empty-text / audit-rejected', () => {
+    // 同样只看非注释代码行，防止把 noteOutcome('x') 写进注释就骗过计数。
+    const codeLines = region
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0 && !line.startsWith('//'));
+    for (const outcome of ['no-comment', 'trigger-missing', 'self-authored', 'not-mentioned', 'empty-text', 'audit-rejected']) {
+      const hit = codeLines.some(line => line.includes(`noteOutcome('${outcome}')`));
+      expect(hit, `缺少真实的 noteOutcome('${outcome}') 调用（注释不算）`).toBe(true);
+    }
+  });
+
+  it("dispatched 只在 handleDocComment 真接纳（accepted=true）后记，且在 WS settle 之后", () => {
+    // ⚠️ 不能对整段 region 做 `toContain("if (accepted) noteOutcome(...)")`：那种纯
+    // 文本断言能被一行**注释**骗过（把同样的字串写进注释里，代码删了测试仍绿）。
+    // 这里只保留「非注释代码行」，再对真实语句断言。
+    const codeLines = region
+      .split('\n')
+      .map(line => line.trim())
+      // 去整行注释；行尾注释按最后一个 // 剥掉。本区间没有「字符串里含 //」的代码行，
+      // 且只匹配固定守卫前缀，误剥不影响结论。
+      .map(line => (line.startsWith('//') ? '' : line.replace(/\s*\/\/.*$/, '')))
+      .filter(line => line.length > 0);
+
+    // ① 必须存在一条真实的 accepted 守卫语句（注释里的同名字串不算）。
+    const guardedIdx = codeLines.findIndex(line => line.startsWith("if (accepted) noteOutcome('dispatched')"));
+    expect(guardedIdx, '缺少「if (accepted) noteOutcome(\'dispatched\')」真实语句（注释不算）').toBeGreaterThan(-1);
+
+    // ② 在 WS settle 之后。
+    const settleIdx = codeLines.findIndex(line => line.includes('const retryOutcome = settleDocCommentWsDelivery('));
+    expect(settleIdx).toBeGreaterThan(-1);
+    expect(guardedIdx).toBeGreaterThan(settleIdx);
+
+    // ③ 在 handleDocComment 调用之后（不能提前记成功）。
+    const dispatchIdx = codeLines.findIndex(line => line.includes('accepted = await handlers.handleDocComment(delivery)'));
+    expect(dispatchIdx).toBeGreaterThan(-1);
+    expect(guardedIdx).toBeGreaterThan(dispatchIdx);
+
+    // 反向保证：不允许出现别的「无条件」noteOutcome('dispatched')。
+    const unconditional = codeLines.filter(line =>
+      line.includes("noteOutcome('dispatched')") && !line.startsWith('if (accepted)'));
+    expect(unconditional).toEqual([]);
+  });
+
+  it('标题补齐 fire-and-forget 且不 await（热路径不能为显示字段插同步往返）', () => {
+    expect(region).toContain('void fetchDocTitle(');
+  });
+
+  it('auto-sub 占位带溯源三字段（陌生人 @ 出来的订阅要能事后审计是谁触发的）', () => {
+    const autoSubRegion = regionBetween('const autoSub: DocSubscription = {', 'putDocSubscription(config.session.dataDir, larkAppId, autoSub)');
+    expect(autoSubRegion).toContain('autoCreated: true');
+    expect(autoSubRegion).toContain('autoCreatedBy: operatorOpenId');
   });
 });

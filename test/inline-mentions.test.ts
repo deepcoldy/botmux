@@ -11,7 +11,7 @@
  * Run: pnpm vitest run test/inline-mentions.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { applyInlineMentions } from '../src/im/lark/inline-mentions.js';
+import { applyInlineMentions, applyInlineMentionsToCard } from '../src/im/lark/inline-mentions.js';
 
 const zhang = { open_id: 'ou_zhangsan', name: '张三' };
 const li = { open_id: 'ou_lisi', name: '李四' };
@@ -94,5 +94,34 @@ describe('applyInlineMentions', () => {
     const r = applyInlineMentions('@张三 hi', [{ open_id: 'ou_x', name: '' }]);
     expect(r.text).toBe('@张三 hi');
     expect(r.usedIds.size).toBe(0);
+  });
+});
+
+describe('applyInlineMentionsToCard', () => {
+  it('inlines a responsible owner in Card 2.0 markdown without changing the source card', () => {
+    const card = {
+      schema: '2.0',
+      body: {
+        elements: [
+          { tag: 'markdown', content: '**修复负责人：** 建议 @张三（高置信度）' },
+          { tag: 'button', text: { tag: 'plain_text', content: '@张三' } },
+        ],
+      },
+    };
+    const result = applyInlineMentionsToCard(card, [zhang]);
+
+    expect((result.card.body as any).elements[0].content)
+      .toBe('**修复负责人：** 建议 <at id=ou_zhangsan></at>（高置信度）');
+    expect((result.card.body as any).elements[1].text.content).toBe('@张三');
+    expect((card.body.elements[0] as any).content).toContain('@张三');
+    expect(result.usedIds).toEqual(new Set(['ou_zhangsan']));
+  });
+
+  it('supports legacy lark_md nodes', () => {
+    const result = applyInlineMentionsToCard({
+      elements: [{ tag: 'div', text: { tag: 'lark_md', content: '负责人 @Owner' } }],
+    }, [owner]);
+    expect(((result.card.elements as any[])[0].text as any).content)
+      .toBe('负责人 <at id=ou_owner></at>');
   });
 });

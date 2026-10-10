@@ -117,3 +117,26 @@ describe('POST /api/sessions/:sessionId/whiteboard', () => {
     expect(update).not.toHaveBeenCalled();
   });
 });
+
+// Read-side regression: the CLI resolves sessions through this authenticated
+// route when the owning daemon is online, instead of using the disk snapshot.
+describe('whiteboard binding readback', () => {
+  it('exposes bind, rebind and unbind through the live session route', async () => {
+    const session = {
+      sessionId: 's-wb-readback', larkAppId: 'app-1', chatId: 'oc_board', rootMessageId: 'om_board',
+      status: 'active', title: 'Whiteboard readback', createdAt: '2026-09-01T00:00:00.000Z',
+      whiteboardId: undefined as string | undefined,
+    };
+    mockOwnedSession(session);
+    vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => undefined);
+    for (const id of ['wb_first', 'wb_second', null]) {
+      expect((await postWhiteboard(session.sessionId, { whiteboardId: id })).status).toBe(200);
+      const path = `/api/sessions/${session.sessionId}`;
+      const response = await fetch(`http://127.0.0.1:${handle!.port}${path}`, {
+        headers: daemonIpcAuthHeaders({ secret: HOST_SECRET, port: handle!.port, method: 'GET', path }),
+      });
+      expect(response.status).toBe(200);
+      expect((await response.json() as { session: { whiteboardId?: string } }).session.whiteboardId).toBe(id ?? undefined);
+    }
+  });
+});

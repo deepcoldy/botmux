@@ -5,11 +5,11 @@ import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 type Row = { sessionId: string; larkAppId: string; [k: string]: unknown };
 type Sched = { id: string; [k: string]: unknown };
-const SESSION_PRESENTATION_FIELDS = ['botAvatarUrl', 'repoName', 'gitBranch'] as const;
+const SESSION_PRESENTATION_FIELDS = ['botAvatarUrl', 'repoName', 'gitBranch', 'workspace'] as const;
 
 function mergeSpawnedRow(current: Row | undefined, incoming: Row, larkAppId: string): Row {
   const next: Row = { ...incoming, larkAppId };
-  if (current && current.workingDir === next.workingDir) {
+  if (current && current.workingDir === next.workingDir && current.backendType === next.backendType) {
     for (const field of SESSION_PRESENTATION_FIELDS) {
       if (next[field] === undefined && current[field] !== undefined) {
         next[field] = current[field];
@@ -45,11 +45,12 @@ export class Aggregator {
         if (cur) {
           const patch = { ...ev.body.patch };
           if (
-            Object.prototype.hasOwnProperty.call(patch, 'workingDir')
-            && patch.workingDir !== cur.workingDir
+            (Object.prototype.hasOwnProperty.call(patch, 'workingDir') && patch.workingDir !== cur.workingDir)
+            || (Object.prototype.hasOwnProperty.call(patch, 'backendType') && patch.backendType !== cur.backendType)
           ) {
             patch.repoName = null;
             patch.gitBranch = null;
+            patch.workspace = null;
           }
           this.sessions.set(ev.body.sessionId, { ...cur, ...patch });
           emitted = { ...ev, body: { ...ev.body, patch } };

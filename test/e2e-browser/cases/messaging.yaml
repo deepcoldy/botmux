@@ -1,0 +1,37 @@
+cases:
+  - name: Streaming card lifecycle
+    tags: [card]
+    steps:
+      - feishu.runScenario: { scenario: card-lifecycle }
+  - name: Consecutive message queue
+    tags: [message]
+    steps:
+      - feishu.runScenario: { scenario: consecutive-messages }
+  - name: Group message without a mention
+    tags: [group, routing]
+    steps:
+      - feishu.runScenario: { scenario: group-without-mention }
+  - name: Group message with one bot mention
+    tags: [group, routing]
+    steps:
+      - feishu.runScenario: { scenario: group-single-mention }
+  - name: Group chat topic reply
+    tags: [group, topic]
+    steps:
+      - feishu.runScenario: { scenario: group-topic-reply }
+  - name: Private chat topic reply
+    tags: [private, topic]
+    steps:
+      - feishu.runScenario: { scenario: private-topic-reply }
+  - name: Mixed image and text card
+    tags: [card, image]
+    steps:
+      - feishu.runScenario: { scenario: image-text-mixing }
+  - name: Scheduled task remains in its source thread
+    tags: [schedule, topic]
+    steps:
+      - feishu.runScenario: { scenario: scheduled-task-thread }
+  - name: Web terminal opens from the streaming card
+    tags: [terminal]
+    steps:
+      - feishu.runScenario: { scenario: web-terminal }

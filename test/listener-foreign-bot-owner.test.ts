@@ -21,7 +21,13 @@ import { describe, expect, it } from 'vitest';
 
 const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
 
-function fnRegion(name: string, span = 50000): string {
+// Fixed-char window sized to cover BOTH the handleNewTopic wrapper and the
+// whole handleNewTopicAdmitted closure (the main-spawn ds object is the last
+// assertion). 50k silently truncated the region once the closure grew past it
+// (the #1439 pinned-dir comments pushed the ds object to offset ~50.1k); the
+// assertions are substring checks, so a wider window has no false-positive
+// surface — it only keeps every pinned line reachable.
+function fnRegion(name: string, span = 100000): string {
   const start = src.indexOf(`async function ${name}(`);
   expect(start, `${name} not found in daemon.ts`).toBeGreaterThanOrEqual(0);
   return src.slice(start, start + span);

@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -62,6 +62,17 @@ describe('parseApiMessage metadata', () => {
 // ─── Interactive card: Format A (Lark API simplified) ─────────────────────
 
 describe('Interactive card parsing: Format A (API simplified)', () => {
+  it('preserves the visible XPI choice token through card re-serialisation', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '请处理这项任务' },
+        { tag: 'text', text: '\n[botmux-as:v1:suggestion]' },
+      ]],
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content)
+      .toContain('[botmux-as:v1:suggestion]');
+  });
+
   it('should extract title and text elements', () => {
     const card = {
       title: '🎁 Bits UT Defect Challenge | Leaderboard Update!',
@@ -1550,6 +1561,72 @@ describe('isPureCardUpgradeFallback (replace gate)', () => {
 // ─── extractResources for interactive cards ───────────────────────────────
 
 describe('Post message parsing', () => {
+  function parsePostEvent(post: object) {
+    return parseEventMessage({
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_post_links',
+        message_type: 'post',
+        content: JSON.stringify(post),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    }).parsed.content;
+  }
+
+  it.each(['unwrapped', 'zh_cn', 'en_us'])('preserves titled MR links in %s posts for API and event messages', (shape) => {
+    // The client can show a resolved MR title even when text === href in the
+    // API. A titled link instead stores its URL only in href.
+    const firstUrl = 'https://example.com/team/service/merge_requests/123';
+    const secondUrl = 'https://example.com/team/client/merge_requests/456?to_version=2';
+    const body = {
+      title: 'Batch review',
+      content: [
+        [{ tag: 'at', user_name: 'Reviewer' }, { tag: 'text', text: ' Review these two MRs.' }],
+        [{ tag: 'a', text: 'fix(api): use configured endpoint · !123', href: firstUrl }],
+        [{ tag: 'a', text: 'fix(client): apply effective thresholds · !456', href: secondUrl }],
+      ],
+    };
+    const post = shape === 'unwrapped' ? body : { [shape]: body };
+    const expected = `Batch review\n@Reviewer Review these two MRs.\nfix(api): use configured endpoint · !123(${firstUrl})\nfix(client): apply effective thresholds · !456(${secondUrl})`;
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(expected);
+    expect(parsePostEvent(post)).toBe(expected);
+  });
+
+  it.each([
+    { name: 'URL label', node: { text: 'https://example.com/mr/123', href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'missing label', node: { href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'empty label', node: { text: '', href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'null label', node: { text: null, href: 'https://example.com/mr/123' }, expected: 'https://example.com/mr/123' },
+    { name: 'missing URL', node: { text: 'MR title' }, expected: 'MR title' },
+    { name: 'empty URL', node: { text: 'MR title', href: '' }, expected: 'MR title' },
+    { name: 'empty anchor', node: {}, expected: '' },
+  ])('renders $name without losing or duplicating content', ({ node, expected }) => {
+    const post = { content: [[{ tag: 'text', text: 'Before ' }, { tag: 'a', ...node }, { tag: 'text', text: ' after' }]] };
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(`Before ${expected} after`);
+    expect(parsePostEvent(post)).toBe(`Before ${expected} after`);
+  });
+
+  it('retains link destinations in authored text while excluding attachment metadata', () => {
+    const post = {
+      content: [[
+        { tag: 'a', text: 'MR title', href: 'https://example.com/mr/123' },
+        { tag: 'file', file_key: 'file_spec', file_name: 'spec.md' },
+      ]],
+    };
+    expect(extractAuthoredMessageText('post', JSON.stringify(post))).toBe('MR title(https://example.com/mr/123)');
+  });
+
+  it('distinguishes posts with the same link label but different destinations', () => {
+    const canonical = (href: string) => rawPlaceholderText('post', JSON.stringify({
+      content: [[{ tag: 'a', text: 'MR title', href }]],
+    }));
+    expect(canonical('https://example.com/mr/123')).toContain('https://example.com/mr/123');
+    expect(canonical('https://example.com/mr/123')).not.toBe(canonical('https://example.com/mr/456'));
+  });
+
   it('renders post code block with fence boundaries for API and event messages', () => {
     const post = {
       zh_cn: {
@@ -1605,7 +1682,7 @@ describe('Post message parsing', () => {
       },
     };
 
-    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档@Alice');
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档(https://example.com)@Alice');
   });
 
   it('renders img tag in post body as [图片] placeholder when no numberer', () => {
@@ -1869,6 +1946,41 @@ describe('cmdQuoted shared-numberer invariant', () => {
     const parsed = parseApiMessage(msg, numberer);
     expect(resources).toEqual([{ type: 'image', key: 'img_zzz', name: 'img_zzz.jpg' }]);
     expect(parsed.content).toBe('[图片 1]');
+  });
+
+  it('post with a top-level files array extracts the upload for download', () => {
+    // Real Feishu shape observed when a user attaches an MD file to a rich-text
+    // message: the body only carries the @ mention, while the upload descriptor
+    // is a sibling of `content`/`content_v2`. It must still reach the shared
+    // resource downloader; otherwise agents see the @ but no attachment path.
+    const postContent = JSON.stringify({
+      title: '',
+      content: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      content_v2: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      files: [{
+        file_key: 'file_v3_top_level',
+        file_name: 'brief.md',
+        is_folder: false,
+      }],
+    });
+    const msg = {
+      message_id: 'om_post_top_level_file',
+      msg_type: 'post',
+      create_time: '1000',
+      sender: { id: 'ou_u', sender_type: 'user' },
+      body: { content: postContent },
+    };
+
+    const numberer = createImgNumberer();
+    const resources = extractResources(msg.msg_type, msg.body.content, numberer);
+    const parsed = parseApiMessage(msg, numberer);
+
+    expect(resources).toEqual([{
+      type: 'file',
+      key: 'file_v3_top_level',
+      name: 'brief.md',
+    }]);
+    expect(parsed.content).toBe('@agent');
   });
 });
 
@@ -2146,5 +2258,62 @@ describe('stripBotMentions', () => {
   it('保留正文换行，只压同一行内的空白', () => {
     expect(stripBotMentions('标题\n/t @Claude 第一行\n  第二行', [selfMention], SELF))
       .toBe('标题\n/t 第一行\n  第二行');
+  });
+});
+
+
+/**
+ * isPlaceholderOnlyText —— 「这段文本除了『发了个附件』之外没有任何信息」。
+ *
+ * 调用方是会话群 AI 命名的种子闸：命中就不改名。判错的代价不对称——漏判（该剥
+ * 没剥）会让群被焊死在一个空洞错名上且不可逆，错判（不该剥却剥了）只是晚几秒
+ * 改名，所以带真实文字的占位符一律保留。
+ */
+describe('isPlaceholderOnlyText', () => {
+  it('裸占位符（含带编号的）判为零信息', () => {
+    for (const s of [
+      '[图片]', '[图片 1]', '[图片 12]',
+      '[文件]', '[文件 1]',
+      '[语音]', AUDIO_PLACEHOLDER,
+      '[卡片]', '[卡片 (模板)]',
+      '[合并转发消息]',
+      CARD_EMBEDDED_PLACEHOLDER,
+    ]) {
+      expect(isPlaceholderOnlyText(s), s).toBe(true);
+    }
+  });
+
+  it('多个占位符拼在一起仍是零信息（相册 / 多附件）', () => {
+    expect(isPlaceholderOnlyText('[图片 1][图片 2]')).toBe(true);
+    expect(isPlaceholderOnlyText('[图片 1]\n[文件 2]\n[语音]')).toBe(true);
+  });
+
+  it('带真实文字的占位符**不是**零信息——文件名/alt/卡片标题就是标题来源', () => {
+    for (const s of [
+      '[文件 1: 季度汇报.pdf]',
+      '[文件: 季度汇报.pdf]',
+      '[图片 2: 报警前30分钟今(红)昨(蓝)同比]',
+      '[卡片: 发布单 #123]',
+      '[标签: P0]',
+      '[输入框: 收件人]',
+      '[确认发布]',
+    ]) {
+      expect(isPlaceholderOnlyText(s), s).toBe(false);
+    }
+  });
+
+  it('占位符 + 正文 → 有信息（图文混排不能被误杀）', () => {
+    expect(isPlaceholderOnlyText('看这张图 [图片 1]')).toBe(false);
+    expect(isPlaceholderOnlyText('[图片 1] 帮我看下报错')).toBe(false);
+  });
+
+  it('空串不算零信息占位符（「没内容」与「只有占位符」是两回事，各自有调用方）', () => {
+    expect(isPlaceholderOnlyText('')).toBe(false);
+    expect(isPlaceholderOnlyText('   \n ')).toBe(false);
+  });
+
+  it('普通文本不受影响', () => {
+    expect(isPlaceholderOnlyText('帮我排查数据库连接池')).toBe(false);
+    expect(isPlaceholderOnlyText('图片里的报错是什么意思')).toBe(false);
   });
 });

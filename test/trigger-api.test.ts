@@ -282,11 +282,10 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
-  it('rejects turnIdempotencyKey outside async scope (wait / dryRun / no async mode)', () => {
+  it('rejects turnIdempotencyKey with wait or dryRun', () => {
     const cases: any[] = [
       { asyncReturnSessionId: true, waitForFinalOutput: true, turnIdempotencyKey: 'tk' },
       { asyncReturnSessionId: true, dryRun: true, turnIdempotencyKey: 'tk' },
-      { turnIdempotencyKey: 'tk' }, // no async response mode
     ];
     for (const options of cases) {
       const req = request();
@@ -434,6 +433,35 @@ describe('trigger request contract', () => {
     // Generic sources keep rawText inside the JSON envelope (escaped), unchanged behavior.
     expect(prompt).toContain('"rawText": "line one\\nline two"');
   });
+
+  it('accepts options.steer on a fresh dryRun=false turn and on an existing-session follow-up', () => {
+    const fresh = request();
+    fresh.options = { asyncReturnSessionId: true, idempotencyKey: 'k-1', steer: true };
+    delete (fresh.target as any).chatId;
+    expect(validateTriggerRequest(fresh).ok).toBe(true);
+
+    const followUp = request();
+    followUp.target = { kind: 'turn', botId: 'app1', sessionId: 'session-1' };
+    followUp.instruction = 'also do X';
+    followUp.options = { asyncReturnSessionId: true, turnIdempotencyKey: 't-1', steer: true };
+    expect(validateTriggerRequest(followUp).ok).toBe(true);
+  });
+
+  it('rejects a non-boolean options.steer', () => {
+    const bad = request() as any;
+    bad.options = { dryRun: true, steer: 'yes' };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.error).toContain('options.steer');
+  });
+
+  it('rejects options.steer combined with dryRun (no dispatch to steer into)', () => {
+    const bad = request();
+    bad.options = { dryRun: true, steer: true };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
 });
 
 describe('dispatchTriggerRequest', () => {
@@ -515,5 +543,36 @@ describe('queryTriggerResult — legacy ok translation for webhook consumers', (
     const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
     expect(res.body.ok).toBe(false);
     expect(res.status).toBe(400);
+  });
+});
+
+
+describe('async group communication contract', () => {
+  it.each(['ui', 'webhook'] as const)('allows authorized messages for %s callers and keeps the sentinel', type => {
+    const req = request();
+    req.source = { ...req.source, type, connectorId: 'generic-caller' };
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'existing' };
+    req.options = { asyncReturnSessionId: true, allowChatMessages: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    const prompt = buildUntrustedEventPrompt(req, 't');
+    expect(prompt).toContain('may call botmux send for messages authorized by the current request');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(prompt).not.toContain('Do not call botmux send; do not post');
+    for (const allowChatMessages of [false, undefined]) {
+      req.options.allowChatMessages = allowChatMessages;
+      expect(buildUntrustedEventPrompt(req, 't')).toContain('Do not call botmux send; do not post');
+    }
+  });
+  it('rejects invalid opt-in shapes', () => {
+    for (const changes of [
+      { options: { asyncReturnSessionId: true, allowChatMessages: 'true' } },
+      { options: { waitForFinalOutput: true, allowChatMessages: true } },
+      { options: { asyncReturnSessionId: true, allowChatMessages: true, steer: true } },
+      { target: { kind: 'turn', chatId: 'oc_real' } },
+      { source: { type: 'headless', requestId: 'headless' } },
+    ]) {
+      const req = { ...request(), target: { kind: 'turn', sessionId: 's' }, options: { asyncReturnSessionId: true, allowChatMessages: true }, ...changes };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
   });
 });

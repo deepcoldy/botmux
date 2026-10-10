@@ -18,7 +18,13 @@ async function until(predicate: () => boolean, logs: string[], timeout = 12000):
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
 afterEach(async () => {
   for (const { child, root, observation } of fixtures.splice(0)) {
-    if (child.connected) child.send({ type: 'close' });
+    if (child.connected) {
+      // `connected` can remain true while the worker is concurrently closing
+      // its IPC channel. Supplying a callback contains EPIPE / closed-channel
+      // send failures inside cleanup; the exit wait and SIGKILL fallback below
+      // still prove that the child is reaped.
+      try { child.send({ type: 'close' }, () => {}); } catch { /* already closed */ }
+    }
     await until(() => child.exitCode !== null || child.signalCode !== null, [], 3000).catch(() => child.kill('SIGKILL'));
     await until(() => child.exitCode !== null || child.signalCode !== null, [], 3000);
     // PTY children create their own process groups. Record every fake CLI PID

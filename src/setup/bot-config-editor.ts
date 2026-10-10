@@ -4,6 +4,11 @@ import {
   type CliRuntimeConfig,
 } from '../adapters/cli/runtime.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
+import {
+  normalizeCliLaunchMode,
+  validateCliLaunchModeConfig,
+  type CliLaunchMode,
+} from '../core/cli-launch-mode.js';
 
 export const CLI_ID_CHOICES: Record<string, CliId> = {
   '1': 'claude-code',
@@ -42,9 +47,12 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // （25→reasonix、26→opencode2、27→dsh）。
   '28': 'mojo',
   '29': 'ebsd',
+  // minimax 的 '30' 已随 v3.21.0 正式发布，序号不能移位。
+  '30': 'minimax',
   // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
   // 插位会让老脚本静默选错 CLI。
-  '30': 'minimax',
+  '31': 'mimocode',
+  '32': 'remote-runner',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -64,6 +72,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
+  'mimocode': 'MiMoCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -86,6 +95,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
   'minimax': 'MiniMax',
+  'remote-runner': 'Remote Runner',
 };
 
 /**
@@ -227,6 +237,13 @@ export interface BotConfigEditInput {
    * 避免 bot-config-editor 反向依赖 cli-selection（会成循环 import）。
    */
   wrapperCli?: string | null;
+  /**
+   * 特殊启动模式（如 Forge x TraeX）。三态：
+   *   - undefined → 不动
+   *   - 'forge-traex' → 设置
+   *   - null → 清空
+   */
+  cliLaunchMode?: CliLaunchMode | null;
   /**
    * Model 字段三态语义（setup 不再交互式询问 model，此字段仅由切换 CLI 时的
    * 强制清空逻辑设 null；改 model 走 /config 卡片或手动编辑 bots.json）：
@@ -453,6 +470,8 @@ export const CLONE_EXCLUDED_KEYS = [
   'name',
   'displayName',
   'messageListeners',
+  'globalMessageListener',
+  'groupMessageListenerOverrides',
   'oncallChats',
   'defaultOncallAutoboundChats',
   'allowedChatGroups',
@@ -462,6 +481,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'grantExpiryState',
   'sessionGroup',
   'chatReplyModes',
+  'chatSoloGroupMentionBypass',
   'chatFeedbackPolicies',
   'noCardChats',
   'quotaFallbackBot',
@@ -484,6 +504,13 @@ export const CLONE_IDENTITY_KEYS = [
   'ownerOpenId',
 ] as const;
 
+const CLONE_LAUNCH_MODE_KEYS = [
+  'wrapperCli',
+  'cliLaunchMode',
+  'cliRuntime',
+  'cliPathOverride',
+] as const;
+
 /**
  * 把源 Bot 的行为配置覆盖到刚创建的目标 Bot，同时保留目标应用自己的身份。
  * Dashboard 与 CLI clone 共用这里，避免两条入口各维护一份排除字段。
@@ -504,6 +531,10 @@ export function cloneBotConfig(
     } else {
       delete cloned[key];
     }
+  }
+
+  for (const key of CLONE_LAUNCH_MODE_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) delete cloned[key];
   }
 
   return cloned;
@@ -609,11 +640,39 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   } else if (typeof input.wrapperCli === 'string') {
     const v = input.wrapperCli.trim();
     if (!v || v === '-') delete out.wrapperCli;
-    else out.wrapperCli = v;
+    else {
+      out.wrapperCli = v;
+      delete out.cliLaunchMode;
+    }
+  }
+
+  if (input.cliLaunchMode === null) {
+    delete out.cliLaunchMode;
+  } else if (input.cliLaunchMode !== undefined) {
+    const mode = normalizeCliLaunchMode(input.cliLaunchMode);
+    if (mode) {
+      out.cliLaunchMode = mode;
+      delete out.wrapperCli;
+      if (input.cliRuntime === null && !cliPathOverrideEdited) {
+        delete out.cliPathOverride;
+      }
+    }
   }
   if (out.cliRuntime && out.wrapperCli) {
     throw new Error('cliRuntime cannot be combined with wrapperCli');
   }
+  if (out.cliLaunchMode !== undefined) {
+    out.cliLaunchMode = normalizeCliLaunchMode(out.cliLaunchMode);
+  }
+  validateCliLaunchModeConfig({
+    cliId: out.cliId,
+    cliLaunchMode: out.cliLaunchMode,
+    wrapperCli: out.wrapperCli,
+    cliRuntime: out.cliRuntime,
+    cliPathOverride: out.cliPathOverride,
+    sandbox: out.sandbox,
+    readIsolation: out.readIsolation,
+  });
 
   // Model 字段：null = 清空，string = 设置，undefined = 不动。
   if (input.model === null) {
@@ -630,8 +689,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", or "mojo": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", "mojo", or "remote-runner": ${backendType}`);
       }
       out.backendType = backendType;
     }

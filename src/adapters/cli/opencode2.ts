@@ -100,11 +100,12 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     async writeInput(pty: PtyHandle, content: string) {
       const isSlashCommand = content.startsWith('/');
+      const needsPaste = !isSlashCommand && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'));
       const baseline = isSlashCommand ? null : snapPartBaseline('v2');
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+          if (needsPaste && pty.pasteText) {
             pty.pasteText(content);
           } else {
             pty.sendText(content);
@@ -112,7 +113,9 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          pty.write(content);
+          // Raw PTY has no tmux paste-buffer to add these markers. Without
+          // them, long or multiline prompts may be split into key events.
+          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
           await delay(1000);
           pty.write('\r');
         }
@@ -133,6 +136,10 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    // Bubble Tea has no reliable prompt anchor: require 4s of silence before
+    // the FIRST paste so cold start / resume→fresh cannot type into a booting
+    // TUI; later cycles return to the normal 2s window.
+    firstPromptQuiescenceMs: 4_000,
     busyPattern: undefined,
     isSessionBusy({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId)

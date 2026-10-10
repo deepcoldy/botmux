@@ -119,6 +119,14 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     expect(block).toContain('.filter(notApiOnly)');
   });
 
+  it('normalizes legacy document watches before restoring sessions can close them', () => {
+    const block = region(daemonSource, 'reapOrphanWorkers();', '// Close CoT thinking bubbles');
+    expect(block).toContain('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)');
+    expect(block).toContain('restoreSessionsAndScheduleStartupRecovery({');
+    expect(block.indexOf('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)'))
+      .toBeLessThan(block.indexOf('restoreSessionsAndScheduleStartupRecovery({'));
+  });
+
   it('gates doc-subscription restore + comment poller behind !cfg.apiOnly', () => {
     const block = region(daemonSource, '文档订阅恢复 + 评论轮询', 'Sweep orphan sandbox trees');
     expect(block).toContain('if (!cfg.apiOnly) {');
@@ -305,7 +313,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
-    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return;');
+    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return false;');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
@@ -698,15 +706,15 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // CRITICAL: must NOT name-only kill — an isolated/MCP herdr agent lives on the
     // SHARED host session `botmux`, so a name-only killPersistentSession('herdr',
     // 'botmux') would tear down every bot's agent. Mirror the migration effects:
-    // target helper for herdr's agent scope, frozen-PID path for ZMX identity.
+    // target helper for herdr's agent scope, frozen PID + socket dir for ZMX identity.
     const teardown = region(commitBlock,
       'const teardownTarget = selectedBackend.persistentBackendTarget;', 'Condition #2:');
     // Dispatches on the pure, behaviorally-tested policy (read-isolation.test.ts).
     expect(teardown).toContain('persistentTeardownKillKind({');
     expect(teardown).toContain('killPersistentBackendTarget(teardownTarget!, cfg.sessionId)');
     expect(teardown).toContain('probePersistentBackendTarget(teardownTarget!)');
-    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)');
-    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe');
+    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir))');
+    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe');
     expect(teardown).toContain("postKill !== 'missing'");
     expect(teardown).toContain('pending proof retained');
 
@@ -802,10 +810,24 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       '\n\n  // Close CoT thinking bubbles orphaned by the previous daemon generation',
     );
     expect(helperCall).toContain(
-      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),',
+      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {',
+    );
+    expect(helperCall).toContain(
+      'prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
     );
     expect(helperCall).toContain('markSessionsRestored: () => {');
     expect(helperCall).toContain('sessionsRestored = true;');
+
+    // Supplemental ordering guard only; this assertion does not prove callback
+    // delivery semantics and must not be treated as load-bearing evidence.
+    const dispatcherStartAt = daemonSource.indexOf(
+      'for (const startDispatcher of startEventDispatchers) startDispatcher();',
+    );
+    const quarantineNoticeAt = daemonSource.indexOf(
+      'for (const notice of startupXpiQuarantineNotices)',
+    );
+    expect(dispatcherStartAt).toBeGreaterThan(restoreAt);
+    expect(quarantineNoticeAt).toBeGreaterThan(dispatcherStartAt);
 
     const helperBody = region(
       daemonSource,
@@ -844,7 +866,8 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    expect(trustedCallerArgs.length).toBe(2);
+    // handleNewTopic, principal-lane live suggestion, and handleThreadReply.
+    expect(trustedCallerArgs.length).toBe(3);
     for (const args of trustedCallerArgs) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
@@ -902,6 +925,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(block).toContain('startMaintenance();');
     expect(block).toContain('startCliRuntimeUpdateMonitor(');
     expect(block).toContain('sendRestartReportIfPending(');
+    expect(block).toContain('notifyOnRestart: readGlobalConfig().maintenance?.notifyOnRestart !== false,');
   });
 
   it('P1(3rd round): core-only does NOT write shared-HOME .data-dir breadcrumb or ~/.botmux/bin wrapper', () => {

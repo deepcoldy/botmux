@@ -52,4 +52,11 @@ describe('resolveChatBotDiscoveryConfig', () => {
     expect(resolveChatBotDiscoveryConfig({}).listBotsApiTimeoutMs).toBe(3000);
     expect(resolveChatBotDiscoveryConfig({ BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS: '5000' }).listBotsApiTimeoutMs).toBe(5000);
   });
+
+  it.each(['0', '-1', 'Infinity', 'not-a-number'])(
+    'timeout falls back to 3000ms for invalid override %j',
+    value => {
+      expect(resolveChatBotDiscoveryConfig({ BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS: value }).listBotsApiTimeoutMs).toBe(3000);
+    },
+  );
 });

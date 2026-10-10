@@ -35,7 +35,7 @@ const CHAT = 'oc-recycle-group';
 let controller: WorkspaceRecycleRuntime | undefined;
 afterEach(() => {
   controller?.stop(); active.clear(); pool.setActiveSessionsRegistry(new Map());
-  store.init(); initSessionGroups(APP);
+  store.init('app-recycle-group'); initSessionGroups(APP);
   rmSync(mocks.dataDir, { recursive: true, force: true });
 });
 

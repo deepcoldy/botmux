@@ -17,7 +17,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { TriggerRequest } from '../src/services/trigger-types.js';
+import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
+import { buildOrchestratorReportTrigger, deliverReportSessionRelay, retryAutomaticDispatchReport } from '../src/core/report-session-relay.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 let tempDir: string;
@@ -91,6 +92,11 @@ import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempoten
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import { sessionKey } from '../src/core/types.js';
+import { commitTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { config } from '../src/config.js';
+import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 
 const APP = 'local_riff';
 const SID = 'sess_existing';
@@ -136,8 +142,10 @@ beforeEach(() => {
   process.env.SESSION_DATA_DIR = tempDir;
   existingRows.length = 0;
   existingRows.push({ sessionId: SID, chatId: CHAT, scope: 'chat', status: 'active' });
+  mockGetBot.mockImplementation(() => ({ config: { cliId: 'codex-app', apiOnly: true } }));
   forkShouldThrow = false; sendShouldRefuse = false; queuedActivationGateActive = false;
   mockForkWorker.mockClear(); mockSendWorkerInput.mockClear(); mockCloseSession.mockClear();
+  mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: true } });
 });
 afterEach(() => {
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = prevDataDir;
@@ -179,6 +187,57 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     expect(second.idempotent).toBe(true);
     expect(second.triggerId).toBe(first.triggerId);
     expect(mockSendWorkerInput).toHaveBeenCalledTimes(1); // still ONE send
+  });
+
+  it('automatic report retries a lost HTTP response without dispatching a second lead turn', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    mockGetBot.mockReturnValue({ config: { cliId: 'claude-code', apiOnly: false } });
+    ds.chatId = ds.session.chatId = 'oc_lead';
+    ds.session.rootMessageId = 'om_lead';
+    existingRows[0].chatId = 'oc_lead';
+    ds.latestAsyncTriggerId = 'real-http-request';
+    const activeSessions = activeWith(ds);
+    const decision = { ok: true as const, source: { sessionId: 'sub', larkAppId: 'cli_sub' },
+      target: { sessionId: SID, larkAppId: APP }, dispatchRoot: 'om_dispatch',
+      sourceName: 'review', content: 'review result', projectUpdate: {} };
+    const key = 'zero-prompt:sub:turn-1';
+    const triggerMeta = { requestId: key, receivedAt: '2026-09-25T07:00:00.000Z', turnIdempotencyKey: key };
+    const shape = validateTriggerRequest(buildOrchestratorReportTrigger(decision, triggerMeta));
+    expect(shape.ok).toBe(true);
+    let lost = true;
+    const fetchTarget = vi.fn(async (_path: string, init: RequestInit) => {
+      const req = JSON.parse(init.body as string) as TriggerRequest;
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+      expect(result.ok).toBe(true);
+      if (lost) { lost = false; throw new Error('response lost after acceptance'); }
+      expect(result.idempotent).toBe(true);
+      return { ok: true, status: 200, json: async () => result };
+    });
+    const work = retryAutomaticDispatchReport(async () => {
+      const response = await deliverReportSessionRelay({ decision, triggerMeta, fetchTarget,
+        postProjectUpdate: async () => ({ projectSynced: false }) });
+      expect(response.status).toBe(200);
+    });
+    await work;
+    expect(fetchTarget).toHaveBeenCalledTimes(2);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(ds.asyncTriggerResults).toBeUndefined();
+    expect(ds.latestAsyncTriggerId).toBe('real-http-request');
+    expect(asyncTriggerStore.lookup(SID)).toBeUndefined();
+    expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBe(true);
+  });
+
+  it('keeps explicit final suppression turn-scoped on an idempotent Lark follow-up', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    mockGetBot.mockReturnValue({ config: { cliId: 'claude-code', apiOnly: false } });
+    ds.chatId = ds.session.chatId = 'oc_lead';
+    existingRows[0].chatId = 'oc_lead';
+    const req = followUpReq('lark-suppressed');
+    req.options = { turnIdempotencyKey: 'lark-suppressed', suppressFinalOutput: true };
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(result.ok).toBe(true);
+    expect(ds.suppressedTriggerFinalTurns?.has(result.triggerId!)).toBe(true);
+    expect(ds.asyncTriggerResults).toBeUndefined();
   });
 
   it('same key + DIFFERENT payload → 409 idempotency_conflict, no second send', async () => {
@@ -268,6 +327,46 @@ describe('turn-level idempotency — no key (unchanged behavior)', () => {
   });
 });
 
+describe('options.steer — HTTP native turn/steer authorization plumbing', () => {
+  function steerReq(): TriggerRequest {
+    const req = followUpReq(undefined, 'also handle X');
+    req.options = { asyncReturnSessionId: true, steer: true };
+    return req;
+  }
+
+  it('LIVE follow-up with steer=true forwards codexAppSteerable on sendWorkerInput and echoes steer', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(steerReq(), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mockSendWorkerInput.mock.calls[0][3]?.codexAppSteerable).toBe(true);
+  });
+
+  it('follow-up WITHOUT steer never marks the input steerable (serial queue unchanged)', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(followUpReq(undefined, 'ordinary follow-up'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBeUndefined();
+    expect(mockSendWorkerInput.mock.calls[0][3]?.codexAppSteerable).toBeUndefined();
+  });
+
+  it('DORMANT follow-up with steer=true marks the cold-resume root steerable on the fork payload', async () => {
+    // A follow-up that cold-resumes a dead worker becomes the new root turn; it
+    // must itself be steerable so a later steer can merge into IT.
+    const ds = existingDs({ worker: null, hasHistory: true });
+    const res = await triggerSessionTurn(steerReq(), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBe(true);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    // The HTTP virtual prompt wrapper enriches the content; assert the payload
+    // SHAPE (object, not a bare string) + the flag + the instruction carried.
+    expect(typeof mockForkWorker.mock.calls[0][1]).toBe('object');
+    expect(mockForkWorker.mock.calls[0][1]).toMatchObject({ codexAppSteerable: true });
+    expect(mockForkWorker.mock.calls[0][1].content).toContain('also handle X');
+  });
+});
+
 // ── codex #818 review regressions: the structural at-most-once defects the
 //    first round missed, each pinned with the deterministic scenario codex gave.
 describe('turn-level idempotency — codex #818 P1 regressions', () => {
@@ -315,6 +414,23 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     // The exact turn is terminalized (caller polls failed at-most-once)…
     expect(asyncTriggerStore.lookup(SID, 'trg_prev')?.result.reason).toBe('dispatch_unknown');
     // …but the SHARED session is NEVER closed or quarantined (fresh-session-only teardown).
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.has(SID)).toBe(false);
+  });
+
+  it('P1-3b: boot reconcile preserves an interrupted turn lease and shared session', async () => {
+    idempotencyStore.claim({
+      ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_interrupted',
+      requestHash: 'sha256:x', ownerBootId: 'boot-OLD', key: `${SID}\u0000tk-interrupted`, now: 1, kind: 'turn',
+    });
+    idempotencyStore.transition(APP, `${SID}\u0000tk-interrupted`,
+      idempotencyStore.lookup(APP, `${SID}\u0000tk-interrupted`, 'turn')!, { state: 'attempting', now: 2 }, 'turn');
+    asyncTriggerStore.recordInterruptedStrict(SID, 'trg_interrupted', 3, APP);
+    mockCloseSession.mockClear();
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(APP, 'boot-CURRENT', () => ({ chatId: CHAT }));
+
+    expect(asyncTriggerStore.lookup(SID, 'trg_interrupted')?.result.status).toBe('interrupted');
     expect(mockCloseSession).not.toHaveBeenCalled();
     expect(quarantined.has(SID)).toBe(false);
   });
@@ -455,5 +571,223 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // stale fault entry cleared
     expect(mockSendWorkerInput).not.toHaveBeenCalled();
     void realRFS;
+  });
+});
+
+
+describe('visible handoff dispatch to a reused session', () => {
+  it.each(['ordinary', 'async', 'suppressed', 'dormant'] as const)(
+    '%s dispatch commits the card using the actual worker input id', async mode => {
+      mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+      const chatId = 'oc_handoff';
+      const ds = existingDs({ chatId, worker: mode === 'dormant' ? null : { killed: false, send: vi.fn() } as any });
+      ds.session.chatId = chatId;
+      const req = followUpReq(undefined);
+      req.options = mode === 'async' ? { asyncReturnSessionId: true }
+        : mode === 'suppressed' ? { suppressFinalOutput: true } : undefined;
+      req.presentation = { liveCard: 'on-start', title: '接手任务' };
+      const res = await triggerSessionTurn(req, { larkAppId: APP,
+        activeSessions: new Map([[sessionKey(chatId, APP), ds]]) });
+      expect(res.ok).toBe(true);
+      const turnId = mode === 'dormant' ? mockForkWorker.mock.calls[0][2].turnId
+        : mockSendWorkerInput.mock.calls[0][2];
+      expect(turnId).toBe(res.triggerId);
+      const start = vi.fn();
+      expect(start).not.toHaveBeenCalled();
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(true);
+      expect(start).toHaveBeenCalledExactlyOnceWith(ds, '接手任务', turnId);
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(false);
+    });
+
+  it('leaves an ordinary input without handoff presentation unchanged', async () => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_handoff', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_handoff';
+    const req = followUpReq(undefined); req.options = undefined;
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+    expect(res.ok).toBe(true);
+    expect(mockSendWorkerInput.mock.calls[0][2]).toBeUndefined();
+    expect(commitTriggerStreamingCard(ds, res.triggerId, vi.fn())).toBe(false);
+  });
+});
+
+describe('recovery thinking presentation', () => {
+  it('validates the explicit thinking option and retains normal requests', () => {
+    const req = followUpReq('presentation');
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: 'hidden' } }).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: true } }).ok).toBe(false);
+  });
+
+  it('bounds restored hidden turns while recording the exact new worker input', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    ds.session.hiddenThinkingTurns = Array.from({ length: 256 }, (_, i) => `old_${i}`);
+    const req = followUpReq(undefined);
+    req.presentation = { thinking: 'hidden' };
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toHaveLength(256);
+    expect(ds.session.hiddenThinkingTurns).not.toContain('old_0');
+    expect(ds.session.hiddenThinkingTurns.at(-1)).toBe(res.triggerId);
+    expect(mockSendWorkerInput.mock.calls.at(-1)?.[2]).toBe(res.triggerId);
+  });
+
+  it.each([true, false])('preserves async receipts and ordinary turns with live worker=%s', async live => {
+    const ds = existingDs({ worker: live ? { killed: false, send: vi.fn() } as any : null });
+    const active = activeWith(ds);
+    const req = followUpReq('hidden-recovery'); req.presentation = { thinking: 'hidden' };
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    expect(ds.asyncTriggerResults?.has(first.triggerId!)).toBe(true);
+    const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(repeated.triggerId).toBe(first.triggerId);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    const normal = await triggerSessionTurn(followUpReq('normal'), { larkAppId: APP, activeSessions: active });
+    expect(normal.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).not.toContain(normal.triggerId);
+    expect(ds.suppressedTriggerFinalTurns?.has(first.triggerId!)).not.toBe(true);
+  });
+});
+
+
+describe('exact trigger presentation keeps the persisted reply destination', () => {
+  const cases = [true, false].flatMap(live => ['ordinary', 'wait', 'async'].flatMap(mode =>
+    ['live', 'hidden', 'both', 'suppressed', 'plain', 'default'].map(presentation => ({ live, mode, presentation }))));
+  it.each(cases)('$mode / $presentation / live=$live', async ({ live, mode, presentation }) => {
+    const nativeStore = await vi.importActual<typeof import('../src/services/session-store.js')>('../src/services/session-store.js');
+    const previousDir = config.session.dataDir;
+    config.session.dataDir = tempDir;
+    nativeStore.init(APP);
+    vi.mocked(sessionStore.updateSession).mockImplementation(nativeStore.updateSession);
+    const ds = existingDs({ chatId: 'oc_shared', worker: live ? { killed: false, send: vi.fn() } as any : null });
+    ds.session.chatId = ds.chatId;
+    if (presentation !== 'plain') ds.session.currentReplyTarget = ds.currentReplyTarget = {
+      turnId: 'om_origin', rootMessageId: 'om_shared', updatedAt: new Date().toISOString(),
+    };
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const req = followUpReq(undefined);
+    req.options = mode === 'wait' ? { waitForFinalOutput: true } : mode === 'async' ? { asyncReturnSessionId: true } : {};
+    if (presentation !== 'default') req.presentation = presentation === 'hidden' ? { thinking: 'hidden' }
+      : presentation === 'both' ? { thinking: 'hidden', liveCard: 'on-start' } : { liveCard: 'on-start' };
+    if (presentation === 'suppressed') req.options.suppressFinalOutput = true;
+    try {
+      const pending = triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+      if (mode === 'wait') {
+        await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+        for (const waiter of ds.pendingWaitPromises!.values()) waiter.resolve('HTTP result');
+      }
+      const result = await pending;
+      expect(result.ok).toBe(true);
+      const input = live ? mockSendWorkerInput.mock.calls[0][2] : mockForkWorker.mock.calls[0][2];
+      const turnId = typeof input === 'string' ? input : input?.turnId;
+      if (mode === 'ordinary' && presentation === 'default' && live) {
+        expect(turnId).toBeUndefined();
+        expect(ds.session.replyTargets).toBeUndefined();
+        return;
+      }
+      expect(turnId).toBe(result.triggerId);
+      const expected = presentation === 'plain' ? { mode: 'plain', chatId: ds.chatId }
+        : { mode: 'thread', rootMessageId: 'om_shared' };
+      expect(resolveSessionReplyTarget(ds, turnId)).toEqual(expected);
+      // Reopen SQLite to prove the standalone sender sees the same exact-turn anchor.
+      nativeStore.init(APP);
+      const persisted = nativeStore.getOwnedSession(ds.session.sessionId)!;
+      expect(persisted).toBeDefined();
+      expect(resolveSessionReplyTarget({ ...ds, currentReplyTarget: undefined, session: persisted }, turnId)).toEqual(expected);
+      expect(persisted.hiddenThinkingTurns?.includes(turnId)).toBe(['hidden', 'both'].includes(presentation) ? true : undefined);
+      expect(ds.suppressedTriggerFinalTurns?.has(turnId) === true).toBe(presentation === 'suppressed' && mode === 'ordinary');
+      if (mode === 'wait') expect(result.output?.content).toBe('HTTP result');
+      if (mode === 'async') expect(ds.asyncTriggerResults?.has(turnId)).toBe(true);
+    } finally {
+      vi.mocked(sessionStore.updateSession).mockReset();
+      nativeStore.init(APP, { owner: false });
+      config.session.dataDir = previousDir;
+    }
+  });
+});
+
+
+describe('async opt-in group messages', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => [true, false].map(live => ({ cliId, live }))))('scopes permission to one $cliId turn with live=$live, retaining idempotency', async ({ cliId, live }) => {
+    mockGetBot.mockReturnValue({ config: { cliId, apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', worker: live ? { killed: false, send: vi.fn() } as any : null });
+    ds.session.chatId = 'oc_real';
+    const active = activeWith(ds);
+    const req = followUpReq('chat-on'); req.options!.allowChatMessages = true;
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    if (!live) asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'completed result', Date.now(), APP);
+    const second = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(second.ok).toBe(true);
+    expect(second.idempotent).toBe(true);
+    expect(second.triggerId).toBe(first.triggerId);
+    const dispatch = live ? mockSendWorkerInput : mockForkWorker;
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(dispatch.mock.calls[0])).toContain('may call botmux send');
+    const normal = followUpReq('chat-default');
+    await triggerSessionTurn(normal, { larkAppId: APP, activeSessions: active });
+    expect(JSON.stringify(dispatch.mock.calls[1])).toContain('Do not call botmux send; do not post');
+    req.options!.allowChatMessages = false;
+    expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active })).errorCode).toBe('idempotency_conflict');
+  });
+  it.each(['group', 'p2p', 'missing'])('revalidates a reserved takeover for %s', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', chatType: kind === 'p2p' ? 'p2p' : 'group' });
+    ds.session.chatId = 'oc_real';
+    const req = followUpReq('takeover'); req.options!.allowChatMessages = true;
+    const { turnIdempotencyKey: _key, ...options } = req.options!;
+    const requestHash = computeInputHash({ seam: 'turn', sessionId: SID, instruction: req.instruction,
+      envelope: req.envelope, source: req.source, presentation: null, options });
+    idempotencyStore.claim({ ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_old', requestHash,
+      ownerBootId: 'boot-OLD', key: `${SID}\u0000takeover`, now: 1, kind: 'turn' });
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: kind === 'missing' ? new Map() : activeWith(ds) });
+    expect(result.ok).toBe(kind === 'group');
+    expect(mockForkWorker).toHaveBeenCalledTimes(kind === 'group' ? 1 : 0);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    if (kind !== 'group') expect(idempotencyStore.lookup(APP, `${SID}\u0000takeover`, 'turn')?.ownerBootId).toBe('boot-OLD');
+  });
+  it.each(['virtual', 'headless', 'apiOnly', 'p2p', 'missing', 'mismatched-chat', 'wrong-bot', 'steer', 'wait', 'non-async', 'wrong-kind', 'source-headless'])('rejects %s before dispatch', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: kind === 'apiOnly' } });
+    const ds = existingDs({ chatId: kind === 'virtual' ? CHAT : kind === 'headless' ? 'headless_test' : 'oc_real',
+      chatType: kind === 'p2p' ? 'p2p' : 'group', worker: { killed: false, send: vi.fn() } as any });
+    if (kind === 'wrong-bot') ds.larkAppId = 'other';
+    const req = followUpReq('invalid'); req.options!.allowChatMessages = true;
+    if (kind === 'steer') req.options!.steer = true;
+    if (kind === 'wait') req.options!.waitForFinalOutput = true;
+    if (kind === 'non-async') req.options!.asyncReturnSessionId = false;
+    if (kind === 'wrong-kind') req.target.kind = 'card';
+    if (kind === 'source-headless') req.source.type = 'headless';
+    if (kind === 'mismatched-chat') req.target.chatId = 'oc_other';
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: kind === 'missing' ? new Map() : activeWith(ds) });
+    expect(result.ok).toBe(false);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe('completed turn retry after session leaves active map', () => {
+  it.each([false, true])('allowChatMessages=%s retains completed receipt', async allowChatMessages => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_real'; existingRows[0].chatId = 'oc_real';
+    const active = activeWith(ds);
+    const req = followUpReq('completed-retry'); req.options!.allowChatMessages = allowChatMessages;
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'completed result', Date.now(), APP);
+    active.clear();
+    const retry = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(retry.ok).toBe(true);
+    expect(retry.idempotent).toBe(true);
+    expect(retry.triggerId).toBe(first.triggerId);
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result).toMatchObject({ status: 'completed', content: 'completed result' });
+    const changed = { ...req, instruction: 'changed payload' };
+    expect((await triggerSessionTurn(changed, { larkAppId: APP, activeSessions: active })).errorCode).toBe('idempotency_conflict');
+    const fresh = { ...req, options: { ...req.options, turnIdempotencyKey: 'new-key' } };
+    expect((await triggerSessionTurn(fresh, { larkAppId: APP, activeSessions: active })).ok).toBe(false);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mockForkWorker).not.toHaveBeenCalled();
   });
 });

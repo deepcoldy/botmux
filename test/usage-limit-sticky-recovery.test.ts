@@ -33,6 +33,7 @@ vi.mock('node-pty', () => ({
 
 import { registerBot } from '../src/bot-registry.js';
 import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import * as sessionStore from '../src/services/session-store.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -75,6 +76,7 @@ describe('usage-limit sticky state self-heal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-limit-'));
+    sessionStore.init(APP);
     registerBot({
       larkAppId: APP,
       larkAppSecret: 's',

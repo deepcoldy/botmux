@@ -176,6 +176,17 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
+  it('preserves @ file mentions in normal user input', async () => {
+    const adapter = createTraexAdapter('/bin/traex');
+    const prompt = 'inspect @src/index.ts';
+    const pty = ptyThatCommits(SID_1);
+
+    const result = await adapter.writeInput(pty, prompt);
+
+    expect(result).toEqual({ submitted: true });
+    expect(pty.pasteText).toHaveBeenCalledWith(prompt);
+  });
+
   it('confirms a later turn from the history.jsonl delta, ignoring earlier lines', async () => {
     seedHistory(SID_1, 'the immutable first prompt');
     const adapter = createTraexAdapter('/bin/traex');

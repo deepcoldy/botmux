@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { PendingAsk } from '../src/core/ask-types.js';
+import type { AskResult, PendingAsk } from '../src/core/ask-types.js';
 
 // vi.mock 被 vitest 提升到模块顶层，在 import 之前执行。
 // 用 importOriginal 保留所有真实导出，仅把 submitAsk 替换为可监测的 spy。
@@ -26,6 +26,11 @@ import {
   handleAskCardAction,
   parseFormSelections,
 } from '../src/im/lark/ask-card.js';
+import {
+  askOptionLayoutForBot,
+  normalizeAskOptionLayout,
+  setAskOptionLayoutLookup,
+} from '../src/im/lark/ask-option-layout.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
 
@@ -68,6 +73,40 @@ function makePending(overrides: Partial<PendingAsk> = {}): PendingAsk {
 }
 
 describe('buildAskCard', () => {
+  it.each([false, true])('preserves labelled web links before and after settlement (%s)', (settled) => {
+    const ask = makePending();
+    ask.questions[0]!.prompt = 'Review [design](https://example.com/design?id=4&rev=2) and [preview](http://localhost:3000/path_(v2)) before _confirming_.';
+    const result: AskResult | undefined = settled ? { kind: 'answered', answers: [['deploy']], by: 'ou_owner', comment: null, timedOut: false } : undefined;
+    const card = JSON.parse(buildAskCard(ask, result));
+    const question = card.elements.find((item: any) => item.text?.content?.includes('Review'));
+    expect(question.text.content).toContain('[design](https://example.com/design?id=4&rev=2)');
+    expect(question.text.content).toContain('[preview](http://localhost:3000/path_%28v2%29)');
+    expect(question.text.content).toContain('\\_confirming\\_');
+  });
+
+  it('keeps unsupported, escaped and incomplete link markup literal', () => {
+    const ask = makePending();
+    ask.questions[0]!.prompt = String.raw`literal \[escaped](https://example.com) ![image](https://example.com/a.png) [unsafe](javascript:alert(1)) [file](file:///tmp/a) [broken](https://example.com`;
+    const card = JSON.parse(buildAskCard(ask));
+    const question = card.elements.find((item: any) => item.text?.content?.includes('literal'));
+    for (const label of ['escaped', 'image', 'unsafe', 'file', 'broken']) {
+      expect(question.text.content).toContain(`\\[${label}\\]`);
+    }
+  });
+
+  it.each(['ou_proposer_123', 'ou_proposer-123', '"ou_proposer-123"', "'ou_proposer-123'"])('preserves a host question mention with ID %s', (id) => {
+    const tag = `<at id=${id}></at>`;
+    const ask = makePending({ questions: [{
+      prompt: `${tag} choose _one_`, multiSelect: false,
+      options: [{ key: 'independent', label: 'independent' }, { key: 'suggestion', label: 'suggestion' }],
+    }] });
+    const card = JSON.parse(buildAskCard(ask));
+    const question = card.elements.find((item: any) => item.text?.content?.includes('choose'));
+    expect(question.text.content).toContain(tag);
+    expect(question.text.content).toContain('\\_one\\_');
+    expect(question.text.content).not.toContain('ou\\_');
+  });
+
   it('多问卡片：每问一个分区 + option buttons + 一个 submit', () => {
     const ask = makePending({
       questions: [
@@ -111,6 +150,26 @@ describe('buildAskCard', () => {
     expect(text).toContain('继续发布');
   });
 
+  it('XPI 指定答复人只用于点击鉴权，不作为 at/person 资源写进卡片', () => {
+    const text = buildAskCard(makePending({
+      answererOpenId: 'ou_cross_app_answerer',
+      originKind: 'host_cross_principal_owner',
+    }));
+
+    expect(text).toContain('指定成员（仅本人可操作）');
+    expect(text).not.toContain('ou_cross_app_answerer');
+    expect(text).not.toContain('<at');
+  });
+
+  it('普通同 app 指定答复人仍显示具体成员', () => {
+    const text = buildAskCard(makePending({ answererOpenId: 'ou_same_app_answerer' }));
+
+    // Master keeps the complete <at> mention atomic (escaping the id underscores
+    // invalidates the card); same-app asks still render the concrete mention.
+    expect(text).toContain('<at id=ou_same_app_answerer></at>');
+    expect(text).not.toContain('指定成员（仅本人可操作）');
+  });
+
   it('未 settle 卡片：含自定义回复提示（直接在话题里回复）', () => {
     const text = buildAskCard(makePending());
     expect(text).toContain('直接在话题');
@@ -151,7 +210,7 @@ describe('buildAskCard', () => {
 
   it('settled 态（answered）：渲染答案摘要、无可点组件', () => {
     const ask = makePending({
-      questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
+      questions: [{ prompt: '审批内容：补充回归测试', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
     });
     const json = JSON.parse(buildAskCard(ask, {
       kind: 'answered',
@@ -165,6 +224,8 @@ describe('buildAskCard', () => {
     expect(json.header.template).toBe('green');
     // 答案摘要包含"已选择"文字
     expect(text).toContain('已选择');
+    // 终态仍保留原问题，让审批人能回看自己批准的内容。
+    expect(text).toContain('审批内容：补充回归测试');
     // 选中标签"是"出现在卡片中
     expect(text).toContain('是');
     // 不含任何 action 动作（无可交互组件）
@@ -833,5 +894,90 @@ describe('createLarkAskCardDispatcher', () => {
       timedOut: true,
     });
     expect(update).toHaveBeenCalledWith('cli_ask', 'om_card', expect.stringContaining('超时'));
+  });
+});
+
+describe('ask option layout（askOptionLayout per-bot 配置）', () => {
+  afterEach(() => {
+    // 还原为「无配置」lookup，避免污染同文件其它用例（未配置即 compact）。
+    setAskOptionLayoutLookup(() => undefined);
+  });
+
+  it('normalizeAskOptionLayout：合法值原样通过，非法值给 warning 并丢弃', () => {
+    expect(normalizeAskOptionLayout(undefined)).toEqual({ warnings: [] });
+    expect(normalizeAskOptionLayout(null)).toEqual({ warnings: [] });
+    expect(normalizeAskOptionLayout('compact')).toEqual({ layout: 'compact', warnings: [] });
+    expect(normalizeAskOptionLayout('vertical')).toEqual({ layout: 'vertical', warnings: [] });
+    for (const bad of ['sideways', 42, true, [], {}]) {
+      const r = normalizeAskOptionLayout(bad);
+      expect(r.layout, JSON.stringify(bad)).toBeUndefined();
+      expect(r.warnings).toHaveLength(1);
+    }
+  });
+
+  it('askOptionLayoutForBot：lookup 未注册 / bot 未知 / 值非法 / 抛错一律回退 compact', () => {
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => undefined);
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'sideways' } }));
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => { throw new Error('boom'); });
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    expect(askOptionLayoutForBot('cli_ask')).toBe('vertical');
+    expect(askOptionLayoutForBot(undefined)).toBe('compact');
+  });
+
+  it('默认 compact：action 行每行最多 4 个按钮，无 column_set', () => {
+    const ask = makePending({
+      questions: [{
+        prompt: 'q', multiSelect: false,
+        options: Array.from({ length: 6 }, (_, i) => ({ key: `k${i}`, label: `L${i}` })),
+      }],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    expect(card.elements.some((el: any) => el.tag === 'column_set')).toBe(false);
+    const optionRows = card.elements.filter((el: any) =>
+      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION));
+    expect(optionRows).toHaveLength(2);
+    expect(optionRows[0].actions).toHaveLength(4);
+    expect(optionRows[1].actions).toHaveLength(2);
+  });
+
+  it('vertical：每个选项一个 column_set 行，单列 weighted、一按钮', () => {
+    setAskOptionLayoutLookup((id) => id === 'cli_ask'
+      ? { config: { askOptionLayout: 'vertical' } }
+      : undefined);
+    const card = JSON.parse(buildAskCard(makePending()));
+    const columnSets = card.elements.filter((el: any) => el.tag === 'column_set');
+    expect(columnSets).toHaveLength(3);
+    for (const row of columnSets) {
+      expect(row.flex_mode).toBe('none');
+      expect(row.horizontal_spacing).toBe('small');
+      expect(row.columns).toHaveLength(1);
+      expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
+      const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
+      expect(buttons).toHaveLength(1);
+      expect(buttons[0].value.action).toBe(ASK_SELECT_ACTION);
+    }
+    // vertical 下不再有装选项按钮的 action 行
+    expect(card.elements.some((el: any) =>
+      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION))).toBe(false);
+  });
+
+  it('vertical 只影响选项按钮：submit 行仍是 action 行，按钮值不变', () => {
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    const ask = makePending({
+      questions: [
+        { prompt: 'q1', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    const submitRow = card.elements.find((el: any) =>
+      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SUBMIT_ACTION));
+    expect(submitRow).toBeDefined();
+    const toggleRows = card.elements.filter((el: any) => el.tag === 'column_set');
+    expect(toggleRows).toHaveLength(2);
+    expect(toggleRows[0].columns[0].elements[0].value.action).toBe(ASK_TOGGLE_ACTION);
   });
 });

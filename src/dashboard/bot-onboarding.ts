@@ -34,6 +34,7 @@ import {
 } from '../setup/open-platform-automation.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
+import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
 
 // Static default-imports of qrcode-terminal's vendored QRCode class (its public
 // API only prints to a terminal; we need the low-level class to render a QR into
@@ -169,6 +170,7 @@ export interface BotOnboardingInput {
   cliId?: CliId;
   /** 通用启动前缀（如 "aiden x claude"）；aiden×* 选项解析所得，普通 CLI 为空。 */
   wrapperCli?: string;
+  cliLaunchMode?: 'forge-traex';
   workingDir?: string;
   /**
    * 新话题工作目录模式：'fixed' → 落 defaultWorkingDir（直接启动、不弹卡片）；
@@ -1718,6 +1720,7 @@ export class BotOnboardingManager {
       cliId,
       // aiden × claude/codex 等启动前缀；普通 CLI 不写此字段。
       ...(input.wrapperCli ? { wrapperCli: input.wrapperCli } : {}),
+      ...(input.cliLaunchMode ? { cliLaunchMode: input.cliLaunchMode } : {}),
       // 'fixed' → defaultWorkingDir（新话题直接启动、不弹卡片，扫描根回退 ~）；
       // 'card'/缺省 → workingDir（仓库选择卡片扫描根，兼容旧调用方语义）。
       ...(input.dirMode === 'fixed' ? { defaultWorkingDir: workingDir } : { workingDir }),
@@ -1731,6 +1734,24 @@ export class BotOnboardingManager {
       bot = cloneBotConfig(cloneSource, bot);
       cliId = bot.cliId ?? 'claude-code';
       workingDir = bot.defaultWorkingDir ?? bot.workingDir ?? '~';
+    }
+    try {
+      validateCliLaunchModeConfig({
+        cliId: bot.cliId,
+        cliLaunchMode: bot.cliLaunchMode,
+        wrapperCli: bot.wrapperCli,
+        cliRuntime: bot.cliRuntime,
+        cliPathOverride: bot.cliPathOverride,
+        sandbox: bot.sandbox,
+        readIsolation: bot.readIsolation,
+      }, 'Dashboard onboarding bot');
+    } catch (e) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_launch_mode_config',
+        message: (e as Error).message,
+      });
+      return;
     }
     // 注意：此处 **不** 立刻把 bot 写进 bots.json。空 allowedUsers 的 bot 一旦落盘,
     // 就是一个「可被 botmux start/restart 读取、运行时按无白名单全开放」的 fail-open

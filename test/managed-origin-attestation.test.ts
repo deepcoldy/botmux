@@ -55,6 +55,9 @@ describe('managed-origin host proof sidecar', () => {
             channelId: CHANNEL,
             sessionId: context.sessionId,
             turnId: 'turn-live',
+            callerOpenId: 'ou_current',
+            larkAppId: 'cli_app',
+            scheduleCreator: { ok: true, ownerUnionId: 'on_current' },
             dispatchAttempt: 4,
             requiresCodexAppLedger: true,
             issuedAtMs: Date.now(),
@@ -63,12 +66,16 @@ describe('managed-origin host proof sidecar', () => {
         return new Response(JSON.stringify({
           // Deliberately forged transport body: it must never win.
           turnId: 'turn-forged',
+          scheduleCreator: { ok: true, ownerUnionId: 'on_forged' },
         }), { status: 200 });
       },
     });
     expect(result).toEqual({
       sessionId: 'session-a',
       turnId: 'turn-live',
+      callerOpenId: 'ou_current',
+      larkAppId: 'cli_app',
+      scheduleCreator: { ok: true, ownerUnionId: 'on_current' },
       dispatchAttempt: 4,
       requiresCodexAppLedger: true,
     });

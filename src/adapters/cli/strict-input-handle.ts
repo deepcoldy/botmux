@@ -19,7 +19,7 @@ export function strictInputHandle<T extends PtyHandle>(pty: T): T {
   const proxy = new Proxy(pty as T & object, {
     get(target, property) {
       const value = Reflect.get(target, property, target);
-      if (property === 'sendText' || property === 'sendSpecialKeys') {
+      if (property === 'sendText' || property === 'sendSpecialKeys' || property === 'sendLines') {
         if (typeof value !== 'function') return value;
         return (...args: unknown[]) => {
           const result = Reflect.apply(value, target, args);

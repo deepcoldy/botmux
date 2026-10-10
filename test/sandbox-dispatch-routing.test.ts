@@ -82,6 +82,7 @@ describe('sandbox dispatch CLI routing', () => {
         sessionId: value('--session-id'),
         chatId: value('--chat-id'),
         targetAppId: value('--bot-app'),
+        delegate: value('--delegate'),
         brief: readFileSync(value('--brief-file'), 'utf8'),
       };
       appendFileSync(${JSON.stringify(calls)}, JSON.stringify(result) + '\\n');
@@ -97,6 +98,7 @@ describe('sandbox dispatch CLI routing', () => {
       const result = await runCli([
         'dispatch', '--session-id', 'source-session', '--title', 'work',
         '--bot-app', 'cli_target', '--chat-id', 'oc_target', '--brief', 'bounded task',
+        '--delegate', 'schedule:create',
       ], {
         ...process.env,
         SESSION_DATA_DIR: dataDir,
@@ -110,6 +112,7 @@ describe('sandbox dispatch CLI routing', () => {
         sessionId: 'source-session',
         chatId: 'oc_target',
         targetAppId: 'cli_target',
+        delegate: 'schedule:create',
         brief: 'bounded task',
       });
       expect(readFileSync(calls, 'utf8').trim().split('\n')).toHaveLength(1);

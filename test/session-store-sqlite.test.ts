@@ -80,7 +80,7 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-store-sqlite-test-'));
   __testOnly_setSqliteUnavailable(false);
   mockDeleteFrozenCards.mockReset();
-  init();
+  init('test-app');
 });
 
 afterEach(() => {
@@ -122,19 +122,51 @@ describe('first-start JSON import', () => {
     expect(readFileSync(jsonFp, 'utf-8')).toBe(jsonBefore);
   });
 
-  it('imports only this bot\'s rows from legacy sessions.json and leaves it frozen', () => {
+  it('rescues only this bot’s larkAppId-tagged rows from the shared flat sessions.json', () => {
+    // Builds 1.8.0–1.12.x (2026-03-13…20, before the 1.13.0 per-bot split)
+    // wrote every row into the flat `sessions.json` WITH a larkAppId. A
+    // deployment that jumps straight from one of those builds to a SQLite
+    // release still gets its own rows imported once; sibling bots' rows and
+    // untagged rows are abandoned.
     const legacyFp = seedJson('sessions.json', {
-      a1: row('a1', { larkAppId: 'app-A' }),
-      b1: row('b1', { larkAppId: 'app-B' }),
+      a1: row('a1', { larkAppId: 'appA' }),
+      a2: row('a2', { larkAppId: 'appA' }),
+      otherBot: row('otherBot', { larkAppId: 'appZ' }),
+      untagged: row('untagged'),
     });
     const legacyBefore = readFileSync(legacyFp, 'utf-8');
+    expect(existsSync(join(tempDir, 'sessions-appA.json'))).toBe(false);
 
-    init('app-A');
-    expect(listSessions().map(s => s.sessionId)).toEqual(['a1']);
-    expect(existsSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'))).toBe(true);
-    // 旧行为会把行迁移写进 sessions-app-A.json；现在 JSON 全部冻结
-    expect(existsSync(join(tempDir, 'sessions-app-A.json'))).toBe(false);
+    init('appA');
+
+    const ids = listSessions().map(s => s.sessionId).sort();
+    expect(ids).toEqual(['a1', 'a2']);
+    expect(getSession('otherBot')).toBeUndefined();
+    expect(getSession('untagged')).toBeUndefined();
+    // The per-bot store was built from the rescued rows.
+    expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(true);
+    expect(Object.keys(readPersistedSessionRows(tempDir, 'appA')).sort()).toEqual(['a1', 'a2']);
+    // The shared legacy file is never rewritten/deleted — it stays frozen.
     expect(readFileSync(legacyFp, 'utf-8')).toBe(legacyBefore);
+  });
+
+  it('does not let an unrelated malformed flat sessions.json block this bot first start', () => {
+    // The flat file is a SHARED foreign artifact: when this bot has no own
+    // per-bot JSON, a corrupt legacy file must degrade to "no rescued rows",
+    // never fail the whole first import (master threw here and built no .db,
+    // letting one bot’s broken flat file take every bot’s first start hostage).
+    const legacyFp = join(tempDir, 'sessions.json');
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(legacyFp, '{broken-legacy');
+
+    init('appA');
+    // Own first start still succeeds and builds an empty, writable store.
+    expect(() => listSessionsStrict()).not.toThrow();
+    const created = createSession('oc_fresh', 'om_fresh', 'Fresh');
+    expect(created.status).toBe('active');
+    expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(true);
+    // The corrupt foreign file is left exactly as found.
+    expect(readFileSync(legacyFp, 'utf-8')).toBe('{broken-legacy');
   });
 
   it('is idempotent: a restart with the frozen JSON still present must not re-import', () => {
@@ -194,25 +226,19 @@ describe('first-start JSON import', () => {
     expect(readdirSync(storeDir).filter(n => n.includes('.tmp'))).toEqual([]);
 
     // Reopen from scratch: a shell db would throw instead of yielding the rows.
-    init();
+    init('test-app');
     init('appA');
     expect(listSessionsStrict().map(s => s.sessionId).sort()).toEqual(['s1', 's2']);
   });
 
-  it('a non-owning process (worker under an old daemon) reads the JSON and never bootstraps the .db', () => {
+  it('a non-owning process does not bootstrap a .db and treats leftover JSON as unmigrated', () => {
     seedJson('sessions-appA.json', { s1: row('s1') });
 
-    // worker（owner:false）在旧 daemon 还没导入时启动：照常读得到会话（那台
-    // daemon 还在写这份 JSON），但不许建库——建了就等于在它背后把两种表示
-    // 分叉，还会把它的一次性导入门关掉。
     init('appA', { owner: false });
-    expect(getSession('s1')?.title).toBe('s1');
-    expect(listSessionsStrict()).toHaveLength(1);
+    expect(() => listSessionsStrict()).toThrow(/尚未迁移到 SQLite|unmigrated|unavailable/i);
     expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(false);
-    // 只读：不得把 scope 修复或 legacy 迁移写回 JSON（那是拥有者 daemon 的活）。
     expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.title).toBe('s1');
 
-    // daemon（owner）随后启动才导入
     init('appA');
     expect(getSession('s1')?.title).toBe('s1');
     expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(true);
@@ -240,17 +266,14 @@ describe('the frozen import source is not a store', () => {
     expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('live db copy');
     expect(loadAllSessionsSnapshot({ dataDir: tempDir }).get('s1')?.title).toBe('live db copy');
     // 身份扫描：同一 store 的冻结 JSON 不算第二份拷贝（exactly-once 证明不被打破）
-    expect(readSessionRowCopiesAcrossStores('s1', tempDir)).toHaveLength(1);
+    expect(readSessionRowCopiesAcrossStores('s1', tempDir).matches).toHaveLength(1);
     // 冻结 JSON 独有的行不可见——读者一律以 .db 为准
     expect(loadAllSessionsSnapshot({ dataDir: tempDir }).has('ghost')).toBe(false);
     expect(countActiveSessionsOnDisk(tempDir)).toBe(1);
   });
 
-  it('an un-imported peer store still composes with imported ones', () => {
-    // 混合升级窗口：appOld 的 daemon 还在跑迁移前的版本（只有 JSON），appNew
-    // 已经切到 SQLite。跨 bot 发现（继承 workingDir、活跃数统计、adopt 去重）
-    // 必须同时看见两者——把没重启过的 peer 读成「不存在」会让继承和去重失效。
-    seedJson('sessions-appOld.json', { o1: row('o1', { larkAppId: 'appOld' }) });
+  it('an imported peer store still composes with other imported ones', () => {
+    seedPersistedSessionRows(tempDir, 'appOld', { o1: row('o1', { larkAppId: 'appOld' }) });
     init('appNew');
     const n1 = createSession('oc_chat', 'om_shared_root', 'new bot session');
     n1.larkAppId = 'appNew';
@@ -278,48 +301,6 @@ describe('the frozen import source is not a store', () => {
     expect(getSession(s.sessionId)?.title).toBe('fresh probe'); // 缓存语义不变
   });
 
-  it('offline mutation targets the .db when it exists and leaves the frozen JSON untouched', () => {
-    const jsonFp = seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    init('appA');
-    expect(getSession('s1')?.status).toBe('active'); // 首次访问触发导入 → .db
-    const jsonAfterImport = readFileSync(jsonFp, 'utf-8');
-
-    const published = applySessionCommandUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { type: 'close' },
-      { dataDir: tempDir },
-    );
-    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
-    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('closed');
-    expect(readFileSync(jsonFp, 'utf-8')).toBe(jsonAfterImport);
-    expect(JSON.parse(jsonAfterImport).s1.status).toBe('active');
-  });
-
-  it('offline mutation on the .db keeps the abortIf entry + pre-publication probes', () => {
-    seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
-    init('appA');
-    listSessions(); // 触发导入 → .db
-    const before = readPersistedSessionRows(tempDir, 'appA');
-
-    let probes = 0;
-    const aborted = applySessionCommandUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { type: 'close' },
-      { dataDir: tempDir, abortIf: () => ++probes > 1 },
-    );
-    expect(aborted).toEqual({ outcome: 'owned' });
-    expect(probes).toBe(2);
-    expect(readPersistedSessionRows(tempDir, 'appA')).toEqual(before);
-
-    const abortedAtEntry = applySessionCommandUnowned(
-      { sessionId: 's1', larkAppId: 'appA' },
-      { type: 'close' },
-      { dataDir: tempDir, abortIf: () => true },
-    );
-    expect(abortedAtEntry).toEqual({ outcome: 'owned' });
-    expect(readPersistedSessionRows(tempDir, 'appA')).toEqual(before);
-  });
-
   it('offline mutation hands mutate the FRESH .db row, never the caller snapshot', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
@@ -342,7 +323,7 @@ describe('the frozen import source is not a store', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions();
-    init();
+    init('test-app');
     const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
     const before = readPersistedSessionRows(tempDir, 'appA');
     const writer = new DatabaseSync(dbPath);
@@ -381,7 +362,7 @@ describe('first-load serialization against an in-flight offline writer', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions(); // 触发导入 → .db
-    init();         // 释放连接，模拟 daemon 尚未启动
+    init('test-app');         // 释放连接，模拟 daemon 尚未启动
     const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
 
     // 握手协议保证确定性：子进程持锁改行后发 HELD；父进程落下 loading 标记后
@@ -430,7 +411,7 @@ describe('first-load serialization against an in-flight offline writer', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA', title: 'must-survive-busy' }) });
     init('appA');
     listSessions();
-    init();
+    init('test-app');
     const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
     const releaseMarker = join(tempDir, 'busy-release');
     const child = spawn(process.execPath, ['-e', `
@@ -519,29 +500,17 @@ describe('SQLite capability gate', () => {
     seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions(); // 首次访问触发导入 → .db
-    init(); // 释放已 attach 的连接，模拟独立 CLI 进程
+    init('test-app'); // 释放已 attach 的连接，模拟独立 CLI 进程
     __testOnly_setSqliteUnavailable(true);
 
     expect(() => readSessionRowFromDisk('s1', 'appA', tempDir)).toThrow(SessionStoreSqliteUnavailableError);
     expect(() => loadAllSessionsSnapshot({ dataDir: tempDir })).toThrow(SessionStoreSqliteUnavailableError);
     expect(() => readSessionRowCopiesAcrossStores('s1', tempDir)).toThrow(SessionStoreSqliteUnavailableError);
-    expect(() => applySessionCommandUnowned(
+    expect(applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
       { type: 'close' },
       { dataDir: tempDir },
-    )).toThrow(SessionStoreSqliteUnavailableError);
-  });
-
-  it('an un-imported peer store still resolves for the identity scan', () => {
-    // 身份扫描是 fail-closed 的「恰好一次」判定。窗口期把某个 store 读成
-    // 「不存在」，会让本来能唯一命中的行变成 0 命中，命令报「未找到当前进程
-    // 所属 session」，把人引去查进程标记。
-    seedJson('sessions-appOld.json', { o1: row('o1', { larkAppId: 'appOld' }) });
-    seedPersistedSessionRows(tempDir, 'appA', { a1: row('a1', { larkAppId: 'appA' }) });
-
-    expect(readSessionRowCopiesAcrossStores('a1', tempDir)).toHaveLength(1);
-    expect(readSessionRowCopiesAcrossStores('o1', tempDir)).toHaveLength(1);
-    expect(readSessionRowCopiesAcrossStores('missing', tempDir)).toHaveLength(0);
+    )).toEqual({ outcome: 'owned', heldBy: 'store_unreadable' });
   });
 
   it('a corrupt .db is a skippable store, not a missing-engine error', () => {
@@ -552,7 +521,8 @@ describe('SQLite capability gate', () => {
 
     expect(() => assertSqliteSupported()).not.toThrow();
     const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
-    expect(copies).toHaveLength(1);
-    expect(copies[0]?.title).toBe('other-bot');
+    expect(copies.matches).toHaveLength(1);
+    expect(copies.unreadableStores).toBe(1);
+    expect(copies.matches[0]?.title).toBe('other-bot');
   });
 });

@@ -1,4 +1,4 @@
-import type React from 'react';
+import * as React from 'react';
 import {
   useCallback,
   useEffect,
@@ -558,44 +558,16 @@ function PluginEnableRow(props: {
   );
 }
 
-function PluginGlobalSetting(props: {
-  plugin: ManagedPlugin;
-  bots: PluginBotScope[];
-  pendingToggles: PendingToggles;
-  busy: boolean;
-  onToggle(scope: string, enabled: boolean): void;
-}): React.JSX.Element {
-  const enabled = pluginEnabledInScope(props.plugin, 'global', props.pendingToggles);
-  return (
-    <label className="toggle-row plugin-global-setting">
-      <span className="plugin-global-setting-copy">
-        <strong>全局启用</strong>
-        <small>{enabled
-          ? `已对全部 ${props.bots.length} 个 Bot 启用`
-          : '关闭时可展开卡片，按 Bot 单独启用'}</small>
-      </span>
-      <input
-        type="checkbox"
-        data-plugin-toggle="global"
-        data-plugin-id={props.plugin.id}
-        checked={enabled}
-        disabled={props.busy}
-        onChange={event => props.onToggle('global', event.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true"></span>
-    </label>
-  );
-}
-
 function PluginBotSettings(props: {
   plugin: ManagedPlugin;
   bots: PluginBotScope[];
   pendingToggles: PendingToggles;
   busy: boolean;
+  globalEnabled: boolean;
+  globalTogglePending: boolean;
   onToggle(scope: string, enabled: boolean): void;
 }): React.JSX.Element {
   const { plugin, bots, pendingToggles } = props;
-  const enabledBotCount = bots.filter(bot => pluginEnabledInScope(plugin, bot.id, pendingToggles)).length;
   return (
     <section className="plugin-enable-panel" aria-label={`${plugin.displayName || plugin.id} 按 Bot 启用`}>
       <div className="plugin-enable-panel-head">
@@ -603,27 +575,44 @@ function PluginBotSettings(props: {
           <strong>按 Bot 启用</strong>
           <small>全局关闭时，可为需要此插件的 Bot 单独开启；新启动的 CLI 会话生效。</small>
         </div>
-        <span>{enabledBotCount}/{bots.length} 个 Bot 已启用</span>
+        <label className="toggle-row plugin-global-toggle">
+          <input
+            type="checkbox"
+            data-plugin-toggle="global"
+            data-plugin-id={plugin.id}
+            checked={props.globalEnabled}
+            disabled={props.busy}
+            onChange={event => props.onToggle('global', event.currentTarget.checked)}
+          />
+          <span className="switch" aria-hidden="true"></span>
+          <span>为所有 Bot 启用</span>
+        </label>
       </div>
-      <div className="plugin-enable-list">
-        {bots.map(bot => {
-          const checked = pluginEnabledInScope(plugin, bot.id, pendingToggles);
-          const enabledState = checked ? '已启用' : '未启用';
-          return (
-            <PluginEnableRow
-              plugin={plugin}
-              scope={bot.id}
-              label={bot.name}
-              hint={`当前${enabledState}`}
-              checked={checked}
-              busy={props.busy}
-              onToggle={props.onToggle}
-              key={bot.id}
-            />
-          );
-        })}
-        {bots.length === 0 ? <div className="plugin-enable-empty">暂无已配置 Bot</div> : null}
-      </div>
+      {props.globalTogglePending ? (
+        <div className="plugin-enable-empty">正在更新全局设置...</div>
+      ) : props.globalEnabled ? (
+        <div className="plugin-enable-empty">已对全部 {bots.length} 个 Bot 启用；关闭上方开关后可单独设置。</div>
+      ) : (
+        <div className="plugin-enable-list">
+          {bots.map(bot => {
+            const checked = pluginEnabledInScope(plugin, bot.id, pendingToggles);
+            const enabledState = checked ? '已启用' : '未启用';
+            return (
+              <PluginEnableRow
+                plugin={plugin}
+                scope={bot.id}
+                label={bot.name}
+                hint={`当前${enabledState}`}
+                checked={checked}
+                busy={props.busy}
+                onToggle={props.onToggle}
+                key={bot.id}
+              />
+            );
+          })}
+          {bots.length === 0 ? <div className="plugin-enable-empty">暂无已配置 Bot</div> : null}
+        </div>
+      )}
     </section>
   );
 }
@@ -633,6 +622,9 @@ function PluginCapabilitySummary(props: {
   globalEnabled: boolean;
   enabledBotCount: number;
   botCount: number;
+  expanded: boolean;
+  detailsId: string;
+  onToggle(): void;
 }): React.JSX.Element {
   const commands = props.plugin.contributions?.cli?.commands ?? [];
   const capabilities = [
@@ -642,8 +634,14 @@ function PluginCapabilitySummary(props: {
     { label: 'Dashboard', count: props.plugin.dashboard?.length ?? 0 },
   ].filter(item => item.count > 0);
   return (
-    <div className="plugin-card-summary">
-      <div className="plugin-capability-summary" aria-label="插件能力摘要">
+    <button
+      type="button"
+      className="plugin-card-summary"
+      aria-expanded={props.expanded}
+      aria-controls={props.detailsId}
+      onClick={props.onToggle}
+    >
+      <span className="plugin-capability-summary" aria-label="插件能力摘要">
         {capabilities.map(item => (
           <span className="plugin-capability-chip" key={item.label}><strong>{item.count}</strong>{item.label}</span>
         ))}
@@ -653,13 +651,13 @@ function PluginCapabilitySummary(props: {
           </span>
         ) : null}
         {capabilities.length === 0 && !props.plugin.service ? <span className="plugin-muted">未声明扩展能力</span> : null}
-      </div>
+      </span>
       <span className="plugin-scope-summary">
         {props.globalEnabled
           ? `全部 ${props.botCount} 个 Bot`
           : `${props.enabledBotCount}/${props.botCount} 个 Bot 单独启用`}
       </span>
-    </div>
+    </button>
   );
 }
 
@@ -747,31 +745,26 @@ function PluginCard(props: {
           {expanded ? '收起详情' : '展开详情'}
         </button>
       </header>
-      <PluginGlobalSetting
-        plugin={plugin}
-        bots={props.bots}
-        pendingToggles={props.pendingToggles}
-        busy={props.busy}
-        onToggle={props.onToggle}
-      />
       <PluginCapabilitySummary
         plugin={plugin}
         globalEnabled={enabledGlobal}
         enabledBotCount={enabledBotCount}
         botCount={props.bots.length}
+        expanded={expanded}
+        detailsId={detailsId}
+        onToggle={() => setExpanded(current => !current)}
       />
       {expanded ? (
         <div className="plugin-card-expanded" id={detailsId}>
-          {!enabledGlobal && !globalTogglePending ? (
-            <PluginBotSettings
-              plugin={plugin}
-              bots={props.bots}
-              pendingToggles={props.pendingToggles}
-              busy={props.busy}
-              onToggle={props.onToggle}
-            />
-          ) : null}
-          {globalTogglePending ? <div className="plugin-settings-pending">正在更新全局设置...</div> : null}
+          <PluginBotSettings
+            plugin={plugin}
+            bots={props.bots}
+            pendingToggles={props.pendingToggles}
+            busy={props.busy}
+            globalEnabled={enabledGlobal}
+            globalTogglePending={globalTogglePending}
+            onToggle={props.onToggle}
+          />
           {hasDashboard ? (
             <div className="plugin-card-controls">
               <label className="toggle-row plugin-pin-toggle">
@@ -932,7 +925,20 @@ function PluginManagementPage(): React.JSX.Element {
 }
 
 function pluginDashboardApi(pluginId: string) {
+  async function settings(method: string, value?: unknown) {
+    const response = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings`, {
+      method, headers: { 'content-type': 'application/json' },
+      ...(method === 'PUT' ? { body: JSON.stringify(value) } : {}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    return result;
+  }
   return {
+    react: React,
+    getSettings: () => settings('GET'),
+    saveSettings: (value: unknown) => settings('PUT', value),
+    async listBots() { return (await fetchPluginManagement()).bots; },
     async getServiceStatus() {
       const payload = await fetchPluginManagement();
       return payload.plugins.find(plugin => plugin.id === pluginId)?.serviceReport;

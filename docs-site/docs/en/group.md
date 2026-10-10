@@ -36,3 +36,35 @@ If you'd rather not use commands, the **Groups** panel in `botmux dashboard` can
 
 ![Create Group in Dashboard](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300986_dash-newgroup.png)
 <p class="cap">"New Group": fill in the group name, bind a directory, and check the bots to pull into the group</p>
+
+## DM-created session groups: change the tag on close
+
+With `p2pMode: "group"`, set **Tag after closing** under Dashboard **Bot configuration → Sessions → Session mode → DM dedicated group → Session-group tag**, for example “Closed”. Leave it empty to retain the current behavior. The equivalent per-bot `bots.json` configuration is:
+
+```json
+{
+  "p2pMode": "group",
+  "sessionGroup": {
+    "tag": {
+      "mode": "feed-group",
+      "name": "Active",
+      "closedName": "Closed"
+    }
+  }
+}
+```
+
+After a clean `/close` (including the close-card action that uses this command), the chat is added to the configured destination and then removed from its original automatic group. The destination is reused or created by name. Neither group itself, other chats, nor chat history are deleted. Names are trimmed and limited to 60 Unicode codepoints.
+
+- Supports personal `feed-group` mode only, using the **user who created the session group** and their existing tag authorization. Use `/login tags` if authorization is missing.
+- Failed closes, unclean residuals, `/stop`, crashes, background cleanup, and ordinary groups/topics do not move tags.
+- Migration runs in the background with a separate failure notification. Failed adds keep the original association; identical source and destination IDs are never removed.
+- Resuming does not move the chat back. Clearing `closedName` disables this behavior without bulk-migrating existing chats.
+
+## Disband a dedicated session group: `/dismiss`
+
+Send `/dismiss` at the top level of a dedicated session group, review the impact notice, then send the returned confirmation command. Only its initiating human with Bot operator permission may confirm. The Bot must own the group or be its creator with `im:chat:operate_as_owner`.
+
+The command safely closes the session before disbanding the group, then sends a private receipt. Other active sessions, failed closure or runtime residuals prevent deletion. If deletion fails, the session stays closed; send `/dismiss` again to confirm a retry. DMs, ordinary groups, subtopics and adopted sessions are excluded.
+
+All group members are affected; resuming cannot recreate the original group. Code and worktrees are kept, and closed-tag migration is skipped. Use `/close` to keep the group and change its tag.

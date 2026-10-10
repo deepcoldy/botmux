@@ -25,6 +25,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync, readFileSync, symlinkSync } from 'node:fs';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
@@ -109,7 +110,12 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     writeFileSync(join(S, 'proj/.env'), 'API_KEY=zzz');
     writeFileSync(join(S, 'ref/doc.md'), 'ref');
   });
-  afterAll(() => { if (S) rmSync(S, { recursive: true, force: true }); });
+  // `build()` chmods the deny-mask sources to 000 (mirroring the worker), and a
+  // 000 DIRECTORY cannot be traversed — so a plain recursive delete throws
+  // `EACCES: permission denied, rm` for any NON-root uid, failing this file in an
+  // unnamed afterAll while every real case is already green. See the helper for
+  // the measurements (root hides it; Node and Bun fail alike).
+  afterAll(() => rmSandboxScratch(S));
 
   it('readWrite: reads AND writes the project', () => {
     const { args } = build({});

@@ -79,6 +79,17 @@ describe('daemon IPC session-scoped fallback', () => {
     })).toEqual({ ok: true });
   });
 
+  it('overrides a stale project-card root with the live chat route', () => {
+    const ask = { sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: 'om_project_card', requestId: 'req-a' };
+    const bound = bindSessionScopedIpcIdentity(ask, {
+      sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: null,
+    });
+    expect(bound).toEqual({ ...ask, rootMessageId: null });
+    expect(bindSessionScopedIpcIdentity(ask, {
+      sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: 'om_live_topic',
+    })).toEqual({ ...ask, rootMessageId: 'om_live_topic' });
+  });
+
   it('binds ask and hook routing fields to the authenticated session', () => {
     const bound = bindSessionScopedIpcIdentity({
       sessionId: 'session-b',
@@ -121,15 +132,24 @@ describe('daemon session-scoped IPC route wiring', () => {
       "ipcRoute('POST', '/api/attention'",
     );
     const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
-    const registerAt = route.indexOf('registerAskBroker({');
+    const registerAt = route.indexOf('registerAskForResponse({');
     expect(bindAt).toBeGreaterThanOrEqual(0);
     expect(registerAt).toBeGreaterThan(bindAt);
     expect(route).toContain('const askChatType = askSession?.chatType;');
     expect(route).toMatch(
-      /registerAskBroker\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
+      /registerAskForResponse\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
     );
     expect(route).not.toMatch(
-      /registerAskBroker\(\{\s*larkAppId: parsed\.larkAppId,/,
+      /registerAskForResponse\(\{\s*larkAppId: parsed\.larkAppId,/,
+    );
+    // #1740: the route override applies to BOTH caller kinds — a trusted HMAC
+    // host is bound to the live session just like a capability caller, so a
+    // stale/manual root can never redirect a group question. The bind therefore
+    // must follow the authorization block (depth-1 `}`) guarded ONLY by
+    // `if (askSession)`; nesting it back inside `if (!isTrustedHostIpcRequest)`
+    // would silently restore the HMAC bypass.
+    expect(route).toMatch(
+      /\}\n\s*\/\/ Authentication and routing are separate[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*if \(askSession\) \{\n\s*boundAsk = bindSessionScopedIpcIdentity\(/,
     );
   });
 

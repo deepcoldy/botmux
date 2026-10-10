@@ -127,6 +127,30 @@ export function buildDispatchCompletionBrief(input: {
     : withReport;
 }
 
+/** Remove only our exact generated suffix, after the receiver has verified the
+ * dispatch binding. Never strip user-authored XML or arbitrary instructions. */
+export function stripDispatchCompletionProtocol(content: string, dispatchRoot: string): string {
+  const trimmed = content.trimEnd();
+  for (const exactReportRootEnabled of [true, false]) {
+    for (const sameTopicSendEnabled of [true, false]) {
+      const suffix = buildDispatchCompletionBrief({ brief: '', dispatchRootId: dispatchRoot,
+        exactReportRootEnabled, sameTopicSendEnabled });
+      // Rich-post parsing drops empty paragraphs and trims each line. Accept
+      // that exact representation too; an optional role footer is task data.
+      const postSuffix = '\n' + suffix.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+      for (const candidate of [suffix, postSuffix]) {
+        const start = trimmed.lastIndexOf(candidate);
+        if (start < 0) continue;
+        const tail = trimmed.slice(start + candidate.length);
+        if (tail === '' || /^\n{1,2}分工：\n(?:·[^\n]+(?:\n|$))+$/.test(tail)) {
+          return trimmed.slice(0, start) + tail;
+        }
+      }
+    }
+  }
+  return content;
+}
+
 /**
  * Parse a `--bot` spec `openId[:name[:role]]` into a {@link DispatchBot}.
  * Mirrors the `--mention "open_id:Display Name"` convention, with an optional
@@ -416,6 +440,90 @@ export function resolveReportRecipient(input: {
     input.ownerOpenId,
     input.quoteTargetSenderOpenId,
   ].find(value => !!value?.trim())?.trim();
+}
+
+export interface ReportRecipientSession {
+  sessionId?: string;
+  larkAppId?: string;
+  chatId?: string;
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  status?: string;
+  creatorOpenId?: string;
+  ownerOpenId?: string;
+  quoteTargetSenderOpenId?: string;
+  createdAt?: string;
+}
+
+export type ReportRecipientSource =
+  | 'recipient-root-chat-creator'
+  | 'session-creator'
+  | 'session-owner'
+  | 'quote-sender'
+  | 'none';
+
+export interface ResolvedReportRecipient {
+  openId?: string;
+  source: ReportRecipientSource;
+  sourceSessionId?: string;
+}
+
+export function resolveReportRecipientForSession(input: {
+  session: ReportRecipientSession;
+  sessions: ReportRecipientSession[];
+  knownPeerBotOpenIds: ReadonlySet<string>;
+  recipientRoot?: string;
+}): ResolvedReportRecipient {
+  const current = input.session;
+  const currentCreator = current.creatorOpenId?.trim();
+  if (input.recipientRoot !== undefined) {
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(input.recipientRoot)) {
+      throw new Error('--recipient-root 必须是有效的 om_ 消息 id。');
+    }
+    const currentCreatedAt = Date.parse(current.createdAt ?? '');
+    if ((current.scope ?? 'thread') !== 'thread'
+      || current.status !== 'active'
+      || !current.sessionId
+      || !current.larkAppId
+      || !current.chatId
+      || !Number.isFinite(currentCreatedAt)) {
+      throw new Error('--recipient-root 需要有效的 active thread 来源会话。');
+    }
+    // Count structural matches before checking peer identity so a peer+human ambiguity fails closed.
+    const candidates = input.sessions.filter(candidate => {
+      const candidateCreatedAt = Date.parse(candidate.createdAt ?? '');
+      return candidate.sessionId !== current.sessionId
+        && candidate.status === 'active'
+        && candidate.scope === 'chat'
+        && candidate.larkAppId === current.larkAppId
+        && candidate.chatId === current.chatId
+        && candidate.rootMessageId === input.recipientRoot
+        && Number.isFinite(candidateCreatedAt)
+        && candidateCreatedAt < currentCreatedAt;
+    });
+    if (candidates.length !== 1) {
+      throw new Error('--recipient-root 未匹配唯一的同应用、同群且严格更早的 active chat 会话。');
+    }
+    const candidateCreator = candidates[0].creatorOpenId?.trim();
+    if (!candidateCreator || !input.knownPeerBotOpenIds.has(candidateCreator)) {
+      throw new Error('--recipient-root 对应的 creator 不是当前应用已知的 peer。');
+    }
+    if (currentCreator && input.knownPeerBotOpenIds.has(currentCreator)) {
+      return { openId: currentCreator, source: 'session-creator' };
+    }
+    return {
+      openId: candidateCreator,
+      source: 'recipient-root-chat-creator',
+      sourceSessionId: candidates[0].sessionId,
+    };
+  }
+
+  if (currentCreator) return { openId: currentCreator, source: 'session-creator' };
+  const owner = current.ownerOpenId?.trim();
+  if (owner) return { openId: owner, source: 'session-owner' };
+  const quoteSender = current.quoteTargetSenderOpenId?.trim();
+  if (quoteSender) return { openId: quoteSender, source: 'quote-sender' };
+  return { source: 'none' };
 }
 
 /**

@@ -23,6 +23,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
@@ -73,8 +74,14 @@ const mocks = vi.hoisted(() => {
       const session = sessions.get(sessionId);
       if (session) session.status = 'closed';
     }),
-    forkWorker: vi.fn((ds: any) => {
+    forkWorker: vi.fn((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
+    }),
+    forkAdoptWorker: vi.fn((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return 'accepted' as const;
     }),
     // Must mirror the real contract: closeSession() always resolves a
     // CloseSessionResult. Returning undefined made the remote-close guard
@@ -90,6 +97,10 @@ const mocks = vi.hoisted(() => {
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
+    runAutoWorktreeCommit: vi.fn(async (deps: any) => {
+      deps.ds.worktreeCreating = true;
+    }),
+    persistStreamCardState: vi.fn((impl: (...args: any[]) => any, ...args: any[]) => impl(...args)),
   };
 });
 
@@ -143,7 +154,10 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return {
     ...actual,
     forkWorker: mocks.forkWorker,
+    forkAdoptWorker: mocks.forkAdoptWorker,
     closeSession: mocks.closeWorkerPoolSession,
+    closeSessionForBackgroundCleanup: (sessionId: string) =>
+      mocks.closeWorkerPoolSession(sessionId),
   };
 });
 
@@ -173,12 +187,20 @@ vi.mock('../src/core/session-manager.js', async () => {
     ...actual,
     getAvailableBots: mocks.getAvailableBots,
     downloadResources: mocks.downloadResources,
+    persistStreamCardState: (...args: any[]) =>
+      mocks.persistStreamCardState(actual.persistStreamCardState, ...args),
   };
 });
 
 vi.mock('../src/services/project-scanner.js', async () => {
   const actual = await vi.importActual<any>('../src/services/project-scanner.js');
   return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
+});
+
+
+vi.mock('../src/im/lark/card-handler.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/card-handler.js');
+  return { ...actual, runAutoWorktreeCommit: mocks.runAutoWorktreeCommit };
 });
 
 vi.mock('../src/im/lark/identity-cache.js', async () => {
@@ -188,6 +210,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
+import { __testOnly_setCascadeTiming } from '../src/core/cli-idle-wait.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
@@ -201,6 +224,7 @@ import {
   __testOnly_prewarmDocCommentSession as prewarmDocCommentSession,
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
+  __testOnly_retryPendingDocCommentDeliveries as retryPendingDocCommentDeliveries,
 } from '../src/daemon.js';
 import {
   admitQueuedActivationTail,
@@ -550,9 +574,16 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     mocks.sessions.clear();
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
+    mocks.forkAdoptWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return 'accepted';
+    });
+    mocks.persistStreamCardState.mockImplementation((impl: (...args: any[]) => any, ...args: any[]) => impl(...args));
     mocks.closeWorkerPoolSession.mockImplementation(async (sessionId: string) => {
       for (const [key, candidate] of activeSessions) {
         if (candidate.session.sessionId !== sessionId) continue;
@@ -629,7 +660,7 @@ describe('/rename production routing — must not pre-create a session (review P
       expect(mocks.closeSession).not.toHaveBeenCalled();
     } finally {
       mocks.createSession.mockImplementation(original!);
-      actual.init();
+      actual.init(APP);
       rmSync(home, { recursive: true, force: true });
     }
   });
@@ -643,6 +674,38 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(activeSessions.size).toBe(0);
     expect(repliedText()).toContain('没有活跃的会话');
+  });
+
+  // PR-2 有意变化（docs/design/2026-09-11-command-router.md §9）：thread 入口的 /card /cot
+  // 与新话题入口对齐为前置特判——无会话时不再预建 worker:null 的幽灵会话。
+  it('thread reply with no existing session: `/card pin status` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_card', '/card pin status', 'om_root_card'),
+      makeCtx('om_root_card', 'om_reply_card'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
+  });
+
+  it('thread reply with no existing session: `/term` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_term', '/term', 'om_root_term'),
+      makeCtx('om_root_term', 'om_reply_term'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
+  });
+
+  it('thread reply with no existing session: `/cot status` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_cot', '/cot status', 'om_root_cot'),
+      makeCtx('om_root_cot', 'om_reply_cot'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
   });
 
   it('thread reply with an existing session: `/rename` renames it in place', async () => {
@@ -697,6 +760,85 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
+  });
+
+  // The pre-created record is a REAL session: every later turn in this topic
+  // routes into it and forks a CLI from it. Historically only `/repo` resolved a
+  // pinned dir here, so a session born from any other session-needing daemon
+  // command carried NO workingDir and silently ignored the bot's
+  // defaultWorkingDir / the chat's oncall binding for the rest of its life.
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/status` pins the bot default workingDir on the pre-created session', async (_label, reply) => {
+    const defaultDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: defaultDir,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_wd_root' : 'om_wd_new';
+    const messageId = reply ? 'om_wd_reply' : rootId;
+    const data = makeEventData(messageId, '/status', reply ? rootId : undefined);
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBe(defaultDir);
+    expect(ds!.session.workingDir).toBe(defaultDir);
+    // Inheriting the dir must NOT turn a non-`/repo` command into a repo picker:
+    // these commands fork no CLI of their own.
+    expect(ds!.pendingRepo).toBeFalsy();
+  });
+
+  // Auto-worktree bots: `defaultWorkingDir` is a worktree BASE, and the ordinary
+  // spawn paths answer it with pendingRepo + a detached worktree build. A daemon
+  // command must not start that build on the user's behalf, and pinning the base
+  // dir instead would run every later turn of this session inside the SHARED
+  // repo — exactly the isolation the flag buys. So it stays unpinned.
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/status` does NOT pin the auto-worktree base dir', async (_label, reply) => {
+    const baseDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: baseDir,
+      defaultWorkingDirAutoWorktree: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_wt_root' : 'om_wt_new';
+    const messageId = reply ? 'om_wt_reply' : rootId;
+    const data = makeEventData(messageId, '/status', reply ? rootId : undefined);
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBeUndefined();
+    expect(ds!.session.workingDir).toBeUndefined();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+
+  // Guard the other half: with nothing configured there is no dir to pin, and
+  // the session must keep the "unset = follow the bot default at fork time"
+  // shape rather than being pinned to some fallback here.
+  it('control: `/status` with no bot default leaves the session unpinned', async () => {
+    await handleNewTopic(makeEventData('om_wd_none', '/status'), makeCtx('om_wd_none', 'om_wd_none'));
+
+    const ds = activeSessions.get(sessionKey('om_wd_none', APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBeUndefined();
+    expect(ds!.session.workingDir).toBeUndefined();
   });
 
   it.each([
@@ -1402,6 +1544,122 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
 
+
+
+  it('`/t here <content>` reuses the current chat-scope working directory and skips repo selection', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_force_topic_here', '/t here 检查实现'),
+      makeCtx('om_force_topic_here', 'om_force_topic_here'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_force_topic_here', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.scanMultipleProjects).not.toHaveBeenCalled();
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+  });
+
+
+
+  it('`/tw <content>` creates a topic that starts from a worktree of the current chat working directory', async () => {
+    const repoRoot = makeRepoFixtureDir();
+    const currentDir = join(repoRoot, 'packages', 'app');
+    mkdirSync(currentDir, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoRoot });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_force_topic_worktree', '/tw 检查实现'),
+      makeCtx('om_force_topic_worktree', 'om_force_topic_worktree'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_force_topic_worktree', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.initialStartPending).toBe(false);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      anchor: 'om_force_topic_worktree',
+      baseDir: currentDir,
+      prompt: expect.stringContaining('检查实现'),
+      force: true,
+      targetSubdir: join('packages', 'app'),
+    }));
+  });
+
+
+
+  it('`/topic here` and `/topic worktree` use the same current-directory variants', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_topic_here', '/topic here 检查实现'),
+      makeCtx('om_topic_here', 'om_topic_here'),
+    );
+    expect(activeSessions.get(sessionKey('om_topic_here', APP))?.workingDir).toBe(currentDir);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+
+    mocks.forkWorker.mockClear();
+    mocks.runAutoWorktreeCommit.mockClear();
+    activeSessions.delete(sessionKey('om_topic_here', APP));
+
+    await handleNewTopic(
+      makeEventData('om_topic_worktree', '/topic worktree 检查实现'),
+      makeCtx('om_topic_worktree', 'om_topic_worktree'),
+    );
+    const ds = activeSessions.get(sessionKey('om_topic_worktree', APP));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      baseDir: currentDir,
+      force: true,
+    }));
+  });
+
   it('card-off pinned cwd + `/t <content>` immediately seeds the thread and starts work', async () => {
     const bot = registerBot({
       larkAppId: APP,
@@ -2079,6 +2337,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/fast',
       turnId: 'om_fast_live',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
 
     // Cold (no existing session): /fast is a tier toggle, not "start work", so
@@ -2166,6 +2429,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/model',
       turnId: 'om_model_tui',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
   });
 
@@ -2206,6 +2474,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/goal',
       turnId: 'om_goal_tui',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
 
     // Inverse: bot default is interactive Codex, but a frozen Codex App session
@@ -2281,6 +2554,29 @@ describe('/rename production routing — must not pre-create a session (review P
       expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw_input' }));
       expect(repliedText()).toMatch(/切不了 Codex 档位|can't toggle/);
     }
+  });
+
+  it.each(['persisted', 'live legacy'] as const)('zero-injection %s pending-repo attachments remain on separate turns', async (snapshot) => {
+    const anchor = 'om_zero_pending';
+    const ds = seedPendingRawSession(anchor);
+    if (snapshot === 'persisted') ds.session.promptInjection = 'none';
+    else {
+      delete ds.session.promptInjection;
+      ds.initConfig = { ...ds.initConfig, promptInjection: 'none' } as any;
+    }
+    ds.pendingRawInput = undefined;
+    ds.pendingPrompt = 'opening task';
+    ds.pendingAttachments = [{ type: 'file', name: 'opening.md', path: '/tmp/opening.md' }];
+    mocks.downloadResources.mockResolvedValueOnce({ attachments: [
+      { type: 'file', name: 'followup.md', path: '/tmp/followup.md' },
+    ], needLogin: false });
+    await handleThreadReply(makeEventData('om_zero_followup', 'follow-up task', anchor),
+      makeCtx(anchor, 'om_zero_followup'));
+    const tail = ds.session.queuedActivationTail ?? [];
+    expect(tail).toHaveLength(1);
+    expect(tail[0]?.cliInput?.content).toBe('follow-up task\n\n[file] followup.md: /tmp/followup.md');
+    expect(ds.pendingFollowUps).toBeUndefined();
+    expect(ds.pendingAttachments).toEqual([{ type: 'file', name: 'opening.md', path: '/tmp/opening.md' }]);
   });
 
   it('pending raw follow-up keeps the raw root identity and durably stages an exact successor', async () => {
@@ -2682,6 +2978,7 @@ describe('/rename production routing — must not pre-create a session (review P
 
     mocks.forkWorker.mockImplementation((owner: any) => {
       owner.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     await handleThreadReply(
       makeEventData('om_retry_owner', 'RETRY_OWNER_REPLY', anchor),
@@ -2875,8 +3172,10 @@ describe('document comment canonical ownership and single-flight delivery', () =
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.sessions.clear();
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
     mocks.getAvailableBots.mockResolvedValue([]);
     activeSessions.clear();
@@ -2900,6 +3199,21 @@ describe('document comment canonical ownership and single-flight delivery', () =
     return sub;
   }
 
+  function docNativeSub(fileToken: string): any {
+    const anchor = `doc:${fileToken}:watch`;
+    const sub = {
+      fileToken,
+      fileType: 'docx',
+      sessionAnchor: anchor,
+      scope: 'chat' as const,
+      chatId: anchor,
+      commentTriggerMode: 'all' as const,
+      managedBy: 'watch-comment' as const,
+      createdAt: Date.now(),
+    };
+    putDocSubscription(config.session.dataDir, APP, sub);
+    return sub;
+  }
   function docCtx(sub: any, suffix: string): any {
     return {
       larkAppId: APP,
@@ -3004,50 +3318,243 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
-  it('serializes concurrent get-or-create, merges targets, and reuses canonical state after restart', async () => {
+  it('isolates concurrent document comment threads and reuses one thread after restart', async () => {
     const fileToken = `doc-concurrent-${Date.now()}`;
-    const sub = docSub(fileToken);
+    const sub = docNativeSub(fileToken);
 
     await expect(Promise.all([
       handleDocComment(docCtx(sub, 'one')),
       handleDocComment(docCtx(sub, 'two')),
     ])).resolves.toEqual([true, true]);
 
-    const key = sessionKey(`doc:${fileToken}`, APP);
-    const owner = activeSessions.get(key)!;
-    expect(owner).toBeDefined();
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual(['reply-one', 'reply-two']);
+    const keyOne = sessionKey(`doc:${fileToken}:comment-one`, APP);
+    const keyTwo = sessionKey(`doc:${fileToken}:comment-two`, APP);
+    const ownerOne = activeSessions.get(keyOne)!;
+    const ownerTwo = activeSessions.get(keyTwo)!;
+    expect(ownerOne).toBeDefined();
+    expect(ownerTwo).toBeDefined();
+    expect(ownerOne).not.toBe(ownerTwo);
+    expect(mocks.createSession).toHaveBeenCalledTimes(2);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+    expect(Object.keys(ownerOne.session.docCommentTargets ?? {})).toEqual(['reply-one']);
+    expect(Object.keys(ownerTwo.session.docCommentTargets ?? {})).toEqual(['reply-two']);
 
     const persisted = getDocSubscription(config.session.dataDir, APP, fileToken)!;
     expect(persisted).toMatchObject({
-      sessionAnchor: `doc:${fileToken}`,
-      sessionId: owner.session.sessionId,
+      sessionAnchor: `doc:${fileToken}:watch`,
       scope: 'chat',
-      chatId: `doc:${fileToken}`,
+      chatId: `doc:${fileToken}:watch`,
     });
-    // This is the exact anchor closeSession uses to find subscriptions.
-    expect(sessionAnchorId(owner)).toBe(persisted.sessionAnchor);
+    expect(persisted.sessionId).toBeUndefined();
 
-    // Simulate a daemon memory restart restoring the same persisted session at
-    // activeSessionKey(ds), then deliver another comment from a stale snapshot.
     activeSessions.clear();
-    owner.worker = null;
-    activeSessions.set(key, owner);
+    ownerOne.worker = null;
+    activeSessions.set(keyOne, ownerOne);
     const staleSnapshot = { ...sub };
-    await expect(handleDocComment(docCtx(staleSnapshot, 'three'))).resolves.toBe(true);
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-    expect(activeSessions.get(key)).toBe(owner);
-    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual([
+    await expect(handleDocComment({
+      ...docCtx(staleSnapshot, 'one-followup'),
+      commentId: 'comment-one',
+    })).resolves.toBe(true);
+    expect(mocks.createSession).toHaveBeenCalledTimes(2);
+    expect(activeSessions.get(keyOne)).toBe(ownerOne);
+    expect(Object.keys(ownerOne.session.docCommentTargets ?? {}).sort()).toEqual([
       'reply-one',
-      'reply-three',
-      'reply-two',
+      'reply-one-followup',
     ]);
 
     removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
+  it('consumes a stale comment after its document watch is stopped during sender lookup', async () => {
+    const fileToken = `doc-stopped-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.closeWorkerPoolSession.mockImplementationOnce(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId !== sessionId) continue;
+        activeSessions.delete(key);
+        candidate.session.status = 'closed';
+      }
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true };
+    });
 
+    const delivery = handleDocComment(docCtx(sub, 'stopped'));
+    await vi.waitFor(() => expect(mocks.createSession).toHaveBeenCalledTimes(1));
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+    gate.resolve();
+
+    await expect(delivery).resolves.toBe(true);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-stopped`, APP))).toBe(false);
+  });
+
+  it('retries a stale document comment on the latest explicit session binding', async () => {
+    const fileToken = `doc-rebound-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.closeWorkerPoolSession.mockImplementationOnce(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId !== sessionId) continue;
+        activeSessions.delete(key);
+        candidate.session.status = 'closed';
+      }
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true };
+    });
+
+    const delivery = handleDocComment(docCtx(sub, 'rebound'));
+    await vi.waitFor(() => expect(mocks.createSession).toHaveBeenCalledTimes(1));
+    const rebound = seedThreadSession(`om_rebound_${fileToken}`, 'rebound doc owner');
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      sessionAnchor: sessionAnchorId(rebound),
+      sessionId: rebound.session.sessionId,
+      scope: rebound.scope,
+      chatId: rebound.chatId,
+    });
+    gate.resolve();
+
+    await expect(delivery).resolves.toBe(true);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(rebound.session.docCommentTargets).toHaveProperty('reply-rebound');
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rebound`, APP))).toBe(false);
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps a live-worker comment accepted when post-send projection fails', async () => {
+    const fileToken = `doc-live-projection-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'mention-only';
+    const ds = seedThreadSession(sub.sessionAnchor, 'live projection');
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    bindSubToSession(sub, ds);
+    mocks.persistStreamCardState.mockImplementationOnce(() => {
+      throw new Error('projection persistence failed');
+    });
+
+    await expect(handleDocComment(docCtx(sub, 'projection'))).resolves.toBe(true);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ds.session.docCommentTargets).toHaveProperty('reply-projection');
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps the comment retryable when worker admission rejects the fork', async () => {
+    const fileToken = `doc-admission-rejected-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _resume: any, opts?: any) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+
+    await expect(handleDocComment(docCtx(sub, 'rejected'))).resolves.toBe(false);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[3]).toEqual(expect.objectContaining({
+      deferDuringDeviceIsolation: false,
+    }));
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rejected`, APP))).toBe(false);
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)).not.toBeNull();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps an explicitly bound adopted comment retryable when the adopt fork rejects', async () => {
+    const fileToken = `doc-adopt-rejected-${Date.now()}`;
+    const sub = docSub(fileToken);
+    const ds = seedThreadSession(sub.sessionAnchor, 'adopted doc owner');
+    ds.adoptedFrom = {
+      source: 'tmux',
+      tmuxTarget: 'work:0.0',
+      originalCliPid: 4242,
+      sessionId: 'sess-adopt-live',
+      cliId: 'claude-code',
+      cwd: '/repo',
+    };
+    ds.session.adoptedFrom = { ...ds.adoptedFrom };
+    bindSubToSession(sub, ds);
+    mocks.forkAdoptWorker.mockReturnValueOnce('rejected');
+
+    await expect(handleDocComment(docCtx(sub, 'adopt-rejected'))).resolves.toBe(false);
+
+    expect(mocks.forkAdoptWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.docCommentTargets).not.toHaveProperty('reply-adopt-rejected');
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)).not.toBeNull();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('retries persisted WS delivery across rounds using the latest explicit binding', async () => {
+    const fileToken = `doc-pending-ws-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'mention-only';
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      pendingDocCommentDeliveries: [{
+        commentId: 'comment-pending',
+        replyId: 'reply-pending',
+        text: 'retry me',
+        queuedAt: 1,
+      }],
+    });
+    const attempts: string[] = [];
+    const reject = vi.fn(async (ctx: any) => {
+      attempts.push(ctx.sub.sessionAnchor);
+      return false;
+    });
+
+    const blocked = await retryPendingDocCommentDeliveries(APP, reject);
+    expect(blocked).toEqual({ acceptedKeys: new Set(), blockedFiles: new Set([fileToken]) });
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toHaveLength(1);
+
+    const rebound = seedThreadSession(`om_pending_rebound_${fileToken}`, 'pending rebound');
+    bindSubToSession(getDocSubscription(config.session.dataDir, APP, fileToken)!, rebound);
+    const accept = vi.fn(async (ctx: any) => {
+      attempts.push(ctx.sub.sessionAnchor);
+      return true;
+    });
+    const accepted = await retryPendingDocCommentDeliveries(APP, accept);
+
+    expect(accepted).toEqual({ acceptedKeys: new Set(), blockedFiles: new Set() });
+    expect(attempts).toEqual([sub.sessionAnchor, sessionAnchorId(rebound)]);
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+  it('does not re-execute an accepted --all pending marker after restart', async () => {
+    const fileToken = `doc-accepted-marker-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'all';
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      pendingDocCommentDeliveries: [{
+        commentId: 'comment-accepted',
+        replyId: 'reply-accepted',
+        text: 'already delivered',
+        queuedAt: 1,
+        acceptedAt: 2,
+      }],
+    });
+    const deliver = vi.fn(async () => true);
+
+    await expect(retryPendingDocCommentDeliveries(APP, deliver)).resolves.toEqual({
+      acceptedKeys: new Set([`${fileToken}:reply-accepted`]),
+      blockedFiles: new Set(),
+    });
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries?.[0])
+      .toMatchObject({ replyId: 'reply-accepted', acceptedAt: 2 });
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
   it('makes duplicate WS/poll deliveries share failure so neither advances its cursor', async () => {
     const fileToken = `doc-failure-${Date.now()}`;
     const sub = docSub(fileToken);
@@ -3063,8 +3570,10 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
 
     // Failure was not recorded as completed: a later poll retry can deliver.
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
     await expect(handleDocComment(ctx)).resolves.toBe(true);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
@@ -3262,5 +3771,302 @@ describe('/repo trusted sibling production routing', () => {
     expect(repliedText()).toContain('仅 allowedUsers 可执行');
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * runtime 级联定序器（docs/design/2026-09-11-command-router.md §6，PR-3）：thread + 活 worker 上
+ * 「透传命令行 ⏎ …」逐条送出，每条之间等 CLI 执行完；后端跑不了时 fail closed。
+ * 透传链钉顺序与 turn 标识；「命令 + 正文」另钉重入顺序，以及 worker 中途消失时停住。
+ */
+describe('runtime passthrough cascade (PR-3)', () => {
+  const tick = (ms: number) => new Promise(r => setTimeout(r, ms));
+  beforeEach(() => {
+    resetRouteTestState();
+    activeSessions.clear();
+    __testOnly_setCascadeTiming({ idleTimeoutMs: 400, busyGraceMs: 40, pollMs: 5 });
+  });
+
+  function seedLiveThreadSession(anchor: string): { ds: DaemonSession; raws: () => any[] } {
+    const ds = seedThreadSession(anchor, '级联');
+    const send = vi.fn(() => true);
+    (ds as any).worker = { killed: false, pid: 4242, send };
+    ds.cliReady = true;
+    ds.cliReadyGeneration = 1;
+    ds.lastScreenStatus = 'idle';
+    ds.session.cliId = 'claude-code';
+    return { ds, raws: () => send.mock.calls.map(c => c[0]).filter((m: any) => m.type === 'raw_input') };
+  }
+
+  it('瞬时命令：第一条立即送出，宽限窗内没忙就送第二条；派生/真实 turn id 各归其位', async () => {
+    const { raws } = seedLiveThreadSession('om_root_casc1');
+    await handleThreadReply(
+      makeEventData('om_casc_1', '/model opus\n/clear', 'om_root_casc1'),
+      makeCtx('om_root_casc1', 'om_casc_1'),
+    );
+    await tick(15);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(raws()[0].turnId).toBe('om_casc_1#c1');
+    await tick(120);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus', '/clear']);
+    expect(raws()[1].turnId).toBe('om_casc_1');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it('真忙命令：第二条要等到 prompt_ready 代际递增才送', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc2');
+    await handleThreadReply(
+      makeEventData('om_casc_2', '/compact 只留登录上下文\n/clear', 'om_root_casc2'),
+      makeCtx('om_root_casc2', 'om_casc_2'),
+    );
+    await tick(15);
+    expect(raws()).toHaveLength(1);
+    ds.lastScreenStatus = 'working';
+    await tick(150);
+    expect(raws()).toHaveLength(1);
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear']);
+  });
+
+  it('adopt 会话跑不了级联：fail closed 回一句，什么都不发', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc3');
+    (ds as any).adoptedFrom = { kind: 'tmux', pane: '%1' };
+    await handleThreadReply(
+      makeEventData('om_casc_3', '/model opus\n/clear', 'om_root_casc3'),
+      makeCtx('om_root_casc3', 'om_casc_3'),
+    );
+    await tick(30);
+    expect(raws()).toHaveLength(0);
+    expect(repliedText()).toContain('分条发送');
+  });
+
+  it('级联在飞时后到的单条透传排在定序器之后重入（保序），第二条级联 fail closed', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc5');
+    await handleThreadReply(
+      makeEventData('om_casc_5', '/compact 只留登录上下文\n/clear', 'om_root_casc5'),
+      makeCtx('om_root_casc5', 'om_casc_5'),
+    );
+    await tick(15);
+    ds.lastScreenStatus = 'working'; // 第一条真忙
+    await handleThreadReply(makeEventData('om_casc_5b', '/model opus', 'om_root_casc5'), makeCtx('om_root_casc5', 'om_casc_5b'));
+    await handleThreadReply(makeEventData('om_casc_5c', '/model haiku\n/clear', 'om_root_casc5'), makeCtx('om_root_casc5', 'om_casc_5c'));
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文']);
+    expect(repliedText()).toContain('上一条级联还在执行');
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(120);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear', '/model opus']);
+    expect(ds.cascadeInFlight).toBe(false);
+    expect(ds.cascadeDeferred).toBeUndefined();
+  });
+
+  it('限流（limited）时不白等：剩余条目直接发出并提示', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc6');
+    ds.lastScreenStatus = 'limited';
+    await handleThreadReply(
+      makeEventData('om_casc_6', '/model opus\n/clear', 'om_root_casc6'),
+      makeCtx('om_root_casc6', 'om_casc_6'),
+    );
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus', '/clear']);
+    expect(repliedText()).toContain('直接发出');
+  });
+
+  it('透传命令 + 正文：正文等命令 settled 之后才重入，一次性副作用只跑一次', async () => {
+    const learn = vi.spyOn(await import('../src/im/lark/identity-cache.js'), 'learnFromMentions');
+    const hook = vi.spyOn(await import('../src/services/hook-runner.js'), 'emitHookEvent');
+    const { ds, raws } = seedLiveThreadSession('om_root_casc_body');
+    const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+    const body = '接下来看登录';
+    await handleThreadReply(
+      makeEventData('om_casc_body', `/model opus\n${body}`, 'om_root_casc_body'),
+      makeCtx('om_root_casc_body', 'om_casc_body'),
+    );
+    await tick(15);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(JSON.stringify(sent())).not.toContain(body);
+    ds.lastScreenStatus = 'working';
+    await tick(80);
+    expect(raws()).toHaveLength(1);
+    expect(JSON.stringify(sent())).not.toContain(body);
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(80);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(JSON.stringify(sent())).toContain(body);
+    expect(learn).toHaveBeenCalledTimes(1);
+    expect(hook.mock.calls.filter(call => call[0] === 'thread.reply')).toHaveLength(1);
+    learn.mockRestore();
+    hook.mockRestore();
+  });
+
+  it('级联途中 worker 消失：停住并提示剩余条数，不再送正文', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc_gone');
+    await handleThreadReply(
+      makeEventData('om_casc_gone', '/model opus\n接下来看登录', 'om_root_casc_gone'),
+      makeCtx('om_root_casc_gone', 'om_casc_gone'),
+    );
+    await tick(15);
+    expect(raws()).toHaveLength(1);
+    ds.lastScreenStatus = 'working';
+    (ds.worker as { killed: boolean }).killed = true;
+    await tick(40);
+    expect(raws()).toHaveLength(1);
+    expect(repliedText()).toContain('剩余的 1 条没有发送');
+    expect(ds.cascadeInFlight).toBe(false);
+  });
+
+  it('级联在飞时推迟的普通消息：放开后送到 CLI，thread.reply 只发一次', async () => {
+    const learn = vi.spyOn(await import('../src/im/lark/identity-cache.js'), 'learnFromMentions');
+    const hook = vi.spyOn(await import('../src/services/hook-runner.js'), 'emitHookEvent');
+    const threadReplies = (id: string) => hook.mock.calls.filter(
+      call => call[0] === 'thread.reply' && (call[1] as { messageId?: string } | undefined)?.messageId === id,
+    );
+    try {
+      const { ds, raws } = seedLiveThreadSession('om_root_casc_defer');
+      const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+      await handleThreadReply(
+        makeEventData('om_casc_defer', '/compact 只留登录上下文\n/clear', 'om_root_casc_defer'),
+        makeCtx('om_root_casc_defer', 'om_casc_defer'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const later = '稍后这条普通消息';
+      await handleThreadReply(
+        makeEventData('om_casc_defer_msg', later, 'om_root_casc_defer'),
+        makeCtx('om_root_casc_defer', 'om_casc_defer_msg'),
+      );
+      expect(JSON.stringify(sent())).not.toContain(later);
+      expect(threadReplies('om_casc_defer_msg')).toHaveLength(1);
+      expect(learn).toHaveBeenCalledTimes(2);
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear']);
+      expect(JSON.stringify(sent())).toContain(later);
+      expect(threadReplies('om_casc_defer_msg')).toHaveLength(1);
+      expect(learn).toHaveBeenCalledTimes(2);
+      expect(ds.cascadeInFlight).toBe(false);
+    } finally {
+      learn.mockRestore();
+      hook.mockRestore();
+    }
+  });
+
+  it('级联在飞时推迟的语音：只转写一次，放开后 CLI 拿到转写文本', async () => {
+    const client = await import('../src/im/lark/client.js');
+    const voice = await import('../src/services/voice/index.js');
+    const asr = await import('../src/services/voice/asr.js');
+    const download = vi.spyOn(client, 'downloadMessageResource').mockResolvedValue(undefined);
+    const asrCfg = vi.spyOn(voice, 'resolveAsrConfig').mockReturnValue({
+      baseUrl: 'http://asr.example/v1',
+      model: 'whisper-1',
+      timeoutMs: 1000,
+    });
+    const transcribe = vi.spyOn(asr, 'transcribeAudioFile').mockResolvedValue('你好世界');
+    try {
+      const { ds, raws } = seedLiveThreadSession('om_root_casc_audio');
+      const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+      await handleThreadReply(
+        makeEventData('om_casc_audio_cmd', '/compact 只留登录上下文\n/clear', 'om_root_casc_audio'),
+        makeCtx('om_root_casc_audio', 'om_casc_audio_cmd'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const audio = makeEventData('om_casc_audio', '', 'om_root_casc_audio');
+      audio.message.message_type = 'audio';
+      audio.message.content = JSON.stringify({ file_key: 'file_voice_1' });
+      await handleThreadReply(audio, makeCtx('om_root_casc_audio', 'om_casc_audio'));
+      expect(transcribe).toHaveBeenCalledTimes(1);
+      expect(download).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(sent())).not.toContain('你好世界');
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(transcribe).toHaveBeenCalledTimes(1);
+      expect(download).toHaveBeenCalledTimes(1);
+      const payload = JSON.stringify(sent());
+      expect(payload).toContain('你好世界');
+      expect(payload).not.toContain('[语音]');
+      expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear']);
+      const transcribing = mocks.replyMessage.mock.calls.filter(call => JSON.stringify(call).includes('正在转写'));
+      expect(transcribing).toHaveLength(1);
+    } finally {
+      download.mockRestore();
+      asrCfg.mockRestore();
+      transcribe.mockRestore();
+    }
+  });
+
+  it('级联在飞时推迟的合并转发：子消息只展开一次', async () => {
+    const merge = await import('../src/im/lark/merge-forward.js');
+    const expand = vi.spyOn(merge, 'expandMergeForward').mockImplementation(async (_app, _id, parsed) => {
+      parsed.content = '转发正文：登录失败';
+      parsed.msgType = 'merge_forward_expanded';
+      return { extraResources: [{ type: 'image', key: 'img_fwd_1', name: 'img_fwd_1.jpg' }] };
+    });
+    try {
+      const { ds } = seedLiveThreadSession('om_root_casc_fwd');
+      const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+      await handleThreadReply(
+        makeEventData('om_casc_fwd_cmd', '/compact 只留登录上下文\n/clear', 'om_root_casc_fwd'),
+        makeCtx('om_root_casc_fwd', 'om_casc_fwd_cmd'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const forwarded = makeEventData('om_casc_fwd', '', 'om_root_casc_fwd');
+      forwarded.message.message_type = 'merge_forward';
+      forwarded.message.content = '{}';
+      await handleThreadReply(forwarded, makeCtx('om_root_casc_fwd', 'om_casc_fwd'));
+      expect(expand).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(sent())).not.toContain('转发正文：登录失败');
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(expand).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(sent())).toContain('转发正文：登录失败');
+    } finally {
+      expand.mockRestore();
+    }
+  });
+
+  it('级联在飞时推迟的合并转发：首过展开没有改写类型时，重入也不再展开', async () => {
+    // 成功展开会把 msgType 改成 merge_forward_expanded，重入即使漏了 !replay 也不会再进展开。
+    // 空树 / 拉取失败保持原 msgType，这时 !replay 是唯一闸门。
+    const merge = await import('../src/im/lark/merge-forward.js');
+    const expand = vi.spyOn(merge, 'expandMergeForward').mockResolvedValue({ extraResources: [] });
+    try {
+      const { ds } = seedLiveThreadSession('om_root_casc_fwd_empty');
+      await handleThreadReply(
+        makeEventData('om_casc_fwd_empty_cmd', '/compact 只留登录上下文\n/clear', 'om_root_casc_fwd_empty'),
+        makeCtx('om_root_casc_fwd_empty', 'om_casc_fwd_empty_cmd'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const forwarded = makeEventData('om_casc_fwd_empty', '', 'om_root_casc_fwd_empty');
+      forwarded.message.message_type = 'merge_forward';
+      forwarded.message.content = '{}';
+      await handleThreadReply(forwarded, makeCtx('om_root_casc_fwd_empty', 'om_casc_fwd_empty'));
+      expect(expand).toHaveBeenCalledTimes(1);
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(expand).toHaveBeenCalledTimes(1);
+    } finally {
+      expand.mockRestore();
+    }
+  });
+
+  it('单条透传不受影响：仍然立即以真实 messageId 送出', async () => {
+    const { raws } = seedLiveThreadSession('om_root_casc4');
+    await handleThreadReply(
+      makeEventData('om_casc_4', '/model opus', 'om_root_casc4'),
+      makeCtx('om_root_casc4', 'om_casc_4'),
+    );
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(raws()[0].turnId).toBe('om_casc_4');
   });
 });

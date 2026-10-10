@@ -50,6 +50,11 @@ const CODE_SUFFIXES = ['.js', '.js.map', '.d.ts', '.d.ts.map', '.mjs', '.cjs'];
  */
 const EMBED_MECHANISMS = [
   {
+    id: 'cn-work-calendar-json-import',
+    covers: (rel) => rel === 'services/work-calendars/cn-2026.json',
+    proof: 'services/work-calendars/catalog.ts statically imports with { type: "json" }; the calendar module compile smoke verifies CN rest/makeup/coverage without an on-disk JSON file',
+  },
+  {
     id: 'dashboard-embed-preamble',
     // scripts/generate-dashboard-embed.mjs walks this tree and emits one
     // `import … with { type: 'file' }` per file, so the whole subtree is

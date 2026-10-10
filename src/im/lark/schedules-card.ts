@@ -365,6 +365,8 @@ function deliveryLabel(detail: ScheduleDetailDto, locale: Locale): string {
       return t('card.dashboard.schedules.delivery.local', undefined, locale);
     case 'new-topic':
       return t('card.dashboard.schedules.delivery.new_topic', undefined, locale);
+    case 'task':
+      return t('schedulePos.cardDeliveryTask', undefined, locale);
     case 'chat':
     default:
       return t('card.dashboard.schedules.delivery.top_level', undefined, locale);
@@ -428,7 +430,7 @@ export function buildSchedulesDetailCard(
   infoLines.push(
     t('card.dashboard.schedules.detail.name_label', { name: escapeLarkMd(detail.name) }, opts.locale),
   );
-  if (detail.executionPlacement === 'new-topic' && detail.raw.topicTitle) {
+  if ((detail.executionPlacement === 'new-topic' || detail.executionPlacement === 'task') && detail.raw.topicTitle) {
     infoLines.push(
       t(
         'card.dashboard.schedules.detail.topic_title_label',
@@ -593,9 +595,11 @@ export function buildSchedulesDetailCard(
       content: t(
         deliveryTarget === 'new-topic'
           ? 'card.dashboard.schedules.btn.use_fresh_topic'
-          : deliveryTarget === 'topic'
-            ? 'card.dashboard.schedules.btn.use_origin'
-            : 'card.dashboard.schedules.btn.use_new_topic',
+          : deliveryTarget === 'task'
+            ? 'schedulePos.cardBtnUseTaskTopic'
+            : deliveryTarget === 'topic'
+              ? 'card.dashboard.schedules.btn.use_origin'
+              : 'card.dashboard.schedules.btn.use_new_topic',
         undefined,
         opts.locale,
       ),
@@ -715,6 +719,10 @@ function mapDeliveryDisabledReason(reasonKey: string | undefined): string | unde
       return 'card.dashboard.schedules.delivery.disabled.alreadyTopLevel';
     case 'schedules.action.delivery.alreadyNewTopic':
       return 'card.dashboard.schedules.delivery.disabled.alreadyNewTopic';
+    case 'schedules.action.delivery.alreadyTask':
+      return 'schedulePos.cardAlreadyTask';
+    case 'schedules.action.delivery.taskMultiChat':
+      return 'schedulePos.cardTaskMultiChatUnsupported';
     default:
       return undefined;
   }
@@ -954,7 +962,7 @@ export async function handleSchedulesCardAction(
       ? 'topic'
       : value.target_delivery === 'new-topic' ? 'top-level' : undefined;
     const targetPosition =
-      value.target_position === 'top-level' || value.target_position === 'topic' || value.target_position === 'new-topic'
+      value.target_position === 'top-level' || value.target_position === 'topic' || value.target_position === 'new-topic' || value.target_position === 'task'
         ? value.target_position
         : legacyTarget;
     if (!targetPosition) {
@@ -993,11 +1001,13 @@ export async function handleSchedulesCardAction(
       return errorToast(failedKey, { reason: failureReason }, locale);
     }
 
+    const responsePositionBody = (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition;
     const responsePosition =
-      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'topic' ||
-      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'top-level' ||
-      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'new-topic'
-        ? (resp.body as { executionPosition: 'topic' | 'top-level' | 'new-topic' }).executionPosition
+      responsePositionBody === 'topic' ||
+      responsePositionBody === 'top-level' ||
+      responsePositionBody === 'new-topic' ||
+      responsePositionBody === 'task'
+        ? responsePositionBody as 'topic' | 'top-level' | 'new-topic' | 'task'
         : targetPosition;
     const postRefetch = await safeGetSchedulesList(client, locale, listPathSuffix);
     let after: ScheduleCardTaskInput | undefined;
@@ -1010,7 +1020,7 @@ export async function handleSchedulesCardAction(
       // target position; the next refresh converges to the owner snapshot.
       after = {
         ...before,
-        scope: responsePosition === 'topic' ? 'thread' : 'chat',
+        scope: responsePosition === 'topic' || responsePosition === 'task' ? 'thread' : 'chat',
         executionPosition: responsePosition,
       };
     }

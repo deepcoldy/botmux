@@ -4,9 +4,11 @@
  * Pi stores sessions under:
  *   ~/.pi/agent/sessions/<workspace-encoded>/<timestamp>_<sessionId>.jsonl
  *
- * Bridge contract (same as Codex/Grok/CoCo): emit only
+ * Bridge contract (same structured queue as Codex/Grok/CoCo):
  *   - `user`            — a real user prompt (`message.role === "user"`).
  *   - `assistant_final` — an assistant record carrying a TERMINAL `stopReason`.
+ *   - `cot`             — thinking, interim narration, tool calls and results.
+ *                         Cosmetic only; never starts or closes a turn.
  *
  * ## Turn boundary (verified on pi 0.80.6; `@earendil-works/pi-ai` StopReason
  * union = `"stop" | "length" | "toolUse" | "error" | "aborted"`):
@@ -68,7 +70,8 @@ import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readl
 import { execSync } from 'node:child_process';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
-import { codexTaskFailureCode, safeFailureSummary } from './codex-transcript.js';
+import { codexTaskFailureCode, safeFailureSummary, type CodexCotEntry } from './codex-transcript.js';
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 import {
   PI_TURN_BOUNDARY_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_STOP_REASON_ERROR,
@@ -81,8 +84,9 @@ const IS_LINUX = platform() === 'linux';
 export interface PiBridgeEvent {
   uuid: string;
   timestampMs: number;
-  kind: 'user' | 'assistant_final';
+  kind: 'user' | 'assistant_final' | 'cot';
   text: string;
+  cotEntries?: CodexCotEntry[];
   /** Best-effort terminal outcome carried by an `assistant_final` (attribution
    *  metadata, NOT a durable receipt — Pi has no reliableTurnTerminal). Undefined
    *  on a `stop`/`length` completion (keeps the historical completed default and
@@ -187,6 +191,48 @@ function joinTextContent(content: unknown): string {
 function hasToolCall(content: unknown): boolean {
   if (!Array.isArray(content)) return false;
   return content.some((item) => item && typeof item === 'object' && (item as any).type === 'toolCall');
+}
+
+/** Pi persists complete assistant messages before executing their tools and
+ * toolResult messages after execution. Reading both on the existing transcript
+ * cursor covers fresh, resumed and adopted sessions without a second watcher.
+ * Only display blocks are forwarded: signatures, images and result details
+ * stay in the transcript. Final answer text belongs to the reply channel. */
+function piCotEntries(message: Record<string, unknown>, includeText: boolean): CodexCotEntry[] {
+  const content = message.content;
+  if (!Array.isArray(content)) return [];
+  if (message.role === 'toolResult') {
+    if (typeof message.toolCallId !== 'string' || !message.toolCallId.trim()) return [];
+    const result = joinTextContent(content);
+    return [{
+      kind: 'tool_result', id: message.toolCallId,
+      result: result.length > 800 ? `${result.slice(0, 800)}…` : result,
+    }];
+  }
+  if (message.role !== 'assistant') return [];
+  const entries: CodexCotEntry[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'thinking' && block.redacted !== true && typeof block.thinking === 'string') {
+      if (block.thinking.trim()) entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && includeText && typeof block.text === 'string') {
+      if (block.text.trim()) entries.push({ kind: 'text', text: block.text });
+    } else if (block.type === 'toolCall') {
+      if (typeof block.id !== 'string' || !block.id.trim()
+        || typeof block.name !== 'string' || !block.name.trim()) continue;
+      const input: unknown = block.arguments;
+      // Malformed/truncated arguments must not break the final-answer bridge.
+      let args = '';
+      try { args = JSON.stringify(input) ?? ''; } catch { /* display without arguments */ }
+      const subject = boundSubjectForTransport(subjectFromInputObject(input));
+      entries.push({
+        kind: 'tool_call', id: block.id, name: block.name,
+        args: args.length > 600 ? `${args.slice(0, 600)}…` : args,
+        ...(subject ? { subject } : {}),
+      });
+    }
+  }
+  return entries;
 }
 
 export function findPiTranscriptBySessionId(cliSessionId: string, cwd?: string): string | undefined {
@@ -437,7 +483,12 @@ export function drainPiTranscript(
     }
 
     if (obj?.type !== 'message' || !obj.message || typeof obj.message !== 'object') continue;
-    const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+    const rawTs = obj.timestamp ?? (obj.message as any)?.timestamp;
+    const ts = typeof rawTs === 'number'
+      ? rawTs
+      : typeof rawTs === 'string'
+        ? Date.parse(rawTs)
+        : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const role = obj.message.role;
 
@@ -483,8 +534,16 @@ export function drainPiTranscript(
       continue;
     }
 
-    // Only assistant records can close a turn. `toolResult` / `bashExecution`
-    // and any other role are mid-turn plumbing and never a boundary.
+    if (role === 'toolResult') {
+      const cotEntries = piCotEntries(obj.message, false);
+      if (cotEntries.length > 0) events.push({
+        uuid: `${path}:${lineStart}:cot`, timestampMs,
+        kind: 'cot', text: '', cotEntries, sourceSessionId: sessionId,
+      });
+      continue;
+    }
+
+    // Only assistant records can close a turn; other roles are not activity.
     if (role !== 'assistant') continue;
 
     const stopReason =
@@ -552,6 +611,15 @@ export function drainPiTranscript(
       };
       continue;
     }
+
+    // Emit before the terminal so the queue attributes the activity while the
+    // turn is still collecting. A distinct UUID prevents the cosmetic record
+    // from consuming the final's dedup key when both come from the same line.
+    const cotEntries = isHardTerminal ? [] : piCotEntries(obj.message, !isTextTerminal);
+    if (cotEntries.length > 0) events.push({
+      uuid: `${path}:${lineStart}:cot`, timestampMs,
+      kind: 'cot', text: '', cotEntries, sourceSessionId: sessionId,
+    });
 
     if (!isHardTerminal && !isTextTerminal) continue;
 

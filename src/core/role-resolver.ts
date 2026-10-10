@@ -232,7 +232,9 @@ export function resolveRole(larkAppId: string, chatId: string): { content: strin
 export type RoleInjectMode = 'every' | 'once';
 
 interface RoleMeta {
-  inject?: 'once';
+  inject?: RoleInjectMode;
+  replyPrivately?: true;
+  privateReplyNotice?: string;
   dispatchCompletionEnabled?: true;
 }
 
@@ -250,7 +252,9 @@ function readRoleMeta(larkAppId: string, chatId: string): RoleMeta {
     if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) return {};
     const raw = meta as Record<string, unknown>;
     return {
-      ...(raw.inject === 'once' ? { inject: 'once' as const } : {}),
+      ...(raw.inject === 'once' || raw.inject === 'every' ? { inject: raw.inject } : {}),
+      ...(raw.replyPrivately === true ? { replyPrivately: true as const } : {}),
+      ...(typeof raw.privateReplyNotice === 'string' ? { privateReplyNotice: raw.privateReplyNotice.trim() } : {}),
       ...(raw.dispatchCompletionEnabled === true ? { dispatchCompletionEnabled: true as const } : {}),
     };
   } catch {
@@ -307,23 +311,24 @@ export function writeTeamRoleInjectMode(larkAppId: string, mode: RoleInjectMode)
 
 /**
  * Read the injection mode for a (bot, chat). A chat that set its own mode via
- * 角色管理 wins (sidecar present ⇒ 'once'); otherwise we fall back to the
+ * 角色管理 wins; otherwise we fall back to the
  * bot-level default (readTeamRoleInjectMode), which itself defaults to 'every'
  * — so legacy behavior is unchanged until an operator opts a bot into 'once'.
  */
 export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjectMode {
   if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return 'every';
   const meta = readRoleMeta(larkAppId, chatId);
-  return meta.inject === 'once' ? 'once' : readTeamRoleInjectMode(larkAppId);
+  return meta.inject ?? readTeamRoleInjectMode(larkAppId);
 }
 
 /**
- * Persist the injection mode. 'every' (the default) removes the sidecar so the
- * on-disk state stays clean; 'once' writes it.
+ * Persist the injection mode as a per-chat override only when it differs from
+ * the bot-level default. Matching values remove the override so future bot
+ * default changes continue to flow through to the chat.
  */
 export function writeRoleInjectMode(larkAppId: string, chatId: string, mode: RoleInjectMode): void {
   const meta = readRoleMeta(larkAppId, chatId);
-  if (mode === 'once') meta.inject = 'once';
+  if (mode !== readTeamRoleInjectMode(larkAppId)) meta.inject = mode;
   else delete meta.inject;
   writeRoleMeta(larkAppId, chatId, meta);
   logger.info(`[role] inject mode chat=${chatId} app=${larkAppId} => ${mode}`);
@@ -365,4 +370,28 @@ export function resolveRoleInjection(
   const base = resolveRole(larkAppId, chatId);
   if (!base.content) return { ...base, injectMode: 'every' };
   return { ...base, injectMode: readRoleInjectMode(larkAppId, chatId) };
+}
+
+/** Private delivery is a per-group setting with no bot-level inheritance. */
+export function readRoleReplyPrivately(larkAppId: string, chatId: string): boolean {
+  return !!larkAppId && !!chatId && readRoleMeta(larkAppId, chatId).replyPrivately === true;
+}
+
+export function writeRoleReplyPrivately(larkAppId: string, chatId: string, enabled: boolean): void {
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (enabled) meta.replyPrivately = true;
+  else delete meta.replyPrivately;
+  writeRoleMeta(larkAppId, chatId, meta);
+}
+
+export function readRolePrivateReplyNotice(larkAppId: string, chatId: string): string {
+  return readRoleMeta(larkAppId, chatId).privateReplyNotice ?? '';
+}
+
+export function writeRolePrivateReplyNotice(larkAppId: string, chatId: string, notice: string): void {
+  if (notice.length > 500) throw new Error('Private reply notice exceeds 500 characters');
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (notice.trim()) meta.privateReplyNotice = notice.trim();
+  else delete meta.privateReplyNotice;
+  writeRoleMeta(larkAppId, chatId, meta);
 }

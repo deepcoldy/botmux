@@ -2,6 +2,8 @@
 
 Supports three schedule types plus natural-language input. Tasks run at their configured execution position when due. **In group chats, the default is chat top level, even when the task is created inside a topic.** To continue in the current topic, explicitly pass `--topic` when creating the task through the CLI, or select the original topic under **Execution position** in the Dashboard.
 
+There are four execution positions: **chat top level** (the default; all top-level tasks in one group share the chat-scope session context), **a specified topic** (`--topic`, bound to one existing topic), **a new topic per run** (`--new-topic`, every run stands alone), and **a dedicated task topic** (opt-in; each task owns its own topic session — see below).
+
 ## Two Ways to Create
 
 - **Slash command** (quick): `/schedule 每日17:50 帮我看看AI圈有什么新闻`
@@ -14,6 +16,65 @@ botmux schedule add "0 18 * * *" "check deployment status" --topic
 ```
 
 `--topic` can infer the anchor from the current topic session. Use `--root-msg-id <om_...>` to specify a target topic explicitly.
+
+## Cross-bot delegated creation
+
+When a human explicitly asks Bot A to have Bot B create a schedule, A must request the persistent capability on the managed dispatch:
+
+```bash
+botmux dispatch --bot-app cli_target --title "Polling task" --brief "Create and maintain the poll" \
+  --delegate schedule:create
+```
+
+The host must also opt in through `~/.botmux/config.json` (off by default):
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "runEnabled": true,
+    "maxTasksPerTurn": 64,
+    "runScopes": ["bytedcli"],
+    "selfManageEnabled": true
+  }
+}
+```
+
+Enable the identity wrappers on both the source orchestrator and target
+generalist in `bots.json`. The target bot must govern both tools so a scheduled
+turn cannot inherit an ambient login through an unmanaged tool:
+
+```json
+"triggerUserAuth": {
+  "enabled": true,
+  "tools": ["lark-cli", "bytedcli"]
+}
+```
+
+The initial version is single-hop and bound to the target bot's current dispatch turn. It has no fixed five-minute deadline: multiple distinct tasks may be created while that turn is live, and the authority ends with the turn. A turn may create at most 64 tasks by default; `maxTasksPerTurn` accepts a host-configured limit from 1 through 1024. Each canonical request gets a deterministic task ID, so an identical retry returns the original task without consuming another slot. Tasks may run only in the original dispatch chat, at chat top level or in the current topic. `--new-topic`, `--follow-active`, multi-chat targets, and onward delegation are rejected. The dispatch grant authorizes creation only; optional task-local self-management is described below.
+
+To make every managed dispatch from a selected orchestrator request the capability without changing each SOP, configure the source bot id:
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "defaultOnDispatchFromBotAppIds": ["cli_spu_orchestrator"],
+    "runScopes": ["bytedcli"],
+    "selfManageEnabled": true
+  }
+}
+```
+
+Use `--no-delegate schedule:create` to opt out for one dispatch.
+
+`runScopes` is empty by default. Setting it to `["bytedcli"]` lets delegated tasks use the original human's bytedcli authorization on each future fire. Both source and target bots must enable `triggerUserAuth`, and the target must govern both `lark-cli` and `bytedcli`, so a reused session cannot inherit an earlier identity; creation or execution otherwise fails closed. This does not turn the scheduled turn into a general human current actor and never persists lark-cli authority.
+
+With `selfManageEnabled:true`, a delegated scheduled turn may stop its current task using `botmux schedule pause self` or `botmux schedule remove self`. It cannot change the prompt or target, resume or force-run a task, manage another task, or create a successor. `createEnabled:false` stops new grants, `runEnabled:false` revokes future runs of existing delegated tasks, and removing `runScopes` or disabling self-management revokes those persistent capabilities independently.
+
+The host SQLite store is authoritative for task definitions, grants, pause/completion state, and run claims; `schedules.json` is a rebuildable projection. The first upgraded start records the then-existing task inventory once as legacy. Later JSON additions, copies, or edits gain no execution authority. This boundary protects managed CLIs and the file sandbox; it does not claim to defend against a process running as the same OS user with unrestricted access to host keys and authority databases.
+
+Consequently, writes from `schedule add/update/remove/pause/resume/run` must reach the owning bot daemon. If that daemon is unavailable or its authority store failed to initialize, the command fails explicitly instead of editing `schedules.json` and leaving behind a task that appears to exist but can never run.
 
 ## Supported Formats
 
@@ -104,7 +165,31 @@ botmux schedule add "每日17:30" "generate digest" --new-topic
 botmux schedule add "每日17:30" "generate digest" --deliver new-topic
 ```
 
-You can also edit a task on the Dashboard's **Schedules** page and use **Execution position** to choose the original topic, chat top level, or a new topic for every run.
+You can also edit a task on the Dashboard's **Schedules** page and use **Execution position** to choose the original topic, chat top level, a new topic for every run, or the task's dedicated topic.
+
+## A Dedicated Topic Per Task
+
+"A new topic per run" keeps every run of the same task unrelated; chat top level goes the other way, with all top-level tasks in one group sharing one chat-scope session. A **dedicated task topic** gives each task a topic session that belongs to it alone:
+
+- Every run of the same task lands in the **same topic**, so the context carries over — just like a topic-pinned task.
+- Different tasks in the same group use separate topics and are **isolated from one another, never sharing context** — a sentinel task and a daily-report task never end up in the same session history.
+- The topic is created **on the first fire**: a non-silent task posts a seed message (the "task started" banner) first, anchored as that topic's root; a silent task defers creation until the bot's first `botmux send`, exactly like "new topic per run" combined with silent.
+
+How to set it:
+
+- **Natural language**: prefix the prompt with the dedicated-topic keyword — `独立话题` / `专属话题` in Chinese, "dedicated topic" in English. It combines with the silent keyword in either order, for example:
+
+```bash
+/schedule 每日18:00 独立话题 summarize today's service health checks
+/schedule 工作日9:00 静默 专属话题 write the morning brief; speak up only on anomalies
+```
+
+- **Lark schedule card / Dashboard**: on the card, the execution-position button cycles **chat top level → new topic per run → dedicated task topic → chat top level**; the Dashboard **Schedules** form lets you pick the position directly.
+
+Limits and notes:
+
+- **Single-group tasks only**; a multi-group task cannot choose the dedicated task topic.
+- The per-task model behaves exactly like `--topic`: it applies only on the first fire that creates the session; later runs reuse the model that session started with (see the next section).
 
 ## Follow the Active Topic
 
@@ -152,7 +237,7 @@ The Dashboard "Schedules" page has both fields too; empty means "follow the bot 
 | Execution position | Effect |
 | --- | --- |
 | `--new-topic` | Every run starts a new session, so the model applies **every time** |
-| `--topic` / `--top-level` | Applies on the run that creates the session; later runs reuse it with the model it started with |
+| Dedicated task topic / `--topic` / `--top-level` | Applies on the run that creates the session; later runs reuse it with the model it started with |
 
 Use `--new-topic` when it must apply on every run. Both the CLI and the Dashboard say which case you are in when you save.
 
@@ -165,4 +250,113 @@ Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trig
 /schedule remove|enable|disable|run <id>
 ```
 
-> Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content.
+> Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content. A dedicated task topic creates the task's own topic on its first fire (a non-silent run posts a seed message anchored as the root; a silent run defers materialization to the first `botmux send`), and every later run is appended to that same session.
+
+## Update a prompt in place
+
+Use `update` to change an existing task without deleting and recreating it:
+
+```bash
+botmux schedule update <id> --prompt-file report-prompt.md
+# For short prompts, use exactly one of these two input options.
+botmux schedule update <id> --prompt "The complete replacement prompt"
+```
+
+Files are read as UTF-8 with line breaks preserved. Only the prompt changes: the task ID, schedule, enabled state, execution position and run history remain intact. Updating does not trigger a run. Already dispatched runs keep their original prompt; subsequent runs use the replacement. Input or authorization failures do not delete the task. Updates use the same locked atomic storage as other task operations.
+
+For ownerless topics created by scheduled tasks, the host daemon authorizes the current caller without exposing bot configuration or credentials to the sandbox. Upgrade the CLI and daemon together: an older daemon without this authorization capability is rejected explicitly, without deleting the task or bypassing verification.
+
+A task bound to a protected precondition cannot be changed with `update`: the precondition records a hash of the task input, while its definition file is host-only and cannot be rebound from inside the sandbox. Rewriting the prompt would make every later fire fail validation and stop the task silently. Edit such tasks on the Dashboard scheduled-tasks page instead.
+
+
+## Custom Work Calendar
+
+Bind an independent named calendar to a recurring task and choose **Workdays only** or **Rest days only**. Tasks without a calendar keep their original behavior. Existing bindings default to workdays. The scheduler reads local data; it does not query online APIs or ask a model to decide holidays.
+
+Calendar IDs are stable configuration keys; display names follow the Dashboard language. Calendars have their own time zone, confirmed coverage, normal workweek and date overrides. Region is optional descriptive metadata. Built-in and custom calendars use the same validation and admission logic. Add future built-in calendars in `src/services/work-calendars/catalog.ts` with verified data; add custom calendars to the Bot's local file without changing code.
+
+### China Statutory Work Calendar
+
+The built-in calendar displays **China Statutory Work Calendar / 中国法定工作日历**, with ID `cn` and time zone `Asia/Shanghai`. It represents the nationwide mainland China holiday and makeup-workday arrangement. **Confirmed coverage is 2026-01-01 through 2026-12-31.** No local calendar file is required:
+
+```bash
+botmux schedule add "0 9 * * *" "generate the daily report" --calendar cn
+botmux schedule calendars
+```
+
+The authoritative source is the [State Council General Office notice for 2026](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm), document 国办发明电〔2025〕7号, published 2025-11-04. The [Beijing government republication](https://www.beijing.gov.cn/zhengce/zhengcefagui/202511/t20251104_4258873.html) provides the full notice. The repository snapshot `src/services/work-calendars/cn-2026.json` and `schedule calendars` expose provenance, scope and version metadata.
+
+The calendar starts with Monday–Friday and applies the official holiday and makeup-day overrides. It does not represent every employer's attendance rules. Regional extra holidays, holidays for specific groups, company shifts, Hong Kong, Macau, Taiwan and other countries are outside the initial built-in scope. A time zone does not select a region.
+
+Annual data is verified against the official notice, updated with date tests, and shipped with a release. Dates outside confirmed coverage, including unverified 2027 data, fail closed with `calendar_out_of_coverage`; the scheduler does not infer the next year or reuse the previous year's exceptions. Upgrade to verified next-year data before crossing the coverage boundary.
+
+The built-in ID `cn` is reserved and cannot be overridden by a local file. A missing or damaged local extension file does not affect `cn`; missing custom IDs never fall back to it.
+
+### Custom Calendar Data
+
+Save `work-calendars.json` beside the Bot's `schedules.json`, normally at `~/.botmux/bots/<appId>/work-calendars.json`. Calendars are isolated per Bot. Keep your source data under version control and replace the deployed file atomically; the next check reloads it without restarting the daemon.
+
+This is **synthetic demonstration data, not a statutory holiday arrangement**:
+
+```json
+{
+  "version": 1,
+  "calendars": {
+    "demo": {
+      "displayNames": { "zh": "演示工作日历", "en": "Demo Work Calendar" },
+      "timeZone": "Asia/Shanghai",
+      "coverage": { "start": "2027-12-30", "end": "2028-12-31" },
+      "workWeek": [1, 2, 3, 4, 5],
+      "restDates": ["2028-01-04"],
+      "workDates": ["2028-01-01", "2028-01-08"]
+    }
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `version` | File schema version, currently `1` |
+| `calendars` | ID-to-definition map; IDs contain 1–64 letters, digits, `_` or `-`, starting with a letter or digit |
+| `displayNames` | Optional `zh` and `en` names; falls back to the ID and does not change the binding when the UI language changes |
+| `timeZone` | IANA time zone used to determine the local date at dispatch, separate from cron's `scheduleTimeZone` |
+| `coverage.start/end` | Inclusive confirmed coverage using valid `YYYY-MM-DD` dates |
+| `workWeek` | Normal working weekdays: `0` is Sunday, `1` is Monday, through `6`; may be empty |
+| `restDates` | Explicit rest dates overriding the normal week |
+| `workDates` | Explicit working dates overriding the normal week, including weekend makeup days |
+
+All rule fields are required except `displayNames`. Dates must be valid and within coverage. Duplicate dates or weekdays, conflicting rest/work dates, invalid time zones and reversed coverage are rejected. Maximum file size is 1 MiB. An invalid definition does not affect other valid definitions; a malformed file blocks automatic tasks bound to its local calendars. Built-in calendars remain available.
+
+Add other independent IDs such as `company-shifts` to the same map, using their own time zone, workweek and overrides. Reserve your own IDs for company data rather than modifying the official built-in calendar.
+
+### Binding, Display and Execution
+
+```bash
+# Daily candidates are filtered by the selected calendar.
+botmux schedule add "0 9 * * *" "generate the daily report" --calendar cn
+botmux schedule calendars
+botmux schedule list
+botmux schedule update <task-id> --calendar cn
+botmux schedule update <task-id> --calendar-day-type restday
+botmux schedule update <task-id> --calendar none
+```
+
+`none` is reserved for removing the binding. Edit tasks with a protected Bash precondition in the Dashboard so its canonical-input binding is updated together with the task.
+
+The Dashboard's **Custom Work Calendar** section lists built-in and local calendars for the selected Bot. Choose **Workdays only** or **Rest days only**, or remove the binding. Rest days include confirmed nonworking weekdays, ordinary weekends without a makeup override, and holidays. Unknown dates are not eligible rest days.
+
+Create/update API requests use `calendar: "cn"` and `calendarDayType: "workday" | "restday"`; workday is the default. Updating `calendar: null` clears the binding. Rows expose `calendarCheck`, `lastCalendarCheck` and `nextEligibleRunAt` alongside the original `nextRunAt`.
+
+The eligible-next-run preview only filters existing cron/interval candidates. It does not create weekend triggers or guarantee precondition, model or delivery success. It scans at most 10,000 candidate local dates and returns `null` with an explicit reason when it cannot confirm a date. Use a **daily cron + calendar** to include weekend makeup days; a Monday–Friday cron has no weekend candidates.
+
+| Trigger | Behavior |
+| --- | --- |
+| Automatic cron/interval | Check the actual local date before Bash, model calls, topic creation or notifications; only matching workdays/rest days proceed |
+| Once | Calendar bindings are unsupported and rejected; malformed stored once bindings also do not execute automatically |
+| Dashboard Run now / CLI `schedule run` | Explicit manual execution bypasses the calendar and records `manual_bypass`, preserving other execution and precondition rules |
+
+A CLI manual request is persisted and consumed once by the owning Bot. A request surviving downtime beyond the catch-up grace window executes once after restart, then subsequent automatic occurrences check the calendar normally. **Pausing cancels any unconsumed queued manual request.** CLI run requests on paused tasks are rejected with a prompt to resume first. Resuming a paused task also clears legacy pending requests; repeating resume on an enabled task does not defer its valid pending request. Changing the schedule cancels an unconsumed manual request associated with the old rule; automatic occurrences under the new rule check the calendar. Editing only other fields or saving the same rule preserves a valid pending request. Dashboard Run now executes directly for that invocation; it does not queue a future bypass or resume the automatic schedule.
+
+A nonmatching date records `calendar_skipped` / `lastStatus: skipped` without consuming finite repeat counts. Missing, invalid or out-of-coverage calendar data records an error and blocks execution without consuming counts or automatically disabling the task. Fixing the data allows later eligible candidates. Unbound tasks remain unaffected.
+
+Calendar dates do not override a business worker's own weekday checks. If a worker hardcodes `weekday < 5`, that separate filter must be removed before weekend makeup runs work end to end. Use a separate unbound task for compensation or other workflows that must run across nonworking dates.

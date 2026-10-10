@@ -17,6 +17,10 @@ function tmp(): string {
 afterEach(() => {
   delete process.env.BOTMUX_DSH_ASK_BRIDGE;
   delete process.env.DSH_HOME;
+  delete process.env.BOTMUX_DSH_ASK_TIMEOUT_MS;
+  delete process.env.BOTMUX_SESSION_ID;
+  delete process.env.BOTMUX_CHAT_ID;
+  delete process.env.BOTMUX_LARK_APP_ID;
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.clear();
 });
@@ -224,7 +228,7 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ 
     process.env.BOTMUX_SESSION_ID = 's';
     process.env.BOTMUX_CHAT_ID = 'c';
     process.env.BOTMUX_LARK_APP_ID = 'app';
-    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '10';
+    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '5000';
     const request = { questions: [{ id: 'q', question: 'Q?', options: [{ label: 'Yes' }, { label: 'No' }] }] };
     const runOfficial = async (home: string, hookCommand: { cmd: string; args: string[] }, salt: string, signal?: AbortSignal) => {
       const result = ensureDshQuestionBridgePatch({ cliId: 'dsh', homeDir: home, hookCommand, buildSalt: salt })!;
@@ -243,11 +247,13 @@ process.stdin.on('end', () => process.stdout.write(JSON.stringify({ answers: [{ 
     await expect(runOfficial(nonzeroHome, { cmd: process.execPath, args: [nonzero] }, 'nonzero'))
       .rejects.toThrow(/nonzero-exit/);
 
+    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '10';
     const timeoutHome = tmp();
     const hang = makeHookScript(timeoutHome, `setTimeout(() => {}, 10000);`);
     await expect(runOfficial(timeoutHome, { cmd: process.execPath, args: [hang] }, 'timeout'))
       .rejects.toThrow(/timeout/);
 
+    process.env.BOTMUX_DSH_ASK_TIMEOUT_MS = '5000';
     const abortHome = tmp();
     const abortScript = makeHookScript(abortHome, `setTimeout(() => {}, 10000);`);
     const controller = new AbortController();

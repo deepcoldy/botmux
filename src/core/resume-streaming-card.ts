@@ -1,3 +1,4 @@
+import { privateReplyEnabled } from './private-reply.js';
 /**
  * Reconcile the public streaming card after a closed session is resumed from
  * outside its original topic (for example the current-group `/sessions` card).
@@ -11,7 +12,7 @@
 import { getBot } from '../bot-registry.js';
 import { deleteMessage } from '../im/lark/client.js';
 import type { DaemonSession } from './types.js';
-import { sessionAnchorId } from './types.js';
+import { activeSessionKey, sessionAnchorId } from './types.js';
 import { persistStreamCardState } from './session-manager.js';
 import {
   buildStreamingCardJson,
@@ -35,12 +36,13 @@ export async function reconcileResumedStreamingCard(
   postCard: (cardJson: string) => Promise<string>,
 ): Promise<ResumeStreamingCardReconcileResult> {
   const botCfg = getBot(ds.larkAppId).config;
-  const shouldRepost = botCfg.disableStreamingCard !== true
+  const shouldRepost = !privateReplyEnabled(ds.session) && botCfg.disableStreamingCard !== true
     && !botCfg.noCardChats?.includes(ds.chatId);
   const priorCardId = ds.streamCardId;
   const fence = {
     session: ds.session,
     larkAppId: ds.larkAppId,
+    runtimeKey: activeSessionKey(ds),
     anchorId: sessionAnchorId(ds),
     expectedPriorCardId: priorCardId,
   };

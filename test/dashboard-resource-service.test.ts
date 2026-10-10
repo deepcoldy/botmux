@@ -442,6 +442,98 @@ describe('ResourceMonitorService', () => {
     expect(svc.history('1h').botmux?.rssBytes).toEqual([100, 150]);
   });
 
+  it('hands the sampler every pid attribution will sum, as PSS roots', () => {
+    // The sampler confines the expensive smaps_rollup read to these subtrees;
+    // anything missing here silently degrades that group's memory to RSS.
+    let seenRoots: number[] | undefined;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: (_now, opts) => {
+        seenRoots = [...(opts.pssRoots ?? [])];
+        return sample([{ pid: 99, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'dashboard' }]);
+      },
+      listSessions: () => [
+        { sessionId: 's1', larkAppId: 'app', botName: 'bot', status: 'working', workerPid: 20 },
+        { sessionId: 's2', larkAppId: 'app', botName: 'bot', status: 'working', adoptCliPid: 40 },
+      ],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      listBotmuxPids: () => [99],
+      readCliMarkers: () => new Map([[30, { sessionId: 's1' }]]),
+      nowMs: () => 100_000,
+    });
+
+    svc.sampleOnce();
+
+    expect([...seenRoots!].sort((a, b) => a - b)).toEqual([10, 20, 30, 40, 99]);
+  });
+
+  it('applies an asynchronous sample once it resolves and coalesces overlapping ticks', async () => {
+    let resolveSample: ((s: ProcfsSample) => void) | undefined;
+    let calls = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => {
+        calls++;
+        return new Promise<ProcfsSample>((resolve) => { resolveSample = resolve; });
+      },
+      listSessions: () => [],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      listBotmuxPids: () => [10],
+      readCliMarkers: () => new Map(),
+      nowMs: () => 100_000,
+    });
+
+    const first = svc.sampleOnce();
+    expect(first).toBeInstanceOf(Promise);
+    expect(svc.current().supported).toBe(false);   // nothing applied yet
+
+    // A tick that fires while the sweep is still running must not start a second
+    // sweep (that is how a slow host piles up concurrent /proc walks).
+    expect(svc.sampleOnce()).toBeUndefined();
+    expect(calls).toBe(1);
+
+    resolveSample!(sample([{ pid: 10, ppid: 1, rssBytes: 123, cpuTicks: 10, cmd: 'botmux' }]));
+    await first;
+
+    expect(svc.current().supported).toBe(true);
+    expect(svc.current().botmux?.rssBytes).toBe(123);
+
+    // Once settled, the next tick samples again.
+    const second = svc.sampleOnce();
+    expect(second).toBeInstanceOf(Promise);
+    expect(calls).toBe(2);
+    resolveSample!(sample([{ pid: 10, ppid: 1, rssBytes: 456, cpuTicks: 20, cmd: 'botmux' }], 2000));
+    await second;
+    expect(svc.current().botmux?.rssBytes).toBe(456);
+  });
+
+  it('degrades a rejected asynchronous sample to unsupported instead of throwing', async () => {
+    let tick = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      sampleProcfs: () => tick++ === 0
+        ? Promise.resolve(sample([{ pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, cmd: 'botmux' }]))
+        : Promise.reject(new Error('sampler bug')),
+      listSessions: () => [],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      listBotmuxPids: () => [10],
+      readCliMarkers: () => new Map(),
+      nowMs: () => 100_000,
+    });
+
+    await svc.sampleOnce();
+    expect(svc.current().supported).toBe(true);
+
+    await expect(svc.sampleOnce()).resolves.toBeUndefined();
+    expect(svc.current().supported).toBe(false);
+    expect(svc.current().runtime.sampleHealth.status).toBe('unsupported');
+
+    // …and it is not stuck: a good sample afterwards is applied again.
+    tick = 0;
+    await svc.sampleOnce();
+    expect(svc.current().supported).toBe(true);
+  });
+
   it('includes the dashboard process in botmux totals when no bot daemons are registered', () => {
     let tick = 0;
     const svc = createResourceMonitorService({

@@ -36,6 +36,7 @@ import {
   canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
   readDashboardClientShell,
+  readDashboardWorkbenchShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
 import { ToastStack } from './toast.js';
@@ -67,6 +68,8 @@ type BotmuxUpdateStatus = {
   updateCommand: string | null;
   node: { version: string; required: number; ok: boolean };
   installs: { entries: Array<{ binPath: string }>; multiple: boolean };
+  runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+  runningDaemonRestartHint?: string;
 };
 
 type NavItem = {
@@ -93,6 +96,8 @@ const MANAGE_ROUTES = [
   'bot-defaults',
   'skills',
   'customization',
+  'doc-watches',
+  'message-listeners',
   'plugins',
   'team',
   'connectors',
@@ -117,8 +122,8 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
   {
-    // 驾驶舱（Agent Workbench）：桌面/移动壳内仍是无边框壳（见 workbenchSurface），
-    // 从侧边栏进入时走正常壳。不属于 manage 项。
+    // 驾驶舱（Agent Workbench）：桌面/移动壳内与带沉浸式标记的直达入口是无边框壳
+    // （见 workbenchSurface），从侧边栏进入时走正常壳。不属于 manage 项。
     id: 'agent-workbench',
     href: '#/agent-workbench',
     labelKey: 'nav.workbench',
@@ -137,6 +142,7 @@ const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'roles', href: '#/roles', labelKey: 'nav.roles', manage: true, icon: <><path d="M8 1.8l5.2 2v3.4c0 3.4-2.2 5.9-5.2 7-3-1.1-5.2-3.6-5.2-7V3.8z" /><path d="M5.8 8l1.6 1.6 2.8-3" /></> },
+  { id: 'message-listeners', href: '#/message-listeners', labelKey: 'nav.messageListeners', manage: true, icon: <><circle cx="8" cy="8" r="5.5" /><path d="M8 4.7v3.7l2.4 1.5" /></> },
   {
     id: 'monitoring',
     href: '#/monitoring',
@@ -165,6 +171,7 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'schedules', href: '#/schedules', labelKey: 'nav.schedules', icon: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.4 1.6" /></> },
   { id: 'whiteboards', href: '#/whiteboards', labelKey: 'nav.whiteboards', manage: true, icon: <><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2" /><path d="M4.8 5.2h6.4M4.8 8h6.4M4.8 10.8h4" /></> },
+  { id: 'doc-watches', href: '#/doc-watches', labelKey: 'nav.docWatches', manage: true, icon: <><path d="M3.2 2.2h6.2l3.4 3.4v8.2H3.2z" /><path d="M9.2 2.4v3.4h3.4" /><path d="M5.4 9h4M5.4 11.2h2.6" /></> },
   { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
   { id: 'bot-defaults', href: '#/bot-defaults', labelKey: 'nav.botDefaults', manage: true, icon: <><rect x="2.5" y="5" width="11" height="8" rx="2" /><circle cx="5.8" cy="9" r="1" /><circle cx="10.2" cy="9" r="1" /><path d="M8 5V2.5M5.5 13v1.2M10.5 13v1.2" /></> },
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
@@ -184,7 +191,7 @@ const NAV_ITEMS: NavItem[] = [
 const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'office'] },
-  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'bot-defaults'] },
+  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
 ];
@@ -767,11 +774,7 @@ function TopbarVersionControl(props: {
   const behind = status.behind && !!status.latest;
   const unknown = !status.latest;
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
-  // Rollback is its own capability, reported explicitly by the backend: the
-  // self-replacing binary CAN update but /api/update/rollback only drives a
-  // package manager, so deriving this from `updateSupported` would show a button
-  // that always fails. Older backends omit the field — fall back to the previous
-  // derivation so a stale dashboard/daemon pair behaves as before.
+  // Older backends omit rollbackSupported; retain their update capability fallback.
   const rollbackSupported = (status.rollbackSupported ?? status.updateSupported)
     && !status.localDevInstall && status.node.ok;
   const busy = phase === 'updating' || phase === 'restarting';
@@ -829,16 +832,6 @@ function TopbarVersionControl(props: {
     try {
       const previousInstance = await dashboardInstance();
       const result = await updateAndRestartBotmux(fetch, setPhase);
-      if (result.bootstrapRequired) {
-        // The new binary is installed, but a normal restart is refused because
-        // live daemons still run the pre-signal-death-autorestart PM2 policy.
-        // Point the operator at the one-time terminal bootstrap instead of
-        // polling a reconnect that can never happen.
-        actionInFlightRef.current = false;
-        setPhase('error');
-        setErrorDetail(t('update.bootstrapRequired'));
-        return;
-      }
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.
@@ -1042,6 +1035,9 @@ function TopbarVersionControl(props: {
               role={phase === 'error' || refreshFailed ? 'alert' : 'status'}
               aria-live="polite"
             >{message}</p>
+            {status.runningDaemonRestartHint ? (
+              <p className="dashboard-version-message" role="status">{status.runningDaemonRestartHint}</p>
+            ) : null}
             <a
               className="dashboard-version-release-link"
               href="https://github.com/deepcoldy/botmux/releases"
@@ -1231,11 +1227,13 @@ function DashboardShell(): React.JSX.Element {
     expiredShown = false;
     setAuthExpiredOpen(false);
   };
-  // 工作台默认是无边框壳（没有 topbar / 侧栏），但无边框只留给桌面 / 移动客户端
-  // （botmuxClientShell）：从侧边栏等网页入口点进 #/agent-workbench 时必须保持正常
-  // 壳，否则导航一去不回。client-shell 参数可能挂在 search 也可能挂在 hash（桌面端
-  // 为过登录重定向把壳标记放在 hash 里），readDashboardClientShell 两种都认。
-  const workbenchSurface = readDashboardClientShell()
+  // 工作台默认是无边框壳（没有 topbar / 侧栏），但无边框只留给两类入口：桌面 / 移动
+  // 客户端（botmuxClientShell），以及带沉浸式标记的直达入口（botmuxWorkbenchShell，
+  // `/workbench`、短票兑换、卡片按钮与 CLI 打印的链接都 302 到这种 hash，见
+  // core/workbench-shell.ts）。从侧边栏等网页入口点进 #/agent-workbench 时必须保持
+  // 正常壳，否则导航一去不回。两种标记都可能挂在 search 或 hash（为过登录重定向把
+  // 标记放在 hash 里，启动时再提升进 search），reader 两种都认。
+  const workbenchSurface = (readDashboardClientShell() || readDashboardWorkbenchShell())
     ? activeHash.startsWith('#/agent-workbench-dock')
       ? 'dock'
       : activeHash.startsWith('#/agent-workbench')

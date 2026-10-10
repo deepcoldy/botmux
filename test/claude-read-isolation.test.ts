@@ -6,7 +6,10 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 
-vi.mock('node:child_process', () => ({ execSync: vi.fn(() => '') }));
+vi.mock('node:child_process', () => ({
+  execFile: vi.fn(),
+  execSync: vi.fn(() => ''),
+}));
 
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 

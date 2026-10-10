@@ -40,6 +40,11 @@ export interface InlineMentionResult {
   usedIds: Set<string>;
 }
 
+export interface InlineCardMentionResult {
+  card: Record<string, unknown>;
+  usedIds: Set<string>;
+}
+
 export function applyInlineMentions(
   text: string,
   mentions: NamedMention[],
@@ -72,4 +77,35 @@ export function applyInlineMentions(
   });
 
   return { text: out, usedIds };
+}
+
+/**
+ * Apply the same named-mention rewriting to every Markdown text node in a
+ * custom card. Supports Card 2.0 `markdown` elements and legacy `lark_md`
+ * text nodes while leaving plain-text labels and callback values untouched.
+ */
+export function applyInlineMentionsToCard(
+  card: Record<string, unknown>,
+  mentions: NamedMention[],
+): InlineCardMentionResult {
+  const cloned = structuredClone(card);
+  const usedIds = new Set<string>();
+
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    const node = value as Record<string, unknown>;
+    if ((node.tag === 'markdown' || node.tag === 'lark_md') && typeof node.content === 'string') {
+      const result = applyInlineMentions(node.content, mentions);
+      node.content = result.text;
+      for (const id of result.usedIds) usedIds.add(id);
+    }
+    for (const child of Object.values(node)) visit(child);
+  };
+
+  visit(cloned);
+  return { card: cloned, usedIds };
 }
