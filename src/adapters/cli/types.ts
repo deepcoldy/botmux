@@ -649,6 +649,12 @@ export interface CliAdapter {
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
 
+  /** Whether the CLI supports the Program Status Protocol (OSC 7501).
+   *  When true, the worker mounts a ProgramStatusFramingStream on the PTY stream
+   *  to handle the \x1b]7501;?\x1b\ handshake probe, strip 7501 control codes,
+   *  and observe authoritative program status events in IdleDetector. */
+  readonly supportsProgramStatus?: boolean;
+
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
    *  require fresh composer evidence (`staticBusyClearPattern`, falling back
