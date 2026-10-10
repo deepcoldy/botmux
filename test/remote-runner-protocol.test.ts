@@ -189,6 +189,54 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
+  it('accepts only structured, read-only session tool requests', () => {
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'session_tool',
+      operationId: 'session-tool-1',
+      turnId: 'turn-1',
+      generation: 3,
+      request: {
+        tool: 'history',
+        limit: 20,
+        scope: 'thread',
+        withCardJson: true,
+      },
+    }))).toMatchObject({
+      type: 'session_tool',
+      operationId: 'session-tool-1',
+      request: { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
+    });
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'session_tool',
+      operationId: 'session-tool-2',
+      turnId: 'turn-1',
+      generation: 3,
+      request: { tool: 'skill.read', name: 'demo', path: '../secret' },
+    }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'session_tool',
+      operationId: 'session-tool-3',
+      turnId: 'turn-1',
+      generation: 3,
+      request: { tool: 'schedule.add', prompt: 'not read only' },
+    }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'session_tool',
+      operationId: 'session-tool-4',
+      turnId: 'turn-1',
+      generation: 3,
+      request: { tool: 'history', limit: 101 },
+    }))).toBeUndefined();
+  });
+
   it('accepts authoritative usage on final and rejects malformed metrics', () => {
     const base = {
       protocol: REMOTE_RUNNER_PROTOCOL,

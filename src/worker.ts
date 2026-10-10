@@ -134,6 +134,7 @@ import {
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
+import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
@@ -5854,6 +5855,48 @@ async function deliverRemoteRunnerOutboundMessage(
   return sendRemoteRunnerOutboundMessage(message, {
     sessionId,
     turnId: message.turnId,
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+    env,
+  });
+}
+
+async function deliverRemoteRunnerSessionTool(
+  operation: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerSessionToolOperation,
+): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerSessionToolResult> {
+  const authority = activeTurnAuthority.identity();
+  if (!sessionId || !lastInitConfig
+    || operation.turnId !== currentBotmuxTurnId
+    || authority.turnId !== operation.turnId
+    || (authority.dispatchAttempt !== undefined
+      && authority.dispatchAttempt !== currentBotmuxDispatchAttempt)) {
+    return {
+      outcome: 'rejected',
+      code: 'session_tool_turn_stale',
+      message: 'The session tool no longer belongs to the worker\'s active turn.',
+    };
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    SESSION_DATA_DIR: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+    BOTMUX_LARK_APP_ID: lastInitConfig.larkAppId,
+    BOTMUX_CHAT_ID: lastInitConfig.chatId,
+    BOTMUX_SESSION_SCOPE: lastInitConfig.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+    BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
+    BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
+  };
+  const pinnedConfig = resolveChildBotsConfig(
+    lastInitConfig.loadedBotsConfigPath,
+    lastInitConfig.loadedBotsConfigProvenance,
+  );
+  if (pinnedConfig) env.BOTS_CONFIG = pinnedConfig;
+  else delete env.BOTS_CONFIG;
+
+  return runRemoteRunnerSessionTool(operation.request, {
+    sessionId,
+    turnId: operation.turnId,
     ...(currentBotmuxDispatchAttempt !== undefined
       ? { dispatchAttempt: currentBotmuxDispatchAttempt }
       : {}),
@@ -19747,6 +19790,16 @@ async function spawnCli(
       };
     }
     return deliverRemoteRunnerOutboundMessage(message);
+  });
+  backend.onSessionTool?.(async (operation) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) {
+      return {
+        outcome: 'rejected',
+        code: 'session_tool_backend_stale',
+        message: 'The backend generation that requested this session tool is no longer active.',
+      };
+    }
+    return deliverRemoteRunnerSessionTool(operation);
   });
   backend.onTurnFailure?.((failure) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;

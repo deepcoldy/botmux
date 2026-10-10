@@ -8336,6 +8336,11 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   // No-transport turn cannot fetch a quoted Feishu message — central hard gate.
   assertTurnTransportOrExit('quoted');
   const sessionIdArg = argValue(rest, '--session-id');
+  const remoteRunnerSessionTool = rest.includes('--remote-runner-session-tool');
+  if (remoteRunnerSessionTool && process.env.BOTMUX_HOST_RELAY_AUTHORIZED !== '1') {
+    console.error('botmux quoted refused: --remote-runner-session-tool requires the owning worker\'s live turn authority');
+    process.exit(2);
+  }
   // Positional message_id is required. The id comes verbatim from the
   // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
   // injects when the user used the Lark quote-reply UI. Skip --session-id and
@@ -8367,6 +8372,10 @@ async function cmdQuoted(rest: string[]): Promise<void> {
     if (!msg) {
       console.error(`未找到消息 ${messageId}`);
       process.exit(1);
+    }
+    if (remoteRunnerSessionTool && (msg as any).chat_id !== quotedSession.chatId) {
+      console.error('botmux quoted refused: message is outside the current session chat');
+      process.exit(2);
     }
     // Interactive cards are re-resolved inside the render pipeline (both
     // im.message.get representations unioned, content + resources replaced

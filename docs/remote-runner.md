@@ -13,7 +13,8 @@
     "expectedProvider": "example-cloud",
     "requiredCapabilities": [
       "start", "resume", "turn", "cancel", "detach", "reattach", "status",
-      "terminal_screen", "terminal_input", "terminal_resize", "outbound_message"
+      "terminal_screen", "terminal_input", "terminal_resize", "outbound_message",
+      "session_tool"
     ],
     "handshakeTimeoutMs": 30000,
     "operationTimeoutMs": 20000
@@ -56,7 +57,7 @@ ACK 超时或未知执行结果，且不会毒化后续 turn。
 `rebuild` 表示用户显式关闭后重新打开，旧远端资源已被取消，provider 必须创建新资源、推进
 `generation`，并在可能时保留 `agentThreadId`。BotMux 会拒绝未推进 generation 的 rebuild `ready`。
 
-`status: busy` 前不得发送 `progress`、`outbound_message` 或 `final`。ACK 后的终态 `failure`
+`status: busy` 前不得发送 `progress`、`outbound_message`、`session_tool` 或 `final`。ACK 后的终态 `failure`
 必须携带 `turnId`；可以同时重复原 turn 的 `requestId`，但该值必须精确匹配。只带 `requestId`
 的 post-ACK failure 不足以作为终态关联依据，会被视为协议错误。
 
@@ -129,7 +130,55 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 结果为 `delivered|rejected|unknown`。`unknown` 表示平台可能已经接受消息但 BotMux 无法证明结果，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
 
 主动消息写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`。该 capability 同样不属于默认必需集合，只有显式配置它的部署才会在握手时要求 provider 支持。
-成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
+成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
+
+### 可选只读 Session 工具
+
+声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的只读 Session helper。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic 或 Bot；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。
+
+当前 allowlist：
+
+- `history`：`limit` 限制为 `1..100`，`scope` 只允许 `session|thread|chat|ambient`，可选 `withCardJson`。
+- `quoted`：只接受合法 `om_` message id 和可选 `raw`；下载的附件经宿主 attachments 根校验后，以最多 8 个、合计最多 512 KiB 的有界 payload 回传。
+- `bots.list`：固定为当前群 `chat` scope，不开放跨团队发现或邀请。
+- `skill.list|show|read|resources`：沿用当前 Session 的 skill manifest 和内置技能；resource path 必须是无 `.` / `..` 的安全相对路径。
+
+不属于 allowlist 的 schedule、ask、handoff、workflow、改名、管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、附件、加急、attention 或 final 能力。
+
+```json
+{
+  "type": "session_tool",
+  "operationId": "history-1",
+  "turnId": "turn-1",
+  "generation": 3,
+  "request": {
+    "tool": "history",
+    "limit": 20,
+    "scope": "thread",
+    "withCardJson": true
+  }
+}
+```
+
+宿主完成后写回 `session_tool_result`：
+
+```json
+{
+  "type": "session_tool_result",
+  "requestId": "session-tool-result:...",
+  "operationId": "history-1",
+  "turnId": "turn-1",
+  "generation": 3,
+  "result": {
+    "outcome": "completed",
+    "exitCode": 0,
+    "stdout": "{\"total\":1}\n",
+    "stderr": ""
+  }
+}
+```
+
+`completed` 保留 CLI 的确定性 `exitCode/stdout/stderr`；宿主执行器启动失败、超时或无法证明结果时返回 `unknown`，安全门禁拒绝则返回 `rejected`。同一 turn 最多执行 30 个不同 operation；同 operation id 同 payload 复用首次结果，不同 payload 被拒绝。`turnId`、`generation` 和成功 `final` 的结算顺序与 `outbound_message` 使用同一套 fencing。
 
 ### 可选运行用量
 

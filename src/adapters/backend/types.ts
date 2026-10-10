@@ -2,6 +2,8 @@ import type {
   RemoteRunnerBackendState,
   RemoteRunnerOutboundMessage,
   RemoteRunnerOutboundMessageResult,
+  RemoteRunnerSessionToolOperation,
+  RemoteRunnerSessionToolResult,
   RemoteRunnerTrustedCaller,
   RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
@@ -229,6 +231,12 @@ export interface SessionBackend {
    * receive a destination override or platform credential. */
   onOutboundMessage?(
     cb: (message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>,
+  ): void;
+  /** Provider-requested, read-only access to the current BotMux session's
+   * allowlisted helper surface.  The worker freezes session and turn authority
+   * before executing anything on the host. */
+  onSessionTool?(
+    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
   ): void;
   /** Provider handshake/startup is complete and turns may be accepted. */
   onReady?(cb: () => void): void;
