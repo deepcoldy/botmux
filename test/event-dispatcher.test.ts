@@ -1142,6 +1142,56 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('captures human input only after durable primary claims the event', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => true);
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary captured human input',
+    });
+    expect(handlers.captureHumanInput).toHaveBeenCalledOnce();
+    expect(handlers.captureHumanInput).toHaveBeenCalledWith(data);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('retries the durable claim when captured-input persistence fails', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => {
+      throw new Error('capture store unavailable');
+    });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture_retry',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture_retry'))
+      .rejects.toThrow('capture store unavailable');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it.each(['never', 'ambient'] as const)(
     'dispatches a %s topic seed immediately when the durable primary wait is disabled',
     async mentionMode => {
@@ -1262,6 +1312,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
   it('awaits primary durable enqueue in the WS callback and bypasses the legacy route', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => true);
     let release!: () => void;
     const persisted = new Promise<void>(resolve => { release = resolve; });
     const enqueuePrimary = vi.fn(() => persisted);
@@ -1291,6 +1342,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
       data,
     });
+    expect(handlers.captureHumanInput).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     release();
     await callback;
