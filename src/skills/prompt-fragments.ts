@@ -154,7 +154,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   { key: 'ai.routing.usage_send', block: 'routing_system', stage: 'new', label: '发送用法', kind: 'editable' },
   { key: 'ai.routing.usage_mention_gate', block: 'routing_system', stage: 'new', label: '@ 决策规则', kind: 'editable' },
-  { key: 'ai.routing.usage_attachments', block: 'routing_system', stage: 'new', stages: ['followup'], label: '附件用法', kind: 'editable' },
+  { key: 'ai.routing.usage_attachments', block: 'routing_system', stage: 'new', label: '附件用法', kind: 'editable' },
   { key: 'ai.routing.usage_helpers', block: 'routing_system', stage: 'new', label: '上下文 / 协作命令', kind: 'editable' },
   { key: 'ai.routing.usage_silence', block: 'routing_system', stage: 'new', label: '沉默规则（BOTMUX_NOTHING_TO_SEND）', kind: 'editable' },
   {
