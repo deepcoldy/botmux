@@ -200,11 +200,16 @@ export class MockLlmServer {
       console.log(`[mock-llm-server] Message roles: ${messages.map((m: any) => m?.role).join(' -> ')}`);
     }
 
-    // Check if the latest turn is tool_result
-    const isToolResult =
-      lastMsg &&
-      Array.isArray(lastMsg.content) &&
-      lastMsg.content.some((b: any) => b?.type === 'tool_result');
+    // Check if the latest turn is tool_result.
+    // Real Claude Code sessions often append a trailing `system` message
+    // (reminders/context update) after `user(tool_result)`. Scan backwards for
+    // the latest user message to detect tool_result correctly.
+    const lastUserMsg = [...messages].reverse().find((m: any) => m?.role === 'user');
+    const isToolResult = Boolean(
+      lastUserMsg &&
+      Array.isArray(lastUserMsg.content) &&
+      lastUserMsg.content.some((b: any) => b?.type === 'tool_result'),
+    );
 
     if (isToolResult) {
       // Phase 2: Tool execution completed, output concluding text
@@ -238,7 +243,8 @@ export class MockLlmServer {
     const lastMsg = messages[messages.length - 1];
     const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
 
-    const isToolResult = lastMsg?.role === 'tool';
+    const lastNonSystemMsg = [...messages].reverse().find((m: any) => m?.role !== 'system');
+    const isToolResult = lastNonSystemMsg?.role === 'tool';
 
     if (isToolResult) {
       const events = buildOpenAiTextEvents({

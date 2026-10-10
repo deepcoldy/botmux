@@ -120,6 +120,41 @@ describe('MockLlmServer', () => {
       expect(bodyText).toContain('"type":"text"');
       expect(bodyText).toContain('"stop_reason":"end_turn"');
     });
+
+    it('generates text completion SSE stream on tool_result turn followed by trailing system message', async () => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-3-7-sonnet-20250219',
+          messages: [
+            {
+              role: 'user',
+              content: '测试消息 ACK-e2e-suite-999',
+            },
+            {
+              role: 'assistant',
+              content: [{ type: 'tool_use', id: 'call_1', name: 'Bash', input: {} }],
+            },
+            {
+              role: 'user',
+              content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'Sent OK' }],
+            },
+            {
+              role: 'system',
+              content: 'Reminder: keep answers concise',
+            },
+          ],
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const bodyText = await res.text();
+      expect(bodyText).toContain('event: message_start');
+      expect(bodyText).toContain('"type":"text"');
+      expect(bodyText).toContain('"stop_reason":"end_turn"');
+      expect(bodyText).not.toContain('"stop_reason":"tool_use"');
+    });
   });
 
   describe('OpenAI Chat Completions API (/v1/chat/completions)', () => {
