@@ -1122,6 +1122,52 @@ describe('BridgeTurnQueue', () => {
       expect(ready[0].assistantUuids).toEqual(['a-start', 'a-final']);
     });
 
+    it('mid-turn absorbed reminder queued_command is filtered and does not split or drop turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1');
+      q.ingest([user('u1', 'first question'), assistant('a1', 'answering')]);
+      const absorbedEvent: any = {
+        type: 'attachment',
+        uuid: 'q-absorbed',
+        timestamp: new Date().toISOString(),
+        attachment: {
+          type: 'queued_command',
+          prompt: '<system-reminder>User sent another message while you were working</system-reminder>',
+        },
+        renderedRole: 'system',
+        rendered: [{ content: '<system-reminder>User sent another message</system-reminder>' }],
+      };
+      q.ingest([absorbedEvent]);
+      const peek = q.peek();
+      expect(peek).toHaveLength(1);
+      expect(peek[0].turnId).toBe('t1');
+      expect(peek[0].assistantUuids).toEqual(['a1']);
+    });
+
+    it('protects turn with assistant activity from HOL drop even without visible text', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1', makeFingerprint('task 1'));
+      const toolUseEv: any = {
+        type: 'assistant',
+        uuid: 'a-tool',
+        timestamp: new Date().toISOString(),
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'tool_1', name: 'botmux_send', input: {} }],
+        },
+      };
+      q.ingest([user('u1', 'task 1'), toolUseEv]);
+      expect(q.peek()[0].hasAssistantActivity).toBe(true);
+      expect(q.peek()[0].assistantUuids).toHaveLength(0);
+
+      q.mark('t2', makeFingerprint('task 2'));
+      q.ingest([user('u2', 'task 2')]);
+
+      const emittable = q.drainEmittable();
+      expect(emittable).toHaveLength(1);
+      expect(emittable[0].turnId).toBe('t1');
+    });
+
     it('task notifications do not cap the send-marker window before the final botmux send', () => {
       const q = new BridgeTurnQueue();
       const firstPrompt = '<user_message>research startup hooks</user_message>';

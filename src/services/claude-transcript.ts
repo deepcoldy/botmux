@@ -1254,6 +1254,15 @@ export function isMeaningfulQueuedCommand(ev: TranscriptEvent | null | undefined
   if (ev.attachment?.type !== 'queued_command') return false;
   if (ev.attachment.commandMode === 'task-notification') return false;
   if ((ev as any).isSidechain === true) return false;
+  // Mid-turn absorbed message (Claude Code 2.1+): when the user types while
+  // a turn is running, Claude Code logs an attachment(queued_command) rendered
+  // as a system reminder (`renderedRole: "system"`, `<system-reminder>`).
+  // This is intra-turn context, NOT a new conversation turn boundary.
+  if ((ev as any).renderedRole === 'system') return false;
+  const rendered = (ev as any).rendered;
+  if (Array.isArray(rendered) && rendered.some((r: any) => typeof r?.content === 'string' && r.content.includes('<system-reminder>'))) {
+    return false;
+  }
   const text = normaliseForFingerprint(extractTurnStartText(ev));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;

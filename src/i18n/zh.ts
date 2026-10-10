@@ -963,6 +963,7 @@ export const messages: Record<string, string> = {
   // helpers / silence（见 shared-hints.ts）。
   'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，直接作答即可。',
   'ai.send.after_success_hint': '本次发送已完成。若本轮 final 后仍需补充，请使用 `botmux send --response-kind auxiliary`；没有了就让最终回复只输出 BOTMUX_NOTHING_TO_SEND。',
+  'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息使用 `botmux send --response-kind final` 发送完整答复（若无需回复则输出 BOTMUX_NOTHING_TO_SEND）。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
   // 提示模型完成时用 --response-kind final 发完整答复。
   'ai.send.after_success_unified': '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。',

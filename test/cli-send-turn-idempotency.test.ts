@@ -247,6 +247,69 @@ describe('botmux send per-turn final idempotency', () => {
       expect(existsSync(recordPath)).toBe(false);
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
+
+  it('automatically advances PID marker to queued turn when active turn has delivered final', () => {
+    const f = createFixture(undefined, {
+      scope: 'chat',
+      replyTargets: {
+        om_turn_idempotency: { rootMessageId: 'om_trigger_1', quoteOnly: true },
+        om_turn_2: { rootMessageId: 'om_trigger_2', quoteOnly: true },
+      },
+    });
+    try {
+      const turn1 = f.run('final', 'turn 1 answer');
+      expect(turn1.result.status, String(turn1.result.stderr)).toBe(0);
+      expect(turn1.requests).toHaveLength(1);
+      expect(turn1.requests[0]).toContain('/open-apis/im/v1/messages/om_trigger_1/reply');
+
+      const markerPath = join(f.dataDir, '.botmux-cli-pids', String(process.pid));
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: f.sessionId,
+        turnId: 'om_turn_idempotency',
+        queuedTurns: [{ turnId: 'om_turn_2' }],
+      }));
+
+      const turn2 = f.run('final', 'turn 2 answer');
+      expect(turn2.result.status, String(turn2.result.stderr)).toBe(0);
+      expect(turn2.requests).toHaveLength(1);
+      expect(turn2.requests[0]).toContain('/open-apis/im/v1/messages/om_trigger_2/reply');
+
+      const markerAfter = JSON.parse(readFileSync(markerPath, 'utf8'));
+      expect(markerAfter.turnId).toBe('om_turn_2');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  it('promotes auxiliary to final and quotes queued turn when active turn has delivered final and successor has not', () => {
+    const f = createFixture(undefined, {
+      scope: 'chat',
+      replyTargets: {
+        om_turn_idempotency: { rootMessageId: 'om_trigger_1', quoteOnly: true },
+        om_turn_2: { rootMessageId: 'om_trigger_2', quoteOnly: true },
+      },
+    });
+    try {
+      const turn1 = f.run('final', 'turn 1 answer');
+      expect(turn1.result.status, String(turn1.result.stderr)).toBe(0);
+
+      const markerPath = join(f.dataDir, '.botmux-cli-pids', String(process.pid));
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: f.sessionId,
+        turnId: 'om_turn_idempotency',
+        queuedTurns: [{ turnId: 'om_turn_2' }],
+      }));
+
+      // Caller sends auxiliary (e.g. Claude Code fallback)
+      const turn2 = f.run('auxiliary', 'turn 2 answer');
+      expect(turn2.result.status, String(turn2.result.stderr)).toBe(0);
+      expect(turn2.requests).toHaveLength(1);
+      expect(turn2.requests[0]).toContain('/open-apis/im/v1/messages/om_trigger_2/reply');
+
+      // The delivery was recorded as final in the ledger for turn 2
+      const ledger = new TurnSendLedger(f.dataDir);
+      const record = ledger.read({ larkAppId: 'cli_test', sessionId: f.sessionId, turnId: 'om_turn_2' });
+      expect(record?.final).toBeDefined();
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 30_000);
 });
 
 /** Path of the single record the fixture's session wrote (per-session layout). */

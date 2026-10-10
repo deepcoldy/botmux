@@ -323,5 +323,6 @@ describe('resolveSessionContext()', () => {
     const step = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
     expect(step?.turnId).toBe('turn-2');
     expect(step?.trustedCaller).toEqual(callerB);
+    expect(step?.steerPromotedTurn).toBe(true);
   });
 });

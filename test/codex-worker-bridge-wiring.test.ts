@@ -138,9 +138,16 @@ describe('Codex worker structured-bridge wiring', () => {
     const start = workerSource.indexOf('function resolveCodexOwnershipPid');
     expect(start).toBeGreaterThan(0);
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
-    expect(body).toContain("findLaunchedCliPid(candidatePid, 'codex')");
+    expect(body).toContain("findLaunchedCliPid(candidatePid, 'codex'");
+    // A direct native leaf (its own comm already identifies as codex) must
+    // short-circuit BEFORE the descendant scan.
+    expect(body).toContain('codexProcessIsNativeLeaf(candidatePid, filterExecutable)');
     expect(workerSource).toContain('lastSpawnCodexLauncherActive = codexLauncherActive;');
     const kicks = workerSource.match(/if \(cfg\.cliId === 'codex' && codexLauncherActive\) startCodexLauncherPidResolve\(/g) ?? [];
     expect(kicks.length).toBeGreaterThanOrEqual(2);
+    // The retry loop gets the same leaf predicate (no 30× waste on direct
+    // installs) and the configured custom executable name.
+    expect(workerSource).toContain('isDirectLeaf: (lp) => codexProcessIsNativeLeaf(lp, codexFilterExecutable)');
+    expect(workerSource).toContain("findLaunchedCliPid(lp, 'codex', 6, {}, codexFilterExecutable)");
   });
 });
