@@ -532,7 +532,7 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
 async function cmdServe(args: string[]): Promise<void> {
   const apiOnly = args.includes('--api-only');
   if (!apiOnly) {
-    console.error('Usage: botmux serve --api-only [--port <PORT>] [--bot <local_slug>] [--cli <cliId>] [--state-dir <DIR>]');
+    console.error('Usage: botmux serve --api-only [--port <PORT>] [--bot <local_slug>] [--cli <cliId>] [--backend <tmux|pty>] [--state-dir <DIR>]');
     console.error('  Only core-only (--api-only) serving is supported. It runs a headless HTTP');
     console.error('  control-API service with no Feishu credentials (for riff sandbox / embedding).');
     process.exit(2);
@@ -550,6 +550,11 @@ async function cmdServe(args: string[]): Promise<void> {
   const cli = getOpt('--cli') ?? process.env.BOTMUX_CORE_CLI;
   const workingDir = getOpt('--working-dir') ?? process.env.BOTMUX_CORE_WORKING_DIR;
   const stateDir = getOpt('--state-dir') ?? process.env.BOTMUX_CORE_STATE_DIR;
+  const backend = getOpt('--backend') ?? process.env.BOTMUX_CORE_BACKEND;
+  if (backend !== undefined && backend !== 'tmux' && backend !== 'pty') {
+    console.error(`botmux serve --api-only: --backend must be tmux or pty; got: ${backend}`);
+    process.exit(2);
+  }
 
   // Node: spawn `node dist/index-core-only.js`. Standalone binary: re-exec THIS
   // binary with the hidden `__core-only` subcommand (no dist/ on disk). Same env
@@ -569,6 +574,7 @@ async function cmdServe(args: string[]): Promise<void> {
         ...(cli ? { BOTMUX_CORE_CLI: cli } : {}),
         ...(workingDir ? { BOTMUX_CORE_WORKING_DIR: workingDir } : {}),
         ...(stateDir ? { BOTMUX_CORE_STATE_DIR: stateDir } : {}),
+        ...(backend ? { BOTMUX_CORE_BACKEND: backend } : {}),
       };
       // Never hand an ambient BOTS_CONFIG / legacy worker-host alias / ambient
       // SESSION_DATA_DIR to the core-only child — the entrypoint freezes/strips

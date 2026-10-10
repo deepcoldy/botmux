@@ -358,7 +358,7 @@ import {
 import {
   createDispatchReportBinding,
   resolveVerifiedDispatchReportTarget,
-  dispatchReportBindingSecretPath,
+  loadOrCreateDispatchReportBindingSecret,
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
@@ -3915,7 +3915,7 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
     && caller.requestLarkAppId === ds.larkAppId && caller.requestUserOpenId) return undefined;
   return resolveDispatchUser({
     dataDir: config.session.dataDir,
-    secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+    secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     appId: ds.larkAppId, chatId: ds.chatId, turnId,
     rootId: reply.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
   });
@@ -4086,7 +4086,7 @@ async function reportZeroPromptFinal(ds: DaemonSession, input: {
   try { registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8')); }
   catch { return; }
   const decision = prepareAutomaticDispatchReport({
-    registry, bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+    registry, bindingSecret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     dispatchRoot: input.dispatchRoot, sourceSessionId: ds.session.sessionId,
     sourceLarkAppId: ds.larkAppId, content: input.content,
   });
@@ -4114,7 +4114,7 @@ function zeroPromptTaskContent(content: string, larkAppId: string, dispatchRoot?
   try {
     const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
     const bound = resolveVerifiedDispatchReportTarget({ registry, dispatchRoot,
-      secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)) });
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir) });
     return bound.ok ? stripDispatchCompletionProtocol(content, dispatchRoot) : content;
   } catch { return content; }
 }
@@ -6818,9 +6818,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     });
   }
 
-  const bindingSecret = loadOrCreateDashboardSecret(
-    dispatchReportBindingSecretPath(config.session.dataDir),
-  );
+  const bindingSecret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
   const issuedAt = new Date().toISOString();
   const reportBinding = createDispatchReportBinding(bindingSecret, {
     dispatchRoot,
@@ -6989,7 +6987,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const messageId = authority && turnId && targetAppIds.length
       ? await deliverDispatchWithUser({
           dataDir: config.session.dataDir,
-          secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+          secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
           payload: {
             sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
             rootId, chatId, targetAppIds, authority,
@@ -7382,9 +7380,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       : undefined,
     selfLarkAppId: selfDaemonLarkAppId,
     registry,
-    bindingSecret: loadOrCreateDashboardSecret(
-      dispatchReportBindingSecretPath(config.session.dataDir),
-    ),
+    bindingSecret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
   });
   if (!decision.ok) {
     return jsonRes(res, decision.status, { ok: false, error: decision.error });
@@ -28784,9 +28780,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Linux bwrap snapshots `.dashboard-secret.*` authority leaves at launch;
   // creating this later would leave the new key visible through its writable
   // host-root bind until the pane cold-started.
-  loadOrCreateDashboardSecret(
-    dispatchReportBindingSecretPath(config.session.dataDir),
-  );
+  loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
   let markIpcReady!: () => void;
   const ipcReady = new Promise<void>((resolve) => { markIpcReady = resolve; });
   const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';

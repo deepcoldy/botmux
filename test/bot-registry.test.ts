@@ -1612,7 +1612,7 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
   const saved: Record<string, string | undefined> = {};
-  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL'];
+  const CORE_KEYS = ['BOTMUX_CORE_ONLY', 'BOTS_CONFIG', 'BOTMUX_API_ONLY_BOT', 'BOTMUX_CORE_CLI', 'BOTMUX_CORE_WORKING_DIR', 'BOTMUX_CORE_MODEL', 'BOTMUX_CORE_BACKEND'];
 
   beforeEach(async () => {
     mod = await freshImport();
@@ -1675,6 +1675,23 @@ describe('loadBotConfigs — core-only synthesis (BOTMUX_CORE_ONLY=1)', () => {
     const [cfg] = mod.loadBotConfigs();
     expect(cfg.larkAppId).toBe('local_riff');
     expect(cfg.cliId).toBe('codex-app');
+    expect(cfg.backendType).toBeUndefined();
+  });
+
+  it('applies an explicit core-only PTY backend without changing the default', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'pty';
+    const [cfg] = mod.loadBotConfigs();
+    expect(cfg.apiOnly).toBe(true);
+    expect(cfg.backendType).toBe('pty');
+  });
+
+  it('rejects an invalid core-only backend instead of falling back to tmux', () => {
+    fsMock.existsSync.mockReturnValue(false);
+    process.env.BOTMUX_CORE_ONLY = '1';
+    process.env.BOTMUX_CORE_BACKEND = 'zellij';
+    expect(() => mod.loadBotConfigs()).toThrow('BOTMUX_CORE_BACKEND must be tmux or pty');
   });
 
   it('rejects a non-local_ synthetic id (identity must be a synthetic local slug)', () => {

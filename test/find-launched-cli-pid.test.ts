@@ -212,7 +212,15 @@ describe('worker wrapper PID wiring', () => {
   it.each([false, true])('keeps the wrapper bridge resolver off under sandbox while the codex bwrap resolver runs (late=%s)', late => {
     const result = runWorkerWiring(late, { sandboxRequested: true });
     expect(result.bridgeCliPid).toBeUndefined();
+    // The production resolver supplies optional BFS probe/filter arguments;
+    // this boundary cares that every probe starts at the launcher and targets
+    // Codex, not about the internal optional-argument representation.
+    expect(result.findLaunchedCliPid.mock.calls).not.toHaveLength(0);
+    expect(result.findLaunchedCliPid.mock.calls.every((args: unknown[]) =>
+      args[0] === 100 && args[1] === 'codex',
+    )).toBe(true);
     expect(result.backend.cliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
   });
 });
 

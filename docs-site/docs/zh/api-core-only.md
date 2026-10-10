@@ -42,6 +42,7 @@ BOTMUX_CORE_ONLY=1 BOTMUX_API_PORT=8930 node <pkg>/dist/index-core-only.js
 | `--cli` | `BOTMUX_CORE_CLI` | `codex-app` | 跑哪个 CLI（`codex` / `claude-code` / …） |
 | `--working-dir` | `BOTMUX_CORE_WORKING_DIR` | 当前目录 | CLI 工作目录 |
 | `--state-dir` | `BOTMUX_CORE_STATE_DIR` | `~/.botmux/core-only/<botId>/data` | 专用状态根 |
+| `--backend` | `BOTMUX_CORE_BACKEND` | `tmux` | `tmux` 或 `pty`；PTY 不提供跨 daemon pane 恢复 |
 | （无 flag） | `BOTMUX_CORE_MODEL` | 未设 | 覆盖合成 bot 的默认模型（仅环境变量，无对应 flag） |
 
 > **可视 TUI vs 结构化返回**：`--cli codex-app` 走 app-server runner，结构化返回、无可视终端；`--cli codex`（或 `claude-code`）在 tmux pane 里跑可视 TUI，可经 Web 终端围观/操作（见 [§6](#6-可写-web-终端)）。
@@ -59,7 +60,7 @@ daemon **先 bind 端口、后完成 durable restore**。所以「端口能连�
   - 未就绪 → `503 {"ok":false,"status":"starting"}`
   - 就绪 → `200 {"ok":true}`
 
-就绪屏障同时作用于**公共控制路由**：restore 未完成时，`/api/trigger`、`/api/sessions/:id/trigger-result`、`/api/sessions/:id/insight` 也返回 `503 {status:'starting'}`——所以即使你的客户端跳过 `/healthz` 探针，也不会触发进一条正在竞态恢复的路径。**推荐 launcher 先轮询 `/healthz` 到 200 再发第一条 trigger。**
+就绪屏障同时作用于**公共控制路由**：restore 未完成时，`/api/trigger`、`/api/sessions/:id/trigger-result`、`/api/sessions/:id/insight`、`/api/sessions/:id/host-facts` 也返回 `503 {status:'starting'}`——所以即使你的客户端跳过 `/healthz` 探针，也不会触发进一条正在竞态恢复的路径。**推荐 launcher 先轮询 `/healthz` 到 200 再发第一条 trigger。**
 
 ---
 
@@ -74,11 +75,12 @@ core-only 的 IPC 路由不是「公共 vs 全部 HMAC」二分，而是**三层
 | `/api/trigger` | POST | 发起一轮任务 |
 | `/api/sessions/:id/trigger-result` | GET | 轮询最终结果（四态） |
 | `/api/sessions/:id/insight` | GET | 轮询对话/进度 |
+| `/api/sessions/:id/host-facts` | GET | 读取安全的会话宿主事实 |
 | `/healthz` | GET | 就绪探针（core-only 别名） |
 
 （另有 `/__health` 也**永久公开**、任何模式都免鉴权，但它是 **legacy liveness 探针、始终返 200**——**不是** `/healthz` 的等价物：`/healthz` 在 restore/attach/scheduler 完成前返 `503 {status:'starting'}`，是 core-only 的 **readiness barrier**。判断「能不能开始 trigger」**必须**用 `/healthz`；用 `/__health` 会误判成已就绪、过早 trigger 进正在竞态恢复的路径。）
 
-这三条控制路由的免签是 core-only 专属的紧致 allowlist——刻意收窄：早期「全部路由免鉴权」会让同机 co-resident 的模型 turn 读写会话/调度/发起变更。`/api/asks/answer` **刻意不在**内（askId 为键、无会话绑定，暴露会让同机 turn 劫持别的待答 ask）。
+这些控制与只读路由的免签是 core-only 专属的紧致 allowlist——刻意收窄：早期「全部路由免鉴权」会让同机 co-resident 的模型 turn 读写会话/调度/发起变更。`/api/asks/answer` **刻意不在**内（askId 为键、无会话绑定，暴露会让同机 turn 劫持别的待答 ask）。
 
 **第二层 · 内部 capability / 签名路由**（绕外层 trusted-host HMAC，但各由 handler 自证）——这些**不是** public，但也**不要求**本文 §4 那种 trusted-host HMAC；它们由**会话内 rotating per-turn capability**（绑定到 URL 里的 sessionId）或**独立的强签名协议**在 handler 内验证。典型：`POST /api/session-ready`、`POST /api/asks`、`POST /api/sessions/:id/{slash,cd,close,chat-rename}`、`POST /api/hooks/emit`、`POST /api/attention`、`POST /api/vc-meetings/action-request`、workflow v3 变更前缀。合法调用方是**会话内的 CLI 自身**（沙箱/读隔离下读不到 host secret），capability 只证明「我是这个会话当前这轮的 CLI」，选不了别的会话。集成方通常不直接调这层。
 
@@ -170,6 +172,18 @@ curl -s "http://127.0.0.1:8930/api/sessions/<uuid>/trigger-result"
 
 > **completion 机制**：trigger-result 翻 `completed` 依赖 botmux 从 CLI transcript 里抽取 final_output。core-only claude-code 曾有一个「首轮 ready-gate 超时回落后落盘 user 行截头 → 完成信号接不上 → 永久 running」的 bug，已在 **v3.9.0** 修复（改用后缀锚定的内容证明绑定 durable mark）。用 **v3.9.0 及以上**。
 
+### 会话宿主事实
+
+把 Botmux 当作真实 CLI 会话宿主的集成方，可以读取：
+
+```bash
+curl -s "http://127.0.0.1:8930/api/sessions/<uuid>/host-facts"
+```
+
+它只对 core-only 的 HTTP virtual session 公开，返回 session id、CLI、后端、`exists / missing / unknown` 三态存活结论、worker generation、CLI 原生 session/thread id 与 Botmux 当前逻辑 turn id。它不返回 tmux socket、PID、worker token、环境变量、终端写 capability 或 CLI native turn id。
+
+CLI 回合结束和集成方的业务完成是不同事实；Workflow 调用方仍应自行校验结果、持久化证据并推进状态机。`unknown` 不能当作 `missing`，也不能据此创建替代会话。
+
 ---
 
 ## 6. 可写 Web 终端
@@ -211,6 +225,7 @@ core-only 是「无飞书出站通道 + 单租户 loopback」，围绕这点有�
 - **无飞书 Client**：apiOnly bot 根本不构造 `Lark.Client`，`larkAppSecret` 对 worker **withheld**（不注入子进程环境）。
 - **配置权威**：忽略 `~/.botmux/bots.json` 与 `BOTS_CONFIG`，且入口**删除** `process.env.BOTS_CONFIG`——避免 fork 出的 worker 里 agent `cat $BOTS_CONFIG` 读到真实 fleet 的 sibling 凭证。
 - **状态隔离**：入口**冻结** `SESSION_DATA_DIR` 到专用 `~/.botmux/core-only/<botId>/data`——一个把 host 的 `SESSION_DATA_DIR` 带进来的 managed turn 无法让 core-only 去读真实 fleet 的会话/pid/descriptor。
+- **宿主密钥隔离**：core-only 的 dispatch-report 签名密钥保存在专用 `SESSION_DATA_DIR` 内；显式 `--state-dir` 不会把新密钥写入其父目录，也不会读取同 HOME fleet 的共享签名密钥。为兼容历史 core-only 状态，仅当旧位置的叶子存在且通过严格宿主凭证校验时才迁移；缺失时直接在 state-dir 创建新密钥，不安全旧叶子则 fail closed。
 - **loopback 冻结**：`BOTMUX_WORKER_HTTP_HOST` 与 `WEB_EXTERNAL_HOST` 都被冻结成 `127.0.0.1`（bind 与广告 host 一致），worker web server 不会暴露在所有网卡上。
 - **跳过 host 维护**：core-only 不跑 fleet 级的 auto-restart / `botmux restart` / 共享 HOME breadcrumb 写入，绝不触碰同机的全局 botmux 安装。
 - **鉴权仍是硬门**：loopback 只是连通性不是身份——同机（含 bwrap 沙箱，默认共享网络命名空间）的进程也能拨 `127.0.0.1`。所以除 §3 第一层的三条控制路由 + `/healthz`/`/__health` 外，其余路由都要鉴权：第二层由 handler 内的 per-session capability / 独立强签名验证，第三层 host/operator 路由要 §4 的 route+port-bound HMAC。没有任何一层是「裸 loopback 就放行」。
@@ -225,6 +240,7 @@ core-only 是「无飞书出站通道 + 单租户 loopback」，围绕这点有�
 | `/api/trigger` | POST | 公共（第一层） | 发起一轮任务（须带 HTTP 应答模式） |
 | `/api/sessions/:id/trigger-result` | GET | 公共（第一层） | 轮询最终结果（四态）；core-only live worker 附 `readOnlyUrl`+`viewToken` |
 | `/api/sessions/:id/insight` | GET | 公共（第一层） | 轮询对话/进度 |
+| `/api/sessions/:id/host-facts` | GET | 公共（第一层） | 读取安全的会话、CLI、后端与三态存活事实；不授予终端写入 |
 | `/api/sessions/:id/write-link` | GET | **HMAC + bind**（第三层） | 取可写终端 URL（建议打开时现取） |
 | `/api/sessions/:id` | GET | **HMAC + bind**（第三层） | 会话元信息 |
 | `/api/sessions/:id/close` | POST | HMAC + bind（第三层）**或**会话内 capability（第二层） | 取消/关闭会话 |

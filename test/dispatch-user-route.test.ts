@@ -54,7 +54,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
-    config: { session: { dataDir } }, loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
+    config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };
   const run = new Function('scope', 'with (scope) { ' + code + '; return handler; }')(scope);

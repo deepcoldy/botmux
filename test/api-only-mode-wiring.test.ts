@@ -776,9 +776,19 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(allow).toContain("pathname === '/api/trigger'");
     expect(allow).toContain('trigger-result$');
     expect(allow).toContain('insight$');
+    expect(allow).toContain('host-facts$');
     expect(allow).not.toContain('answer');
     // And the gate consults it only under the core-only flag.
     expect(ipcSource).toContain('opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname)');
+  });
+
+  it('host-facts fails closed unless the owned session is apiOnly and HTTP-virtual', () => {
+    const handler = region(ipcSource, "ipcRoute('GET', '/api/sessions/:sessionId/host-facts'", "ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede'");
+    expect(handler).toContain('session.larkAppId !== cachedLarkAppId');
+    expect(handler).toContain('getBot(cachedLarkAppId).config.apiOnly === true');
+    expect(handler).toContain('!apiOnly || !isHttpVirtualSession(session.chatId)');
+    expect(handler.match(/jsonRes\(res, 404, \{ ok: false, error: 'session_not_found' \}\)/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(handler).toContain("backingProbe = 'unknown'");
   });
 
   it('P1-2: core-only skips fleet sandbox migration + synthesis ignores ambient BOTS_CONFIG', () => {
@@ -923,6 +933,18 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
     const serve = region(cliSource, 'async function cmdServe(', 'child.on(');
     expect(serve).toContain('delete e.SESSION_DATA_DIR;');
+  });
+
+  it('core-only backend is an explicit tmux/pty opt-in and never changes fleet defaults', () => {
+    const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
+    const serve = region(cliSource, 'async function cmdServe(', 'child.on(');
+    expect(serve).toContain("getOpt('--backend') ?? process.env.BOTMUX_CORE_BACKEND");
+    expect(serve).toContain("backend !== 'tmux' && backend !== 'pty'");
+    expect(serve).toContain('BOTMUX_CORE_BACKEND: backend');
+    expect(registrySource).toContain("const coreBackend = process.env.BOTMUX_CORE_BACKEND;");
+    expect(registrySource).toContain("coreBackend !== 'tmux' && coreBackend !== 'pty'");
+    expect(registrySource).toContain('if (coreBackend) entry.backendType = coreBackend;');
+    expect(readFileSync(resolve('src/config.ts'), 'utf8')).toContain("return 'tmux';");
   });
 
   it('P1(2nd round): core-only skips host-wide maintenance / auto-restart / restart-report', () => {

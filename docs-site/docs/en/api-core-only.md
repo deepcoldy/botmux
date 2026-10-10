@@ -43,6 +43,7 @@ Optional env vars / flags (`--flag` wins over the env var):
 | `--cli` | `BOTMUX_CORE_CLI` | `codex-app` | Which CLI to run (`codex` / `claude-code` / …) |
 | `--working-dir` | `BOTMUX_CORE_WORKING_DIR` | cwd | CLI working directory |
 | `--state-dir` | `BOTMUX_CORE_STATE_DIR` | `~/.botmux/core-only/<botId>/data` | Dedicated state root |
+| `--backend` | `BOTMUX_CORE_BACKEND` | `tmux` | `tmux` or `pty`; PTY has no cross-daemon pane recovery |
 | (no flag) | `BOTMUX_CORE_MODEL` | unset | Override the synthetic bot's default model (env-only; no matching flag) |
 
 > **Visible TUI vs structured return**: `--cli codex-app` uses the app-server runner — structured return, no visible terminal; `--cli codex` (or `claude-code`) runs a visible TUI in a tmux pane you can watch/operate via the web terminal (see [§6](#6-writable-web-terminal)).
@@ -60,7 +61,7 @@ The daemon **binds the port first, then completes durable restore**. So "port ac
   - not ready → `503 {"ok":false,"status":"starting"}`
   - ready → `200 {"ok":true}`
 
-The readiness barrier **also gates the public control routes**: while restore is incomplete, `/api/trigger`, `/api/sessions/:id/trigger-result`, and `/api/sessions/:id/insight` also return `503 {status:'starting'}` — so even a client that skips the `/healthz` probe cannot trigger into a racing restore. **Recommended: poll `/healthz` until 200 before the first trigger.**
+The readiness barrier **also gates the public control routes**: while restore is incomplete, `/api/trigger`, `/api/sessions/:id/trigger-result`, `/api/sessions/:id/insight`, and `/api/sessions/:id/host-facts` also return `503 {status:'starting'}` — so even a client that skips the `/healthz` probe cannot trigger into a racing restore. **Recommended: poll `/healthz` until 200 before the first trigger.**
 
 ---
 
@@ -75,6 +76,7 @@ core-only's IPC routes are not a "public vs everything-HMAC" split — there are
 | `/api/trigger` | POST | Start a turn |
 | `/api/sessions/:id/trigger-result` | GET | Poll the final result (four states) |
 | `/api/sessions/:id/insight` | GET | Poll conversation / progress |
+| `/api/sessions/:id/host-facts` | GET | Read safe session-host facts |
 | `/healthz` | GET | Readiness probe (core-only alias) |
 
 (`/__health` is also **permanently public** in every mode, but it is a **legacy liveness probe that always returns 200** — it is **not** equivalent to `/healthz`: `/healthz` returns `503 {status:'starting'}` until restore/attach/scheduler finish, i.e. it is the core-only **readiness barrier**. To decide "may I start triggering", you **must** use `/healthz`; using `/__health` would read as ready-when-not and trigger too early into a racing restore.)
@@ -171,6 +173,18 @@ curl -s "http://127.0.0.1:8930/api/sessions/<uuid>/trigger-result"
 
 > **Completion mechanism**: `trigger-result` flips to `completed` when botmux extracts final_output from the CLI transcript. core-only claude-code once had a bug where, after the first-turn ready-gate timed out and fell back, the persisted user line was head-truncated → the completion signal never bound → permanent `running`. Fixed in **v3.9.0** (suffix-anchored content proof to bind the durable mark). Use **v3.9.0 or later**.
 
+### Session-host facts
+
+An embedding application that treats Botmux as a real CLI session host can read:
+
+```bash
+curl -s "http://127.0.0.1:8930/api/sessions/<uuid>/host-facts"
+```
+
+This core-only route exposes the session id, CLI, backend, `exists / missing / unknown` liveness, worker generation, the CLI native session/thread id, and Botmux's current logical turn id. It never exposes a tmux socket, PID, worker token, environment, terminal-write capability, or CLI native turn id.
+
+A CLI turn ending and an embedding application's business completion are separate facts. A Workflow caller must still validate and persist its own result before advancing its state machine. Never interpret `unknown` as `missing` or create a replacement session from it.
+
 ---
 
 ## 6. Writable web terminal
@@ -212,6 +226,7 @@ core-only is "no Feishu outbound + single-tenant loopback", with a ring of delib
 - **No Feishu Client**: an apiOnly bot never constructs a `Lark.Client`; `larkAppSecret` is **withheld** from workers (not injected into the child env).
 - **Config authority**: ignores `~/.botmux/bots.json` and `BOTS_CONFIG`, and the entrypoint **deletes** `process.env.BOTS_CONFIG` — so a forked worker can't `cat $BOTS_CONFIG` to read a real fleet's sibling credentials.
 - **State isolation**: the entrypoint **freezes** `SESSION_DATA_DIR` to a dedicated `~/.botmux/core-only/<botId>/data` — a managed turn carrying the host's `SESSION_DATA_DIR` can't point core-only at the real fleet's sessions/pid/descriptor.
+- **Host-secret isolation**: the core-only dispatch-report signing secret lives inside its dedicated `SESSION_DATA_DIR`; an explicit `--state-dir` never writes a new secret into its parent or reads the same-HOME fleet's shared secret. For historical core-only state only, the old leaf is migrated when it exists and passes strict host-credential validation; an absent old leaf creates a new in-state secret, while an unsafe old leaf fails closed.
 - **Loopback freeze**: `BOTMUX_WORKER_HTTP_HOST` and `WEB_EXTERNAL_HOST` are both frozen to `127.0.0.1` (bind and advertised host agree), so the worker web server is never exposed on all interfaces.
 - **Skips host maintenance**: core-only does not run fleet-level auto-restart / `botmux restart` / shared-HOME breadcrumb writes; it never touches the global botmux install on the same machine.
 - **Auth is still the hard gate**: loopback is connectivity, not identity — same-machine processes (incl. bwrap sandboxes, which normally share the network namespace) can also dial `127.0.0.1`. So beyond §3's Layer-1 three control routes + `/healthz`/`/__health`, every route is authenticated: Layer 2 by a per-session capability / independent strong signature verified in the handler, and Layer-3 host/operator routes by the §4 route+port-bound HMAC. No layer is "bare loopback is enough".
@@ -226,6 +241,7 @@ core-only is "no Feishu outbound + single-tenant loopback", with a ring of delib
 | `/api/trigger` | POST | public (layer 1) | Start a turn (must set an HTTP response mode) |
 | `/api/sessions/:id/trigger-result` | GET | public (layer 1) | Poll the final result (four states); core-only live worker also carries `readOnlyUrl`+`viewToken` |
 | `/api/sessions/:id/insight` | GET | public (layer 1) | Poll conversation / progress |
+| `/api/sessions/:id/host-facts` | GET | public (layer 1) | Read safe session/CLI/backend/liveness facts; grants no terminal write access |
 | `/api/sessions/:id/write-link` | GET | **HMAC + bind** (layer 3) | Get the writable terminal URL (fetch on open) |
 | `/api/sessions/:id` | GET | **HMAC + bind** (layer 3) | Session metadata |
 | `/api/sessions/:id/close` | POST | HMAC + bind (layer 3) **or** in-session capability (layer 2) | Cancel / close the session |

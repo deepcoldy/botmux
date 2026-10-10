@@ -412,8 +412,9 @@ import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
-import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
-import { isRemoteBackendSession } from './persistent-backend.js';
+import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
+import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
+import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
@@ -867,6 +868,7 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  *   POST /api/sessions/:id/turns/:triggerId/interrupt (stop exact turn)
  *   GET  /api/sessions/:id/trigger-result          (poll final)
  *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
+ *   GET  /api/sessions/:id/host-facts              (read safe session-host facts)
  * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
  * session/turn binding, so exposing it would let any co-resident turn hijack
  * another pending ask (codex). riff's async main-link needs no awaiting_input;
@@ -877,7 +879,8 @@ function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/turns\/[^/]+\/interrupt$/.test(pathname)) return true;
   if (method === 'GET') {
     return /^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
-      || /^\/api\/sessions\/[^/]+\/insight$/.test(pathname);
+      || /^\/api\/sessions\/[^/]+\/insight$/.test(pathname)
+      || /^\/api\/sessions\/[^/]+\/host-facts$/.test(pathname);
   }
   return false;
 }
@@ -3768,6 +3771,52 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   // resolved state including not_found — task state lives in `result.state`,
   // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
   jsonRes(res, result.ok ? 200 : 400, result);
+});
+
+/**
+ * core-only 会话宿主事实：供嵌入方读取会话、CLI、后端、worker 与 native session 状态。
+ *
+ * 路由只在 startIpcServer({ coreOnlyPublicRoutes:true }) 时免 HMAC；普通 fleet 仍需可信
+ * host 鉴权。即使在 core-only 下也只允许本 daemon 的 apiOnly HTTP virtual session，且
+ * 永不返回 tmux socket、worker token、PID、环境变量或任意终端写 capability。
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/host-facts', (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  const session = ds?.session ?? sessionStore.getOwnedSession(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (!cachedLarkAppId || session.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  let apiOnly = false;
+  try { apiOnly = getBot(cachedLarkAppId).config.apiOnly === true; } catch { /* fail closed below */ }
+  if (!apiOnly || !isHttpVirtualSession(session.chatId)) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+
+  const backend = ds?.initConfig?.backendType ?? session.backendType ?? null;
+  let backingProbe: import('../adapters/backend/types.js').SessionProbe | null = null;
+  if (ds) {
+    try {
+      const target = persistentBackendTargetForSession(ds);
+      if (target) backingProbe = probePersistentBackendTarget(target);
+    } catch {
+      backingProbe = 'unknown';
+    }
+  }
+  const workerPresent = !!ds?.worker && !ds.worker.killed && ds.worker.exitCode === null;
+  const facts = projectCoreOnlyHostFacts({
+    sessionId: session.sessionId,
+    sessionStatus: session.status,
+    cli: ds?.initConfig?.cliId ?? session.cliLaunchSnapshot?.cliId ?? session.cliId ?? null,
+    backend,
+    nativeSessionId: session.cliSessionId ?? null,
+    activeTurnId: ds?.activeInteractiveTurn?.turnId ?? null,
+    workerPresent,
+    workerReady: workerPresent && ds?.workerReady === true,
+    workerGeneration: ds?.workerGeneration ?? session.workerGeneration ?? null,
+    backingProbe,
+  });
+  return jsonRes(res, 200, { ok: true, facts });
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req, res, params) => {

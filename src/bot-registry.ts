@@ -3129,6 +3129,14 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   const cliId = process.env.BOTMUX_CORE_CLI || 'codex-app';
   const entry: Record<string, unknown> = { larkAppId, apiOnly: true, cliId };
   if (process.env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = process.env.BOTMUX_CORE_WORKING_DIR;
+  // Core-only keeps tmux as the default. PTY is an explicit opt-in for embedded
+  // hosts that cannot establish a reliable tmux server; it is intentionally
+  // limited to this synthetic apiOnly Bot and never changes fleet defaults.
+  const coreBackend = process.env.BOTMUX_CORE_BACKEND;
+  if (coreBackend !== undefined && coreBackend !== 'tmux' && coreBackend !== 'pty') {
+    throw new Error(`Core-only BOTMUX_CORE_BACKEND must be tmux or pty, got: ${coreBackend}`);
+  }
+  if (coreBackend) entry.backendType = coreBackend;
   if (process.env.BOTMUX_CORE_MODEL) entry.model = process.env.BOTMUX_CORE_MODEL;
   if (process.env.BOTMUX_CORE_CODEX_AUTH_SYNC === 'isolated') entry.codexAuthSync = 'isolated';
   // Route through the normal parser so the synthesized entry gets identical
