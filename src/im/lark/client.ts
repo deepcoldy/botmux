@@ -2,6 +2,7 @@ import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendEr
 import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
@@ -20,6 +21,7 @@ import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../s
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import { executeWithLarkGate } from './api-gate.js';
 import type { ChatContext } from '../../types.js';
+import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -1618,6 +1620,22 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
     return;
   } catch (appErr: any) {
+    // 234037 is a transfer-size limit, not an identity/permission failure.
+    // Retry with the SAME app token, including passive-history downloads.
+    // A failed Range transfer must propagate, never turn into a /login prompt.
+    if (await isResourceSizeLimitError(appErr)) {
+      const c = getBotClient(larkAppId);
+      await downloadResourceWithRange((start, end) => (c as any).request({
+        method: 'GET',
+        url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}`,
+        params: { type },
+        headers: { Range: `bytes=${start}-${end}` },
+        responseType: 'stream',
+        timeout: 30_000,
+      }), savePath);
+      logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
+      return;
+    }
     // Passive history is only entitled to the observing app's visibility.
     // It must never borrow a historical sender's OAuth credentials.
     if (options?.allowUserTokenFallback === false) throw appErr;
@@ -1676,6 +1694,26 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
+    if (await isResourceSizeLimitError({ response: { data: body } })) {
+      await downloadResourceWithRange(async (start, end) => {
+        const partial = await fetch(url, {
+          headers: { Authorization: `Bearer ${userToken}`, Range: `bytes=${start}-${end}` },
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!partial.ok || !partial.body) {
+          await partial.body?.cancel();
+          if (partial.status === 401) {
+            throw new UserTokenMissingError('User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。');
+          }
+          throw Object.assign(new Error(`Resource Range download failed: HTTP ${partial.status}`), { status: partial.status });
+        }
+        const stream = Readable.fromWeb(partial.body as any) as ResourceStream;
+        stream.statusCode = partial.status;
+        stream.headers = { 'content-range': partial.headers.get('content-range') ?? undefined };
+        return stream;
+      }, savePath);
+      return;
+    }
     // 401 = the token itself was rejected (expired / wrong scope) → genuinely
     // needs re-login. Any other status (403/404/4xx/5xx) means the token is
     // fine but THIS resource can't be fetched (cross-tenant, card image,
