@@ -6,6 +6,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { createMinimaxAdapter, minimaxDataDir } from '../src/adapters/cli/minimax.js';
 import { runMcodeExec } from '../src/services/mcode-exec.js';
+import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
 
 const roots: string[] = [];
 const children: ChildProcessWithoutNullStreams[] = [];
@@ -92,7 +93,10 @@ it('preserves multiline messages, tools, owner and exact session across turns', 
   const finals = markers(h.stdout).filter(m => m.kind === 'final');
   expect(finals.map(m => m.payload.turnId)).toEqual(['one', 'two']);
   expect(finals[0].payload.content).toBe('answer:line 1\nline 2');
-  expect(finals[0].payload.usage).toEqual({ inputTokens: 15, outputTokens: 5, cachedInputTokens: 2, cacheWriteInputTokens: 3 });
+  const expectedUsage = { inputTokens: 15, outputTokens: 5, cacheReadTokens: 2, cacheCreateTokens: 3 };
+  expect(finals[0].payload.usage).toEqual(expectedUsage);
+  // Exercise the actual worker boundary, not just the runner's own shape.
+  expect(finals.map(m => normalizeFinalUsage(m.payload.usage))).toEqual([expectedUsage, expectedUsage]);
   expect(h.stdout).toContain('[tool] bash');
 });
 
@@ -123,6 +127,23 @@ it.each(['incomplete', 'nonzero', 'mismatch', 'failed'])('does not report succes
   const f = fixture();
   await expect(runMcodeExec({ executable: f.executable, cwd: f.root, env: { ...process.env, MCODE_TEST_LOG: f.log },
     content, nativeSessionId: 'session_fixture', timeoutMs: 5000, permission: 'full' }, AbortSignal.timeout(8000))).rejects.toThrow();
+});
+
+it.each([
+  ['failed-zero-exit', 'mcode_inference_incomplete'],
+  ['nonstring-output', 'mcode_inference_incomplete'],
+  ['duplicate-sequence', 'mcode_protocol_invalid'],
+  ['decreasing-sequence', 'mcode_protocol_invalid'],
+  ['event-after-completed', 'mcode_protocol_invalid'],
+  ['run-drift', 'mcode_run_mismatch'],
+  ['turn-drift', 'mcode_run_mismatch'],
+  ['result-session-mismatch', 'mcode_protocol_invalid'],
+  ['result-run-mismatch', 'mcode_protocol_invalid'],
+  ['result-turn-mismatch', 'mcode_protocol_invalid'],
+])('rejects hostile native stream %s even with a clean exit', async (content, error) => {
+  const f = fixture();
+  await expect(runMcodeExec({ executable: f.executable, cwd: f.root, env: { ...process.env, MCODE_TEST_LOG: f.log },
+    content, nativeSessionId: 'session_fixture', timeoutMs: 5000, permission: 'full' }, AbortSignal.timeout(8000))).rejects.toThrow(error);
 });
 
 it('kills a hung invocation and permits a later turn in the same native session', async () => {

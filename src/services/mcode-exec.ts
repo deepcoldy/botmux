@@ -17,7 +17,7 @@ export interface McodeExecOptions {
 export interface McodeExecResult {
   sessionId: string;
   content: string;
-  usage?: { inputTokens: number; outputTokens: number; cachedInputTokens: number; cacheWriteInputTokens: number };
+  usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
 }
 
 /** Official v1 stream-json contract. Only exec.completed's result is a final
@@ -69,7 +69,7 @@ export async function runMcodeExec(opts: McodeExecOptions, signal: AbortSignal):
     && valid(raw.cacheReadTokens ?? 0) && valid(raw.cacheWriteTokens ?? 0)
     // Native fresh input excludes cache reads/writes; Botmux input is total.
     ? { inputTokens: raw.inputTokens + (raw.cacheReadTokens ?? 0) + (raw.cacheWriteTokens ?? 0), outputTokens: raw.outputTokens,
-      cachedInputTokens: raw.cacheReadTokens ?? 0, cacheWriteInputTokens: raw.cacheWriteTokens ?? 0 }
+      cacheReadTokens: raw.cacheReadTokens ?? 0, cacheCreateTokens: raw.cacheWriteTokens ?? 0 }
     : undefined;
   return { sessionId: result.sessionId, content: result.output, ...(usage ? { usage } : {}) };
 }
