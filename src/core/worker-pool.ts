@@ -15699,6 +15699,9 @@ function setupWorkerHandlers(
           break;
         }
         const prior = ds.session.remoteBackendState;
+        const rebuildGenerationAdvanced = startupState.onRemoteBackendStartupExit !== undefined
+          && prior !== undefined
+          && state.generation > prior.generation;
         if (prior && state.provider !== prior.provider) {
           logger.error(`[${t}] Ignored remote backend state from a different provider`);
           break;
@@ -15724,7 +15727,13 @@ function setupWorkerHandlers(
           // RemoteRunnerBackend publishes its normalized ready state before
           // firing onReady. For an explicit rebuild this is the durable proof
           // that the provider crossed its second (backend) startup boundary.
-          startupState.onRemoteBackendStartupExit = undefined;
+          // onBackendState immediately replays the CONSTRUCTOR'S initial state
+          // when the callback is registered. That same-generation replay is not
+          // provider readiness and must not disarm rollback: otherwise a child
+          // exit during resume leaves the Session ghost-active with no backend.
+          if (rebuildGenerationAdvanced) {
+            startupState.onRemoteBackendStartupExit = undefined;
+          }
         } catch (err) {
           ds.session.remoteBackendState = prior;
           ds.session.remoteRunnerUsage = priorUsage;

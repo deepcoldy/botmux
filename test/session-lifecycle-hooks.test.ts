@@ -486,6 +486,57 @@ describe('worker-pool lifecycle hook integration', () => {
     expect(reconcile).not.toHaveBeenCalled();
   });
 
+  it('keeps remote rebuild reconciliation armed for the initial same-generation state replay', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'remote-runner';
+    ds.session.backendType = 'remote-runner';
+    ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'reference',
+      generation: 2,
+    };
+    const reconcile = vi.fn(() => true);
+    const startupState = {
+      ready: true,
+      failureNotified: false,
+      onRemoteBackendStartupExit: reconcile,
+    };
+    __testOnly_setupWorkerHandlers(ds, worker, startupState as any);
+
+    worker.emit('message', {
+      type: 'remote_backend_state',
+      state: {
+        version: 1,
+        provider: 'reference',
+        generation: 2,
+      },
+    });
+    await flush();
+
+    expect(startupState.onRemoteBackendStartupExit).toBe(reconcile);
+    expect(reconcile).not.toHaveBeenCalled();
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 1,
+      signal: null,
+    });
+    await flush();
+
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(worker.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(ds.worker).toBeNull();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('clears the persisted terminal port and Dashboard proxy state on worker exit', () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, workerPort: 9999 });
