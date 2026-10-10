@@ -563,7 +563,6 @@ import {
 import {
   applyTrustedCodexAppActivityMarker,
   applyTrustedCodexAppStateMarker,
-  CODEX_APP_NO_PROGRESS_TIMEOUT_MS,
   CodexAppFlushPromptReplay,
   CodexAppReadyAuthority,
   CodexAppTurnLiveness,
@@ -5005,13 +5004,16 @@ function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): 
   if (liveness.shouldNotify) {
     send({
       type: 'user_notify',
+      // Lets the daemon apply the per-bot enabled mute against the LIVE
+      // registry (immediate effect, even for the turn stalled right now).
+      kind: 'codex_app_no_progress',
       turnId: liveness.turnId ?? currentBotmuxTurnId,
       ...(liveness.turnId === currentBotmuxTurnId
         && currentBotmuxDispatchAttempt !== undefined
         ? { dispatchAttempt: currentBotmuxDispatchAttempt }
         : {}),
       message: t('worker.codex_app.no_progress', {
-        seconds: Math.round(CODEX_APP_NO_PROGRESS_TIMEOUT_MS / 1000),
+        seconds: Math.round(codexAppTurnLiveness.getTimeoutMs() / 1000),
       }),
     });
   }
@@ -22778,6 +22780,13 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      if (msg.cliId === 'codex-app' && msg.noProgressNotify?.timeoutMs !== undefined) {
+        // Per-bot liveness window override (#1162). The value is normalized at
+        // the registry layer, so retimeout's positive-finite guard is purely
+        // defensive here. In-flight turns keep their activity clocks; only the
+        // window computation changes.
+        codexAppTurnLiveness.retimeout(msg.noProgressNotify.timeoutMs);
+      }
       if (msg.cliInstanceBinding && (msg.cliId !== 'codex' || msg.adoptMode || msg.existingAppServerEndpoint)) {
         throw new Error('Codex instance binding is incompatible with this worker init');
       }

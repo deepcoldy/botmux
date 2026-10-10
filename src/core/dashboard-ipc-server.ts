@@ -6744,6 +6744,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
+    noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
@@ -8158,6 +8159,31 @@ ipcRoute('PUT', '/api/bot-oncall-group', async (req, res) => {
   const result = await applyConfigField(cachedLarkAppId, spec, parsed.value);
   if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
   jsonRes(res, 200, { ok: true, oncallGroup: parsed.value });
+});
+
+// Per-bot Codex App 无进展提醒 noProgressNotify（#1162）。Body
+// `{ noProgressNotify?: { enabled?: boolean; timeoutMs?: number } | null }`:
+//   • null/缺省 → 清回默认（开启 + 90s）
+//   • {"enabled":false} → 仅静默 Lark 推送（立即生效，读实时 registry）
+//   • {"timeoutMs":300000} → 调整阈值（10000–3600000ms，下一个 worker 进程生效）
+// 走 coerceConfigValue + applyConfigField（与 /config set 同一写盘 + 热更新路径）。
+ipcRoute('PUT', '/api/bot-no-progress-notify', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { noProgressNotify?: unknown };
+  try { body = await readJsonBody<{ noProgressNotify?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const spec = findConfigField('noProgressNotify');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  if (body.noProgressNotify === null) {
+    const cleared = await applyConfigField(cachedLarkAppId, spec, null);
+    if (!cleared.ok) return jsonRes(res, 400, { ok: false, error: cleared.reason });
+    return jsonRes(res, 200, { ok: true, noProgressNotify: null });
+  }
+  const parsed = coerceConfigValue(spec, JSON.stringify(body.noProgressNotify ?? {}));
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.reason });
+  const result = await applyConfigField(cachedLarkAppId, spec, parsed.value);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, noProgressNotify: parsed.value ?? null });
 });
 
 ipcRoute('PUT', '/api/bot-feedback', async (req, res) => {

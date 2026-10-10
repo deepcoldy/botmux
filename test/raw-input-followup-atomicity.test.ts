@@ -143,8 +143,9 @@ describe('worker raw_input delivery', () => {
   // The span only has to cover deliverRawInput's body; it is not itself an
   // assertion. Kept comfortably ahead of the last anchor below (the previous
   // 7000 left ~2 chars of slack, so any added line broke these tests for
-  // reasons that had nothing to do with what they check).
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 7600);
+  // reasons that had nothing to do with what they check; 7600 lasted until
+  // the codex-app liveness nudge wiring landed mid-span).
+  const region = caseRegion(workerSrc, 'async function deliverRawInput', 8000);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
     const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');

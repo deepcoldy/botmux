@@ -12746,6 +12746,10 @@ export function forkWorker(
     // dsh runtime variant (official runner vs dsh-tui PTY TUI).
     dshRuntime: botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
+    // Codex App no-progress nudge tuning: read live from bot config so
+    // /config set noProgressNotify takes effect on the next worker fork
+    // without recreating the session (same pattern as turnTimeoutMs).
+    noProgressNotify: agentCfg.cliId === 'codex-app' ? botCfg.noProgressNotify : undefined,
     codexBrowser: botCfg.codexBrowser,
     // Existing App Server attachment owns neither an app-server nor a JSON-RPC
     // input channel. It is a normal official remote TUI, so all user input goes
@@ -15931,6 +15935,19 @@ function setupWorkerHandlers(
           message: msg.message,
         });
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        // Mute ONLY the Lark push for the per-bot opt-out: checked against the
+        // LIVE registry so an already-stalled turn is silenced the moment the
+        // config lands. The lifecycle hook above and the dashboard stalled
+        // projection stay observable either way; registry read failures fail
+        // open (nudge delivered) rather than silently eating real warnings.
+        if (msg.kind === 'codex_app_no_progress') {
+          let muted = false;
+          try { muted = getBot(ds.larkAppId).config.noProgressNotify?.enabled === false; } catch { /* fail open */ }
+          if (muted) {
+            logger.info(`[${t}] Codex App no-progress nudge muted by noProgressNotify.enabled=false`);
+            break;
+          }
+        }
         try {
           await scopedReply(msg.message, 'text', msg.turnId);
         } catch (err: any) {
@@ -18909,6 +18926,9 @@ export function forkAdoptWorker(
     dshProfile: botCfg.dshProfile,
     dshRuntime: botCfg.dshRuntime,
     disableCliBypass: botCfg.disableCliBypass === true,
+    // Same live-read pattern as the primary init: adopt re-forks gate on the
+    // adopted CLI id.
+    noProgressNotify: adoptedCliId === 'codex-app' ? botCfg.noProgressNotify : undefined,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
     // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited

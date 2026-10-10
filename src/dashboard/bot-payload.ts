@@ -192,6 +192,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
+    noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,

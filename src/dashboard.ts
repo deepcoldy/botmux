@@ -7980,6 +7980,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/no-progress-notify — proxy to that bot's daemon.
+    // Body `{ noProgressNotify: { enabled?: boolean; timeoutMs?: number } | null }`
+    // (null = clear → enabled nudge at the built-in 90s window).
+    let mBotNoProgress: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotNoProgress = url.pathname.match(/^\/api\/bots\/([^/]+)\/no-progress-notify$/))) {
+      const appId = decodeURIComponent(mBotNoProgress[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-no-progress-notify`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/idle-suspend-minutes — proxy to that bot's daemon.
     // Body `{ idleSuspendMinutes: number | null }` (null = clear → idle TTL
     // disabled; a positive integer sets the minutes threshold).

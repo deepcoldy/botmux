@@ -185,6 +185,35 @@ describe('shouldBeginCodexAppReattachObservation', () => {
 });
 
 describe('CodexAppTurnLiveness', () => {
+  it('retimes the liveness window in place without touching in-flight turns', () => {
+    const tracker = new CodexAppTurnLiveness(1_000);
+    tracker.begin('turn-a', 0);
+    expect(tracker.getTimeoutMs()).toBe(1_000);
+    // 0.9s: inside the original window.
+    expect(tracker.poll(900)).toMatchObject({ stalled: false, shouldNotify: false });
+    // Widen to 2s (#1162): the turn's activity clock stays at 0.
+    tracker.retimeout(2_000);
+    expect(tracker.getTimeoutMs()).toBe(2_000);
+    // 1.9s: the old window would have fired; the widened one has not.
+    expect(tracker.poll(1_900)).toMatchObject({ stalled: false, shouldNotify: false });
+    // 2s: the widened window fires, once per turn as usual.
+    expect(tracker.poll(2_000)).toMatchObject({ newlyStalled: true, shouldNotify: true, turnId: 'turn-a' });
+    expect(tracker.poll(2_500)).toMatchObject({ stalled: true, shouldNotify: false });
+    // Activity after the stall still recovers the turn under the new window;
+    // a second stall of the SAME turn stays once-per-turn silent.
+    tracker.noteActivity(2_600);
+    expect(tracker.poll(3_500)).toMatchObject({ stalled: false, shouldNotify: false });
+    expect(tracker.poll(4_600)).toMatchObject({ newlyStalled: true, shouldNotify: false });
+  });
+
+  it('rejects invalid retimeout values like the constructor', () => {
+    const tracker = new CodexAppTurnLiveness();
+    expect(() => tracker.retimeout(0)).toThrow();
+    expect(() => tracker.retimeout(-5)).toThrow();
+    expect(() => tracker.retimeout(Number.NaN)).toThrow();
+    // A rejected retimeout leaves the previous window in place.
+    expect(tracker.getTimeoutMs()).toBe(90_000);
+  });
   it('coalesces a replayed final while persistence is pending and keeps type-ahead working', async () => {
     const tracker = new CodexAppTurnLiveness(1_000);
     const gate = new CodexAppControlRecordApplicationGate();
