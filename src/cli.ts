@@ -9513,11 +9513,16 @@ async function cmdSend(rest: string[]): Promise<void> {
   // adds spawn-time BOTMUX_TURN_ID/ATTEMPT compatibility fallbacks, which can be
   // stale after a later turn, so only a parent-bound host relay or a fresh
   // marker/protected-capability tuple can authorize a durable dispatch.
+  // An unreadable marker (e.g. Seatbelt EPERM) is reported as sessionId ''.
+  // Treat it as absent so it cannot shadow the attested managed origin, but
+  // never let it degrade to the child-controlled ancestor/env fallbacks.
+  const liveMarkerUnreadable = !!liveMarkerCtx && !liveMarkerCtx.sessionId;
   const originSessionId = trustedRelayCtx?.sessionId
-    ?? liveMarkerCtx?.sessionId
+    ?? (liveMarkerCtx?.sessionId || undefined)
     ?? isolatedManagedOriginCtx?.sessionId
-    ?? ancestorCtx?.sessionId
-    ?? process.env.BOTMUX_SESSION_ID;
+    ?? (liveMarkerUnreadable
+      ? undefined
+      : ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID);
   const authoritativeOriginTurnCtx = trustedRelayCtx
     ? (trustedRelayCtx.turnId ? trustedRelayCtx : undefined)
     : (liveMarkerCtx?.turnId
