@@ -2601,6 +2601,53 @@ describe('message listener polling backfill', () => {
     );
   });
 
+  it('routes a recent top-level merge-forward message found in chat history', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '阅读转发内容并响应',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [USER_OPEN_ID],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    const forwarded = makeHistoryMessage({
+      senderAppId: USER_OPEN_ID,
+      senderType: 'user',
+      messageType: 'merge_forward',
+      messageId: 'msg-polled-forward',
+      chatId: 'chat_listener',
+      content: '{}',
+      createTime: String(Date.now()),
+    });
+    forwarded.sender.id_type = 'open_id';
+    mockListChatMessagesUntil.mockResolvedValueOnce([forwarded]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-forward' }) }),
+      expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-polled-forward',
+        messageListener: expect.objectContaining({
+          senderOpenId: USER_OPEN_ID,
+          senderType: 'user',
+          msgType: 'merge_forward',
+        }),
+      }),
+    );
+  });
+
   it('does not replay a polled listener message after the message_id is claimed', async () => {
     const card = makeHistoryMessage({
       senderAppId: OTHER_BOT_APP_ID,
@@ -10074,6 +10121,30 @@ describe('solo-group mention bypass configuration', () => {
     const event = await send();
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       messageListener: expect.objectContaining({ senderOpenId: USER_OPEN_ID }),
+    }));
+  });
+
+  it('routes configured merge-forward topic roots through the listener', async () => {
+    start({
+      soloGroupMentionBypass: false,
+      messageListeners: {
+        [CHAT]: {
+          enabled: true, prompt: 'Read forwarded messages',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [USER_OPEN_ID], includeSenderTypes: ['user'] },
+          messagePolicy: { includeMsgTypes: ['merge_forward'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    const event = await send({
+      messageType: 'merge_forward',
+      content: '{}',
+    });
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      messageListener: expect.objectContaining({
+        senderOpenId: USER_OPEN_ID,
+        msgType: 'merge_forward',
+      }),
     }));
   });
 
