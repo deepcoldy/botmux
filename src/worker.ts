@@ -20077,11 +20077,16 @@ async function spawnCli(
     //
     // Both branches below are blocked while the gate still holds (flushPending
     // and markPromptReady both bail on readyGate.shouldHold()), so release it
-    // first. This is the hard cap: the adapter's own deadline has passed, so the
-    // gate's extra hold must not outlive it. Falling through (rather than
-    // returning) keeps the settle → mark-ready path intact for non-type-ahead
-    // adapters.
-    if (readyGate.shouldHold()) {
+    // first — but ONLY at the hard cap (`forced`): that is the adapter's own
+    // deadline, so the gate's extra hold must not outlive it. A SOFT timeout
+    // (15s) leaves the gate armed: for an adapter that does not defer
+    // (claude-code), the gate is the anti-startup-selector hold and its own
+    // release edge is the READY_SIGNAL_TIMEOUT_MS (45s) fallback — opening it
+    // here would write the first message into a selector that has not been
+    // passed yet, exactly what the gate exists to prevent. Falling through
+    // (rather than returning) keeps the settle → mark-ready path intact for
+    // non-type-ahead adapters.
+    if (forced && readyGate.shouldHold()) {
       log('First prompt hard timeout — releasing ready gate before the hard-cap flush');
       releaseReadyGate('first-prompt hard timeout');
     }
