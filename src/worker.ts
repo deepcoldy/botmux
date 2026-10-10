@@ -2841,6 +2841,23 @@ function releaseReadyGate(reason: string, opts?: { promptReadyAfterSettle?: bool
   }
 }
 
+/** Cancel a post-release quiescence settle that is still pending.
+ *
+ *  Called by the FIRST-PROMPT HARD CAP, which is the adapter's own deadline: for
+ *  an adapter that defers its first prompt, the ready-gate's own fallback is
+ *  aligned WITH that cap (resolveReadySignalTimeoutMs), so both timers land in
+ *  the same tick and the gate's release starts a settle that `flushPending()`
+ *  then honours for up to READY_FLUSH_SETTLE_CAP_MS — the "90s hard cap" would
+ *  really be 96s of held input. The cap wins over a settle still in flight
+ *  (including one started by a real ready signal shortly before the cap); a
+ *  settle that already finished is a no-op here. */
+function cancelFirstFlushSettle(): void {
+  if (!readyFlushSettleTimer && !isSettlingFirstFlush) return;
+  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+  isSettlingFirstFlush = false;
+  log('First prompt hard timeout — cancelling the pending ready-gate settle (cap is the deadline)');
+}
+
 /** Per-startup-command quiescence: how long the PTY must be quiet before sending
  *  the next command, capped so a slow/redrawing command can't stall the queue. */
 const STARTUP_CMD_QUIET_MS = 500;
@@ -20067,6 +20084,14 @@ async function spawnCli(
       log('First prompt hard timeout — releasing ready gate before the hard-cap flush');
       releaseReadyGate('first-prompt hard timeout');
     }
+    // …and at the HARD CAP (not at a soft timeout) cancel whatever settle that
+    // release just started — or one a cap-aligned gate fallback started in this
+    // same tick: the cap is the adapter's deadline, so the first write must not
+    // land up to READY_FLUSH_SETTLE_CAP_MS later. Without this, the "90s hard
+    // cap" actually held the queued first input for 90–96s. A soft-timeout
+    // release keeps its settle: that is the pre-existing behavior for legacy
+    // adapters, whose own cap is far away.
+    if (forced) cancelFirstFlushSettle();
     if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush') {
       const armPromptSeed = shouldArmFirstPromptTimeoutPromptSeed({
         wasAwaitingPostHookPrompt,
