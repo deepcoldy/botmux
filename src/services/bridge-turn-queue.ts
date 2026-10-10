@@ -128,6 +128,8 @@ export interface BridgePendingTurn {
    *  delivered fallback with an "interrupted by restart" notice so the user
    *  can tell a recovered partial answer from a live one. */
   restoredFromJournal?: boolean;
+  /** Observed at least one non-error assistant event (including tool calls). */
+  hasAssistantActivity?: boolean;
 }
 
 /** Trim a Lark message into a stable fingerprint. Keeps a leading window
@@ -502,6 +504,9 @@ export class BridgeTurnQueue {
           this.collecting = headless;
           this.onLocalTurnStarted?.(headless);
         }
+        if (this.collecting) {
+          this.collecting.hasAssistantActivity = true;
+        }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
           try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
@@ -580,13 +585,16 @@ export class BridgeTurnQueue {
    *  unstarted — the scheduler's prompt must never fingerprint-bind them. */
   private handleScheduledTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
     // Same transcript-order closeout as a real turn start.
-    if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
-      this.collecting.terminalObserved = true;
-      this.collecting = null;
+    if (this.collecting && !this.collecting.terminalObserved) {
+      if (this.collecting.dispatchAttempt !== undefined || this.collecting.hasAssistantActivity) {
+        this.collecting.terminalObserved = true;
+        this.collecting = null;
+      }
     }
     if (this.collecting
       && !this.collecting.terminalObserved
-      && this.collecting.assistantUuids.length === 0) {
+      && this.collecting.assistantUuids.length === 0
+      && !this.collecting.hasAssistantActivity) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
       if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
@@ -658,17 +666,20 @@ export class BridgeTurnQueue {
     // JSONL variants that omitted the explicit final marker, without trusting
     // the TUI's prompt-looking screen. Keep the turn queued so an empty/silent
     // durable delivery still produces its terminal receipt.
-    if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
-      this.collecting.terminalObserved = true;
-      this.collecting = null;
+    if (this.collecting && !this.collecting.terminalObserved) {
+      if (this.collecting.dispatchAttempt !== undefined || this.collecting.hasAssistantActivity) {
+        this.collecting.terminalObserved = true;
+        this.collecting = null;
+      }
     }
     // Head-of-line block drop: previous turn never produced any visible
-    // assistant text and a new meaningful turn-start has arrived → Claude
+    // assistant text or assistant activity and a new meaningful turn-start has arrived → Claude
     // is single-threaded over the PTY, so the old turn will never get
     // text. Applies to both Lark and local turns.
     if (this.collecting
       && !this.collecting.terminalObserved
-      && this.collecting.assistantUuids.length === 0) {
+      && this.collecting.assistantUuids.length === 0
+      && !this.collecting.hasAssistantActivity) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
       // This turn will never reach drainEmittable, which is where the worker

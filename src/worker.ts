@@ -3350,6 +3350,7 @@ let lastPtyActivityAtMs = 0;
 let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
+let currentTurnSteerPromoted = false;
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
   dispatchAttempt?: number;
@@ -3774,11 +3775,13 @@ function adoptInitialActiveTurn(parsed: {
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
+  steerPromotedTurn?: boolean;
 }): void {
   currentBotmuxTurnId = parsed.turnId;
   currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
     ? parsed.dispatchAttempt
     : undefined;
+  currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   activeTurnAuthority.clear();
   activeTurnAuthority.reserve({
     turnId: parsed.turnId,
@@ -3799,6 +3802,7 @@ function adoptDisplacedActiveTurn(parsed: {
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
+  steerPromotedTurn?: boolean;
 }): void {
   const currentCaller = activeTurnAuthority.snapshot()?.caller;
   const currentController = activeTurnAuthority.snapshot()?.controller;
@@ -3815,6 +3819,7 @@ function adoptDisplacedActiveTurn(parsed: {
   currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
     ? parsed.dispatchAttempt
     : undefined;
+  currentTurnSteerPromoted = Boolean(parsed.steerPromotedTurn);
   if (!queuedTypeAheadTurns.some(q => q.turnId === displaced.turnId)) {
     queuedTypeAheadTurns.unshift(displaced);
   }
@@ -3872,6 +3877,7 @@ function writeCliPidMarker(): void {
                     ? parsed.dispatchAttempt
                     : advancedRecord.dispatchAttempt;
                   currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
+                  currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
                   queuedTypeAheadTurns.splice(0, idx + 1);
                   markActiveTurnStarted(advancedRecord);
                   publishSandboxRelayCapability();
@@ -3927,6 +3933,7 @@ function writeCliPidMarker(): void {
           ...(queuedTurnId ? { queuedTurnId } : {}),
           ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
           ...(procStart ? { procStart } : {}),
+          ...(currentTurnSteerPromoted ? { steerPromotedTurn: true } : {}),
         }));
       });
     } catch (err: any) {
@@ -3992,6 +3999,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
                 ? parsed.dispatchAttempt
                 : advancedRecord.dispatchAttempt;
               currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
+              currentTurnSteerPromoted = Boolean((parsed as any)?.steerPromotedTurn);
               queuedTypeAheadTurns.splice(0, idx + 1);
               markActiveTurnStarted(advancedRecord);
               publishSandboxRelayCapability();
@@ -4041,6 +4049,8 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
   currentBotmuxTurnId = next.turnId;
   currentBotmuxDispatchAttempt = next.dispatchAttempt;
   currentVcMeetingImTurnOrigin = next.vcMeetingImTurnOrigin;
+  currentTurnSteerPromoted = true;
+  queuedTurnAdvanceConsumedForPrompt = true;
   markActiveTurnStarted(next);
   writeCliPidMarker();
   publishSandboxRelayCapability();
@@ -13807,7 +13817,20 @@ async function flushPending(): Promise<void> {
         normalWritePrepared = true;
         syncQueuedTurnsFromMarkerDisk();
 
+        let currentTurnFinalDelivered = Boolean(
+          currentBotmuxTurnId
+            && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
+        );
+        if (currentTurnFinalDelivered && queuedTypeAheadTurns.length > 0) {
+          advanceQueuedTypeAheadTurn('final_delivered');
+          currentTurnFinalDelivered = Boolean(
+            currentBotmuxTurnId
+              && readSendMarkers().some(m => m.turnId === currentBotmuxTurnId && m.responseKind === 'final')
+          );
+        }
+
         const isTypeAhead = !!currentBotmuxTurnId
+          && !currentTurnFinalDelivered
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
           && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0 || queuedTypeAheadTurns.length > 0);
@@ -13831,6 +13854,7 @@ async function flushPending(): Promise<void> {
           currentBotmuxTurnId = item.turnId;
           currentBotmuxDispatchAttempt = item.dispatchAttempt;
           currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
+          currentTurnSteerPromoted = false;
           // Intentionally preserve queuedTypeAheadTurns: earlier type-ahead turns remain in queue.
           markActiveTurnStarted(item);
         }

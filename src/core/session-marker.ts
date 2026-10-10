@@ -30,6 +30,7 @@ export interface AncestorSessionContext {
   trustedController?: TrustedCaller;
   queuedTurnId?: string;
   queuedTurns?: QueuedTypeAheadTurn[];
+  steerPromotedTurn?: boolean;
 }
 
 interface IdentityBoundSessionMarker extends AncestorSessionContext {
@@ -101,6 +102,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       procStart?: unknown;
       queuedTurnId?: unknown;
       queuedTurns?: unknown;
+      steerPromotedTurn?: unknown;
     };
     const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
     const queuedTurns = Array.isArray(parsed.queuedTurns)
@@ -128,6 +130,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
       ...(queuedTurnId ? { queuedTurnId } : {}),
       ...(queuedTurns && queuedTurns.length > 0 ? { queuedTurns } : {}),
+      ...(parsed.steerPromotedTurn === true ? { steerPromotedTurn: true } : {}),
     };
   } catch {
     return { sessionId: '' };
@@ -182,6 +185,7 @@ export function findAuthenticatedAncestorSessionContext(
         procStart: marker.procStart,
         ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
         ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
+        ...(marker.steerPromotedTurn ? { steerPromotedTurn: true } : {}),
       };
     }
     const parent = readParentPid(pid);
@@ -261,6 +265,7 @@ export function findAncestorSessionMarkerContext(
           markerPid: pid,
           ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
           ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
+          ...(marker.steerPromotedTurn ? { steerPromotedTurn: true } : {}),
         };
       }
       // Marker present but not ours: keep climbing (see doc comment above).
@@ -316,6 +321,7 @@ export function advanceAncestorSessionTurn(
       const updatedPayload: Record<string, unknown> = {
         sessionId: marker.sessionId,
         turnId: nextTurn.turnId,
+        steerPromotedTurn: true,
         ...(nextTurn.dispatchAttempt !== undefined ? { dispatchAttempt: nextTurn.dispatchAttempt } : {}),
         ...(nextTurn.trustedCaller ? { trustedCaller: nextTurn.trustedCaller } : {}),
         ...(nextTurn.trustedController ? { trustedController: nextTurn.trustedController } : {}),

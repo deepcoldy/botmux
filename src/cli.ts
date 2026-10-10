@@ -3912,6 +3912,7 @@ interface SessionData {
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
   turnReplyContexts?: Record<string, {
     target?: { mode?: string; chatId?: string; rootMessageId?: string };
+    quoteTargetId?: string;
     inThread?: boolean;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
@@ -9461,8 +9462,8 @@ async function cmdSend(rest: string[]): Promise<void> {
         : isolatedManagedOriginCtx?.turnId
           ? isolatedManagedOriginCtx
           : undefined);
-  const originTurnId = authoritativeOriginTurnCtx?.turnId;
-  const originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
+  let originTurnId = authoritativeOriginTurnCtx?.turnId;
+  let originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
   const originSession = originSessionId
     ? sessionsForOrigin.get(originSessionId)
     : undefined;
@@ -9821,7 +9822,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const currentTurnId = originTurnId;
+  let currentTurnId = originTurnId;
   let s: SessionData | undefined;
 
   // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
@@ -9883,9 +9884,35 @@ async function cmdSend(rest: string[]): Promise<void> {
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
+  const turnSendLedger = new TurnSendLedger(resolveDataDir());
+  while (liveMarkerCtx?.markerPid && liveMarkerCtx.turnId && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
+    const activeMarkerKey = {
+      larkAppId: originSession?.larkAppId ?? s.larkAppId,
+      sessionId: originSessionId ?? sid,
+      turnId: liveMarkerCtx.turnId,
+      ...(liveMarkerCtx.dispatchAttempt !== undefined ? { dispatchAttempt: liveMarkerCtx.dispatchAttempt } : {}),
+    };
+    const activePrior = turnSendLedger.read(activeMarkerKey);
+    if (activePrior?.final) {
+      const advResult = advanceAncestorSessionTurn(sendDataDir, liveMarkerCtx.markerPid, liveMarkerCtx.turnId);
+      if (advResult.advanced && advResult.turnId) {
+        liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+        originTurnId = advResult.turnId;
+        currentTurnId = advResult.turnId;
+        originDispatchAttempt = liveMarkerCtx?.dispatchAttempt;
+        continue;
+      }
+    }
+    break;
+  }
+
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
+    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.quoteTargetId
+    ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
+    ?? (currentTurnId?.startsWith('om_') ? currentTurnId : undefined);
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -10391,7 +10418,8 @@ async function cmdSend(rest: string[]): Promise<void> {
           noQuote,
           quoteTargetId: explicitQuote
             ?? frozenTurnDispatch?.quoteTargetId
-            ?? s.quoteTargetId,
+            ?? turnBoundQuoteTarget
+            ?? (currentTurnId ? undefined : s.quoteTargetId),
           frozenReplyTarget: frozenTurnReplyTarget,
           turnReplyTarget: turnReplyTarget
             ? {
@@ -10408,6 +10436,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       replyTargetSenderOpenId: explicitVcMeetingImOrigin?.replyTargetSenderOpenId
         ?? frozenTurnDispatch?.replyTargetSenderOpenId
         ?? turnReplyTarget?.senderOpenId
+        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
         ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId),
     },
     presentation: {
@@ -10434,7 +10463,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       })),
     },
   });
-  const turnSendLedger = new TurnSendLedger(dataDir);
   try {
     await turnSendLedger.pruneCompletedIfDue();
   } catch (error) {
@@ -10447,6 +10475,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EROFS') {
       logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (responseKind === 'auxiliary' && turnSendKey && liveMarkerCtx?.steerPromotedTurn) {
+    const prior = turnSendLedger.read(turnSendKey);
+    if (!prior?.final) {
+      effectiveResponseKind = 'final';
     }
   }
   const executeTurnPrimary = async (
@@ -10857,6 +10891,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
     ?? turnReplyTarget?.senderOpenId
+    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
     // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
     // borrowed as a legacy fallback when there is NO currentTurnId (true
     // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
@@ -11294,7 +11329,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? undefined
       : explicitVcMeetingImOrigin?.larkMessageId
         ?? frozenTurnDispatch?.quoteTargetId
-        ?? s.quoteTargetId,
+        ?? turnBoundQuoteTarget
+        ?? (currentTurnId ? undefined : s.quoteTargetId),
   });
   // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边。飞书的 reply 接口让回复继承
   // 被引用消息**此刻**的话题归属（`reply_in_thread:false` 只是不新开话题，逃不出
@@ -12125,12 +12161,16 @@ async function cmdSend(rest: string[]): Promise<void> {
           : 'non_patchable',
       );
     }
+    let advancedNextTurnId: string | undefined;
     if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
-      advanceAncestorSessionTurn(
+      const advResult = advanceAncestorSessionTurn(
         sendDataDir,
         liveMarkerCtx.markerPid,
         originTurnId ?? currentTurnId,
       );
+      if (advResult.advanced) {
+        advancedNextTurnId = advResult.turnId;
+      }
     }
 
     // Send attachments as separate messages — best-effort. The primary message
@@ -12202,7 +12242,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     const sendLocale = localeForBot(appId);
     console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
       ? t('ai.send.after_success_unified', undefined, sendLocale)
-      : t('ai.send.after_success_hint', undefined, sendLocale));
+      : advancedNextTurnId
+        ? t('ai.send.after_success_steer_advanced', undefined, sendLocale)
+        : t('ai.send.after_success_hint', undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',

@@ -966,6 +966,7 @@ export const messages: Record<string, string> = {
   // usage_silence are kept (see shared-hints.ts).
   'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — just answer directly.',
   'ai.send.after_success_hint': 'This send is complete. If a delivered final still needs a supplement, use `botmux send --response-kind auxiliary`; otherwise make the final reply just BOTMUX_NOTHING_TO_SEND.',
+  'ai.send.after_success_steer_advanced': 'This send is complete. The session has automatically advanced to the next queued turn; send the full answer for the new message with `botmux send --response-kind final` (or output BOTMUX_NOTHING_TO_SEND if no response is needed).',
   'ai.send.after_success_unified': 'Progress was posted to this turn’s card. When done, send the full answer with `botmux send --response-kind final`.',
   'ai.routing.xpi_as_hint': 'XPI is enabled: every plain-text message directed to another bot must declare its handling up front. Start a separate task with `botmux send --as independent`; leave it for the current task with `--as suggestion`.',
   'ai.shell.xpi_as_hint': 'XPI is enabled: every plain-text message to another bot must include a handling choice. Start separately: `botmux send --as independent`. Leave it for the current task: `botmux send --as suggestion`.',
