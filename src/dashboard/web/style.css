@@ -35193,6 +35193,14 @@ a.card-menu-item {
 .group-serial-input-row input { width: auto; }
 .group-serial-input-row > small { flex-basis: 100%; }
 
+.group-idle-close-row { display: grid; gap: 10px; padding: 12px 0; }
+.group-idle-close-row + .group-idle-close-row { border-top: 1px solid var(--border); }
+.group-idle-close-row .toggle-row { margin: 0; }
+.group-idle-close-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.group-idle-close-controls input[type="number"] { width: 96px; min-width: 0; }
+.group-idle-close-controls select { width: auto; min-width: 72px; }
+.group-idle-close-row > small:empty { display: none; }
+
 /* Worktree grouping keeps existing virtualised heights. */
 .wb-worktree-hint { margin: 4px 12px; color: var(--text-2); font-size: 11px; line-height: 1.4; }
 .wb-session-rail:has(> .wb-worktree-hint) { grid-template-rows: 38px auto 38px minmax(0, 1fr); }

@@ -252,6 +252,7 @@ import {
   setPinStreamingCardForGroup,
   setDefaultModelsForGroup,
   setSerialInputForGroup,
+  setIdleCloseForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -3234,7 +3235,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
-          defaultModels, serialInput, agentCliId, agentModel, agentReasoningEffort,
+          defaultModels, serialInput, idleClose, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3261,6 +3262,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           oncallChat: oncallChat ?? null,
           defaultModels: defaultModels ?? {},
           serialInput: serialInput === true,
+          idleClose,
           agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
@@ -6982,6 +6984,18 @@ const server = createServer(async (req, res) => {
         const result = await unbindOncall(chatId, appId, groupsActionDeps);
         return writeHandlerResult(res, result);
       }
+    }
+
+    let mIdleClose: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mIdleClose = url.pathname.match(/^\/api\/groups\/([^/]+)\/idle-close\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setIdleCloseForGroup(
+        decodeURIComponent(mIdleClose[1]), decodeURIComponent(mIdleClose[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
     }
 
     let mSerialInput: RegExpMatchArray | null;

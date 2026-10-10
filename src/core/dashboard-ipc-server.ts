@@ -67,6 +67,8 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
+import { setGroupIdleClose } from '../services/group-idle-close-store.js';
+import { DEFAULT_GROUP_IDLE_CLOSE, parseGroupIdleClose, type GroupIdleCloseSettings } from './group-idle-close.js';
 import { setGroupSerialInput } from '../services/group-serial-input-store.js';
 import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
@@ -5446,6 +5448,16 @@ ipcRoute('PUT', '/api/chat-group-grant', async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+ipcRoute('PUT', '/api/group-idle-close/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let settings: GroupIdleCloseSettings;
+  try { settings = parseGroupIdleClose(await readJsonBody(req)); }
+  catch (e) { return jsonRes(res, 400, { ok: false, error: e instanceof Error ? e.message : 'bad_json' }); }
+  const result = await setGroupIdleClose(cachedLarkAppId, p.chatId, settings);
+  return jsonRes(res, result.ok ? 200 : 500, result);
+});
+
 ipcRoute('PUT', '/api/group-serial-input/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
@@ -5473,6 +5485,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     let agentDefaults: { agentCliId?: string; agentModel?: string; agentReasoningEffort?: string } = {};
     let groupDefaultModels: Record<string, import('./group-default-models.js').GroupDefaultModels> = {};
     let groupSerialInput: Record<string, boolean> = {};
+    let groupIdleClose: Record<string, GroupIdleCloseSettings> = {};
     let pinStreamingCardMasterEnabled = false;
     let noPinStreamingCardChats = new Set<string>();
     let effectiveMessageListenerForChat: ((chatId: string) => boolean) | undefined;
@@ -5482,6 +5495,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       agentDefaults = { agentCliId: botConfig.cliId, agentModel: botConfig.model, agentReasoningEffort: botConfig.reasoningEffort };
       groupDefaultModels = botConfig.groupDefaultModels ?? {};
       groupSerialInput = botConfig.groupSerialInput ?? {};
+      groupIdleClose = botConfig.groupIdleClose ?? {};
       pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
       noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
       effectiveMessageListenerForChat = (chatId) => resolveEffectiveMessageListener(botState, chatId)?.enabled === true;
@@ -5510,6 +5524,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         oncallChat: oncall ?? null,
         ...agentDefaults,
         serialInput: groupSerialInput[c.chatId] === true,
+        idleClose: groupIdleClose[c.chatId] ?? DEFAULT_GROUP_IDLE_CLOSE,
         ...(groupDefaultModels[c.chatId] ? { defaultModels: groupDefaultModels[c.chatId] } : {}),
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,

@@ -488,6 +488,7 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
+import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
@@ -29546,10 +29547,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (err: any) {
     logger.warn(`[sandbox-sweep] failed: ${err?.message ?? err}`);
   }
+  const closeIdleGroupSessions = createGroupIdleCloseSweeper({
+    larkAppId: cfg.larkAppId,
+    sessions: activeSessions,
+    getSettings: chatId => getBot(cfg.larkAppId).config.groupIdleClose?.[chatId],
+    isTransferring: isSessionTransferring,
+    close: closeSessionForBackgroundCleanup,
+    log: message => logger.info(message),
+  });
   const idleWorkerSweepTimer = setInterval(() => {
     // Dashboard config edits need no restart; the timer also backstops any
     // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
     enforceLiveSessionCap('periodic');
+    void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
