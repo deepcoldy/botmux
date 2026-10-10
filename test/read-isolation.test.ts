@@ -1095,12 +1095,72 @@ describe('CLI protected capability wiring', () => {
     expect(cliSource).toContain(
       'if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx)',
     );
+    // The reporter resolves the live origin itself rather than trusting a
+    // caller-supplied identity — EXCEPT for the turn-idle v2 report, whose origin
+    // (turnId/attempt/capability) was frozen by the in-CLI plugin AT THE EVENT and
+    // is transported verbatim: this child can run after the worker already advanced
+    // the marker to the NEXT dispatch, so re-resolving it here is what the fence
+    // exists to prevent (see cmdTurnIdle). The exemption is only sound while that
+    // internal event path is the sole producer of a frozen origin — pinned by the
+    // test below, which fails if any other command can reach it.
     expect(cliSource).toContain(
-      'const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);',
+      'const liveOrigin = frozenOrigin ? undefined : resolveSessionContext(resolveDataDir(), sessionId);',
     );
     expect(vcSource).toContain(
       'const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);',
     );
+  });
+
+  /**
+   * Comment text blanked to spaces, every other character left AT ITS OFFSET. The
+   * shared `stripComments` helper deletes comment text instead, so its output no
+   * longer addresses the original source — the enclosing-function scan below needs
+   * the two to line up. Same two regexes, and the same deliberate over-strip on a
+   * `//` inside a string literal: that direction is safe here because over-stripping
+   * can only HIDE a mention, which turns these assertions red, never green.
+   */
+  const blankComments = (source: string): string => source
+    .replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '))
+    .replace(/(^|[^:])\/\/[^\n]*/g, (m, p1: string) => p1 + ' '.repeat(m.length - p1.length));
+
+  /** Name of the top-level `function` (column-0 declaration) whose body encloses `at`. */
+  const enclosingFunctionName = (source: string, at: number): string | undefined => {
+    const head = source.slice(0, at);
+    const decls = [...head.matchAll(/^(?:export )?(?:async )?function ([A-Za-z0-9_$]+)\(/gm)];
+    return decls.at(-1)?.[1];
+  };
+
+  /**
+   * The frozen-origin exemption pinned above widens the reporter's identity source
+   * from "what this process can read now" to "what the event froze". That is only
+   * acceptable because the exemption is unreachable from every user-facing command:
+   * `postSessionScopedSignal` is module-local, only `cmdTurnIdle` (the versioned
+   * internal `__turn-idle-v2` subcommand, never named by a user or an adapter
+   * command line) constructs a frozen origin, and only its `/api/turn-idle` call
+   * passes one. Wire a caller-supplied origin into `send` / reply / relay (or into
+   * the session-ready call, or into any new transport call) and one of these
+   * assertions goes red — the mention/ carrier sets are computed from the source,
+   * not from a substring's presence.
+   */
+  it('keeps the frozen origin reachable only from the internal turn-idle event', () => {
+    const code = blankComments(cliSource);
+    // Every mention — the opts type, the opts read, the field assignments, the
+    // construction and the pass-through — must sit in one of these two functions.
+    expect(
+      [...new Set([...code.matchAll(/frozenOrigin/g)]
+        .map(m => enclosingFunctionName(code, m.index!)))].sort(),
+    ).toEqual(['cmdTurnIdle', 'postSessionScopedSignal']);
+    // Exactly one producer, fed only by a v2 plugin payload.
+    expect([...code.matchAll(/frozenOrigin = \{/g)]).toHaveLength(1);
+    expect(code).toContain('if (parsed && parsed.v === TURN_IDLE_PROTOCOL_VERSION) {');
+    expect(code).toContain('if (turnId) frozenOrigin = { turnId,');
+    // …and exactly two carriers. session-ready passes NO opts (so it must resolve
+    // the live origin itself); turn-idle passes the frozen one.
+    expect([...code.matchAll(/await postSessionScopedSignal\(/g)]
+      .map(m => enclosingFunctionName(code, m.index!)).sort())
+      .toEqual(['cmdSessionReady', 'cmdTurnIdle']);
+    expect(code).toContain("await postSessionScopedSignal('/api/session-ready', { source });");
+    expect(code).toContain("await postSessionScopedSignal('/api/turn-idle', { seq, pid }, { frozenOrigin });");
   });
 });
 
