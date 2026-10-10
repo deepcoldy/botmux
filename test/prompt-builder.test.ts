@@ -481,14 +481,22 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
-    // Complex send guidance is discoverable once in the opening catalog; keep
-    // every follow-up reminder intentionally tiny. By default (experimental
-    // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
-    // baseline — no anti-resend clause appended.
-    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    // Preserve the silence/anti-resend contract while refreshing the compact
+    // image hint on every follow-up, including sessions opened before a guide
+    // update. The full writing guide remains discoverable on demand.
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND\n');
     expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
-    expect(content).not.toContain('botmux skill show botmux-send');
+    expect(content).toContain('botmux skill show botmux-send');
+    expect(content).toContain('--image-mode small');
+  });
+
+  it.each(['zh', 'en'] as const)('refreshes image guidance in an existing Pi session on a plain resend request (%s)', locale => {
+    const content = buildFollowUpContent('重发一张试试', SESSION_ID, { cliId: 'pi', locale });
+    const reminder = content.match(/<botmux_reminder>([\s\S]*?)<\/botmux_reminder>/)?.[1];
+    expect(reminder).toContain('botmux skill show botmux-send');
+    expect(reminder).toContain('--image-mode small');
+    expect(content).toContain('<user_message>\n重发一张试试\n</user_message>');
   });
 
   it('carries the anti-resend reminder variant when config.noVisibleOutputHint is ON', () => {
@@ -512,7 +520,7 @@ describe('buildFollowUpContent', () => {
     // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND\n');
     expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
     expect(content).not.toContain('直接把给用户看的答案写在 final');
   });

@@ -1740,7 +1740,14 @@ function buildFollowUpBlocks(
         : resolveConditionalLine('ai.followup.reminder_no_resend', config.noVisibleOutputHint)
           ? 'ai.followup.reminder_no_resend'
           : 'ai.followup.reminder';
-    const reminder = t(reminderKey, undefined, opts?.locale);
+    // A resident CLI keeps its original system prompt. Repeat the compact
+    // image/attachment hint on follow-ups so an existing session also sees
+    // updated guidance before it sends another image. No-transport turns must
+    // continue to omit all explicit send guidance.
+    const reminder = [
+      t(reminderKey, undefined, opts?.locale),
+      ...(!noTransport ? [t('ai.routing.usage_attachments', undefined, opts?.locale)] : []),
+    ].join('\n');
     blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
