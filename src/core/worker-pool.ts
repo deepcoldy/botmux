@@ -7358,6 +7358,11 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
   };
 }
 
+/** Whether accepted ordinary IM input still awaits worker admission. */
+export function hasPendingOrdinaryImInput(ds: DaemonSession): boolean {
+  return [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds);
+}
+
 /** Caller holds the bot mutation gate. Never interrupt or replay a business turn. */
 export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): 'saved' | 'busy' | 'unsupported' | 'invalid' {
   const control = sessionReasoningControl(ds);

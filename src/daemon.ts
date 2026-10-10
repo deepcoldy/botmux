@@ -1,3 +1,4 @@
+import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -298,6 +299,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
   closeSessionForBackgroundCleanup,
+  hasPendingOrdinaryImInput,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
@@ -5600,6 +5602,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   }
   // New turn — the previous turn's deliberate-silence marker (if any) has been
   // baked into the frozen card above; live cards return to normal labels.
+  ds.messageListenerCompletedTurnId = undefined;
   ds.silentIdleTurnId = undefined;
   ds.completedIdleTurnId = undefined;
   ds.failedIdleTurnId = undefined;
@@ -22864,6 +22867,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
   const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, { source: 'ordinary-feishu' });
+  if (messageListener?.autoCloseAfterCompletion === true) session.messageListenerAutoClose = true;
   // Session-group registry: point the group at its (new) resident session so
   // same-group resume and the async AI title can find it.
   if (chatType === 'group' && isSessionGroup(chatId)) {
@@ -25950,6 +25954,7 @@ async function handleThreadReplyAdmitted(
     // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it):
     // without clearing, a previous turn's deliberate-silence marker survives the
     // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
+    ds.messageListenerCompletedTurnId = undefined;
     ds.silentIdleTurnId = undefined;
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
@@ -27223,6 +27228,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
       // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it) —
       // see the Lark-message re-fork branch above.
+      ds.messageListenerCompletedTurnId = undefined;
       ds.silentIdleTurnId = undefined;
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
@@ -28305,6 +28311,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
     },
   );
+  const scheduleMessageListenerAutoClose = createMessageListenerAutoCloseScheduler({
+    mutate: (ds, action) => runDetachedBotTurnMutation(ds.larkAppId, action),
+    isCurrent: ds => findActiveBySessionId(ds.session.sessionId) === ds && !hasPendingOrdinaryImInput(ds),
+    closeCompletedSession: async ds => {
+      const result = await closeSessionForBackgroundCleanup(ds.session.sessionId, 'message-listener completion');
+      if (result.ok) logger.info(`[message-listener] Auto-closed completed session ${ds.session.sessionId.slice(0, 8)}`);
+    },
+    onError: err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`),
+  });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -28340,6 +28355,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       return cardRuntimeStatusBridge.publish({
         sessionId: ds.session.sessionId,
         larkAppId: ds.larkAppId,
@@ -28509,11 +28525,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
+      if (ds.session.messageListenerAutoClose && ds.currentTurnId === terminal.turnId) {
+        ds.messageListenerCompletedTurnId = terminal.status === 'completed' ? terminal.turnId : undefined;
+        scheduleMessageListenerAutoClose(ds);
+      }
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
     onCliExit(ds, context) {
+      ds.messageListenerCompletedTurnId = undefined;
       ds.activeInteractiveTurn = undefined;
       // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
       // exit inside a still-live Node worker (persistent-pane / codex-app
@@ -28537,6 +28558,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     },
     onWorkerExit(ds, context) {
+      ds.messageListenerCompletedTurnId = undefined;
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.

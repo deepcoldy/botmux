@@ -976,3 +976,15 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
     expect(prompt).toContain('message_title="Argos 报警"');
   });
 });
+
+describe('listener completion policy', () => {
+  it.each([true, false, undefined])('propagates opt-in %s to a matched message', enabled => {
+    const match = evaluateMessageListener({
+      bot: bot({ globalMessageListener: { enabled: true, prompt: 'inspect', autoCloseAfterCompletion: enabled } }),
+      chatId: 'oc_chat', message: textMessage(), senderOpenId: 'ou_user',
+      senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    });
+    expect(match).not.toBeNull();
+    expect(match?.autoCloseAfterCompletion === true).toBe(enabled === true);
+  });
+});

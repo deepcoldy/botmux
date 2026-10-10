@@ -239,6 +239,8 @@ export type MessageListenerSenderType = 'user' | 'bot';
 
 export interface MessageListenerConfig {
   enabled: boolean;
+  /** Opt in to closing listener-created sessions after successful completion. */
+  autoCloseAfterCompletion?: boolean;
   name?: string;
   replyCardTitle?: string;
   workingDir?: string;
@@ -1193,6 +1195,7 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   return {
     enabled,
     ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
+    ...(entry.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     ...(normalizeNonEmptyString(entry.replyCardTitle) ? { replyCardTitle: normalizeNonEmptyString(entry.replyCardTitle) } : {}),
     ...(normalizeNonEmptyString(entry.workingDir) ? { workingDir: normalizeNonEmptyString(entry.workingDir) } : {}),
     prompt: prompt ?? '',
