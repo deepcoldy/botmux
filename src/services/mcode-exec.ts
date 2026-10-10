@@ -67,8 +67,9 @@ export async function runMcodeExec(opts: McodeExecOptions, signal: AbortSignal):
   const valid = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
   const usage = raw && valid(raw.inputTokens) && valid(raw.outputTokens)
     && valid(raw.cacheReadTokens ?? 0) && valid(raw.cacheWriteTokens ?? 0)
-    // Native fresh input excludes cache reads/writes; Botmux input is total.
-    ? { inputTokens: raw.inputTokens + (raw.cacheReadTokens ?? 0) + (raw.cacheWriteTokens ?? 0), outputTokens: raw.outputTokens,
+    // Runner final usage has four mutually exclusive buckets. Keep native
+    // fresh input unchanged; model-only invocation usage uses inclusive input.
+    ? { inputTokens: raw.inputTokens, outputTokens: raw.outputTokens,
       cacheReadTokens: raw.cacheReadTokens ?? 0, cacheCreateTokens: raw.cacheWriteTokens ?? 0 }
     : undefined;
   return { sessionId: result.sessionId, content: result.output, ...(usage ? { usage } : {}) };

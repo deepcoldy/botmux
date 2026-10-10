@@ -7,6 +7,7 @@ import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { createMinimaxAdapter, minimaxDataDir } from '../src/adapters/cli/minimax.js';
 import { runMcodeExec } from '../src/services/mcode-exec.js';
 import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
+import { recordSessionUsage } from '../src/services/usage-ledger.js';
 
 const roots: string[] = [];
 const children: ChildProcessWithoutNullStreams[] = [];
@@ -93,11 +94,25 @@ it('preserves multiline messages, tools, owner and exact session across turns', 
   const finals = markers(h.stdout).filter(m => m.kind === 'final');
   expect(finals.map(m => m.payload.turnId)).toEqual(['one', 'two']);
   expect(finals[0].payload.content).toBe('answer:line 1\nline 2');
-  const expectedUsage = { inputTokens: 15, outputTokens: 5, cacheReadTokens: 2, cacheCreateTokens: 3 };
+  const expectedUsage = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheCreateTokens: 3 };
   expect(finals[0].payload.usage).toEqual(expectedUsage);
   // Exercise the actual worker boundary, not just the runner's own shape.
   expect(finals.map(m => normalizeFinalUsage(m.payload.usage))).toEqual([expectedUsage, expectedUsage]);
+  const usage = normalizeFinalUsage(finals[0].payload.usage)!;
+  const promptTokens = usage.inputTokens + usage.cacheReadTokens + usage.cacheCreateTokens;
+  expect(promptTokens).toBe(15);
+  const record = recordSessionUsage({ sessionId: h.root, cliId: 'minimax', ledgerDir: join(h.root, 'usage'),
+    usage: { ...usage, in: promptTokens, out: usage.outputTokens, model: 'minimax/MiniMax-M3', turns: 1 } });
+  expect(record).toMatchObject({ ...expectedUsage, inputTokenSemantics: 'uncached' });
+  expect(record!.inputTokens + record!.outputTokens + record!.cacheReadTokens + record!.cacheCreateTokens)
+    .toBe(promptTokens + usage.outputTokens);
+  expect(promptTokens + usage.outputTokens).toBe(20);
   expect(h.stdout).toContain('[tool] bash');
+});
+
+it('drops the legacy inclusive invocation shape at the worker usage boundary', () => {
+  expect(normalizeFinalUsage({ inputTokens: 15, outputTokens: 5,
+    cachedInputTokens: 2, cacheWriteInputTokens: 3 })).toBeUndefined();
 });
 
 it('escapes model-controlled terminal control bytes', async () => {
