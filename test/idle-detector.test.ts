@@ -14,6 +14,7 @@ import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -105,6 +106,29 @@ describe('IdleDetector: onIdle()', () => {
 
 describe('IdleDetector: onBusy()', () => {
   const idleToBusyPattern = /Working[^\r\n]{0,160}esc to interrupt/i;
+
+  it('recovers OMP local input from a split ANSI footer once per idle cycle', () => {
+    const detector = new IdleDetector(createOhMyPiAdapter('/bin/omp'));
+    const cb = vi.fn();
+    detector.onBusy(cb);
+    try {
+      detector.fireIdle();
+      detector.feed('Working... was printed in the previous reply.\n○ 🐴 ponytail: ⚡ FULL\n');
+      expect(cb).not.toHaveBeenCalled();
+      detector.feed('\x1b[2K\x1b[32m⠇ 1h │ model │ ');
+      expect(cb).not.toHaveBeenCalled();
+      detector.feed('67%┃─272K─\x1b[0m');
+      detector.feed('\r● 🐴 ponytail: ⚡ FULL');
+      expect(cb).toHaveBeenCalledTimes(1);
+      detector.fireIdle();
+      detector.feed('\x1b[2K○ 🐴 ponytail: ⚡ FULL');
+      expect(cb).toHaveBeenCalledTimes(1);
+      detector.feed('\r\x1b[32m● 🐴 ponytail: ⚡ FULL\x1b[0m');
+      expect(cb).toHaveBeenCalledTimes(2);
+    } finally {
+      detector.dispose();
+    }
+  });
 
   it('fires once when an explicit busy marker follows idle, but ignores an ordinary redraw', () => {
     const detector = new IdleDetector(makeCli({ idleToBusyPattern }));
