@@ -1,5 +1,8 @@
 import { putChatTopNotice } from '../im/lark/chat-top-notice.js';
 
+const MESSAGE_ID_PATTERN = /^om_[A-Za-z0-9_-]{1,128}$/;
+const CHAT_ID_PATTERN = /^oc_[A-Za-z0-9_-]{1,128}$/;
+
 export const CHAT_TOP_NOTICE_CLI_USAGE = `用法:
   botmux top-notice set <message_id> [--session-id <id>] [--chat-id <oc_xxx>] [--json]
 
@@ -45,10 +48,10 @@ export function parseChatTopNoticeCli(args: string[]): ParsedChatTopNoticeCli {
   if (action !== 'set') throw new Error(`未知 top-notice 子命令: ${action || '(空)'}`);
   const messageId = pos.shift();
   if (!messageId || pos.length) throw new Error('set 需要且只接受一个 message_id');
-  if (!/^om_[A-Za-z0-9]+$/.test(messageId)) throw new Error(`message_id 无效: ${messageId}`);
+  if (!MESSAGE_ID_PATTERN.test(messageId)) throw new Error(`message_id 无效: ${messageId}`);
   const sessionId = flagValue(args, '--session-id');
   const chatId = flagValue(args, '--chat-id');
-  if (chatId && !/^oc_[A-Za-z0-9]+$/.test(chatId)) throw new Error(`chat_id 无效: ${chatId}`);
+  if (chatId && !CHAT_ID_PATTERN.test(chatId)) throw new Error(`chat_id 无效: ${chatId}`);
   return { action: 'set', messageId, sessionId, chatId, json: args.includes('--json') };
 }
 

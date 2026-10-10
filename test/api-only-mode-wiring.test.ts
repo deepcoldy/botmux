@@ -348,12 +348,21 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
       const body = region(cliSource, start, end);
       expect(body, `${op} target-aware`).toContain('assertSessionTransportOrExit({ chatId: ');
     }
+    const chatMetadataCommands: Array<[string, string, string]> = [
+      ['tabs', 'async function cmdTabs(', 'async function cmdTopNotice('],
+      ['top-notice', 'async function cmdTopNotice(', 'async function cmdHistory('],
+    ];
+    for (const [op, start, end] of chatMetadataCommands) {
+      const body = region(cliSource, start, end);
+      expect(body, `${op} env gate`).toContain(`assertTurnTransportOrExit('${op}')`);
+      expect(body, `${op} target-aware`).toContain(`assertSessionTransportOrExit(session, '${op}')`);
+    }
     // Root-dispatch gate: managed no-transport turn refused for ALL Lark-facing
     // commands, resolved via TAMPER-RESISTANT pid-marker ancestry (not raw env).
     const rootGate = region(cliSource, 'const LARK_FACING_COMMANDS = new Set(', 'switch (command) {');
     expect(rootGate).toContain('managedOriginHasNoTransport()');
     // The command set includes the verbs codex flagged (vc-agent, report).
-    for (const cmd of ['send', 'dispatch', 'create-group', 'grant', 'vc-agent', 'report']) {
+    for (const cmd of ['send', 'dispatch', 'create-group', 'grant', 'vc-agent', 'report', 'tabs', 'top-notice']) {
       expect(rootGate, `LARK_FACING has ${cmd}`).toContain(`'${cmd}'`);
     }
     // managedOriginHasNoTransport resolves via ancestry (env-independent).

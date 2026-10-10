@@ -83,7 +83,8 @@ export async function ensureUrlChatTab(
   }
   if (name && existing.tab_name !== name && existing.tab_id) {
     const updated = await updateChatTab(larkAppId, chatId, existing.tab_id, { name, url });
-    return { created: false, tab: updated[0] ?? { ...existing, tab_name: name, tab_content: { url } } };
+    const tab = updated.find(candidate => candidate.tab_id === existing.tab_id);
+    return { created: false, tab: tab ?? { ...existing, tab_name: name, tab_content: { url } } };
   }
   return { created: false, tab: existing };
 }

@@ -60,9 +60,24 @@ describe('parseChatTopNoticeCli', () => {
     });
   });
 
+  it('accepts repository-standard Lark IDs including underscores, hyphens, and 128 characters', () => {
+    const messageId = `om_${'a_b-'.repeat(32)}`;
+    const chatId = `oc_${'z-y_'.repeat(32)}`;
+    expect(parseChatTopNoticeCli(['set', messageId, '--chat-id', chatId])).toMatchObject({
+      messageId,
+      chatId,
+    });
+  });
+
   it('rejects malformed identifiers and unknown arguments', () => {
     expect(() => parseChatTopNoticeCli(['set', 'bad'])).toThrow('message_id 无效');
+    expect(() => parseChatTopNoticeCli(['set', 'om_'])).toThrow('message_id 无效');
+    expect(() => parseChatTopNoticeCli(['set', `om_${'a'.repeat(129)}`])).toThrow('message_id 无效');
     expect(() => parseChatTopNoticeCli(['set', 'om_ok', '--chat-id', 'bad'])).toThrow('chat_id 无效');
+    expect(() => parseChatTopNoticeCli(['set', 'om_ok', '--chat-id', 'oc_'])).toThrow('chat_id 无效');
+    expect(() => parseChatTopNoticeCli([
+      'set', 'om_ok', '--chat-id', `oc_${'a'.repeat(129)}`,
+    ])).toThrow('chat_id 无效');
     expect(() => parseChatTopNoticeCli(['set', 'om_ok', '--wat'])).toThrow('未知参数');
   });
 

@@ -16990,6 +16990,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
   'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
+  'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
