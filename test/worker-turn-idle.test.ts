@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 const TURN_ID = 'turn-idle-under-test';
 const NEXT_TURN_ID = 'turn-idle-steered-next';
@@ -141,7 +141,12 @@ function startWorker(): Harness {
   const sessionId = `turnidle${Date.now().toString(36)}${process.pid.toString(36)}`;
   const logs: string[] = [];
   const messages: WorkerToDaemon[] = [];
-  const child = spawnTsScript(resolve('src/worker.ts'), [], {
+  // Node, not "whatever runs this file": the worker drives a real PTY, and
+  // node-pty's `tty.ReadStream` closes the master on the first EAGAIN read under
+  // Bun, so the kernel SIGHUPs the fake CLI ~5ms after spawn and every case here
+  // would fail on a dead CLI rather than on the channel under test. See
+  // `nodeTsRunnerPrefix` (test/helpers/ts-runner.ts), which exists for this shape.
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,

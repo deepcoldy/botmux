@@ -37,7 +37,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 /** Production constant under test (worker.ts: FIRST_PROMPT_HARD_TIMEOUT_MS). */
 const HARD_CAP_MS = 90_000;
@@ -114,7 +114,12 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
 
   const logs: string[] = [];
   const sessionId = `hardcap${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
-  const child = spawnTsScript(resolve('src/worker.ts'), [], {
+  // Node, not "whatever runs this file": the whole point here is a real PTY, and
+  // node-pty's `tty.ReadStream` closes the master on the first EAGAIN read under
+  // Bun — the kernel then SIGHUPs the fake CLI ~5ms after spawn, so the held
+  // prompt could never be received by it. See `nodeTsRunnerPrefix` in
+  // test/helpers/ts-runner.ts.
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
       ...process.env,
