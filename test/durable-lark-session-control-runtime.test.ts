@@ -236,7 +236,11 @@ describe('durable Lark session control runtime', () => {
         target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
         content: 'anchor_occupied:session-other',
       });
-    expect(await store.readOutbox(`control_update_${digest}`)).toBeUndefined();
+    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
+      .toMatchObject({
+        target: { kind: 'update', messageId: 'om_card' },
+        content: 'closed',
+      });
     await facade.stop();
     await store.close();
   });
@@ -330,7 +334,11 @@ describe('durable Lark session control runtime', () => {
     const digest = createHash('sha256').update(input.control.operationId).digest('hex');
     expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_notice_${digest}`))!))
       .toMatchObject({ content: 'resume_start_failed' });
-    expect(await store.readOutbox(`control_update_${digest}`)).toBeUndefined();
+    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
+      .toMatchObject({
+        target: { kind: 'update', messageId: 'om_card' },
+        content: 'closed',
+      });
     await facade.stop();
     await store.close();
   });
@@ -360,6 +368,7 @@ describe('durable Lark session control runtime', () => {
         larkAppId: 'cli_test',
         chatId: 'oc_chat',
         streamCardId: 'om_card',
+        suppressRecoveryCard: true,
       } as DaemonSession;
       return { ok: true as const, ds: active, recoveryPending: true as const };
     });
@@ -417,6 +426,7 @@ describe('durable Lark session control runtime', () => {
     });
     const operation = await store.readControlOperation(input.control.operationId);
     expect(operation).toMatchObject({ state: 'completed', attempts: 1 });
+    expect(active?.suppressRecoveryCard).toBeUndefined();
     const digest = createHash('sha256').update(input.control.operationId).digest('hex');
     expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
       .toMatchObject({ content: 'active' });

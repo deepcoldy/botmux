@@ -37,7 +37,7 @@ export interface DurableLarkSessionControlRuntimeOptions {
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
-  buildClosedCard(session: DaemonSession): string;
+  buildClosedCard(session: DaemonSession | Session): string;
   buildActiveCard(session: DaemonSession): string;
   resumeRefusedText(error: string, activeSessionId?: string): string;
   now?: () => number;
@@ -161,6 +161,14 @@ export function createDurableLarkSessionControlRuntime(
     const closeCard = control.action === 'close' && live
       ? options.buildClosedCard(live)
       : undefined;
+    // A Remote Runner resume may briefly reactivate its local Session while the
+    // replacement provider generation is still starting. If startup later
+    // rolls back, worker readiness may already have repainted the clicked card
+    // as active. Keep an exact closed projection ready so reconciliation can
+    // restore the Resume button together with the canonical closed commit.
+    const resumeRollbackCard = control.action === 'resume'
+      ? options.buildClosedCard(session)
+      : undefined;
 
     const result = (
       status: 'closed' | 'active',
@@ -193,7 +201,7 @@ export function createDurableLarkSessionControlRuntime(
       }
       if (control.action === 'resume' && reconcileResume && current.status === 'closed') {
         return {
-          result: result('closed', undefined, {
+          result: result('closed', resumeRollbackCard, {
             applied: false,
             error: 'resume_start_failed',
             noticeText: options.resumeRefusedText('resume_start_failed'),
@@ -299,7 +307,7 @@ export function createDurableLarkSessionControlRuntime(
             }
             return {
               kind: 'completed',
-              result: result('closed', undefined, {
+              result: result('closed', resumeRollbackCard, {
                 applied: false,
                 error: resumed.error,
                 noticeText: options.resumeRefusedText(resumed.error, resumed.activeSessionId),
@@ -348,6 +356,16 @@ export function createDurableLarkSessionControlRuntime(
           });
           if (committed.kind !== 'committed') {
             throw new Error(`canonical control commit failed: ${committed.kind}`);
+          }
+          if (control.action === 'resume' && status === 'active') {
+            const active = options.findActiveSession(control.sessionId);
+            if (active?.session.sessionId === control.sessionId) {
+              // Remote resume keeps automatic worker cards silent until the
+              // canonical active commit. Release that presentation gate only
+              // after RDS is authoritative; the outbox update below then owns
+              // the first active projection.
+              active.suppressRecoveryCard = undefined;
+            }
           }
           const digest = createHash('sha256').update(control.operationId, 'utf8').digest('hex');
           const enqueue = async (message: ReturnType<typeof durableLarkOutboxMessage>, label: string) => {

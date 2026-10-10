@@ -3777,6 +3777,11 @@ export async function resumeSession(
     lastCodexAppInput: session.lastCodexAppInput,
     replyThreadAliases: session.replyThreadAliases,
     currentReplyTarget: session.currentReplyTarget,
+    // A Remote Runner resume is only provisionally active until its rebuilt
+    // provider generation publishes a durable remoteSessionId. Do not let the
+    // worker's ready/screen events overwrite the still-canonical closed card;
+    // durable lifecycle commit releases this gate after RDS becomes active.
+    suppressRecoveryCard: remoteRunnerResume ? true : undefined,
   };
 
   messageQueue.ensureQueue(anchor);
