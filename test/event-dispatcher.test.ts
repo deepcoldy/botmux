@@ -1142,6 +1142,90 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('retries an active canonical route on a replica that does not own that Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const readPrimarySession = vi.fn(async () => ({
+      sessionId: 'session-owned-elsewhere',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-root',
+      scope: 'thread' as const,
+      title: 'Remote owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { readPrimarySession },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-followup',
+      rootId: 'msg-primary-root',
+      threadId: 'omt_primary',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-followup'))
+      .rejects.toThrow(/active canonical Session is owned by another replica/);
+    expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root::${MY_APP_ID}`);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
+    setupBotState({ allowedUsers: [] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const readPrimarySession = vi.fn(async () => ({
+      sessionId: 'session-owned-elsewhere',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-root-bot',
+      scope: 'thread' as const,
+      title: 'Remote bot owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { readPrimarySession },
+    );
+    const data = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-bot-followup',
+      rootId: 'msg-primary-root-bot',
+      threadId: 'omt_primary_bot',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-bot-followup'))
+      .rejects.toThrow(/active canonical Session is owned by another replica/);
+    expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root-bot::${MY_APP_ID}`);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it.each(['never', 'ambient'] as const)(
     'dispatches a %s topic seed immediately when the durable primary wait is disabled',
     async mentionMode => {

@@ -29342,6 +29342,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             },
             authorizePrimaryControl: async data =>
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
+            readPrimarySession: async stableKey => {
+              const current = await durableCoordinationRuntime.store.readSession(stableKey);
+              return current ? parseDurablePrimarySessionRecord(current).session : undefined;
+            },
           },
         );
         startEventDispatchers.push(() => {

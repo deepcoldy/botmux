@@ -276,8 +276,21 @@ function mergePrimaryProjection(
     // envelopes remain fail-closed instead of being silently replaced.
     if (currentValue?.type === 'botmux.session.primary') {
       const parsed = parseDurablePrimarySessionRecord(current);
-      previousAdmissions = parsed.admissions;
-      previousControls = parsed.controls;
+      const nextSession = object(next.session) as unknown as Session | undefined;
+      if (!nextSession) {
+        throw new Error(`durable primary Session ${current.sessionKey} has an invalid next snapshot`);
+      }
+      if (parsed.session.sessionId === nextSession.sessionId) {
+        previousAdmissions = parsed.admissions;
+        previousControls = parsed.controls;
+      } else if (parsed.session.status === 'active') {
+        throw new Error(
+          `durable primary active canonical Session ${current.sessionKey} cannot be replaced`,
+        );
+      }
+      // A deliberately closed Session may be followed by a brand-new logical
+      // Session at the same conversation anchor. Its admission/control history
+      // belongs to the retired sessionId and must not leak into the successor.
     }
   }
   const admissions = [
