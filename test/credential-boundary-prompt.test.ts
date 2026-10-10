@@ -48,7 +48,10 @@ describe('buildCredentialBoundaryBlock', () => {
     expect(byted).not.toContain('git');
     expect(byted).not.toContain('missing_scope');
     expect(byted).toContain(locale === 'zh' ? 'stderr 已附授权链接' : 'If stderr carries an authorization link');
-    expect(byted).toContain(locale === 'zh' ? '只需授权一次、自动续期' : 'authorize just once, it renews automatically');
+    expect(lark).toContain('open.feishu.cn/page/cli');
+    expect(lark).toContain(locale === 'zh'
+      ? '个人飞书应用首次使用分两步'
+      : 'First-time personal Feishu setup has two steps');
     // The Feishu-specific failure flow must follow the same gate as lark-cli.
     // Discriminate on that line itself: on_auth_link is emitted for every tool
     // and also mentions `botmux auth request`, so the shared phrase cannot tell
@@ -74,6 +77,7 @@ describe('buildCredentialBoundaryBlock', () => {
     // the rule checkable by the agent itself.
     expect(zh).toContain('user-token-');
     expect(zh).toContain('~/.botmux/data/');
+    expect(zh).toContain('lark-cli-home/');
   });
 
   it('tells the agent what to do instead of hunting for credentials', () => {

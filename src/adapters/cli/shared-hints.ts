@@ -193,6 +193,8 @@ export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | und
   if (!policy?.enabled || policy.tools.length === 0) return '';
   const lark = triggerUserAuthApplies(policy, 'lark-cli');
   const bytedcli = triggerUserAuthApplies(policy, 'bytedcli');
+  const larkdev = triggerUserAuthApplies(policy, 'larkdev');
+  const bytecloud = bytedcli || larkdev;
   const line = (key: string, params?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, params, locale))}`;
   return [
     '<botmux_credentials>',
@@ -201,7 +203,7 @@ export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | und
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
     ...(lark ? [line('ai.credentials.on_auth_failure')] : []),
-    ...(bytedcli ? [line('ai.credentials.on_bytedcli_auth_failure')] : []),
+    ...(bytecloud ? [line('ai.credentials.on_bytedcli_auth_failure')] : []),
     line('ai.credentials.on_auth_link'),
     ...(lark ? [line('ai.credentials.on_missing_scope')] : []),
     '</botmux_credentials>',

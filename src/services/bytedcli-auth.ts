@@ -37,7 +37,10 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
-import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
+import {
+  scrubByteCloudCredentialEnv,
+  scrubSessionTurnMarkerEnv,
+} from '../utils/child-env.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
@@ -122,10 +125,14 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const env = { ...process.env };
   scrubSessionTurnMarkerEnv(env);
+  // ByteCloud Auth reads injected JWTs and AK/SK before the isolated HOME.
+  // Leaving even one site-specific value in place would silently act as the
+  // daemon/operator instead of this sender.
+  scrubByteCloudCredentialEnv(env);
   for (const key of [
     'BYTEDCLI_PROFILE', 'BYTEDCLI_CODEBASE_APP_ID', 'BYTEDCLI_CODEBASE_APP_SECRET',
+    'BYTEDCLI_CLOUD_SITE', 'BYTEDCLI_AUTH_SITE',
     'AIME_WORKSPACE_PATH', 'AIME_CURRENT_USER',
-    'BYTECLOUD_AUTH_ACCESS_KEY_ID', 'BYTECLOUD_AUTH_SECRET_ACCESS_KEY',
   ]) delete env[key];
   Object.assign(env, { HOME: home, BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1' });
   return await new Promise<BytedcliResult>(resolve => {
@@ -321,6 +328,44 @@ export interface BytedcliJwts {
   cloudJwt: string;
   /** Git pushes authenticate with this one, so commit attribution follows it. */
   codeJwt?: string;
+}
+
+/** ByteCloud sites larkdev can select through its control-plane flag. BOE is
+ * an alias of CN in larkdev's SDK, so one CN token covers both planes. */
+export const LARKDEV_BYTECLOUD_SITES = [
+  'cn',
+  'i18n-tt',
+  'i18n-bd',
+  'eu-ttp',
+  'us-ttp',
+] as const;
+export type LarkdevByteCloudSite = typeof LARKDEV_BYTECLOUD_SITES[number];
+
+/**
+ * Mint the current sender's ByteCloud JWT for every larkdev plane that their
+ * login can reach. Missing regional access is represented by an absent entry,
+ * never by falling through to a machine login inside larkdev.
+ */
+export async function mintLarkdevByteCloudJwts(
+  openId: string,
+): Promise<Partial<Record<LarkdevByteCloudSite, string>> | null> {
+  // Reuse the existing CN mint path so pending-login completion, provider
+  // verification and in-flight de-duplication stay identical to bytedcli.
+  const primary = await mintBytedcliJwts(openId);
+  if (!primary) return null;
+  const result: Partial<Record<LarkdevByteCloudSite, string>> = {
+    cn: primary.cloudJwt,
+  };
+  await Promise.all(LARKDEV_BYTECLOUD_SITES.filter(site => site !== 'cn').map(async site => {
+    const minted = await runAsUser(openId, [
+      '--site', site,
+      'auth', 'get-bytecloud-jwt-token',
+    ]);
+    const jwt = minted.stdout.trim();
+    if (minted.ok && jwt) result[site] = jwt;
+    else logger.debug(`[bytedcli-auth] no personal ByteCloud JWT available for larkdev site ${site}`);
+  }));
+  return result;
 }
 
 /**

@@ -3861,9 +3861,7 @@ describe('handleCommand', () => {
     // bearing on, and the reader found out only when a command failed.
     describe('trigger-user auth lines', () => {
       function statusWith(triggerUserAuth: unknown, authorized: boolean) {
-        vi.mocked(listAuthorizedUsers).mockReturnValue(
-          authorized ? [{ openId: 'ou_sender', userName: '孙晓雪', expiresAt: '', refreshExpiresAt: '' }] : [],
-        );
+        vi.mocked(hasLarkCliHome).mockReturnValue(authorized);
         vi.mocked(getBot).mockImplementation((() => ({
           botName: 'Claude',
           config: {
@@ -3885,23 +3883,17 @@ describe('handleCommand', () => {
         expect(text).not.toContain('Trigger-user auth');
       });
 
-      it('names the authorized person for lark-cli', async () => {
+      it('reports the sender-owned personal HOME for lark-cli', async () => {
         const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, true));
-        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+        expect(text).toContain('lark-cli: 以你自己的身份调用');
       });
 
-      // F-C: a person who authorized through the per-person device-code HOME
-      // (no legacy user-token row) must still read as authorized in /status.
-      it('counts a per-person lark-cli HOME as authorized even with no legacy token', async () => {
-        vi.mocked(hasLarkCliHome).mockReturnValue(true);
-        try {
-          vi.mocked(listAuthorizedUsers).mockReturnValue([]);
-          const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
-          expect(text).toContain('lark-cli: 以你自己的身份调用');
-          expect(text).not.toContain('你未授权');
-        } finally {
-          vi.mocked(hasLarkCliHome).mockReturnValue(false);
-        }
+      // A person with a sender-owned personal HOME must read as authorized
+      // even when no legacy Bot-app OAuth token exists.
+      it('counts a personal lark-cli HOME as authorized', async () => {
+        const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, true));
+        expect(text).toContain('lark-cli: 以你自己的身份调用');
+        expect(text).not.toContain('你未授权');
       });
 
       it('tells an unauthorized sender the call is refused (never "as the bot")', async () => {
@@ -3929,7 +3921,7 @@ describe('handleCommand', () => {
         const text = await statusText(
           statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true),
         );
-        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+        expect(text).toContain('lark-cli: 以你自己的身份调用');
         expect(text).toContain('bytedcli: 你未授权');
         expect(text).toContain('首次调用被拒时会自动返回登录链接');
       });
@@ -6204,7 +6196,9 @@ describe('handleCommand', () => {
       });
 
       it('completes pending challenges for BOTH providers in one reply', async () => {
-        vi.mocked(pendingLarkCliChallenge).mockReturnValue({ deviceCode: 'dc-1', authUrl: 'https://lark/x', createdAt: Date.now() });
+        vi.mocked(pendingLarkCliChallenge).mockReturnValue({
+          deviceCode: 'dc-1', authUrl: 'https://lark/x', scopes: [], createdAt: Date.now(),
+        });
         vi.mocked(completeLarkCliLogin).mockResolvedValue({ state: 'authorized' });
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });

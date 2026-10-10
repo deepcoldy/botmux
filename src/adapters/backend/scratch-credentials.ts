@@ -137,10 +137,15 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
       }
     } catch { /* */ }
 
-    // Per-person secret subdirectories (whole dirs): VC daemon auth tokens
-    // and each person's bytedcli login HOME. The CLI never needs these inside
-    // a scratch turn (they are daemon-side / per-owner).
-    for (const secretDir of ['vc-meeting-daemon-auth', 'bytedcli-home']) {
+    // Per-person secret subdirectories (whole dirs): VC daemon auth tokens,
+    // bytedcli logins, and lark-cli personal apps/logins. The CLI receives only
+    // its own per-turn wrapper identity and must not enumerate another sender's
+    // HOME.
+    for (const secretDir of [
+      'vc-meeting-daemon-auth',
+      'bytedcli-home',
+      'lark-cli-home',
+    ]) {
       const p = join(dataDir, secretDir);
       if (isDir(p)) out.add(p);
     }
@@ -172,6 +177,18 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     resolveLarkCliLinuxStoreDir(process.env.LARKSUITE_CLI_DATA_DIR, homeDir),
   ]);
   for (const p of larkStoreCandidates) {
+    if (existsSync(p)) out.add(p);
+  }
+
+  // larkdev's ByteCloud SDK keeps refresh/login state here. A governed wrapper
+  // always overrides LARKDEV_AUTH_DIR with an empty per-invocation directory,
+  // but scratch exposes the host tree for reads; mask both the default and an
+  // operator-configured auth root so the agent cannot bypass the wrapper by
+  // reading or invoking against the machine login directly.
+  for (const p of new Set<string>([
+    join(homeDir, '.larkdev', 'auth'),
+    ...(process.env.LARKDEV_AUTH_DIR?.startsWith('/') ? [process.env.LARKDEV_AUTH_DIR] : []),
+  ])) {
     if (existsSync(p)) out.add(p);
   }
 

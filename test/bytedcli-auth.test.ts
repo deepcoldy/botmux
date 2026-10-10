@@ -309,6 +309,53 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   });
 });
 
+describe('mintLarkdevByteCloudJwts — per-plane sender identity', () => {
+  it('mints every larkdev site from the same isolated sender HOME', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    replies = [
+      { code: 0, stdout: 'cn.jwt\n' },
+      { code: 0, stdout: 'code.jwt\n' },
+      { code: 0, stdout: 'tt.jwt\n' },
+      { code: 0, stdout: 'bd.jwt\n' },
+      { code: 0, stdout: 'eu.jwt\n' },
+      { code: 0, stdout: 'us.jwt\n' },
+    ];
+    expect(await mod.mintLarkdevByteCloudJwts(ALICE)).toEqual({
+      cn: 'cn.jwt',
+      'i18n-tt': 'tt.jwt',
+      'i18n-bd': 'bd.jwt',
+      'eu-ttp': 'eu.jwt',
+      'us-ttp': 'us.jwt',
+    });
+    expect(calls.map(call => call.args)).toEqual([
+      ['auth', 'get-bytecloud-jwt-token'],
+      ['auth', 'get-codebase-jwt-token'],
+      ['--site', 'i18n-tt', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'i18n-bd', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'eu-ttp', 'auth', 'get-bytecloud-jwt-token'],
+      ['--site', 'us-ttp', 'auth', 'get-bytecloud-jwt-token'],
+    ]);
+    expect(calls.every(call => call.home === mod.bytedcliHomeFor(ALICE))).toBe(true);
+  });
+
+  it('omits an unavailable region instead of borrowing a machine token', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    replies = [
+      { code: 0, stdout: 'cn.jwt\n' },
+      { code: 1, stderr: 'no code jwt' },
+      { code: 0, stdout: 'tt.jwt\n' },
+      { code: 1, stderr: 'not authorized for bd' },
+      { code: 0, stdout: 'eu.jwt\n' },
+      { code: 0, stdout: 'us.jwt\n' },
+    ];
+    const jwts = await mod.mintLarkdevByteCloudJwts(ALICE);
+    expect(jwts?.cn).toBe('cn.jwt');
+    expect(jwts?.['i18n-bd']).toBeUndefined();
+  });
+});
+
 describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate (F-B)', () => {
   async function beginOnce(mod: Awaited<ReturnType<typeof fresh>>) {
     replies = [{

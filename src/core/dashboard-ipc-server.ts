@@ -360,8 +360,15 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import {
+  beginLarkCliLogin,
+  completeLarkCliLogin,
+  larkCliHomeForTurn,
+  larkCliLoginScopes,
+  materializeLarkCliHomeForSession,
+} from '../services/lark-cli-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -2358,10 +2365,15 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
   return jsonRes(res, 200, { ok: true, preview });
 });
 
+type SessionAuthPollResult =
+  | { status: 'pending' }
+  | { status: 'ready'; home: string }
+  | { status: 'failed'; error: string };
+
 const sessionAuthRequests = new Map<string, {
   sessionId: string;
   isCurrent: () => boolean;
-  poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+  poll: () => Promise<SessionAuthPollResult>;
 }>();
 
 for (const action of ['auth-request', 'auth-status']) {
@@ -2442,7 +2454,7 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
       }
       if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
-        tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
+        tool: 'lark-cli', mode: 'user-home', home: result.home, turnId,
       })) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
@@ -2463,21 +2475,60 @@ for (const action of ['auth-request', 'auth-status']) {
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
-    let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+    let authorization: Awaited<ReturnType<typeof beginLarkCliLogin>>;
     try {
-      authorization = await requestUserAuthorization(
-        cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, isCurrent,
-      );
+      const brand = normalizeBrand(cfg.brand);
+      authorization = await (brand === 'lark'
+        ? beginLarkCliLogin(callerOpenId, scopes, brand)
+        : beginLarkCliLogin(callerOpenId, scopes));
     } catch {
       return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
     }
     if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+    if (!authorization) {
+      return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+    }
+    if (authorization.stage === 'app-setup') {
+      // Scope top-ups only make sense after the sender has a personal app. Hand
+      // the first-step URL back explicitly; never fall through to the Bot app.
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'personal_lark_app_required',
+        authUrl: authorization.authUrl,
+      });
+    }
     const requestId = randomBytes(32).toString('hex');
-    sessionAuthRequests.set(requestId, { sessionId: params.sessionId, isCurrent, poll: authorization.poll });
-    setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+    const expiresIn = 9 * 60;
+    sessionAuthRequests.set(requestId, {
+      sessionId: params.sessionId,
+      isCurrent,
+      poll: async () => {
+        const completed = await completeLarkCliLogin(callerOpenId);
+        if (completed.state === 'pending') return { status: 'pending' };
+        if (completed.state === 'failed') {
+          return { status: 'failed', error: completed.detail ?? 'authorization_failed' };
+        }
+        const sandbox = ds.session.sandbox;
+        const home = sandbox === true || sandbox === 'oncall' || sandbox === 'scratch'
+          ? await materializeLarkCliHomeForSession(
+              callerOpenId,
+              config.session.dataDir,
+              params.sessionId,
+            )
+          : larkCliHomeForTurn(callerOpenId);
+        return home
+          ? { status: 'ready', home }
+          : { status: 'failed', error: 'authorization_identity_unavailable' };
+      },
+    });
+    setTimeout(() => sessionAuthRequests.delete(requestId), expiresIn * 1_000).unref();
     return jsonRes(res, 200, {
-      ok: true, authUrl: authorization.authUrl, requestId,
-      scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
+      ok: true,
+      authUrl: authorization.authUrl,
+      requestId,
+      scopes: authorization.scopes ?? larkCliLoginScopes(scopes),
+      expiresIn,
+      autoCallback: true,
     });
   });
 }

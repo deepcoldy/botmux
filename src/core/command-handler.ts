@@ -64,7 +64,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -1250,16 +1250,9 @@ async function triggerUserAuthStatusLines(
 ): Promise<string[]> {
   const policy = botCfg.triggerUserAuth;
   if (!policy?.enabled || !policy.tools.length) return [];
-  const brand = normalizeBrand(botCfg.brand);
-  // lark-cli acts as the person via either the new per-person device-code HOME
-  // or a legacy bot-app OAuth token. Both must count (and /login status reads the
-  // same two sources), or someone who authorized through the device flow would
-  // be told here they had not. The legacy lookup also supplies a display name.
-  const legacyLarkUser = senderOpenId
-    ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
-    : undefined;
-  const larkAuthorized = senderOpenId !== undefined
-    && (hasLarkCliHome(senderOpenId) || !!legacyLarkUser);
+  // A Bot-app OAuth token is intentionally NOT a trigger-user fallback. Only
+  // the sender-keyed HOME created from scratch counts as lark-cli authorization.
+  const larkAuthorized = senderOpenId !== undefined && hasLarkCliHome(senderOpenId);
 
   const bytedStatus = policy.tools.includes('bytedcli') ? await bytedcliLoginStatus(senderOpenId) : undefined;
   const lines = ['Trigger-user auth: 已开启'];
@@ -1267,7 +1260,7 @@ async function triggerUserAuthStatusLines(
     lines.push(`  ${tool}: ${
       tool === 'lark-cli'
         ? larkAuthorized
-          ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
+          ? '以你自己的身份调用'
           // lark-cli no longer degrades to the bot's own identity: an
           // unauthorized call is refused, and the refusal carries a ready
           // device-code link. Saying "running as the bot" here would describe a
@@ -3635,9 +3628,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
           break;
         }
-        // 授权归属到「发起这条 /login 的人」。token 代表一个人而不是一个 bot：不带
-        // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
-        // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
+        // 授权归属到「发起这条 /login 的人」。每个人的 lark-cli HOME 独立。
         const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
@@ -3701,13 +3692,16 @@ export async function handleCommand(
           break;
         }
 
-        // `/login lark` — lark-cli device-code (QR) authorization against the
-        // provisioned per-person issuer app. Non-blocking: returns a verify URL.
+        // `/login lark` — compatibility entry for the same automatic flow:
+        // select/bind an app in this person's HOME, then authorize through it.
         if (subCmd === 'lark' || subCmd.startsWith('lark ')) {
           if (loginOpenId) {
-            const started = await beginLarkCliLogin(loginOpenId);
+            const brand = normalizeBrand(botCfg2.brand);
+            const started = await (brand === 'lark'
+              ? beginLarkCliLogin(loginOpenId, [], brand)
+              : beginLarkCliLogin(loginOpenId));
             if (!started) {
-              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'lark-cli has no provisioned issuer app on the server' }, loc));
+              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'personal app setup could not be started' }, loc));
               break;
             }
             await sessionReply(rootId, [
@@ -3731,9 +3725,12 @@ export async function handleCommand(
         const larkDeviceOn = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
         if (larkDeviceOn && subCmd === '') {
           if (loginOpenId) {
-            const started = await beginLarkCliLogin(loginOpenId);
+            const brand = normalizeBrand(botCfg2.brand);
+            const started = await (brand === 'lark'
+              ? beginLarkCliLogin(loginOpenId, [], brand)
+              : beginLarkCliLogin(loginOpenId));
             if (!started) {
-              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'no provisioned issuer app' }, loc));
+              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'personal app setup could not be started' }, loc));
               break;
             }
             await sessionReply(rootId, [
