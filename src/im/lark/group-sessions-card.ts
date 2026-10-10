@@ -367,6 +367,7 @@ export async function handleGroupSessionsCardAction(
       });
       if (response.status !== 200 || (response.body as { ok?: boolean } | undefined)?.ok !== true) {
         const reason = String((response.body as Record<string, unknown> | undefined)?.error ?? `http_${response.status}`);
+        if (reason === 'workspace_retired') return error('card.action.resume_workspace_retired', undefined, locale);
         return error('card.group_sessions.resume_failed', { reason }, locale);
       }
       const refreshed = await getScopedRows(client, { larkAppId, chatId }, locale);

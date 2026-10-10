@@ -286,6 +286,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { logger } from '../src/utils/logger.js';
+import { mutatePersistedSessionRow } from './helpers/session-store-disk.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'restore-zombie-test-'));
@@ -328,6 +329,33 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   sessionStore.updateSession(s);
   return s; // left active
 }
+
+describe('restoreActiveSessions — workspace retirement', () => {
+  it.each(['tmux', 'zmx'] as const)('skips and explains a corrupt active retired %s row before registration or spawn', async backend => {
+    const session = makeActivePersistentSession('retired-root', backend);
+    const retirement = { operationId: 'recycle-corrupt', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    // Bypass the write invariant to model historical/corrupt durable data, then reload it.
+    mutatePersistedSessionRow(tempDir, undefined, session.sessionId, row => {
+      row.workspaceRetirement = retirement;
+    });
+    sessionStore.init();
+    expect(sessionStore.getSession(session.sessionId)).toMatchObject({ status: 'active', workspaceRetirement: retirement });
+    vi.mocked(setActiveSessionSafe).mockClear();
+    vi.mocked(forkAdoptWorker).mockClear();
+    vi.mocked(logger.info).mockClear();
+    const active = new Map<string, DaemonSession>();
+    wp.registry = active;
+
+    await restoreActiveSessions(active);
+
+    expect(active.size).toBe(0);
+    expect(setActiveSessionSafe).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(forkAdoptWorker).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining(`Skipping workspace-retired session ${session.sessionId}`));
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining(`operationId=${retirement.operationId}`));
+  });
+});
 
 describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', () => {
   // The module-level bot-registry mock serves every other describe; stash its

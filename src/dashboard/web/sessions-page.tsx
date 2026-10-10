@@ -68,6 +68,7 @@ import {
   copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
+  resumeErrorMessage,
   sessionLocationText,
   preferChatFilterLabel,
   sessionLocationTitle,
@@ -3438,7 +3439,7 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        toast(`${t('sessions.resumeFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
+        toast(resumeErrorMessage(body?.error ?? r.status, t), { kind: 'error' });
         return false;
       }
       return true;

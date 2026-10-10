@@ -1662,6 +1662,8 @@ function persistRow(session: Session): void {
       new Error(`session store ${getDbPath()} is not attached`),
     );
   }
+  // Retirement is a terminal invariant even when the durable row has no marker yet.
+  if (session.workspaceRetirement && session.status !== 'closed') throw new Error('workspace_retired');
   testOnlyBeforeRowPersist?.(session.sessionId);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {

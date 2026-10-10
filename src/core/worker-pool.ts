@@ -7245,8 +7245,9 @@ function removeInactiveRegistration(
   // same routing key and must never be evicted by this continuation.
   if (map.get(key) === ds) map.delete(key);
   logger.warn(
-    `[${tag(ds)}] Refusing to register an inactive session ` +
-    `(status=${ds.session.status})`,
+    ds.session.workspaceRetirement
+      ? `[${tag(ds)}] Refusing to register a workspace-retired session (status=${ds.session.status}, operationId=${ds.session.workspaceRetirement.operationId})`
+      : `[${tag(ds)}] Refusing to register an inactive session (status=${ds.session.status})`,
   );
   return true;
 }
@@ -7358,12 +7359,7 @@ export async function setActiveSessionSafe(
     // to a non-active status while an async creator/restore awaited Lark/project
     // metadata. Never publish that now-inactive row back into the live map; drop
     // only our exact stale object so a newer owner of the same key is untouched.
-    if (ds.session.status !== 'active') {
-      if (map.get(key) === ds) map.delete(key);
-      logger.warn(
-        `[setActiveSessionSafe] refusing to register inactive session `
-        + `${ds.session.sessionId.substring(0, 8)} (status=${ds.session.status})`,
-      );
+    if (removeInactiveRegistration(map, key, ds)) {
       return {
         accepted: false,
         reason: 'inactive_incoming',

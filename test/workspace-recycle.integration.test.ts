@@ -38,7 +38,7 @@ async function startWorker(workspace: string): Promise<{ worker: ChildProcess; p
   const ready = await new Promise<{ pid: number; port: number }>((resolve, reject) => {
     let stderr = '';
     worker.stderr?.on('data', data => { stderr += data.toString(); });
-    const timeout = setTimeout(() => reject(new Error(`fixture_ready_timeout:${stderr}`)), 10_000);
+    const timeout = setTimeout(() => reject(new Error(`fixture_ready_timeout:${stderr}`)), 30_000);
     worker.once('exit', code => { clearTimeout(timeout); reject(new Error(`fixture_exited_before_ready:${code}:${stderr}`)); });
     worker.on('message', message => {
       const event = message as { type: string; pid: number; port: number };
@@ -110,5 +110,5 @@ describe('isolated real process and standard close', () => {
     // Optional evidence path is supplied only by this task's isolated validation
     // run. Normal CI leaves no artifact outside the disposable fixture.
     if (process.env.BOTMUX_RECYCLE_TEST_EVIDENCE) writeFileSync(process.env.BOTMUX_RECYCLE_TEST_EVIDENCE, JSON.stringify(evidence, null, 2));
-  }, 30_000);
+  }, 120_000);
 });

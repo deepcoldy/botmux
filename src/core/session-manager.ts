@@ -2110,7 +2110,14 @@ export async function restoreActiveSessions(
   // Registration itself is CAS, so a fresh runtime occupant always wins over
   // every startup candidate regardless of this disk ordering.
   const active = sessions
-    .filter(s => s.status === 'active' && !s.workspaceRetirement)
+    .filter(s => {
+      if (s.status !== 'active') return false;
+      if (s.workspaceRetirement) {
+        logger.info(`Skipping workspace-retired session ${s.sessionId} during restore (operationId=${s.workspaceRetirement.operationId})`);
+        return false;
+      }
+      return true;
+    })
     // Idempotency quarantine (at-most-once): a session the boot reconcile just
     // terminalized as `dispatch_unknown` (or dropped as a pre-dispatch reserved
     // orphan) must NOT be re-attached — the poller now sees it `failed`, so

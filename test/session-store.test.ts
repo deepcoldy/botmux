@@ -673,6 +673,24 @@ describe('closeSession()', () => {
     expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
   });
 
+  it('rejects a first retirement marker on an active row without changing memory or disk', () => {
+    const session = createSession('chat1', 'root1', 'Incoming retirement');
+    const retirement = { operationId: 'recycle-incoming', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    expect(() => updateSession({ ...session, workspaceRetirement: retirement })).toThrow('workspace_retired');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+
+    // A normal close and an idempotent retirement of an already closed row remain valid.
+    closeSession(session.sessionId);
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', workspaceRetirement: retirement });
+  });
+
   it('commits workspace retirement with closed state and refuses stale writers that resurrect or erase it', () => {
     const session = createSession('chat1', 'root1', 'Retired workspace');
     const stale = { ...session };
