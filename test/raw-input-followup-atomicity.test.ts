@@ -140,11 +140,19 @@ describe('worker adopt/native-rename coordination', () => {
 });
 
 describe('worker raw_input delivery', () => {
-  // The span only has to cover deliverRawInput's body; it is not itself an
-  // assertion. Kept comfortably ahead of the last anchor below (the previous
-  // 7000 left ~2 chars of slack, so any added line broke these tests for
-  // reasons that had nothing to do with what they check).
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 7600);
+  // Bound the region to the deliverRawInput function body (up to the next
+  // top-level function) instead of a fixed char span. The previous 7600 window
+  // had only ~150 chars of slack, so unrelated lines merged into this body on
+  // master pushed the sendToPty anchor past the end and failed these ordering
+  // assertions for reasons that had nothing to do with what they check.
+  const deliverStart = workerSrc.indexOf('async function deliverRawInput');
+  expect(deliverStart).toBeGreaterThanOrEqual(0);
+  // turnAuthorityIdentity is the next top-level function on the supported
+  // baselines (master later inserted markTurnRetired between the two, which
+  // only widens this slice by a few unrelated lines).
+  const deliverEnd = workerSrc.indexOf('function turnAuthorityIdentity', deliverStart);
+  expect(deliverEnd).toBeGreaterThan(deliverStart);
+  const region = workerSrc.slice(deliverStart, deliverEnd);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
     const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');
