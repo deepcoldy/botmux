@@ -448,7 +448,6 @@ import {
 } from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
-import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
 import {
@@ -10474,6 +10473,9 @@ async function captureAndUpload(): Promise<void> {
         usageLimitContent = snap;
         const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
         const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
+        // Lazy for the same reason as transient-snapshot.ts: a missing canvas
+        // native must fail this capture (caught below), not the whole worker.
+        const { captureToPng } = await import('./utils/screenshot-renderer.js');
         png = await captureToPng(term, { cols: shotCols, rows: shotRows, startY });
       }
     } catch (err: any) {
