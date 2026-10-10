@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { DaemonSession } from '../core/types.js';
 import { sessionKey, storedSessionAnchorId } from '../core/types.js';
 import type { Session } from '../types.js';
@@ -138,9 +139,15 @@ export function createDurableLarkSessionControlRuntime(
 
     const canonicalKey = sessionKey(storedSessionAnchorId(session), options.larkAppId);
     const canonical = await options.store.readSession(canonicalKey);
-    if (!canonical || parseDurablePrimarySessionRecord(canonical).session.sessionId !== control.sessionId) {
+    const canonicalSession = canonical
+      ? parseDurablePrimarySessionRecord(canonical).session
+      : undefined;
+    if (!canonicalSession || canonicalSession.sessionId !== control.sessionId) {
       throw new Error('durable lifecycle control canonical Session is unavailable');
     }
+    const resumeBaselineState = control.action === 'resume'
+      ? normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState)
+      : undefined;
     const operationPayload = {
       version: 1,
       type: 'botmux.lark.session-control-operation',
@@ -169,7 +176,9 @@ export function createDurableLarkSessionControlRuntime(
       ...extra,
     }) as unknown as DurableJson;
 
-    const observed = (): { result: DurableJson; evidence: DurableJson } | undefined => {
+    const observed = (
+      reconcileResume = false,
+    ): { result: DurableJson; evidence: DurableJson } | undefined => {
       const current = options.getPersistedSession(control.sessionId);
       if (!current) return undefined;
       if (control.action === 'close' && current.status === 'closed') {
@@ -182,11 +191,45 @@ export function createDurableLarkSessionControlRuntime(
           },
         };
       }
+      if (control.action === 'resume' && reconcileResume && current.status === 'closed') {
+        return {
+          result: result('closed', undefined, {
+            applied: false,
+            error: 'resume_start_failed',
+            noticeText: options.resumeRefusedText('resume_start_failed'),
+          }),
+          evidence: {
+            source: 'session-store',
+            status: 'closed',
+            recovery: 'rolled-back',
+            ...(current.closedAt ? { closedAt: current.closedAt } : {}),
+          },
+        };
+      }
       if (control.action === 'resume' && current.status === 'active') {
         const active = options.findActiveSession(control.sessionId);
+        if (resumeBaselineState) {
+          const recoveredState = normalizeRemoteRunnerBackendState(
+            active?.session.remoteBackendState,
+          );
+          if (!active
+              || !recoveredState
+              || recoveredState.provider !== resumeBaselineState.provider
+              || recoveredState.generation <= resumeBaselineState.generation
+              || !recoveredState.remoteSessionId) return undefined;
+        }
         return {
           result: result('active', active ? options.buildActiveCard(active) : undefined),
-          evidence: { source: 'session-store', status: 'active' },
+          evidence: {
+            source: 'session-store',
+            status: 'active',
+            ...(resumeBaselineState
+              ? {
+                  recovery: 'ready',
+                  generation: active?.session.remoteBackendState?.generation,
+                }
+              : {}),
+          },
         };
       }
       return undefined;
@@ -229,6 +272,14 @@ export function createDurableLarkSessionControlRuntime(
           }
           const resumed = await options.resumeSession(control.sessionId);
           if (resumed.ok) {
+            if (resumed.recoveryPending === true) {
+              const recovered = observed(true);
+              if (recovered) return { kind: 'completed', result: recovered.result };
+              return {
+                kind: 'ambiguous',
+                error: 'remote resume recovery is pending durable readiness',
+              };
+            }
             return {
               kind: 'completed',
               result: result(
@@ -238,8 +289,6 @@ export function createDurableLarkSessionControlRuntime(
               ),
             };
           }
-          const after = observed();
-          if (after) return { kind: 'completed', result: after.result };
           if (resumed.error === 'anchor_occupied' || resumed.error === 'resume_start_failed') {
             const closed = options.getPersistedSession(control.sessionId);
             if (!closed || closed.status !== 'closed') {
@@ -257,13 +306,15 @@ export function createDurableLarkSessionControlRuntime(
               }),
             };
           }
+          const after = observed(true);
+          if (after) return { kind: 'completed', result: after.result };
           return {
             kind: 'ambiguous',
             error: `resume result requires reconciliation: ${resumed.error}`,
           };
         },
         reconcile: async () => {
-          const reconciled = observed();
+          const reconciled = observed(true);
           return reconciled
             ? { kind: 'completed', ...reconciled }
             : { kind: 'unknown', error: 'backend cannot yet prove the lifecycle outcome' };
