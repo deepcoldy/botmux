@@ -315,7 +315,7 @@ describe('worker turn-idle channel', () => {
    * The blocker this channel shipped with, restated for the post-#1781 worker.
    *
    * Original hazard: the turn identity was read LATER, inside the detached
-   * `botmux turn-idle` child, off the worker's MUTABLE active-turn marker —
+   * `botmux turn-idle-v2` child, off the worker's MUTABLE active-turn marker —
    * dsh-tui steers busy-period input, so that read could name turn B while the
    * report was about turn A. Freezing the identity inside the `agent/status`
    * callback (see the file header) is what closed it.

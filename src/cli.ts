@@ -14919,7 +14919,7 @@ async function postSessionScopedSignal(
   } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
 }
 
-// ─── botmux turn-idle ─────────────────────────────────────────────────────────
+// ─── botmux turn-idle-v2 ──────────────────────────────────────────────────────
 //
 // CLI 进程内的**结构化回合空闲**上报客户端。当前唯一调用方是 dsh-tui 的 cordis
 // wrapper 插件：`agent/status` 落到 idle（一个回合真正结束）时执行
@@ -14934,6 +14934,12 @@ async function postSessionScopedSignal(
 // 会自称 B、反过来骗过 worker 的精确匹配 fence → B 仍在跑就 fireIdle()。
 // 缺协议版本 / 缺冻结身份（v1 插件只送 seq+pid / 读不到冻结来源）一律静默丢弃：
 // 宁可少一条 idle 边（该轮退回既有兜底），也绝不早判一轮为 idle。
+//
+// 子命令名带协议版本（`turn-idle-v2`，见 adapters/hook-command.ts）：命令指向的
+// cli.js 会被 in-place update / rollback 换成任意版本，而长命 TUI 进程里仍是生成时
+// 那份 v2 插件。不带版本的旧子命令会让 v1 CLI「成功」处理 v2 payload，却完全不看
+// 冻结身份、改读执行时的 marker —— 版本化子命令让混装直接变成「v1 不认识 → 一个
+// 请求都不发」，fail closed。
 //
 // 与 session-ready 同一条 fail-open 铁律：env 缺失 / daemon 不可达 / 未授权都静默
 // exit 0，绝不产生用户可见输出，也绝不阻塞回合结算。capability 仍是唯一凭据
@@ -16225,8 +16231,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // Structured end-of-turn idle report (dsh-tui wrapper plugin). Same class as
     // `session-ready`: a purely local, session-scoped callback with no chat,
     // workflow, deployment, or external messaging effect — the worker fence
-    // decides whether it may settle a turn.
-    'turn-idle',
+    // decides whether it may settle a turn. The `-v2` suffix is the versioned
+    // fail-closed switch (see turnIdleHookCommand): a v1 CLI must not be able to
+    // "service" a v2 report by re-reading the live marker.
+    'turn-idle-v2',
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
@@ -17430,9 +17438,11 @@ switch (command) {
     await cmdSessionReady();
     break;
   }
-  case 'turn-idle': {
-    // `botmux turn-idle` — CLI 进程内结构化回合空闲上报客户端（dsh-tui 的 cordis
-    // wrapper 插件在 agent/status 落到 idle 时执行）；worker 侧做回合 fence。
+  case 'turn-idle-v2': {
+    // `botmux turn-idle-v2` — CLI 进程内结构化回合空闲上报客户端（dsh-tui 的
+    // cordis wrapper 插件在 agent/status 落到 idle 时执行）；worker 侧做回合 fence。
+    // 子命令名带协议版本：v1 CLI 不认识它，混装时一个请求都不会发（见
+    // adapters/hook-command.ts 的 turnIdleHookCommand）。
     await cmdTurnIdle();
     break;
   }

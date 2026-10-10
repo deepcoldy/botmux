@@ -350,7 +350,7 @@ export function apply(ctx) {
  *
  * The turn identity is FROZEN INSIDE that callback, and carried in the payload
  * (protocol v2, see utils/turn-idle-report.ts). It must not be resolved later,
- * by the detached `botmux turn-idle` child: the worker rewrites the published
+ * by the detached `botmux turn-idle-v2` child: the worker rewrites the published
  * (turn, dispatch generation) pair before every literal write, and dsh-tui
  * steers busy-period input, so a report about turn A that reads the pair after
  * the next dispatch would claim turn B — and satisfy the worker's exact-match

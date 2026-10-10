@@ -2,7 +2,7 @@
  * Turn-idle report fence.
  *
  * A structured "this turn finished" report can arrive from inside the CLI
- * process (dsh-tui's cordis wrapper plugin fires `botmux turn-idle` on every
+ * process (dsh-tui's cordis wrapper plugin fires `botmux turn-idle-v2` on every
  * `agent/status === 'idle'` transition). The worker turns an accepted report
  * into `idleDetector.fireIdle()` → `markPromptReady()`, which publishes a ready
  * edge and may flush queued input. Accepting a report for a turn that is NOT the
@@ -36,9 +36,11 @@
  *     idle edge costs nothing.
  *
  * Legacy reporters that cannot carry an attempt are therefore NOT accepted
- * wholesale: the transport (dsh-tui wrapper plugin → `botmux turn-idle`) is
- * versioned, and a report without a frozen identity never reaches this fence
- * (see cli.ts cmdTurnIdle).
+ * wholesale: the transport (dsh-tui wrapper plugin → `botmux turn-idle-v2`) is
+ * versioned — both in the payload (`v`) and in the subcommand name, so a CLI
+ * that predates v2 cannot service the command at all (see cli.ts cmdTurnIdle and
+ * adapters/hook-command.ts) — and a report without a frozen identity never
+ * reaches this fence.
  */
 /**
  * Wire version of the in-CLI → daemon report envelope.

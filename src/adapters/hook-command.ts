@@ -106,15 +106,26 @@ export function sessionReadyHookCommand(): string {
 }
 
 /**
- * 构造 dsh-tui 结构化回合空闲上报的 **shell 命令字符串** → `botmux turn-idle`。
+ * 构造 dsh-tui 结构化回合空闲上报的 **shell 命令字符串** → `botmux turn-idle-v2`。
  * 与 `sessionReadyHookCommand` 同源的路径解析与加引号策略：同样写进 CLI 进程的
  * env（`BOTMUX_TURN_IDLE_COMMAND`），由 dsh-tui 的 cordis wrapper 插件在
  * `agent/status` 落到 idle 时按 shell 字符串执行一次。CLI 侧靠子进程继承的
  * `BOTMUX_SESSION_ID` / `BOTMUX_LARK_APP_ID` 定位会话与 owning daemon，
  * 不需要 cliId。
+ *
+ * 子命令名带协议版本是**跨版本混装的 fail-closed 开关**，不是装饰：
+ * 长命的 dsh-tui 进程里跑的是生成时那份 wrapper 插件（v2，会把事件时冻结的
+ * turn/attempt/token 放进 payload），而命令指向的 `<dist>/cli.js` 会被 in-place
+ * update / rollback 换成**任意版本**。若沿用不带版本的 `turn-idle`，v1 CLI 会
+ * 完全不看 payload 里的 v2 身份，改读**执行时**的 marker/capability —— 那时 worker
+ * 可能已经旋到下一轮 B，于是 A 轮的 idle 报告自称 B，tuple 与 token 都「确实是当前
+ * B」，worker 的精确匹配 fence 通过，B 还在跑就 fireIdle()（真实提前放行）。
+ * 仅靠 payload 里的 `v` 字段挡不住：v1 parser 根本不解析它。
+ * 换成 v1 不认识的子命令后，混装只会「命令无法解释 → 一个请求都不发」（插件
+ * fire-and-forget，静默 fail-closed），该轮退回既有兜底路径，绝不误判空闲。
  */
 export function turnIdleHookCommand(): string {
-  return renderShellCommand(undefined, 'turn-idle');
+  return renderShellCommand(undefined, 'turn-idle-v2');
 }
 
 /**

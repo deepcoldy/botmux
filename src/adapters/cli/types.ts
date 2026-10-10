@@ -590,7 +590,7 @@ export interface CliAdapter {
   readonly injectsReadyHook?: boolean;
 
   /** When true, the adapter injects `BOTMUX_TURN_IDLE_COMMAND`
-   *  (`botmux turn-idle`) so an integration running INSIDE the CLI process can
+   *  (`botmux turn-idle-v2`) so an integration running INSIDE the CLI process can
    *  report a structured end-of-turn idle edge (dsh-tui: its cordis wrapper
    *  plugin listens to `agent/status === 'idle'`). The worker forwards such a
    *  report to `idleDetector.fireIdle()` only when it names the worker's own
