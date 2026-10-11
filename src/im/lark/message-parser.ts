@@ -8,6 +8,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
+import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -1166,6 +1167,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
           for (const node of paragraph) {
             if (inSignedFooter) continue;
             if (node.tag === 'text') {
+              const visibleText = typeof node.text === 'string'
+                ? stripTrailingGroupContextCardPurposeMarker(node.text)
+                : node.text;
+              if (visibleText !== node.text
+                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                if (visibleText) textNodes.push(visibleText);
+                continue;
+              }
               if (hasCurrentFooterMarker(node.text)) {
                 textNodes.push(node.text.slice(0, node.text.indexOf(REPLY_CARD_FOOTER_MARKER)));
                 inSignedFooter = true;
@@ -1771,7 +1780,12 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // div / markdown / plain_text blocks
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {
     const text = el.text?.content ?? el.content;
-    if (text) parts.push(text);
+    if (text) {
+      const visibleText = typeof text === 'string'
+        ? stripTrailingGroupContextCardPurposeMarker(text)
+        : text;
+      if (visibleText) parts.push(visibleText);
+    }
   }
 
   if (tag === 'table') {

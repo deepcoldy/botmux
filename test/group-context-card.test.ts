@@ -120,6 +120,26 @@ describe('group-context card projection', () => {
     expect(projectGroupContextCard(markGroupContextCardPurpose(runtime, 'message'))?.kind).toBe('conversation');
   });
 
+  it('inlines a standalone purpose marker without adding a blank footer row', () => {
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'markdown', content: 'PUBLIC_PROGRESS' },
+    ] } });
+    const runtime = markGroupContextCardPurpose(raw, 'runtime');
+    const runtimeCard = JSON.parse(runtime);
+    expect(runtimeCard.body.elements).toHaveLength(1);
+    expect(runtimeCard.body.elements[0].content).toBe(`PUBLIC_PROGRESS${'\u2063'.repeat(12)}`);
+    expect(extractCardContent(runtime)).toBe('PUBLIC_PROGRESS');
+    expect(projectGroupContextCard(runtime)).toEqual({ kind: 'runtime' });
+    expect(projectGroupContextCard(simplified(runtime))).toEqual({ kind: 'runtime' });
+
+    const message = markGroupContextCardPurpose(runtime, 'message');
+    const messageCard = JSON.parse(message);
+    expect(messageCard.body.elements).toHaveLength(1);
+    expect(messageCard.body.elements[0].content).toBe(`PUBLIC_PROGRESS${'\u2063'.repeat(13)}`);
+    expect(conversation(message).text).toBe('PUBLIC_PROGRESS');
+    expect(conversation(simplified(message)).text).toBe('PUBLIC_PROGRESS');
+  });
+
   it('leaves ordinary author and third-party cards unclassified even when they contain status words', () => {
     for (const raw of [buildCanonicalFinalReplyCard({ markdown: 'Working; Completed; 正在处理' }),
       JSON.stringify({ title: 'Working', elements: [[{ tag: 'text', text: 'Completed' }]] }), '{']) {
