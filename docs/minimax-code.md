@@ -62,4 +62,4 @@ bun run build
 
 Bun 的 `tty.ReadStream` 会将非阻塞 PTY 暂时无数据产生的 `EAGAIN` 当作读失败，关闭 master 并导致子进程收到 SIGHUP。公共 `utils/pty.ts` 仅为 Bun Unix 的单个 reader 重试 `EAGAIN`/`EWOULDBLOCK`/`EINTR`，保留 node-pty 的编码、输入、resize、暂停/恢复与退出逻辑；Node 和 Windows 沿用原始 reader。回归测试在 Node/Bun 下覆盖空闲间隔、跨块 UTF-8、交互输入、resize、主动中断和大块输出暂停/恢复。
 
-Linux 上已使用登录的真实 MiniMax OAuth 账号验证服务端 `MiniMax-M3.1-Flash-Preview`：两轮 Shell 文件工具执行、原生精确 ID 恢复和用量回传通过；真实 tmux 中也完成首轮 Shell 写文件及 owner 透传。后续真实服务的 tmux 重建验收遇到 Token Plan 用量上限（2067），需额度恢复后继续，不能以本地合成服务结果替代订阅验收。macOS 未作实机运行验收。
+Linux 上已使用登录的真实 MiniMax OAuth 账号验证服务端 `MiniMax-M3.1-Flash-Preview`：两轮 Shell 文件工具执行、原生精确 ID 恢复和用量回传通过。真实服务的 tmux 完整流程也已通过：首轮工具写文件及 owner 透传，销毁旧 runner 并确认新 runner 的 PID 改变，再指定同一原生 ID 恢复；第二轮不读取验证文件，仅从会话历史回忆首轮随机标识并写出相同结果，两轮 final 的 turnId 和用量回传均正确。macOS 未作实机运行验收。
