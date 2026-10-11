@@ -7,7 +7,7 @@ const version = 1;
 const capabilities = [
   'start', 'resume', 'turn', 'cancel', 'detach', 'status',
   'terminal_screen', 'terminal_input', 'terminal_resize', 'reattach',
-  'outbound_message',
+  'outbound_message', 'session_tool',
   // Unknown additive capabilities are intentionally safe for older clients.
   'reference_future_capability',
 ];
@@ -18,6 +18,7 @@ let screenSequence = 0;
 let cols = 120;
 let rows = 40;
 let pendingOutboundTurn;
+let pendingSessionToolTurn;
 
 function emit(event) {
   process.stdout.write(`${JSON.stringify({ protocol, version, ...event })}\n`);
@@ -137,6 +138,17 @@ input.on('line', line => {
         });
         return;
       }
+      if (command.content === 'request-session-tool') {
+        pendingSessionToolTurn = command;
+        emit({
+          type: 'session_tool',
+          operationId: 'reference-session-tool-1',
+          turnId: command.turnId,
+          generation: state.generation,
+          request: { tool: 'history', limit: 20, scope: 'thread' },
+        });
+        return;
+      }
       finishTurn(command);
       return;
     }
@@ -150,6 +162,19 @@ input.on('line', line => {
       }
       const turn = pendingOutboundTurn;
       pendingOutboundTurn = undefined;
+      finishTurn(turn, JSON.stringify(command.result));
+      return;
+    }
+    case 'session_tool_result': {
+      if (!pendingSessionToolTurn
+          || command.operationId !== 'reference-session-tool-1'
+          || command.turnId !== pendingSessionToolTurn.turnId
+          || command.generation !== state?.generation) {
+        fail(command, 'session_tool_result_mismatch', 'session tool result does not match the pending operation');
+        return;
+      }
+      const turn = pendingSessionToolTurn;
+      pendingSessionToolTurn = undefined;
       finishTurn(turn, JSON.stringify(command.result));
       return;
     }

@@ -291,6 +291,45 @@ export function shouldReleaseFirstPromptTimeout(state: {
 }
 
 /**
+ * How long the ready-gate waits for its signal before falling back.
+ *
+ * The gate's fallback is only allowed to remove the gate's OWN extra hold; it
+ * must never become the effective first-prompt deadline for an adapter that
+ * deferred the first prompt to a real readyPattern. For such an adapter the
+ * gate's fallback flushes through `settleThenFlush` → `flushPending()`, and a
+ * type-ahead adapter admits that write while `isPromptReady` is still false —
+ * so a 45s fallback would deliver the first prompt at ~45-51s, straight into a
+ * TUI whose composer may not be mounted yet (dsh-tui boots in three stages and
+ * a first run also shells out to `dsh plugin add`). That silently pre-empts the
+ * adapter's own 90s hard cap, which exists precisely because no earlier
+ * evidence is trustworthy.
+ *
+ * The alignment is therefore an EXPLICIT, per-adapter opt-in
+ * (`readyGateFallbackAlignedWithHardCap`) and is deliberately not derived from
+ * the shared `deferFirstPromptTimeoutUntilReady` + readyPattern flags: grok
+ * carries both of those, yet its 45s gate fallback is a pre-existing behavior
+ * it must keep (its SessionStart hook is the primary signal, and the fallback is
+ * simply the other ready edge). Deriving it from shared flags silently moved
+ * every deferring adapter — grok included — from 45s to 90s.
+ *
+ * For an adapter that opts in, aligning the fallback with its hard cap keeps one
+ * deadline: the readyPattern still releases the gate as soon as it proves the
+ * input box, and an absent signal degrades to exactly the adapter's own
+ * hard-cap path.
+ */
+export function resolveReadySignalTimeoutMs(state: {
+  /** Adapter-declared opt-in (see `CliAdapter.readyGateFallbackAlignedWithHardCap`). */
+  alignFallbackWithFirstPromptHardCap: boolean;
+  /** Default fallback for adapters whose readiness signal is their only edge. */
+  readySignalTimeoutMs: number;
+  /** The adapter's own absolute cap for keeping the first prompt queued. */
+  firstPromptHardTimeoutMs: number;
+}): number {
+  if (!state.alignFallbackWithFirstPromptHardCap) return state.readySignalTimeoutMs;
+  return Math.max(state.readySignalTimeoutMs, state.firstPromptHardTimeoutMs);
+}
+
+/**
  * After the ready-gate releases (SessionStart/direct-ready signal OR the timeout
  * fallback), the worker settles for PTY quiescence and then decides whether to
  * mark the prompt ready (which flushes for ALL adapters) vs. just calling

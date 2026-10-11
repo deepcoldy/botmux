@@ -1,4 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -9,9 +11,19 @@ import { buildRelayHostEnv, startOutboxWatcher } from '../src/adapters/backend/s
 import {
   ensureManagedOriginAttestationDirectory,
   managedOriginCapabilityPath,
+  managedOriginIsolationMarkerPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
+import {
+  MANAGED_ORIGIN_PROOF_DOMAIN,
+  writeManagedOriginAttestationProof,
+} from '../src/core/managed-origin-attestation.js';
+import {
+  acceptVcMeetingDelivery,
+  applyVcMeetingMemberProjection,
+  markVcMeetingDeliveryDispatched,
+} from '../src/services/vc-meeting-delivery-store.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliSource = readFileSync(join(__dirname, '..', 'src', 'cli.ts'), 'utf8');
@@ -485,6 +497,174 @@ describe('cmdSend hook context wiring', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  // A Seatbelt profile can let existsSync() see the PID marker while denying
+  // the read (EPERM); the marker reader reports that as sessionId ''. Real
+  // Seatbelt denial cannot be reproduced here, so chmod 000 stands in for it
+  // (meaningless as root, hence the skip and the explicit precondition).
+  async function withUnreadableMarker(
+    options: { attestable: boolean; dispatchAttempt?: number },
+    run: (env: NodeJS.ProcessEnv) => Promise<void>,
+  ): Promise<void> {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-unreadable-marker-'));
+    const dataDir = join(root, 'data');
+    const markerDir = join(dataDir, '.botmux-cli-pids');
+    const markerPath = join(markerDir, String(process.pid));
+    const channelId = 'ad'.repeat(32);
+    const capability = 'be'.repeat(32);
+    const daemon = createServer((req, res) => {
+      let body = '';
+      req.on('data', chunk => { body += String(chunk); });
+      req.on('end', () => {
+        const request = JSON.parse(body) as {
+          sessionId: string; channelId: string; originCapability: string; nonce: string;
+        };
+        if (request.sessionId === 'session' && request.channelId === channelId
+          && request.originCapability === capability) {
+          writeManagedOriginAttestationProof({
+            dataDir,
+            proof: {
+              domain: MANAGED_ORIGIN_PROOF_DOMAIN,
+              version: 1,
+              nonce: request.nonce,
+              channelId,
+              sessionId: 'session',
+              turnId: 'turn-live',
+              ...(options.dispatchAttempt !== undefined ? { dispatchAttempt: options.dispatchAttempt } : {}),
+              requiresCodexAppLedger: false,
+              issuedAtMs: Date.now(),
+            },
+          });
+        }
+        res.writeHead(200).end();
+      });
+    });
+    try {
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, JSON.stringify({ sessionId: 'session', turnId: 'turn-live' }));
+      chmodSync(markerPath, 0o000);
+      expect(() => readFileSync(markerPath, 'utf-8')).toThrow();
+      await new Promise<void>(resolve => daemon.listen(0, '127.0.0.1', resolve));
+      const { port } = daemon.address() as AddressInfo;
+      if (options.attestable) {
+        ensureManagedOriginAttestationDirectory(dataDir, 'session', channelId);
+        // Keep the CLI on the non-isolated classification so the unreadable
+        // marker itself drives attestation; writing the proof re-creates the
+        // read-isolation marker only after classification has finished.
+        rmSync(managedOriginIsolationMarkerPath(dataDir, 'session', channelId));
+        replaceManagedOriginCapabilityFile(
+          managedOriginCapabilityPath(dataDir, 'session', channelId),
+          JSON.stringify({ sessionId: 'session', channelId, capability, ipcPort: port }),
+        );
+      }
+      if (options.dispatchAttempt !== undefined) {
+        // A durable dispatch carries an attempt; the VC managed-output policy
+        // then requires a live receipt whose attempt equals the attested one.
+        const memberKey = { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 };
+        applyVcMeetingMemberProjection(dataDir, {
+          ...memberKey, ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'app-a',
+          role: 'minutes', membershipGeneration: 1, status: 'active', responseMode: 'listener_thread',
+          capabilities: ['listener.output.request', 'meeting.read'], ownedSinks: [],
+          sinkOwnerGeneration: 1, joinedAtIngestSeq: 0, receiverSessionId: 'session',
+          outputChatId: 'listener-chat', outputPlacement: 'auto',
+        });
+        acceptVcMeetingDelivery(dataDir, {
+          ...memberKey, ownerBootId: 'owner-boot', ownerEpoch: 1, membershipGeneration: 1,
+          deliveryKey: 'turn-live', inputHash: 'input-hash', fromSeq: 1, toSeq: 1,
+          responseMode: 'listener_thread', listenerOutputProtocol: 'plain', receiverBootId: 'receiver-boot',
+        });
+        markVcMeetingDeliveryDispatched(dataDir, { ...memberKey, deliveryKey: 'turn-live' }, {
+          receiverBootId: 'receiver-boot', workerGeneration: 1,
+        });
+      }
+      seedPersistedSessionRows(dataDir, 'app-a', {
+        session: {
+          sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+          title: 'unreadable marker', status: 'active', createdAt: new Date(0).toISOString(),
+          larkAppId: 'app-a', cliId: 'codex-app',
+          codexAppDispatchLedger: options.dispatchAttempt === undefined
+            ? [{
+                dispatchId: 'dispatch-live', turnId: 'turn-live',
+                state: 'prepared', content: 'prompt', deliverySink: 'http_wait',
+              }]
+            // Two attempts of the same turn: only the attested attempt may
+            // select its entry (attempt 1 is the live durable receipt below).
+            : [{
+                dispatchId: 'dispatch-live', turnId: 'turn-live', dispatchAttempt: 1,
+                state: 'prepared', content: 'prompt', deliverySink: 'http_wait',
+              }, {
+                dispatchId: 'dispatch-other', turnId: 'turn-live', dispatchAttempt: 2,
+                state: 'prepared', content: 'prompt', deliverySink: 'lark',
+              }],
+        },
+      });
+      await run({
+        ...process.env,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'session',
+        BOTMUX_ORIGIN_CHANNEL_ID: channelId,
+        BOTMUX_SEND_RELAY: '',
+        BOTMUX_READ_ISOLATED: '',
+        BOTMUX_HOST_RELAY_AUTHORIZED: '',
+        BOTMUX_WORKFLOW: '',
+        BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
+        HOME: root,
+      });
+    } finally {
+      await new Promise<void>(resolve => daemon.close(() => resolve()));
+      try { chmodSync(markerPath, 0o600); } catch { /* setup may not have created it */ }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it.skipIf(process.getuid?.() === 0)(
+    'falls back to the attested managed origin when the live marker exists but is unreadable',
+    async () => {
+      await withUnreadableMarker({ attestable: true }, async env => {
+        const result = await runCli(['send', 'must not send', '--session-id', 'session', '--no-mention'], env);
+        expect(result.code).toBe(2);
+        // Reaching the origin session's durable sink proves the origin resolved
+        // to the attested session rather than the marker's empty string.
+        expect(result.stderr).toContain('origin turn turn-live is bound to the http_wait host sink');
+        expect(result.stderr).not.toContain('Invalid turn-send ledger session id');
+      });
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0)(
+    'carries the attested dispatch attempt when the live marker is unreadable',
+    async () => {
+      await withUnreadableMarker({ attestable: true, dispatchAttempt: 1 }, async env => {
+        const result = await runCli(['send', 'must not send', '--session-id', 'session', '--no-mention'], env);
+        expect(result.code).toBe(2);
+        // Attempt 1 passes the receipt check and selects its own (http_wait)
+        // ledger entry, not attempt 2's lark entry.
+        expect(result.stderr).toContain('origin turn turn-live is bound to the http_wait host sink');
+      });
+      await withUnreadableMarker({ attestable: true, dispatchAttempt: 2 }, async env => {
+        const result = await runCli(['send', 'must not send', '--session-id', 'session', '--no-mention'], env);
+        expect(result.code).toBe(2);
+        expect(result.stderr).toContain('(origin_mismatch)');
+        expect(result.stderr).not.toContain('bound to the http_wait host sink');
+      });
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0)(
+    'does not let an unreadable marker fall back to the env session when nothing was attested',
+    async () => {
+      await withUnreadableMarker({ attestable: false }, async env => {
+        const result = await runCli(['send', 'must not send', '--session-id', 'session', '--no-mention'], env);
+        // Adopting the env session would hit its unsettled durable ledger and
+        // refuse; with no trusted origin the send instead proceeds as an
+        // ordinary reply (as before the fix) and stops at the unregistered
+        // fixture bot, before any provider side effect.
+        expect(result.stderr).not.toContain('origin session session has unsettled durable output');
+        expect(result.stderr).not.toContain('Invalid turn-send ledger session id');
+        expect(result.stderr).toContain('Bot not registered: app-a');
+      });
+    },
+  );
 
   it('rejects a trusted host re-exec when its authorized Codex App ledger was already settled', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-host-ledger-gone-'));

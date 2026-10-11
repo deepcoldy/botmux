@@ -135,3 +135,19 @@ For the **specific wrapper scripts** of each gateway, use the docs published by 
 6. Update the README
 
 See [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md) for details.
+
+## Native Codex App questions
+
+Botmux-managed `codex-app` sessions and `codex` sessions using app-server RPC bridge native `request_user_input` requests to Lark ask cards. A selection or text reply in the current conversation is returned under the original question IDs to the same native turn. TRAE RPC uses the same bridge.
+
+A batch preserves all questions and option descriptions. Text-only questions appear on a card awaiting a conversation text reply. A batch containing text-only questions is answered entirely through one text reply. Recommended labels are never accepted automatically. A text reply supplies the same batch-level comment to the questions, without including unsubmitted selections. Existing Ask routing and responder permissions apply.
+
+The wait lasts up to one hour. Dispatch errors, timeout, invalidation, or unsupported questions interrupt the native turn instead of returning empty answers. Turn completion, process exit, and session shutdown cancel pending waits; late answers are ignored. Native waits are not retried or restored across daemon restarts.
+
+Choice questions require at least two options. Secret inputs and malformed batches fail explicitly without answering only part of the batch. Do not send secrets through chat cards. Workflow subagents use `humanGate` / decision nodes instead. API-only sessions without Lark transport, ordinary terminal paste mode, and the App history service do not use this bridge.
+
+To verify, ask a model in an ordinary Codex App session to use native `request_user_input` for a choice question. Confirm the Lark card appears, then submit and confirm the same turn continues with your answer. Native tool availability still depends on the Codex version and execution mode.
+
+Card structure preview (rendered locally from actual card JSON; live Lark interaction has not yet been manually verified):
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

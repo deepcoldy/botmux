@@ -914,6 +914,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // worker PRE-CREATES this file before spawn so it survives the existence
   // filter and bwrap can bind it (bwrap cannot bind a nonexistent source).
   if (ctx.sessionId) push([`${sd}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+  // ready-signal 诊断轨迹（dsh-tui wrapper 插件在沙盒内 append）：同 turn-sends 形态，
+  // 只授本会话的**单个文件**（路径常量见 services/ready-signal-log.ts，此处按本模块的
+  // "no imports / pure" 约定内联）。append-only + 写满时 in-place 截断（保 inode），所以
+  // 单文件 bind 有效；worker 预创建文件与父目录（bwrap 不能 bind 不存在的源）。共享根与
+  // 兄弟会话保持 deny-by-default —— 这份轨迹含会话标识与派发结果，不该跨会话可读可写。
+  if (ctx.sessionId) push([`${sd}/ready-signal/${ctx.sessionId}.log`], 'readWrite', 'internal');
   // statusline: `botmux statusline` (Claude's statusLine.command, run INSIDE the
   // sandbox) atomically writes `statusline/<sessionId>/latest.json`. Atomic
   // write = tmp + rename in the parent dir, so a single-file grant (as for
