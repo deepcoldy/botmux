@@ -479,6 +479,52 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     await expect(deferredAgain.waitIfMarginal()).resolves.toBeUndefined();
   });
 
+  it('keeps the primary gate attached to marginal admission through the initial fork', async () => {
+    const anchor = 'om_primary_marginal_initial';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.pendingPrompt = 'start after reclaim';
+    ds.pendingTurnId = 'om_primary_marginal_turn';
+    const ctx = makeCtx(anchor, 'om_primary_marginal_turn');
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    const gate = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_marginal_turn',
+    )!;
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    let forkOptions: any;
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: unknown, _turn: unknown, options: any) => {
+      forkOptions = options;
+      options.marginalReclaimScheduled = true;
+      return true;
+    });
+
+    expect(forkReservedInitialSession(ds, [], trustedCaller, gate.options)).toBe(true);
+    gate.markForkReturned();
+    let settled = false;
+    const waiting = gate.waitIfMarginal().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    forkOptions.onAdmissionBlocked({
+      content: 'Memory pressure is critical',
+      turnId: 'om_primary_marginal_turn',
+    });
+    forkOptions.onAdmission('rejected');
+    await waiting;
+
+    expect(settled).toBe(true);
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'Memory pressure is critical',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+    }));
+  });
+
   it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {
     const ctx = makeCtx('om_thread_queue_full', 'om_msg_queue_full');
     ctx.ingressAdmission = { admitted: false };

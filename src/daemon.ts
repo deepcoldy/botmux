@@ -19637,7 +19637,10 @@ function forkReservedInitialSession(
     }
   }
   let accepted = false;
-  const admissionOpts: ForkWorkerOptions = { ...forkOptions };
+  // Worker admission writes marginalReclaimScheduled as an out-flag. Keep the
+  // caller's object identity so durablePrimaryWorkerAdmission can observe the
+  // deferred path and hold the Inbox claim until the final admission result.
+  const admissionOpts = forkOptions;
   try {
     accepted = forkWorker(ds, input, turnId ? {
       turnId,
