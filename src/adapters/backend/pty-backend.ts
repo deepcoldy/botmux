@@ -1,5 +1,5 @@
 import { botInjectedEnv } from '../../core/env-policy.js';
-import * as pty from 'node-pty';
+import * as pty from '../../utils/pty.js';
 import { chmodSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';

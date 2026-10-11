@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { runMcodeExec } from '../src/services/mcode-exec.js';
 import { collectNativePrint } from '../src/services/constrained-invocation/print-process.js';
-import * as pty from 'node-pty';
+import * as pty from '../src/utils/pty.js';
 import { applySessionOwnerEnv } from '../src/utils/child-env.js';
 import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
 import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';

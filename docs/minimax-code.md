@@ -53,7 +53,13 @@ runner 忽略坏帧及非协议输入，后续合法消息仍可执行。输入�
 bun x vitest run --project unit test/minimax-runner.test.ts test/cli-adapters.test.ts test/cli-runner-compiled-entries.test.ts test/cli-id-roster-derivation.test.ts test/ipc-constrained-invocation.test.ts test/worker-app-runner-control-wiring.test.ts test/worker-pipe-initial-screen-order.test.ts test/runner-control-channel.test.ts test/constrained-invocation.test.ts test/model-only-print.test.ts
 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
 BOTMUX_MCODE_SANDBOX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
+BOTMUX_MCODE_TMUX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun run test:e2e -- test/minimax-tmux.e2e.ts
+bun run test -- test/pty-reader-compat.test.ts
 bun run build
 ```
 
-原生测试使用隔离 HOME/数据目录及本地合成 OpenAI 服务，实际执行 Bash 写文件，检查 Shell owner 身份和第二轮原生历史。Linux 文件沙盒场景用 node-pty 拉起真实 mcode，保持运行超过 90 秒，再验证同一会话恢复。合成服务只验证原生协议和工具闭环，真实 MiniMax 账号、订阅及服务端模型仍需登录后验证；macOS 未作本机运行验收。
+原生测试使用隔离 HOME/数据目录及本地合成 OpenAI 服务，实际执行 Bash 写文件，检查 Shell owner 身份和第二轮原生历史。Linux 文件沙盒场景用真实 PTY 拉起 mcode，保持运行超过 90 秒，再验证同一会话恢复；Node 和 Bun 直接驱动均已通过。tmux 测试通过 daemon 使用的 `TmuxPipeBackend` 验证工具、owner、用量回传以及销毁并重建 runner 后按精确 ID 恢复历史，Node 和 Bun 均已通过。该测试仅销毁自己创建的唯一命名会话，不操作共享 tmux server 或其它会话。
+
+Bun 的 `tty.ReadStream` 会将非阻塞 PTY 暂时无数据产生的 `EAGAIN` 当作读失败，关闭 master 并导致子进程收到 SIGHUP。公共 `utils/pty.ts` 仅为 Bun Unix 的单个 reader 重试 `EAGAIN`/`EWOULDBLOCK`/`EINTR`，保留 node-pty 的编码、输入、resize、暂停/恢复与退出逻辑；Node 和 Windows 沿用原始 reader。回归测试在 Node/Bun 下覆盖空闲间隔、跨块 UTF-8、交互输入、resize、主动中断和大块输出暂停/恢复。
+
+Linux 上已使用登录的真实 MiniMax OAuth 账号验证服务端 `MiniMax-M3.1-Flash-Preview`：两轮 Shell 文件工具执行、原生精确 ID 恢复和用量回传通过；真实 tmux 中也完成首轮 Shell 写文件及 owner 透传。后续真实服务的 tmux 重建验收遇到 Token Plan 用量上限（2067），需额度恢复后继续，不能以本地合成服务结果替代订阅验收。macOS 未作实机运行验收。

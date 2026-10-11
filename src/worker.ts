@@ -486,7 +486,7 @@ import {
 } from './services/adopt-input-sequence.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
-import * as pty from 'node-pty';
+import * as pty from './utils/pty.js';
 import {
   hasInstalledSessionReadyHook,
   installHook,
