@@ -318,9 +318,9 @@ describe('worker pipe initial screen ordering', () => {
     // adapter.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
-    const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
+    const decideIdx = source.indexOf("decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead)", fallbackStart);
     const markReadyIdx = source.indexOf('markPromptReady();', decideIdx);
-    const flushIdx = source.indexOf("if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')", fallbackStart);
+    const flushIdx = source.indexOf("if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush')", fallbackStart);
 
     expect(fallbackStart).toBeGreaterThan(-1);
     expect(decideIdx).toBeGreaterThan(fallbackStart);

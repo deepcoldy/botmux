@@ -104,7 +104,7 @@ function readSubmissions(path: string): Array<{ pid: number; text: string }> {
 }
 
 describe('TraeX transcript-terminal / PTY-readiness desync reproduction', () => {
-  it('accepts healthy type-ahead but holds successors after terminal desync and unconfirmed submits', async () => {
+  it.each(['intentional restart', 'CLI crash'] as const)('accepts healthy type-ahead and never replays quarantined input after %s', async restartKind => {
     const botmuxSessionId = randomUUID();
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-desync-repro-'));
     tempDirs.add(root);
@@ -429,7 +429,24 @@ setInterval(() => {
       'third submit is quarantined before the restart',
     );
     const readyBeforeRestart = messages.filter(message => message.type === 'prompt_ready').length;
-    child.send({ type: 'restart' } satisfies DaemonToWorker);
+    if (restartKind === 'CLI crash') {
+      // Emulate the daemon's automatic recovery only after the real CLI exit
+      // callback has reconciled inflight carry-over. An intentional restart
+      // bypasses that callback and cannot prove the no-replay contract.
+      let crashReported = false;
+      child.on('message', raw => {
+        if ((raw as WorkerToDaemon).type !== 'claude_exit' || crashReported) return;
+        crashReported = true;
+        child.send({ type: 'restart' } satisfies DaemonToWorker);
+      });
+      process.kill(recoveredSubmissions[5]!.pid, 'SIGKILL');
+      // Managed tmux panes debounce missing probes at 1s / 3s / 9s;
+      // their exit notification can arrive after the usual 12s test wait.
+      await waitFor(child, () => crashReported, logs, 'natural CLI exit before automatic recovery', workerBinary ? 25_000 : 12_000);
+      expect(logs.join('')).toContain('TRAE exited (code:');
+    } else {
+      child.send({ type: 'restart' } satisfies DaemonToWorker);
+    }
     await waitFor(
       child,
       () => messages.filter(message => message.type === 'prompt_ready').length > readyBeforeRestart,
@@ -440,5 +457,12 @@ setInterval(() => {
     expect(readSubmissions(submissionsPath).filter(
       item => item.text === 'third message waits behind quarantine',
     )).toHaveLength(1);
-  }, 30_000);
+    child.send({ type: 'message', content: 'fresh input after recovery', turnId: 'om_after_restart' } satisfies DaemonToWorker);
+    await waitFor(child, () => readSubmissions(submissionsPath).length >= 7, logs, 'fresh input on replacement generation');
+    const afterRestart = readSubmissions(submissionsPath);
+    expect(afterRestart).toHaveLength(7);
+    // Every generation refreshes the plugin catalogue on its first message.
+    expect(afterRestart[6]!.text).toBe(firstSubmission.text.replace(/^first prompt/, 'fresh input after recovery'));
+    expect(afterRestart[6]!.pid).not.toBe(recoveredSubmissions[5]!.pid);
+  }, 60_000);
 });

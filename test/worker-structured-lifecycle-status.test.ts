@@ -593,17 +593,12 @@ describe('worker structured-turn status wiring', () => {
     expect(adoptFence).toBeGreaterThan(adoptDrain);
   });
 
-  it('allows healthy type-ahead batches while keeping explicit serial adapters gated', () => {
+  it('uses the shared backend policy for message admission and batch delivery', () => {
     const flush = functionSlice('flushPending', 'sendToPty');
-    const batchStop = flush.indexOf('if (shouldStopPendingBatch(');
-    const serialOptIn = flush.indexOf(
-      'cliAdapter.postTerminalPromptFence !== true || runtimeSupportsTypeAhead',
-      batchStop,
-    );
-    expect(batchStop).toBeGreaterThanOrEqual(0);
-    expect(serialOptIn).toBeGreaterThan(batchStop);
-    expect(flush.slice(batchStop, serialOptIn))
-      .not.toContain('runtimeSupportsTypeAhead');
+    expect(flush).toContain('allowBackToBackWrites } = runtimePtyInputPolicy()');
+    expect(flush.slice(flush.indexOf('if (shouldStopPendingBatch('))).toContain('allowBackToBackWrites,');
+    const incoming = functionSlice('sendToPty', 'startScreenUpdates');
+    expect(incoming).toContain('runtimePtyInputPolicy().supportsTypeAhead');
   });
 
   it('quarantines unconfirmed adapter submits without replaying them or their successors', () => {

@@ -438,6 +438,7 @@ import {
 } from './utils/idle-detector.js';
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
+import { inspectPostTerminalComposer, resolvePtyInputPolicy } from './utils/pty-input-policy.js';
 import {
   StuckDetector,
   matchHookReviewScreen,
@@ -13548,6 +13549,14 @@ function codexAppRuntimeTypeAheadReady(): boolean {
     && codexAppInputReady;
 }
 
+function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
+  return resolvePtyInputPolicy(
+    cliAdapter ?? {},
+    backendScreenEvidenceIsAuthoritativeForMutation(),
+    codexAppRuntimeTypeAheadReady(),
+  );
+}
+
 /** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
  *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
  *  must stop while the exact native turn is awaiting activation, active, or
@@ -13670,8 +13679,7 @@ async function flushPending(): Promise<void> {
   // turn/start, not the Codex App runner's ordered turn/steer contract.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
-  const runtimeSupportsTypeAhead =
-    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady();
+  const { supportsTypeAhead: runtimeSupportsTypeAhead, allowBackToBackWrites } = runtimePtyInputPolicy();
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
     runtimeSupportsTypeAhead,
     durableTurnInFlight,
@@ -13828,6 +13836,8 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
+      // The entry check protects a new drain. These checks protect subsequent
+      // items when a terminal or late receipt arrives during awaited writes.
       if (currentInputDeliveryQuarantine()) break;
       if (cliAdapter.postTerminalPromptFence === true) {
         const target: SessionBackend = backend;
@@ -14566,7 +14576,7 @@ async function flushPending(): Promise<void> {
       if (shouldStopPendingBatch(
         item,
         pendingMessages[0],
-        cliAdapter.postTerminalPromptFence !== true || runtimeSupportsTypeAhead,
+        allowBackToBackWrites,
       )) break;
     }
   } finally {
@@ -14671,7 +14681,7 @@ function sendToPty(
   }
   if (!cliAdapter) return false;
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
-    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
+    runtimePtyInputPolicy().supportsTypeAhead,
     durableTurnInFlight,
     next,
     directRpcTurnBlocksTypeAhead(),
@@ -15133,18 +15143,6 @@ function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScr
   return !!(be.captureCurrentScreen || be.captureViewport || renderer);
 }
 
-function lastPatternIndex(pattern: RegExp | undefined, text: string): number {
-  if (!pattern || !text) return -1;
-  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
-  const scan = new RegExp(pattern.source, flags);
-  let last = -1;
-  for (let match = scan.exec(text); match; match = scan.exec(text)) {
-    last = match.index;
-    if (match[0].length === 0) scan.lastIndex += 1;
-  }
-  return last;
-}
-
 /** A transcript terminal closes the logical turn, but selected PTY adapters
  * require an independently observed composer before they accept successors.
  * Apply this only to authoritative local viewports; ZMX/history snapshots can
@@ -15170,12 +15168,10 @@ function postTerminalPromptFenceHolds(
   const composerPattern = cliAdapter.staticBusyClearPattern ?? cliAdapter.readyPattern;
   if (!composerPattern) return false;
   try {
-    // tmux capture-pane retains the unused bottom rows. Scan the visible
-    // content tail instead of a tail made entirely of viewport padding.
-    const screen = busyProbeRegion(captureBackendScreen(be).trimEnd());
-    const busyAt = lastPatternIndex(cliAdapter.busyPattern, screen);
-    const composerAt = lastPatternIndex(composerPattern, screen);
-    if (composerAt >= 0 && composerAt > busyAt) {
+    const { ready, busyAt, composerAt } = inspectPostTerminalComposer(
+      captureBackendScreen(be), cliAdapter.busyPattern, composerPattern,
+    );
+    if (ready) {
       postTerminalInputFence = null;
       return false;
     }
@@ -20140,7 +20136,7 @@ async function spawnCli(
     // detector never matched) would hold the first queued message forever —
     // the previous code only logged "forcing flush" without actually flushing
     // for non-type-ahead adapters.
-    if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush') {
+    if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush') {
       const armPromptSeed = shouldArmFirstPromptTimeoutPromptSeed({
         wasAwaitingPostHookPrompt,
         hasPendingInput: hasPendingInputForFlush(),
