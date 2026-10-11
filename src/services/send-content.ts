@@ -3,8 +3,9 @@
  * positional `botmux send` argument. Shell quotes do not expand those escapes,
  * while positional arguments are documented as single-line content.
  *
- * Keep every other source byte-for-byte: stdin and --content-file may carry
- * code or serialized text where a literal escape is intentional.
+ * This is intentionally a narrow heuristic: content with real line breaks and
+ * single literal `\\n` escapes is left unchanged. Callers keep stdin and
+ * --content-file outside this positional-only normalization.
  */
 export function normalizePositionalSendContent(content: string): string {
   if (/[\r\n]/.test(content) || !content.includes('\\n\\n')) return content;

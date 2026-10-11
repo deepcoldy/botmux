@@ -9274,7 +9274,9 @@ async function sendDryRun(rest: string[]): Promise<void> {
     content = readFileSync(contentFile, 'utf-8');
   } else {
     const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
-    content = pos.length > 0 ? pos.join(' ') : await readStdin();
+    content = pos.length > 0
+      ? normalizePositionalSendContent(pos.join(' '))
+      : await readStdin();
   }
   content = extractCardText(stripTrailingOaiMemoryCitation(content));
   if (!content.trim()) {
