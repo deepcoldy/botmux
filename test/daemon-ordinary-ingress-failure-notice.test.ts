@@ -2474,6 +2474,44 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(messageQueue.readUnread(anchor).length).toBe(1);
   });
 
+  it('keeps the real new-topic handler pending until marginal admission reaches a terminal decision', async () => {
+    const anchor = 'om_primary_marginal_handler';
+    const ctx = makeCtx(anchor, anchor);
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    let forkOptions: any;
+    mocks.forkWorker.mockImplementationOnce((ds: any, _input: unknown, _turn: unknown, options: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      forkOptions = options;
+      options.marginalReclaimScheduled = true;
+      options.onAdmission?.('deferred');
+      return true;
+    });
+
+    let resolved = false;
+    const handling = handleNewTopic(
+      makeEventData(anchor, 'start after marginal reclaim'),
+      ctx,
+    ).then(() => { resolved = true; });
+    await vi.waitFor(() => expect(forkOptions).toBeDefined());
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
+
+    forkOptions.onAdmissionBlocked({
+      content: 'Memory pressure is critical',
+      turnId: anchor,
+    });
+    forkOptions.onAdmission('rejected');
+    await handling;
+
+    expect(resolved).toBe(true);
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'Memory pressure is critical',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+    }));
+  });
+
   // 同一降级的另外两个发卡点。三处的 fallback 各自不同（raw passthrough 走
   // forkReservedInitialRawSession，auto-create 走 noteTurnReceived +
   // forkReservedInitialSession），所以分别钉住，避免只在一处补了兜底。
