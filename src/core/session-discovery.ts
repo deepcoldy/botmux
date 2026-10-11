@@ -622,6 +622,11 @@ export interface WrapperRealPidResolveDeps {
   applyRealPid: (realPid: number) => void;
   /** Timer scheduler (injectable for tests). */
   schedule: (fn: () => void, ms: number) => void;
+  /** When the launcher pid is itself the CLI leaf (e.g. a direct native
+   *  install, not a wrapper), descendant discovery can never find anything
+   *  realer: stop polling immediately instead of rescanning the tree on every
+   *  tick. */
+  isDirectLeaf?: (launcherPid: number) => boolean;
   intervalMs?: number;
   maxAttempts?: number;
 }
@@ -645,6 +650,7 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   let attempts = 0;
   const tick = () => {
     if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
+    if (deps.isDirectLeaf?.(launcherPid)) return;
     const realPid = deps.findRealPid(launcherPid);
     if (realPid && realPid !== launcherPid) {
       deps.applyRealPid(realPid);

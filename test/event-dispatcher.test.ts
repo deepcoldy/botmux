@@ -207,6 +207,7 @@ import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { InputCaptureTerminalRejection } from '../src/core/plugins/input-capture/runtime.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { resolve } from 'node:path';
 
@@ -1182,6 +1183,84 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('captures human input only after durable primary claims the event', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => true);
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary captured human input',
+    });
+    expect(handlers.captureHumanInput).toHaveBeenCalledOnce();
+    expect(handlers.captureHumanInput).toHaveBeenCalledWith(data);
+    expect(hasTriggeredMessage(MY_APP_ID, 'om_primary_capture')).toBe(true);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('retries the durable claim when captured-input persistence fails', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => {
+      throw new Error('capture store unavailable');
+    });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture_retry',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture_retry'))
+      .rejects.toThrow('capture store unavailable');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('settles a deterministic input-capture rejection without routing the message', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => {
+      throw new InputCaptureTerminalRejection('input_capture_authority_changed');
+    });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture_rejected',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture_rejected')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary input capture rejected: input_capture_authority_changed',
+    });
+    expect(hasTriggeredMessage(MY_APP_ID, 'om_primary_capture_rejected')).toBe(true);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it.each(['never', 'ambient'] as const)(
     'dispatches a %s topic seed immediately when the durable primary wait is disabled',
     async mentionMode => {
@@ -1302,6 +1381,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
   it('awaits primary durable enqueue in the WS callback and bypasses the legacy route', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => true);
     let release!: () => void;
     const persisted = new Promise<void>(resolve => { release = resolve; });
     const enqueuePrimary = vi.fn(() => persisted);
@@ -1331,10 +1411,75 @@ describe('Lark event dispatcher — durable primary processor', () => {
       partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
       data,
     });
+    expect(handlers.captureHumanInput).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     release();
     await callback;
     expect(acked).toBe(true);
+    runtime.close();
+  });
+
+  it.each(['close', 'resume', 'restart'])(
+    'rejects unfenced %s card actions before local side effects',
+    async action => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      const handlers = makeHandlers();
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        handlers,
+        'feishu',
+        undefined,
+        { enqueuePrimary },
+      );
+      runtime.connect();
+
+      const result = await capturedHandlers['card.action.trigger']({
+        action: { value: { action, session_id: 'session-primary' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_primary_lifecycle' },
+      });
+
+      expect(result).toEqual({
+        toast: {
+          type: 'warning',
+          content: expect.stringContaining('多副本持久模式'),
+        },
+      });
+      expect(handlers.handleCardAction).not.toHaveBeenCalled();
+      expect(enqueuePrimary).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
+
+  it('keeps read-only card actions available in durable primary mode', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.handleCardAction.mockResolvedValue({
+      toast: { type: 'success', content: 'opened' },
+    });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const data = {
+      action: { value: { action: 'open_terminal', session_id: 'session-primary' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_primary_readonly' },
+    };
+
+    await expect(capturedHandlers['card.action.trigger'](data)).resolves.toEqual({
+      toast: { type: 'success', content: 'opened' },
+    });
+    expect(handlers.handleCardAction).toHaveBeenCalledWith(data, MY_APP_ID);
+    expect(enqueuePrimary).not.toHaveBeenCalled();
     runtime.close();
   });
 
@@ -3121,6 +3266,15 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown external bot
     const entry = { chatId: 'chat-001', workingDir: '/repo' };
     mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      // 对齐真实实现：ensureDefaultOncallBound 经 autoBindOncallFromDefault await
+      // 锁内 RMW + 磁盘写（多个异步 tick）之后才把 entry 发布进内存态
+      //（findOncallChat 读的那份）。这里让出两个 microtask 再翻转：
+      // 单 tick 时 mock 恢复反应在微任务队列里天然早于 async helper 的 resolve
+      // 反应，模拟不出 I/O 深度；双 tick 才能同时钉死两类漏 await——
+      // 调用点 fire-and-forget（evaluateBotTalk 在同同步段执行）与 helper 内不向
+      // 外传播 await（调用方在第二 tick 前恢复）都会读到未翻转的 oncall 态而变红。
+      await Promise.resolve();
+      await Promise.resolve();
       mockFindOncallChat.mockReturnValue(entry);
       return entry;
     });
@@ -7731,6 +7885,11 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     mockGetOwnerOpenId.mockReturnValue('ou_owner');
     mockGetChatMode.mockReset();
     mockGetChatMode.mockResolvedValue('topic');
+    // defaultOncall 懒绑定相关 mock 默认「未开/未绑」：mockReturnValue 持久生效，
+    // 不在这里复位会让某个用例翻转的 oncall 态泄漏进后续用例。
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockEnsureDefaultOncallBound.mockReset();
+    mockEnsureDefaultOncallBound.mockResolvedValue(undefined);
     handlers = makeHandlers();
     handlers.isSessionOwner.mockReturnValue(false);
   });
@@ -7819,6 +7978,36 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     // 发了授权申请卡（maybeSendGrantRequestCard → replyMessage interactive）
     expect(mockReplyMessage).toHaveBeenCalledTimes(1);
     expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-seed-stranger', expect.any(String), 'interactive');
+  });
+
+  it('defaultOncall 懒绑定先于 autoTopic 授权门：陌生告警 bot 的免@新话题种子自动开工、不弹卡', async () => {
+    // 回归 #1765：免@新话题自动开工的 bot 种子点（autoTopic 分支）也曾漏掉
+    // defaultOncall 前置绑定。场景与上一用例完全相同（restricted + 无 cross-ref 的
+    // 陌生外部 bot，没有任何其它放行腿），唯一区别是本群开了 defaultOncall：
+    // 首条被观察到的消息触发懒绑定，绑定必须在 evaluateBotTalk 之前 await 完成，
+    // oncall 腿才放行 → 自动开工；否则与上一用例一样误弹授权卡、不建 session。
+    setupAutoTopicBotSender(true, false);
+    const entry = { chatId: 'chat-oncall-seed', workingDir: '/repo' };
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      // 对齐真实实现：锁内 RMW + 磁盘写（多个异步 tick）后才发布内存态，
+      // 双 microtask 才能钉死调用链必须逐层 await（见 @ 路径同名用例注释）。
+      await Promise.resolve();
+      await Promise.resolve();
+      mockFindOncallChat.mockReturnValue(entry);
+      return entry;
+    });
+    const event = makeBotTopicSeed('msg-oncall-seed', 'chat-oncall-seed');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockEnsureDefaultOncallBound).toHaveBeenCalledWith(MY_APP_ID, 'chat-oncall-seed', 'group');
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-oncall-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
   it('restricted 模式陌生 bot 连发两条新话题 → 授权卡去重（节流），只发一次', async () => {

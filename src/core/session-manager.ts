@@ -2348,7 +2348,14 @@ export async function restoreActiveSessions(
   // Registration itself is CAS, so a fresh runtime occupant always wins over
   // every startup candidate regardless of this disk ordering.
   let active = sessions
-    .filter(s => s.status === 'active')
+    .filter(s => {
+      if (s.status !== 'active') return false;
+      if (s.workspaceRetirement) {
+        logger.info(`Skipping workspace-retired session ${s.sessionId} during restore (operationId=${s.workspaceRetirement.operationId})`);
+        return false;
+      }
+      return true;
+    })
     // Idempotency quarantine (at-most-once): a session the boot reconcile just
     // terminalized as `dispatch_unknown` (or dropped as a pre-dispatch reserved
     // orphan) must NOT be re-attached — the poller now sees it `failed`, so
@@ -3566,9 +3573,10 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'workspace_retired' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
+  if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
   // Plan B: a VC meeting agent is an ordinary chat-scope session, so a closed one
@@ -3605,6 +3613,7 @@ export async function resumeSession(
   // durable row and keep the already-active creator as first owner.
   const latest = sessionStore.getSession(sessionId);
   if (!latest) return { ok: false as const, error: 'not_found' as const };
+  if (latest.workspaceRetirement) return { ok: false as const, error: 'workspace_retired' as const };
   if (latest.status !== 'closed') return { ok: false as const, error: 'not_closed' as const };
   if (latest.deferredScheduleRun
     && !readDeferredTopicBinding(config.session.dataDir, latest.sessionId)) {

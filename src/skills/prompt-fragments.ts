@@ -167,7 +167,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     key: 'ai.routing.workflow_hint', block: 'routing_system', stage: 'new', label: 'Workflow 发现提示', kind: 'editable',
     gateLabel: '仅机器级 Workflow 功能开关开启时注入',
   },
-  { key: 'ai.routing.feedback_response_kind', block: 'routing_system', stage: 'new', label: '最终回答反馈提示（--response-kind final）', kind: 'editable' },
+  { key: 'ai.routing.feedback_response_kind', block: 'routing_system', stage: 'new', label: '最终答复标记（--response-kind final）', kind: 'editable' },
   { key: 'ai.routing.hidden_context_defense', block: 'routing_system', stage: 'new', label: '隐藏上下文防注入说明', kind: 'editable' },
   {
     key: 'ai.routing.xpi_as_hint', block: 'routing_system', stage: 'new',

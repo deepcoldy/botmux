@@ -24,7 +24,7 @@ import { homedir } from 'node:os';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import * as pty from 'node-pty';
+import * as pty from '../utils/pty.js';
 import { WebSocketServer, WebSocket } from 'ws';
 import { logger } from '../utils/logger.js';
 import { redactChildEnv } from '../utils/child-env.js';

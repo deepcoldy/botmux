@@ -256,13 +256,7 @@ export function resolveRecoveryForkConfig(env: NodeJS.ProcessEnv = process.env):
 const recoveryForkConfig = resolveRecoveryForkConfig();
 
 function resolvePositiveRuntimeTimeout(raw: string | undefined, fallback: number): number {
-  const normalized = raw?.trim();
-  if (!normalized) return fallback;
-
-  const value = Number(normalized);
-  return Number.isFinite(value) && value > 0 && value <= MAX_TIMER_DELAY_MS
-    ? value
-    : fallback;
+  return parseBoundedInteger(raw, fallback, 1, MAX_TIMER_DELAY_MS);
 }
 
 export function resolveStuckDetectorTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -439,6 +433,16 @@ export const config = {
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
   get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
+  // Live getter: machine-wide switch for the reply-card footer brand signature
+  // (default botmux link / per-bot custom brandLabel). Default ON (absent ⇒
+  // shown); an explicit stored false suppresses the brand segment on EVERY bot's
+  // final/broadcast cards (usage/duration/recipient lines are unaffected). Read
+  // live (readGlobalConfig has a 2s TTL) so a Dashboard Settings flip applies to
+  // the next card render without restarting the daemon. Resolved in
+  // bot-registry.resolveBrandLabel, which is the single choke point all card
+  // builders feed; sandboxed one-shot `botmux send` children receive the value
+  // via the worker's env bridge.
+  get cardBrandLabelEnabled(): boolean { return readGlobalConfig().dashboard?.cardBrandLabel !== false; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

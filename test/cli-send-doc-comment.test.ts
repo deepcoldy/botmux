@@ -273,13 +273,22 @@ describe('real CLI document-comment reply routing', () => {
     expect(result.sends).toEqual([]);
   }, 35_000);
 
-  it('leaves an ordinary chat on the chat interface even with an older pending comment', () => {
+  it.each([false, true])('leaves an ordinary chat on the chat interface even with an older pending comment (noQuote=%s)', noQuote => {
     const result = runSend({
       markerTurn: 'om_chat_turn', mentionBack: false, session: { chatId: 'oc_chat' },
+      args: noQuote ? ['--no-quote'] : [],
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.requests).toHaveLength(1);
-    expect(result.requests[0]?.path).toBe('/open-apis/im/v1/messages');
-    expect(result.requests[0]?.body.receive_id).toBe('oc_chat');
+    if (noQuote) {
+      expect(result.requests[0]?.path).toBe('/open-apis/im/v1/messages');
+      expect(result.requests[0]?.body.receive_id).toBe('oc_chat');
+    } else {
+      expect(result.requests[0]?.path).toBe('/open-apis/im/v1/messages/om_chat_turn/reply');
+      expect(result.requests[0]?.body.reply_in_thread).not.toBe(true);
+    }
+    expect(result.sends).toEqual([expect.objectContaining({
+      messageId: 'om_sent', turnId: 'om_chat_turn',
+    })]);
   }, 35_000);
 });

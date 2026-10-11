@@ -10,11 +10,9 @@ import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
-import { prepareCodexTerminalStatusLine, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
-import { t } from '../../i18n/index.js';
-import { codexStatusLineSetupNotice } from '../../services/codex-statusline-config.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
@@ -66,10 +64,10 @@ function restoredCodexHistoryReady(history: string): boolean {
   const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
   const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
   const lines = history.trimEnd().split(/\r?\n/);
-  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
   const prompt = lines.length - 1 - fromBottom;
-  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   const footer = lines.slice(prompt + 1).filter(line => line.trim());
   if (footer.length !== 1) return false;
   const restoredReady = (restored || initialized)
@@ -89,10 +87,10 @@ function restoredCodexHistoryReady(history: string): boolean {
 function resumedCodexPromptReady(screen: string): boolean {
   if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
   const lines = screen.trimEnd().split('\n');
-  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
   const prompt = lines.length - 1 - fromBottom;
-  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   // The composer must be the bottom input surface, followed only by its
   // initialized model/path footer. Pickers, review dialogs and history alone
   // cannot satisfy this shape. Do not depend on a particular model name.
@@ -120,10 +118,10 @@ interface HistoryMatch {
   ownershipProven?: boolean;
 }
 
-function historyMatchResult(match: HistoryMatch): { submitted: true; cliSessionId?: string; ownershipProven?: true } {
+function historyMatchResult(match: HistoryMatch, requireOwnership: boolean): { submitted: true; cliSessionId?: string; ownershipProven?: true } {
   return {
     submitted: true,
-    ...(match.cliSessionId ? { cliSessionId: match.cliSessionId } : {}),
+    ...(match.cliSessionId && (!requireOwnership || match.ownershipProven) ? { cliSessionId: match.cliSessionId } : {}),
     ...(match.ownershipProven ? { ownershipProven: true } : {}),
   };
 }
@@ -454,12 +452,6 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     async writeInput(pty: PtyHandle, content: string) {
       const terminalSession = await refreshCodexTerminalSession(pty);
-      if (terminalSession.kind === 'unavailable') {
-        const setup = prepareCodexTerminalStatusLine(pty);
-        return { submitted: false, failureReason: setup
-          ? `${t('worker.codex_terminal_message_not_written')}\n${codexStatusLineSetupNotice(setup)}`
-          : t('worker.codex_terminal_identity_unavailable') };
-      }
       // Codex's input mode treats every literal \n as Enter. The old path
       // (`send-keys -l` with the whole multi-line blob) therefore submitted
       // each line as its own turn — a single Lark message fragmented into
@@ -514,15 +506,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           ? (sid) => {
             if (!sid) return false;
             const owned = findCodexRolloutSetByPid(cliPid);
-            // set unavailable (enumeration failed) → don't block the submit
-            // confirmation; the worker attach gate re-checks ownership.
-            if (!owned) return true;
+            if (!owned || owned.size === 0) return true;
             return owned.has(sid.toLowerCase());
           }
           : undefined;
       // Positive ownership only: the explicit expected thread, or an owned
       // rollout set that is available AND contains the line's session. The
-      // enumeration-unavailable and unfiltered acceptances above keep their
+      // empty/unavailable-set and unfiltered acceptances above keep their
       // submit semantics but never prove that this pane consumed the input.
       const proveSid: HistorySidProof | undefined = expectedRemoteSid
         ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
@@ -552,18 +542,18 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
       for (let attempt = 0; attempt < 3; attempt++) {
         const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
-        if (match.found) return historyMatchResult(match);
+        if (match.found) return historyMatchResult(match, cliPid !== undefined);
         if (!trySendEnter()) return { submitted: false };
       }
       const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
-      if (match.found) return historyMatchResult(match);
+      if (match.found) return historyMatchResult(match, cliPid !== undefined);
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
       // initial prompt) may still append our marker after the retries gave
       // up, and the worker re-scans on a delay before warning the user.
       const recheck = () => {
         const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid, proveSid);
-        return late.found ? historyMatchResult(late) : false;
+        return late.found ? historyMatchResult(late, cliPid !== undefined) : false;
       };
       return { submitted: false, recheck };
     },
@@ -579,7 +569,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // the update. Keep accepting the composer marker anywhere in a TUI redraw,
     // but reject numbered menu choices. This remains necessary for wrappers
     // such as Aiden that cannot forward the startup-update config override.
-    readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    readyPattern: /[›»](?!\s*\d+\.)|\d+% left/,
     // 0.153.x paints a skeleton composer before thread initialization. The
     // `›` and two seconds of silence do not prove it can submit yet; history
     // can remain empty throughout bootstrap even when a TUI input is queued.

@@ -23,6 +23,7 @@ import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
+import { codexHistorySidIsOwned, findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 
 const SID_A = '019dd80d-d922-7a11-8339-0208d8c5b4ec'; // foreign sibling pane
 const SID_B = '019dd80d-d922-7a11-8339-0208d8c5b4ee'; // this pane (owned)
@@ -183,13 +184,37 @@ describe('codex writeInput history ownership filter', () => {
     const adapter = createCodexAdapter();
     // A pid whose open-file enumeration fails (not our child; a dead pid) models
     // the documented lsof/proc failure branch: the submit is accepted for
-    // compatibility, the sibling's same-text line is bound, but nothing proves
-    // this pane consumed the input.
+    // compatibility while its session identity remains unproven.
     const onEnter = () => { appendFileSync(historyPath, historyLine(SID_A, 'unowned')); };
     const deadPid = 2_147_000_000;
     const result = await adapter.writeInput!(fakePty(deadPid, onEnter), 'unowned');
     expect((result as any)?.submitted).toBe(true);
     expect((result as any)?.ownershipProven).toBeUndefined();
+    expect((result as any)?.cliSessionId).toBeUndefined();
+  });
+
+  it.each(['immediate', 'late'])('confirms %s history with an empty rollout set without exposing a session ID', async (timing) => {
+    expect(findCodexRolloutSetByPid(process.pid)).toEqual(new Set());
+    const pty = fakePty(process.pid, () => {
+      if (timing === 'immediate') {
+        appendFileSync(join(home, 'history.jsonl'), historyLine(SID_A, 'shared submit'));
+      }
+    });
+    pty.captureInputState = () => ({
+      viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+      cursor: { x: 2, y: 1 },
+    });
+
+    const result = await createCodexAdapter().writeInput(pty, 'shared submit');
+
+    if (timing === 'late') {
+      if (!result || result.submitted !== false) throw new Error('Expected a pending submission');
+      appendFileSync(join(home, 'history.jsonl'), historyLine(SID_A, 'shared submit'));
+      expect(result.recheck?.()).toEqual({ submitted: true });
+    } else {
+      expect(result).toEqual({ submitted: true });
+    }
+    expect(codexHistorySidIsOwned(SID_A, findCodexRolloutSetByPid(process.pid))).toBe(false);
   });
 
   it('external App Server viewer accepts only its explicitly selected remote thread', async () => {

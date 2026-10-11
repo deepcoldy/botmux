@@ -90,8 +90,8 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // Declaring it lets `botmux setup` fail fast on a missing install instead of
   // letting the first IM message die with ENOENT.
   mojo: 'mojo',
-  // MiniMax CLI — `mmx text repl` is the interactive chat surface.
-  minimax: 'mmx',
+  // MiniMax Code — native exec stream-json, wrapped by minimax-runner.
+  minimax: 'mcode',
   'remote-runner': 'botmux-remote-runner',
 };
 

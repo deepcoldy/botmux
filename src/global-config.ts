@@ -400,6 +400,12 @@ export interface DashboardGlobalConfig {
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
+  /** 机器级总开关：是否在回复卡片页脚渲染品牌签名（默认 botmux 链接 / 各 bot 自定义
+   *  brandLabel）。缺省 ON（absent ⇒ 显示）；显式 `false` 时**所有** bot 的页脚品牌
+   *  签名一律不渲染（等价于每 bot brandLabel 被置空），Dashboard 每个 bot 的签名
+   *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
+   *  Live 读取（见 config.ts `cardBrandLabelEnabled`），Settings 翻转后无需重启。 */
+  cardBrandLabel?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -554,6 +560,10 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
     && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
   }
+  // Round-trip an explicit boolean either way. Absent stays absent — the live
+  // getter (config.ts `cardBrandLabelEnabled`) treats absent as ON, so a stored
+  // `false` must be preserved to let an operator suppress footer brands fleet-wide.
+  if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

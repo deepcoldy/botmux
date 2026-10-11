@@ -415,7 +415,7 @@ describe('target daemon consumes signed message authority', () => {
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
       getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
-      loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
+      loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
       listChatMemberOpenIds: async () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');

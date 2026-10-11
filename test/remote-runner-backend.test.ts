@@ -12,6 +12,7 @@ const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mj
 const stalledReattachRunner = resolve('test/fixtures/remote-runner-stalled-reattach.mjs');
 const preAckFailureRunner = resolve('test/fixtures/remote-runner-pre-ack-failure.mjs');
 const outboundRunner = resolve('test/fixtures/remote-runner-outbound.mjs');
+const sessionToolRunner = resolve('test/fixtures/remote-runner-session-tool.mjs');
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
 const children: RemoteRunnerBackend[] = [];
@@ -110,6 +111,72 @@ describe('RemoteRunnerBackend', () => {
       operationId: 'reference-outbound-1',
       content: 'reference progress',
     }]);
+  });
+
+  it('returns a host-governed result for a read-only session tool', async () => {
+    const backend = new RemoteRunnerBackend(
+      { expectedProvider: 'session-tool-test' },
+      'session-tool-test',
+    );
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const requested = vi.fn(async operation => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: JSON.stringify({ total: 1 }),
+      stderr: '',
+    }));
+    backend.onSessionTool(requested);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await expect(backend.submitTurn({
+      turnId: 'turn-session-tool',
+      content: 'session-tool',
+    })).resolves.toEqual({ submitted: true });
+
+    await expect(final).resolves.toBe(JSON.stringify({
+      outcome: 'completed',
+      exitCode: 0,
+      stdout: JSON.stringify({ total: 1 }),
+      stderr: '',
+    }));
+    expect(requested).toHaveBeenCalledWith(expect.objectContaining({
+      operationId: 'session-tool-1',
+      turnId: 'turn-session-tool',
+      generation: 1,
+      request: { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
+    }));
+  });
+
+  it.each([
+    ['session-no-session-tool', 'session-tool'],
+    ['session-session-tool-generation', 'future-generation'],
+  ])('fails closed for session tool protocol guard %s', async (sessionId, content) => {
+    const backend = new RemoteRunnerBackend(
+      { expectedProvider: 'session-tool-test' },
+      sessionId,
+    );
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: `turn-${content}`, content });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it('deduplicates one outbound operation id and rejects payload conflicts', async () => {

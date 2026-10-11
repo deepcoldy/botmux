@@ -850,7 +850,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(4);
   });
 
-  it.each(['unified', 'unified-status-off', 'legacy'] as const)('keeps delayed worker receipt consistent with %s mode', async mode => {
+  it.each(['unified', 'unified-status-off', 'legacy'] as const)('waits quietly for the worker receipt with no late notice in %s mode', async mode => {
     vi.useRealTimers();
     const bot = getBot('app_test');
     bot.config.replyCardMode = mode === 'legacy' ? 'legacy' : 'unified';
@@ -868,18 +868,25 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
     await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'refresh' },
       (body, type, uuid) => sessionReply(ds.session.rootMessageId, body, type, ds.larkAppId, ds.currentTurnId, { uuid }));
+    const beforeEnqueueReplies = sessionReply.mock.calls.length;
+    const beforeEnqueueTypes = sessionReply.mock.calls.map(call => call[2]);
     const enqueuedAt = Date.now();
     expect(sendWorkerInput(ds, 'hello', ds.currentTurnId)).toBe(true);
-    if (mode === 'legacy') {
-      await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1), { timeout: 4000 });
-      expect(sessionReply.mock.calls[0][2]).toBe('text');
-    } else {
+    // The old 2s "delivery delayed" nudge (text in legacy, card refresh in
+    // unified) has been removed: a turn waiting for its worker receipt must stay
+    // completely quiet now. Wait past the old settlement window and assert no
+    // new outgoing message of any kind was produced.
+    await new Promise(resolve => setTimeout(resolve, 2_500));
+    expect(sessionReply).toHaveBeenCalledTimes(beforeEnqueueReplies);
+    expect(sessionReply.mock.calls.map(call => call[2])).toEqual(beforeEnqueueTypes);
+    expect(sessionReply.mock.calls.every(call => call[2] !== 'text')).toBe(true);
+    if (mode !== 'legacy') {
       const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
-      await vi.waitFor(() => expect(new TurnReplyCardStore(config.session.dataDir).read({
+      // No quiet card refresh either: the stored card must not have been
+      // rewritten after enqueue.
+      expect(new TurnReplyCardStore(config.session.dataDir).read({
         larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId!,
-      })?.updatedAtMs).toBeGreaterThan(enqueuedAt), { timeout: 4000 });
-      expect(sessionReply).toHaveBeenCalledTimes(1);
-      expect(sessionReply.mock.calls.every(call => call[2] === 'interactive')).toBe(true);
+      })?.updatedAtMs).not.toBeGreaterThan(enqueuedAt);
     }
   });
 

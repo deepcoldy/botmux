@@ -32,10 +32,19 @@ export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message',
 ] as const;
 
+/** Optional provider-to-host access to a small, read-only BotMux session tool
+ * surface.  The provider contributes structured arguments only; the host
+ * freezes the current session/turn and translates them into an allowlisted
+ * local CLI invocation. */
+export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
+  'session_tool',
+] as const;
+
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
   ...REMOTE_RUNNER_OUTBOUND_CAPABILITIES,
+  ...REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -126,6 +135,53 @@ export type RemoteRunnerOutboundMessageResult =
       message: string;
     };
 
+export type RemoteRunnerSessionToolRequest =
+  | {
+      tool: 'history';
+      limit?: number;
+      scope?: 'session' | 'thread' | 'chat' | 'ambient';
+      withCardJson?: boolean;
+    }
+  | {
+      tool: 'quoted';
+      messageId: string;
+      raw?: boolean;
+    }
+  | { tool: 'bots.list' }
+  | { tool: 'skill.list' }
+  | { tool: 'skill.show'; name: string }
+  | { tool: 'skill.read'; name: string; path: string }
+  | { tool: 'skill.resources'; name: string };
+
+export interface RemoteRunnerSessionToolOperation {
+  operationId: string;
+  turnId: string;
+  generation: number;
+  request: RemoteRunnerSessionToolRequest;
+}
+
+export interface RemoteRunnerSessionToolAttachment {
+  placeholder: string;
+  name: string;
+  type: 'image' | 'file';
+  mimeType?: string;
+  dataBase64: string;
+}
+
+export type RemoteRunnerSessionToolResult =
+  | {
+      outcome: 'completed';
+      exitCode: number;
+      stdout: string;
+      stderr: string;
+      attachments?: RemoteRunnerSessionToolAttachment[];
+    }
+  | {
+      outcome: 'rejected' | 'unknown';
+      code: string;
+      message: string;
+    };
+
 interface RemoteRunnerCommandBase {
   protocol: typeof REMOTE_RUNNER_PROTOCOL;
   version: typeof REMOTE_RUNNER_PROTOCOL_VERSION;
@@ -175,6 +231,13 @@ export type RemoteRunnerCommand =
       generation: number;
       result: RemoteRunnerOutboundMessageResult;
     })
+  | (RemoteRunnerCommandBase & {
+      type: 'session_tool_result';
+      operationId: string;
+      turnId: string;
+      generation: number;
+      result: RemoteRunnerSessionToolResult;
+    })
   | (RemoteRunnerCommandBase & { type: 'terminal_input'; generation: number; data: string })
   | (RemoteRunnerCommandBase & { type: 'terminal_resize'; generation: number; cols: number; rows: number });
 
@@ -218,6 +281,13 @@ export type RemoteRunnerEvent =
       content: string;
       responseKind: RemoteRunnerOutboundResponseKind;
       mention: RemoteRunnerOutboundMention;
+    })
+  | (RemoteRunnerEventBase & {
+      type: 'session_tool';
+      operationId: string;
+      turnId: string;
+      generation: number;
+      request: RemoteRunnerSessionToolRequest;
     })
   | (RemoteRunnerEventBase & {
       type: 'final';
@@ -265,6 +335,8 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ERROR_CODE_RE = /^[a-z][a-z0-9._-]{0,127}$/;
 export const MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES = 32 * 1024;
+export const MAX_REMOTE_RUNNER_SESSION_TOOL_TEXT_BYTES = 512 * 1024;
+export const MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES = 512 * 1024;
 const SENSITIVE_STATE_KEY_PARTS = [
   'token',
   'secret',
@@ -446,6 +518,81 @@ export function normalizeRemoteRunnerUsageReport(
   };
 }
 
+function hasExactKeys(raw: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(raw).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+export function normalizeRemoteRunnerSessionToolRequest(
+  value: unknown,
+): RemoteRunnerSessionToolRequest | undefined {
+  const raw = record(value);
+  if (!raw || typeof raw.tool !== 'string') return undefined;
+
+  if (raw.tool === 'history') {
+    const allowed = new Set(['tool', 'limit', 'scope', 'withCardJson']);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const limit = raw.limit === undefined ? undefined : nonNegativeInteger(raw.limit);
+    if (raw.limit !== undefined && (limit === undefined || limit < 1 || limit > 100)) {
+      return undefined;
+    }
+    const scope = raw.scope === undefined ? undefined : String(raw.scope);
+    if (scope !== undefined && !['session', 'thread', 'chat', 'ambient'].includes(scope)) {
+      return undefined;
+    }
+    if (raw.withCardJson !== undefined && typeof raw.withCardJson !== 'boolean') {
+      return undefined;
+    }
+    return {
+      tool: 'history',
+      ...(limit !== undefined ? { limit } : {}),
+      ...(scope !== undefined ? { scope: scope as 'session' | 'thread' | 'chat' | 'ambient' } : {}),
+      ...(raw.withCardJson !== undefined ? { withCardJson: raw.withCardJson } : {}),
+    };
+  }
+
+  if (raw.tool === 'quoted') {
+    const allowed = new Set(['tool', 'messageId', 'raw']);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const messageId = nonEmptyString(raw.messageId, 256);
+    if (!messageId || !/^om_[A-Za-z0-9_-]+$/.test(messageId)) return undefined;
+    if (raw.raw !== undefined && typeof raw.raw !== 'boolean') return undefined;
+    return {
+      tool: 'quoted',
+      messageId,
+      ...(raw.raw !== undefined ? { raw: raw.raw } : {}),
+    };
+  }
+
+  if (raw.tool === 'bots.list' || raw.tool === 'skill.list') {
+    return hasExactKeys(raw, ['tool']) ? { tool: raw.tool } : undefined;
+  }
+
+  if (raw.tool === 'skill.show' || raw.tool === 'skill.resources') {
+    const name = nonEmptyString(raw.name, 256);
+    if (!hasExactKeys(raw, ['tool', 'name']) || !name || !ID_RE.test(name)) return undefined;
+    return { tool: raw.tool, name };
+  }
+
+  if (raw.tool === 'skill.read') {
+    const name = nonEmptyString(raw.name, 256);
+    const path = nonEmptyString(raw.path, 1024);
+    if (!hasExactKeys(raw, ['tool', 'name', 'path']) || !name || !ID_RE.test(name) || !path) {
+      return undefined;
+    }
+    const normalizedPath = path.replace(/\\/g, '/');
+    const parts = normalizedPath.split('/');
+    if (normalizedPath.startsWith('/') || parts.some(part => !part || part === '.' || part === '..')) {
+      return undefined;
+    }
+    return { tool: 'skill.read', name, path: normalizedPath };
+  }
+
+  return undefined;
+}
+
 export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | undefined {
   const raw = record(value);
   if (!raw || !validBase(raw) || typeof raw.type !== 'string') return undefined;
@@ -519,6 +666,27 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       content: raw.content,
       responseKind: raw.responseKind as RemoteRunnerOutboundResponseKind,
       mention: raw.mention as RemoteRunnerOutboundMention,
+    };
+  }
+
+  if (raw.type === 'session_tool') {
+    const operationId = nonEmptyString(raw.operationId, 256);
+    const turnId = nonEmptyString(raw.turnId, 256);
+    const request = normalizeRemoteRunnerSessionToolRequest(raw.request);
+    if (!operationId || !ID_RE.test(operationId)
+        || !turnId || !ID_RE.test(turnId)
+        || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
+        || !request) {
+      return undefined;
+    }
+    return {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'session_tool',
+      operationId,
+      turnId,
+      generation: Number(raw.generation),
+      request,
     };
   }
 

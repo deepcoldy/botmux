@@ -474,11 +474,13 @@ vi.mock('../src/im/lark/doc-comment.js', () => {
     listDocComments: vi.fn(async () => []),
     subscribeDocFile: vi.fn(async () => {}),
     unsubscribeDocFile: vi.fn(async () => {}),
+    fetchDocTitle: vi.fn(async () => undefined),
   };
 });
 
 vi.mock('../src/services/doc-subs-store.js', () => ({
   docWatchAnchor: (fileToken: string) => `doc:${fileToken}:watch`,
+  isPollingDocTriggerMode: (mode?: string) => mode === 'all' || mode === 'owner-mention',
   putDocSubscription: vi.fn(() => ({})),
   removeDocSubscription: vi.fn(),
   listDocSubscriptionsForSession: vi.fn(() => []),
@@ -2385,6 +2387,8 @@ describe('handleCommand', () => {
           workingDir: '/work/current-session',
           managedBy: 'watch-comment',
         }),
+        // 重新登记延续运行态诊断；溯源三字段刻意不传（owner 接管，不再是 auto-sub）。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2432,6 +2436,8 @@ describe('handleCommand', () => {
         expect.any(String),
         LARK_APP_ID,
         expect.objectContaining({ workingDir: undefined }),
+        // watch-comment 重登记走 inheritRuntime。
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -2469,6 +2475,7 @@ describe('handleCommand', () => {
           workingDir: '/work/repo',
           managedBy: 'watch-comment',
         }),
+        { inheritRuntime: true },
       );
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,

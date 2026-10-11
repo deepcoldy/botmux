@@ -87,6 +87,23 @@ export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string)
 }
 
 /**
+ * Machine-readable companion to {@link sessionActiveTurnPath}:
+ * `{"turnId":…,"dispatchAttempt":…}` (one JSON object, 0600).
+ *
+ * The shell file stays a bare line because the `/bin/sh` identity wrapper
+ * sources it per tool call; this one exists for a JSON consumer that must
+ * freeze the (turn, dispatch generation) pair it is reporting on. The dsh-tui
+ * wrapper plugin reads it synchronously inside the `agent/status` callback
+ * (BOTMUX_TURN_IDLE_COMMAND) and carries the pair end-to-end, because a later
+ * read can already name the NEXT dispatch — see src/utils/turn-idle-report.ts.
+ * Its path layout is therefore mirrored in the generated snippet
+ * (src/adapters/dsh-question-bridge.ts): keep the two in sync.
+ */
+export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn.json');
+}
+
+/**
  * Publish the turn now executing. Called by the worker at the point it hands a
  * queued input to the CLI, which is later than the daemon's acceptance of that
  * message and possibly much later.
@@ -98,12 +115,23 @@ export function publishActiveTurn(
   sessionDataDir: string,
   sessionId: string,
   turnId: string | undefined,
+  dispatchAttempt?: number,
 ): void {
   const path = sessionActiveTurnPath(sessionDataDir, sessionId);
   try {
     mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
     atomicWriteFileSync(path, `${turnId ?? ''}\n`, { mode: 0o600 });
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
+  try {
+    atomicWriteFileSync(
+      sessionActiveTurnIdentityPath(sessionDataDir, sessionId),
+      `${JSON.stringify({
+        turnId: turnId ?? null,
+        dispatchAttempt: dispatchAttempt ?? null,
+      })}\n`,
+      { mode: 0o600 },
+    );
+  } catch { /* best-effort: the reader stays silent without a frozen identity */ }
 }
 
 /** Session ids reach here from IPC; they are concatenated into a path, so a

@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { cliIdForComm, findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
 function makeScheduler() {
@@ -26,20 +26,68 @@ const workerWiring = transpileModule(workerSource.slice(wiringStart, wiringEnd),
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
 }).outputText;
 
+// Execute the REAL worker functions resolveCodexOwnershipPid /
+// codexProcessIsNativeLeaf (extracted verbatim from worker.ts) in the wiring
+// VM, so mutating their leaf/filter logic is caught behaviourally instead of
+// being hidden behind a stub.
+const leafFnsStart = workerSource.indexOf('function codexProcessIsNativeLeaf');
+if (leafFnsStart < 0) throw new Error('codexProcessIsNativeLeaf not found');
+const leafFnsEnd = workerSource.indexOf('\n}\n', workerSource.indexOf('function resolveCodexOwnershipPid', leafFnsStart)) + 3;
+const leafFnsSource = transpileModule(workerSource.slice(leafFnsStart, leafFnsEnd)
+  + '\nthis.__exports.codexProcessIsNativeLeaf = codexProcessIsNativeLeaf;'
+  + 'this.__exports.resolveCodexOwnershipPid = resolveCodexOwnershipPid;', {
+  compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
+}).outputText;
+function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; findReal: typeof findLaunchedCliPid }) {
+  const sandbox: Record<string, unknown> = { __exports: {} };
+  runInNewContext(leafFnsSource, {
+    ...sandbox,
+    readComm: deps.readComm,
+    cliIdForComm,
+    findLaunchedCliPid: deps.findReal,
+  });
+  return sandbox.__exports as {
+    codexProcessIsNativeLeaf: (pid: number, filter?: string) => boolean;
+    resolveCodexOwnershipPid: (pid: number, active: boolean, filter?: string) => number;
+  };
+}
+
 function runWorkerWiring(late: boolean, options: {
   cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean;
+  launchedCliPid?: number | null;
+  // comm of the pane/getChildPid process: 'node' models the npm launcher (a
+  // codex descendant must be discovered), 'codex' a direct native install (no
+  // descendant scan may run).
+  comm?: string;
+  cliRuntime?: { source: string; executable: string };
 } = {}) {
   const scheduler = makeScheduler();
   const backend = { cliPid: 100, getChildPid: () => 100 };
+  const findLaunchedCliPidMock = vi.fn(function (this: unknown, ..._args: unknown[]) {
+    return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
+  });
+  // The pane process's comm: 'node' models the npm launcher (descendant must be
+  // discovered); 'codex' a direct native install (no scan may run). Any other
+  // pid has no comm. The REAL cliIdForComm + the REAL worker resolve functions
+  // run against this probe, so the leaf/filter logic is covered behaviourally.
+  const realFns = loadRealLeafFns({
+    readComm: (pid) => (pid === 100 ? (options.comm ?? 'node') : undefined),
+    findReal: findLaunchedCliPidMock as unknown as typeof findLaunchedCliPid,
+  });
   const context = {
-    cfg: { cliId: options.cliId ?? 'codex', wrapperCli: options.wrapperCli ?? 'launcher', workingDir: '/work' },
+    cfg: {
+      cliId: options.cliId ?? 'codex', wrapperCli: options.wrapperCli ?? 'launcher', workingDir: '/work',
+      ...(options.cliRuntime ? { cliRuntime: options.cliRuntime } : {}),
+    },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
-    resolveCodexOwnershipPid: vi.fn((candidatePid: number) => candidatePid),
+    lastSpawnCodexExecutable: undefined,
+    resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
+    codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
-    findLaunchedCliPid: vi.fn(() => 200), scheduleWrapperRealCliPid,
+    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
@@ -65,8 +113,91 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
   });
 
+  it.each([false, true])('attests the native Codex child behind the standard npm launcher (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { wrapperCli: '' });
+    // The gate must be ACTIVE for managed Codex even without a sandbox
+    // (regression guard: passing outerBwrapActive here silently reverts the fix).
+    expect(result.resolveCodexOwnershipPid).toHaveBeenCalledWith(100, true, undefined);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex', 6, expect.any(Object), undefined);
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('forwards the configured custom codex executable to BOTH resolve sites (late PID=%s)', late => {
+    // Renamed Codex-compatible runtime: the child never forks, so every
+    // descendant probe — the synchronous resolve (1) plus 30 retry ticks —
+    // must carry the exact configured executable name. No call may fall back
+    // to the static 'codex' map.
+    const result = runWorkerWiring(late, {
+      wrapperCli: '', launchedCliPid: null,
+      cliRuntime: { source: 'configured', executable: '/opt/foo/my-codex' },
+    });
+    expect(result.resolveCodexOwnershipPid).toHaveBeenCalledWith(100, true, '/opt/foo/my-codex');
+    expect(result.findLaunchedCliPid).toHaveBeenCalledTimes(31);
+    expect(result.findLaunchedCliPid.mock.calls.every(call => call[4] === '/opt/foo/my-codex')).toBe(true);
+    expect(result.backend.cliPid).toBe(100);
+  });
+
+  it.each([false, true])('recognises a renamed native leaf by the configured executable and skips scans (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      wrapperCli: '', comm: 'my-codex',
+      cliRuntime: { source: 'configured', executable: '/opt/foo/my-codex' },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(100);
+  });
+
+  it.each([false, true])('does NOT treat the official-name comm as a leaf for a configured renamed runtime (fail closed) (late PID=%s)', late => {
+    // customCodexExecutableName deliberately maps the official 'codex' name to
+    // an unmatchable identity when a custom runtime is configured; a process
+    // literally named codex must therefore be descended through, not trusted.
+    const result = runWorkerWiring(late, {
+      wrapperCli: '', comm: 'codex', launchedCliPid: null,
+      cliRuntime: { source: 'configured', executable: '/opt/foo/my-codex' },
+    });
+    expect(result.findLaunchedCliPid).toHaveBeenCalled();
+  });
+
+  it.each([false, true])('never scans descendants when the pane pid already is a native codex leaf (late PID=%s)', late => {
+    // Direct standalone install: getChildPid() itself IS the native binary.
+    // The synchronous resolve returns it unchanged and the retry loop stops on
+    // the first tick WITHOUT a single descendant scan (the P2 waste: 31 full
+    // process-table scans per spawn otherwise).
+    const result = runWorkerWiring(late, { wrapperCli: '', comm: 'codex' });
+    expect(result.resolveCodexOwnershipPid).toHaveBeenCalledWith(100, true, undefined);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(100);
+    expect(result.bridgeCliPid).toBeUndefined();
+    // The resolved native child (200) must never be attested; only the raw pid
+    // is, and solely on the late-pid path (which always attests once).
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+    expect(result.publishLocalProcessAttestation.mock.calls.every(call => call[0] === 100)).toBe(true);
+    expect(result.publishLocalProcessAttestation).toHaveBeenCalledTimes(late ? 1 : 0);
+  });
+
+  it.each([false, true])('keeps the launcher pid while the native child has not forked yet (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { wrapperCli: '', launchedCliPid: null });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex', 6, expect.any(Object), undefined);
+    expect(result.backend.cliPid).toBe(100);
+    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+    expect(result.publishLocalProcessAttestation.mock.calls.every(call => call[0] === 100)).toBe(true);
+    expect(result.publishLocalProcessAttestation).toHaveBeenCalledTimes(late ? 1 : 0);
+  });
+
+  it.each([false, true])('a whitespace wrapperCli skips only the generic wrapper resolver, not the codex one (late PID=%s)', late => {
+    // The trim() short-circuit in startWrapperRealPidResolve is the sole
+    // protection for a blank/whitespace wrapperCli: the generic wrapper bridge
+    // resolver must stay off (bridgeCliPid untouched), but the codex-native
+    // launcher resolver is unconditional and must still rewire cliPid.
+    const result = runWorkerWiring(late, { wrapperCli: '  ' });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBeUndefined();
+  });
+
   it.each([
-    { wrapperCli: '' }, { wrapperCli: '  ' }, { cliId: 'claude-code' },
+    { cliId: 'claude-code', wrapperCli: '' },
   ])('does not resolve an ineligible wrapper: %j', options => {
     for (const late of [false, true]) {
       const result = runWorkerWiring(late, options);
@@ -81,7 +212,15 @@ describe('worker wrapper PID wiring', () => {
   it.each([false, true])('keeps the wrapper bridge resolver off under sandbox while the codex bwrap resolver runs (late=%s)', late => {
     const result = runWorkerWiring(late, { sandboxRequested: true });
     expect(result.bridgeCliPid).toBeUndefined();
+    // The production resolver supplies optional BFS probe/filter arguments;
+    // this boundary cares that every probe starts at the launcher and targets
+    // Codex, not about the internal optional-argument representation.
+    expect(result.findLaunchedCliPid.mock.calls).not.toHaveLength(0);
+    expect(result.findLaunchedCliPid.mock.calls.every((args: unknown[]) =>
+      args[0] === 100 && args[1] === 'codex',
+    )).toBe(true);
     expect(result.backend.cliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
   });
 });
 
@@ -260,5 +399,36 @@ describe('scheduleWrapperRealCliPid()', () => {
     });
     sch.runAll();
     expect(applied).toEqual([]);
+  });
+
+  it('stops on the first tick, without any descendant scan, when isDirectLeaf reports the leaf', () => {
+    // Direct native install: scanning the launcher's descendants 30 times is
+    // pure waste. isDirectLeaf must abort BEFORE findRealPid runs.
+    const sch = makeScheduler();
+    const findRealPid = vi.fn(() => 200);
+    const applied: number[] = [];
+    const schedules: Array<() => void> = [];
+    scheduleWrapperRealCliPid(100, {
+      findRealPid, isDirectLeaf: () => true,
+      getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => applied.push(p),
+      schedule: (fn) => { schedules.push(fn); sch.schedule(fn); },
+    });
+    sch.runAll();
+    expect(findRealPid).not.toHaveBeenCalled();
+    expect(applied).toEqual([]);
+    expect(schedules.length).toBe(1); // only the initial tick, no re-arm
+  });
+
+  it('still descends normally when isDirectLeaf reports false', () => {
+    const sch = makeScheduler();
+    const applied: number[] = [];
+    scheduleWrapperRealCliPid(100, {
+      findRealPid: () => 200, isDirectLeaf: () => false,
+      getBackend: () => backendA, getChildPid: () => 100,
+      applyRealPid: (p) => applied.push(p), schedule: sch.schedule,
+    });
+    sch.runAll();
+    expect(applied).toEqual([200]);
   });
 });

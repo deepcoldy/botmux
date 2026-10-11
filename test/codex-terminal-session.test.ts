@@ -4,16 +4,8 @@ import type { PtyHandle } from '../src/adapters/cli/types.js';
 import { findCodexRolloutSetByPid } from '../src/services/codex-transcript.js';
 import {
   refreshCodexTerminalSession,
-  prepareCodexTerminalStatusLine,
   codexTerminalSessionIsBound,
 } from '../src/services/codex-terminal-session.js';
-
-import { codexConfigPathForPid, ensureCodexStatusLineConfig } from '../src/services/codex-statusline-config.js';
-
-vi.mock('../src/services/codex-statusline-config.js', () => ({
-  codexConfigPathForPid: vi.fn(),
-  ensureCodexStatusLineConfig: vi.fn(),
-}));
 
 vi.mock('../src/services/codex-transcript.js', () => ({ findCodexRolloutSetByPid: vi.fn() }));
 
@@ -38,7 +30,7 @@ function terminal(id = sid) {
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe('Codex terminal session identity', () => {
-  it('requires a visible thread ID without injecting a status command', async () => {
+  it('reports missing footer evidence without writing to the terminal', async () => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal('');
     expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
@@ -63,6 +55,26 @@ describe('Codex terminal session identity', () => {
     expect(codexTerminalSessionIsBound(t.pty, other)).toBe(true);
     expect(t.sendText).not.toHaveBeenCalled();
     expect(t.sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
+  it('reads the thread ID behind the Codex 0.154 U+00BB composer marker', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal('');
+    t.pty.captureInputState = () => ({
+      viewport: `\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · ${sid}`,
+      cursor: { x: 2, y: 1 },
+    });
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'terminal', sessionId: sid });
+  });
+
+  it('leaves the 0.154 footer unbound when the thread ID is absent', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal('');
+    t.pty.captureInputState = () => ({
+      viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+      cursor: { x: 2, y: 1 },
+    });
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
   });
 
   // Two-row layouts reproduced from the Linux 0.158 review captures.
@@ -131,7 +143,7 @@ describe('Codex terminal session identity', () => {
     { line: '› draft', x: 7, y: 0 },
     { line: '› first line\n  second line', x: 13, y: 1 },
     { line: '› 1. Update now', x: 2, y: 0 },
-  ])('does not bind or configure while the composer contains a draft or picker: %s', async ({ line, x, y }) => {
+  ])('does not bind while the composer contains a draft or picker: %s', async ({ line, x, y }) => {
     vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
     const t = terminal();
     t.pty.captureInputState = () => ({
@@ -139,8 +151,6 @@ describe('Codex terminal session identity', () => {
       cursor: { x, y },
     });
     expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -306,69 +316,5 @@ describe('Codex terminal session identity', () => {
     expect(t.pty.captureInputState).not.toHaveBeenCalled();
     expect(t.sendText).not.toHaveBeenCalled();
   });
-});
 
-
-describe('Codex terminal statusline setup', () => {
-  it('configures once but still requires the running TUI to expose the ID before binding', async () => {
-    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
-    vi.mocked(codexConfigPathForPid).mockReturnValue('/custom/config.toml');
-    vi.mocked(ensureCodexStatusLineConfig).mockReturnValue({ kind: 'updated', configPath: '/custom/config.toml' });
-    const t = terminal('');
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('updated');
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('updated');
-    expect(ensureCodexStatusLineConfig).toHaveBeenCalledTimes(1);
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'unavailable' });
-    expect(codexTerminalSessionIsBound(t.pty, sid)).toBe(false);
-    t.pty.captureInputState = () => ({ viewport: `\n› Ask Codex to do anything\n\n  ${sid}`, cursor: { x: 2, y: 1 } });
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'terminal', sessionId: sid });
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    expect(t.sendText).not.toHaveBeenCalled();
-    expect(t.sendSpecialKeys).not.toHaveBeenCalled();
-  });
-
-  it('does not alter config for visible IDs, drafts, or unknown layouts', () => {
-    const t = terminal();
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    t.pty.captureInputState = () => ({ viewport: '› draft', cursor: { x: 2, y: 0 } });
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    expect(codexConfigPathForPid).not.toHaveBeenCalled();
-    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
-  });
-
-  it('does not guess another config path when process inspection fails', () => {
-    const t = terminal('');
-    expect(prepareCodexTerminalStatusLine(t.pty)).toEqual({ kind: 'failed' });
-    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
-  });
-
-  it('retries failed edits and invalidates the cached setup after PID replacement', () => {
-    const t = terminal('');
-    vi.mocked(codexConfigPathForPid).mockReturnValue('/custom/config.toml');
-    vi.mocked(ensureCodexStatusLineConfig)
-      .mockReturnValueOnce({ kind: 'failed', configPath: '/custom/config.toml' })
-      .mockReturnValue({ kind: 'configured', configPath: '/custom/config.toml' });
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('failed');
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('configured');
-    t.pty.cliPid = 1000;
-    expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('configured');
-    expect(ensureCodexStatusLineConfig).toHaveBeenCalledTimes(3);
-  });
-
-  it('falls back to legacy mode for owned sessions (isAdopt === false) when statusline thread ID is absent', async () => {
-    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
-    const t = terminal('');
-    t.pty.isAdopt = false;
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'legacy' });
-    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
-    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
-  });
-
-  it('still uses visible footer thread ID for owned sessions when present', async () => {
-    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
-    const t = terminal();
-    t.pty.isAdopt = false;
-    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'terminal', sessionId: sid });
-  });
 });

@@ -1,6 +1,5 @@
 import type { PtyHandle } from '../adapters/cli/types.js';
 import { findCodexRolloutSetByPid } from './codex-transcript.js';
-import { codexConfigPathForPid, ensureCodexStatusLineConfig, type CodexStatusLineSetup } from './codex-statusline-config.js';
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
 import { detectCodexComposerState } from './codex-composer-state.js';
 
@@ -12,7 +11,6 @@ type Resolution =
 // Scope evidence to a backend generation, never to CODEX_HOME or the daemon.
 const bindings = new WeakMap<PtyHandle, { pid: number; sessionId: string }>();
 const pending = new WeakMap<PtyHandle, Promise<Resolution>>();
-const configured = new WeakMap<PtyHandle, { pid: number; setup: CodexStatusLineSetup }>();
 
 export function codexTerminalSessionIsBound(terminal: PtyHandle, sessionId: string): boolean {
   const binding = bindings.get(terminal);
@@ -30,7 +28,7 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
   // Cursor position alone cannot distinguish a draft whose cursor is at Home.
   // Accept only an empty row or the known native placeholder, plus a live
   // initialized footer below it. Unknown placeholders fail closed.
-  const prompt = /^(\s*)› (?:Ask Codex to do anything)?\s*$/.exec(line);
+  const prompt = /^(\s*)[›»] (?:Ask Codex to do anything)?\s*$/.exec(line);
   if (!prompt || state.cursor.x !== (prompt[1]?.length ?? 0) + 2) return undefined;
   // Match native state rows, not words inside transcript prose or tool output.
   const below = lines.slice(state.cursor.y + 1);
@@ -90,8 +88,8 @@ function statusLineSession(footer: string): string | undefined {
  * Older/embedded TUIs own their rollout fds. Shared-daemon TUIs do not, and
  * daemon fds include unrelated panes. Read the original TUI's live thread-id
  * footer without writing commands into the conversation. Refresh on every
- * submission to follow local thread switches. If identity cannot be proven,
- * callers must stop before writing the prompt and explain how to expose it.
+ * submission to follow local thread switches. Available footer IDs supplement
+ * the PID/rollout ownership evidence used for submission confirmation.
  */
 export function refreshCodexTerminalSession(terminal: PtyHandle): Promise<Resolution> {
   const inFlight = pending.get(terminal);
@@ -117,27 +115,5 @@ async function refresh(terminal: PtyHandle): Promise<Resolution> {
       }
     }
   } catch { /* Closed pane or unsupported snapshot: keep the binding unproven. */ }
-  // When explicitly known as an owned session (isAdopt === false), do not block
-  // input just because statusline ID is missing — fresh owned Codex has no rollout yet.
-  if (terminal.isAdopt === false) {
-    return { kind: 'legacy' };
-  }
   return { kind: 'unavailable' };
-}
-
-/** One setup per backend generation; failures remain retryable. No TUI writes. */
-export function prepareCodexTerminalStatusLine(terminal: PtyHandle): CodexStatusLineSetup | undefined {
-  const pid = terminal.cliPid;
-  if (!pid || terminal.expectedCodexSessionId || terminal.isAdopt === false) return undefined;
-  try {
-    const footer = emptyComposerFooter(terminal);
-    if (footer === undefined || statusLineSession(footer)) return undefined;
-    const previous = configured.get(terminal);
-    if (previous?.pid === pid) return previous.setup;
-    const path = codexConfigPathForPid(pid);
-    const setup: CodexStatusLineSetup = path && terminal.cliPid === pid
-      ? ensureCodexStatusLineConfig(path) : { kind: 'failed' };
-    if (setup.kind !== 'failed') configured.set(terminal, { pid, setup });
-    return setup;
-  } catch { return { kind: 'failed' }; }
 }

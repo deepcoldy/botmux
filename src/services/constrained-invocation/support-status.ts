@@ -41,6 +41,6 @@ export const modelOnlyAssessments: Readonly<Record<CliId, ModelOnlyAssessment>> 
   dsh: { group: 'agent-profile', status: 'verification_required', reason: 'native_profile_unverified', detail: '现有 runner 使用 profile 认证和 ACP session/prompt；缺少 dsh 程序，profile 的空工具和无定制加载未验证。' },
   'dsh-tui': { group: 'agent-profile', status: 'verification_required', reason: 'native_profile_unverified', detail: '这是独立 TUI 入口，配置和登录关联 dsh；未验证可复用的原生 model-only 协议，不能退回 PTY 提示词限制。' },
   mojo: { group: 'remote-agent', status: 'interface_gap', reason: 'remote_loop_control_unproven', detail: '现有 CLI 管理后台远端 Agent session；session cancel 能控制任务生命周期，但没有已核实的禁用远端工具和 loop 参数。' },
-  minimax: { group: 'native-print', status: 'implemented', reason: null, detail: '原生 text chat/json，不传任何 tool；原生合成服务测试通过，使用原生 config.json 维护区域和认证。' },
+  minimax: { group: 'native-exec', status: 'verification_required', reason: 'mcode_model_only_isolation_unverified', detail: '已升级为 MiniMax Code mcode exec；原生 exec 保留 Agent 工具与插件，尚未验证完全零工具和独立认证的 model-only 契约，不回退 mmx。' },
   'remote-runner': { group: 'remote-agent', status: 'interface_gap', reason: 'provider_controls_agent_loop', detail: '执行由外置 provider 管理；是否支持纯模型、空工具和隔离凭据取决于 provider 声明与内部验收。' },
 };

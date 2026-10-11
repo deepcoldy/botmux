@@ -135,3 +135,20 @@ BotMux 把“协议能力”和“发行版身份”分开：`cliId: "codex"` �
 6. 更新 README
 
 详见 [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md)。
+
+## Codex App 原生提问
+
+Botmux 管理的 `codex-app` 会话，以及启用 app-server RPC 的 `codex` 会话，会把原生 `request_user_input` 转成飞书问答卡片。用户选择或在当前会话文字作答后，答案按原问题 ID 回传给同一个原生轮次，无需新发一轮提示。TRAE RPC 也使用同一桥接。
+
+- 一次请求里的多个问题保留为同一批问题，选项说明随问题展示；推荐文案不会被自动当成答案。
+- 原生纯文本题会显示为等待文字回复的卡片；含纯文本题的整批问题统一通过会话文字回复作答。直接文字答复作为整批问题的答案回传；不要把未提交的选项当作已回答。
+- 复用现有 Ask 的会话路由和答复权限。等待最多一小时；发卡失败、超时、卡片失效或无法表达的问题会中断原轮次，避免空答案使 Agent 继续执行。
+- 原轮次结束、进程退出或会话关闭后，会取消等待；迟到答复不再回传。daemon 重启时此类原生请求不自动重试或恢复。
+- 选择题要求至少两个选项；秘密输入题和畸形问题会明确失败，整批不做部分回答。不要在聊天中输入密码等秘密。
+- Workflow 子任务仍使用 `humanGate` / decision 节点。无飞书传输的 API-only 会话、普通终端粘贴模式，以及 App 历史查看服务不走此问答桥接。
+
+验证时，在普通 Codex App 会话中让模型用原生 `request_user_input` 问一个选择题，确认飞书卡片能收到问题，提交后同一轮继续并能复述所选答案。原生工具是否可用仍由 Codex 的版本和运行模式决定。
+
+卡片结构示意（由实际卡片 JSON 本地渲染，尚未进行真人飞书点击验收）：
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

@@ -3349,6 +3349,439 @@ function ownsCurrentStreamingCard(ds: DaemonSession, messageId: string): boolean
   return ownsActiveStreamingCardRegistrySlot(ds);
 }
 
+// ─── Streaming-card display identity (display toggle / screenshot target) ───
+
+/** Record the exact card this daemon just published (or verified by PATCHing
+ * the persisted current card). Call ONLY after the publication fence passed
+ * and `ds.streamCardId` was committed to `messageId`. Never call from card
+ * callbacks or frozen-card self-heal: those cards may carry the current
+ * nonce/session_id without being the current publication. */
+export function rememberPublishedStreamingCardIdentity(
+  ds: DaemonSession,
+  messageId: string,
+  /** Turn generation captured when the POST started. A card whose POST was
+   * superseded by a newer turn is recorded under its own (older) generation
+   * so it can never be restored as the newer turn's card. */
+  publishedGeneration: number = ds.streamCardTurnGeneration ?? 0,
+): void {
+  if (ds.streamCardId !== messageId || !ds.streamCardNonce
+    || messageId === CARD_POSTING_SENTINEL) return;
+  ds.lastPublishedStreamingCardIdentity = {
+    messageId, nonce: ds.streamCardNonce,
+    sessionId: ds.session.sessionId, larkAppId: ds.larkAppId,
+    anchorId: sessionAnchorId(ds), runtimeKey: activeSessionKey(ds),
+    turnGeneration: publishedGeneration,
+  };
+}
+
+/** Drop the publication proof (optionally only when it names `messageId`). */
+export function forgetPublishedStreamingCardIdentity(ds: DaemonSession, messageId?: string): void {
+  if (!ds.lastPublishedStreamingCardIdentity) return;
+  if (messageId !== undefined && ds.lastPublishedStreamingCardIdentity.messageId !== messageId) return;
+  ds.lastPublishedStreamingCardIdentity = undefined;
+}
+
+/** Auxiliary-UI suppression for one worker turn/attempt: no Lark transport,
+ * silent scheduled turn, meeting-driven turn, or a durable-suppressed replay
+ * attempt. Module-level twin of setupWorkerHandlers' `managedAuxUiSuppressed`
+ * closure, for callers outside the worker handlers (display toggle and cached
+ * screenshot source checks). The closure intentionally stays inline (its
+ * source is locked by test/api-only-mode-wiring.test.ts); KEEP THE TWO
+ * PREDICATES IDENTICAL — parity is asserted behaviourally in
+ * test/worker-ready-display-mode.test.ts. Fails closed if the bot is gone. */
+export function managedAuxUiSuppressedFor(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): boolean {
+  try {
+    if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
+  } catch {
+    return true;
+  }
+  if (isSilentScheduledTurn(ds, turnId)) return true;
+  if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
+  const armedThrough = turnId ? ds.suppressedFinalOutputTurns?.get(turnId) : undefined;
+  return dispatchAttempt !== undefined
+    && armedThrough !== undefined
+    && dispatchAttempt <= armedThrough;
+}
+
+/** May a screenshot captured for this turn/attempt be shown on a visible
+ * streaming card? Adds the chat-scope substitute (分身) restriction on top of
+ * managed/silent suppression. Deliberately independent of
+ * `streamingCardForced`: forcing a card on never authorizes another source's
+ * frames. */
+export function screenshotSourceSuppressed(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): boolean {
+  return managedAuxUiSuppressedFor(ds, turnId, dispatchAttempt) || isSubstituteTurn(ds, turnId);
+}
+
+type CaptureTuple = { turnId?: string; dispatchAttempt?: number };
+
+function captureTupleEmpty(tuple: CaptureTuple): boolean {
+  return tuple.turnId === undefined && tuple.dispatchAttempt === undefined;
+}
+
+/** The capture identity announced by worker generation `workerGeneration`
+ * (default: the session's current generation), if any. */
+export function currentCaptureIdentity(
+  ds: DaemonSession,
+  workerGeneration: number | undefined = ds.workerGeneration,
+): NonNullable<DaemonSession['captureIdentity']> | undefined {
+  const identity = ds.captureIdentity;
+  return identity && workerGeneration !== undefined && identity.workerGeneration === workerGeneration
+    ? identity
+    : undefined;
+}
+
+/** Complete, same-source tuples known to describe what the current worker's
+ * terminal may be showing. Never splices one source's turnId with another's
+ * attempt: each entry is copied whole from where it was observed. */
+function knownCaptureSourceTuples(ds: DaemonSession, base: CaptureTuple | undefined): CaptureTuple[] {
+  const tuples: CaptureTuple[] = [];
+  const identity = currentCaptureIdentity(ds);
+  const seed = base ?? (identity ? { turnId: identity.turnId, dispatchAttempt: identity.dispatchAttempt } : undefined);
+  if (seed && !captureTupleEmpty(seed)) tuples.push(seed);
+  // An empty tuple (CLI cleared/exited, idle, a replacement worker's initial
+  // snapshot) does not clear the pixels the previous source left on the
+  // terminal — that evidence outlives the worker generation.
+  if ((!seed || captureTupleEmpty(seed)) && ds.retainedCaptureSource) tuples.push(ds.retainedCaptureSource);
+  // The worker-published live origin is an independent complete tuple; when it
+  // names the same turn it carries the attempt that managed replay suppression
+  // keys on. For a legacy worker (this generation never announced a capture
+  // identity) it is the ONLY positive evidence of what the terminal is
+  // producing, so it is always a known source: a frame tagged with a different
+  // (e.g. older public) turn conflicts with it rather than overriding it.
+  const origin = ds.managedTurnOrigin;
+  if (origin?.turnId !== undefined) {
+    const first = tuples[0];
+    if (!identity || !first || first.turnId === origin.turnId) {
+      tuples.push({ turnId: origin.turnId, dispatchAttempt: origin.dispatchAttempt });
+    }
+  }
+  return tuples;
+}
+
+function anyCaptureSourceSuppressed(ds: DaemonSession, tuples: CaptureTuple[]): boolean {
+  return tuples.some(tuple => screenshotSourceSuppressed(ds, tuple.turnId, tuple.dispatchAttempt));
+}
+
+/** Commit a capture_identity event synchronously (before any await in the
+ * handler). Accepts only safe non-negative integer revisions of the emitting
+ * generation; an identical revision+tuple is idempotent; an older revision or
+ * the same revision with a different tuple is rejected (no rollback). A new
+ * generation starts fresh. Returns whether the identity is now `msg`'s. */
+export function commitCaptureIdentity(
+  ds: DaemonSession,
+  workerGeneration: number,
+  msg: { revision: number; turnId?: string; dispatchAttempt?: number },
+): boolean {
+  if (!Number.isSafeInteger(msg.revision) || msg.revision < 0) return false;
+  const current = currentCaptureIdentity(ds, workerGeneration);
+  if (current) {
+    if (msg.revision < current.revision) return false;
+    if (msg.revision === current.revision) {
+      return current.turnId === msg.turnId && current.dispatchAttempt === msg.dispatchAttempt;
+    }
+  }
+  const tuple: CaptureTuple = {
+    ...(msg.turnId !== undefined ? { turnId: msg.turnId } : {}),
+    ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+  };
+  // A real non-empty write replaces the retained source evidence; an empty
+  // tuple keeps it (clearing execution ownership does not clear pixels).
+  if (!captureTupleEmpty(tuple)) ds.retainedCaptureSource = tuple;
+  const lastSource = ds.retainedCaptureSource;
+  ds.captureIdentity = {
+    workerGeneration,
+    revision: msg.revision,
+    ...tuple,
+    ...(lastSource ? { lastSource } : {}),
+  };
+  noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
+  promoteWaitingStreamCardTarget(ds);
+  return true;
+}
+
+let streamCardPublicationSeq = 0;
+
+/** Bind the display target of a card that has just become `ds.streamCardId`.
+ * `newTurnId` is the real turn a NEW-TURN card was published for: it waits for
+ * that exact turn's capture identity (or follows live at once if the worker is
+ * already capturing it). Restored/manual/no-turn cards follow live. Each call
+ * is a fresh publication: no match state is inherited from another card. */
+export function bindStreamCardDisplayTarget(
+  ds: DaemonSession,
+  messageId: string,
+  newTurnId?: string,
+): void {
+  if (!isRealStreamingCardId(messageId) || ds.streamCardId !== messageId) return;
+  const publication = ++streamCardPublicationSeq;
+  const identity = currentCaptureIdentity(ds);
+  ds.streamCardDisplayTarget = newTurnId === undefined || identity?.turnId === newTurnId
+    ? { messageId, publication, mode: 'follow-live', ...(newTurnId !== undefined ? { turnId: newTurnId } : {}) }
+    : { messageId, publication, mode: 'waiting-exact-turn', turnId: newTurnId };
+}
+
+/** Target for a re-sent copy of the current card (/card, legacy migration).
+ * Decided at COMMIT time against the exact target object captured when the
+ * POST started: only if that same publication is still waiting does the copy
+ * re-evaluate for its turn; an activation observed during the POST window (the
+ * object was replaced by its promoted copy) or any other replacement means the
+ * copy follows live — never bound to a past turn forever, and never inheriting
+ * an unrelated card's state. */
+function waitingTurnToCarryForResend(
+  ds: DaemonSession,
+  targetAtPost: DaemonSession['streamCardDisplayTarget'],
+): string | undefined {
+  const target = ds.streamCardDisplayTarget;
+  return target !== undefined && target === targetAtPost && target.mode === 'waiting-exact-turn'
+    ? target.turnId
+    : undefined;
+}
+
+/** Activate a waiting target once its exact turn is being captured. Also
+ * allowed during a publication window (POST sentinel): the target still names
+ * the card that is current until the POST commits, and a failed POST restores
+ * exactly that card, so the activation observed in the window must survive. A
+ * successful re-send decides at commit whether its copy inherits the wait (see
+ * postFreshStreamingCard); an unrelated successor binds its own target. */
+function promoteWaitingStreamCardTarget(ds: DaemonSession): void {
+  const target = ds.streamCardDisplayTarget;
+  if (target?.mode !== 'waiting-exact-turn') return;
+  if (target.messageId !== ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) return;
+  const identity = currentCaptureIdentity(ds);
+  if (!identity || identity.turnId !== target.turnId) return;
+  // CAS on the exact publication: never upgrade a replaced target.
+  if (ds.streamCardDisplayTarget !== target) return;
+  ds.streamCardDisplayTarget = { ...target, mode: 'follow-live' };
+}
+
+/** Drop the display target (optionally only when it names `messageId`). */
+export function forgetStreamCardDisplayTarget(ds: DaemonSession, messageId?: string): void {
+  if (!ds.streamCardDisplayTarget) return;
+  if (messageId !== undefined && ds.streamCardDisplayTarget.messageId !== messageId) return;
+  ds.streamCardDisplayTarget = undefined;
+}
+
+/** The current card's target. A real card with no recorded publication (one
+ * restored by a path that does not publish here) follows live. A recorded
+ * target stays in force while the runtime card id is temporarily absent
+ * (its publication proof may still restore that exact card) AND during a
+ * publication window (POST sentinel, e.g. a manual re-send of a card still
+ * waiting for its turn): the successor is bound only when the POST commits,
+ * and a frame cached meanwhile would otherwise be painted onto it by the next
+ * screen render. Losing or replacing the reference never relaxes a
+ * waiting-exact-turn constraint. Withdrawn, expired, replaced, transferred and
+ * closed targets are cleared by their own paths. */
+export function currentStreamCardDisplayTarget(
+  ds: DaemonSession,
+): NonNullable<DaemonSession['streamCardDisplayTarget']> | undefined {
+  const target = ds.streamCardDisplayTarget;
+  if (!isRealStreamingCardId(ds.streamCardId)) return target;
+  if (target?.messageId === ds.streamCardId) return target;
+  return { messageId: ds.streamCardId, publication: 0, mode: 'follow-live' };
+}
+
+/** May a cached image with this source be rendered for the current target? A
+ * waiting-exact-turn(T) target accepts only a frame positively from T — never
+ * a predecessor's frame and never a source-less cache. */
+function cachedImageAllowedByDisplayTarget(ds: DaemonSession, source: CaptureTuple | undefined): boolean {
+  const target = currentStreamCardDisplayTarget(ds);
+  if (target?.mode !== 'waiting-exact-turn') return true;
+  return source?.turnId !== undefined && source.turnId === target.turnId;
+}
+
+export type ScreenshotFrameVerdict =
+  | { ok: true; source: CaptureTuple }
+  | { ok: false; reason:
+      | 'invalid-revision' | 'unknown-revision' | 'superseded-revision' | 'tuple-mismatch'
+      | 'protocol-downgrade' | 'superseded-attempt' | 'source-suppressed' | 'target-waiting' };
+
+/** Producer (source) and display-target verdict for one worker frame. Both
+ * must pass before the frame may enter the cache or be PATCHed.
+ *  - New protocol (captureRevision present): must equal the observed revision
+ *    of this generation AND carry exactly its tuple.
+ *  - Once a generation announced capture_identity, frames without a revision
+ *    are rejected (no downgrade). Pre-protocol workers keep a conservative
+ *    legacy path: missing fields are judged against complete known tuples.
+ *  - A waiting-exact-turn(T) target needs a positive T match. */
+export function evaluateScreenshotFrame(
+  ds: DaemonSession,
+  workerGeneration: number,
+  msg: { turnId?: string; dispatchAttempt?: number; captureRevision?: number },
+): ScreenshotFrameVerdict {
+  const identity = currentCaptureIdentity(ds, workerGeneration);
+  let source: CaptureTuple;
+  let tuples: CaptureTuple[];
+  if (msg.captureRevision !== undefined) {
+    if (!Number.isSafeInteger(msg.captureRevision) || msg.captureRevision < 0) return { ok: false, reason: 'invalid-revision' };
+    if (!identity || msg.captureRevision > identity.revision) return { ok: false, reason: 'unknown-revision' };
+    if (msg.captureRevision < identity.revision) return { ok: false, reason: 'superseded-revision' };
+    if (msg.turnId !== identity.turnId || msg.dispatchAttempt !== identity.dispatchAttempt) {
+      return { ok: false, reason: 'tuple-mismatch' };
+    }
+    source = {
+      ...(identity.turnId !== undefined ? { turnId: identity.turnId } : {}),
+      ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    };
+    tuples = knownCaptureSourceTuples(ds, source);
+  } else {
+    if (identity) return { ok: false, reason: 'protocol-downgrade' };
+    source = {
+      ...(msg.turnId !== undefined ? { turnId: msg.turnId } : {}),
+      ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
+    };
+    tuples = knownCaptureSourceTuples(ds, msg.turnId !== undefined ? source : undefined);
+    // Untagged legacy frame: the known current task is a candidate source.
+    if (msg.turnId === undefined && ds.currentTurnId) tuples.push({ turnId: ds.currentTurnId });
+  }
+  if (source.turnId !== undefined && source.dispatchAttempt !== undefined) {
+    const origin = ds.managedTurnOrigin;
+    if (origin?.turnId === source.turnId && origin.dispatchAttempt !== undefined
+      && source.dispatchAttempt < origin.dispatchAttempt) return { ok: false, reason: 'superseded-attempt' };
+    const highWater = ds.turnDispatchAttemptHighWater;
+    if (highWater?.turnId === source.turnId && source.dispatchAttempt < highWater.dispatchAttempt) {
+      return { ok: false, reason: 'superseded-attempt' };
+    }
+    const cached = ds.currentImageSource?.imageKey === ds.currentImageKey ? ds.currentImageSource : undefined;
+    if (cached?.turnId === source.turnId && cached.dispatchAttempt !== undefined
+      && source.dispatchAttempt < cached.dispatchAttempt) return { ok: false, reason: 'superseded-attempt' };
+  }
+  if (anyCaptureSourceSuppressed(ds, tuples)) return { ok: false, reason: 'source-suppressed' };
+  const target = currentStreamCardDisplayTarget(ds);
+  if (target?.mode === 'waiting-exact-turn' && source.turnId !== target.turnId) {
+    return { ok: false, reason: 'target-waiting' };
+  }
+  return { ok: true, source };
+}
+
+/** Raise the per-turn dispatch-attempt high-water mark (never lowers it for
+ * the same turn; a different turn replaces it). Authority-free bookkeeping. */
+export function noteTurnDispatchAttempt(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+): void {
+  if (!turnId || dispatchAttempt === undefined) return;
+  const current = ds.turnDispatchAttemptHighWater;
+  if (current?.turnId === turnId && current.dispatchAttempt >= dispatchAttempt) return;
+  ds.turnDispatchAttemptHighWater = { turnId, dispatchAttempt };
+}
+
+/** A frame that passed the current worker's source + target + suppression
+ * checks and was written to the visible cache proves the terminal now shows
+ * that (non-empty) source's pixels: it replaces the retained suppressed-source
+ * evidence. Called ONLY after acceptance, so a merely tagged old frame, a
+ * source-less legacy frame, or a rejected frame never releases it. */
+export function releaseRetainedCaptureSourceByAcceptedFrame(ds: DaemonSession, source: CaptureTuple): void {
+  if (source.turnId === undefined) return;
+  ds.retainedCaptureSource = { ...source };
+  const identity = currentCaptureIdentity(ds);
+  if (identity) identity.lastSource = ds.retainedCaptureSource;
+}
+
+/** Is any known source of the current worker's pixels suppressed? */
+function currentCaptureSourcesSuppressed(ds: DaemonSession): boolean {
+  if (screenshotSourceSuppressed(ds, ds.currentTurnId)) return true;
+  return anyCaptureSourceSuppressed(ds, knownCaptureSourceTuples(ds, undefined));
+}
+
+/** Cached image key that is safe to render on a card, or undefined. With
+ * provenance, the capturing turn/attempt must not be suppressed. Without
+ * provenance (legacy/disk-restored cache) the frame is only shown while no
+ * known current source is suppressed. */
+export function displayableStreamingCardImageKey(ds: DaemonSession): string | undefined {
+  const key = ds.currentImageKey;
+  if (!key) return undefined;
+  const source = ds.currentImageSource?.imageKey === key ? ds.currentImageSource : undefined;
+  if (source) {
+    if (screenshotSourceSuppressed(ds, source.turnId, source.dispatchAttempt)) return undefined;
+  }
+  if (currentCaptureSourcesSuppressed(ds)) return undefined;
+  // Target compatibility (not only source): rendering from cache obeys the
+  // same waiting-exact-turn constraint as writing a frame into the cache.
+  if (!cachedImageAllowedByDisplayTarget(ds, source)) return undefined;
+  return key;
+}
+
+/** Can the running worker be expected to deliver a fresh frame onto the
+ * current card? Requires a live, connected, initialized worker, a real current
+ * card id, Lark transport, and no suppressed known source. Used only to choose
+ * between "waiting for screenshot" and an explicit unavailable state. */
+export function canExpectFreshStreamingScreenshot(ds: DaemonSession): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed) return false;
+  // A disconnected IPC channel or an exited process can never deliver a frame.
+  if (worker.connected === false) return false;
+  if (worker.exitCode != null || worker.signalCode != null) return false;
+  if (!workerHasInitialized(ds)) return false;
+  if (!isRealStreamingCardId(ds.streamCardId)) return false;
+  if (!retainsLarkStreamingCardTransport(ds)) return false;
+  return !currentCaptureSourcesSuppressed(ds);
+}
+
+export type StreamingCardRestoreClaim = {
+  /** Message id of the clicked card (Lark callback context). */
+  messageId: string;
+  /** card_nonce carried by the clicked card's button value. */
+  clickedNonce: string | undefined;
+  /** session_id carried by the clicked card's button value. */
+  actionSessionId: string | undefined;
+  /** root_id carried by the clicked card's button value. */
+  actionRootId: string | undefined;
+};
+
+/** Is the clicked message provably the card this daemon last published for
+ * the current turn generation and route? Pure predicate; see
+ * {@link restoreStreamingCardIdentityFromProof}. */
+export function canRestoreStreamingCardIdentity(
+  ds: DaemonSession,
+  claim: StreamingCardRestoreClaim,
+): boolean {
+  const proof = ds.lastPublishedStreamingCardIdentity;
+  const { messageId, clickedNonce, actionSessionId, actionRootId } = claim;
+  const samePublication = Boolean(proof
+    && clickedNonce
+    && messageId === proof.messageId && clickedNonce === proof.nonce
+    && clickedNonce === ds.streamCardNonce
+    && actionSessionId === proof.sessionId && actionSessionId === ds.session.sessionId
+    && actionRootId === proof.anchorId && actionRootId === sessionAnchorId(ds)
+    && proof.larkAppId === ds.larkAppId
+    && proof.runtimeKey === activeSessionKey(ds)
+    && proof.turnGeneration === (ds.streamCardTurnGeneration ?? 0));
+  if (!samePublication || ds.streamCardId != null || ds.cardPatchInFlight
+    || ds.streamCardPending || ds.streamCardPendingTurnId
+    || ds.parkedStreamCardNonce || ds.suppressRecoveryCard) return false;
+  // Lifecycle / ownership: active, not transferring, not retiring, real Lark
+  // transport, and still the registry owner of its runtime slot.
+  if (ds.session.status !== 'active' || isSessionTransferring(ds)) return false;
+  if (remoteRetirementAdmissionPhase(ds) !== null || !retainsLarkStreamingCardTransport(ds)) return false;
+  if (!ownsActiveStreamingCardRegistrySlot(ds)) return false;
+  // Never re-enable a card the bot/turn policy keeps off, nor re-bind during
+  // a silent/managed/substitute turn (streamingCardDisabled alone misses
+  // those, and streamingCardForced bypasses substitute).
+  if (streamingCardDisabled(ds, ds.currentTurnId)) return false;
+  if (currentCaptureSourcesSuppressed(ds)) return false;
+  return true;
+}
+
+/** Re-bind `claim.messageId` as the current streaming card only when the
+ * independent publication proof matches exactly. Returns whether it did. */
+export function restoreStreamingCardIdentityFromProof(
+  ds: DaemonSession,
+  claim: StreamingCardRestoreClaim,
+): boolean {
+  if (!canRestoreStreamingCardIdentity(ds, claim)) return false;
+  ds.streamCardId = claim.messageId;
+  persistStreamCardState(ds);
+  return true;
+}
+
 function pinStreamingCardEnabled(ds: DaemonSession): boolean {
   return pinStreamingCardEnabledFor(ds.larkAppId, ds.chatId);
 }
@@ -4160,6 +4593,9 @@ async function postTurnStartingStatusCard(
     ds.streamCardId = messageId;
     ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
     ds.parkedStreamCardNonce = undefined;
+    rememberPublishedStreamingCardIdentity(ds, messageId, generation);
+    // New-turn card: wait for this exact turn's capture identity.
+    bindStreamCardDisplayTarget(ds, messageId, turnId);
     const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
     if (!superseded) {
       ds.streamCardPending = false;
@@ -4225,6 +4661,7 @@ export async function postFreshStreamingCard(
   const title = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
   const status = ds.lastScreenStatus ?? 'idle';
 
+  const displayTargetAtPost = ds.streamCardDisplayTarget;
   // Park the current card (no-op when there's none) so the fresh one replaces
   // rather than duplicates it.
   parkStreamCard(ds);
@@ -4318,6 +4755,10 @@ export async function postFreshStreamingCard(
       ds.session.handoffLiveCard = { ...handoff, manualCard: { messageId, nonce: postingNonce } };
     }
     ds.parkedStreamCardNonce = undefined;
+    rememberPublishedStreamingCardIdentity(ds, messageId);
+    // Manual re-send of the current screen: follows live, unless the card it
+    // replaces was still waiting for its new turn (re-evaluated, not inherited).
+    bindStreamCardDisplayTarget(ds, messageId, waitingTurnToCarryForResend(ds, displayTargetAtPost));
     const predecessorIds = snapshotStreamingCardPredecessorIds(ds, messageId);
     persistStreamCardState(ds);
     const recalledIds = recallFrozenCards(ds);
@@ -4793,6 +5234,7 @@ function flushCardPatch(ds: DaemonSession): void {
   ds.pendingCardId = undefined;
   ds.pendingCardUserInitiated = undefined;
   ds.cardPatchInFlight = true;
+  ds.cardPatchInFlightMessageId = cardId;
   let patchSucceeded = false;
   updateMessage(appId, cardId, json, { beforeWrite: () => {
     if (!writeFence?.()) throw new Error('Streaming-card PATCH no longer owns its original card');
@@ -4803,6 +5245,10 @@ function flushCardPatch(ds: DaemonSession): void {
     .catch(err => {
       if (err instanceof MessageWithdrawnError || err instanceof MessageUpdateExpiredError) {
         const reason = err instanceof MessageUpdateExpiredError ? 'expired' : 'withdrawn';
+        // The message can no longer be updated; it must never be restored as
+        // the current card from the publication proof.
+        forgetPublishedStreamingCardIdentity(ds, cardId);
+        forgetStreamCardDisplayTarget(ds, cardId);
         // Only clear streamCardId when the withdrawn message is still the
         // active one. With auto-recall a new turn may have advanced
         // ds.streamCardId past `cardId` while this PATCH was in flight (the
@@ -4840,6 +5286,7 @@ function flushCardPatch(ds: DaemonSession): void {
     })
     .finally(() => {
       ds.cardPatchInFlight = false;
+      ds.cardPatchInFlightMessageId = undefined;
       // A re-render can queue the exact same state while this PATCH is in
       // flight. Drop only that adjacent duplicate after confirmed delivery.
       // Failed PATCHes deliberately retain the queued item so it retries, and
@@ -7964,7 +8411,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; cardVisibility?: 'private' | 'public' },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public' },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -8099,6 +8546,7 @@ export async function closeSession(
       // earlier — one layer up.
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
+        ...(opts?.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
         ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
         // Park a LOCAL residual so an idempotent re-close still reports it — the
         // journal (its runtime home) is wiped by this same transaction.
@@ -8166,6 +8614,7 @@ export async function closeSession(
       // SUCCESSFUL save, and skipped when the two are the same object anyway, so
       // the runtime view cannot end up carrying a park the disk does not have.
       if (after && after !== ds.session) {
+        ds.session.workspaceRetirement = after.workspaceRetirement;
         ds.session.mojoCloseJournal = after.mojoCloseJournal;
         if (clearMojoLineage || prepared.parkMojoLineage) {
           ds.session.riffParentTaskId = after.riffParentTaskId;
@@ -8207,6 +8656,8 @@ export async function closeSession(
     ds.session.crossPrincipalInterruptions = undefined;
     clearTimeout(ds.crossPrincipalWaitTimer);
     ds.crossPrincipalWaitTimer = undefined;
+    forgetPublishedStreamingCardIdentity(ds);
+    forgetStreamCardDisplayTarget(ds);
     killedLive = true;
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
@@ -8617,13 +9068,14 @@ function removeInactiveRegistration(
   key: string,
   ds: DaemonSession,
 ): boolean {
-  if (ds.session.status === 'active') return false;
+  if (ds.session.status === 'active' && !ds.session.workspaceRetirement) return false;
   // Only remove our exact stale object. A newer session may already own the
   // same routing key and must never be evicted by this continuation.
   if (map.get(key) === ds) map.delete(key);
   logger.warn(
-    `[${tag(ds)}] Refusing to register an inactive session ` +
-    `(status=${ds.session.status})`,
+    ds.session.workspaceRetirement
+      ? `[${tag(ds)}] Refusing to register a workspace-retired session (status=${ds.session.status}, operationId=${ds.session.workspaceRetirement.operationId})`
+      : `[${tag(ds)}] Refusing to register an inactive session (status=${ds.session.status})`,
   );
   return true;
 }
@@ -8735,12 +9187,7 @@ export async function setActiveSessionSafe(
     // to a non-active status while an async creator/restore awaited Lark/project
     // metadata. Never publish that now-inactive row back into the live map; drop
     // only our exact stale object so a newer owner of the same key is untouched.
-    if (ds.session.status !== 'active') {
-      if (map.get(key) === ds) map.delete(key);
-      logger.warn(
-        `[setActiveSessionSafe] refusing to register inactive session `
-        + `${ds.session.sessionId.substring(0, 8)} (status=${ds.session.status})`,
-      );
+    if (removeInactiveRegistration(map, key, ds)) {
       return {
         accepted: false,
         reason: 'inactive_incoming',
@@ -8902,12 +9349,7 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
-// IPC transport and worker acknowledgement are separate stages. A transport
-// timeout may retry because the parent never confirmed enqueue; an ACK timeout
-// is only a delayed/ambiguous state because the child may still execute later.
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
-const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
-const ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS = 90_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -8920,7 +9362,6 @@ type OrdinaryImDelivery = {
   attempt: number;
   received: boolean;
   transportConfirmed: boolean;
-  delayNotified: boolean;
   /** At most one daemon ownership handoff may run for a logical delivery.
    * Duplicate worker reject events join this promise instead of creating a
    * second durable record. */
@@ -8932,6 +9373,15 @@ type OrdinaryImDelivery = {
  * daemon event has already been claimed by Lark dedup at this point, so losing
  * this in-memory delivery without retry would permanently drop the message. */
 const pendingOrdinaryImDeliveries = new Map<string, OrdinaryImDelivery>();
+
+/** A cached idle screen does not prove that a just-admitted message has been
+ * committed by the worker. Automatic workspace recycling must preserve it. */
+export function hasPendingOrdinaryImDelivery(ds: DaemonSession): boolean {
+  for (const delivery of pendingOrdinaryImDeliveries.values()) {
+    if (delivery.ds === ds) return true;
+  }
+  return false;
+}
 
 function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGeneration: number): string {
   return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;
@@ -8950,11 +9400,21 @@ function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
   record.timer = undefined;
 }
 
+/** Terminal user-facing notices for an ordinary-IM delivery that never landed.
+ * `input_delivery_failed` states an UNKNOWN outcome ("could not confirm ...
+ * do not resend"), which is only honest when the daemon really cannot tell.
+ * A `rejectedBeforeAdmission` rejection is the opposite: the worker reports
+ * with certainty that the turn never entered the queue, so it gets its own
+ * key instead of being described as ambiguous. */
+type OrdinaryImFailureMessageKey =
+  | 'worker.input_delivery_failed'
+  | 'worker.input_retired_unconfirmed'
+  | 'worker.input_rejected_before_admission';
+
 function failOrdinaryImDelivery(
   record: OrdinaryImDelivery,
   reason: string,
-  messageKey: 'worker.input_delivery_failed' | 'worker.input_retired_unconfirmed'
-    = 'worker.input_delivery_failed',
+  messageKey: OrdinaryImFailureMessageKey = 'worker.input_delivery_failed',
 ): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   clearOrdinaryImDelivery(record);
@@ -8982,7 +9442,7 @@ function failOrdinaryImDelivery(
   const loc = botLocale(getBot(record.ds.larkAppId).config);
   void requireCallbacks().sessionReply(
     sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
+    tr(messageKey, { turnId: record.turnId.substring(0, 16), reason }, loc),
     'text',
     record.ds.larkAppId,
     record.turnId,
@@ -8992,52 +9452,11 @@ function failOrdinaryImDelivery(
   ));
 }
 
-function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
-  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
-  // A delayed notice is only an intermediate status. Keep the delivery record
-  // so a later explicit rejection or worker exit can still produce the real
-  // terminal outcome instead of silently dropping the turn after telling the
-  // user not to resend it.
-  clearOrdinaryImDeliveryTimer(record);
-  if (record.delayNotified) return;
-  record.delayNotified = true;
-  logger.warn(
-    `[${tag(record.ds)}] Ordinary IM input is still waiting for the worker after IPC enqueue `
-    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
-    + `attempt=${record.attempt}`,
-  );
-  if (
-    record.turnId.startsWith('bmx-recovery-')
-    || isMeetingDrivenTurn(record.ds, record.turnId)
-    || isSilentScheduledTurn(record.ds, record.turnId)
-  ) return;
-  const loc = botLocale(getBot(record.ds.larkAppId).config);
-  const messageKey = record.received
-    ? 'worker.input_commit_delayed'
-    : 'worker.input_delivery_delayed';
-  if (replyCardModeFor(record.ds, record.turnId) !== 'legacy') {
-    // The turn card already represents queued/working state. A slow worker
-    // receipt must not create a second message (or expose progress in final-only).
-    void updateTurnReplyCard(record.ds, record.turnId, { kind: 'refresh' },
-      (body, type, uuid, beforeWrite) => requireCallbacks().sessionReply(
-        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid, beforeWrite },
-      )).catch(err => logger.warn(`[${tag(record.ds)}] reply-card delivery wait: ${err.message}`));
-    return;
-  }
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
-    'text',
-    record.ds.larkAppId,
-    record.turnId,
-  ).catch(err => logger.error(
-    `[${tag(record.ds)}] Failed to report delayed ordinary IM worker delivery: `
-    + `${err instanceof Error ? err.message : String(err)}`,
-  ));
-}
-
-function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
-  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+function retryOrFailOrdinaryImDelivery(
+  record: OrdinaryImDelivery,
+  reason: string,
+  failureMessageKey?: OrdinaryImFailureMessageKey,
+): void {  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   if (
     record.attempt < ORDINARY_IM_MAX_ATTEMPTS
     && record.ds.worker === record.worker
@@ -9053,7 +9472,7 @@ function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: strin
     sendOrdinaryImDeliveryAttempt(record);
     return;
   }
-  failOrdinaryImDelivery(record, reason);
+  failOrdinaryImDelivery(record, reason, failureMessageKey);
 }
 
 function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
@@ -9096,10 +9515,6 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
         `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
         + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} attempt=${attempt}`,
       );
-      record.timer = setTimeout(() => {
-        delayOrdinaryImDelivery(record);
-      }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
-      record.timer.unref?.();
     });
   } catch (err) {
     queueMicrotask(() => retryOrFailOrdinaryImDelivery(
@@ -9173,7 +9588,6 @@ function sendOrdinaryImDeliveryTracked(
     attempt: 0,
     received: false,
     transportConfirmed: false,
-    delayNotified: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
   onIpcDispatchAttempted?.();
@@ -9211,19 +9625,6 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
-    // Cold start (worker not ready yet) must await web server bind, plugin prep,
-    // and spawnCli before any turn can commit. Native Codex also commits after
-    // history confirms submission rather than on enqueue. Keep the short
-    // settlement budget for steady-state IPC enqueue, not for multi-second process startup.
-    const isColdStart = ds.workerReady !== true;
-    const isNativeCodex = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput;
-    const commitWaitMs = (isColdStart || isNativeCodex)
-      ? ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS
-      : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
-    record.timer = setTimeout(() => {
-      delayOrdinaryImDelivery(record);
-    }, commitWaitMs);
-    record.timer.unref?.();
   }
   logger.info(
     `[${tag(ds)}] Ordinary IM input received by worker `
@@ -9305,7 +9706,16 @@ async function rejectOrdinaryImDelivery(
       if (record.rejectionHandoff === handoff) record.rejectionHandoff = undefined;
     }
   }
-  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${rejection.reason}`);
+  // A pre-admission rejection is a KNOWN outcome: the worker refused the turn
+  // before it entered the queue, so nothing ran and nothing has side effects.
+  // Reporting it as "could not confirm ... do not resend" would strand a
+  // message the user is free (and expected) to send again once the turn that
+  // owns the session finishes.
+  retryOrFailOrdinaryImDelivery(
+    record,
+    `worker_rejected:${rejection.reason}`,
+    rejection.rejectedBeforeAdmission ? 'worker.input_rejected_before_admission' : undefined,
+  );
 }
 
 function settleOrdinaryImDeliveriesForWorker(
@@ -10016,6 +10426,8 @@ export async function transferSession(
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
   ds.currentImageKey = undefined;
+  forgetPublishedStreamingCardIdentity(ds);
+  forgetStreamCardDisplayTarget(ds);
   rehomeReplyTargetState(ds);
 
   sessionStore.updateSession(ds.session);
@@ -13377,7 +13789,10 @@ function setupWorkerHandlers(
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
-  // let stale per-turn authority escape its generation.
+  // let stale per-turn authority escape its generation. The attempt number it
+  // carried is kept (authority-free) so an older attempt's frames stay
+  // recognisable as superseded.
+  noteTurnDispatchAttempt(ds, ds.managedTurnOrigin?.turnId, ds.managedTurnOrigin?.dispatchAttempt);
   ds.managedTurnOrigin = undefined;
   // Source authorization belongs to one worker lifetime. A replacement worker
   // must announce its own Hermes sources before any stamped final_output is
@@ -13607,6 +14022,18 @@ function setupWorkerHandlers(
       case 'active_turn_envelope_changed':
         inheritActiveTurnFinalSuppression(ds, msg.previousTurnId, msg.turnId);
         break;
+      case 'capture_identity': {
+        // Committed synchronously (no await before this point) so no later
+        // frame of this worker can be judged against an older identity.
+        if (ds.workerGeneration !== workerGeneration) break;
+        if (!commitCaptureIdentity(ds, workerGeneration, msg)) {
+          logger.debug(
+            `[${t}] Rejected capture_identity rev=${String(msg.revision)} `
+            + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
+          );
+        }
+        break;
+      }
       case 'terminal_turn_started': {
         if (sessionPromptInjection(ds) !== 'none' || ds.adoptedFrom || ds.session.adoptedFrom
           || ds.session.vcMeetingReceiver || !ds.chatId.startsWith('oc_')
@@ -14036,6 +14463,11 @@ function setupWorkerHandlers(
             } });
             if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             ds.parkedStreamCardNonce = undefined;
+            // Verified: the persisted exact current card id/nonce accepted
+            // this PATCH, so it is the publication proof for this route.
+            rememberPublishedStreamingCardIdentity(ds, restoredCardId);
+            // Restored existing card: follows live (never bound to a past turn).
+            bindStreamCardDisplayTarget(ds, restoredCardId);
             // Worker IPC handlers may run while the direct restore PATCH is in
             // flight. Re-queue readiness after it completes so an older
             // not-ready payload can never overwrite the cli_session_id PATCH.
@@ -14061,6 +14493,8 @@ function setupWorkerHandlers(
             if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             // PATCH failed (withdrawn, expired, etc.) — fall through to POST a fresh card.
             logger.info(`[${t}] Failed to reuse existing streaming card (${err instanceof Error ? err.message : err}), posting new one`);
+            forgetPublishedStreamingCardIdentity(ds, restoredCardId);
+            forgetStreamCardDisplayTarget(ds, restoredCardId);
             ds.streamCardId = undefined;
             persistStreamCardState(ds);
           }
@@ -14075,6 +14509,7 @@ function setupWorkerHandlers(
         // POST a second card; the in-flight POST becomes this turn's card.
         if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
         const pendingNewTurn = !!ds.streamCardPending;
+        const pendingTurnIdAtPost = pendingNewTurn ? ds.streamCardPendingTurnId : undefined;
         const postingGeneration = ds.streamCardTurnGeneration ?? 0;
         const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
         const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
@@ -14166,6 +14601,8 @@ function setupWorkerHandlers(
           }
           ds.streamCardId = postedCardId;
           ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
+          rememberPublishedStreamingCardIdentity(ds, postedCardId, postingGeneration);
+          bindStreamCardDisplayTarget(ds, postedCardId, pendingTurnIdAtPost);
           // This card IS the current turn's live card — clear the new-turn flag
           // so subsequent screen_updates PATCH it (starting → working) instead of
           // POSTing a second card. Without this, a re-fork that happens while
@@ -14799,6 +15236,7 @@ function setupWorkerHandlers(
           // New turn — create a fresh card, old card freezes at its last state.
           // Generate new nonce so old card buttons are distinguishable.
           const isNewTurn = !!ds.streamCardPending;
+          const newTurnIdAtPost = isNewTurn ? ds.streamCardPendingTurnId : undefined;
           const postingGeneration = ds.streamCardTurnGeneration ?? 0;
           ds.streamCardNonce = randomBytes(4).toString('hex');
           // New turn → image_key from previous turn no longer valid
@@ -14878,6 +15316,8 @@ function setupWorkerHandlers(
               }
               ds.streamCardId = msgId;
               ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
+              rememberPublishedStreamingCardIdentity(ds, msgId, postingGeneration);
+              bindStreamCardDisplayTarget(ds, msgId, newTurnIdAtPost);
               const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
               if (!superseded) ds.streamCardPendingTurnId = undefined;
               ds.parkedStreamCardNonce = undefined;
@@ -14968,6 +15408,19 @@ function setupWorkerHandlers(
         // Drop uploads that arrived during a new-turn handoff — the image_key may
         // reflect previous turn's content. Next 10s cycle picks up fresh content.
         if (ds.streamCardPending) break;
+        // Source + target fence. The worker binds capture revision/tuple at
+        // capture start and drops frames that outlive them; here the frame must
+        // also match this generation's observed capture identity exactly, its
+        // known sources must not be suppressed, and the current card's display
+        // target must accept it (a new-turn card waits for its exact turn).
+        const frameVerdict = evaluateScreenshotFrame(ds, workerGeneration, msg);
+        if (!frameVerdict.ok) {
+          logger.debug(
+            `[${t}] Dropped screenshot (${frameVerdict.reason}) turn=${msg.turnId?.substring(0, 12) ?? '-'} `
+            + `attempt=${msg.dispatchAttempt ?? '-'} rev=${msg.captureRevision ?? '-'}`,
+          );
+          break;
+        }
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
@@ -15003,7 +15456,18 @@ function setupWorkerHandlers(
         // uploading during a suppressed managed/silent turn — letting that
         // frame into ds.currentImageKey would paste it onto the next visible
         // card render (the same leak class the comment above names).
+        // A chat-scope substitute (分身) turn's frames must not reach the
+        // visible card cache either; streamingCardForced does not lift this.
+        if (isSubstituteTurn(ds, msg.turnId)) {
+          persistStreamCardState(ds);
+          break;
+        }
+        noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.currentImageKey = msg.imageKey;
+        ds.currentImageSource = { imageKey: msg.imageKey, ...frameVerdict.source };
+        // Accepted for display ⇒ consistent on re-expand: a verified public
+        // source releases the retained suppressed-source evidence.
+        releaseRetainedCaptureSourceByAcceptedFrame(ds, frameVerdict.source);
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
@@ -15033,7 +15497,7 @@ function setupWorkerHandlers(
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
-        scheduleCardPatch(ds, cardJson);
+        scheduleCardPatch(ds, cardJson, msg.turnId);
         break;
       }
 
@@ -16594,6 +17058,7 @@ function setupWorkerHandlers(
           ? currentGatewayCallerOpenId(ds, msg.turnId)
           : undefined;
         const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
+        noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.managedTurnOrigin = {
           capability: msg.capability,
           ...(msg.policyCapability ? { policyCapability: msg.policyCapability } : {}),

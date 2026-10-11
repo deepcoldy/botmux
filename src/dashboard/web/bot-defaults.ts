@@ -457,6 +457,22 @@ export async function resolveSubstituteTarget(
   }
 }
 
+/** Machine-wide reply-card footer brand switch from GET /api/settings.
+ *  Fail-OPEN: any fetch/shape error returns true (per-bot editing stays usable)
+ *  rather than wrongly greying the field — the server is the enforcement point
+ *  anyway, this flag only drives the disabled UI state. */
+export async function fetchCardBrandLabelEnabled(): Promise<boolean> {
+  try {
+    const r = await fetch('/api/settings');
+    if (!r.ok) return true;
+    const body = await r.json().catch(() => ({}));
+    // Present even for tokenless public-readOnly visitors (not redacted).
+    return body?.settings?.cardBrandLabel !== false;
+  } catch {
+    return true;
+  }
+}
+
 export async function fetchCliOptions(): Promise<CliOptionsState> {
   try {
     // `?probe=none` 显式跳过开放平台登录态探测（一趟 1-4s 的实时飞书往返）。

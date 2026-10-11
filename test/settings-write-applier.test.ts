@@ -25,6 +25,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     enableLocalCliOpen: false,
     localCliOpenMode: 'attach',
     chatBotDiscovery: true,
+    cardBrandLabel: true,
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
     autoUpgradeCodexSessions: true,
@@ -171,6 +172,13 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ chatBotDiscovery: false }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
+  });
+
+  it.each([false, true])('writes cardBrandLabel=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ cardBrandLabel: enabled });
   });
 
   it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
@@ -527,6 +535,15 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_chatBotDiscovery');
+  });
+
+  it('rejects non-boolean cardBrandLabel → invalid_cardBrandLabel (no merge)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: 'off' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_cardBrandLabel');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('rejects non-boolean noVisibleOutputHint → invalid_noVisibleOutputHint', async () => {

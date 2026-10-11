@@ -86,4 +86,13 @@ describe('botmux send: 事后开的话题不再被 quote 带进去（接线）',
   it('探测走 catch 兜底 ⇒ 飞书报错不阻断发送(失败方向=保持既有 quote)', () => {
     expect(cliSource).toMatch(/const probedThreadId = await getMessageThreadId\([^)]*\)\.catch/);
   });
+
+  it('普通群聊顶层轮次优先解析本轮绑定的 quote 目标，同时防范跨轮污染', () => {
+    expect(cliSource).toMatch(
+      /const turnBoundQuoteTarget = turnReplyTarget\?\.rootMessageId\s*\?\?\s*s\.turnReplyContexts\?\.\[currentTurnId \?\? ''\]\?\.quoteTargetId\s*\?\?\s*\(turnReplyTarget\?\.turnId\?\.startsWith\('om_'\) \? turnReplyTarget\.turnId : undefined\)\s*\?\?\s*\(currentTurnId\?\.startsWith\('om_'\) \? currentTurnId : undefined\);/,
+    );
+    expect(cliSource).toMatch(
+      /sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin[\s\S]*?\?\? turnBoundQuoteTarget\s*\?\? \(currentTurnId \? undefined : s\.quoteTargetId\)/,
+    );
+  });
 });

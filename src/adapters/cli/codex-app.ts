@@ -153,7 +153,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
 
     supportsTypeAhead: true,
     completionPattern: undefined,
-    readyPattern: /›/,
+    readyPattern: /[›»]/,
     systemHints: [],
     injectsSessionContext: true,
     altScreen: false,

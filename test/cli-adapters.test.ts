@@ -101,7 +101,7 @@ describe('createCliAdapterSync factory', () => {
     if (isRemoteCliId(id) && id !== 'remote-runner') expect(adapter.resolvedBin).toBe('');
     // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
     // the node binary, not the pinned path.
-    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
+    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh' || id === 'minimax') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -327,6 +327,24 @@ describe('claude-code buildArgs', () => {
       expect(prompt).toContain('JSON-escaped text as a positional argument');
       expect(prompt).toContain('literal `\\n` back into newlines');
       expect(prompt).toContain('--content-file');
+    }
+  });
+
+  it('points to the send guide in both locales and injection paths', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const prompts = [
+        buildBotmuxSystemPromptText({ locale }),
+        buildBotmuxShellHints(locale).join('\n'),
+      ];
+      for (const prompt of prompts) {
+        expect(prompt).toContain('botmux skill show botmux-send');
+      }
+      // No-transport and transcript delivery must keep their existing contract:
+      // these modes do not advertise explicit send commands in routing hints.
+      expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
     }
   });
 

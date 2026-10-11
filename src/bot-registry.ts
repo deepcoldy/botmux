@@ -1,4 +1,5 @@
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
+import { readGlobalConfig } from './global-config.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
@@ -2915,13 +2916,40 @@ function botsConfigDiskPath(): string | null {
 }
 
 /**
+ * Machine-wide switch for the reply-card footer brand signature
+ * (`~/.botmux/config.json` → `dashboard.cardBrandLabel`). Default ON; only an
+ * explicit stored `false` disables. Read live (readGlobalConfig has a 2s TTL)
+ * so a Dashboard Settings flip reaches the next card render without a restart.
+ *
+ * A sandboxed / one-shot child (`botmux send`) can't read config.json
+ * (deny-by-default → EPERM, readGlobalConfig then sees `{}` = enabled), so the
+ * worker bridges the resolved value as `BOTMUX_CARD_BRAND_ENABLED`; it's only
+ * honoured for THIS bot's own child process — the same own-appId gate used for
+ * `BOTMUX_BRAND_LABEL` — never on a value inherited from an unrelated process.
+ */
+export function isCardBrandLabelEnabled(larkAppId?: string): boolean {
+  if (larkAppId !== undefined
+    && process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && process.env.BOTMUX_CARD_BRAND_ENABLED === 'false') {
+    return false;
+  }
+  return readGlobalConfig().dashboard?.cardBrandLabel !== false;
+}
+
+/**
  * The configured brand label for a bot, or `undefined` when unset (`''` = off
  * is preserved). Prefers the in-memory registry (daemon hot path); falls back
  * to a mtime-cached read of bots.json so the CLI process — which never loads
  * the registry — still resolves the sending bot's brand. Callers feed the
  * result into {@link brandFooterSegment} for the unset→default / ''→off rule.
+ *
+ * The machine-wide {@link isCardBrandLabelEnabled} switch is applied HERE, the
+ * single choke point every card builder funnels through: when off it returns
+ * `''` for every bot — a custom label included — so callers suppress the brand
+ * rather than falling back to the default botmux link (`undefined`).
  */
 export function resolveBrandLabel(larkAppId: string): string | undefined {
+  if (!isCardBrandLabelEnabled(larkAppId)) return '';
   // A sandboxed one-shot `botmux send` can't read bots.json (deny-by-default),
   // so it has no in-memory registry and would fall through to a bots.json read
   // that EPERMs → role footer lost. The worker injects THIS bot's resolved
@@ -3101,6 +3129,14 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   const cliId = process.env.BOTMUX_CORE_CLI || 'codex-app';
   const entry: Record<string, unknown> = { larkAppId, apiOnly: true, cliId };
   if (process.env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = process.env.BOTMUX_CORE_WORKING_DIR;
+  // Core-only keeps tmux as the default. PTY is an explicit opt-in for embedded
+  // hosts that cannot establish a reliable tmux server; it is intentionally
+  // limited to this synthetic apiOnly Bot and never changes fleet defaults.
+  const coreBackend = process.env.BOTMUX_CORE_BACKEND;
+  if (coreBackend !== undefined && coreBackend !== 'tmux' && coreBackend !== 'pty') {
+    throw new Error(`Core-only BOTMUX_CORE_BACKEND must be tmux or pty, got: ${coreBackend}`);
+  }
+  if (coreBackend) entry.backendType = coreBackend;
   if (process.env.BOTMUX_CORE_MODEL) entry.model = process.env.BOTMUX_CORE_MODEL;
   if (process.env.BOTMUX_CORE_CODEX_AUTH_SYNC === 'isolated') entry.codexAuthSync = 'isolated';
   // Route through the normal parser so the synthesized entry gets identical
