@@ -140,6 +140,33 @@ describe('group-context card projection', () => {
     expect(conversation(simplified(message)).text).toBe('PUBLIC_PROGRESS');
   });
 
+  it('strips an inline purpose marker from a promoted heading in both API shapes', () => {
+    const raw = buildCanonicalFinalReplyCard({ markdown: '# 通知标题\n\n请查收附件' });
+    const assertCleanHeading = (content: string, atx: boolean) => {
+      const text = extractCardContent(content);
+      expect(text).toContain(atx ? '# 通知标题' : '通知标题');
+      expect(text).toContain('请查收附件');
+      expect(text).not.toContain('\u2063');
+    };
+
+    const runtime = markGroupContextCardPurpose(raw, 'runtime');
+    assertCleanHeading(runtime, true);
+    assertCleanHeading(simplified(runtime), false);
+    expect(projectGroupContextCard(runtime)).toEqual({ kind: 'runtime' });
+    expect(projectGroupContextCard(simplified(runtime))).toEqual({ kind: 'runtime' });
+
+    const message = markGroupContextCardPurpose(raw, 'message');
+    assertCleanHeading(message, true);
+    assertCleanHeading(simplified(message), false);
+    expect(conversation(message).turnReply).toBe(false);
+    expect(conversation(simplified(message)).turnReply).toBe(false);
+
+    const turnMessage = buildTurnReplyCard(record({ finalCard: raw }), presentation);
+    assertCleanHeading(turnMessage, true);
+    expect(conversation(turnMessage).turnReply).toBe(true);
+    expect(projectGroupContextCard(simplified(turnMessage))).toEqual({ kind: 'unresolved' });
+  });
+
   it('leaves ordinary author and third-party cards unclassified even when they contain status words', () => {
     for (const raw of [buildCanonicalFinalReplyCard({ markdown: 'Working; Completed; 正在处理' }),
       JSON.stringify({ title: 'Working', elements: [[{ tag: 'text', text: 'Completed' }]] }), '{']) {

@@ -257,6 +257,36 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
+  it('rejects isolated image magic, duplicate-name, and extra-field violations', () => {
+    const png = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x00,
+    ]).toString('base64');
+    const event = (operationId: string, images: unknown[]) => JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId,
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'bad image',
+      responseKind: 'auxiliary',
+      mention: 'none',
+      images,
+    });
+
+    expect(parseRemoteRunnerEventLine(event('outbound-magic-mismatch', [
+      { name: 'proof.jpg', mimeType: 'image/jpeg', dataBase64: png },
+    ]))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(event('outbound-duplicate-image-name', [
+      { name: 'proof.png', mimeType: 'image/png', dataBase64: png },
+      { name: 'proof.png', mimeType: 'image/png', dataBase64: png },
+    ]))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(event('outbound-image-extra-field', [
+      { name: 'proof.png', mimeType: 'image/png', dataBase64: png, size: 12 },
+    ]))).toBeUndefined();
+  });
+
   it('accepts only structured, read-only session tool requests', () => {
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,

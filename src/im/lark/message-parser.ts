@@ -1769,7 +1769,9 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   if (tag === 'markdown' && typeof el.element_id === 'string') {
     const idMatch = REPLY_CARD_HEADING_ELEMENT_ID_RE.exec(el.element_id);
     if (idMatch) {
-      const heading = (typeof elementText === 'string' ? elementText : nestedCardText(el))?.trim();
+      const heading = stripTrailingGroupContextCardPurposeMarker(
+        (typeof elementText === 'string' ? elementText : nestedCardText(el)) ?? '',
+      ).trim();
       if (heading) {
         parts.push(`${'#'.repeat(Number(idMatch[1]))} ${heading}`);
         return;
