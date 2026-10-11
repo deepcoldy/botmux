@@ -148,6 +148,10 @@ describe('remote runner protocol', () => {
   });
 
   it('accepts only bounded non-terminal outbound message intents', () => {
+    const png = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0x00, 0x00, 0x00, 0x00,
+    ]).toString('base64');
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
@@ -158,12 +162,14 @@ describe('remote runner protocol', () => {
       content: 'still working',
       responseKind: 'progress',
       mention: 'requester',
+      images: [{ name: 'proof.png', mimeType: 'image/png', dataBase64: png }],
     }))).toMatchObject({
       type: 'outbound_message',
       operationId: 'outbound-1',
       generation: 3,
       responseKind: 'progress',
       mention: 'requester',
+      images: [{ name: 'proof.png', mimeType: 'image/png', dataBase64: png }],
     });
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
@@ -186,6 +192,68 @@ describe('remote runner protocol', () => {
       content: 'x'.repeat(33 * 1024),
       responseKind: 'auxiliary',
       mention: 'none',
+    }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId: 'outbound-4',
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'bad image',
+      responseKind: 'auxiliary',
+      mention: 'none',
+      images: [{ name: 'proof.png', mimeType: 'image/jpeg', dataBase64: png }],
+    }))).toBeUndefined();
+    for (const image of [
+      { name: '截图.png', mimeType: 'image/png', dataBase64: png },
+      { name: 'proof.png', mimeType: 'image/png', dataBase64: `${png}\n` },
+      { name: 'proof.jpg', mimeType: 'image/png', dataBase64: png },
+    ]) {
+      expect(parseRemoteRunnerEventLine(JSON.stringify({
+        protocol: REMOTE_RUNNER_PROTOCOL,
+        version: REMOTE_RUNNER_PROTOCOL_VERSION,
+        type: 'outbound_message',
+        operationId: 'outbound-image-invalid',
+        turnId: 'turn-1',
+        generation: 3,
+        content: 'bad image',
+        responseKind: 'auxiliary',
+        mention: 'none',
+        images: [image],
+      }))).toBeUndefined();
+    }
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId: 'outbound-too-many-images',
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'too many images',
+      responseKind: 'auxiliary',
+      mention: 'none',
+      images: Array.from({ length: 5 }, (_, index) => ({
+        name: `proof-${index}.png`, mimeType: 'image/png', dataBase64: png,
+      })),
+    }))).toBeUndefined();
+    const oneMiBImage = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(1024 * 1024),
+    ]).toString('base64');
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId: 'outbound-images-too-large',
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'images exceed the aggregate limit',
+      responseKind: 'auxiliary',
+      mention: 'none',
+      images: [0, 1].map(index => ({
+        name: `large-${index}.png`, mimeType: 'image/png', dataBase64: oneMiBImage,
+      })),
     }))).toBeUndefined();
   });
 

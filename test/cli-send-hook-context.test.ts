@@ -767,10 +767,13 @@ describe('cmdSend hook context wiring', () => {
     const providerImport = cmdSend.indexOf("const { sendMessage, replyMessage");
     expect(guard).toBeGreaterThan(0);
     expect(guard).toBeLessThan(providerImport);
-    expect(cmdSend.slice(guard, providerImport)).toContain('trustedRelayCtx.sessionId !== sid');
-    expect(cmdSend.slice(guard, providerImport)).toContain("['progress', 'auxiliary']");
-    expect(cmdSend.slice(guard, providerImport)).toContain('sendTopLevel || overrideChatId || sendInto');
-    expect(cmdSend.slice(guard, providerImport)).toContain('mentionArgs.length > 0');
+    const remoteGuard = cmdSend.slice(guard, cmdSend.indexOf('// A proof is a point-in-time', guard));
+    expect(remoteGuard).toContain('trustedRelayCtx.sessionId !== sid');
+    expect(remoteGuard).toContain("['progress', 'auxiliary']");
+    expect(remoteGuard).toContain('sendTopLevel || overrideChatId || sendInto');
+    expect(remoteGuard).toContain('mentionArgs.length > 0');
+    expect(remoteGuard).not.toContain('images.length > 0');
+    expect(remoteGuard).toContain('files.length > 0');
     expect(cmdSend).toContain('...(remoteRunnerOutbound ? { terminalIndependent: true } : {})');
   });
 
@@ -808,7 +811,7 @@ describe('cmdSend hook context wiring', () => {
         BOTMUX_LARK_APP_SECRET: '',
       });
       expect(result.code).toBe(2);
-      expect(result.stderr).toContain('supports only current-session Markdown with one none/requester mention decision');
+      expect(result.stderr).toContain('supports only current-session Markdown/images with one none/requester mention decision');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
