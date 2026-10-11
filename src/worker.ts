@@ -11193,11 +11193,13 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
 
   aidenCodexUpdateLastActionAt = Date.now();
   let delivered = false;
+  const key = keys[0];
+  if (!key) return true;
   try {
     if (backend && 'sendSpecialKeys' in backend) {
-      delivered = (backend as any).sendSpecialKeys(...keys) !== false;
+      delivered = (backend as any).sendSpecialKeys(key) !== false;
     } else {
-      const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
+      const input = key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r';
       delivered = backend?.write(input) === true;
     }
   } catch (error) {
@@ -11208,7 +11210,7 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
     return true;
   }
   aidenCodexUpdateAttempts += 1;
-  log(`Codex startup update dialog detected behind Aiden, selecting the non-upgrade option (${keys.join('+')}, attempt ${aidenCodexUpdateAttempts}/${AIDEN_CODEX_UPDATE_MAX_ATTEMPTS})...`);
+  log(`Codex startup update dialog detected behind Aiden, sending ${key} and waiting for a fresh selection frame (attempt ${aidenCodexUpdateAttempts}/${AIDEN_CODEX_UPDATE_MAX_ATTEMPTS})...`);
   return true;
 }
 
@@ -20061,6 +20063,23 @@ async function spawnCli(
   let requestedAidenResumeRedraw = false;
   const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+    // Never let the timeout fallback paste the queued user turn into Codex's
+    // startup update picker. Keep the turn queued while the bounded recovery
+    // observes the current row, moves to Skip, and confirms it on a fresh frame.
+    if (inspectAidenCodexUpdateDialogOnScreen()) {
+      log(`First prompt timeout — ${cliName()} update dialog still active; keeping input queued`);
+      const remainingMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
+      if (remainingMs > 0) {
+        const waitMs = Math.min(FIRST_PROMPT_STARTUP_RECHECK_MS, remainingMs);
+        const nextElapsedMs = elapsedMs + waitMs;
+        const updateDialogTimer = setTimeout(
+          () => releaseFirstPromptTimeout(nextElapsedMs, nextElapsedMs >= FIRST_PROMPT_HARD_TIMEOUT_MS),
+          waitMs,
+        );
+        updateDialogTimer.unref?.();
+      }
+      return;
+    }
     // A timeout can recover missing prompt evidence, never contradict explicit
     // loading evidence. Keep the queue/startup flag; the loaded frame re-drives
     // normal idle detection and flushes it without replaying a pasted draft.

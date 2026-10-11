@@ -28,6 +28,10 @@ describe('CodexUpdateDialogGuard', () => {
     expect(guard.inspect(menu)).toBe('dismiss');
     expect(codexUpdateDialogSafeKeys(menu.replace('1. Update now', '› 1. Update now')))
       .toEqual(['Down', 'Enter']);
+    expect(codexUpdateDialogSafeKeys(
+      menu.replace('1. Update now', '› 1. Update now')
+        .replace('Press enter to continue', 'enter continue · esc skip'),
+    )).toEqual(['Down', 'Enter']);
   });
 
   it.each([
@@ -87,10 +91,27 @@ describe('Aiden Codex update dialog worker wiring', () => {
     const dismiss = workerSource.slice(start, end);
 
     expect(dismiss).toContain('codexUpdateDialogSafeKeys(data)');
+    expect(dismiss).toContain('const key = keys[0];');
+    expect(dismiss).toContain('sendSpecialKeys(key)');
+    expect(dismiss).not.toContain('sendSpecialKeys(...keys)');
     expect(dismiss).toContain('AIDEN_CODEX_UPDATE_RETRY_MS');
     expect(workerSource).toContain('const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;');
     expect(dismiss).toContain("source === 'screen'");
     expect(dismiss).toContain("type: 'user_notify'");
+  });
+
+  it('keeps the first user turn queued while the update picker is visible', () => {
+    const start = workerSource.indexOf('const releaseFirstPromptTimeout =');
+    const end = workerSource.indexOf(
+      'setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS',
+      start,
+    );
+    const timeout = workerSource.slice(start, end);
+
+    expect(timeout).toContain('inspectAidenCodexUpdateDialogOnScreen()');
+    expect(timeout).toContain('update dialog still active; keeping input queued');
+    expect(timeout.indexOf('inspectAidenCodexUpdateDialogOnScreen()'))
+      .toBeLessThan(timeout.indexOf('awaitingFirstPrompt = false'));
   });
 });
 
