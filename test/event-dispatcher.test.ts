@@ -198,6 +198,7 @@ import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { InputCaptureTerminalRejection } from '../src/core/plugins/input-capture/runtime.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { resolve } from 'node:path';
 
@@ -1154,6 +1155,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     });
     expect(handlers.captureHumanInput).toHaveBeenCalledOnce();
     expect(handlers.captureHumanInput).toHaveBeenCalledWith(data);
+    expect(hasTriggeredMessage(MY_APP_ID, 'om_primary_capture')).toBe(true);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     runtime.close();
@@ -1178,6 +1180,33 @@ describe('Lark event dispatcher — durable primary processor', () => {
 
     await expect(processPrimary(runtime, data, 'om_primary_capture_retry'))
       .rejects.toThrow('capture store unavailable');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('settles a deterministic input-capture rejection without routing the message', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => {
+      throw new InputCaptureTerminalRejection('input_capture_authority_changed');
+    });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture_rejected',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture_rejected')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary input capture rejected: input_capture_authority_changed',
+    });
+    expect(hasTriggeredMessage(MY_APP_ID, 'om_primary_capture_rejected')).toBe(true);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     runtime.close();

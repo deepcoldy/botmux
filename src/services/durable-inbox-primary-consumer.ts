@@ -47,6 +47,8 @@ export interface DurableInboxPrimaryConsumerOptions {
   leaseDurationMs?: number;
   renewalIntervalMs?: number;
   retryDelayMs?: number;
+  /** Stop retrying one permanently failing row before it can block the whole partition forever. */
+  maxAttempts?: number;
   concurrency?: number;
   batchSize?: number;
   shutdownMs?: number;
@@ -121,6 +123,7 @@ export function startDurableInboxPrimaryConsumer(
     leaseDurationMs - 1,
   );
   const retryDelayMs = boundedInteger(options.retryDelayMs ?? 5_000, 'retryDelayMs', 100, 3_600_000);
+  const maxAttempts = boundedInteger(options.maxAttempts ?? 16, 'maxAttempts', 1, 1_000);
   const concurrency = boundedInteger(options.concurrency ?? 4, 'concurrency', 1, 32);
   const batchSize = boundedInteger(options.batchSize ?? 32, 'batchSize', 1, 1_000);
   const shutdownMs = boundedInteger(options.shutdownMs ?? 5_000, 'shutdownMs', 0, 300_000);
@@ -203,6 +206,33 @@ export function startDurableInboxPrimaryConsumer(
       if (renewing) await renewing;
       if (ownershipLost || controller.signal.aborted) return;
       reportError(error);
+      if (claim.attempts >= maxAttempts) {
+        const completed = await options.store.completeInboxClaim(claim);
+        if (completed.kind === 'stale') {
+          reportError(new Error(`durable inbox primary retry limit lost claim ${claim.event.eventId}`));
+          return;
+        }
+        reportError(new Error(
+          `durable inbox primary retry limit reached for ${claim.event.eventId} after ${claim.attempts} attempts`,
+        ));
+        if (message) {
+          try {
+            options.onCommitted?.({
+              message,
+              result: {
+                kind: 'ignored',
+                reason: 'durable primary retry limit reached',
+              },
+            });
+          } catch (observerError) {
+            reportError(new Error(
+              `durable inbox primary commit observer failed for ${claim.event.eventId}: `
+              + `${observerError instanceof Error ? observerError.message : String(observerError)}`,
+            ));
+          }
+        }
+        return;
+      }
       const retried = await options.store.retryInboxClaim({
         claim,
         visibleAt: now() + retryDelayMs,

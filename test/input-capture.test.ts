@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInputCaptureStore } from '../src/core/plugins/input-capture/store.js';
-import { createInputCaptureRuntime, type InputCaptureOptions } from '../src/core/plugins/input-capture/runtime.js';
+import {
+  createInputCaptureRuntime,
+  InputCaptureTerminalRejection,
+  isInputCaptureTerminalRejection,
+  type InputCaptureOptions,
+} from '../src/core/plugins/input-capture/runtime.js';
 import { parseInputCaptureCommand } from '../src/cli/input-capture.js';
 import { parseInputCaptureConditions } from '../src/core/plugins/input-capture/conditions.js';
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -20,6 +25,22 @@ function fixture(overrides: Partial<InputCaptureOptions> = {}, registration: Rec
   const event = { messageId: 'om_reply', chatId: 'oc_chat', anchor: 'om_root', senderOpenId: 'ou_owner', text: 'continue only the first step', botSender: false };
   return { runtime, binding, event, options, store, session };
 }
+
+it('exposes deterministic capture rejection as a typed terminal error', () => {
+  const f = fixture();
+  f.session.active = false;
+
+  let thrown: unknown;
+  try {
+    f.runtime.capture(f.event);
+  } catch (error) {
+    thrown = error;
+  }
+
+  expect(isInputCaptureTerminalRejection(thrown)).toBe(true);
+  expect(thrown).toBeInstanceOf(InputCaptureTerminalRejection);
+  expect((thrown as InputCaptureTerminalRejection).code).toBe('input_capture_authority_changed');
+});
 
 it('pages full source bytes at a fixed upper sequence across restart and rejects closing over new input', async () => {
   const f = fixture();
