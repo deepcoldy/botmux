@@ -30,6 +30,13 @@ describe('buildCardBodyElements · vega-lite fences', () => {
     expect(elements[0].tag).toBe('chart');
   });
 
+  it('uses the same chart conversion for fences nested in lists', () => {
+    const input = ['- Chart:', ...chart('A').split('\n').map(line => `  ${line}`), '- Done'].join('\n');
+    const elements = buildCardBodyElements(input, '/', 'disabled');
+    expect(elements.map(element => element.tag)).toEqual(['markdown', 'chart', 'markdown']);
+    expect(elements[1].chart_spec).toMatchObject({ type: 'bar', title: { text: 'A' } });
+  });
+
   it('leaves ordinary code fences untouched', () => {
     const elements = buildCardBodyElements('```json\n{"mark":"bar"}\n```', '/', 'disabled');
     expect(elements).toEqual([{ tag: 'markdown', content: '```json\n{"mark":"bar"}\n```' }]);
