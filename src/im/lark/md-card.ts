@@ -1377,6 +1377,26 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  */
 const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
 
+/**
+ * Return the real Feishu image keys referenced by Markdown card content.
+ *
+ * The MarkdownIt-backed scanner deliberately ignores fenced/inline code,
+ * escaped syntax and non-image links.  Inbound card parsing reuses this helper
+ * so images emitted by `botmux send --images` remain downloadable through
+ * history/quoted even when Feishu keeps them inside a `markdown` element
+ * instead of normalizing them to a native `img` element.
+ */
+export function extractFeishuCardMarkdownImageKeys(input: string): string[] {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  for (const reference of cardImageReferences(input)) {
+    if (!FEISHU_IMG_KEY.test(reference.source) || seen.has(reference.source)) continue;
+    seen.add(reference.source);
+    keys.push(reference.source);
+  }
+  return keys;
+}
+
 type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] } | { type: 'img'; key: string; alt: string };
 
 /**

@@ -7,6 +7,7 @@ import {
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
+import { extractFeishuCardMarkdownImageKeys } from './md-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -485,10 +486,7 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
           for (const block of rootElements) {
             if (!Array.isArray(block)) continue;
             for (const node of block) {
-              const key = node.image_key ?? node.img_key;
-              if ((node.tag === 'img' || node.tag === 'image') && key) {
-                pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
-              }
+              extractElementImages(node, resources, pushIfNew);
             }
           }
         } else {
@@ -1694,6 +1692,25 @@ function extractElementImages(el: any, resources: MessageResource[], pushIfNew: 
   const key = el.image_key ?? el.img_key;
   if ((tag === 'img' || tag === 'image') && key) {
     pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
+  }
+
+  // `botmux send --images` keeps ordinary full-width/inline images inside a
+  // Markdown element as `![alt](img_vN_...)`.  Feishu does not always promote
+  // those tokens to native `img` nodes on readback, so native-node-only
+  // extraction made `quoted` render the image while returning resources: [].
+  // Reuse the outbound Markdown parser so code examples and escaped syntax do
+  // not become fake downloadable attachments.
+  if (tag === 'markdown' || tag === 'md' || tag === 'lark_md') {
+    const markdown = typeof el.content === 'string'
+      ? el.content
+      : typeof el.text === 'string'
+        ? el.text
+        : typeof el.text?.content === 'string'
+          ? el.text.content
+          : '';
+    for (const markdownKey of extractFeishuCardMarkdownImageKeys(markdown)) {
+      pushIfNew(resources, { type: 'image', key: markdownKey, name: `${markdownKey}.jpg` });
+    }
   }
 
   // div.extra can contain an image
