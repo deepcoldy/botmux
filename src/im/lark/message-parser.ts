@@ -7,7 +7,7 @@ import {
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
-import { extractFeishuCardMarkdownImageKeys } from './md-card.js';
+import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
