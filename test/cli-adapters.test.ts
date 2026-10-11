@@ -330,7 +330,7 @@ describe('claude-code buildArgs', () => {
     }
   });
 
-  it('makes QR size guidance visible before skill loading in both locales and injection paths', () => {
+  it('points to the send guide in both locales and injection paths', () => {
     for (const locale of ['zh', 'en'] as const) {
       const prompts = [
         buildBotmuxSystemPromptText({ locale }),
@@ -338,14 +338,13 @@ describe('claude-code buildArgs', () => {
       ];
       for (const prompt of prompts) {
         expect(prompt).toContain('botmux skill show botmux-send');
-        expect(prompt).toContain('--image-mode small');
       }
       // No-transport and transcript delivery must keep their existing contract:
       // these modes do not advertise explicit send commands in routing hints.
-      expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('--image-mode small');
-      expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('--image-mode small');
-      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('--image-mode small');
-      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('--image-mode small');
+      expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
     }
   });
 
