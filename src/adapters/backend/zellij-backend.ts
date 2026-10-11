@@ -1,4 +1,4 @@
-import * as pty from 'node-pty';
+import * as pty from '../../utils/pty.js';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';

@@ -342,6 +342,29 @@ describe('/sessions current-group card', () => {
     expect(JSON.stringify(result.card?.data)).toContain('Active 1 · Closed 0 · Page 1/1');
   });
 
+  it.each([
+    ['zh', '该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。'],
+    ['en', 'This session’s workspace has been reclaimed and the session cannot be resumed. Create a new session in a valid workspace.'],
+  ] as const)('explains workspace retirement when resume is rejected (%s)', async (locale, message) => {
+    const request = vi.fn(async (opts: { method?: string }) => opts.method === 'POST'
+      ? { status: 409, body: { ok: false, error: 'workspace_retired' }, raw: '' }
+      : { status: 200, body: { sessions: [row({ status: 'closed' })] }, raw: '' });
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_RESUME,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      session_id: 'session-secret',
+    }), APP, {
+      createClient: () => ({ request }) as unknown as DaemonClient,
+      getMessageChatId: vi.fn(async () => CHAT),
+      getDashboardAdminOpenIds: () => [USER],
+      locale,
+    });
+    expect(result.toast).toEqual({ type: 'error', content: message });
+    expect(result.card).toBeUndefined();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it('does not POST resume when the fresh row is no longer closed', async () => {
     const client = clientWith([row({ status: 'idle' })]);
     const result = await handleGroupSessionsCardAction(callback({

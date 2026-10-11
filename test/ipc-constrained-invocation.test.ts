@@ -11,10 +11,6 @@ vi.mock('../src/services/constrained-invocation/pi-runtime.js', async importOrig
   ...await importOriginal<typeof import('../src/services/constrained-invocation/pi-runtime.js')>(),
   runPiInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
 }));
-vi.mock('../src/services/constrained-invocation/minimax-runtime.js', async importOriginal => ({
-  ...await importOriginal<typeof import('../src/services/constrained-invocation/minimax-runtime.js')>(),
-  runMinimaxInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
-}));
 vi.mock('../src/services/constrained-invocation/gemini-runtime.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/services/constrained-invocation/gemini-runtime.js')>(),
   runGeminiInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
@@ -49,9 +45,9 @@ it('requires host authentication even with core-only public routes enabled', asy
   }
   expect(runCodexInvocation).not.toHaveBeenCalled();
 });
-it.each(['codex', 'codex-app', 'claude-code', 'pi', 'minimax', 'gemini', 'opencode'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
+it.each(['codex', 'codex-app', 'claude-code', 'pi', 'gemini', 'opencode'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
   const s = await start(cli); const path = '/api/headless/invocations';
-  const run = cli.startsWith('codex') ? runCodexInvocation : cli === 'pi' ? runPiInvocation : cli === 'minimax' ? runMinimaxInvocation : cli === 'gemini' ? runGeminiInvocation : cli === 'opencode' ? runOpenCodeInvocation : runClaudeInvocation;
+  const run = cli.startsWith('codex') ? runCodexInvocation : cli === 'pi' ? runPiInvocation : cli === 'gemini' ? runGeminiInvocation : cli === 'opencode' ? runOpenCodeInvocation : runClaudeInvocation;
   const invocation = { ...request, requestId: `round-${cli}` };
   const call = (method: string, target: string, body?: unknown) => fetchDaemonIpc(s.port, target, { method, ...(body ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}) }, secret);
   expect((await call('POST', path, invocation)).status).toBe(202);
@@ -65,8 +61,8 @@ it.each(['codex', 'codex-app', 'claude-code', 'pi', 'minimax', 'gemini', 'openco
   expect(vi.mocked(run).mock.calls[0][1].authHome).toMatch(new RegExp(`/${cli.startsWith('codex') ? 'codex' : cli === 'claude-code' ? 'claude' : cli}$`));
   expect((await call('POST', path, { ...request, requestId: 'forged-owner', ownerOpenId: 'ou_forged' })).status).toBe(400);
 });
-it('rejects an unsupported CLI without launching a worker', async () => {
-  const s = await start('cursor');
+it.each(['cursor', 'minimax'])('rejects unsupported %s without launching a worker', async cli => {
+  const s = await start(cli as any);
   const response = await fetchDaemonIpc(s.port, '/api/headless/invocations', { method: 'POST', body: JSON.stringify(request), headers: { 'content-type': 'application/json' } }, secret);
   expect(response.status).toBe(400);
   expect(await response.json()).toMatchObject({ error: 'constrained_capability_unsupported' });
@@ -98,7 +94,6 @@ it.each([
 
 import { runPiInvocation } from '../src/services/constrained-invocation/pi-runtime.js';
 
-import { runMinimaxInvocation } from '../src/services/constrained-invocation/minimax-runtime.js';
 
 import { runGeminiInvocation } from '../src/services/constrained-invocation/gemini-runtime.js';
 

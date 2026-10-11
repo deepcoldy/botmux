@@ -1322,6 +1322,45 @@ describe('buildStreamingCard', () => {
       expect(mdElements[0].content).toBe('_(等待第一张截图…)_');
     });
 
+    // Positional helper: buildStreamingCard's 23rd argument is screenshotUnavailable.
+    const withUnavailable = (imageKey: string | undefined, unavailable: boolean, locale: 'zh' | 'en' = 'zh') =>
+      parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'screenshot',
+        'nonce_x', imageKey, false, false, locale, undefined, undefined, false,
+        undefined, undefined, undefined, undefined, undefined, [], unavailable,
+      ));
+
+    it('renders an explicit unavailable state instead of waiting when no frame can arrive', () => {
+      const card = withUnavailable(undefined, true);
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      expect(md[0].content).toBe('_(当前没有可用截图，请在会话恢复后刷新。)_');
+      expect(card.elements.some((e: any) => e.tag === 'img')).toBe(false);
+      expect(withUnavailable(undefined, true, 'en').elements.find((e: any) => e.tag === 'markdown').content)
+        .toBe('_(No screenshot is available. Refresh after the session resumes.)_');
+    });
+
+    it('keeps the waiting placeholder when a fresh frame is expected (default)', () => {
+      const card = withUnavailable(undefined, false);
+      expect(card.elements.find((e: any) => e.tag === 'markdown').content).toBe('_(等待第一张截图…)_');
+    });
+
+    it('a cached image always wins over the unavailable flag', () => {
+      const card = withUnavailable('img_cached', true);
+      expect(card.elements[0]).toMatchObject({ tag: 'img', img_key: 'img_cached' });
+      expect(card.elements.some((e: any) => e.tag === 'markdown'
+        && String(e.content).includes('当前没有可用截图'))).toBe(false);
+    });
+
+    it('hidden mode ignores the unavailable flag', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'hidden',
+        'nonce_x', undefined, false, false, 'zh', undefined, undefined, false,
+        undefined, undefined, undefined, undefined, undefined, [], true,
+      ));
+      expect(card.elements.some((e: any) => e.tag === 'markdown'
+        && String(e.content).includes('当前没有可用截图'))).toBe(false);
+    });
+
     it('should include hr separator after screenshot output', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
       expect(card.elements[0].tag).toBe('markdown');

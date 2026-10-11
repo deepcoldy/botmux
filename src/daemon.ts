@@ -358,7 +358,7 @@ import {
 import {
   createDispatchReportBinding,
   resolveVerifiedDispatchReportTarget,
-  dispatchReportBindingSecretPath,
+  loadOrCreateDispatchReportBindingSecret,
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
@@ -858,6 +858,7 @@ import {
 } from './services/vc-meeting-im-routing.js';
 import { VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT } from './services/vc-meeting-listener-output-protocol.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -3914,7 +3915,7 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
     && caller.requestLarkAppId === ds.larkAppId && caller.requestUserOpenId) return undefined;
   return resolveDispatchUser({
     dataDir: config.session.dataDir,
-    secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+    secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     appId: ds.larkAppId, chatId: ds.chatId, turnId,
     rootId: reply.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
   });
@@ -4085,7 +4086,7 @@ async function reportZeroPromptFinal(ds: DaemonSession, input: {
   try { registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8')); }
   catch { return; }
   const decision = prepareAutomaticDispatchReport({
-    registry, bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+    registry, bindingSecret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     dispatchRoot: input.dispatchRoot, sourceSessionId: ds.session.sessionId,
     sourceLarkAppId: ds.larkAppId, content: input.content,
   });
@@ -4113,7 +4114,7 @@ function zeroPromptTaskContent(content: string, larkAppId: string, dispatchRoot?
   try {
     const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
     const bound = resolveVerifiedDispatchReportTarget({ registry, dispatchRoot,
-      secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)) });
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir) });
     return bound.ok ? stripDispatchCompletionProtocol(content, dispatchRoot) : content;
   } catch { return content; }
 }
@@ -6817,9 +6818,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     });
   }
 
-  const bindingSecret = loadOrCreateDashboardSecret(
-    dispatchReportBindingSecretPath(config.session.dataDir),
-  );
+  const bindingSecret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
   const issuedAt = new Date().toISOString();
   const reportBinding = createDispatchReportBinding(bindingSecret, {
     dispatchRoot,
@@ -6988,7 +6987,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const messageId = authority && turnId && targetAppIds.length
       ? await deliverDispatchWithUser({
           dataDir: config.session.dataDir,
-          secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+          secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
           payload: {
             sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
             rootId, chatId, targetAppIds, authority,
@@ -7381,9 +7380,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       : undefined,
     selfLarkAppId: selfDaemonLarkAppId,
     registry,
-    bindingSecret: loadOrCreateDashboardSecret(
-      dispatchReportBindingSecretPath(config.session.dataDir),
-    ),
+    bindingSecret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
   });
   if (!decision.ok) {
     return jsonRes(res, decision.status, { ok: false, error: decision.error });
@@ -7860,6 +7857,109 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     const acknowledged = await ack;
     if (!acknowledged) {
       logger.warn(`[${sessionId.slice(0, 8)}] session-ready worker ACK timed out; allowing hook to continue`);
+    }
+  }
+  return jsonRes(res, 200, { ok: true });
+});
+
+// ─── turn-idle IPC route (internal: 结构化回合空闲信号) ────────────────────────
+//
+// NOT an agent-facing command. CLI 进程内的结构化集成——当前只有 dsh-tui 的
+// cordis wrapper 插件，在 `agent/status` 落到 idle（回合结束）时——经
+// `botmux turn-idle`（cli.ts cmdTurnIdle）调到这里；daemon 把信号连同上报者读到
+// 的回合身份一起转给该会话的 worker，worker 只在身份与自己当前回合逐字相符时才
+// `idleDetector.fireIdle()`（判定见 utils/turn-idle-report.ts）。
+//
+// 为什么带的是**上报者声明的** turnId/dispatchAttempt，而不是 daemon 自己的
+// managedTurnOrigin：worker 侧那道 fence 要判的是「上报时到底哪一轮在跑」。daemon
+// 的副本可能已经推进到下一轮（更接近 worker 的实时值），转发它只会削弱 fence；
+// 声明的值由 dsh-tui 插件在 `agent/status` 回调里当场冻结（协议 v2），最保守。
+// capability 仍是唯一凭据，且这里把**声明回合与该 capability 的 live origin 绑定**
+// （同一 fence：声明必须逐字等于 token 所对应的 origin 元组）——光有 token 只能证明
+// 「呼叫方持有本会话当前 token」，不能证明它说的那一轮。绑定失败一律 403，不转发。
+//
+// 鉴权与 /api/session-ready 同构（能读 host secret 走 HMAC，沙箱内走本会话
+// rotating per-turn capability），但**不放行 receiver 会话**：按
+// authorizeSessionScopedIpc 的契约，只有「不可观测」的路由才允许 receiver，而本路由
+// 会释放 worker 的输入闸门（可能产生写入），属可观测副作用。VC-meeting receiver 会话
+// 因此退回既有兜底路径，无回归。找不到会话 / worker 仍返回 200（best-effort）：
+// 丢一个回合空闲不致命，worker 侧还有既有兜底路径。
+ipcRoute('POST', '/api/turn-idle', async (req, res) => {
+  let raw: {
+    sessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+    seq?: unknown;
+    pid?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  const positiveInt = (value: unknown): number | undefined => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+  );
+  if (!isTrustedHostIpcRequest(req)) {
+    const claimedTurnId = typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined;
+    const claimedDispatchAttempt = positiveInt(raw.originDispatchAttempt);
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId,
+      claimedDispatchAttempt,
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: verified.error,
+      });
+    }
+    // The capability only proves "the caller holds this session's CURRENT
+    // per-dispatch token" — it says nothing about the turn the report claims.
+    // Bind the two: the claim must name exactly the origin the token was
+    // published for (same fence as the worker's, applied here). A reporter that
+    // presents a live token with somebody else's tuple, or a legacy payload
+    // without one, is refused rather than forwarded.
+    const binding = decideTurnIdleReport({
+      reportedTurnId: claimedTurnId,
+      reportedDispatchAttempt: claimedDispatchAttempt,
+      activeTurnId: ds?.managedTurnOrigin?.turnId,
+      activeDispatchAttempt: ds?.managedTurnOrigin?.dispatchAttempt,
+      promptReady: false,
+    });
+    if (!binding.accept) {
+      logger.warn(`[${sessionId.slice(0, 8)}] turn-idle claim refused (${binding.reason})`);
+      return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
+    }
+  }
+  if (ds?.worker) {
+    try {
+      ds.worker.send({
+        type: 'turn_idle',
+        turnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+        dispatchAttempt: positiveInt(raw.originDispatchAttempt),
+        seq: positiveInt(raw.seq),
+        pid: positiveInt(raw.pid),
+      } as DaemonToWorker);
+      logger.info(`[${sessionId.slice(0, 8)}] turn-idle signal forwarded to worker (turn=${typeof raw.originTurnId === 'string' ? raw.originTurnId.slice(0, 12) : '?'})`);
+    } catch (err) {
+      logger.warn(`turn-idle forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return jsonRes(res, 200, { ok: true });
@@ -22320,7 +22420,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // ─── 会话群同群续聊 ─────────────────────────────────────────────────────
   // 会话群里的新消息发现登记的会话已关闭时，自动 resume 原会话（与话题内续聊
-  // 同款体验），而不是新开 CLI。恢复失败则照常走全新会话。
+  // 同款体验），而不是新开 CLI。已回收的会话拒绝恢复，也不能隐式新建。
   if (chatType === 'group' && scope === 'chat' && !ctx.sessionGroupBirth) {
     const sgEntry = getSessionGroup(chatId);
     if (sgEntry?.lastSessionId) {
@@ -22336,6 +22436,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
             touchSessionGroup(chatId);
             logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
             return handleThreadReply(data, ctx);
+          }
+          if (resumed.error === 'workspace_retired') {
+            await sessionReply(messageId, tr('card.action.resume_workspace_retired', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+            return;
           }
           logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
         }
@@ -28676,9 +28780,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Linux bwrap snapshots `.dashboard-secret.*` authority leaves at launch;
   // creating this later would leave the new key visible through its writable
   // host-root bind until the pane cold-started.
-  loadOrCreateDashboardSecret(
-    dispatchReportBindingSecretPath(config.session.dataDir),
-  );
+  loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
   let markIpcReady!: () => void;
   const ipcReady = new Promise<void>((resolve) => { markIpcReady = resolve; });
   const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';

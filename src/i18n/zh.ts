@@ -67,6 +67,7 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 会话已搬迁',
   'card.status.selected': '已选择',
   'card.status.waiting_screenshot': '_(等待第一张截图…)_',
+  'card.status.screenshot_unavailable': '_(当前没有可用截图，请在会话恢复后刷新。)_',
   'card.status.truncated_prefix': '… (已截断)',
   'card.pending.detoured_title': '已发送',
   'card.pending.detoured_body': '最终回复已发送到其他目标。',
@@ -1139,8 +1140,10 @@ export const messages: Record<string, string> = {
   'card.action.resume_adopt_unsupported': '⚠️ adopt 接管会话不支持 resume。',
   'card.action.resume_deferred_unmaterialized': '⚠️ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，无法恢复。',
   'card.action.resume_cancelled': '⚠️ 恢复过程中会话被关闭，本次恢复已取消。',
+  'card.action.resume_workspace_retired': '该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。',
   'card.action.resume_start_failed': '⚠️ 远程后端恢复进程未能启动，会话仍保持关闭，请稍后重试。',
   'card.action.resume_reconciliation_required': '⚠️ 远程恢复启动失败，且无法证明已回到关闭状态。会话保持保护状态，请先重试关闭或检查远端状态。',
+  'card.action.primary_lifecycle_unavailable': '⚠️ 多副本持久模式暂不支持通过卡片关闭、恢复或重启会话。关闭请在话题内发送 `/close`；需要继续时请直接 @机器人创建新会话。',
   'card.action.disconnected': '⏏ 已断开，原 CLI 会话不受影响',
   'card.voice.toast_wait': '🔊 正在生成语音总结，请耐心等待…',
   'card.voice.toast_already': '🔊 这条已经在生成语音啦，请稍候',
@@ -1710,6 +1713,7 @@ export const messages: Record<string, string> = {
   'toast.action_received_no_repeat': '操作已收到，请勿重复点击',
   'toast.action_in_progress': '操作正在处理中，请稍候',
   'toast.action_received_bg': '操作已收到，后台处理中',
+  'toast.card_update_busy_retry': '卡片正在更新，请稍后再点一次',
   'toast.not_in_approver_list': '你不在该审批人名单里，无法操作',
 
   // Quote hint (injected into the CLI prompt)

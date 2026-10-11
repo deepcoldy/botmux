@@ -942,4 +942,50 @@ describe('scanProjects — maxScanDirs budget', () => {
     expect(results.map(r => r.name)).toEqual(['proj']);
     expect(called).toBe(false);
   });
+
+  it('skips redundant subprocess calls for already discovered sibling worktrees', () => {
+    // When a repo has multiple worktrees under the scan root, discovering the
+    // first worktree registers all of them. Subsequent sibling directories must
+    // be skipped directly without running git rev-parse subprocesses.
+    const mainPath = mkRepo('main-repo');
+    const wt1 = mkWorktreeGitlink('wt-1', `${mainPath}/.git/worktrees/wt-1`);
+    const wt2 = mkWorktreeGitlink('wt-2', `${mainPath}/.git/worktrees/wt-2`);
+    const laterRepo = mkRepo('zz-later-repo');
+
+    let revParseCommonDirCalls = 0;
+    mockedExecSync.mockImplementation((cmd: string, opts?: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes('rev-parse --git-common-dir')) {
+        revParseCommonDirCalls++;
+        return `${mainPath}/.git\n`;
+      }
+      if (cmdStr.includes('rev-parse --abbrev-ref HEAD')) {
+        return 'main\n';
+      }
+      if (cmdStr.includes('worktree list --porcelain')) {
+        if (opts?.cwd === mainPath || opts?.cwd === wt1 || opts?.cwd === wt2) {
+          return [
+            `worktree ${mainPath}`,
+            'branch refs/heads/main',
+            '',
+            `worktree ${wt1}`,
+            'branch refs/heads/wt-1',
+            '',
+            `worktree ${wt2}`,
+            'branch refs/heads/wt-2',
+            '',
+          ].join('\n');
+        }
+        return `worktree ${opts?.cwd}\nbranch refs/heads/main\n\n`;
+      }
+      return '';
+    });
+
+    const results = scanProjects(tempRoot);
+    expect(results.some(r => r.name === 'main-repo' && r.type === 'repo')).toBe(true);
+    expect(results.some(r => r.name === 'zz-later-repo')).toBe(true);
+    // rev-parse --git-common-dir should not be repeatedly invoked for each sibling worktree
+    expect(revParseCommonDirCalls).toBe(0);
+  });
 });
+

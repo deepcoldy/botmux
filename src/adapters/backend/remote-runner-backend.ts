@@ -26,6 +26,8 @@ import {
   type RemoteRunnerEvent,
   type RemoteRunnerOutboundMessage,
   type RemoteRunnerOutboundMessageResult,
+  type RemoteRunnerSessionToolOperation,
+  type RemoteRunnerSessionToolResult,
   type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from './remote-runner-config.js';
@@ -43,7 +45,13 @@ type OutboundOperation = {
   result: Promise<RemoteRunnerOutboundMessageResult>;
 };
 
+type SessionToolOperation = {
+  fingerprint: string;
+  result: Promise<RemoteRunnerSessionToolResult>;
+};
+
 const MAX_OUTBOUND_MESSAGES_PER_TURN = 10;
+const MAX_SESSION_TOOLS_PER_TURN = 30;
 
 function boundedTimeout(value: number | undefined, fallback: number): number {
   if (!Number.isSafeInteger(value) || value! < 100 || value! > 300_000) return fallback;
@@ -107,7 +115,9 @@ export class RemoteRunnerBackend implements SessionBackend {
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly outboundOperations = new Map<string, OutboundOperation>();
   private outboundOperationCount = 0;
-  private readonly outboundResultWrites = new Map<string, number>();
+  private readonly sessionToolOperations = new Map<string, SessionToolOperation>();
+  private sessionToolOperationCount = 0;
+  private readonly hostResultWrites = new Map<string, number>();
   private dataCb: ((data: string) => void) | null = null;
   private screenResyncCb: ((snapshot: string) => void) | null = null;
   private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
@@ -115,6 +125,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private turnFinalCb: ((text: string, turnId?: string) => void) | null = null;
   private turnFailureCb: ((failure: BackendTurnFailure) => void) | null = null;
   private outboundMessageCb: ((message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>) | null = null;
+  private sessionToolCb: ((operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>) | null = null;
   private readyCb: (() => void) | null = null;
   private stateCb: ((state: RemoteRunnerBackendState) => void) | null = null;
   private usageCb: ((usage: RemoteRunnerUsageReport) => void) | null = null;
@@ -221,7 +232,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     this.activeTurnAccepted = false;
     this.outboundOperations.clear();
     this.outboundOperationCount = 0;
-    this.outboundResultWrites.clear();
+    this.sessionToolOperations.clear();
+    this.sessionToolOperationCount = 0;
+    this.hostResultWrites.clear();
     this.turnSettled = new Promise<void>(resolve => { this.settleTurn = resolve; });
     const requestId = this.requestId('turn');
     this.activeTurnRequestId = requestId;
@@ -296,6 +309,9 @@ export class RemoteRunnerBackend implements SessionBackend {
   onOutboundMessage(
     cb: (message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>,
   ): void { this.outboundMessageCb = cb; }
+  onSessionTool(
+    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+  ): void { this.sessionToolCb = cb; }
   onReady(cb: () => void): void {
     this.readyCb = cb;
     if (this.ready) queueMicrotask(cb);
@@ -581,10 +597,14 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.handleOutboundMessage(event);
       return;
     }
+    if (event.type === 'session_tool') {
+      this.handleSessionTool(event);
+      return;
+    }
     if (event.type === 'final') {
       if (!this.acceptAcknowledgedTurn(event.turnId)) return;
-      if ((this.outboundResultWrites.get(event.turnId) ?? 0) > 0) {
-        this.failProtocol('remote runner emitted final before an outbound message result was returned');
+      if ((this.hostResultWrites.get(event.turnId) ?? 0) > 0) {
+        this.failProtocol('remote runner emitted final before a host operation result was returned');
         return;
       }
       if (event.state && !this.applyState(event.state)) return;
@@ -729,9 +749,9 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.outboundOperations.set(message.operationId, { fingerprint, result });
     }
 
-    this.outboundResultWrites.set(
+    this.hostResultWrites.set(
       message.turnId,
-      (this.outboundResultWrites.get(message.turnId) ?? 0) + 1,
+      (this.hostResultWrites.get(message.turnId) ?? 0) + 1,
     );
     void result.then(async (settled) => {
       if (this.activeTurnId !== message.turnId
@@ -750,10 +770,92 @@ export class RemoteRunnerBackend implements SessionBackend {
         );
       }
     }).finally(() => {
-      const pending = this.outboundResultWrites.get(message.turnId);
+      const pending = this.hostResultWrites.get(message.turnId);
       if (pending === undefined) return;
-      if (pending <= 1) this.outboundResultWrites.delete(message.turnId);
-      else this.outboundResultWrites.set(message.turnId, pending - 1);
+      if (pending <= 1) this.hostResultWrites.delete(message.turnId);
+      else this.hostResultWrites.set(message.turnId, pending - 1);
+    });
+  }
+
+  private sessionToolFingerprint(operation: RemoteRunnerSessionToolOperation): string {
+    return createHash('sha256').update(JSON.stringify([
+      operation.turnId,
+      operation.generation,
+      operation.request,
+    ])).digest('hex');
+  }
+
+  private handleSessionTool(operation: RemoteRunnerSessionToolOperation): void {
+    if (!this.providerCapabilities.has('session_tool')) {
+      this.failProtocol('remote runner emitted session_tool without advertising the capability');
+      return;
+    }
+    if (!this.acceptAcknowledgedTurn(operation.turnId)) return;
+    if (operation.generation !== this.state?.generation) {
+      this.failProtocol('remote runner session tool belongs to another backend generation');
+      return;
+    }
+
+    const fingerprint = this.sessionToolFingerprint(operation);
+    const existing = this.sessionToolOperations.get(operation.operationId);
+    let result: Promise<RemoteRunnerSessionToolResult>;
+    if (existing) {
+      result = existing.fingerprint === fingerprint
+        ? existing.result
+        : Promise.resolve({
+            outcome: 'rejected',
+            code: 'operation_id_conflict',
+            message: 'The session tool operation id was reused with a different payload.',
+          });
+    } else if (this.sessionToolOperationCount >= MAX_SESSION_TOOLS_PER_TURN) {
+      result = Promise.resolve({
+        outcome: 'rejected',
+        code: 'session_tool_rate_limited',
+        message: `A remote turn may execute at most ${MAX_SESSION_TOOLS_PER_TURN} session tools.`,
+      });
+    } else {
+      this.sessionToolOperationCount++;
+      const callback = this.sessionToolCb;
+      result = callback
+        ? Promise.resolve().then(() => callback(operation)).catch((error): RemoteRunnerSessionToolResult => ({
+            outcome: 'unknown',
+            code: 'session_tool_execution_unknown',
+            message: (error instanceof Error ? error.message : String(error)).slice(0, 4096)
+              || 'The session tool failed with an unknown result.',
+          }))
+        : Promise.resolve({
+            outcome: 'rejected',
+            code: 'session_tool_unavailable',
+            message: 'The BotMux host did not install a session tool handler.',
+          });
+      this.sessionToolOperations.set(operation.operationId, { fingerprint, result });
+    }
+
+    this.hostResultWrites.set(
+      operation.turnId,
+      (this.hostResultWrites.get(operation.turnId) ?? 0) + 1,
+    );
+    void result.then(async (settled) => {
+      if (this.activeTurnId !== operation.turnId
+          || this.state?.generation !== operation.generation) return;
+      await this.send(remoteRunnerCommand('session_tool_result', {
+        requestId: this.requestId('session-tool-result'),
+        operationId: operation.operationId,
+        turnId: operation.turnId,
+        generation: operation.generation,
+        result: settled,
+      }));
+    }).catch(error => {
+      if (this.activeTurnId === operation.turnId) {
+        this.failProtocol(
+          `remote runner session tool result could not be returned: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }).finally(() => {
+      const pending = this.hostResultWrites.get(operation.turnId);
+      if (pending === undefined) return;
+      if (pending <= 1) this.hostResultWrites.delete(operation.turnId);
+      else this.hostResultWrites.set(operation.turnId, pending - 1);
     });
   }
 
@@ -770,7 +872,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     this.activeTurnRequestId = null;
     this.outboundOperations.clear();
     this.outboundOperationCount = 0;
-    if (turnId) this.outboundResultWrites.delete(turnId);
+    this.sessionToolOperations.clear();
+    this.sessionToolOperationCount = 0;
+    if (turnId) this.hostResultWrites.delete(turnId);
     const settle = this.settleTurn;
     this.settleTurn = null;
     settle?.();

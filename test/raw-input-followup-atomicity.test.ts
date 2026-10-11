@@ -177,7 +177,9 @@ describe('worker raw_input delivery', () => {
   it('rotates or revokes the marker immediately before writing the raw command', () => {
     const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');
     const callbackIdx = region.indexOf('() => {', sendIdx);
-    const bindIdx = region.indexOf('currentBotmuxTurnId = msg.turnId');
+    // V3: the capture identity is bound through the single writer
+    // setCaptureIdentity (which assigns currentBotmuxTurnId) at the same point.
+    const bindIdx = region.indexOf('setCaptureIdentity(msg.turnId, undefined)');
     const markerIdx = region.indexOf('writeCliPidMarker()');
     const capabilityIdx = region.indexOf('publishSandboxRelayCapability()');
     expect(sendIdx).toBeGreaterThanOrEqual(0);
