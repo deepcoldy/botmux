@@ -167,6 +167,11 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Deferred-schedule settlement injection: settlement returns close_refused '
       + 'rather than closed.',
   },
+  'daemon.ts::closeSession::closeSession': {
+    category: 'infrastructure',
+    why: 'Injects the raw typed close result into the durable card-control runtime; '
+      + 'that runtime durably replies with refusal/residual details before settling.',
+  },
   'daemon.ts::cleanupFailedDelivery::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Document-comment admission rollback has no direct user surface; the '

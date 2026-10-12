@@ -125,6 +125,7 @@ import {
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import { parseDurablePrimarySessionRecord } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
+import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -29533,6 +29534,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               ds,
               ds.session.suspendedColdResume ? 'idle' : undefined,
             ),
+            closeResidualText: residual => {
+              const loc = localeForBot(cfg.larkAppId);
+              return tr(
+                closeResidualIsLocal(residual)
+                  ? 'card.action.close_residual_local'
+                  : 'card.action.close_residual',
+                { taskId: describeCloseResidual(residual) },
+                loc,
+              );
+            },
+            closeRefusedText: (error, taskId) => {
+              const loc = localeForBot(cfg.larkAppId);
+              return taskId
+                ? tr('card.action.close_refused_with_task', { error, taskId }, loc)
+                : tr('card.action.close_refused', { error }, loc);
+            },
             resumeRefusedText: (error, activeSessionId) => {
               const loc = localeForBot(cfg.larkAppId);
               return error === 'anchor_occupied'

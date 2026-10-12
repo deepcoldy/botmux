@@ -1194,6 +1194,8 @@ export const messages: Record<string, string> = {
   'card.action.compact_unsupported': '⚠️ 当前环境不支持卡片压缩，请直接发送 /compact',
   'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
   'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
+  'card.action.close_residual': '会话已在本地关闭，但远端会话未取消（{taskId}），需要人工清理。',
+  'card.action.close_residual_local': '会话已在本地关闭、远端会话已取消，但本机可能残留带凭证子进程未确认终止（{taskId}）。请人工核查该主机进程。',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
