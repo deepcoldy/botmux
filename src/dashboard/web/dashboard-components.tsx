@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { Menu as BaseMenu } from '@base-ui/react/menu';
 
 export type DropdownOption<T extends string> = {
   value: T;
@@ -534,25 +535,35 @@ function clippingAncestorBoxes(el: HTMLElement): { top: number; bottom: number }
   return boxes;
 }
 
+/**
+ * Dropdown menu built on Base UI (@base-ui/react) primitives for improved
+ * keyboard navigation and accessibility, while preserving all existing behavior:
+ * - Custom viewport-aware placement logic (dropdownPlacement, popupClipFrame)
+ * - Dialog-aware portaling via floatingPortalHost
+ * - Searchable filtering
+ * - No-op on reselect
+ * - All existing CSS classes and styling
+ *
+ * Base UI provides the behavior layer (open/close state, keyboard navigation,
+ * ARIA attributes); positioning and portaling remain custom-implemented to
+ * maintain the carefully-tuned clipping-ancestor-aware logic.
+ */
 export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
-  const detailsRef = useRef<HTMLDetailsElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
+
   const choose = (next: T) => {
-    detailsRef.current?.removeAttribute('open');
-    // Belt-and-braces: `onToggle` normally syncs this, but WebKit before Safari
-    // 15.4 did not fire toggle for programmatic open changes, which would leave
-    // `open` stuck true and the placement effect skipped on the next open (stale
-    // budget / drop-up class). Setting it here closes that loop; on browsers that
-    // do fire toggle React bails out of the identical-state update, so it is free.
     setOpen(false);
     // Re-selecting the already-active value is a no-op: close the menu but skip
     // onChange, so auto-saving dropdowns don't fire a redundant write + "saved" flash.
     if (next === props.value) return;
     props.onChange(next);
   };
+
   const queryNorm = query.trim().toLowerCase();
   // Match on the visible label when it is plain text, plus the value itself
   // (users search either "Claude" or "claude-code").
@@ -566,11 +577,12 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
   useLayoutEffect(() => {
     if (!open) return undefined;
     const place = () => {
-      const details = detailsRef.current;
+      const menu = menuRef.current;
+      const triggerEl = triggerRef.current;
       const pop = popRef.current;
-      if (!details || !pop) return;
-      const trigger = details.getBoundingClientRect();
-      // Walk from the popup, so the <details> that wraps it is itself checked:
+      if (!menu || !triggerEl || !pop) return;
+      const trigger = triggerEl.getBoundingClientRect();
+      // Walk from the popup, so the menu container itself is checked:
       // nothing sets overflow on `.sect-sort-menu` today, but a page-level rule
       // that did would clip the popup, and starting at the trigger would miss it.
       const frame = popupClipFrame({
@@ -586,7 +598,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
         frameBottom: frame.bottom,
       };
       const { dropUp, maxHeight } = dropdownPlacement(geometry);
-      details.classList.toggle('is-drop-up', dropUp);
+      menu.classList.toggle('is-drop-up', dropUp);
       // A per-page rule may pin the direction regardless of the class — e.g.
       // `.connector-create-modal #cn-verify .sect-sort-pop` sets `bottom` with
       // ID specificity, so that popup always opens upward. Budgeting for the
@@ -615,111 +627,97 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
   }, [open, visibleOptions.length]);
 
   useEffect(() => {
-    if (typeof document === 'undefined') return undefined;
-    const close = () => {
-      if (detailsRef.current?.open) detailsRef.current.open = false;
-      // Same reason as in choose(): don't rely solely on toggle firing.
+    if (props.disabled && open) {
       setOpen(false);
-    };
-    const onPointerDown = (event: PointerEvent) => {
-      const details = detailsRef.current;
-      if (!details?.open) return;
-      const target = event.target;
-      if (target instanceof Node && details.contains(target)) return;
-      close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
-    };
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, []);
+    }
+  }, [props.disabled, open]);
+
   useEffect(() => {
-    if (props.disabled) return;
-    if (detailsRef.current?.open) detailsRef.current.open = false;
-    // Third programmatic close path — keep it in sync too (see choose()).
-    setOpen(false);
-  }, [props.disabled]);
+    if (open && props.searchable) {
+      setQuery('');
+      // Focus after portal renders
+      window.requestAnimationFrame(() => searchRef.current?.focus());
+    }
+  }, [open, props.searchable]);
 
   const className = ['sect-sort-menu', props.disabled ? 'is-disabled' : '', props.className].filter(Boolean).join(' ');
 
   return (
-    <details
-      id={props.id}
-      className={className}
-      ref={detailsRef}
-      hidden={props.hidden}
-      style={props.style}
-      onToggle={event => {
-        // <details> fires toggle for programmatic `.open = false` too, so this is
-        // the single place that keeps the placement effect in sync with reality.
-        const isOpen = event.currentTarget.open;
-        setOpen(isOpen);
-        if (!props.searchable || !isOpen) return;
-        setQuery('');
-        searchRef.current?.focus();
-      }}
-    >
-      <summary
-        aria-label={props.ariaLabel}
-        aria-disabled={props.disabled ? true : undefined}
-        tabIndex={props.disabled ? -1 : undefined}
-        onClick={event => {
-          if (props.disabled) event.preventDefault();
-        }}
-        onKeyDown={event => {
-          if (props.disabled && (event.key === 'Enter' || event.key === ' ')) event.preventDefault();
-        }}
+    <BaseMenu.Root open={open} onOpenChange={(nextOpen) => !props.disabled && setOpen(nextOpen)}>
+      <div
+        id={props.id}
+        className={className}
+        ref={menuRef}
+        hidden={props.hidden}
+        style={props.style}
       >
-        <span className="sect-sort-value">{props.label}</span>
-      </summary>
-      <div className="sect-sort-pop" ref={popRef}>
-        {props.searchable ? (
-          <input
-            ref={searchRef}
-            className="sect-sort-search"
-            type="search"
-            placeholder={props.searchPlaceholder}
-            aria-label={props.searchPlaceholder}
-            autoComplete="off"
-            spellCheck={false}
-            value={query}
-            onChange={event => setQuery(event.currentTarget.value)}
-            onKeyDown={event => {
-              if (event.key !== 'Enter') return;
-              // The dropdown often sits inside a <form>: never let Enter submit
-              // it. Enter picks the first matching option instead.
-              event.preventDefault();
-              const first = visibleOptions.find(option => !option.disabled);
-              if (first) choose(first.value);
-            }}
-          />
-        ) : null}
-        {visibleOptions.map(option => (
-          <button
-            key={option.value}
-            type="button"
-            disabled={option.disabled}
-            aria-current={props.value === option.value ? 'true' : undefined}
-            onClick={() => choose(option.value)}
-          >
-            {option.hint ? (
-              <span className="sect-sort-option">
-                <span className="sect-sort-option-title">{option.label}</span>
-                <span className="sect-sort-option-hint">{option.hint}</span>
-              </span>
-            ) : option.label}
-          </button>
-        ))}
-        {props.searchable && visibleOptions.length === 0
-          ? <p className="sect-sort-empty">{props.searchEmptyLabel}</p>
-          : null}
+        <BaseMenu.Trigger
+          ref={triggerRef}
+          disabled={props.disabled}
+          aria-label={props.ariaLabel}
+        >
+          <span className="sect-sort-value">{props.label}</span>
+        </BaseMenu.Trigger>
+        {open && typeof document !== 'undefined' && triggerRef.current && (
+          createPortal(
+            <BaseMenu.Positioner
+              anchor={triggerRef.current}
+              positionMethod="absolute"
+              side="bottom"
+              align="start"
+            >
+              <div className="sect-sort-pop" ref={popRef}>
+                {props.searchable && (
+                  <input
+                    ref={searchRef}
+                    className="sect-sort-search"
+                    type="search"
+                    placeholder={props.searchPlaceholder}
+                    aria-label={props.searchPlaceholder}
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={query}
+                    onChange={event => setQuery(event.currentTarget.value)}
+                    onKeyDown={event => {
+                      if (event.key !== 'Enter') return;
+                      // The dropdown often sits inside a <form>: never let Enter submit
+                      // it. Enter picks the first matching option instead.
+                      event.preventDefault();
+                      const first = visibleOptions.find(option => !option.disabled);
+                      if (first) choose(first.value);
+                    }}
+                  />
+                )}
+                {visibleOptions.map(option => (
+                  <BaseMenu.Item
+                    key={option.value}
+                    disabled={option.disabled}
+                    onClick={() => choose(option.value)}
+                  >
+                    <button
+                      type="button"
+                      disabled={option.disabled}
+                      aria-current={props.value === option.value ? 'true' : undefined}
+                    >
+                      {option.hint ? (
+                        <span className="sect-sort-option">
+                          <span className="sect-sort-option-title">{option.label}</span>
+                          <span className="sect-sort-option-hint">{option.hint}</span>
+                        </span>
+                      ) : option.label}
+                    </button>
+                  </BaseMenu.Item>
+                ))}
+                {props.searchable && visibleOptions.length === 0 && (
+                  <p className="sect-sort-empty">{props.searchEmptyLabel}</p>
+                )}
+              </div>
+            </BaseMenu.Positioner>,
+            floatingPortalHost(triggerRef.current, document.body),
+          )
+        )}
       </div>
-    </details>
+    </BaseMenu.Root>
   );
 }
 
