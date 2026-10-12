@@ -21,6 +21,15 @@ function fixture() {
     content: 'hello', permission: 'full', timeoutMs: 5000, onUserInput: async () => ({ action: 'accept', content: {} }) };
   return { root, log, options, calls: () => readFileSync(log, 'utf8').trim().split('\n').map(l => JSON.parse(l)) };
 }
+function durableFixture() {
+  const f = fixture(); mkdirSync(join(f.root, 'data/v2/sqlite'), { recursive: true });
+  const db = openDatabaseSyncNow(join(f.root, 'data/v2/sqlite/runtime-state.sqlite'))!;
+  db.exec(`CREATE TABLE questionnaire_requests (request_id TEXT,session_id TEXT,status TEXT,injected_at INTEGER,created_at INTEGER);
+    CREATE TABLE local_runtime_message_rows (id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,source TEXT,turn_id TEXT,source_context_json TEXT,data_json TEXT);
+    CREATE TABLE local_runtime_turn_ingress (session_id TEXT,turn_id TEXT,status TEXT,completed_at_ms INTEGER);`);
+  f.options.env.MCODE_ACP_SCENARIO = 'native-questionnaire';
+  return { ...f, db };
+}
 const bounded = () => AbortSignal.timeout(5000);
 async function waitFor(check: () => boolean) {
   const deadline = Date.now() + 5000;
@@ -81,12 +90,10 @@ describe('mcode ACP wire client', () => {
     expect(waiting.mock.calls.map(c => c[0])).toEqual([true, false]);
   });
   it('keeps the native process alive after early end_turn until the durable answer continuation finishes', async () => {
-    const f = fixture(); mkdirSync(join(f.root, 'data/v2/sqlite'), { recursive: true });
-    const db = openDatabaseSyncNow(join(f.root, 'data/v2/sqlite/runtime-state.sqlite'))!;
-    db.exec(`CREATE TABLE questionnaire_requests (request_id TEXT,session_id TEXT,status TEXT,injected_at INTEGER,created_at INTEGER);
-      CREATE TABLE local_runtime_message_rows (id INTEGER PRIMARY KEY,session_id TEXT,role TEXT,source TEXT,turn_id TEXT,source_context_json TEXT,data_json TEXT);
-      CREATE TABLE local_runtime_turn_ingress (session_id TEXT,turn_id TEXT,status TEXT,completed_at_ms INTEGER);
-      INSERT INTO questionnaire_requests VALUES ('ask-native','session_fixture','pending',NULL,1);`);
+    const f = durableFixture(); const { db } = f;
+    const onUpdate = (update: Record<string, any>) => {
+      if (update.toolCallId === 'questionnaire') db.exec("INSERT INTO questionnaire_requests VALUES ('ask-native','session_fixture','pending',NULL,1)");
+    };
     let finished = false;
     const input = async () => {
       db.exec("UPDATE questionnaire_requests SET status='answered', injected_at=2");
@@ -102,10 +109,47 @@ describe('mcode ACP wire client', () => {
       return { action: 'accept', content: { approach: 'fast-id' } };
     };
     try {
-      const result = await runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input }, bounded());
+      const result = await runMinimaxAcp({ ...f.options, content: 'ask', onUpdate, onUserInput: input }, bounded());
       expect(finished).toBe(true); expect(result.content).toBe('After choice: Smoke');
       await stopped(f.calls()[0].pid);
     } finally { db.close(); }
+  });
+  it('completes a new questionnaire after cancelling and resuming a session with a stale pending row', async () => {
+    const f = durableFixture(); const { db } = f;
+    const controller = new AbortController(); const input = vi.fn().mockImplementation(() => new Promise(() => {}));
+    try {
+      const cancelled = runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input,
+        onUpdate(update) {
+          if (update.toolCallId === 'questionnaire') db.exec("INSERT INTO questionnaire_requests VALUES ('stale','session_fixture','pending',NULL,1)");
+        } }, controller.signal);
+      await waitFor(() => input.mock.calls.length === 1); controller.abort();
+      await expect(cancelled).rejects.toThrow('aborted');
+      await stopped(f.calls()[0].pid);
+      const result = await runMinimaxAcp({ ...f.options, content: 'ask', nativeSessionId: 'session_fixture',
+        onUpdate(update) {
+          if (update.toolCallId === 'questionnaire') db.exec("INSERT INTO questionnaire_requests VALUES ('fresh','session_fixture','pending',NULL,1)");
+        },
+        onUserInput: async () => {
+          db.exec("UPDATE questionnaire_requests SET status='answered', injected_at=2 WHERE request_id='fresh'");
+          db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id,source_context_json) VALUES (?,?,?,?,?)')
+            .run('session_fixture', 'user', 'questionnaire', 'fresh-turn', JSON.stringify({ origin: { requestId: 'fresh' } }));
+          db.exec("INSERT INTO local_runtime_turn_ingress VALUES ('session_fixture','fresh-turn','completed',3)");
+          db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,turn_id,data_json) VALUES (?,?,?,?)')
+            .run('session_fixture', 'assistant', 'fresh-turn', JSON.stringify({ msg_content: 'New questionnaire completed' }));
+          return { action: 'accept', content: { approach: 'safe-id' } };
+        } }, bounded());
+      expect(result).toEqual({ sessionId: 'session_fixture', content: 'New questionnaire completed' });
+      expect(db.prepare("SELECT status FROM questionnaire_requests WHERE request_id='stale'").get()).toEqual({ status: 'pending' });
+      expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(1);
+    } finally { controller.abort(); db.close(); }
+  });
+  it('fails closed if a native elicitation has no questionnaire belonging to this prompt cycle', async () => {
+    const f = durableFixture(); const input = vi.fn();
+    try {
+      f.db.exec("INSERT INTO questionnaire_requests VALUES ('stale','session_fixture','pending',NULL,1)");
+      await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input }, bounded())).rejects.toThrow('缺少本轮');
+      expect(input).not.toHaveBeenCalled();
+    } finally { f.db.close(); }
   });
   it('forwards native permission requests with an explicit response', async () => {
     const f = fixture(); const input = vi.fn().mockResolvedValue({ outcome: { outcome: 'selected', optionId: 'deny' } });
@@ -132,7 +176,12 @@ describe('mcode ACP wire client', () => {
     await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: async () => { throw new Error('ask timed out'); } }, bounded())).rejects.toThrow('ask timed out');
     expect(f.calls().some(c => c.message?.id === 'native-question' && !c.message.method)).toBe(false);
   });
-  it.each(['foreign-ask', 'foreign-update', 'crash', 'invalid-json', 'unknown-response', 'cancelled', 'limit', 'oversize'])('rejects %s without a successful final', async content => {
+  it.each(['oversize', 'oversize-stderr'])('rejects %s specifically at the output byte limit', async content => {
+    const f = fixture();
+    await expect(runMinimaxAcp({ ...f.options, content }, bounded())).rejects.toThrow('mcode_acp_output_limit');
+    await stopped(f.calls()[0].pid);
+  });
+  it.each(['foreign-ask', 'foreign-update', 'crash', 'invalid-json', 'unknown-response', 'cancelled', 'limit'])('rejects %s without a successful final', async content => {
     const f = fixture(); const input = vi.fn();
     await expect(runMinimaxAcp({ ...f.options, content, onUserInput: input }, bounded())).rejects.toThrow();
     expect(input).not.toHaveBeenCalled();
@@ -158,9 +207,9 @@ describe('mcode ACP wire client', () => {
   });
 });
 
-it('default ACP runner preserves queue attribution, native id, escaped display and interrupt recovery', async () => {
+it.each([false, true])('default ACP runner preserves queue attribution, native id, escaped display and interrupt recovery (resume: %s)', async resume => {
   const f = fixture();
-  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable, '--cwd', f.root, '--data-dir', join(f.root, 'data')], { env: f.options.env }) as ChildProcessWithoutNullStreams;
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable, '--cwd', f.root, '--data-dir', join(f.root, 'data'), ...(resume ? ['--native-session-id', 'session_fixture'] : [])], { env: f.options.env }) as ChildProcessWithoutNullStreams;
   let stdout = ''; child.stdout.on('data', chunk => { stdout += chunk.toString(); });
   const closed = new Promise<void>(r => child.once('close', () => r()));
   const markers = () => [...stdout.matchAll(/\x1b\]777;botmux:(\w+):([A-Za-z0-9+/=]+)\x07/g)].map(m => ({ kind: m[1], payload: JSON.parse(Buffer.from(m[2], 'base64').toString()) }));
@@ -179,6 +228,7 @@ it('default ACP runner preserves queue attribution, native id, escaped display a
     send('healthy', 'four');
     await waitFor(() => markers().filter(m => m.kind === 'final').length === 4);
     expect(markers().filter(m => m.kind === 'final').at(-1)?.payload).toMatchObject({ turnId: 'four', content: 'answer:healthy' });
-    expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(3);
+    expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(resume ? 4 : 3);
+    expect(markers().filter(m => m.kind === 'thread')).toEqual([{ kind: 'thread', payload: { threadId: 'session_fixture' } }]);
   } finally { child.kill('SIGTERM'); await closed; }
 });

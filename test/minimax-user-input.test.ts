@@ -6,6 +6,24 @@ const form = (properties: object, required: string[] = []) => ({ mode: 'form', s
 const choice = (title = 'Strategy') => ({ type: 'string', title, oneOf: [{ const: 'safe-id', title: 'Safe', description: 'Check first' }, { const: 'fast-id', title: 'Fast' }] });
 const answer = (answers: Record<string, string[]>) => ({ answers: Object.fromEntries(Object.entries(answers).map(([id, values]) => [id, { answers: values }])) });
 describe('mcode ACP questionnaire bridge', () => {
+  it('accepts 24 form fields and rejects 25 before presenting a card', () => {
+    const properties = Object.fromEntries(Array.from({ length: 24 }, (_, i) => [`field-${i}`, { type: 'string' }]));
+    expect(parseMinimaxForm(form(properties)).fields).toHaveLength(24);
+    expect(() => parseMinimaxForm(form({ ...properties, extra: { type: 'string' } }))).toThrow('不支持');
+  });
+  it.each([0, 1, 2, 10, 11])('enforces native permission option bounds for %s options', async count => {
+    const options = Array.from({ length: count }, (_, i) => ({ optionId: `option-${i}`, name: `Option ${i}` }));
+    const ask = vi.fn().mockResolvedValue(answer({ permission: ['Option 0 (1)'] }));
+    const run = bridgeMinimaxPermission(context, { options }, signal(), ask);
+    if (count < 2 || count > 10) {
+      await expect(run).rejects.toThrow('不支持');
+      expect(ask).not.toHaveBeenCalled();
+    } else {
+      expect(await run).toEqual({ outcome: { outcome: 'selected', optionId: 'option-0' } });
+      expect(ask).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it('batches choices and sends native ids back, with no automatic selection', async () => {
     const ask = vi.fn().mockResolvedValue(answer({ approach: ['Safe'], checks: ['Unit', 'Smoke'] }));
     const result = await bridgeMinimaxForm(context, form({ approach: choice(), checks: { type: 'array', title: 'Checks', items: { anyOf: [{ const: 'unit-id', title: 'Unit' }, { const: 'smoke-id', title: 'Smoke' }] } } }, ['approach', 'checks']), signal(), ask);

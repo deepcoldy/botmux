@@ -10,12 +10,26 @@ const json = (value: unknown): Record<string, any> | undefined => {
  * durable ingress is the completion proof; do not kill that continuation or
  * deliver the pre-question text as the final answer. All reads are session-
  * scoped and read-only, and tied to the actual questionnaire request ids. */
-export function pendingMinimaxQuestionnaires(databasePath: string, sessionId: string, required = false): string[] {
+/** Capture the native insertion boundary immediately before session/prompt.
+ * SQLite rowids also distinguish requests created in the same millisecond;
+ * cancelled turns may leave older pending rows, which this turn must not own. */
+export function minimaxQuestionnaireCursor(databasePath: string, sessionId: string, required = false): number {
+  const db = openDatabaseSyncNow(databasePath, { readOnly: true });
+  if (!db) { if (required) throw new Error('mcode ACP 无法验证原生问卷：数据库不可读'); return 0; }
+  try {
+    const row = db.prepare('SELECT COALESCE(MAX(rowid), 0) AS cursor FROM questionnaire_requests WHERE session_id = ?')
+      .get(sessionId) as { cursor: number };
+    if (!Number.isSafeInteger(row.cursor) || row.cursor < 0) throw new Error('mcode ACP 原生问卷边界无效');
+    return row.cursor;
+  } finally { db.close(); }
+}
+
+export function pendingMinimaxQuestionnaires(databasePath: string, sessionId: string, afterRowId = 0, required = false): string[] {
   const db = openDatabaseSyncNow(databasePath, { readOnly: true });
   if (!db) { if (required) throw new Error('mcode ACP 无法验证原生问卷：数据库不可读'); return []; }
   try {
-    return (db.prepare("SELECT request_id FROM questionnaire_requests WHERE session_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 16")
-      .all(sessionId) as Array<{ request_id: string }>).map(r => r.request_id);
+    return (db.prepare("SELECT request_id FROM questionnaire_requests WHERE session_id = ? AND rowid > ? AND status = 'pending' ORDER BY rowid DESC LIMIT 16")
+      .all(sessionId, afterRowId) as Array<{ request_id: string }>).map(r => r.request_id);
   } finally { db.close(); }
 }
 
@@ -41,7 +55,7 @@ export function minimaxUserTurnIds(db: DatabaseSyncLike, sessionId: string, late
   }
 }
 
-export function readMinimaxContinuation(databasePath: string, sessionId: string, requestIds: ReadonlySet<string>):
+export function readMinimaxContinuation(databasePath: string, sessionId: string, requestIds: ReadonlySet<string>, afterRowId = 0):
   { state: 'waiting' } | { state: 'completed'; content: string } {
   const db = openDatabaseSyncNow(databasePath, { readOnly: true });
   if (!db) throw new Error('mcode ACP 无法验证问卷续跑：原生数据库不可读');
@@ -70,7 +84,7 @@ export function readMinimaxContinuation(databasePath: string, sessionId: string,
     }
     // A continuation can ask another question. Keep its ACP transport alive
     // until that request has also been answered and its continuation completed.
-    if (db.prepare("SELECT request_id FROM questionnaire_requests WHERE session_id = ? AND status = 'pending' LIMIT 1").get(sessionId)) return { state: 'waiting' };
+    if (db.prepare("SELECT request_id FROM questionnaire_requests WHERE session_id = ? AND rowid > ? AND status = 'pending' LIMIT 1").get(sessionId, afterRowId)) return { state: 'waiting' };
     if (!lastTurn) throw new Error('mcode ACP 问卷续跑缺少原生轮次');
     const row = db.prepare("SELECT data_json FROM local_runtime_message_rows WHERE session_id = ? AND turn_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1")
       .get(sessionId, lastTurn.turnId) as { data_json: string } | undefined;

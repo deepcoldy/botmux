@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
 import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
@@ -260,14 +260,16 @@ describe('prepareDirectSandbox mcode data alias', () => {
       expect(plan.args).not.toContain(f.alias);
     } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
   });
-  it.each(['missing', 'denied', 'collision'] as const)('rejects an alias with %s access instead of expanding the grant', scenario => {
+  it.each(['missing', 'parent-only', 'denied', 'collision'] as const)('rejects an alias with %s access instead of expanding the grant', scenario => {
     if (process.platform !== 'linux') return;
     const f = fixture();
     const baseline = prepareDirectSandbox(f.opts);
     try {
       if (!baseline) return;
       baseline.cleanup();
-      const rules = scenario === 'missing' ? [] : [...f.opts.policy.rules,
+      const rules = scenario === 'missing' ? [] : scenario === 'parent-only'
+        ? [{ path: dirname(f.target), access: 'readWrite' as const, source: 'user' as const }]
+        : [...f.opts.policy.rules,
         { path: scenario === 'denied' ? f.target : f.alias, access: 'deny' as const, source: 'user' as const }];
       expect(() => prepareDirectSandbox({ ...f.opts, policy: { ...f.opts.policy, rules }, minimaxDataDir: f.alias })).toThrow(/exact canonical writable grant/);
       expect(existsSync(join(f.opts.dataDir, 'sandboxes', f.opts.sessionId))).toBe(false);

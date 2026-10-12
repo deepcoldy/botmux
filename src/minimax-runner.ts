@@ -86,6 +86,7 @@ async function drain(): Promise<void> {
           permission: permission as 'full' | 'smart', timeoutMs };
         const result = transport === 'acp' ? await runMinimaxAcp({ ...common,
           onSession(sessionId) {
+            if (nativeSessionId === sessionId) return;
             nativeSessionId = sessionId;
             output.marker('thread', { threadId: sessionId });
           },

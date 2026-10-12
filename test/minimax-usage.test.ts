@@ -144,6 +144,17 @@ describe('MiniMax native usage and card runtime', () => {
     expect(readMinimaxUsage(path, sid, true)?.model).toBeUndefined();
   });
 
+  it('rejects a four-segment metadata path containing a parent traversal even when matching artifacts exist', () => {
+    const unsafe = '2026/10/../outside';
+    const dir = join(root, 'v2', 'sessions', unsafe);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ sessionId: sid }));
+    writeFileSync(join(dir, 'llm-call.json'), JSON.stringify({ model: 'unsafe-model', thinkingLevel: 'high' }));
+    db.prepare('UPDATE local_runtime_sessions SET history_relative_dir = ? WHERE session_id = ?').run(unsafe, sid);
+    expect(readMinimaxUsage(path, sid, true)?.model).toBeUndefined();
+    expect(readMinimaxUsage(path, sid, true)?.reasoningEffort).toBeUndefined();
+  });
+
   it('falls back to native usage model when request metadata is absent or malformed', () => {
     usage('first', 100, 10);
     writeFileSync(join(root, 'v2', 'sessions', history, 'llm-call.json'), 'broken-json');

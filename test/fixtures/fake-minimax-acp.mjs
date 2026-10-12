@@ -21,6 +21,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line); log({ message });
   const { method, id, params } = message;
   if (method === 'initialize') send({ id, result: { protocolVersion: scenario === 'version' ? 2 : 1,
+    ...(scenario === 'native-questionnaire' ? { agentInfo: { name: 'minimax-code' } } : {}),
     agentCapabilities: { loadSession: true, sessionCapabilities: scenario === 'load' ? {} : { resume: {} } } } });
   else if (method === 'session/new') { sessionId = 'session_fixture'; send({ id, result: { sessionId, ...control } }); }
   else if (method === 'session/resume' || method === 'session/load') {
@@ -36,11 +37,13 @@ for await (const line of createInterface({ input: process.stdin })) {
     if (prompt === 'crash') { process.exit(4); }
     if (prompt === 'invalid-json') { process.stdout.write('invalid json\n'); continue; }
     if (prompt === 'oversize') { process.stdout.write('x'.repeat(8_000_001)); continue; }
+    if (prompt === 'oversize-stderr') { process.stderr.write('x'.repeat(8_000_001)); continue; }
     if (prompt === 'unknown-response') { send({ id: 999, result: {} }); continue; }
     if (prompt === 'foreign-update') {
       send({ method: 'session/update', params: { sessionId: 'foreign', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'foreign' } } } }); continue;
     }
     if (['ask', 'foreign-ask', 'early-complete', 'permission'].includes(prompt)) {
+      if (scenario === 'native-questionnaire') update({ sessionUpdate: 'tool_call', toolCallId: 'questionnaire', title: 'ask_user' });
       send({ id: 'native-question', method: prompt === 'permission' ? 'session/request_permission' : 'elicitation/create', params: {
         sessionId: prompt === 'foreign-ask' ? 'foreign' : sessionId,
         ...(prompt === 'permission' ? { toolCall: { title: 'Write fixture' }, options: [

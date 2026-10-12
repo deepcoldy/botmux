@@ -5,7 +5,7 @@ import { applySessionOwnerEnv } from '../utils/child-env.js';
 import { readMinimaxUsage } from './minimax-usage.js';
 import { minimaxDataDir } from './minimax-paths.js';
 import type { McodeExecOptions, McodeExecResult } from './mcode-exec.js';
-import { pendingMinimaxQuestionnaires, readMinimaxContinuation } from './minimax-acp-continuation.js';
+import { minimaxQuestionnaireCursor, pendingMinimaxQuestionnaires, readMinimaxContinuation } from './minimax-acp-continuation.js';
 import { setTimeout as delay } from 'node:timers/promises';
 
 type Json = Record<string, any>;
@@ -45,6 +45,7 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
   const pending = new Map<number, { method: string; resolve: (value: Json) => void; reject: (error: Error) => void; timer?: ReturnType<typeof setTimeout> }>();
   const incoming = new Set<number | string>();
   const nativeQuestions = new Set<string>();
+  let questionnaireCursor = 0;
   const dbPath = join(minimaxDataDir(env), 'v2', 'sqlite', 'runtime-state.sqlite');
   const exited = new Promise<void>(resolve => child.once('close', () => resolve()));
   const kill = (sig: NodeJS.Signals) => {
@@ -88,7 +89,9 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
         if (incoming.size >= 8) throw new Error('mcode_acp_too_many_questions');
         incoming.add(id);
         if (message.method === 'elicitation/create') {
-          for (const requestId of pendingMinimaxQuestionnaires(dbPath, sessionId, nativeRuntime)) nativeQuestions.add(requestId);
+          const questions = pendingMinimaxQuestionnaires(dbPath, sessionId, questionnaireCursor, nativeRuntime);
+          if (nativeRuntime && !questions.length) throw new Error('mcode ACP 缺少本轮原生问卷记录');
+          for (const requestId of questions) nativeQuestions.add(requestId);
           if (nativeQuestions.size > 32) throw new Error('mcode_acp_too_many_native_questions');
         }
         if (incoming.size === 1) opts.onInteractionPending?.(true);
@@ -200,6 +203,7 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
     }
     if (opts.effort) await configure('thinkingEffort', opts.effort);
     const before = readMinimaxUsage(dbPath, sessionId!, true)?.tokens;
+    questionnaireCursor = minimaxQuestionnaireCursor(dbPath, sessionId!, nativeRuntime);
     prompting = true;
     const result = await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: opts.content }] }, false);
     if (incoming.size || failure || inputSignal.aborted) throw failure ?? new Error('mcode_acp_question_incomplete');
@@ -207,7 +211,7 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
     if (nativeQuestions.size) {
       for (;;) {
         inputSignal.throwIfAborted();
-        const continuation = readMinimaxContinuation(dbPath, sessionId!, nativeQuestions);
+        const continuation = readMinimaxContinuation(dbPath, sessionId!, nativeQuestions, questionnaireCursor);
         if (continuation.state === 'completed' && !incoming.size) {
           if (content !== continuation.content) opts.onUpdate?.({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: continuation.content } });
           content = continuation.content;

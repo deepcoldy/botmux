@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncNow, type DatabaseSyncLike } from '../src/services/sqlite-compat.js';
-import { pendingMinimaxQuestionnaires, readMinimaxContinuation, minimaxUserTurnIds } from '../src/services/minimax-acp-continuation.js';
+import { minimaxQuestionnaireCursor, pendingMinimaxQuestionnaires, readMinimaxContinuation, minimaxUserTurnIds } from '../src/services/minimax-acp-continuation.js';
 let root: string; let path: string; let db: DatabaseSyncLike;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'botmux-acp-continuation-')); path = join(root, 'native.sqlite');
@@ -22,6 +22,28 @@ function answered(status = 'accepted') {
   db.prepare('INSERT INTO local_runtime_turn_ingress VALUES (?,?,?,?)').run('native', 'continuation-turn', status, status === 'completed' ? 3 : null);
 }
 describe('native questionnaire continuation completion proof', () => {
+  it('ignores stale pending requests while still waiting for new questionnaires in this prompt cycle', () => {
+    for (let i = 0; i < 20; i++) db.prepare('INSERT INTO questionnaire_requests VALUES (?,?,?,?,?)')
+      .run(`stale-${i}`, 'native', 'pending', null, 1);
+    const cursor = minimaxQuestionnaireCursor(path, 'native', true);
+    expect(pendingMinimaxQuestionnaires(path, 'native', cursor, true)).toEqual([]);
+    // Equal timestamps deliberately rule out a clock-based ownership boundary.
+    db.prepare('INSERT INTO questionnaire_requests VALUES (?,?,?,?,?)').run('fresh', 'native', 'pending', null, 1);
+    expect(pendingMinimaxQuestionnaires(path, 'native', cursor, true)).toEqual(['fresh']);
+    const requests = new Set(['fresh']);
+    expect(readMinimaxContinuation(path, 'native', requests, cursor)).toEqual({ state: 'waiting' });
+    db.exec("UPDATE questionnaire_requests SET status='answered', injected_at=2 WHERE request_id='fresh'");
+    db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id,source_context_json) VALUES (?,?,?,?,?)')
+      .run('native', 'user', 'questionnaire', 'fresh-turn', JSON.stringify({ origin: { requestId: 'fresh' } }));
+    db.exec("INSERT INTO local_runtime_turn_ingress VALUES ('native','fresh-turn','completed',3)");
+    db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,turn_id,data_json) VALUES (?,?,?,?)')
+      .run('native', 'assistant', 'fresh-turn', JSON.stringify({ msg_content: 'New answer completed' }));
+    expect(readMinimaxContinuation(path, 'native', requests, cursor)).toEqual({ state: 'completed', content: 'New answer completed' });
+    db.prepare('INSERT INTO questionnaire_requests VALUES (?,?,?,?,?)').run('fresh-two', 'native', 'pending', null, 1);
+    expect(readMinimaxContinuation(path, 'native', requests, cursor)).toEqual({ state: 'waiting' });
+    expect(db.prepare("SELECT status FROM questionnaire_requests WHERE request_id='question'").get()).toEqual({ status: 'pending' });
+  });
+
   it('keeps waiting after original end_turn until the answer is injected and its exact continuation finishes', () => {
     expect(pendingMinimaxQuestionnaires(path, 'native')).toEqual(['question']);
     expect(read()).toEqual({ state: 'waiting' });
