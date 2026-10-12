@@ -9,6 +9,11 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+
+vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
+  validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+}));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient {
@@ -56,6 +61,7 @@ describe('bot-config store', () => {
     // Isolate the allowedUsers sidecar (setBotAllowedUsers writes it) into the
     // same tmp dir so tests don't pollute the real ~/.botmux/data.
     process.env.SESSION_DATA_DIR = dir;
+    vi.mocked(validateCodexServiceTier).mockReset().mockResolvedValue({ ok: true });
   });
   afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; });
 
@@ -1020,6 +1026,72 @@ describe('bot-config store', () => {
     expect(readConfig().reasoningEffort).toBe('xhigh');
     expect(registry.getBot('app_default').config.model).toBe('GPT-5.5');
     expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
+  });
+
+  it('serviceTier is a codex-only next-session enum field', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('serviceTier')!;
+    expect(spec.kind).toBe('enum');
+    expect(spec.effect).toBe('next-session');
+    expect(store.coerceConfigValue(spec, 'PRIORITY')).toEqual({ ok: true, value: 'priority' });
+    expect(store.coerceConfigValue(spec, 'fast')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const explicitDefault = await store.applyConfigField('app_default', spec, 'default');
+    expect(explicitDefault.ok).toBe(true);
+    expect(readConfig().serviceTier).toBe('default');
+    expect(registry.getBot('app_default').config.serviceTier).toBe('default');
+
+    const cleared = await store.applyConfigField('app_default', spec, null);
+    expect(cleared.ok).toBe(true);
+    expect(readConfig().serviceTier).toBeUndefined();
+    expect(registry.getBot('app_default').config.serviceTier).toBeUndefined();
+  });
+
+  it('validates accelerated serviceTier against the actual model catalog', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex', model: 'gpt-6.1-sol' });
+    const spec = store.findConfigField('serviceTier')!;
+    vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'not_supported_by_model' });
+    const rejected = await store.applyConfigField('app_default', spec, 'ultrafast');
+    expect(rejected).toEqual({ ok: false, reason: 'service_tier_not_supported_by_model' });
+    expect(validateCodexServiceTier).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'gpt-6.1-sol',
+      serviceTier: 'ultrafast',
+    }));
+    expect(readConfig().serviceTier).toBeUndefined();
+    expect(registry.getBot('app_default').config.serviceTier).toBeUndefined();
+
+    const saved = await store.applyConfigField('app_default', spec, 'priority');
+    expect(saved.ok).toBe(true);
+    expect(readConfig().serviceTier).toBe('priority');
+  });
+
+  it('rejects accelerated serviceTier without a model and rechecks when model changes', async () => {
+    const { store } = await loaded({ cliId: 'codex', model: 'gpt-6.1-sol', serviceTier: 'priority' });
+    const tierSpec = store.findConfigField('serviceTier')!;
+    vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'model_required' });
+    const rejected = await store.applyConfigField('app_default', tierSpec, 'priority');
+    expect(rejected).toEqual({ ok: false, reason: 'service_tier_model_required' });
+
+    const modelSpec = store.findConfigField('model')!;
+    vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'catalog_unavailable' });
+    const changedModel = await store.applyConfigField('app_default', modelSpec, 'gpt-6-astra');
+    expect(changedModel).toEqual({ ok: false, reason: 'service_tier_catalog_unavailable' });
+  });
+
+  it('rejects serviceTier writes for unsupported CLIs and clears it when switching CLI', async () => {
+    const unsupported = await loaded({ cliId: 'gemini' });
+    const spec = unsupported.store.findConfigField('serviceTier')!;
+    const rejected = await unsupported.store.applyConfigField('app_default', spec, 'priority');
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.reason).toBe('service_tier_not_supported');
+    expect(readConfig().serviceTier).toBeUndefined();
+
+    const switched = await loaded({ cliId: 'codex', serviceTier: 'ultrafast' });
+    const cliSpec = switched.store.findConfigField('cli')!;
+    const switchedCli = await switched.store.applyConfigField('app_default', cliSpec, 'claude-code');
+    expect(switchedCli.ok).toBe(true);
+    expect(readConfig().serviceTier).toBeUndefined();
+    expect(switched.registry.getBot('app_default').config.serviceTier).toBeUndefined();
   });
 
   it('replyDelivery: defaults to send on every CLI; both values persist; unset clears back to that default', async () => {

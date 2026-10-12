@@ -2836,6 +2836,32 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('forwards --service-tier into thread/start as a top-level field', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-tier-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      extraArgs: ['--service-tier', 'priority'],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart).toBeTruthy();
+      expect(threadStart.params.serviceTier).toBe('priority');
+      expect(threadStart.params.config?.serviceTier).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-browser-tool-'));
     const fakeCodex = join(dir, 'fake-codex');
@@ -2869,7 +2895,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('SUPPRESSES model/effort on thread/resume even when --model/--reasoning-effort are passed (no resume drift)', async () => {
+  it('SUPPRESSES model/effort on thread/resume but keeps --service-tier (thread-level tier)', async () => {
     // PR #639 P2 regression lock, runner side: a resume (--thread-id present)
     // routes to thread/resume, and even though the adapter still forwards
     // --model/--reasoning-effort on argv, the resume request must carry NEITHER
@@ -2888,6 +2914,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         '--thread-id', 'thread-existing-1',
         '--model', 'gpt-5.6-terra',
         '--reasoning-effort', 'xhigh',
+        '--service-tier', 'priority',
         '--browser-family', 'chrome',
       ],
     });
@@ -2902,6 +2929,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(start).toBeFalsy();            // a warm resume must not fresh-start
       expect(resume.params.model).toBeUndefined();                          // no top-level model
       expect(resume.params.config?.model_reasoning_effort).toBeUndefined(); // no effort
+      expect(resume.params.serviceTier).toBe('priority');                    // tier is thread-level
       expect(resume.params.dynamicTools).toEqual([
         expect.objectContaining({
           type: 'function',
@@ -2988,6 +3016,100 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
       await waitFor(harness, () => control.finals.length >= 1);
       expect(control.finals[0].usage).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Codex App live reasoning effort', () => {
+  it.each([
+    ['effort-live', 'ultra', 'applied', true],
+    ['effort-paginated', 'high', 'applied', true],
+    ['effort-resume', 'high', 'applied', true],
+    ['effort-race', 'high', 'future_only', true],
+    ['effort-partial', 'high', 'future_only', true],
+    ['effort-feature-disabled', 'high', 'future_only', true],
+    ['effort-rejected', 'high', 'future_only', true],
+    ['effort-thread-rejected', 'high', 'error', false],
+    ['effort-model-missing', 'high', 'error', false],
+    ['effort-empty-choices', 'high', 'invalid', false],
+    ['effort-unsupported', 'high', 'error', false],
+    ['effort-invalid', 'ultra', 'invalid', false],
+    ['success', 'high', 'future_only', false],
+  ] as const)('%s updates settings without starting or steering a model turn', async (behavior, effort, status, updatesTurn) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-effort-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path,
+      behavior === 'effort-resume' ? { threadId: 'thread-fake' } : {});
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      if (behavior !== 'success') {
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('business task', undefined, 'om_business')}\r`);
+        await waitFor(harness, () => harness.stdout.includes('effort task running'));
+      }
+      const before = readRequests(logPath).filter(r => r.method === 'turn/start' || r.method === 'turn/steer').length;
+      harness.child.stdin.write(`${CONTROL_PREFIX}${Buffer.from(JSON.stringify({ type: 'effort', requestId: 'request-effort', effort })).toString('base64')}\r`);
+      await waitFor(harness, () => control.markers.some(m => m.kind === 'effort_result'));
+      const result = control.markers.find(m => m.kind === 'effort_result')?.payload;
+      expect(result).toMatchObject({ requestId: 'request-effort', status });
+      expect(result?.reason).toBe(behavior === 'effort-feature-disabled' ? 'step_model_switching_disabled'
+        : behavior === 'effort-race' ? 'target_unavailable' : undefined);
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => r.method === 'model/list').every(r => r.params.includeHidden === true)).toBe(true);
+      if (behavior === 'effort-paginated') {
+        expect(requests.filter(r => r.method === 'model/list').map(r => r.params.cursor)).toEqual([undefined, 'next-model-page', 'last-model-page']);
+      }
+      expect(requests.filter(r => r.method === 'turn/start' || r.method === 'turn/steer')).toHaveLength(before);
+      expect(requests.filter(r => r.method === 'thread/settings/update').map(r => r.params)).toEqual(status === 'invalid' || behavior === 'effort-model-missing' ? [] : [{ threadId: 'thread-fake', effort }]);
+      if (status === 'invalid') expect(result?.choices).toEqual(behavior === 'effort-empty-choices' ? [] : ['low', 'medium']);
+      expect(requests.filter(r => r.method === 'turn/settings/update').map(r => r.params)).toEqual(updatesTurn ? [{ threadId: 'thread-fake', turnId: 'turn-fake-1', effort }] : []);
+      expect(requests.some(r => r.method === 'turn/interrupt')).toBe(false);
+      expect(control.finals).toEqual([]);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent effort commands through the active-turn response', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-effort-serial-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'effort-serial', control.bootstrap.path);
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('business task', undefined, 'om_business')}\r`);
+      await waitFor(harness, () => harness.stdout.includes('effort task running'));
+      harness.child.stdin.write(['low', 'high'].map(effort =>
+        `${CONTROL_PREFIX}${Buffer.from(JSON.stringify({ type: 'effort', requestId: effort, effort })).toString('base64')}\r`,
+      ).join(''));
+      await waitFor(harness, () => control.markers.filter(m => m.kind === 'effort_result').length === 2);
+      expect(control.markers.filter(m => m.kind === 'effort_result').map(m => m.payload)).toEqual([
+        { requestId: 'low', status: 'applied' },
+        { requestId: 'high', status: 'applied' },
+      ]);
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => ['model/list', 'thread/settings/update', 'turn/settings/update'].includes(r.method))
+        .map(r => [r.method, r.params.effort])).toEqual([
+        ['model/list', undefined], ['thread/settings/update', 'low'], ['turn/settings/update', 'low'],
+        ['model/list', undefined], ['thread/settings/update', 'high'], ['turn/settings/update', 'high'],
+      ]);
+      expect(requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
+      expect(requests.some(r => r.method === 'turn/steer' || r.method === 'turn/interrupt')).toBe(false);
+      expect(control.finals).toEqual([]);
     } finally {
       await stopChild(harness.child);
       await control.close();

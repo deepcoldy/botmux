@@ -21,7 +21,8 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
+import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
   resolveSkillInjectionModeForApp,
@@ -236,6 +237,10 @@ async function resumeRestoredPendingRepoSetup(
         codexAppText: ds.pendingCodexAppText,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: ds.pendingCodexAppMessageContext,
+        // This recovery completes the original fresh pending-repo launch.
+        // `hasHistory` may be true after daemon restore, but the paired
+        // forkWorker call below is authoritatively resume:false.
+        larkToolResume: false,
       },
     );
     rememberLastCliInput(ds, setup.prompt, input);
@@ -1220,10 +1225,49 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
-function credentialBoundaryForPrompt(larkAppId: string | undefined, locale?: Locale): string {
+function managedLarkToolAppIdForPrompt(
+  larkAppId: string | undefined,
+  sessionId: string,
+  chatId: string | undefined,
+  resume: boolean,
+): string | undefined {
+  if (!larkAppId) return undefined;
+  if (!chatId) return undefined;
+  try {
+    const botConfig = getBot(larkAppId).config;
+    const session = sessionStore.getSession(sessionId);
+    return usesLarkToolBinding({
+      sessionId,
+      larkAppId,
+      chatId,
+      apiOnly: botConfig.apiOnly,
+      resume,
+      forkSession: session?.pendingForkSession,
+      adoptMode: !!session?.adoptedFrom,
+      existingAppServerEndpoint: session?.existingAppServerEndpoint,
+      backendType: session?.backendType ?? botConfig.backendType ?? config.daemon.backendType,
+    }, config.session.dataDir, process.env.BOTMUX_WORKFLOW === '1')
+      ? larkAppId
+      : undefined;
+  } catch { return undefined; }
+}
+
+function credentialBoundaryForPrompt(
+  larkAppId: string | undefined,
+  sessionId: string,
+  chatId: string | undefined,
+  resume: boolean,
+  locale?: Locale,
+): string {
   if (!larkAppId) return '';
-  try { return buildCredentialBoundaryBlock(getBot(larkAppId).config.triggerUserAuth, locale); }
-  catch { return ''; }
+  try {
+    const policy = getBot(larkAppId).config.triggerUserAuth;
+    return buildManagedLarkToolPromptBlocks(
+      policy,
+      managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
+      locale,
+    );
+  } catch { return ''; }
 }
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
@@ -1281,6 +1325,13 @@ type NewTopicOpts = {
   sharedGroupContext?: string;
   turnId?: string;
   sessionBackendType?: BackendType;
+  /** Exact worker launch decision for this opening input. This cannot be
+   * inferred from persisted prompt/history fields: a failed fresh start may
+   * already have lastCliInput, while a legacy empty-start session may deliver
+   * its first user message through an already resumed live worker. Omission is
+   * treated as resume=true (legacy-safe): an uncertain caller must not claim a
+   * managed bot binding that may not exist. */
+  larkToolResume?: boolean;
   /** replyDelivery=transcript 且本轮是 solo 会话（daemon 算好的 ds.soloSession）：
    *  去掉 <user_message> 壳与 sender/attachments/mentions 块，改用裸文本 +
    *  `[附件]`/`[@提及]` 行（buildBridgeInputContent）。send 模式下忽略。 */
@@ -1442,7 +1493,13 @@ function buildNewTopicBlocks(
     // hook-capable this is the difference between the agent seeing the boundary
     // and not. An envelope the CLI cannot read drops the block silently —
     // nothing errors when a constraint is merely absent.
-    const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, locale);
+    const credentialBoundary = credentialBoundaryForPrompt(
+      opts?.larkAppId,
+      sessionId,
+      opts?.chatId,
+      opts?.larkToolResume !== false,
+      locale,
+    );
     if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
@@ -1540,6 +1597,8 @@ export function buildNewTopicCliInput(
     turnId?: string;
     /** 会话冻结的后端类型，用于 hook 模式判定（远端后端无本地 hook 进程）。 */
     sessionBackendType?: BackendType;
+    /** 见 NewTopicOpts 同名字段。 */
+    larkToolResume?: boolean;
   },
 ): CliTurnPayload {
   opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
@@ -4516,7 +4575,16 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, trustedCaller: scheduledTrustedCaller, promptInjection: sessionPromptInjection(ds) });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, {
+      larkAppId,
+      chatId: task.chatId,
+      whiteboardId: ds.session.whiteboardId,
+      trustedCaller: scheduledTrustedCaller,
+      promptInjection: sessionPromptInjection(ds),
+      // This branch always creates a fresh Session; the paired forkWorker call
+      // below receives no resume flag.
+      larkToolResume: false,
+    });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -4628,6 +4696,9 @@ async function forkOrShowRepoCard(
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
       codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+      // createSession's direct/pending-repo launch is fresh. Any continuation
+      // was handled before this builder is reached.
+      larkToolResume: false,
     },
   );
 

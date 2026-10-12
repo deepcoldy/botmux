@@ -12,6 +12,11 @@ import {
   type Page,
 } from 'playwright';
 import { spawnTsScript } from '../helpers/ts-runner.js';
+import {
+  E2E_VIDEO_DIR,
+  e2eVideoRecordingEnabled,
+  publishPageVideo,
+} from '../e2e-browser/e2e-video.js';
 
 interface DashboardContext {
   agent?: PlaywrightAgent;
@@ -129,12 +134,33 @@ const dashboardSetup = defineProjectSetup<DashboardContext>({
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     });
     onTeardown(() => browser.close());
+    const recordVideo = e2eVideoRecordingEnabled();
+    if (recordVideo) await mkdir(E2E_VIDEO_DIR, { recursive: true });
     const browserContext = await browser.newContext({
       locale: 'en-US',
       viewport: { width: 1440, height: 960 },
+      ...(recordVideo
+        ? {
+            recordVideo: {
+              dir: E2E_VIDEO_DIR,
+              size: { width: 1440, height: 960 },
+            },
+          }
+        : {}),
     });
-    onTeardown(() => browserContext.close());
     const page = await browserContext.newPage();
+    onTeardown(async () => {
+      await browserContext.close();
+      try {
+        await publishPageVideo(
+          page,
+          'Navigate the core read-only Dashboard pages',
+          'dashboard-smoke',
+        );
+      } catch (error) {
+        console.error('Dashboard video publish failed:', error);
+      }
+    });
     const response = await page.goto(`http://127.0.0.1:${port}/`, {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,

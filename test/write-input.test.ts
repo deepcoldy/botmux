@@ -1345,6 +1345,10 @@ Active whiteboard content
   <name>Project Group</name>
 </chat_context>
 
+<botmux_lark_tool>
+  lark-cli defaults to the current bot.
+</botmux_lark_tool>
+
 Fix the test suite failure on CI
 
 <sender type="user" id="ou_123" />
@@ -1356,6 +1360,7 @@ Fix the test suite failure on CI
     expect(hookPayload).not.toContain('chat_context');
     expect(hookPayload).not.toContain('whiteboard');
     expect(hookPayload).not.toContain('attachments');
+    expect(hookPayload).not.toContain('botmux_lark_tool');
 
     // ReDoS safety on unclosed <user_message>
     const unclosed = '<user_message>'.repeat(3000) + 'safe content';

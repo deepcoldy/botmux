@@ -33,6 +33,13 @@ function store(order: string[]): DurableCoordinationStore {
     retryOutboxAttempt: vi.fn(),
     markOutboxAmbiguous: vi.fn(),
     readOutbox: vi.fn(),
+    enqueueControlOperation: vi.fn(),
+    beginControlOperationAttempt: vi.fn(),
+    completeControlOperationAttempt: vi.fn(),
+    retryControlOperationAttempt: vi.fn(),
+    markControlOperationAmbiguous: vi.fn(),
+    reconcileControlOperation: vi.fn(),
+    readControlOperation: vi.fn(),
     close: vi.fn(async () => undefined),
   };
 }

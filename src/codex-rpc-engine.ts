@@ -32,6 +32,8 @@ import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
   isExactCodexOutputLimitError,
 } from './services/codex-transcript.js';
+import type { CodexServiceTier } from './services/codex-service-tier.js';
+import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
@@ -86,6 +88,7 @@ export interface CodexRpcEngineOpts {
   model?: string;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   /** Feature gates owned by the app-server process (the viewer TUI does not
    *  execute model tools in RPC mode). */
   appServerFeatures?: string[];
@@ -111,10 +114,17 @@ export interface CodexRpcEngineDependencies {
   /** Process boundary kept injectable so launch argv/env can be verified without
    * relying on platform-specific process introspection such as Linux /proc. */
   spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
+  validateServiceTier?(input: {
+    cliBin: string;
+    env: NodeJS.ProcessEnv;
+    model?: string;
+    serviceTier?: CodexServiceTier;
+  }): Promise<CodexServiceTierCheck>;
 }
 
 const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
   spawnProcess: (command, args, options) => spawn(command, args, options),
+  validateServiceTier: validateCodexServiceTier,
 };
 
 export interface CodexRpcTurnIdentity {
@@ -299,6 +309,13 @@ export class CodexRpcEngine {
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
     this.reapStaleAppServer();
+    const tierCheck = await (this.dependencies.validateServiceTier ?? validateCodexServiceTier)({
+      cliBin: this.opts.cliBin,
+      env: this.opts.env,
+      model: this.opts.model,
+      serviceTier: this.opts.serviceTier,
+    });
+    if (!tierCheck.ok) throw new Error(`Codex service tier rejected: ${tierCheck.error}`);
     this.port = await findFreePort();
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
@@ -353,7 +370,8 @@ export class CodexRpcEngine {
     // therefore silently drifts model/provider whenever the app-server default
     // changed between restarts. Verified on codex-cli 0.145.0 + traecli 0.200.19.
     // The safe path is to send nothing model-related and let the app-server
-    // restore the full persisted triple. Fresh thread/start still stamps both.
+    // restore the full persisted triple. serviceTier is a thread-level tier and
+    // remains the only non-model resume override. Fresh thread/start stamps it too.
     const params: Json = { ...this.threadParams(true), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
     const r = await this.request('thread/resume', params);
@@ -383,6 +401,7 @@ export class CodexRpcEngine {
       ephemeral: false,
       persistExtendedHistory: true,
       config,
+      ...(this.opts.serviceTier ? { serviceTier: this.opts.serviceTier } : {}),
     };
   }
 

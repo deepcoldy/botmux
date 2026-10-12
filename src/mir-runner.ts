@@ -37,6 +37,7 @@ import {
 import { normalizeMircliPrompt } from './mir-prompt.js';
 import { resolveMirRunnerTimeoutMs } from './mir-runner-config.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 
 interface Args {
   sessionId: string;
@@ -157,6 +158,8 @@ function runtimeSystemPrompt(): string {
     'Do not say the local MCP bridge is disconnected, that only a cloud sandbox is available, or that the operation is cancelled unless a concrete local tool invocation actually returned that error.',
     'If a local tool invocation fails, report the exact failed operation and error concisely, then stop or ask for the missing input.',
   );
+  const larkPrompt = larkToolPromptFromEnv(args.locale);
+  if (larkPrompt) lines.push(larkPrompt);
   return [
     ...lines,
   ].join('\n');

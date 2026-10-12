@@ -5,27 +5,38 @@ import { canonicalJson } from '../utils/canonical-input-hash.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 import type {
   AcquireSessionLeaseInput,
+  BeginControlOperationAttemptInput,
+  BeginControlOperationAttemptResult,
   BeginOutboxAttemptInput,
   BeginOutboxAttemptResult,
   ClaimInboxInput,
+  CompleteControlOperationAttemptInput,
   CompleteOutboxAttemptInput,
+  ControlOperationAttempt,
+  ControlOperationMutationResult,
   DurableCoordinationStore,
+  DurableControlOperationRecord,
   DurableInboxEvent,
   DurableInsertResult,
   DurableJson,
   DurableOutboxRecord,
   DurableSessionRecord,
+  EnqueueControlOperationInput,
   EnqueueOutboxInput,
   InboxClaim,
   InboxClaimMutationResult,
   LeaseMutationResult,
+  MarkControlOperationAmbiguousInput,
   MarkOutboxAmbiguousInput,
   OutboxAttempt,
   OutboxMutationResult,
   OutboxReservation,
+  ReconcileControlOperationInput,
+  ReconcileControlOperationResult,
   RenewInboxClaimInput,
   RenewSessionLeaseInput,
   ReserveOutboxInput,
+  RetryControlOperationAttemptInput,
   RetryInboxClaimInput,
   RetryOutboxAttemptInput,
   SessionLease,
@@ -35,7 +46,7 @@ import type {
 } from './durable-coordination.js';
 import { DURABLE_INBOX_LANE_LARK_MESSAGE } from './durable-coordination.js';
 
-export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 2;
+export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 3;
 
 export interface SqliteDurableCoordinationOptions {
   /** 测试 seam；生产默认使用当前进程时钟。 */
@@ -117,6 +128,25 @@ CREATE TABLE IF NOT EXISTS durable_outbox_order (
 );
 INSERT OR IGNORE INTO durable_outbox_order(message_id)
   SELECT message_id FROM durable_outbox ORDER BY created_at, message_id;
+
+CREATE TABLE IF NOT EXISTS durable_control_operations (
+  operation_id TEXT PRIMARY KEY,
+  session_key TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  origin_epoch INTEGER NOT NULL CHECK(origin_epoch >= 1),
+  state TEXT NOT NULL CHECK(state IN ('pending', 'attempting', 'ambiguous', 'completed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  attempt_owner TEXT,
+  attempt_epoch INTEGER CHECK(attempt_epoch IS NULL OR attempt_epoch >= 1),
+  result_json TEXT,
+  reconciliation_json TEXT,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS durable_control_session_state_idx
+  ON durable_control_operations(session_key, state, created_at, operation_id);
 `;
 
 type LeaseRow = {
@@ -158,6 +188,22 @@ type OutboxRow = {
   claim_until: number | null;
   attempts: number;
   receipt_json: string | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type ControlOperationRow = {
+  operation_id: string;
+  session_key: string;
+  payload_json: string;
+  origin_epoch: number;
+  state: DurableControlOperationRecord['state'];
+  attempts: number;
+  attempt_owner: string | null;
+  attempt_epoch: number | null;
+  result_json: string | null;
+  reconciliation_json: string | null;
   last_error: string | null;
   created_at: number;
   updated_at: number;
@@ -250,6 +296,24 @@ function outboxRecord(row: OutboxRow): DurableOutboxRecord {
   };
 }
 
+function controlOperationRecord(row: ControlOperationRow): DurableControlOperationRecord {
+  return {
+    operationId: row.operation_id,
+    sessionKey: row.session_key,
+    payload: parseJson(row.payload_json),
+    createdAt: Number(row.created_at),
+    state: row.state,
+    originEpoch: Number(row.origin_epoch),
+    attempts: Number(row.attempts),
+    ...(row.result_json !== null ? { result: parseJson(row.result_json) } : {}),
+    ...(row.reconciliation_json !== null
+      ? { reconciliation: parseJson(row.reconciliation_json) }
+      : {}),
+    ...(row.last_error !== null ? { lastError: row.last_error } : {}),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
 /**
  * 本地参考实现。它使用异步合同包裹同步 SQLite 事务，从而让调用方与远程数据库实现
  * 共用同一套接口；现有 BotMux 单机路径在显式接线前不会改变。
@@ -270,17 +334,30 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     const existing = this.db.prepare(
       'SELECT schema_version FROM durable_coordination_meta WHERE singleton = 1',
     ).get() as { schema_version: number } | undefined;
-    if (existing && Number(existing.schema_version) === 1) {
+    let schemaVersion = existing ? Number(existing.schema_version) : undefined;
+    if (schemaVersion === 1) {
       this.transaction(() => {
         this.db.exec(
           "ALTER TABLE durable_inbox ADD COLUMN lane TEXT NOT NULL DEFAULT 'lark-message';",
         );
         this.db.prepare(
           'UPDATE durable_coordination_meta SET schema_version = ? WHERE singleton = 1',
-        ).run(SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION);
+        ).run(2);
       });
-    } else if (existing && Number(existing.schema_version) !== SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION) {
-      throw new Error(`unsupported durable coordination schema version ${existing.schema_version}`);
+      schemaVersion = 2;
+    }
+    if (schemaVersion === 2) {
+      // v3 只新增独立 control operation 表；上面的 idempotent schema DDL
+      // 已创建它，这里只在同一连接内推进持久版本号。
+      this.transaction(() => {
+        this.db.prepare(
+          'UPDATE durable_coordination_meta SET schema_version = ? WHERE singleton = 1',
+        ).run(3);
+      });
+      schemaVersion = 3;
+    }
+    if (schemaVersion !== undefined && schemaVersion !== SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION) {
+      throw new Error(`unsupported durable coordination schema version ${schemaVersion}`);
     }
     this.db.prepare(
       'INSERT INTO durable_coordination_meta(singleton, schema_version) VALUES(1, ?) '
@@ -781,6 +858,252 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
   async readOutbox(messageId: string): Promise<DurableOutboxRecord | undefined> {
     const row = this.selectOutbox(nonempty(messageId, 'messageId'));
     return row ? outboxRecord(row) : undefined;
+  }
+
+  private selectControlOperation(operationId: string): ControlOperationRow | undefined {
+    return this.db.prepare(
+      `SELECT operation_id, session_key, payload_json, origin_epoch, state, attempts,
+              attempt_owner, attempt_epoch, result_json, reconciliation_json,
+              last_error, created_at, updated_at
+         FROM durable_control_operations WHERE operation_id = ?`,
+    ).get(operationId) as ControlOperationRow | undefined;
+  }
+
+  async enqueueControlOperation(
+    input: EnqueueControlOperationInput,
+  ): Promise<DurableInsertResult | { kind: 'stale_lease' }> {
+    if (input.operation.sessionKey !== input.lease.sessionKey) {
+      throw new Error('control operation sessionKey must match the fencing lease');
+    }
+    const operationId = nonempty(input.operation.operationId, 'operationId');
+    timestamp(input.operation.createdAt, 'createdAt');
+    const now = this.now();
+    const payload = encoded(input.operation.payload);
+    return this.transaction(() => {
+      if (!this.leaseIsCurrent(input.lease, now)) return { kind: 'stale_lease' as const };
+      const inserted = this.db.prepare(
+        `INSERT INTO durable_control_operations(
+           operation_id, session_key, payload_json, payload_hash, origin_epoch,
+           state, created_at, updated_at
+         ) VALUES(?, ?, ?, ?, ?, 'pending', ?, ?)
+         ON CONFLICT(operation_id) DO NOTHING`,
+      ).run(
+        operationId,
+        input.operation.sessionKey,
+        payload.json,
+        payload.hash,
+        input.lease.epoch,
+        input.operation.createdAt,
+        now,
+      );
+      if (Number(inserted.changes) === 1) return { kind: 'inserted' as const };
+      const current = this.db.prepare(
+        `SELECT session_key, payload_hash
+           FROM durable_control_operations WHERE operation_id = ?`,
+      ).get(operationId) as { session_key: string; payload_hash: string };
+      return current.session_key === input.operation.sessionKey && current.payload_hash === payload.hash
+        ? { kind: 'duplicate' as const }
+        : { kind: 'conflict' as const };
+    });
+  }
+
+  async beginControlOperationAttempt(
+    input: BeginControlOperationAttemptInput,
+  ): Promise<BeginControlOperationAttemptResult> {
+    const operationId = nonempty(input.operationId, 'operationId');
+    const now = this.now();
+    return this.transaction(() => {
+      if (!this.leaseIsCurrent(input.lease, now)) return { kind: 'stale_lease' as const };
+      let row = this.selectControlOperation(operationId);
+      if (!row) return { kind: 'not_found' as const };
+      if (row.session_key !== input.lease.sessionKey) {
+        throw new Error('control operation sessionKey must match the fencing lease');
+      }
+
+      // A different current Session lease proves the previous attempting owner
+      // lost fencing. The provider may already have applied its request, so the
+      // new owner freezes the operation as result-unknown instead of replaying.
+      if (
+        row.state === 'attempting'
+        && (row.attempt_owner !== input.lease.ownerId || row.attempt_epoch !== input.lease.epoch)
+      ) {
+        this.db.prepare(
+          `UPDATE durable_control_operations
+              SET state = 'ambiguous',
+                  last_error = COALESCE(last_error, 'control attempt lost its session lease before result'),
+                  updated_at = ?
+            WHERE operation_id = ? AND state = 'attempting'`,
+        ).run(now, operationId);
+        row = this.selectControlOperation(operationId);
+        if (!row) throw new Error(`control operation ${operationId} disappeared`);
+      }
+
+      if (row.state !== 'pending') {
+        return { kind: 'not_pending' as const, record: controlOperationRecord(row) };
+      }
+      const begun = this.db.prepare(
+        `UPDATE durable_control_operations
+            SET state = 'attempting', attempts = attempts + 1,
+                attempt_owner = ?, attempt_epoch = ?, last_error = NULL, updated_at = ?
+          WHERE operation_id = ? AND state = 'pending'`,
+      ).run(input.lease.ownerId, input.lease.epoch, now, operationId);
+      if (Number(begun.changes) !== 1) {
+        row = this.selectControlOperation(operationId);
+        if (!row) return { kind: 'not_found' as const };
+        return { kind: 'not_pending' as const, record: controlOperationRecord(row) };
+      }
+      row = this.selectControlOperation(operationId);
+      if (!row) throw new Error(`attempting control operation ${operationId} disappeared`);
+      const record = controlOperationRecord(row);
+      const attempt: ControlOperationAttempt = {
+        operationId,
+        sessionKey: row.session_key,
+        ownerId: input.lease.ownerId,
+        leaseEpoch: input.lease.epoch,
+        attempt: record.attempts,
+      };
+      return { kind: 'applied' as const, record, attempt };
+    });
+  }
+
+  private settleControlOperationAttempt(
+    attempt: ControlOperationAttempt,
+    now: number,
+    state: 'pending' | 'ambiguous' | 'completed',
+    options: { resultJson?: string; error?: string },
+  ): ControlOperationMutationResult {
+    nonempty(attempt.operationId, 'operationId');
+    nonempty(attempt.sessionKey, 'sessionKey');
+    nonempty(attempt.ownerId, 'ownerId');
+    if (!Number.isSafeInteger(attempt.leaseEpoch) || attempt.leaseEpoch < 1) {
+      throw new Error('leaseEpoch must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(attempt.attempt) || attempt.attempt < 1) {
+      throw new Error('attempt must be a positive safe integer');
+    }
+    // Exact late success may settle ambiguous. Safe retry and explicit
+    // ambiguity are only legal while the same attempt is still attempting.
+    const eligibleState = state === 'completed'
+      ? "state IN ('attempting', 'ambiguous')"
+      : "state = 'attempting'";
+    const result = this.db.prepare(
+      `UPDATE durable_control_operations
+          SET state = ?, result_json = COALESCE(?, result_json),
+              last_error = ?, updated_at = ?
+        WHERE operation_id = ? AND session_key = ? AND ${eligibleState}
+          AND attempt_owner = ? AND attempt_epoch = ? AND attempts = ?`,
+    ).run(
+      state,
+      options.resultJson ?? null,
+      options.error ?? null,
+      now,
+      attempt.operationId,
+      attempt.sessionKey,
+      attempt.ownerId,
+      attempt.leaseEpoch,
+      attempt.attempt,
+    );
+    if (Number(result.changes) !== 1) return { kind: 'stale' };
+    const row = this.selectControlOperation(attempt.operationId);
+    if (!row) throw new Error(`settled control operation ${attempt.operationId} disappeared`);
+    return { kind: 'applied', record: controlOperationRecord(row) };
+  }
+
+  async completeControlOperationAttempt(
+    input: CompleteControlOperationAttemptInput,
+  ): Promise<ControlOperationMutationResult> {
+    const now = this.now();
+    const resultJson = canonicalJson(input.result);
+    return this.transaction(() => this.settleControlOperationAttempt(
+      input.attempt,
+      now,
+      'completed',
+      { resultJson },
+    ));
+  }
+
+  async retryControlOperationAttempt(
+    input: RetryControlOperationAttemptInput,
+  ): Promise<ControlOperationMutationResult> {
+    const now = this.now();
+    nonempty(input.error, 'error');
+    return this.transaction(() => this.settleControlOperationAttempt(
+      input.attempt,
+      now,
+      'pending',
+      { error: input.error },
+    ));
+  }
+
+  async markControlOperationAmbiguous(
+    input: MarkControlOperationAmbiguousInput,
+  ): Promise<ControlOperationMutationResult> {
+    const now = this.now();
+    nonempty(input.error, 'error');
+    return this.transaction(() => this.settleControlOperationAttempt(
+      input.attempt,
+      now,
+      'ambiguous',
+      { error: input.error },
+    ));
+  }
+
+  async reconcileControlOperation(
+    input: ReconcileControlOperationInput,
+  ): Promise<ReconcileControlOperationResult> {
+    const operationId = nonempty(input.operationId, 'operationId');
+    if (!Number.isSafeInteger(input.expectedAttempt) || input.expectedAttempt < 1) {
+      throw new Error('expectedAttempt must be a positive safe integer');
+    }
+    if (input.outcome.evidence === null) {
+      throw new Error('control reconciliation evidence must be non-null');
+    }
+    const reconciliationJson = canonicalJson({
+      kind: input.outcome.kind,
+      attempt: input.expectedAttempt,
+      evidence: input.outcome.evidence,
+    });
+    const resultJson = input.outcome.kind === 'completed'
+      ? canonicalJson(input.outcome.result)
+      : undefined;
+    const error = input.outcome.kind === 'not_applied'
+      ? nonempty(input.outcome.error, 'error')
+      : undefined;
+    const now = this.now();
+    return this.transaction(() => {
+      if (!this.leaseIsCurrent(input.lease, now)) return { kind: 'stale_lease' as const };
+      const row = this.selectControlOperation(operationId);
+      if (!row) return { kind: 'stale' as const };
+      if (row.session_key !== input.lease.sessionKey) {
+        throw new Error('control operation sessionKey must match the fencing lease');
+      }
+      const state = input.outcome.kind === 'completed' ? 'completed' : 'pending';
+      const settled = this.db.prepare(
+        `UPDATE durable_control_operations
+            SET state = ?, result_json = ?, reconciliation_json = ?,
+                last_error = ?, updated_at = ?
+          WHERE operation_id = ? AND state = 'ambiguous' AND attempts = ?`,
+      ).run(
+        state,
+        resultJson ?? null,
+        reconciliationJson,
+        error ?? null,
+        now,
+        operationId,
+        input.expectedAttempt,
+      );
+      if (Number(settled.changes) !== 1) return { kind: 'stale' as const };
+      const updated = this.selectControlOperation(operationId);
+      if (!updated) throw new Error(`reconciled control operation ${operationId} disappeared`);
+      return { kind: 'applied' as const, record: controlOperationRecord(updated) };
+    });
+  }
+
+  async readControlOperation(
+    operationId: string,
+  ): Promise<DurableControlOperationRecord | undefined> {
+    const row = this.selectControlOperation(nonempty(operationId, 'operationId'));
+    return row ? controlOperationRecord(row) : undefined;
   }
 
   async close(): Promise<void> {

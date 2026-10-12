@@ -1948,6 +1948,8 @@ async function triggerSessionTurnAdmitted(
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,
+      // Trigger sessions are newly created above and fork without resume.
+      larkToolResume: false,
     },
   );
   // No await from the ownership check through forkWorker. The reservation and

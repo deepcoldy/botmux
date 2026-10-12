@@ -10,7 +10,12 @@ This table lists all available Nodes. See [Node Details](#node-details) below fo
 
 | Node | Description |
 | --- | --- |
+| feishu.close | Click 关闭会话. The screen recording is published when the browser context closes. |
+| feishu.openAndSend | Open Feishu Messenger and send the case prompt. Codex also opens the thread and clicks 直接开启会话 before any streaming-card wait. |
 | feishu.runScenario | Run one migrated Botmux Feishu browser scenario |
+| feishu.showStreamingOutput | Scroll the streaming card into view and toggle 显示输出. Codex cases skip this. |
+| feishu.waitForBotResponse | Wait for the Claude ACK reply bubble, or a Codex-side response. The card title 等待输入 is not the success gate. |
+| feishu.waitForStreamingCard | Wait until the current session streaming card is visible. Codex cases skip this. |
 
 ## Where to use these Nodes
 
@@ -47,6 +52,62 @@ Each Node's returned `data` is saved on that Step's result. Results are not name
 
 ## Node Details
 
+### `feishu.close`
+
+Click 关闭会话. The screen recording is published when the browser context closes.
+
+**String shorthand:** Not supported by this Node.
+
+#### Input Schema
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "scenario": {
+      "enum": [
+        "bot-claude-basic",
+        "bot-codex-basic",
+        "bot-codex-prompt"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario"
+  ],
+  "type": "object"
+}
+```
+
+### `feishu.openAndSend`
+
+Open Feishu Messenger and send the case prompt. Codex also opens the thread and clicks 直接开启会话 before any streaming-card wait.
+
+**String shorthand:** Not supported by this Node.
+
+#### Input Schema
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "scenario": {
+      "enum": [
+        "bot-claude-basic",
+        "bot-codex-basic",
+        "bot-codex-prompt"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario"
+  ],
+  "type": "object"
+}
+```
+
 ### `feishu.runScenario`
 
 Run one migrated Botmux Feishu browser scenario
@@ -78,6 +139,90 @@ Run one migrated Botmux Feishu browser scenario
         "private-topic-reply",
         "scheduled-task-thread",
         "web-terminal"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario"
+  ],
+  "type": "object"
+}
+```
+
+### `feishu.showStreamingOutput`
+
+Scroll the streaming card into view and toggle 显示输出. Codex cases skip this.
+
+**String shorthand:** Not supported by this Node.
+
+#### Input Schema
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "scenario": {
+      "enum": [
+        "bot-claude-basic",
+        "bot-codex-basic",
+        "bot-codex-prompt"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario"
+  ],
+  "type": "object"
+}
+```
+
+### `feishu.waitForBotResponse`
+
+Wait for the Claude ACK reply bubble, or a Codex-side response. The card title 等待输入 is not the success gate.
+
+**String shorthand:** Not supported by this Node.
+
+#### Input Schema
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "scenario": {
+      "enum": [
+        "bot-claude-basic",
+        "bot-codex-basic",
+        "bot-codex-prompt"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "scenario"
+  ],
+  "type": "object"
+}
+```
+
+### `feishu.waitForStreamingCard`
+
+Wait until the current session streaming card is visible. Codex cases skip this.
+
+**String shorthand:** Not supported by this Node.
+
+#### Input Schema
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "scenario": {
+      "enum": [
+        "bot-claude-basic",
+        "bot-codex-basic",
+        "bot-codex-prompt"
       ],
       "type": "string"
     }

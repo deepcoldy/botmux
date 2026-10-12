@@ -24,7 +24,7 @@ import {
 /** 设计 §10 的字母表：命令 / 子命令 / 透传 / 冷启动 / 未注册 / 多行豁免 / 占位符 / 中文 / latin / 引号 / 大小写。 */
 const ALPHABET = [
   '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
-  '/context-sharing',
+  '/context-sharing', '/effort',
   '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
 ];
@@ -46,10 +46,10 @@ function* texts(): Generator<string> {
 }
 
 const BUILTIN = new Set(ORACLE_PASSTHROUGH_COMMANDS);
-const PASSTHROUGH_CONFIGS: Array<{ name: string; passthrough: ReadonlySet<string>; coldStart: ReadonlySet<string> }> = [
+const PASSTHROUGH_CONFIGS: Array<{ name: string; cliId?: string; passthrough: ReadonlySet<string>; coldStart: ReadonlySet<string> }> = [
   { name: 'claude-code 默认', passthrough: new Set([...BUILTIN, '/goal']), coldStart: new Set(['/goal']) },
   { name: '含自定义透传 /foo', passthrough: new Set([...BUILTIN, '/goal', '/foo']), coldStart: new Set(['/goal']) },
-  { name: '无 raw 面（codex-app）', passthrough: new Set(), coldStart: new Set() },
+  { name: '无 raw 面（codex-app）', cliId: 'codex-app', passthrough: new Set(), coldStart: new Set() },
 ];
 const SENDERS: Array<{ name: string; senderIsBot: boolean; acceptSlashFromBots: boolean }> = [
   { name: '真人', senderIsBot: false, acceptSlashFromBots: true },
@@ -88,6 +88,12 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // Codex App 的 /effort 由原生控制接口处理；其它 CLI 保留冻结的透传行为。
+  (input, legacy, next) =>
+    input.cliId === 'codex-app'
+    && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
+    && next.kind === 'daemon' && next.cmd === '/effort'
+    && next.sessionPolicy === 'existing_only',
   // 群上下文开关是新增的 sessionless daemon 命令；冻结 oracle 继续把它视为 unknown slash。
   (input, legacy, next) =>
     input.text.trim().toLowerCase().startsWith('/context-sharing')
@@ -124,7 +130,7 @@ describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
         for (const cfg of PASSTHROUGH_CONFIGS) {
           for (const sender of SENDERS) {
             const input: SlashRouteInput = {
-              text, context, phase,
+              text, context, phase, cliId: cfg.cliId,
               passthrough: cfg.passthrough, coldStartPassthrough: cfg.coldStart,
               senderIsBot: sender.senderIsBot, acceptSlashFromBots: sender.acceptSlashFromBots,
             };

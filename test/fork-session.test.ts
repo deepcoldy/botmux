@@ -611,6 +611,24 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     expect(cfg.model).toBe('gpt-5.6');          // same CLI → live bot model applies (== /restart)
   });
 
+  it('clears a Codex service tier only when a cross-CLI selection resolves', () => {
+    const ds = selectedDs('claude-code', {});
+    ds.session.serviceTier = 'priority';
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+    expect(cfg.cliId).toBe('claude-code');
+    expect(cfg.serviceTier).toBeUndefined();
+    expect(ds.session.serviceTier).toBe('inherit');
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('keeps a Codex service tier for a same-CLI selection', () => {
+    const ds = selectedDs('codex', {});
+    ds.session.serviceTier = 'priority';
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+    expect(cfg.serviceTier).toBe('priority');
+    expect(ds.session.serviceTier).toBe('priority');
+  });
+
   it('honors a per-trigger spawnModelOverride on a /cli session', () => {
     const ds = selectedDs('codex', { spawnModelOverride: 'gpt-5.6-terra' } as any);
     const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
@@ -652,6 +670,43 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
 
     expect(cfg.modelBackendVariant).toBeUndefined();
     expect(ds.session.modelBackendVariant).toBeUndefined();
+  });
+});
+
+
+describe('sessionAgentConfig — service tier without /cli selection', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(['default', 'priority', 'ultrafast'] as const)(
+    'clears %s when the Bot switches CLI before the first fork', (serviceTier) => {
+      const ds = makeSourceDs({ cliId: undefined, agentFrozen: false, serviceTier });
+      const cfg = sessionAgentConfig(ds, { cliId: 'claude-code' });
+      expect(cfg.cliId).toBe('claude-code');
+      expect(cfg.serviceTier).toBeUndefined();
+      expect(ds.session.serviceTier).toBe('inherit');
+      expect(sessionStore.updateSession).toHaveBeenLastCalledWith(expect.objectContaining({
+        cliId: 'claude-code', agentFrozen: true, serviceTier: 'inherit',
+      }));
+      expect(sessionAgentConfig(ds, { cliId: 'codex' }).serviceTier).toBeUndefined();
+    },
+  );
+
+  it('preserves the tier when the session already froze a Codex CLI', () => {
+    const ds = makeSourceDs({ cliId: 'codex', agentFrozen: true, serviceTier: 'priority' });
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code' });
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.serviceTier).toBe('priority');
+    expect(ds.session.serviceTier).toBe('priority');
+  });
+
+  it.each(['codex', 'claude-code'] as const)('resolves the tier after the store restores a stale %s row', (cliId) => {
+    const ds = makeSourceDs({ cliId: undefined, agentFrozen: false, serviceTier: undefined });
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(session => {
+      session.serviceTier = 'priority';
+    });
+    const cfg = sessionAgentConfig(ds, { cliId });
+    expect(cfg.serviceTier).toBe(cliId === 'codex' ? 'priority' : undefined);
+    expect(ds.session.serviceTier).toBe(cliId === 'codex' ? 'priority' : 'inherit');
   });
 });
 

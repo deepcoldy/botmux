@@ -183,6 +183,50 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(params.config?.model_reasoning_effort).toBe('ultra');
   }, 20_000);
 
+  it('forwards serviceTier top-level on start AND resume while resume still suppresses model/effort', async () => {
+    const startFile = join(tmpdir(), `fake-tier-start-${Math.round(performance.now())}.json`);
+    const resumeFile = join(tmpdir(), `fake-tier-resume-${Math.round(performance.now())}.json`);
+    const engine = makeEngine({
+      sessionId: 'tier-wiring',
+      model: 'gpt-5.6-terra',
+      reasoningEffort: 'xhigh',
+      serviceTier: 'priority',
+      env: { ...process.env, FAKE_THREAD_CONFIG_FILE: startFile, FAKE_RESUME_CONFIG_FILE: resumeFile },
+    }, {
+      spawnProcess: spawn,
+      validateServiceTier: async input => {
+        expect(input).toMatchObject({ cliBin: FIXTURE, model: 'gpt-5.6-terra', serviceTier: 'priority' });
+        return { ok: true };
+      },
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.resumeThread('thread-fake-1');
+    engine.stop();
+    const startParams = JSON.parse(readFileSync(startFile, 'utf8'));
+    const resumeParams = JSON.parse(readFileSync(resumeFile, 'utf8'));
+    rmSync(startFile, { force: true });
+    rmSync(resumeFile, { force: true });
+    // serviceTier is a thread-level field: top-level on both request shapes.
+    expect(startParams.serviceTier).toBe('priority');
+    expect(startParams.config?.serviceTier).toBeUndefined();
+    expect(resumeParams.serviceTier).toBe('priority');
+    // Carrying the tier must not reopen the model/effort resume-drift hole.
+    expect(resumeParams.config?.model).toBeUndefined();
+    expect(resumeParams.config?.model_reasoning_effort).toBeUndefined();
+  }, 20_000);
+
+  it('fails closed before spawning when the model does not support serviceTier', async () => {
+    const engine = makeEngine({ model: 'gpt-5.6-terra', serviceTier: 'priority' }, {
+      spawnProcess(): ChildProcess {
+        throw new Error('spawn must not run');
+      },
+      validateServiceTier: async () => ({ ok: false, error: 'not_supported_by_model' }),
+    });
+    await expect(engine.start()).rejects.toThrow('Codex service tier rejected: not_supported_by_model');
+    engine.stop();
+  });
+
   it('forwards backend variant on fresh thread/start and suppresses it on resume', async () => {
     const startFile = join(tmpdir(), `fake-variant-start-${Math.round(performance.now())}.json`);
     const resumeFile = join(tmpdir(), `fake-variant-resume-${Math.round(performance.now())}.json`);

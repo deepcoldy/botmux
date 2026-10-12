@@ -20,6 +20,7 @@ import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
 import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import { larkToolPrompt } from '../../core/lark-tool-binding.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
  *  by default, but a user customization can force it on/off. Keyed by the i18n
@@ -209,6 +210,45 @@ export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | und
   ].join('\n');
 }
 
+function buildCredentialSafetyBlock(locale?: Locale): string {
+  const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
+  return [
+    '<botmux_credentials>',
+    line('ai.credentials.never_read_others'),
+    line('ai.credentials.never_forward'),
+    '</botmux_credentials>',
+  ].join('\n');
+}
+
+/** Build the identity guidance that must match the managed lark-cli wrapper.
+ *
+ * A bound session no longer publishes lark-cli through the legacy per-turn
+ * trigger-user wrapper: it defaults to the receiving bot and switches to the
+ * current user only with an explicit `--as user`. Keep that statement beside
+ * the credential block so both system-prompt and inline-prompt paths use the
+ * same wording and the same filtered legacy policy. */
+export function buildManagedLarkToolPromptBlocks(
+  policy: TriggerUserAuthConfig | undefined,
+  larkToolAppId: string | undefined,
+  locale?: Locale,
+): string {
+  const effectivePolicy = larkToolAppId && policy
+    ? { ...policy, tools: policy.tools.filter(tool => tool !== 'lark-cli') }
+    : policy;
+  const credentialBoundary = buildCredentialBoundaryBlock(effectivePolicy, locale)
+    || (larkToolAppId && policy?.enabled && policy.tools.includes('lark-cli')
+      ? buildCredentialSafetyBlock(locale)
+      : '');
+  const larkToolBoundary = larkToolAppId
+    ? [
+      '<botmux_lark_tool>',
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale))}`,
+      '</botmux_lark_tool>',
+    ].join('\n')
+    : '';
+  return [credentialBoundary, larkToolBoundary].filter(Boolean).join('\n\n');
+}
+
 export function buildBotmuxSystemPromptText(opts: {
   locale?: Locale;
   botName?: string;
@@ -233,10 +273,14 @@ export function buildBotmuxSystemPromptText(opts: {
   noTransport?: boolean;
   /**
    * Trigger-user CLI auth is on for this session: add the credential boundary
-   * block. Off → nothing is emitted, so a bot that never enabled the feature
-   * gets no extra prompt text.
+   * block for tools that still use per-turn initiator identity. Managed
+   * lark-cli guidance is emitted independently through larkToolAppId.
    */
   triggerUserAuth?: TriggerUserAuthConfig;
+  /** App id of this session's managed lark-cli binding. When present, lark-cli
+   *  is removed from the legacy per-turn identity claim and receives its own
+   *  bot-default / explicit-user guidance instead. */
+  larkToolAppId?: string;
   /** Per-bot replyDelivery frozen for this session (core/reply-delivery.ts).
    *  'transcript': the daemon forwards the final assistant message from the CLI
    *  transcript, so the routing block never mentions `botmux send` at all —
@@ -252,7 +296,7 @@ export function buildBotmuxSystemPromptText(opts: {
    *  name/open_id but drops routing_rules — there is no other bot to route to. */
   solo?: boolean;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, replyDelivery, solo } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -359,7 +403,7 @@ export function buildBotmuxSystemPromptText(opts: {
   // determined user or a prompt injection. It exists because the likeliest way
   // these files get read is an agent troubleshooting an auth failure and
   // grepping the data directory, which a clear instruction does prevent.
-  const credentialBoundaryBlock = buildCredentialBoundaryBlock(triggerUserAuth, locale);
+  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale);
   return [
     '<botmux_routing>',
     ...routingInner,

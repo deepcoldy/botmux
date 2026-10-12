@@ -39,6 +39,9 @@ import {
   isConfigurableReasoningCliId,
   isCodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
+import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
+import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
+import { botInjectedEnv, buildSessionChildEnv } from './env-policy.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -67,6 +70,8 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
+import { setGroupIdleClose } from '../services/group-idle-close-store.js';
+import { DEFAULT_GROUP_IDLE_CLOSE, parseGroupIdleClose, type GroupIdleCloseSettings } from './group-idle-close.js';
 import { setGroupSerialInput } from '../services/group-serial-input-store.js';
 import { parseGroupSerialInput } from './group-serial-input.js';
 import { setGroupDefaultModels } from '../services/group-default-models-store.js';
@@ -362,7 +367,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
@@ -371,6 +376,9 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { refreshSessionIdentity } from './cli-identity.js';
+import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
+import { resolveUserToken } from '../utils/user-token.js';
+import { getLarkToolDelegation } from './lark-tool-delegation.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
   ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES,
@@ -886,6 +894,7 @@ function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
 }
 
 function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one
   // aperture is what preserves managed meeting actions from inside bwrap.
@@ -2404,6 +2413,81 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
   return jsonRes(res, 200, { ok: true, preview });
 });
 
+/** Session-local access key, installed with the tool entry at standard launch.
+ * This selects the configured app; it is not a process/turn attestation API. */
+function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string): boolean {
+  try {
+    const binding = readLarkToolBinding(larkToolBindingPath(config.session.dataDir, sessionId));
+    return binding.appId === appId && binding.sessionId === sessionId
+      && req.headers['x-botmux-lark-session'] === binding.accessKey;
+  } catch { return false; }
+}
+
+ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try { body = await readBoundedJsonBody(req, 4096, 1000); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
+    || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId)) {
+    return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
+  }
+  if (!body || Object.keys(body).some(key => key !== 'mode') || !['bot', 'user'].includes(String(body.mode))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
+  }
+  res.setHeader('cache-control', 'no-store');
+  const bot = getBot(ds.larkAppId).config;
+  if (body.mode === 'bot') {
+    let token: unknown;
+    try {
+      // The app-bound SDK caches TATs and refreshes them before expiry. Resolve
+      // on every invocation, rather than freezing a token for the session.
+      token = await getBotClient(bot.larkAppId).tokenManager.getTenantAccessToken();
+    } catch {
+      return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
+    }
+    if (typeof token !== 'string' || !token) {
+      return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
+    }
+    if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
+      || sessionTransportDisabled(ds) || ds.larkAppId !== bot.larkAppId
+      || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
+      return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
+    }
+    return jsonRes(res, 200, {
+      ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
+    });
+  }
+  const origin = ds.managedTurnOrigin;
+  const originSender = origin?.callerOpenId;
+  const turnId = origin?.turnId;
+  if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId);
+  const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
+  if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
+    || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
+    return jsonRes(res, 403, { ok: false, error: delegatedError(delegated.denialReason ?? 'target user/tool access unavailable') });
+  }
+  const sender = delegated?.targetOpenId ?? originSender;
+  if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const cached = delegated ? undefined : getIdentity(ds.larkAppId, sender);
+  const user = delegated ? { type: 'user' as const, openId: sender }
+    : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+      ? cached : await resolveVerifiedUserIdentity(ds.larkAppId, sender);
+  if (!user || user.type !== 'user' || user.openId !== sender) {
+    return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
+  }
+  const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), sender);
+  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
+    || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
+    return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
+  }
+  if (!token) return jsonRes(res, 403, { ok: false, error: delegated
+    ? delegatedError(`the original user's authorization for ${bot.larkAppId} is missing`)
+    : `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
+  return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', credentialType: 'user_access_token', credential: token });
+});
+
 const sessionAuthRequests = new Map<string, {
   sessionId: string;
   isCurrent: () => boolean;
@@ -2421,7 +2505,8 @@ for (const action of ['auth-request', 'auth-status']) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const ds = findActiveBySessionId(params.sessionId);
-    const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+    const boundTool = boundLarkToolRequest(req, params.sessionId, ds?.larkAppId);
+    const auth = boundTool ? { ok: true as const } : sessionCliIpcAuth(req, ds, params.sessionId, body);
     if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
     if (['callerOpenId', 'openId', 'larkAppId', 'chatId'].some(key => key in body)) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
@@ -2446,7 +2531,7 @@ for (const action of ['auth-request', 'auth-status']) {
         || body.originDispatchAttempt !== origin.dispatchAttempt) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
-    } else {
+    } else if (!boundTool) {
       const peer = resolveLoopbackPeerProcesses({
         remoteAddress: req.socket.remoteAddress,
         remotePort: req.socket.remotePort,
@@ -2470,7 +2555,7 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
       && ds.managedTurnOrigin?.dispatchAttempt === attempt;
     const cfg = getBot(ds.larkAppId).config;
-    if (!triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
+    if (!boundTool && !triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
       return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
     }
 
@@ -2487,7 +2572,7 @@ for (const action of ['auth-request', 'auth-status']) {
       if (result.status === 'failed') {
         return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
       }
-      if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+      if (!boundTool && !refreshSessionIdentity(config.session.dataDir, params.sessionId, {
         tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
       })) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
@@ -5538,6 +5623,16 @@ ipcRoute('PUT', '/api/chat-group-grant', async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+ipcRoute('PUT', '/api/group-idle-close/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let settings: GroupIdleCloseSettings;
+  try { settings = parseGroupIdleClose(await readJsonBody(req)); }
+  catch (e) { return jsonRes(res, 400, { ok: false, error: e instanceof Error ? e.message : 'bad_json' }); }
+  const result = await setGroupIdleClose(cachedLarkAppId, p.chatId, settings);
+  return jsonRes(res, result.ok ? 200 : 500, result);
+});
+
 ipcRoute('PUT', '/api/group-serial-input/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
@@ -5565,6 +5660,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     let agentDefaults: { agentCliId?: string; agentModel?: string; agentReasoningEffort?: string } = {};
     let groupDefaultModels: Record<string, import('./group-default-models.js').GroupDefaultModels> = {};
     let groupSerialInput: Record<string, boolean> = {};
+    let groupIdleClose: Record<string, GroupIdleCloseSettings> = {};
     let pinStreamingCardMasterEnabled = false;
     let noPinStreamingCardChats = new Set<string>();
     let effectiveMessageListenerForChat: ((chatId: string) => boolean) | undefined;
@@ -5574,6 +5670,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       agentDefaults = { agentCliId: botConfig.cliId, agentModel: botConfig.model, agentReasoningEffort: botConfig.reasoningEffort };
       groupDefaultModels = botConfig.groupDefaultModels ?? {};
       groupSerialInput = botConfig.groupSerialInput ?? {};
+      groupIdleClose = botConfig.groupIdleClose ?? {};
       pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
       noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
       effectiveMessageListenerForChat = (chatId) => resolveEffectiveMessageListener(botState, chatId)?.enabled === true;
@@ -5602,6 +5699,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         oncallChat: oncall ?? null,
         ...agentDefaults,
         serialInput: groupSerialInput[c.chatId] === true,
+        idleClose: groupIdleClose[c.chatId] ?? DEFAULT_GROUP_IDLE_CLOSE,
         ...(groupDefaultModels[c.chatId] ? { defaultModels: groupDefaultModels[c.chatId] } : {}),
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,
@@ -6648,6 +6746,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let model: string | null = null;
   let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  let serviceTier: CodexServiceTier | null = null;
   let nativeSubagentRuntime: BotConfig['nativeSubagentRuntime'] | null = null;
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
@@ -6675,6 +6774,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.modelBackendVariant
       : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
+    serviceTier = cfg.serviceTier ?? null;
     const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime);
     nativeSubagentRuntime = normalizedNativeSubagentRuntime.ok
       ? normalizedNativeSubagentRuntime.value ?? null
@@ -6766,6 +6866,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     model,
     modelBackendVariant,
     reasoningEffort,
+    serviceTier,
     nativeSubagentRuntime,
     turnTimeoutMs,
     dshRuntime,
@@ -7465,6 +7566,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     model?: unknown;
     modelBackendVariant?: unknown;
     reasoningEffort?: unknown;
+    serviceTier?: unknown;
     nativeSubagentRuntime?: unknown;
     turnTimeoutMs?: unknown;
     cliRuntime?: unknown;
@@ -7502,6 +7604,12 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isConfigurableReasoningCliId(selected.cliId);
+  const serviceTierFieldPresent = Object.prototype.hasOwnProperty.call(body, 'serviceTier');
+  const serviceTier = isCodexServiceTier(body.serviceTier) ? body.serviceTier : null;
+  if (body.serviceTier !== undefined && body.serviceTier !== '' && body.serviceTier !== null && serviceTier === null) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_service_tier' });
+  }
+  const supportsServiceTier = isCodexServiceTierCliId(selected.cliId);
   const nativeSubagentRuntimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'nativeSubagentRuntime');
   let requestedNativeSubagentRuntime: BotConfig['nativeSubagentRuntime'];
   if (selected.cliId === 'traex' && nativeSubagentRuntimeFieldPresent && body.nativeSubagentRuntime !== null) {
@@ -7654,6 +7762,27 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
     availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
   }
+  const effectiveServiceTier = supportsServiceTier
+    ? (serviceTierFieldPresent ? serviceTier ?? undefined : currentBotConfig.serviceTier)
+    : undefined;
+  if (effectiveServiceTier && effectiveServiceTier !== 'default') {
+    const codexAvailability = checkCliAvailability({ cliId: 'codex', cliPathOverride: effectivePath });
+    const tierCheck = await validateCodexServiceTier({
+      cliBin: codexAvailability.resolvedPath ?? codexAvailability.command ?? 'codex',
+      env: {
+        ...buildSessionChildEnv(process.env, currentBotConfig.envPolicy),
+        ...botInjectedEnv(currentBotConfig.env, currentBotConfig.envPolicy),
+      },
+      model,
+      serviceTier: effectiveServiceTier,
+    });
+    if (!tierCheck.ok) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: `service_tier_${tierCheck.error}`,
+      });
+    }
+  }
 
   return withBotTurnMutation(larkAppId, async () => {
     // Agent selection can replace every live worker generation and may also
@@ -7680,6 +7809,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     const r = await rmwBotEntry<{
       error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
+      nextServiceTier?: CodexServiceTier;
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
@@ -7701,6 +7831,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
+      const nextServiceTier = supportsServiceTier
+        ? (serviceTierFieldPresent ? serviceTier ?? undefined : entry.serviceTier)
+        : undefined;
       entry.cliId = selected.cliId;
       if (selected.cliId !== 'codex-app' && entry.codexBrowser !== undefined) {
         delete entry.codexBrowser;
@@ -7735,6 +7868,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       else if (reasoningEffortFieldPresent) {
         if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
         else delete entry.reasoningEffort;
+      }
+      if (!supportsServiceTier) delete entry.serviceTier;
+      else if (serviceTierFieldPresent) {
+        if (serviceTier) entry.serviceTier = serviceTier;
+        else delete entry.serviceTier;
       }
       let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
       if (selected.cliId !== 'traex') {
@@ -7790,7 +7928,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
         delete entry.backendType;
       }
-      return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
+      return { write: true, result: { nextReasoningEffort, nextServiceTier, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
@@ -7821,6 +7959,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       : undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
+    if (!supportsServiceTier) bot.config.serviceTier = undefined;
+    else bot.config.serviceTier = r.result.nextServiceTier ?? undefined;
     updateBotNativeSubagentRuntime(
       larkAppId,
       r.result.nextNativeSubagentRuntimeState ?? { status: 'absent' },
@@ -7857,6 +7997,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       model: model || null,
       modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      serviceTier: supportsServiceTier ? bot.config.serviceTier ?? null : null,
       nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,

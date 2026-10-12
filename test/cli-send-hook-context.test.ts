@@ -116,7 +116,7 @@ describe('cmdSend hook context wiring', () => {
     expect(parseAt).toBeGreaterThanOrEqual(0);
     expect(relayAt).toBeGreaterThan(parseAt);
     expect(cmdSend).toContain('let replyLayout = replyLayoutRequest.layout;');
-    expect(cmdSend).toContain('extractFirstReplyCardHeading(text)');
+    expect(cmdSend).toContain('extractFirstReplyCardHeading(cardText)');
     expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
     expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
     expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');

@@ -15,6 +15,7 @@ export interface GroupMemberBot extends GroupBot {
   agentModel?: string;
   agentReasoningEffort?: string;
   serialInput?: boolean;
+  idleClose?: import('../../core/group-idle-close.js').GroupIdleCloseSettings;
   defaultModels?: import('../../core/group-default-models.js').GroupDefaultModels;
   oncallChat?: { workingDir?: string } | null;
 }

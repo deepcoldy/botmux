@@ -1,5 +1,10 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+
+vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
+  validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+}));
 import { createHmac, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
@@ -7460,6 +7465,74 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists codex serviceTier, keeps explicit default, and clears it on unsupported CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-service-tier-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-service-tier';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex' }]));
+      loadBotConfigs().forEach(c => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (body: Record<string, unknown>) => fetch(`${base}/api/bot-agent`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const saved = await save({ cliId: 'codex', model: '', serviceTier: 'priority' });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, serviceTier: 'priority' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ serviceTier: 'priority' });
+
+      const invalid = await save({ cliId: 'codex', model: '', serviceTier: 'fast' });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'invalid_service_tier' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      const explicitDefault = await save({ cliId: 'codex', model: '', serviceTier: 'default' });
+      expect(explicitDefault.status).toBe(200);
+      expect(await explicitDefault.json()).toMatchObject({ serviceTier: 'default' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('default');
+
+      const cleared = await save({ cliId: 'codex', model: '', serviceTier: null });
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ serviceTier: null });
+      expect(loadBotConfigs()[0]?.serviceTier).toBeUndefined();
+
+      const restored = await save({ cliId: 'codex', model: '', serviceTier: 'priority' });
+      expect(restored.status).toBe(200);
+      expect(await restored.json()).toMatchObject({ serviceTier: 'priority' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'not_supported_by_model' });
+      const unsupportedModel = await save({ cliId: 'codex', model: 'gpt-6-astra', serviceTier: 'priority' });
+      expect(unsupportedModel.status).toBe(400);
+      expect(await unsupportedModel.json()).toMatchObject({ error: 'service_tier_not_supported_by_model' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'catalog_unavailable' });
+      const changedModel = await save({ cliId: 'codex', model: 'gpt-6-astra' });
+      expect(changedModel.status).toBe(400);
+      expect(await changedModel.json()).toMatchObject({ error: 'service_tier_catalog_unavailable' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+      expect(loadBotConfigs()[0]?.model).toBeUndefined();
+
+      const switched = await save({ cliId: 'claude-code', model: '' });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ serviceTier: null });
+      expect(loadBotConfigs()[0]?.serviceTier).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ serviceTier: null });
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects switching a sandboxed bot to Forge x TraeX', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-forge-sandbox-conflict-'));
     const configPath = join(dir, 'bots.json');
@@ -9363,6 +9436,7 @@ describe('GET /api/groups (Phase B)', () => {
       name: 'team',
       oncallChat: null,
       serialInput: false,
+      idleClose: { enabled: false, duration: 1, unit: 'days' },
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
@@ -9401,6 +9475,7 @@ describe('GET /api/groups (Phase B)', () => {
         agentCliId: 'codex',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9445,6 +9520,7 @@ describe('GET /api/groups (Phase B)', () => {
         agentCliId: 'codex',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9479,6 +9555,7 @@ describe('GET /api/groups (Phase B)', () => {
         name: 'config missing',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9526,6 +9603,7 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9540,6 +9618,7 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9554,6 +9633,7 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,

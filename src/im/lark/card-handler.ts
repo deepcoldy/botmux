@@ -668,6 +668,9 @@ export async function commitRepoSelection(
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
               codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
               chatContext: ds.pendingChatContext,
+              // Repo selection commits the original fresh launch. Restoring
+              // the pending card does not turn it into a CLI resume.
+              larkToolResume: false,
               // #794 后续：opening 走 hook 注入（sender/mentions 进 envelope，PTY 文本
               // 只剩正文）。turnId 与下方 forkWorker 的权威 turnId 一致；raw 命令冷启动
               // 的 buffered follow-up 走 raw_input IPC 延迟发送，turnId 权威流不同，不启用。

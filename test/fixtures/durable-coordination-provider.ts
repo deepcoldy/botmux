@@ -8,6 +8,23 @@ import { DURABLE_COORDINATION_CONTRACT_VERSION } from '../../src/services/durabl
 const badContract = process.argv.includes('--bad-contract');
 const provider = process.argv.includes('--slow') ? 'fixture-slow' : 'fixture';
 
+function controlRecord(
+  state: 'pending' | 'attempting' | 'ambiguous' | 'completed',
+  extra: Record<string, unknown> = {},
+) {
+  return {
+    operationId: 'fixture-control',
+    sessionKey: 'session-a',
+    payload: { action: 'close' },
+    createdAt: 1,
+    state,
+    originEpoch: 1,
+    attempts: state === 'pending' ? 0 : 1,
+    updatedAt: 2,
+    ...extra,
+  };
+}
+
 function send(value: unknown, exitAfter = false): void {
   process.stdout.write(`${JSON.stringify(value)}\n`, () => {
     if (exitAfter) process.exit(0);
@@ -48,7 +65,89 @@ lines.on('line', line => {
     send({ ...base, type: 'result', result: { revision: 'wrong' } });
     return;
   }
+  if (request.method === 'enqueueControlOperation') {
+    send({ ...base, type: 'result', result: { kind: 'inserted' } });
+    return;
+  }
+  if (request.method === 'beginControlOperationAttempt') {
+    send({
+      ...base,
+      type: 'result',
+      result: {
+        kind: 'applied',
+        record: controlRecord('attempting'),
+        attempt: {
+          operationId: 'fixture-control',
+          sessionKey: 'session-a',
+          ownerId: 'worker-a',
+          leaseEpoch: 1,
+          attempt: 1,
+        },
+      },
+    });
+    return;
+  }
+  if (request.method === 'completeControlOperationAttempt') {
+    send({
+      ...base,
+      type: 'result',
+      result: {
+        kind: 'applied',
+        record: controlRecord('completed', { result: { status: 'closed' } }),
+      },
+    });
+    return;
+  }
+  if (request.method === 'retryControlOperationAttempt') {
+    send({
+      ...base,
+      type: 'result',
+      result: {
+        kind: 'applied',
+        record: controlRecord('pending', { attempts: 1, lastError: 'not dispatched' }),
+      },
+    });
+    return;
+  }
+  if (request.method === 'markControlOperationAmbiguous') {
+    send({
+      ...base,
+      type: 'result',
+      result: {
+        kind: 'applied',
+        record: controlRecord('ambiguous', { lastError: 'outcome unknown' }),
+      },
+    });
+    return;
+  }
+  if (request.method === 'reconcileControlOperation') {
+    send({
+      ...base,
+      type: 'result',
+      result: {
+        kind: 'applied',
+        record: controlRecord('completed', {
+          result: { status: 'closed' },
+          reconciliation: {
+            kind: 'completed',
+            attempt: 1,
+            evidence: { source: 'fixture' },
+          },
+        }),
+      },
+    });
+    return;
+  }
+  if (request.method === 'readControlOperation' && request.input === 'fixture-control') {
+    send({
+      ...base,
+      type: 'result',
+      result: controlRecord('completed', { result: { status: 'closed' } }),
+    });
+    return;
+  }
   if (request.method === 'readSession' || request.method === 'readOutbox'
+      || request.method === 'readControlOperation'
       || request.method === 'claimNextInbox' || request.method === 'reserveNextOutbox') {
     send({ ...base, type: 'result', result: null });
     return;

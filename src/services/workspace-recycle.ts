@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { withFileLock } from '../utils/file-lock.js';
 import { loadAllSessionsStrict } from './session-store.js';
@@ -196,6 +196,11 @@ export class WorkspaceRecycler {
       this.save(operation);
       return this.status(operationId);
     }, { maxWaitMs: 1_500 });
+  }
+
+  /** Whether prepare ever recorded this operation. Pure read. */
+  hasOperation(operationId: string): boolean {
+    return existsSync(this.path(operationId));
   }
 
   /** Pure readback; deferred initiator completion can happen after CLI exit. */

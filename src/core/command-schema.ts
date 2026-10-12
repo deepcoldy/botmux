@@ -35,6 +35,8 @@ export interface CommandSpec {
   readonly name: string;
   /** 别名（fallthrough case），含前导 `/`。 */
   readonly aliases?: readonly string[];
+  /** 仅指定 CLI 由 daemon 处理；不加入全局命令集合，保留其它 CLI 的透传行为。 */
+  readonly cliId?: string;
   readonly sessionPolicy: CommandSessionPolicy;
   /**
    * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器，从不建会话。
@@ -163,6 +165,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
+  { name: '/effort', cliId: 'codex-app', sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
 ];
 
 /** 话题路由元命令：由 `parseTopicHeader` 在命令表之前拦截，不在 `DAEMON_COMMANDS` 里。
@@ -184,25 +187,27 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
 
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────
 
-/** botmux 自己处理（而非透传给 CLI）的斜杠命令，含别名。 */
-export const DAEMON_COMMANDS: Set<string> = new Set(COMMANDS.flatMap(namesOf));
+const GLOBAL_COMMANDS = COMMANDS.filter(s => !s.cliId);
+
+/** 所有 CLI 都由 botmux 自己处理（而非透传给 CLI）的斜杠命令，含别名。 */
+export const DAEMON_COMMANDS: Set<string> = new Set(GLOBAL_COMMANDS.flatMap(namesOf));
 
 /** 从不建会话的命令（`/watch-comment` 还按参数二次判定，见 isSessionlessCommandInvocation）。 */
 export const SESSIONLESS_DAEMON_COMMANDS: Set<string> = new Set(
-  COMMANDS.filter(s => s.sessionPolicy === 'sessionless').flatMap(namesOf),
+  GLOBAL_COMMANDS.filter(s => s.sessionPolicy === 'sessionless').flatMap(namesOf),
 );
 
 /** 只对已有会话有意义、路由绝不为它预建会话的命令。 */
 export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS: Set<string> = new Set(
-  COMMANDS.filter(s => s.sessionPolicy === 'existingOnly').flatMap(namesOf),
+  GLOBAL_COMMANDS.filter(s => s.sessionPolicy === 'existingOnly').flatMap(namesOf),
 );
 
 /** 允许多行正文的命令（`parseSlashCommandInvocation` 的豁免名单）。 */
 export const MULTILINE_COMMANDS: Set<string> = new Set(
-  COMMANDS.filter(s => s.multiline).flatMap(namesOf),
+  GLOBAL_COMMANDS.filter(s => s.multiline).flatMap(namesOf),
 );
 
 /** 路由入口前置特判：命令 → 处理器。 */
 export const ROUTE_SPECIAL_COMMANDS: ReadonlyMap<string, CommandSpecialHandler> = new Map(
-  COMMANDS.filter(s => s.special).flatMap(s => namesOf(s).map(n => [n, s.special!] as const)),
+  GLOBAL_COMMANDS.filter(s => s.special).flatMap(s => namesOf(s).map(n => [n, s.special!] as const)),
 );

@@ -2,26 +2,36 @@ import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type {
   AcquireSessionLeaseInput,
+  BeginControlOperationAttemptInput,
+  BeginControlOperationAttemptResult,
   BeginOutboxAttemptInput,
   BeginOutboxAttemptResult,
   ClaimInboxInput,
+  CompleteControlOperationAttemptInput,
   CompleteOutboxAttemptInput,
+  ControlOperationMutationResult,
   DurableCoordinationStore,
+  DurableControlOperationRecord,
   DurableInboxEvent,
   DurableInsertResult,
   DurableJson,
   DurableOutboxRecord,
   DurableSessionRecord,
+  EnqueueControlOperationInput,
   EnqueueOutboxInput,
   InboxClaim,
   InboxClaimMutationResult,
   LeaseMutationResult,
+  MarkControlOperationAmbiguousInput,
   MarkOutboxAmbiguousInput,
   OutboxMutationResult,
   OutboxReservation,
+  ReconcileControlOperationInput,
+  ReconcileControlOperationResult,
   RenewInboxClaimInput,
   RenewSessionLeaseInput,
   ReserveOutboxInput,
+  RetryControlOperationAttemptInput,
   RetryInboxClaimInput,
   RetryOutboxAttemptInput,
   SessionLease,
@@ -321,6 +331,65 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
   async readOutbox(messageId: string): Promise<DurableOutboxRecord | undefined> {
     const result = await this.call('readOutbox', messageId);
     return result === null ? undefined : result as unknown as DurableOutboxRecord;
+  }
+
+  async enqueueControlOperation(
+    input: EnqueueControlOperationInput,
+  ): Promise<DurableInsertResult | { kind: 'stale_lease' }> {
+    return await this.call('enqueueControlOperation', input) as unknown as
+      DurableInsertResult | { kind: 'stale_lease' };
+  }
+
+  async beginControlOperationAttempt(
+    input: BeginControlOperationAttemptInput,
+  ): Promise<BeginControlOperationAttemptResult> {
+    return await this.call(
+      'beginControlOperationAttempt',
+      input,
+    ) as unknown as BeginControlOperationAttemptResult;
+  }
+
+  async completeControlOperationAttempt(
+    input: CompleteControlOperationAttemptInput,
+  ): Promise<ControlOperationMutationResult> {
+    return await this.call(
+      'completeControlOperationAttempt',
+      input,
+    ) as unknown as ControlOperationMutationResult;
+  }
+
+  async retryControlOperationAttempt(
+    input: RetryControlOperationAttemptInput,
+  ): Promise<ControlOperationMutationResult> {
+    return await this.call(
+      'retryControlOperationAttempt',
+      input,
+    ) as unknown as ControlOperationMutationResult;
+  }
+
+  async markControlOperationAmbiguous(
+    input: MarkControlOperationAmbiguousInput,
+  ): Promise<ControlOperationMutationResult> {
+    return await this.call(
+      'markControlOperationAmbiguous',
+      input,
+    ) as unknown as ControlOperationMutationResult;
+  }
+
+  async reconcileControlOperation(
+    input: ReconcileControlOperationInput,
+  ): Promise<ReconcileControlOperationResult> {
+    return await this.call(
+      'reconcileControlOperation',
+      input,
+    ) as unknown as ReconcileControlOperationResult;
+  }
+
+  async readControlOperation(
+    operationId: string,
+  ): Promise<DurableControlOperationRecord | undefined> {
+    const result = await this.call('readControlOperation', operationId);
+    return result === null ? undefined : result as unknown as DurableControlOperationRecord;
   }
 
   async close(): Promise<void> {

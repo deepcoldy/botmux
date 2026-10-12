@@ -52,7 +52,7 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnRe
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { appendTurnTerminalReceiptToCard, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
-import { codexServiceTierBadge } from '../services/codex-service-tier.js';
+import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
@@ -108,6 +108,7 @@ import {
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
+import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
 import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
@@ -2359,10 +2360,20 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
   sessionStore.updateSession(ds.session);
 }
 
+function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier | undefined {
+  const tier = ds.session.serviceTier;
+  if (tier === undefined || tier === 'inherit') return undefined;
+  if (isCodexServiceTierCliId(cliId)) return tier;
+  // 有意清除必须落盘 inherit，避免持久层当作陈旧写入复活。
+  ds.session.serviceTier = 'inherit';
+  sessionStore.updateSession(ds.session);
+  return undefined;
+}
+
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
   const groupEffort = resolveSessionGroupSettings(ds, selected?.cliId ?? ds.session.cliId ?? botCfg.cliId).reasoningEffort;
   if (selected) {
@@ -2402,7 +2413,7 @@ function sessionAgentConfig(
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
     const model = resolveSessionLaunchModel(ds, botCfg);
     recordLaunchModel(ds, model);
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -2511,6 +2522,7 @@ function sessionAgentConfig(
     model,
     modelBackendVariant: ds.session.modelBackendVariant,
     reasoningEffort: ds.session.reasoningEffort,
+    serviceTier: sessionServiceTier(ds, ds.session.cliId ?? botCfg.cliId),
     launchShell: botCfg.launchShell,
     startupCommands: botCfg.startupCommands,
   };
@@ -9846,6 +9858,53 @@ export type ExactTurnInterruptResult =
   | { ok: true }
   | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
 
+/** Native settings use their own receipt, without rotating business-turn state. */
+export function updateCodexAppEffort(
+  ds: DaemonSession,
+  effort: string,
+  timeoutMs = 35_000,
+): Promise<import('../types.js').CodexAppEffortResult> {
+  const worker = ds.worker;
+  if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex-app'
+    || !worker || worker.killed || !ds.workerReady || !ds.cliReady
+    || ds.session.status !== 'active' || isSessionTransferring(ds)
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) {
+    return Promise.resolve({ status: 'unavailable' });
+  }
+  const requestId = randomUUID();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (result: import('../types.js').CodexAppEffortResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      resolve(result);
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type !== 'codex_app_effort_result' || msg.requestId !== requestId) return;
+      finish(ds.worker === worker ? msg : { status: 'error' });
+    };
+    const onExit = (): void => finish({ status: 'error' });
+    const timer = setTimeout(() => finish({ status: 'error' }), timeoutMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    try {
+      if (!afterWorkerIpcBootstrap(worker, () => {
+        if (settled) return;
+        if (ds.worker !== worker) return finish({ status: 'unavailable' });
+        worker.send({ type: 'codex_app_effort', requestId, effort } satisfies DaemonToWorker);
+      })) {
+        finish({ status: 'unavailable' });
+      }
+    } catch {
+      finish({ status: 'error' });
+    }
+  });
+}
+
 /** Ask the currently owning worker to interrupt one exact turn and wait for its
  * acknowledgement. IPC delivery alone is not proof: the worker compares the
  * immutable turn id with its active turn before it can inject Ctrl+C. */
@@ -13212,6 +13271,7 @@ export function forkWorker(
     model: agentCfg.model,
     modelBackendVariant: agentCfg.modelBackendVariant,
     reasoningEffort: agentCfg.reasoningEffort,
+    serviceTier: agentCfg.serviceTier,
     // dsh runner turn timeout: read live from bot config so tuning bots.json
     // takes effect on the next worker fork without recreating the session.
     turnTimeoutMs: botCfg.turnTimeoutMs,
@@ -17611,7 +17671,7 @@ function setupWorkerHandlers(
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
-          assistantText,
+          assistantText: repairReplyMarkdown(assistantText),
           assistantLabel: sessionCliDisplayName(ds, botCfg),
           recipientOpenId,
           brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -18726,7 +18786,7 @@ function deliverFinalOutput(
         ? buildContextualReplyCard({
             title: localTurnTitle,
             userText: msg.kind === 'local-turn' ? safeUserText ?? '' : undefined,
-            assistantText: renderedAssistantText,
+            assistantText: repairReplyMarkdown(renderedAssistantText),
             assistantLabel: storedSessionCliDisplayName(ds),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
@@ -18739,7 +18799,7 @@ function deliverFinalOutput(
             ...(feedback ? { feedback } : {}),
           })
         : buildCanonicalFinalReplyCard({
-            markdown: deliveredAssistantText,
+            markdown: repairReplyMarkdown(deliveredAssistantText),
             ...(feedback ? { feedback } : {}),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),

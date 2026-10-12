@@ -8606,6 +8606,7 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
+import { repairReplyMarkdown } from './services/reply-markdown.js';
 import {
   buildReplyLayoutHeader,
   parseReplyLayoutRequest,
@@ -11925,12 +11926,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       messageId = videoResult.sent[0];
     } else {
       // 回复一律卡片（纯文本 post 路径已删）。
+      const cardText = repairReplyMarkdown(text);
       // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
       // aware, see applyInlineMentions); any --mention not inlined here is
       // rendered on the footer `发送给：` line below, not the body.
       const layoutBody = replyLayout
-        ? extractFirstReplyCardHeading(text)
-        : { markdown: text, heading: undefined };
+        ? extractFirstReplyCardHeading(cardText)
+        : { markdown: cardText, heading: undefined };
       const layoutHeader = replyLayout
         ? buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)
         : undefined;
@@ -12733,6 +12735,14 @@ async function cmdAuth(rest: string[]): Promise<void> {
   }
   try {
     const { sid, larkAppId } = await resolveSessionAppId(undefined);
+    const { readLarkToolBinding } = await import('./core/lark-tool-binding.js');
+    const toolBindingPath = process.env.BOTMUX_LARK_TOOL_BINDING;
+    const toolBinding = toolBindingPath ? readLarkToolBinding(toolBindingPath) : undefined;
+    if (toolBinding && (toolBinding.sessionId !== sid || toolBinding.appId !== larkAppId)) {
+      throw new Error('lark-cli application binding does not match this session');
+    }
+    if (toolBinding && (!Number.isSafeInteger(toolBinding.ipcPort) || !toolBinding.ipcPort
+      || toolBinding.ipcPort < 1 || toolBinding.ipcPort > 65535)) throw new Error('Bound bot daemon is unavailable');
     // Isolated panes (sandbox / read isolation) prove the turn with their
     // rotating capability tuple; a managed host session has neither the relay
     // nor the origin channel injected and instead proves lineage on the daemon
@@ -12741,7 +12751,7 @@ async function cmdAuth(rest: string[]): Promise<void> {
     const isolatedPane = !!process.env.BOTMUX_SEND_RELAY
       || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
     let claim: ManagedOriginCapabilityClaim | undefined;
-    if (isolatedPane) {
+    if (isolatedPane && !toolBinding) {
       const read = readManagedOriginCapability(
         resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       );
@@ -12756,21 +12766,28 @@ async function cmdAuth(rest: string[]): Promise<void> {
         process.exitCode = 1;
         return;
       }
-      const response = await postCurrentSessionDaemonRoute({
-        path: `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`,
-        sessionId: sid,
-        larkAppId,
-        ...(claim ? { originClaim: claim } : {}),
-        signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
-        body: {
-          ...(parsed.command === 'request' ? { scopes: parsed.scopes } : { requestId: parsed.requestId }),
-          ...(claim ? {
-            originCapability: claim.capability,
-            originTurnId: claim.turnId,
-            originDispatchAttempt: claim.dispatchAttempt,
-          } : {}),
-        },
-      });
+      const authBody = parsed.command === 'request' ? { scopes: parsed.scopes } : { requestId: parsed.requestId };
+      const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
+      const response = toolBinding
+        ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': toolBinding.accessKey },
+          body: JSON.stringify(authBody), signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+        })
+        : await postCurrentSessionDaemonRoute({
+          path: `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`,
+          sessionId: sid,
+          larkAppId,
+          ...(claim ? { originClaim: claim } : {}),
+          signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+          body: {
+            ...authBody,
+            ...(claim ? {
+              originCapability: claim.capability,
+              originTurnId: claim.turnId,
+              originDispatchAttempt: claim.dispatchAttempt,
+            } : {}),
+          },
+        });
       const body = await response.json() as { ok?: boolean; status?: string };
       if (parsed.command === 'wait' && response.ok && body.ok === true && body.status === 'pending') {
         await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(2_000, deadline - Date.now()))));
@@ -13612,7 +13629,9 @@ async function cmdReport(rest: string[]): Promise<void> {
   let recipientResolution: ReturnType<typeof resolveReportRecipientForSession>;
   try {
     recipientResolution = resolveReportRecipientForSession({
-      session: s,
+      // A daemon answers the by-id lookup with its dashboard row: display status,
+      // no createdAt or creatorOpenId. Recipient rules need the persisted session.
+      session: sessions.get(sid) ?? s,
       sessions: [...sessions.values()],
       knownPeerBotOpenIds: recipientRoot === undefined
         ? new Set<string>()
@@ -16242,6 +16261,10 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
   else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
+  else if (__entrySubcommand === 'lark-tool-runner') {
+    await import('./lark-tool-runner.js');
+    process.exit(process.exitCode ?? 0);
+  }
   // The entry module now drives the process (top-level main() keeps the event
   // loop alive for the daemon; the worker's IPC listener does the same; a
   // core-only bind failure exits from within). Park here so the normal dispatch

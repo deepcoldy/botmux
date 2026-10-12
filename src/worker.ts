@@ -23,6 +23,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -139,7 +140,6 @@ import { runRemoteRunnerSessionTool } from './services/remote-runner-session-too
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
-import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
@@ -251,6 +251,7 @@ import {
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult, type CodexDrainState } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
+import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
@@ -316,7 +317,7 @@ import {
   clamp,
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
-import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
+import { createCliAdapterSync, locateOnPath, resolveCommandReal } from './adapters/cli/registry.js';
 import { cliAdapterBindsOwnershipPid } from './adapters/cli/ownership-pid.js';
 import { resolveCodexUpgradeCommand } from './services/codex-upgrade-target.js';
 import {
@@ -1319,10 +1320,16 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // matching every other backend and preventing stale owner resurrection.
     applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
     // RPC shell tools execute here, before the viewer CLI is even spawned.
-    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, cfg.triggerUserAuth, log);
+    const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+    const identityPolicy = boundLark && cfg.triggerUserAuth
+      ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
+      : cfg.triggerUserAuth;
+    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+    if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
+      sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
-      model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
+      model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, serviceTier: cfg.serviceTier, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
       appServerConfig: cfg.cliId === 'traex'
         ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
@@ -11499,6 +11506,22 @@ async function handleTrustedCodexAppMarker(
   payload: Record<string, unknown>,
   control?: { generation: string; seq: number },
 ): Promise<boolean> {
+  if (kind === 'effort_result' && lastInitConfig?.cliId === 'codex-app') {
+    if (typeof payload.requestId !== 'string'
+      || !['applied', 'future_only', 'invalid', 'unavailable', 'error'].includes(String(payload.status))
+      || (payload.reason !== undefined
+        && (payload.status !== 'future_only'
+          || !['step_model_switching_disabled', 'target_unavailable'].includes(String(payload.reason))))
+      || (payload.choices !== undefined && (!Array.isArray(payload.choices)
+        || !payload.choices.every(choice => typeof choice === 'string')))) return false;
+    send({
+      type: 'codex_app_effort_result', requestId: payload.requestId,
+      status: payload.status as import('./types.js').CodexAppEffortResult['status'],
+      ...(payload.choices ? { choices: payload.choices as string[] } : {}),
+      ...(payload.reason ? { reason: payload.reason as import('./types.js').CodexAppEffortResult['reason'] } : {}),
+    });
+    return true;
+  }
   if (kind === 'thread' && typeof payload.threadId === 'string') {
     persistCliSessionId(payload.threadId);
     return true;
@@ -15496,6 +15519,9 @@ async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
+  if (cfg.adoptMode && cfg.serviceTier) {
+    throw new Error('adopted CLI sessions cannot apply an explicit serviceTier');
+  }
   if (cfg.envPolicy?.mode === 'strict' && (cfg.adoptMode || cfg.existingAppServerEndpoint || cfg.cliLaunchMode === 'forge-traex')) {
     throw new Error('envPolicy strict cannot control an adopted process or an external App Server; create a Botmux-owned session');
   }
@@ -15543,6 +15569,9 @@ async function spawnCli(
     }
     if (codexRpcEngine) {
       throw new Error('existing App Server attachment cannot share a BotMux-owned Codex RPC engine');
+    }
+    if (cfg.serviceTier !== undefined) {
+      throw new Error('existing App Server attachment cannot apply an explicit serviceTier');
     }
     remoteWsUrl = normalizeExistingAppServerEndpoint(
       cfg.existingAppServerEndpoint,
@@ -17397,6 +17426,8 @@ async function spawnCli(
     }
   }
   const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);
+  const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+  const identityDataDir = boundLark ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!) : process.env.SESSION_DATA_DIR;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
   const cliExtra = cliAdapter.allowExtraArgs === false
     ? ''
@@ -17419,9 +17450,9 @@ async function spawnCli(
   };
   if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   if (cfg.rootMessageId?.startsWith('om_')) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
-  if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
-    const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
-    identityShellEnv.SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
+  if ((cfg.triggerUserAuth?.enabled || boundLark) && process.env.SESSION_DATA_DIR) {
+    const dir = sessionIdentityBinDir(identityDataDir!, cfg.sessionId);
+    identityShellEnv.SESSION_DATA_DIR = identityDataDir!;
     identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
     identityShellEnv.ZDOTDIR = join(dir, 'shell');
     identityShellEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
@@ -17430,9 +17461,13 @@ async function spawnCli(
     // governed — that is the exact condition under which installGitAskpass
     // writes the file, and pointing GIT_ASKPASS at a missing path would break
     // git prompts rather than fall back.
-    if (cfg.triggerUserAuth.tools.includes('bytedcli')) {
+    if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('bytedcli')) {
       identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
     }
+  }
+  if (boundLark) {
+    identityShellEnv.BOTMUX_LARK_TOOL_BINDING = larkToolBindingPath(identityDataDir!, cfg.sessionId);
+    if (process.env.BOTMUX_DAEMON_IPC_PORT) identityShellEnv.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
   }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
@@ -17463,6 +17498,7 @@ async function spawnCli(
     // agent from reading another person's token file today, and the likeliest
     // way that happens is an agent grepping the data dir to debug an auth error.
     triggerUserAuth: cfg.triggerUserAuth,
+    larkToolAppId: boundLark ? cfg.larkAppId : undefined,
     // Codex and TraeX explicitly set these in tool shells instead of depending
     // on the CLI's default inheritance policy; other adapters inherit normally.
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
@@ -17478,6 +17514,7 @@ async function spawnCli(
     // dsh runner only; other adapters ignore the field.
     dshProfile: cfg.dshProfile,
     reasoningEffort: cfg.reasoningEffort,
+    serviceTier: cfg.serviceTier,
     disableCliBypass: cfg.disableCliBypass === true,
     settingsEnv: perBotSettingsEnv,
     settingsFilePath: perBotSettingsFilePath,
@@ -17605,7 +17642,12 @@ async function spawnCli(
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
   childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
-  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, cfg.triggerUserAuth, log);
+  const identityPolicy = boundLark && cfg.triggerUserAuth
+    ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
+    : cfg.triggerUserAuth;
+  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+  if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
+    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the file
     // sandbox the agent runs as the same OS user as botmux and can read every
@@ -17852,6 +17894,14 @@ async function spawnCli(
     perBotInjectEnv.KIMI_MODEL_THINKING_EFFORT = cfg.reasoningEffort;
   }
   if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
+  if (boundLark) {
+    const dir = childEnv.BOTMUX_IDENTITY_BIN!;
+    perBotInjectEnv.PATH = [dir, ...(perBotInjectEnv.PATH ?? childEnv.PATH ?? '').split(':').filter(p => p !== dir)].join(':');
+    perBotInjectEnv.BOTMUX_IDENTITY_BIN = dir;
+    perBotInjectEnv.BOTMUX_LARK_TOOL_BINDING = childEnv.BOTMUX_LARK_TOOL_BINDING!;
+    perBotInjectEnv.ZDOTDIR = join(dir, 'shell');
+    perBotInjectEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
+  }
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
@@ -18470,6 +18520,8 @@ async function spawnCli(
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
         tempDir: canonical(sessionScratchDir),
+        effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH,
+        identityBin: childEnv.BOTMUX_IDENTITY_BIN,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,
@@ -18915,6 +18967,19 @@ async function spawnCli(
         }
       }
     }
+  }
+
+  // RPC viewer spawns after CodexRpcEngine.start() has validated the owning
+  // app-server; do not probe the catalog twice for the same launch.
+  if ((cfg.cliId === 'codex' || cfg.cliId === 'codex-app')
+      && cfg.serviceTier && cfg.serviceTier !== 'default' && !remoteWsUrl) {
+    const tierCheck = await validateCodexServiceTier({
+      cliBin: cfg.cliId === 'codex' ? cliAdapter.resolvedBin : resolveCommandReal(cfg.cliPathOverride ?? 'codex'),
+      env: buildEffectiveChildEnv({ base: childEnv, botEnv: perBotInjectEnv }),
+      model: cfg.model,
+      serviceTier: cfg.serviceTier,
+    });
+    if (!tierCheck.ok) throw new Error(`Codex service tier rejected: ${tierCheck.error}`);
   }
 
   // Publish the exact selected resource BEFORE spawn. This both restores host
@@ -23725,6 +23790,28 @@ process.on('message', async (raw: unknown) => {
         if (inputCommitted) {
           if (!deferNativeCodexInputCommit(msg.dispatchAttempt)) acknowledgeTurnInputCommitted(msg.turnId);
         } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+      }
+      break;
+    }
+
+    case 'codex_app_effort': {
+      // One short, atomic frame; never splice into a chunked business input or
+      // rotate currentBotmuxTurnId, readiness, the dispatch ledger, or the card.
+      if (lastInitConfig?.cliId !== 'codex-app' || !backend || !codexAppControlProven
+        || isFlushing || commandLineWritesPending > 0 || cliRestartInProgress
+        || shouldHoldCodexRunnerInput(codexRunnerFreshness) || lastInitConfig.adoptMode) {
+        send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'unavailable' });
+        break;
+      }
+      const frame = Buffer.from(JSON.stringify({
+        type: 'effort', requestId: msg.requestId, effort: msg.effort,
+      })).toString('base64');
+      try {
+        if (!backend.write(`::botmux-codex-app:${frame}\n`)) {
+          send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'error' });
+        }
+      } catch {
+        send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'error' });
       }
       break;
     }
