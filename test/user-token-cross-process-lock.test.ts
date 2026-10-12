@@ -10,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 describe('user token cross-process replacement lock', () => {
   const roots: string[] = [];
@@ -114,7 +114,7 @@ describe('user token cross-process replacement lock', () => {
     `);
 
     const spawnWorker = (role: 'narrow' | 'broad') => {
-      const child = spawnTsScript(workerPath, [], {
+      const child = spawnNodeTsScript(workerPath, [], {
         cwd: process.cwd(),
         env: {
           ...process.env,
