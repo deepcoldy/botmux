@@ -3,7 +3,7 @@ import {
   GROUP_CONTEXT_CARD_CONTENT_VERSION, markGroupContextCardPurpose, projectGroupContextCard,
 } from '../src/im/lark/group-context-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
-import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
+import { buildCanonicalFinalReplyCard, buildImageCardElements } from '../src/im/lark/md-card.js';
 import { extractCardContent, extractResources } from '../src/im/lark/message-parser.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
@@ -141,7 +141,10 @@ describe('group-context card projection', () => {
   });
 
   it('strips an inline purpose marker from a promoted heading in both API shapes', () => {
-    const raw = buildCanonicalFinalReplyCard({ markdown: '# 通知标题\n\n请查收附件' });
+    const raw = JSON.stringify({
+      schema: '2.0',
+      body: { elements: buildImageCardElements('# 通知标题\n\n请查收附件', []) },
+    });
     const assertCleanHeading = (content: string, atx: boolean) => {
       const text = extractCardContent(content);
       expect(text).toContain(atx ? '# 通知标题' : '通知标题');
