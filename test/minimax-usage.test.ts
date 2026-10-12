@@ -62,6 +62,42 @@ afterEach(() => {
 });
 
 describe('MiniMax native usage and card runtime', () => {
+  it.each(['manifest.json', 'llm-call.json'])('enforces the 4MiB file byte limit on valid %s metadata', file => {
+    const limit = 4 * 1024 * 1024;
+    const value = file === 'manifest.json' ? { sessionId: sid } : { model: 'bounded-model', thinkingLevel: 'high' };
+    const base = JSON.stringify({ ...value, padding: '' });
+    for (const bytes of [limit, limit + 1]) {
+      const encoded = JSON.stringify({ ...value, padding: '界'.repeat(Math.floor((bytes - Buffer.byteLength(base)) / 3)) });
+      const content = encoded + ' '.repeat(bytes - Buffer.byteLength(encoded));
+      expect(Buffer.byteLength(content)).toBe(bytes);
+      // Keep character length below the separate JSON parser limit, so only
+      // the file-size guard can reject this otherwise valid metadata.
+      expect(content.length).toBeLessThan(limit);
+      writeFileSync(join(root, 'v2', 'sessions', history, file), content);
+      const snapshot = readMinimaxUsage(path, sid, true)!;
+      if (bytes === limit) {
+        expect(snapshot.model).toBe(file === 'manifest.json' ? 'MiniMax-M3' : 'bounded-model');
+        expect(snapshot.reasoningEffort).toBe(file === 'manifest.json' ? 'xhigh' : 'high');
+      } else {
+        expect(snapshot.model).toBeUndefined(); expect(snapshot.reasoningEffort).toBeUndefined();
+        expect(snapshot.tokens).toBeNull(); expect(snapshot.context).toBeNull();
+      }
+    }
+  });
+
+  it('enforces the 4MiB character limit on valid database context JSON independently of metadata files', () => {
+    const limit = 4 * 1024 * 1024;
+    const base = JSON.stringify({ context_usage: { usedTokens: 900, contextWindowTokens: 512000 } });
+    for (const size of [limit, limit + 1]) {
+      const encoded = base + ' '.repeat(size - base.length);
+      db.exec('DELETE FROM local_runtime_message_rows');
+      db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,created_at_ms,data_json) VALUES (?,?,?,?)')
+        .run(sid, 'assistant', Date.now(), encoded);
+      const snapshot = readMinimaxUsage(path, sid, true)!;
+      expect(snapshot.context).toEqual(size === limit ? { usedTokens: 900, windowTokens: 512000, percentUsed: 0 } : null);
+      expect(snapshot.model).toBe('MiniMax-M3'); expect(snapshot.reasoningEffort).toBe('xhigh');
+    }
+  });
   it('counts the requesting turn and questionnaire continuation together as one user-turn usage', () => {
     db.exec(`ALTER TABLE local_runtime_message_rows ADD COLUMN turn_id TEXT;
       ALTER TABLE local_runtime_message_rows ADD COLUMN source TEXT;

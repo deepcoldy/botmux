@@ -15,6 +15,16 @@ beforeEach(() => {
 });
 afterEach(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
 const read = () => readMinimaxContinuation(path, 'native', new Set(['question']));
+const JSON_LIMIT = 4 * 1024 * 1024;
+function paddedJson(value: object, bytes: number): string {
+  const base = JSON.stringify({ ...value, padding: '' });
+  const padding = '界'.repeat(Math.floor((bytes - Buffer.byteLength(base)) / 3));
+  const encoded = JSON.stringify({ ...value, padding });
+  const result = encoded + ' '.repeat(bytes - Buffer.byteLength(encoded));
+  expect(Buffer.byteLength(result)).toBe(bytes);
+  expect(result.length).toBeLessThan(JSON_LIMIT);
+  return result;
+}
 function answered(status = 'accepted') {
   db.exec("UPDATE questionnaire_requests SET status='answered', injected_at=2");
   db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id,source_context_json) VALUES (?,?,?,?,?)')
@@ -22,6 +32,46 @@ function answered(status = 'accepted') {
   db.prepare('INSERT INTO local_runtime_turn_ingress VALUES (?,?,?,?)').run('native', 'continuation-turn', status, status === 'completed' ? 3 : null);
 }
 describe('native questionnaire continuation completion proof', () => {
+  it.each(['origin', 'request'] as const)('enforces the 4MiB byte limit on valid %s relation JSON', field => {
+    db.exec('ALTER TABLE questionnaire_requests ADD COLUMN request_json TEXT');
+    const origin = { origin: { kind: 'questionnaire-response', requestId: 'question' } };
+    const request = { requester: { sessionId: 'native', runId: 'user-turn' } };
+    db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id,source_context_json) VALUES (?,?,?,?,?)')
+      .run('native', 'user', 'questionnaire', 'continuation', JSON.stringify(origin));
+    db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id) VALUES (?,?,?,?)')
+      .run('native', 'user', 'api', 'user-turn');
+    db.prepare('UPDATE questionnaire_requests SET request_json=?').run(JSON.stringify(request));
+    for (const bytes of [JSON_LIMIT, JSON_LIMIT + 1]) {
+      const encoded = paddedJson(field === 'origin' ? origin : request, bytes);
+      if (field === 'origin') db.prepare("UPDATE local_runtime_message_rows SET source_context_json=? WHERE turn_id='continuation'").run(encoded);
+      else db.prepare('UPDATE questionnaire_requests SET request_json=?').run(encoded);
+      expect(minimaxUserTurnIds(db, 'native', 'continuation'))
+        .toEqual(bytes === JSON_LIMIT ? ['continuation', 'user-turn'] : undefined);
+    }
+  });
+
+  it('accepts final assistant JSON at 4MiB and rejects one byte above without delivering it', () => {
+    answered('completed');
+    const insert = db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,turn_id,data_json) VALUES (?,?,?,?)');
+    insert.run('native', 'assistant', 'continuation-turn', paddedJson({ msg_content: 'bounded answer' }, JSON_LIMIT));
+    expect(read()).toEqual({ state: 'completed', content: 'bounded answer' });
+    insert.run('native', 'assistant', 'continuation-turn', paddedJson({ msg_content: 'oversized answer' }, JSON_LIMIT + 1));
+    expect(read).toThrow('缺少最终回复');
+  });
+
+  it.each([31, 32])('bounds questionnaire usage ancestry traversal for %s links', links => {
+    db.exec('ALTER TABLE questionnaire_requests ADD COLUMN request_json TEXT');
+    db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id) VALUES (?,?,?,?)')
+      .run('native', 'user', 'api', 'turn-0');
+    for (let i = 1; i <= links; i++) {
+      db.prepare('INSERT INTO questionnaire_requests (request_id,session_id,request_json) VALUES (?,?,?)')
+        .run(`q-${i}`, 'native', JSON.stringify({ requester: { sessionId: 'native', runId: `turn-${i - 1}` } }));
+      db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id,source_context_json) VALUES (?,?,?,?,?)')
+        .run('native', 'user', 'questionnaire', `turn-${i}`, JSON.stringify({ origin: { kind: 'questionnaire-response', requestId: `q-${i}` } }));
+    }
+    expect(minimaxUserTurnIds(db, 'native', `turn-${links}`))
+      .toEqual(links === 31 ? Array.from({ length: 32 }, (_, i) => `turn-${31 - i}`) : undefined);
+  });
   it('ignores stale pending requests while still waiting for new questionnaires in this prompt cycle', () => {
     for (let i = 0; i < 20; i++) db.prepare('INSERT INTO questionnaire_requests VALUES (?,?,?,?,?)')
       .run(`stale-${i}`, 'native', 'pending', null, 1);

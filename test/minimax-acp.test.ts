@@ -42,6 +42,80 @@ async function stopped(pid: number) {
   });
 }
 describe('mcode ACP wire client', () => {
+  it('accepts eight simultaneous permission requests and returns each exact response', async () => {
+    const f = fixture(); let release: (value: unknown) => void = () => {};
+    const answer = new Promise(resolve => { release = resolve; });
+    const input = vi.fn().mockImplementation(() => {
+      if (input.mock.calls.length === 8) {
+        expect(f.calls().filter(c => c.message?.id?.startsWith?.('burst-'))).toHaveLength(0);
+        release({ outcome: { outcome: 'selected', optionId: 'deny' } });
+      }
+      return answer;
+    });
+    const result = await runMinimaxAcp({ ...f.options, content: 'permission-burst-8', onUserInput: input }, bounded());
+    expect(result.content).toBe('answered:8'); expect(input).toHaveBeenCalledTimes(8);
+    expect(f.calls().filter(c => c.message?.id?.startsWith?.('burst-')).map(c => c.message))
+      .toEqual(Array.from({ length: 8 }, (_, i) => ({ jsonrpc: '2.0', id: `burst-${i + 1}`,
+        result: { outcome: { outcome: 'selected', optionId: 'deny' } } })));
+    await stopped(f.calls()[0].pid);
+  });
+
+  it('rejects the ninth simultaneous request specifically at the incoming request limit', async () => {
+    const f = fixture(); const input = vi.fn().mockImplementation(() => new Promise(() => {}));
+    await expect(runMinimaxAcp({ ...f.options, content: 'permission-burst-9', onUserInput: input }, bounded()))
+      .rejects.toThrow('mcode_acp_too_many_questions');
+    expect(f.calls().some(c => c.message?.id === 'burst-9' && c.message.result)).toBe(false);
+    await stopped(f.calls()[0].pid);
+  });
+
+  it('reuses an answered request slot while the other seven requests are still pending', async () => {
+    const f = fixture(); const waiting = vi.fn(); let release: (value: unknown) => void = () => {};
+    const response = { outcome: { outcome: 'selected', optionId: 'deny' } };
+    const answer = new Promise(resolve => { release = resolve; });
+    const input = vi.fn().mockImplementation((_method, params) => {
+      if (params.toolCall.title === 'Write 1') return Promise.resolve(response);
+      if (params.toolCall.title === 'Write 9') {
+        expect(input).toHaveBeenCalledTimes(9);
+        expect(f.calls().filter(c => c.message?.id?.startsWith?.('burst-')).map(c => c.message.id)).toEqual(['burst-1']);
+        release(response);
+      }
+      return answer;
+    });
+    const result = await runMinimaxAcp({ ...f.options, content: 'permission-window', onUserInput: input,
+      onInteractionPending: waiting }, bounded());
+    expect(result.content).toBe('answered:9'); expect(input).toHaveBeenCalledTimes(9);
+    expect(waiting.mock.calls.map(c => c[0])).toEqual([true, false]);
+    expect(f.calls().filter(c => c.message?.id?.startsWith?.('burst-'))).toHaveLength(9);
+    await stopped(f.calls()[0].pid);
+  });
+
+  it.each([32, 33])('bounds accumulated native questionnaire ids at 32 for %s sequential questions', async count => {
+    const f = durableFixture(); const input = vi.fn().mockImplementation(async (_method, params) => {
+      const index = Number(params.message.split(' ').at(-1));
+      f.db.prepare("UPDATE questionnaire_requests SET status='answered', injected_at=? WHERE request_id=?")
+        .run(index, `q-${index}`);
+      f.db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,source,turn_id,source_context_json) VALUES (?,?,?,?,?)')
+        .run('session_fixture', 'user', 'questionnaire', `turn-${index}`, JSON.stringify({ origin: { requestId: `q-${index}` } }));
+      f.db.prepare('INSERT INTO local_runtime_turn_ingress VALUES (?,?,?,?)').run('session_fixture', `turn-${index}`, 'completed', index);
+      f.db.prepare('INSERT INTO local_runtime_message_rows (session_id,role,turn_id,data_json) VALUES (?,?,?,?)')
+        .run('session_fixture', 'assistant', `turn-${index}`, JSON.stringify({ msg_content: `durable:${index}` }));
+      return { action: 'accept', content: { answer: `answer-${index}` } };
+    });
+    try {
+      const run = runMinimaxAcp({ ...f.options, content: `native-questions-${count}`, onUserInput: input,
+        onUpdate(update) {
+          if (!update.toolCallId?.startsWith('questionnaire-')) return;
+          const index = Number(update.toolCallId.split('-').at(-1));
+          f.db.prepare('INSERT INTO questionnaire_requests VALUES (?,?,?,?,?)').run(`q-${index}`, 'session_fixture', 'pending', null, index);
+        } }, bounded());
+      if (count === 32) expect((await run).content).toBe('durable:32');
+      else await expect(run).rejects.toThrow('mcode_acp_too_many_native_questions');
+      expect(input).toHaveBeenCalledTimes(32);
+      expect(f.calls().filter(c => c.message?.id?.startsWith?.('sequential-'))).toHaveLength(32);
+      if (count === 33) expect(f.db.prepare("SELECT status FROM questionnaire_requests WHERE request_id='q-33'").get()).toEqual({ status: 'pending' });
+      await stopped(f.calls()[0].pid);
+    } finally { f.db.close(); }
+  });
   it.each(['missing', 'schema', 'locked'] as const)('completes native turns without questions when the questionnaire database is %s', async scenario => {
     const f = fixture(); f.options.env.MCODE_ACP_SCENARIO = 'native-questionnaire';
     let db: ReturnType<typeof openDatabaseSyncNow> = null;

@@ -6,6 +6,25 @@ const form = (properties: object, required: string[] = []) => ({ mode: 'form', s
 const choice = (title = 'Strategy') => ({ type: 'string', title, oneOf: [{ const: 'safe-id', title: 'Safe', description: 'Check first' }, { const: 'fast-id', title: 'Fast' }] });
 const answer = (answers: Record<string, string[]>) => ({ answers: Object.fromEntries(Object.entries(answers).map(([id, values]) => [id, { answers: values }])) });
 describe('mcode ACP questionnaire bridge', () => {
+  it.each(['single', 'multi'] as const)('accepts every legal %s choice count and rejects 0, 21 and 22 before presenting a card', async kind => {
+    const choices = Array.from({ length: 22 }, (_, i) => ({ const: `id-${i}`, title: `Choice ${i}` }));
+    const field = (count: number) => kind === 'single'
+      ? { type: 'string', oneOf: choices.slice(0, count) }
+      : { type: 'array', items: { anyOf: choices.slice(0, count) } };
+    const ask = vi.fn();
+    for (let count = 1; count <= 20; count++) {
+      ask.mockReset().mockResolvedValue(answer({ a: [`Choice ${count - 1}`] }));
+      expect(parseMinimaxForm(form({ a: field(count) }, ['a'])).fields[0].options).toHaveLength(count);
+      expect((await bridgeMinimaxForm(context, form({ a: field(count) }, ['a']), signal(), ask)).content)
+        .toEqual({ a: kind === 'single' ? `id-${count - 1}` : [`id-${count - 1}`] });
+      expect(ask.mock.calls[0][1].questions[0].options).toHaveLength(Math.max(2, count));
+    }
+    for (const count of [0, 21, 22]) {
+      ask.mockClear();
+      await expect(bridgeMinimaxForm(context, form({ a: field(count) }, ['a']), signal(), ask)).rejects.toThrow('不支持');
+      expect(ask).not.toHaveBeenCalled();
+    }
+  });
   it('accepts 24 form fields and rejects 25 before presenting a card', () => {
     const properties = Object.fromEntries(Array.from({ length: 24 }, (_, i) => [`field-${i}`, { type: 'string' }]));
     expect(parseMinimaxForm(form(properties)).fields).toHaveLength(24);

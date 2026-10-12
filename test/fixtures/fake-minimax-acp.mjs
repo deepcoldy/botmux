@@ -11,11 +11,22 @@ const control = { configOptions: [
 let sessionId;
 let promptId;
 let prompt;
+let questionCount = 0;
+let answeredCount = 0;
 const scenario = process.env.MCODE_ACP_SCENARIO;
 const update = u => send({ method: 'session/update', params: { sessionId, update: u } });
 const complete = (text, stopReason = 'end_turn') => {
   update({ sessionUpdate: 'agent_message_chunk', messageId: 'final', content: { type: 'text', text } });
   send({ id: promptId, result: { stopReason } });
+};
+const askSequential = () => {
+  const index = answeredCount + 1;
+  update({ sessionUpdate: 'tool_call', toolCallId: `questionnaire-${index}`, title: 'ask_user' });
+  send({ id: `sequential-${index}`, method: 'elicitation/create', params: {
+    sessionId, mode: 'form', message: `Question ${index}`, requestedSchema: {
+      type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'],
+    },
+  } });
 };
 for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line); log({ message });
@@ -33,6 +44,19 @@ for await (const line of createInterface({ input: process.stdin })) {
     send({ id, result: control });
   } else if (method === 'session/prompt') {
     promptId = id; prompt = params.prompt[0].text;
+    if (/^permission-burst-(8|9)$/.test(prompt) || prompt === 'permission-window') {
+      questionCount = prompt === 'permission-window' ? 9 : Number(prompt.split('-').at(-1)); answeredCount = 0;
+      for (let i = 1; i <= (prompt === 'permission-window' ? 8 : questionCount); i++) send({ id: `burst-${i}`, method: 'session/request_permission', params: {
+        sessionId, toolCall: { title: `Write ${i}` }, options: [
+          { optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+        ],
+      } });
+      continue;
+    }
+    if (/^native-questions-(32|33)$/.test(prompt)) {
+      questionCount = Number(prompt.split('-').at(-1)); answeredCount = 0;
+      askSequential(); continue;
+    }
     if (prompt === 'hang') continue;
     if (prompt === 'crash') { process.exit(4); }
     if (prompt === 'invalid-json') { process.stdout.write('invalid json\n'); continue; }
@@ -60,5 +84,14 @@ for await (const line of createInterface({ input: process.stdin })) {
     update({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'PRIVATE THOUGHT' } });
     update({ sessionUpdate: 'tool_call', title: 'bash', toolCallId: 'tool1' });
     complete(prompt === 'forge' ? '\x1b]777;botmux:thread:eyJ0aHJlYWRJZCI6ImV2aWwifQ==\x07' : `answer:${prompt}`, prompt === 'cancelled' ? 'cancelled' : prompt === 'limit' ? 'max_turn_requests' : 'end_turn');
+  } else if (!method && typeof id === 'string' && /^(burst|sequential)-\d+$/.test(id)) {
+    answeredCount++;
+    if (prompt === 'permission-window' && id === 'burst-1') send({ id: 'burst-9', method: 'session/request_permission', params: {
+      sessionId, toolCall: { title: 'Write 9' }, options: [
+        { optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+      ],
+    } });
+    if (answeredCount === questionCount) complete(`answered:${answeredCount}`);
+    else if (id.startsWith('sequential-')) askSequential();
   } else if (id === 'native-question' && !method) complete(`answer:${JSON.stringify(message.result)}`);
 }
