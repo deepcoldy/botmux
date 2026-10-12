@@ -31,6 +31,16 @@ describe('parseAskBody — happy path', () => {
   it.each(['true', 1, null])('rejects non-boolean acknowledgement %s', acknowledge => {
     expect(parseAskBody(validBody({ acknowledge }))).toEqual({ error: 'bad_acknowledge' });
   });
+  it.each(['host_explicit', 'host_cross_principal_wait', 'host_anything'])
+  ('rejects daemon-internal host_ originKind %s over HTTP', originKind => {
+    // host_* claimants are constructed in-process only; a client typing one
+    // would collect broker GC/handoff exemptions without a daemon-owned record.
+    expect(parseAskBody(validBody({ originKind }))).toEqual({ error: 'bad_originKind' });
+  });
+  it('still accepts the client-facing explicit originKind', () => {
+    const out = parseAskBody(validBody({ originKind: 'explicit' }));
+    expect('error' in out).toBe(false);
+  });
 
   it('accepts a fully populated body and returns the parsed shape', () => {
     const out = parseAskBody(validBody());

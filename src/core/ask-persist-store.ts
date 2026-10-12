@@ -194,9 +194,19 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         ensureDir();
         atomicWriteFileSync(filePath(ask.askKey), JSON.stringify(ask), { mode: 0o600, durable: true });
       } catch (e) {
-        // Explicit human decisions are a correctness gate: do not acknowledge
-        // a click whose durable handoff could not be committed.
-        if (ask.originKind === 'host_explicit') throw e;
+        // A real human ANSWER is a correctness gate: do not acknowledge a click
+        // whose durable handoff could not be committed. settle() performs this
+        // write before ANY state mutation, so the throw leaves the ask pending
+        // and the (catch-wrapped) card click fails closed — the human can click
+        // again once the disk is healthy.
+        //
+        // Timeouts / invalidations carry no human decision and can be persisted
+        // from a bare setTimeout callback (deadline timer, or the remaining=0
+        // timer armed for an expired record on boot) whose throw escapes as
+        // uncaughtException — the daemon installs no trap for that, and explicit
+        // records are exempt from disk reaping below, so it would crash-loop on
+        // every restart until the disk recovered. Those writes stay best-effort.
+        if (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered') throw e;
         // Persistence is a resilience enhancement, never a correctness gate for
         // the live path: a failed write just means this ask won't survive a
         // restart.

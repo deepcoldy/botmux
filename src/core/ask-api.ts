@@ -91,6 +91,14 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     if (typeof r.originKind !== 'string' || !r.originKind.trim() || r.originKind.length > 32) {
       return { error: 'bad_originKind' };
     }
+    // The `host_*` namespace ('host_explicit', 'host_cross_principal_*') is
+    // daemon-internal: those claimants are constructed in-process and the
+    // broker grants the label GC / handoff / persistence exemptions. An HTTP
+    // client must never mint one by typing it — it would collect the privileges
+    // without any daemon-owned record. Reject at the boundary.
+    if (r.originKind.startsWith('host_')) {
+      return { error: 'bad_originKind' };
+    }
     originKind = r.originKind;
   }
 
