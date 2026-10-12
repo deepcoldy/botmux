@@ -33,6 +33,7 @@ vi.mock('../src/bot-registry.js', () => ({
   loadBotConfigs: () => [],
   getBot: () => undefined,
   getAllBots: () => [],
+  effectiveBotDisplayName: () => 'BotA',
   getBotClient: () => undefined,
   getOwnerOpenId: () => undefined,
 }));

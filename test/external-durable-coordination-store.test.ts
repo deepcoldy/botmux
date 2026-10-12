@@ -17,6 +17,16 @@ import { resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const fixture = resolve('test/fixtures/durable-coordination-provider.ts');
+const validAttemptingControlRecord = {
+  operationId: 'fixture-control',
+  sessionKey: 'session-a',
+  payload: { action: 'close' },
+  createdAt: 1,
+  state: 'attempting',
+  originEpoch: 1,
+  attempts: 1,
+  updatedAt: 2,
+} as const;
 
 function providerCommand(extraArgs: string[] = []) {
   const { command, prefixArgs } = tsRunnerPrefix();
@@ -94,8 +104,8 @@ describe('external durable coordination provider', () => {
     ['enqueueControlOperation', { kind: 'applied' }],
     ['beginControlOperationAttempt', {
       kind: 'applied',
-      record: {},
-      attempt: {},
+      record: validAttemptingControlRecord,
+      attempt: { operationId: 'fixture-control' },
     }],
     ['completeControlOperationAttempt', { kind: 'applied', record: {} }],
     ['retryControlOperationAttempt', { kind: 'applied', record: {} }],
