@@ -224,6 +224,8 @@ async function buildOne({ target, out }) {
   mkdirSync(dirname(outfile), { recursive: true });
 
   const baked = versionToBake();
+  const runtimeBuildId = readFileSync(join(REPO_ROOT, 'dist', '.runtime-build-id'), 'utf8').trim();
+  if (!/^[a-f0-9]{64}$/.test(runtimeBuildId)) throw new Error('Invalid runtime build id; run bun run build first');
   const result = await Bun.build({
     entrypoints: [entry],
     compile: { outfile, ...(target ? { target } : {}) },
@@ -233,7 +235,8 @@ async function buildOne({ target, out }) {
     // `bakedBinaryVersion()` (src/utils/install-info.ts), which is written so the
     // identifier is absent under Node — where the disk read still works — and only
     // this compiled path needs the constant.
-    define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked) },
+    define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked),
+      '__BOTMUX_RUNTIME_BUILD_ID__': JSON.stringify(runtimeBuildId) },
     plugins: [makeNativeEmbedPlugin({ ptyNode, spawnHelper })],
   });
   if (!result.success) {
