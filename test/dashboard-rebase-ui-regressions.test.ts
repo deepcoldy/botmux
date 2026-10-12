@@ -19,10 +19,15 @@ describe('dashboard master feature integration', () => {
     const messages = dashboardSource('i18n.ts');
 
     expect(types).toContain('codexAppCleanInput?: boolean');
-    expect(page).toContain('<CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />');
+    expect(page).toContain('<CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} />');
     expect(page).toContain('dataAction="toggle-codex-app-clean-input"');
     expect(messages).toContain('默认关闭，保持原有兼容行为');
     expect(messages).toContain('still reach the model, but move to hidden context');
+    // #1162: the no-progress nudge toggle + threshold input stay wired in too.
+    expect(types).toContain('noProgressNotify?: import(\'../../services/no-progress-notify-policy.js\').NoProgressNotifyPolicy | null');
+    expect(page).toContain('dataAction="toggle-codex-app-no-progress"');
+    expect(page).toContain('data-action="save-no-progress-timeout"');
+    expect(page).toContain('/no-progress-notify`');
   });
 
   it('keeps substitute mode configurable from the React bot defaults page', () => {

@@ -64,6 +64,7 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 Relayed away',
   'card.status.selected': 'Selected',
   'card.status.waiting_screenshot': '_(Waiting for first screenshot…)_',
+  'card.status.screenshot_unavailable': '_(No screenshot is available. Refresh after the session resumes.)_',
   'card.status.truncated_prefix': '… (truncated)',
   'card.pending.detoured_title': 'Sent',
   'card.pending.detoured_body': 'The final reply was sent to another target.',
@@ -953,7 +954,8 @@ export const messages: Record<string, string> = {
   'ai.routing.intro': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output — you MUST reply via `botmux send`.',
   'ai.routing.usage_send': '- Send: `botmux send "message"`',
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
-  'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos` (see `botmux send --help`)',
+  'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos`; for size/layout choices run `botmux skill show botmux-send`',
+  'ai.routing.ask_wait': 'While botmux ask awaits a human, empty output is normal. Do not send Ctrl-C, kill the process, or cancel the waiting tool to finish the turn early. Reuse the original wait until an answer or normal timeout. Transport failures, timeouts and bot replies are not human approval. On Ask recovery, read the original task, question and solution revision; consume only the matching decision without replaying completed work.',
   'ai.routing.usage_helpers': '- Context: `botmux history`; collaborator bots: `botmux bots list`',
   'ai.routing.usage_silence': '- If the message is not for you, final reply must be just `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': 'A successful `botmux send` means delivered; ending with no visible terminal output is normal. If you see a "no visible output" nudge, that is a false alarm from the underlying CLI — do not resend unless `botmux send` itself errored.',
@@ -1709,6 +1711,7 @@ export const messages: Record<string, string> = {
   'toast.action_received_no_repeat': 'Action received — please don’t click again',
   'toast.action_in_progress': 'Action in progress — please wait',
   'toast.action_received_bg': 'Action received — processing in the background',
+  'toast.card_update_busy_retry': 'The card is updating — please tap again in a moment',
   'toast.not_in_approver_list': 'You’re not on the approver list — no action taken',
 
   // Quote hint (injected into the CLI prompt)

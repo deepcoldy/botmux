@@ -405,7 +405,7 @@ botmux send --urgent=phone --mention-back "P0 故障，请立即上线处理"
 
 ### 纯文本（最常见）
 
-**正文输入契约**：\`botmux send [content]\` 接收原始正文，不是 JSON；只有 \`--card-json\` / \`--card-file\` 的卡片输入才按 JSON 解析。不要先对普通正文执行 \`JSON.stringify\`、把换行手动替换成 \`\\n\`，再把结果塞进位置参数；外层工具协议会自行编码命令字符串，shell / botmux 也不会把字面量 \`\\n\` 反解成换行。
+**正文输入契约**：\`botmux send [content]\` 接收原始正文，不是 JSON；只有 \`--card-json\` / \`--card-file\` 的卡片输入才按 JSON 解析。不要先对普通正文执行 \`JSON.stringify\`、把换行手动替换成 \`\\n\`，再把结果塞进位置参数；外层工具协议会自行编码命令字符串，shell / botmux 也不会把字面量 \`\\n\` 反解成换行。仅纯位置参数的单行文本会把字面量 \`\\n\\n\` 还原为段落空行；多行正文仍应使用 heredoc / stdin 或 \`--content-file\`。
 
 位置参数只用于单行正文。多行正文不要写成 \`botmux send "第一行\\n第二行"\`，必须直接走 quoted heredoc / stdin；在 Windows/PowerShell 里发送包含中文或 emoji 的多行内容时，必须先写 UTF-8 文件，再用 \`--content-file\`，不要把中文直接通过 here-string、\`echo\` 或管道送进 stdin。
 
@@ -468,11 +468,27 @@ botmux send --content-file $msg
 
 \`--images <path>\` 上传本地图片（可重复）。在 markdown 正文中用占位符 \`![alt](img:N)\` 标记位置（\`N\` 是 0-based 索引，按 \`--images\` 给出的顺序对应）；不写占位符的图片自动追加到消息末尾。
 
+**独立单图尺寸**：按图片用途选择 \`--image-mode\`。二维码、图标等小图优先用 \`small\`，避免占满卡片；需要直接阅读文字或细节的截图、图表保留全宽，或用 \`medium\`；用户明确要求的尺寸优先。
+
+| 参数 | 展示宽度 |
+|---|---|
+| 不传 / \`fit_horizontal\` | 卡片可用宽度的全宽（默认） |
+| \`medium\` | 卡片可用宽度的 1/2 |
+| \`small\` | 卡片可用宽度的 1/3 |
+| \`tiny\` | 卡片可用宽度的 1/4 |
+
+缩小档位保留完整画面和宽高比，不裁剪，仍可点击预览。比例相对卡片可用宽度，不是固定像素尺寸。该参数只控制末尾追加的图片、独占一行的 \`![说明](img:N)\` 或 \`![说明](img_v3_...)\`；正文行内图片和下面的并排多图保持原布局。二维码缩小后仍需清晰可扫，空间不足时选更大档位或提示点击预览。
+
+当前任务必须等用户扫码授权才能继续时，同一条授权请求加 \`--attention=authz\`，发完结束本轮、等用户回复；只是展示二维码、任务还能继续时，不加举手标记。
+
 **多图一行（图片组合）**：一个占位符里写多个逗号分隔的索引，就把这几张图排成一行并列显示（自动等宽缩放、保留完整画面不裁剪）——\`![](img:0,1)\` 两张一行，\`![](img:0,1,2)\` 三张一行。每个占位符是一行，想多行就写多个占位符。适合菜单、多图对比这类「一屏看完」的场景，避免单图全宽纵向堆很长。
 
 \`\`\`bash
-# 单图：默认追加到末尾
-botmux send --images "$TMPDIR/screenshot.png" "截图如上，红框部分是问题所在。"
+# 需要读细节的截图：默认全宽，追加到末尾
+botmux send --images "$TMPDIR/screenshot.png" --mention-back "截图如上，红框部分是问题所在。"
+
+# 等待扫码授权才能继续：1/3 宽预览，并标进「需要你」
+botmux send --images "$TMPDIR/qrcode.png" --image-mode small --attention=authz --mention-back "需要你扫码授权才能继续；若看不清，可点击图片放大。"
 
 # 图文混排：占位符控制图片位置
 botmux send --images chart.png --images table.png <<'EOF'
@@ -686,6 +702,7 @@ sandbox dispatch 暂不支持
 | (positional 或 stdin) | 消息文本（支持 markdown，自动选择卡片/文本模式） |
 | \`--content-file <path>\` | 从文件读取内容（优先于 stdin/positional） |
 | \`--images <path>\` | 内联图片，可重复多次 |
+| \`--image-mode <mode>\` | 独立单图尺寸：默认 \`fit_horizontal\` 全宽；\`medium\` / \`small\` / \`tiny\` 分别占宽 1/2、1/3、1/4 |
 | \`--files <path>\` | 附件文件，可重复多次，每个单独发送 |
 | \`--videos <path>\` | 视频预览 MP4，可重复；每个必须有对应 \`--video-covers\` |
 | \`--video-covers <path>\` | 视频封面图片，可重复，按顺序对应 \`--videos\` |
@@ -1339,6 +1356,9 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - daemon 不可达或 ask 被 daemon restart 失效：默认模式 stdout 为空，exit 3；\`--json\` 时 \`selected:null\`
 
 所有人类可读提示都在 stderr，调用方不要 parse stderr。
+
+等待真人回答期间，无输出是正常状态。必须复用原等待进程直到回答或 Ask 正常超时；禁止发送 Ctrl-C、kill、结束等待 cell 或另发相同问题来结束当前轮。Ctrl-C 不取消 Ask。连接暂时中断会按原请求身份重连；进程确实退出时，后台保留结果并在原会话空闲后接续。超时、传输错误和机器人回答不能当作真人批准。
+
 
 ## 选项规则
 

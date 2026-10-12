@@ -130,6 +130,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       // a toggle takes effect on the next session without a daemon restart.
       ...(noVisibleOutputHintOn() ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
       t('ai.shell.mention_gate', undefined, locale),
+      t('ai.routing.usage_attachments', undefined, locale),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       hiddenContextDefense(locale),
@@ -322,6 +323,7 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.intro_transcript'),
       '',
       prose('ai.routing.usage_helpers'),
+      prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
       ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
       hiddenContextDefense(locale),
@@ -336,6 +338,7 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.usage_mention_gate'),
       prose('ai.routing.usage_attachments'),
       prose('ai.routing.usage_helpers'),
+      prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
       escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
       ...(xpiAsHintOn() ? [prose('ai.routing.xpi_as_hint')] : []),
