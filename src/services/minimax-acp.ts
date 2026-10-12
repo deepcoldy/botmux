@@ -9,7 +9,7 @@ import { pendingMinimaxQuestionnaires, readMinimaxContinuation } from './minimax
 import { setTimeout as delay } from 'node:timers/promises';
 
 type Json = Record<string, any>;
-export interface McodeAcpOptions extends Omit<McodeExecOptions, 'onEvent'> {
+export interface MinimaxAcpOptions extends Omit<McodeExecOptions, 'onEvent'> {
   onSession?: (sessionId: string) => void;
   onUpdate?: (update: Json) => void;
   onUserInput: (method: 'elicitation/create' | 'session/request_permission', params: Json, signal: AbortSignal) => Promise<unknown>;
@@ -21,7 +21,7 @@ const object = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array
  * One owned process per Botmux turn; exact native session/resume preserves the
  * existing runner's queue and restart semantics. Model-only invocations keep
  * their separate exec surface. No fallback from a failed human question. */
-export async function runMcodeAcp(opts: McodeAcpOptions, signal: AbortSignal): Promise<McodeExecResult> {
+export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal): Promise<McodeExecResult> {
   signal.throwIfAborted();
   const env = { ...opts.env };
   applySessionOwnerEnv(env, opts.env.BOTMUX_OWNER_OPEN_ID);

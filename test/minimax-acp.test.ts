@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { runMcodeAcp, type McodeAcpOptions } from '../src/services/mcode-acp.js';
+import { runMinimaxAcp, type MinimaxAcpOptions } from '../src/services/minimax-acp.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
@@ -15,8 +15,8 @@ function fixture() {
   const executable = join(root, 'mcode');
   const log = join(root, 'calls.jsonl');
   const prefix = tsRunnerPrefix();
-  writeFileSync(executable, `#!/bin/sh\nexec ${[prefix.command, resolve('test/fixtures/fake-mcode-acp.mjs')].map(quote).join(' ')} "$@"\n`, { mode: 0o700 });
-  const options: McodeAcpOptions = { executable, cwd: root, env: { ...process.env, MINIMAX_DATA_DIR: join(root, 'data'),
+  writeFileSync(executable, `#!/bin/sh\nexec ${[prefix.command, resolve('test/fixtures/fake-minimax-acp.mjs')].map(quote).join(' ')} "$@"\n`, { mode: 0o700 });
+  const options: MinimaxAcpOptions = { executable, cwd: root, env: { ...process.env, MINIMAX_DATA_DIR: join(root, 'data'),
     MCODE_TEST_LOG: log, BOTMUX_OWNER_OPEN_ID: 'ou_owner', __OWNER_OPEN_ID: 'ou_stale' },
     content: 'hello', permission: 'full', timeoutMs: 5000, onUserInput: async () => ({ action: 'accept', content: {} }) };
   return { root, log, options, calls: () => readFileSync(log, 'utf8').trim().split('\n').map(l => JSON.parse(l)) };
@@ -35,7 +35,7 @@ async function stopped(pid: number) {
 describe('mcode ACP wire client', () => {
   it('initializes capabilities, creates exact native identity, configures and returns only the final message', async () => {
     const f = fixture(); const session = vi.fn(); const updates = vi.fn();
-    const result = await runMcodeAcp({ ...f.options, model: 'custom_provider:test/model', effort: 'high', onSession: session, onUpdate: updates }, bounded());
+    const result = await runMinimaxAcp({ ...f.options, model: 'custom_provider:test/model', effort: 'high', onSession: session, onUpdate: updates }, bounded());
     expect(result).toEqual({ sessionId: 'session_fixture', content: 'answer:hello' });
     expect(session).toHaveBeenCalledWith('session_fixture');
     const calls = f.calls();
@@ -49,7 +49,7 @@ describe('mcode ACP wire client', () => {
   });
   it.each(['resume', 'load'])('uses %s with exact identity and ignores replayed history', async scenario => {
     const f = fixture(); f.options.env.MCODE_ACP_SCENARIO = scenario;
-    const result = await runMcodeAcp({ ...f.options, nativeSessionId: 'native-existing' }, bounded());
+    const result = await runMinimaxAcp({ ...f.options, nativeSessionId: 'native-existing' }, bounded());
     expect(result).toEqual({ sessionId: 'native-existing', content: 'answer:hello' });
     const attach = f.calls().find(c => c.message?.method === `session/${scenario}`);
     expect(attach.message.params.sessionId).toBe('native-existing');
@@ -57,20 +57,20 @@ describe('mcode ACP wire client', () => {
   });
   it('preserves an explicit provider/model#variant instead of choosing the default variant', async () => {
     const f = fixture();
-    await runMcodeAcp({ ...f.options, model: 'custom_provider:test/model#fast mode' }, bounded());
+    await runMinimaxAcp({ ...f.options, model: 'custom_provider:test/model#fast mode' }, bounded());
     expect(f.calls().find(c => c.message?.params?.configId === 'model').message.params.value)
       .toBe('m:custom_provider%3Atest:model:v:fast%20mode');
   });
   it.each(['unknown', ''])('rejects an unavailable or empty explicit model variant: %s', async variant => {
     const f = fixture();
-    await expect(runMcodeAcp({ ...f.options, model: `custom_provider:test/model#${variant}` }, bounded())).rejects.toThrow();
+    await expect(runMinimaxAcp({ ...f.options, model: `custom_provider:test/model#${variant}` }, bounded())).rejects.toThrow();
     expect(f.calls().some(c => c.message?.method === 'session/prompt')).toBe(false);
   });
   it('waits for the exact human response before allowing prompt completion', async () => {
     const f = fixture(); const waiting = vi.fn(); let release: (value: unknown) => void = () => {};
     const answer = new Promise(resolve => { release = resolve; });
     const input = vi.fn().mockReturnValue(answer);
-    const run = runMcodeAcp({ ...f.options, content: 'ask', onUserInput: input, onInteractionPending: waiting }, bounded());
+    const run = runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input, onInteractionPending: waiting }, bounded());
     await waitFor(() => input.mock.calls.length === 1);
     expect(waiting).toHaveBeenCalledWith(true);
     expect(f.calls().some(c => c.message?.id === 'native-question' && !c.message.method)).toBe(false);
@@ -102,14 +102,14 @@ describe('mcode ACP wire client', () => {
       return { action: 'accept', content: { approach: 'fast-id' } };
     };
     try {
-      const result = await runMcodeAcp({ ...f.options, content: 'ask', onUserInput: input }, bounded());
+      const result = await runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input }, bounded());
       expect(finished).toBe(true); expect(result.content).toBe('After choice: Smoke');
       await stopped(f.calls()[0].pid);
     } finally { db.close(); }
   });
   it('forwards native permission requests with an explicit response', async () => {
     const f = fixture(); const input = vi.fn().mockResolvedValue({ outcome: { outcome: 'selected', optionId: 'deny' } });
-    expect((await runMcodeAcp({ ...f.options, content: 'permission', permission: 'smart', onUserInput: input }, bounded())).content).toContain('deny');
+    expect((await runMinimaxAcp({ ...f.options, content: 'permission', permission: 'smart', onUserInput: input }, bounded())).content).toContain('deny');
     expect(input.mock.calls[0][0]).toBe('session/request_permission');
     expect(f.calls().some(c => c.message?.params?.value === 'bypassPermissions')).toBe(false);
   });
@@ -118,7 +118,7 @@ describe('mcode ACP wire client', () => {
     const input = vi.fn().mockImplementation((_method, _params, signal) => {
       inputSignal = signal; return new Promise((_r, reject) => signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true }));
     });
-    const run = runMcodeAcp({ ...f.options, content: 'ask', onUserInput: input }, controller.signal);
+    const run = runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input }, controller.signal);
     // Bun's promise matcher can wait synchronously; trigger cancellation
     // before invoking it so the test does not deadlock its own producer.
     await waitFor(() => input.mock.calls.length === 1); controller.abort();
@@ -129,12 +129,12 @@ describe('mcode ACP wire client', () => {
   });
   it('stops instead of replying empty when a human question fails', async () => {
     const f = fixture();
-    await expect(runMcodeAcp({ ...f.options, content: 'ask', onUserInput: async () => { throw new Error('ask timed out'); } }, bounded())).rejects.toThrow('ask timed out');
+    await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: async () => { throw new Error('ask timed out'); } }, bounded())).rejects.toThrow('ask timed out');
     expect(f.calls().some(c => c.message?.id === 'native-question' && !c.message.method)).toBe(false);
   });
   it.each(['foreign-ask', 'foreign-update', 'crash', 'invalid-json', 'unknown-response', 'cancelled', 'limit', 'oversize'])('rejects %s without a successful final', async content => {
     const f = fixture(); const input = vi.fn();
-    await expect(runMcodeAcp({ ...f.options, content, onUserInput: input }, bounded())).rejects.toThrow();
+    await expect(runMinimaxAcp({ ...f.options, content, onUserInput: input }, bounded())).rejects.toThrow();
     expect(input).not.toHaveBeenCalled();
     await stopped(f.calls()[0].pid);
   });
@@ -143,17 +143,17 @@ describe('mcode ACP wire client', () => {
     const onUserInput = async (_m: string, _p: unknown, signal: AbortSignal) => new Promise(resolve => {
       signal.addEventListener('abort', () => { aborted = true; resolve({}); }, { once: true });
     });
-    await expect(runMcodeAcp({ ...f.options, content: 'early-complete', onUserInput }, bounded())).rejects.toThrow('question_incomplete');
+    await expect(runMinimaxAcp({ ...f.options, content: 'early-complete', onUserInput }, bounded())).rejects.toThrow('question_incomplete');
     expect(aborted).toBe(true);
   });
   it.each(['version', 'resume-mismatch'])('rejects %s instead of silently starting another conversation', async scenario => {
     const f = fixture(); f.options.env.MCODE_ACP_SCENARIO = scenario;
-    await expect(runMcodeAcp({ ...f.options, nativeSessionId: 'existing' }, bounded())).rejects.toThrow();
+    await expect(runMinimaxAcp({ ...f.options, nativeSessionId: 'existing' }, bounded())).rejects.toThrow();
     expect(f.calls().some(c => c.message?.method === 'session/prompt')).toBe(false);
   });
   it('rejects unsupported model/effort before sending a prompt', async () => {
     const f = fixture();
-    await expect(runMcodeAcp({ ...f.options, effort: 'unknown' }, bounded())).rejects.toThrow('thinkingEffort');
+    await expect(runMinimaxAcp({ ...f.options, effort: 'unknown' }, bounded())).rejects.toThrow('thinkingEffort');
     expect(f.calls().some(c => c.message?.method === 'session/prompt')).toBe(false);
   });
 });

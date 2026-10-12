@@ -4,7 +4,7 @@
 import { delimiter, dirname, resolve } from 'node:path';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { runMcodeExec } from './services/mcode-exec.js';
-import { runMcodeAcp } from './services/mcode-acp.js';
+import { runMinimaxAcp } from './services/minimax-acp.js';
 import { bridgeMinimaxForm, bridgeMinimaxPermission } from './services/minimax-user-input.js';
 
 const output = new RunnerControlWriter();
@@ -84,7 +84,7 @@ async function drain(): Promise<void> {
         const common = { executable: executable!, cwd, env: nativeEnv,
           content: turn.content, nativeSessionId, model: values.get('--model'), effort: values.get('--effort'),
           permission: permission as 'full' | 'smart', timeoutMs };
-        const result = transport === 'acp' ? await runMcodeAcp({ ...common,
+        const result = transport === 'acp' ? await runMinimaxAcp({ ...common,
           onSession(sessionId) {
             nativeSessionId = sessionId;
             output.marker('thread', { threadId: sessionId });
