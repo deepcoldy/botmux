@@ -497,6 +497,7 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
+import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
@@ -28136,6 +28137,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 重投，那句话是假的。后果不是晚同步：in_progress 那次写只要失败一次，5 分钟后平台就把
   // 任务打成 needs_attention(claim_activate_timeout)，而那是单向门，群里的活直接废掉。
   // 同时启动时把卡在 inflight 的行退回待发，否则崩溃一次就永久堵死该 binding 的串行队列。
+  if (!existsSync(config.session.dataDir)) {
+    mkdirSync(config.session.dataDir, { recursive: true });
+  }
   startIssueOutboxPump({ dataDir: config.session.dataDir });
 
   // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
@@ -29885,10 +29889,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (err: any) {
     logger.warn(`[sandbox-sweep] failed: ${err?.message ?? err}`);
   }
+  const closeIdleGroupSessions = createGroupIdleCloseSweeper({
+    larkAppId: cfg.larkAppId,
+    sessions: activeSessions,
+    getSettings: chatId => getBot(cfg.larkAppId).config.groupIdleClose?.[chatId],
+    isTransferring: isSessionTransferring,
+    close: closeSessionForBackgroundCleanup,
+    log: message => logger.info(message),
+  });
   const idleWorkerSweepTimer = setInterval(() => {
     // Dashboard config edits need no restart; the timer also backstops any
     // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
     enforceLiveSessionCap('periodic');
+    void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 

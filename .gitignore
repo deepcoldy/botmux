@@ -54,3 +54,4 @@ src/desktop/assets/*.png
 
 # OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
 .omo/
+test-bots.json
