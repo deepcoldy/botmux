@@ -209,6 +209,52 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('sends Codex serviceTier only after the field is edited', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      if (String(_url).includes('/api/dsh/profiles')) {
+        return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, ...body, selectionKey: 'codex' }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6.1-sol', serviceTier: 'priority' });
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.value).toBe('priority');
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: '' }]);
+
+      act(() => picker.props.onChange('ultrafast'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests.at(-1)).toEqual({
+        cliId: 'codex',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: '',
+        serviceTier: 'ultrafast',
+      });
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('shows, saves and reloads the configured Kimi effort without inventing a CLI default', async () => {
     const previousFetch = globalThis.fetch;
     const saved: unknown[] = [];

@@ -6960,6 +6960,7 @@ describe('handleCommand', () => {
           // remote attach must clear it before the new fork.
           wrapperCli: 'old-wrapper codex',
           agentFrozen: true,
+          serviceTier: 'priority',
         }),
       });
       const deps = makeDeps(ds);
@@ -6972,6 +6973,7 @@ describe('handleCommand', () => {
       expect(ds.session.existingAppServerEndpoint)
         .toBe('unix:///home/testuser/.codex/app-server-control/app-server-control.sock');
       expect(ds.session.wrapperCli).toBeUndefined();
+      expect(ds.session.serviceTier).toBeUndefined();
       expect(ds.session.agentFrozen).toBeUndefined();
       expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;

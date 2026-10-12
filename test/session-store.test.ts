@@ -4951,3 +4951,80 @@ describe('session prompt injection snapshot', () => {
     expect(getSession(next.sessionId)?.promptInjection).toBe('default');
   });
 });
+
+describe('session service tier snapshot', () => {
+  it('freezes the Bot tier onto new sessions and defaults a missing tier to inherit', () => {
+    const appId = 'cli_tier_snapshot';
+    const bot = { larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any;
+    registerCodexInstanceBot(bot);
+    init(appId);
+    expect(createSession('oc_tier_p', 'om_tier_p', 'priority').serviceTier).toBe('priority');
+    bot.serviceTier = 'default';
+    registerCodexInstanceBot(bot);
+    expect(createSession('oc_tier_d', 'om_tier_d', 'default').serviceTier).toBe('default');
+    delete bot.serviceTier;
+    registerCodexInstanceBot(bot);
+    expect(createSession('oc_tier_i', 'om_tier_i', 'inherit').serviceTier).toBe('inherit');
+  });
+
+  it('skips non-Codex bots and external sessions', () => {
+    const appId = 'cli_tier_other';
+    registerCodexInstanceBot({ larkAppId: appId, cliId: 'claude-code', serviceTier: 'priority' } as any);
+    init(appId);
+    expect(createSession('oc_tier_claude', 'om_tier_claude', 'claude').serviceTier).toBeUndefined();
+    registerCodexInstanceBot({ larkAppId: 'cli_tier_ext', cliId: 'codex', serviceTier: 'priority' } as any);
+    init('cli_tier_ext');
+    const external = createSession('oc_tier_ext', 'om_tier_ext', 'external', 'group', 'thread', { source: 'external' });
+    expect(external.serviceTier).toBeUndefined();
+  });
+
+  it('preserves a frozen serviceTier from stale whole-row writers without backfilling legacy rows', () => {
+    const appId = 'cli_tier_legacy';
+    registerCodexInstanceBot({ larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any);
+    init(appId);
+    const session = createSession('oc_tier_legacy', 'om_tier_legacy', 'legacy');
+    const stale = { ...session };
+    delete stale.serviceTier; // a pre-field writer holding an old whole-row snapshot
+    stale.title = 'legacy updated';
+    updateSession(stale);
+    init(appId);
+    expect(getSession(session.sessionId)).toMatchObject({ title: 'legacy updated' });
+    expect(getSession(session.sessionId)?.serviceTier).toBe('priority');
+
+    const legacyAppId = 'cli_tier_missing';
+    registerCodexInstanceBot({ larkAppId: legacyAppId, cliId: 'codex', serviceTier: 'priority' } as any);
+    const legacyRow = {
+      sessionId: 'tier_legacy_missing',
+      chatId: 'oc_tier_missing',
+      rootMessageId: 'om_tier_missing',
+      title: 'legacy missing',
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      creationSource: 'other',
+    };
+    seedPersistedSessionRows(tempDir, legacyAppId, { tier_legacy_missing: legacyRow });
+    init(legacyAppId);
+    const legacy = getSession('tier_legacy_missing')!;
+    legacy.title = 'legacy missing updated';
+    updateSession(legacy);
+    expect(getSession('tier_legacy_missing')).toMatchObject({ title: 'legacy missing updated' });
+    expect(getSession('tier_legacy_missing')?.serviceTier).toBeUndefined();
+  });
+
+  it('re-snapshots forks from the target Bot instead of copying the source session', () => {
+    const appId = 'cli_tier_fork';
+    const bot = { larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any;
+    registerCodexInstanceBot(bot);
+    init(appId);
+    const original = createSession('oc_tier_fork', 'om_tier_original', 'original');
+    expect(original.serviceTier).toBe('priority');
+    bot.serviceTier = 'default';
+    registerCodexInstanceBot(bot);
+    const forked = createSession('oc_tier_fork', 'om_tier_fork', 'fork', 'group', 'thread', { inherit: original });
+    expect(forked.serviceTier).toBe('default');
+    delete bot.serviceTier;
+    registerCodexInstanceBot(bot);
+    const inheritFork = createSession('oc_tier_fork', 'om_tier_inherit', 'inherit fork', 'group', 'thread', { inherit: original });
+    expect(inheritFork.serviceTier).toBe('inherit');
+  });
+});

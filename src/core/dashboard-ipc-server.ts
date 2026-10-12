@@ -39,6 +39,9 @@ import {
   isConfigurableReasoningCliId,
   isCodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
+import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
+import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
+import { botInjectedEnv, buildSessionChildEnv } from './env-policy.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -6648,6 +6651,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let model: string | null = null;
   let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  let serviceTier: CodexServiceTier | null = null;
   let nativeSubagentRuntime: BotConfig['nativeSubagentRuntime'] | null = null;
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
@@ -6675,6 +6679,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.modelBackendVariant
       : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
+    serviceTier = cfg.serviceTier ?? null;
     const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime);
     nativeSubagentRuntime = normalizedNativeSubagentRuntime.ok
       ? normalizedNativeSubagentRuntime.value ?? null
@@ -6766,6 +6771,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     model,
     modelBackendVariant,
     reasoningEffort,
+    serviceTier,
     nativeSubagentRuntime,
     turnTimeoutMs,
     dshRuntime,
@@ -7465,6 +7471,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     model?: unknown;
     modelBackendVariant?: unknown;
     reasoningEffort?: unknown;
+    serviceTier?: unknown;
     nativeSubagentRuntime?: unknown;
     turnTimeoutMs?: unknown;
     cliRuntime?: unknown;
@@ -7502,6 +7509,12 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isConfigurableReasoningCliId(selected.cliId);
+  const serviceTierFieldPresent = Object.prototype.hasOwnProperty.call(body, 'serviceTier');
+  const serviceTier = isCodexServiceTier(body.serviceTier) ? body.serviceTier : null;
+  if (body.serviceTier !== undefined && body.serviceTier !== '' && body.serviceTier !== null && serviceTier === null) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_service_tier' });
+  }
+  const supportsServiceTier = isCodexServiceTierCliId(selected.cliId);
   const nativeSubagentRuntimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'nativeSubagentRuntime');
   let requestedNativeSubagentRuntime: BotConfig['nativeSubagentRuntime'];
   if (selected.cliId === 'traex' && nativeSubagentRuntimeFieldPresent && body.nativeSubagentRuntime !== null) {
@@ -7654,6 +7667,31 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
     availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
   }
+  const effectiveServiceTier = supportsServiceTier
+    ? (serviceTierFieldPresent ? serviceTier ?? undefined : currentBotConfig.serviceTier)
+    : undefined;
+  if (effectiveServiceTier && effectiveServiceTier !== 'default') {
+    const codexAvailability = checkCliAvailability({ cliId: 'codex', cliPathOverride: effectivePath });
+    const tierCheck = await validateCodexServiceTier({
+      cliBin: codexAvailability.resolvedPath ?? codexAvailability.command ?? 'codex',
+      env: {
+        ...buildSessionChildEnv(process.env, currentBotConfig.envPolicy),
+        ...botInjectedEnv(currentBotConfig.env, currentBotConfig.envPolicy),
+      },
+      model,
+      serviceTier: effectiveServiceTier,
+    });
+    if (!tierCheck.ok) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: tierCheck.error === 'model_required'
+          ? 'service_tier_model_required'
+          : tierCheck.error === 'catalog_unavailable'
+            ? 'service_tier_catalog_unavailable'
+            : 'service_tier_not_supported_by_model',
+      });
+    }
+  }
 
   return withBotTurnMutation(larkAppId, async () => {
     // Agent selection can replace every live worker generation and may also
@@ -7680,6 +7718,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     const r = await rmwBotEntry<{
       error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
+      nextServiceTier?: CodexServiceTier;
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
@@ -7701,6 +7740,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
+      const nextServiceTier = supportsServiceTier
+        ? (serviceTierFieldPresent ? serviceTier ?? undefined : entry.serviceTier)
+        : undefined;
       entry.cliId = selected.cliId;
       if (selected.cliId !== 'codex-app' && entry.codexBrowser !== undefined) {
         delete entry.codexBrowser;
@@ -7735,6 +7777,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       else if (reasoningEffortFieldPresent) {
         if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
         else delete entry.reasoningEffort;
+      }
+      if (!supportsServiceTier) delete entry.serviceTier;
+      else if (serviceTierFieldPresent) {
+        if (serviceTier) entry.serviceTier = serviceTier;
+        else delete entry.serviceTier;
       }
       let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
       if (selected.cliId !== 'traex') {
@@ -7790,7 +7837,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
         delete entry.backendType;
       }
-      return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
+      return { write: true, result: { nextReasoningEffort, nextServiceTier, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
@@ -7821,6 +7868,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       : undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
+    if (!supportsServiceTier) bot.config.serviceTier = undefined;
+    else bot.config.serviceTier = r.result.nextServiceTier ?? undefined;
     updateBotNativeSubagentRuntime(
       larkAppId,
       r.result.nextNativeSubagentRuntimeState ?? { status: 'absent' },
@@ -7857,6 +7906,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       model: model || null,
       modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      serviceTier: supportsServiceTier ? bot.config.serviceTier ?? null : null,
       nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,

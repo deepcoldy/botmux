@@ -2360,6 +2360,8 @@ export function BotAgentSection(props: {
   const [modelBackendVariant, setModelBackendVariant] = useState<'' | 'standard' | 'max'>(bot.modelBackendVariant ?? '');
   const [modelBackendVariantTouched, setModelBackendVariantTouched] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
+  const [serviceTier, setServiceTier] = useState<'' | 'default' | 'priority' | 'ultrafast'>(bot.serviceTier ?? '');
+  const [serviceTierTouched, setServiceTierTouched] = useState(false);
   const [nativeModelMode, setNativeModelMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
   const [nativeModel, setNativeModel] = useState(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
   const [nativeEffortMode, setNativeEffortMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
@@ -2398,6 +2400,8 @@ export function BotAgentSection(props: {
     setModelBackendVariant(bot.modelBackendVariant ?? '');
     setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setServiceTier(bot.serviceTier ?? '');
+    setServiceTierTouched(false);
     setNativeModelMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
     setNativeModel(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
     setNativeEffortMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
@@ -2421,6 +2425,7 @@ export function BotAgentSection(props: {
     bot.model,
     bot.modelBackendVariant,
     bot.reasoningEffort,
+    bot.serviceTier,
     bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
     bot.dshRuntime,
@@ -2581,6 +2586,9 @@ export function BotAgentSection(props: {
         model,
         ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
+        ...(serviceTierTouched && (saveCliId === 'codex' || saveCliId === 'codex-app')
+          ? { serviceTier }
+          : {}),
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -2635,6 +2643,7 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          serviceTier: res.body.serviceTier ?? undefined,
           nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
@@ -2734,10 +2743,12 @@ export function BotAgentSection(props: {
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          serviceTier: res.body.serviceTier ?? undefined,
           nativeSubagentRuntime: savedNativePolicy ?? undefined,
           agentSelectionKey: res.body.selectionKey ?? 'riff',
         });
         setReasoningEffort(res.body.reasoningEffort ?? '');
+        setServiceTier(res.body.serviceTier ?? '');
         setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
         setNativeModel(savedNativePolicy?.model?.mode === 'custom' ? savedNativePolicy.model.value : '');
         setNativeEffortMode(nativePolicyModeFrom(savedNativePolicy?.reasoningEffort));
@@ -3190,6 +3201,29 @@ export function BotAgentSection(props: {
                 })),
               ]}
               onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')}
+            />
+          </div>
+        </div>
+      )}
+      {isCodexSelection && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.agentServiceTierHelp')}>{tr('botDefaults.agentServiceTier')}</FieldTitle>
+            <DropdownField
+              dataInput="agentServiceTier"
+              ariaLabel={tr('botDefaults.agentServiceTier')}
+              value={serviceTier}
+              disabled={agentBusy}
+              options={[
+                { value: '', label: tr('botDefaults.agentServiceTierInherit') },
+                { value: 'default', label: tr('botDefaults.agentServiceTierDefault') },
+                { value: 'priority', label: tr('botDefaults.agentServiceTierPriority') },
+                { value: 'ultrafast', label: tr('botDefaults.agentServiceTierUltrafast') },
+              ]}
+              onChange={next => {
+                setServiceTier(next as 'default' | 'priority' | 'ultrafast');
+                setServiceTierTouched(true);
+              }}
             />
           </div>
         </div>

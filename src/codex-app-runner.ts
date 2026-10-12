@@ -40,6 +40,7 @@ import {
   type DynamicToolCallParams,
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
+import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
@@ -61,6 +62,7 @@ interface Args {
   locale?: string;
   model?: string;
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
   browserPluginRoot?: string;
 }
@@ -270,6 +272,13 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
+    else if (key === '--service-tier' && val !== undefined) {
+      if (val !== 'default' && val !== 'priority' && val !== 'ultrafast') {
+        throw new Error('--service-tier accepts default, priority, or ultrafast');
+      }
+      out.serviceTier = val;
+      i++;
+    }
     else if (key === '--browser-family' && (val === 'chrome' || val === 'edge')) { out.browserFamily = val; i++; }
     else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
   }
@@ -1616,6 +1625,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         // Keep Codex App's rich history in sync with turns created by this
         // external runner so the desktop UI can render follow-up messages.
         persistExtendedHistory: true,
+        ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
         ...(browserBroker ? { dynamicTools: [CODEX_BROWSER_DYNAMIC_TOOL] } : {}),
       }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/resume') });
       const resumedThreadId = String(resumed.thread.id);
@@ -1654,6 +1664,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     // fresh thread/start, so a fold-in (existing thread) keeps its frozen model —
     // matching the API's fresh-spawn-only override semantics.
     ...(args.model && args.model.trim() ? { model: args.model.trim() } : {}),
+    ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,

@@ -71,6 +71,7 @@ import {
   type PrincipalLaneQueueHandle,
 } from './message-queue.js';
 import { configuredCodexInstanceBot, newSessionCodexInstanceState, legacyCodexInstanceBinding, type SessionCreationSource } from './codex-instance-pool.js';
+import { isCodexServiceTierCliId } from './codex-service-tier.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveCliRuntime, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import type { HolderReason } from './session-store-copy.js';
@@ -2146,6 +2147,9 @@ function persistRow(session: Session): void {
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
     }
+    if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
+      session = { ...session, serviceTier: durable.serviceTier };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -2196,6 +2200,11 @@ function buildNewSession(
       : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
   };
+  if (source !== 'external' && isCodexServiceTierCliId(bot?.cliId)) {
+    session.serviceTier = bot?.serviceTier ?? 'inherit';
+  } else {
+    delete session.serviceTier;
+  }
   if (chatType !== 'p2p' && scope !== 'chat') {
     const models = resolveGroupDefaultModels?.(chatId);
     if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);

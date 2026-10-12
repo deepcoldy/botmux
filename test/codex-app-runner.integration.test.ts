@@ -2836,6 +2836,32 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('forwards --service-tier into thread/start as a top-level field', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-tier-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      extraArgs: ['--service-tier', 'priority'],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart).toBeTruthy();
+      expect(threadStart.params.serviceTier).toBe('priority');
+      expect(threadStart.params.config?.serviceTier).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-browser-tool-'));
     const fakeCodex = join(dir, 'fake-codex');
@@ -2869,7 +2895,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('SUPPRESSES model/effort on thread/resume even when --model/--reasoning-effort are passed (no resume drift)', async () => {
+  it('SUPPRESSES model/effort on thread/resume but keeps --service-tier (thread-level tier)', async () => {
     // PR #639 P2 regression lock, runner side: a resume (--thread-id present)
     // routes to thread/resume, and even though the adapter still forwards
     // --model/--reasoning-effort on argv, the resume request must carry NEITHER
@@ -2888,6 +2914,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         '--thread-id', 'thread-existing-1',
         '--model', 'gpt-5.6-terra',
         '--reasoning-effort', 'xhigh',
+        '--service-tier', 'priority',
         '--browser-family', 'chrome',
       ],
     });
@@ -2902,6 +2929,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(start).toBeFalsy();            // a warm resume must not fresh-start
       expect(resume.params.model).toBeUndefined();                          // no top-level model
       expect(resume.params.config?.model_reasoning_effort).toBeUndefined(); // no effort
+      expect(resume.params.serviceTier).toBe('priority');                    // tier is thread-level
       expect(resume.params.dynamicTools).toEqual([
         expect.objectContaining({
           type: 'function',
