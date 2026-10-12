@@ -335,6 +335,27 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('omits ultrafast when the selected model catalog only proves priority', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-sol'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-sol', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6-sol' });
+      await flushEffects();
+      const options = root.findByProps({ dataInput: 'agentServiceTier' }).props.options;
+      expect(options.map((option: any) => option.value)).toEqual(['', 'default', 'priority']);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   it('shows, saves and reloads the configured Kimi effort without inventing a CLI default', async () => {
     const previousFetch = globalThis.fetch;
     const saved: unknown[] = [];
