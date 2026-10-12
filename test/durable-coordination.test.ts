@@ -618,6 +618,10 @@ describe('SQLite durable coordination contract', () => {
       payload: { action: 'close', expectedGeneration: 3 },
       createdAt: 1,
     } as const;
+    await expect(store.enqueueControlOperation({
+      lease,
+      operation: { ...operation, sessionKey: 'session-other' },
+    })).rejects.toThrow(/sessionKey must match the fencing lease/);
     expect(await store.enqueueControlOperation({ lease, operation })).toEqual({ kind: 'inserted' });
     expect(await store.enqueueControlOperation({
       lease, operation: { ...operation, createdAt: 99 },
@@ -636,6 +640,10 @@ describe('SQLite durable coordination contract', () => {
       attempt: { ownerId: 'worker-a', leaseEpoch: 1, attempt: 1 },
     });
     if (first.kind !== 'applied') throw new Error('expected first control attempt');
+    expect(await store.completeControlOperationAttempt({
+      attempt: { ...first.attempt, sessionKey: 'session-other' },
+      result: { closed: true },
+    })).toEqual({ kind: 'stale' });
     now = 3;
     expect(await store.retryControlOperationAttempt({
       attempt: first.attempt,
@@ -655,6 +663,10 @@ describe('SQLite durable coordination contract', () => {
       kind: 'applied', record: { state: 'attempting', attempts: 2 },
     });
     if (second.kind !== 'applied') throw new Error('expected second control attempt');
+    expect(await store.markControlOperationAmbiguous({
+      attempt: first.attempt,
+      error: 'old attempt must not mutate the new attempt',
+    })).toEqual({ kind: 'stale' });
     now = 5;
     expect(await store.completeControlOperationAttempt({
       attempt: second.attempt,
@@ -670,6 +682,58 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.beginControlOperationAttempt({
       lease, operationId: operation.operationId,
     })).toMatchObject({ kind: 'not_pending', record: { state: 'completed' } });
+    await store.close();
+  });
+
+  it('rejects stale begin tokens and freezes the same owner after its lease epoch changes', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const firstLease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-same-owner', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:pending-stale-lease',
+        sessionKey: 'session-same-owner',
+        payload: { action: 'close' },
+        createdAt: 1,
+      },
+    });
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:same-owner-new-epoch',
+        sessionKey: 'session-same-owner',
+        payload: { action: 'resume' },
+        createdAt: 1,
+      },
+    });
+    expect(await store.beginControlOperationAttempt({
+      lease: firstLease,
+      operationId: 'control:same-owner-new-epoch',
+    })).toMatchObject({ kind: 'applied', attempt: { leaseEpoch: 1 } });
+
+    now = 11;
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-same-owner', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    expect(takeover.epoch).toBe(2);
+    expect(await store.beginControlOperationAttempt({
+      lease: firstLease,
+      operationId: 'control:pending-stale-lease',
+    })).toEqual({ kind: 'stale_lease' });
+    expect(await store.beginControlOperationAttempt({
+      lease: takeover,
+      operationId: 'control:same-owner-new-epoch',
+    })).toMatchObject({
+      kind: 'not_pending',
+      record: {
+        state: 'ambiguous',
+        attempts: 1,
+        lastError: 'control attempt lost its session lease before result',
+      },
+    });
     await store.close();
   });
 
@@ -825,6 +889,16 @@ describe('SQLite durable coordination contract', () => {
         },
       },
     });
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-not-applied',
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'completed',
+        result: { status: 'must-not-complete-pending' },
+        evidence: { source: 'backend', terminal: true },
+      },
+    })).toEqual({ kind: 'stale' });
     expect(await store.completeControlOperationAttempt({
       attempt: notAppliedAttempt.attempt,
       result: { status: 'resumed' },

@@ -1,6 +1,14 @@
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  type DurableCoordinationProviderMethod,
+  validateDurableCoordinationProviderResult,
+} from '../src/services/durable-coordination-provider-protocol.js';
+import type {
+  DurableJson,
+  SessionLease,
+} from '../src/services/durable-coordination.js';
+import {
   ExternalDurableCoordinationProviderError,
   ExternalDurableCoordinationStore,
 } from '../src/services/external-durable-coordination-store.js';
@@ -19,11 +27,12 @@ describe('external durable coordination provider', () => {
   it('handshakes and forwards coordination calls without a shell', async () => {
     const store = await ExternalDurableCoordinationStore.connect(providerCommand());
     expect(store.provider).toBe('fixture');
-    await expect(store.acquireSessionLease({
+    const acquisition = await store.acquireSessionLease({
       sessionKey: 'session-a',
       ownerId: 'worker-a',
       leaseDurationMs: 1000,
-    })).resolves.toEqual({
+    });
+    expect(acquisition).toEqual({
       kind: 'acquired',
       lease: {
         sessionKey: 'session-a',
@@ -32,10 +41,74 @@ describe('external durable coordination provider', () => {
         leaseUntil: 1234,
       },
     });
+    if (acquisition.kind !== 'acquired') throw new Error('expected fixture lease');
+    const lease: SessionLease = acquisition.lease;
+    const operation = {
+      operationId: 'fixture-control',
+      sessionKey: 'session-a',
+      payload: { action: 'close' },
+      createdAt: 1,
+    } as const;
+    await expect(store.enqueueControlOperation({ lease, operation }))
+      .resolves.toEqual({ kind: 'inserted' });
+    const begun = await store.beginControlOperationAttempt({
+      lease,
+      operationId: operation.operationId,
+    });
+    expect(begun).toMatchObject({
+      kind: 'applied',
+      record: { operationId: 'fixture-control', state: 'attempting' },
+      attempt: { operationId: 'fixture-control', attempt: 1 },
+    });
+    if (begun.kind !== 'applied') throw new Error('expected fixture control attempt');
+    await expect(store.completeControlOperationAttempt({
+      attempt: begun.attempt,
+      result: { status: 'closed' },
+    })).resolves.toMatchObject({ kind: 'applied', record: { state: 'completed' } });
+    await expect(store.retryControlOperationAttempt({
+      attempt: begun.attempt,
+      error: 'not dispatched',
+    })).resolves.toMatchObject({ kind: 'applied', record: { state: 'pending' } });
+    await expect(store.markControlOperationAmbiguous({
+      attempt: begun.attempt,
+      error: 'outcome unknown',
+    })).resolves.toMatchObject({ kind: 'applied', record: { state: 'ambiguous' } });
+    await expect(store.reconcileControlOperation({
+      lease,
+      operationId: operation.operationId,
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'completed',
+        result: { status: 'closed' },
+        evidence: { source: 'fixture' },
+      },
+    })).resolves.toMatchObject({ kind: 'applied', record: { state: 'completed' } });
+    await expect(store.readControlOperation('fixture-control'))
+      .resolves.toMatchObject({ operationId: 'fixture-control', state: 'completed' });
     await expect(store.readSession('missing')).resolves.toBeUndefined();
     await expect(store.readControlOperation('missing-control')).resolves.toBeUndefined();
     await store.close();
   });
+
+  it.each([
+    ['enqueueControlOperation', { kind: 'applied' }],
+    ['beginControlOperationAttempt', {
+      kind: 'applied',
+      record: {},
+      attempt: {},
+    }],
+    ['completeControlOperationAttempt', { kind: 'applied', record: {} }],
+    ['retryControlOperationAttempt', { kind: 'applied', record: {} }],
+    ['markControlOperationAmbiguous', { kind: 'applied', record: {} }],
+    ['reconcileControlOperation', { kind: 'applied', record: {} }],
+    ['readControlOperation', { operationId: '', state: 'completed' }],
+  ] satisfies Array<[DurableCoordinationProviderMethod, DurableJson]>)(
+    'fails closed on a malformed %s result',
+    (method, result) => {
+      expect(() => validateDurableCoordinationProviderResult(method, result))
+        .toThrow(new RegExp(`invalid ${method} result`));
+    },
+  );
 
   it('preserves provider error code and retryability', async () => {
     const store = await ExternalDurableCoordinationStore.connect(providerCommand());
