@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   DurableInboxStore,
   DurableJson,
@@ -11,6 +14,19 @@ import {
 } from '../src/services/durable-inbox-primary-consumer.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
 import { durableLarkAdmissionReceipt } from '../src/services/durable-lark-admission.js';
+import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function sqliteStore(now: () => number): SqliteDurableCoordinationStore {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-primary-inbox-'));
+  tempDirs.push(dir);
+  return new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now });
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -181,6 +197,78 @@ describe('durable inbox primary consumer', () => {
     expect(store.completeInboxClaim).not.toHaveBeenCalled();
     expect(retried).toHaveLength(1);
     expect(retried[0].visibleAt).toBe(5_500);
+    await consumer.stop();
+  });
+
+  it('requeues a transient failure in SQLite with an incremented attempt', async () => {
+    let now = 100;
+    const store = sqliteStore(() => now);
+    const event = claim('om_sqlite_retry').event;
+    await store.enqueueInbox(event);
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      retryDelayMs: 500,
+      now: () => now,
+      dispatch: async () => { throw new Error('capture store unavailable'); },
+    });
+    await consumer.ready;
+
+    expect(await store.claimNextInbox({
+      workerId: 'too-early',
+      leaseDurationMs: 1_000,
+    })).toBeUndefined();
+    now = 600;
+    await expect(store.claimNextInbox({
+      workerId: 'after-delay',
+      leaseDurationMs: 1_000,
+    })).resolves.toMatchObject({
+      event: { eventId: event.eventId },
+      attempts: 2,
+    });
+    await consumer.stop();
+    await store.close();
+  });
+
+  it('settles an exhausted failure and continues with the next row', async () => {
+    const completed: InboxClaim[] = [];
+    const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+    const exhausted = { ...claim('om_exhausted'), attempts: 3 };
+    const store = inboxStore({
+      claims: [exhausted, claim('om_after_exhausted')],
+      completed,
+      retried,
+    });
+    const commits: DurableInboxPrimaryDispatchResult[] = [];
+    const errors: unknown[] = [];
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      maxAttempts: 3,
+      dispatch: async message => {
+        if (message.messageId === 'om_exhausted') throw new Error('provider unavailable');
+        return committed(message);
+      },
+      onCommitted: ({ result }) => commits.push(result),
+      onError: error => errors.push(error),
+    });
+    await consumer.ready;
+
+    expect(completed.map(item => item.event.eventId)).toEqual([
+      'im.message.receive_v1:cli_test:om_exhausted',
+      'im.message.receive_v1:cli_test:om_after_exhausted',
+    ]);
+    expect(retried).toHaveLength(0);
+    expect(commits[0]).toEqual({
+      kind: 'ignored',
+      reason: 'durable primary retry limit reached',
+    });
+    expect(commits[1]?.kind).toBe('committed');
+    expect(errors.some(error => String(error).includes('retry limit reached'))).toBe(true);
     await consumer.stop();
   });
 

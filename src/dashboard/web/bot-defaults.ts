@@ -177,6 +177,8 @@ export type BotDefaultsRow = {
   substituteMode?: BotSubstituteMode | null;
   feedback?: FeedbackPolicyLayer | null;
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
+  /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
+  noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   idleSuspendMinutes?: number | null;

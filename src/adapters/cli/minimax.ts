@@ -1,12 +1,13 @@
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
+import { locateExecutable } from '../../utils/executable.js';
 import type { CliAdapter } from './types.js';
 
 /** MCode owns config.yaml, OAuth, SQLite and native sessions under this root.
@@ -24,6 +25,40 @@ function runnerPath(): string {
   return resolve(here, '..', '..', '..', 'dist', 'minimax-runner.js');
 }
 
+/** npm's bin symlink resolves inside the package. Bind that package, including
+ * its chunks/assets/native dependencies, rather than the shared global prefix.
+ * Stop at the nearest manifest: an unrelated wrapper/package is not MCode. */
+function npmPackageRoot(bin: string): string | undefined {
+  if (!isAbsolute(bin)) return undefined;
+  for (let dir = dirname(bin); ; dir = dirname(dir)) {
+    const manifest = join(dir, 'package.json');
+    if (existsSync(manifest)) {
+      try {
+        return JSON.parse(readFileSync(manifest, 'utf8')).name === '@minimax-ai/code' ? dir : undefined;
+      } catch { return undefined; }
+    }
+    if (dirname(dir) === dir) return undefined;
+  }
+}
+
+/** Official installers may reuse Node outside the installation root. Their
+ * launcher pins nodeExecutable, so that runtime also needs an executable bind. */
+function officialNodeExecutable(root: string): string | undefined {
+  try {
+    const node: unknown = JSON.parse(readFileSync(join(root, 'install.json'), 'utf8')).nodeExecutable;
+    return typeof node === 'string' && isAbsolute(node) && locateExecutable(node)
+      ? realpathSync(node) : undefined;
+  } catch { return undefined; }
+}
+
+/** The adapter's buildArgs entry also prepares persistent bind sources before
+ * the worker existence-filters authPaths. Moving this into the in-sandbox
+ * runner would lose first-run data on the disposable tmpfs root. */
+function prepareNativeDirectories(dataDir: string, officialRoot?: string): void {
+  mkdirSync(dataDir, { recursive: true });
+  if (officialRoot) mkdirSync(join(officialRoot, '.mcode-active'), { recursive: true });
+}
+
 /** Keep the stable minimax ID/setup number, replacing mmx completely.
  * A long-lived runner drives native `mcode exec` per turn. Native Session IDs
  * from stream-json are persisted through the runner control channel; every
@@ -33,6 +68,7 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'mcode';
   let cachedBin: string | undefined;
   let dataDir = minimaxDataDir();
+  let nodeBin: string | undefined;
   const nativeBin = () => (cachedBin ??= resolveCommandReal(rawBin));
   const installRoot = () => {
     const root = dirname(dirname(nativeBin()));
@@ -47,22 +83,34 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
     },
     get skillsDir() { return join(dataDir, 'skills'); },
     allowExtraArgs: false,
-    sandboxExtraExecPaths: () => [nativeBin()],
+    sandboxExtraExecPaths() {
+      const root = installRoot();
+      const runtime = root ? officialNodeExecutable(root) : nodeBin;
+      return [nativeBin(), ...(runtime ? [runtime] : [])];
+    },
     sandboxReadonlyPaths() {
       // Official launchers in <install>/bin read sibling current/releases and
       // the managed Node runtime; the bin directory alone is insufficient.
       const root = installRoot();
-      return root ? [root] : [];
+      const npmRoot = root ? undefined : npmPackageRoot(nativeBin());
+      return root ? [root] : npmRoot ? [npmRoot] : [];
     },
     buildArgs({ resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, turnTimeoutMs, forkSession, env }) {
       if (resume && forkSession) throw new Error('MiniMax Code exec does not support session forks; create a new topic instead.');
-      dataDir = minimaxDataDir({ ...process.env, ...env });
-      mkdirSync(dataDir, { recursive: true });
+      const nativeEnv = { ...process.env, ...env };
+      dataDir = minimaxDataDir(nativeEnv);
       // Official installer tracks active processes outside the data directory.
       // Keep only this marker directory writable; releases/runtime stay read-only.
       const root = installRoot();
-      if (root) mkdirSync(join(root, '.mcode-active'), { recursive: true });
+      prepareNativeDirectories(dataDir, root);
+      nodeBin = undefined;
+      if (!root && npmPackageRoot(nativeBin())) {
+        const node = locateExecutable('node', nativeEnv);
+        if (!node) throw new Error('MiniMax Code npm installation requires node on PATH.');
+        nodeBin = realpathSync(node);
+      }
       const args = [runnerArgv0('minimax-runner', runnerPath()), '--mcode-bin', nativeBin(), '--data-dir', dataDir];
+      if (nodeBin) args.push('--node-bin', nodeBin);
       if (workingDir) args.push('--cwd', workingDir);
       if (resume && resumeSessionId) args.push('--native-session-id', resumeSessionId);
       if (model?.trim()) {

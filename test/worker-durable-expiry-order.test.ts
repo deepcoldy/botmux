@@ -141,8 +141,9 @@ describe('worker durable lease expiry ordering', () => {
     const killEnd = workerSource.indexOf('async function restartCliProcess(', killStart);
     const killCli = workerSource.slice(killStart, killEnd);
     for (const clear of [
-      'currentBotmuxTurnId = undefined;',
-      'currentBotmuxDispatchAttempt = undefined;',
+      // V3: turn + attempt are cleared together through the single capture
+      // identity writer (which also announces the cleared identity).
+      'setCaptureIdentity(undefined, undefined);',
       'currentVcMeetingImTurnOrigin = undefined;',
     ]) {
       expect(killCli).toContain(clear);
@@ -169,7 +170,8 @@ describe('worker durable lease expiry ordering', () => {
     const flushStartForRotation = workerSource.indexOf('async function flushPending(): Promise<void>');
     const flushEndForRotation = workerSource.indexOf('\nfunction sendToPty(', flushStartForRotation);
     const flushForRotation = workerSource.slice(flushStartForRotation, flushEndForRotation);
-    const assignNextTurn = flushForRotation.indexOf('currentBotmuxTurnId = item.turnId;');
+    // V3: bound through the single capture identity writer.
+    const assignNextTurn = flushForRotation.indexOf('setCaptureIdentity(item.turnId, item.dispatchAttempt);');
     const republish = flushForRotation.indexOf('publishSandboxRelayCapability();', assignNextTurn);
     expect(assignNextTurn).toBeGreaterThanOrEqual(0);
     expect(republish).toBeGreaterThan(assignNextTurn);

@@ -3,7 +3,7 @@ import {
   GROUP_CONTEXT_CARD_CONTENT_VERSION, markGroupContextCardPurpose, projectGroupContextCard,
 } from '../src/im/lark/group-context-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
-import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
+import { buildCanonicalFinalReplyCard, buildImageCardElements } from '../src/im/lark/md-card.js';
 import { extractCardContent, extractResources } from '../src/im/lark/message-parser.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
@@ -118,6 +118,56 @@ describe('group-context card projection', () => {
     expect(parsed).toEqual(copy);
     expect(markGroupContextCardPurpose(message, 'message')).toBe(message);
     expect(projectGroupContextCard(markGroupContextCardPurpose(runtime, 'message'))?.kind).toBe('conversation');
+  });
+
+  it('inlines a standalone purpose marker without adding a blank footer row', () => {
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'markdown', content: 'PUBLIC_PROGRESS' },
+    ] } });
+    const runtime = markGroupContextCardPurpose(raw, 'runtime');
+    const runtimeCard = JSON.parse(runtime);
+    expect(runtimeCard.body.elements).toHaveLength(1);
+    expect(runtimeCard.body.elements[0].content).toBe(`PUBLIC_PROGRESS${'\u2063'.repeat(12)}`);
+    expect(extractCardContent(runtime)).toBe('PUBLIC_PROGRESS');
+    expect(projectGroupContextCard(runtime)).toEqual({ kind: 'runtime' });
+    expect(projectGroupContextCard(simplified(runtime))).toEqual({ kind: 'runtime' });
+
+    const message = markGroupContextCardPurpose(runtime, 'message');
+    const messageCard = JSON.parse(message);
+    expect(messageCard.body.elements).toHaveLength(1);
+    expect(messageCard.body.elements[0].content).toBe(`PUBLIC_PROGRESS${'\u2063'.repeat(13)}`);
+    expect(conversation(message).text).toBe('PUBLIC_PROGRESS');
+    expect(conversation(simplified(message)).text).toBe('PUBLIC_PROGRESS');
+  });
+
+  it('strips an inline purpose marker from a promoted heading in both API shapes', () => {
+    const raw = JSON.stringify({
+      schema: '2.0',
+      body: { elements: buildImageCardElements('# 通知标题\n\n请查收附件', []) },
+    });
+    const assertCleanHeading = (content: string, atx: boolean) => {
+      const text = extractCardContent(content);
+      expect(text).toContain(atx ? '# 通知标题' : '通知标题');
+      expect(text).toContain('请查收附件');
+      expect(text).not.toContain('\u2063');
+    };
+
+    const runtime = markGroupContextCardPurpose(raw, 'runtime');
+    assertCleanHeading(runtime, true);
+    assertCleanHeading(simplified(runtime), false);
+    expect(projectGroupContextCard(runtime)).toEqual({ kind: 'runtime' });
+    expect(projectGroupContextCard(simplified(runtime))).toEqual({ kind: 'runtime' });
+
+    const message = markGroupContextCardPurpose(raw, 'message');
+    assertCleanHeading(message, true);
+    assertCleanHeading(simplified(message), false);
+    expect(conversation(message).turnReply).toBe(false);
+    expect(conversation(simplified(message)).turnReply).toBe(false);
+
+    const turnMessage = buildTurnReplyCard(record({ finalCard: raw }), presentation);
+    assertCleanHeading(turnMessage, true);
+    expect(conversation(turnMessage).turnReply).toBe(true);
+    expect(projectGroupContextCard(simplified(turnMessage))).toEqual({ kind: 'unresolved' });
   });
 
   it('leaves ordinary author and third-party cards unclassified even when they contain status words', () => {

@@ -132,15 +132,15 @@ describe('daemon session-scoped IPC route wiring', () => {
       "ipcRoute('POST', '/api/attention'",
     );
     const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
-    const registerAt = route.indexOf('registerAskForResponse({');
+    const inputAt = route.indexOf('const askInput = {');
     expect(bindAt).toBeGreaterThanOrEqual(0);
-    expect(registerAt).toBeGreaterThan(bindAt);
+    expect(inputAt).toBeGreaterThan(bindAt);
     expect(route).toContain('const askChatType = askSession?.chatType;');
     expect(route).toMatch(
-      /registerAskForResponse\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
+      /const askInput = \{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
     );
     expect(route).not.toMatch(
-      /registerAskForResponse\(\{\s*larkAppId: parsed\.larkAppId,/,
+      /const askInput = \{\s*larkAppId: parsed\.larkAppId,/,
     );
     // #1740: the route override applies to BOTH caller kinds — a trusted HMAC
     // host is bound to the live session just like a capability caller, so a
@@ -151,6 +151,13 @@ describe('daemon session-scoped IPC route wiring', () => {
     expect(route).toMatch(
       /\}\n\s*\/\/ Authentication and routing are separate[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*if \(askSession\) \{\n\s*boundAsk = bindSessionScopedIpcIdentity\(/,
     );
+    expect(route).toContain('const explicitInput = { ...askInput,');
+    for (const registration of [
+      'explicitAskContinuation.wait(explicitInput)',
+      'registerAskForResponse(askInput, res)',
+    ]) {
+      expect(route.indexOf(registration), registration).toBeGreaterThan(inputAt);
+    }
   });
 
   it('binds hook identity before emitting the event', () => {

@@ -15,6 +15,44 @@ export interface InputCaptureOptions {
   deliver(binding: InputBinding, input: CapturedInput): Promise<void>;
   warn?(): void;
 }
+
+export const INPUT_CAPTURE_TERMINAL_REJECTION_CODES = [
+  'input_capture_authority_changed',
+  'input_capture_text_too_large',
+  'input_capture_revision_conflict',
+  'input_capture_anchor_conflict',
+  'input_capture_message_conflict',
+] as const;
+
+export type InputCaptureTerminalRejectionCode =
+  typeof INPUT_CAPTURE_TERMINAL_REJECTION_CODES[number];
+
+/**
+ * A deterministic capture rejection. Retrying the same durable Lark event
+ * cannot make these conditions succeed, so primary consumers must settle the
+ * Inbox row instead of blocking the whole chat partition forever.
+ */
+export class InputCaptureTerminalRejection extends Error {
+  readonly code: InputCaptureTerminalRejectionCode;
+
+  constructor(code: InputCaptureTerminalRejectionCode) {
+    super(code);
+    this.name = 'InputCaptureTerminalRejection';
+    this.code = code;
+  }
+}
+
+export function isInputCaptureTerminalRejection(
+  error: unknown,
+): error is InputCaptureTerminalRejection {
+  return error instanceof InputCaptureTerminalRejection;
+}
+
+function terminalCaptureRejection(
+  code: InputCaptureTerminalRejectionCode,
+): InputCaptureTerminalRejection {
+  return new InputCaptureTerminalRejection(code);
+}
 const valid = (s: unknown, max = 200): s is string => typeof s === 'string'
   && !!s.trim() && s.length <= max && !/[\u0000-\u001f\u007f]/.test(s);
 const validThread = (s: unknown): s is string => typeof s === 'string' && /^omt_[A-Za-z0-9_-]{1,196}$/.test(s);
@@ -157,12 +195,14 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       if (historical) {
         const binding = snapshot.bindingsById.get(historical.bindingId)!;
         const thread = historical.threadId ?? [...bindingThreads(snapshot, binding)][0];
-        if (thread && thread !== event.threadId) throw new Error('input_capture_message_conflict');
+        if (thread && thread !== event.threadId) {
+          throw terminalCaptureRejection('input_capture_message_conflict');
+        }
         return thread && binding.anchor !== event.messageId ? binding.anchor : undefined;
       }
       const bindings = state.bindings.filter(b => b.active && owns(b) && b.anchor !== event.messageId
         && bindingThreads(snapshot, b).has(event.threadId));
-      if (bindings.length > 1) throw new Error('input_capture_anchor_conflict');
+      if (bindings.length > 1) throw terminalCaptureRejection('input_capture_anchor_conflict');
       return bindings[0]?.anchor;
     },
     capture(event: { messageId: string; chatId: string; anchor: string; senderOpenId: string; threadId?: string;
@@ -181,7 +221,7 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         if (historical.text !== event.text
           || event.threadId && threads.size && !threads.has(event.threadId)
           || JSON.stringify(parseCaptureAttachments(historical.attachments)) !== JSON.stringify(parseCaptureAttachments(event.attachments))) {
-          throw new Error('input_capture_message_conflict');
+          throw terminalCaptureRejection('input_capture_message_conflict');
         }
         void kick(); return true;
       }
@@ -194,17 +234,21 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
       // an unrelated Worker prompt. Keep the binding for explicit reconciliation.
       const session = options.session(binding.sessionId);
       if (!matchesSession(binding, session) || !options.canTalk(session, event.senderOpenId, event.memberUnionId)) {
-        throw new Error('input_capture_authority_changed');
+        throw terminalCaptureRejection('input_capture_authority_changed');
       }
-      if (Buffer.byteLength(event.text, 'utf8') > 64 * 1024) throw new Error('input_capture_text_too_large');
+      if (Buffer.byteLength(event.text, 'utf8') > 64 * 1024) {
+        throw terminalCaptureRejection('input_capture_text_too_large');
+      }
       store.transact((current, index) => {
         const active = current.bindings.find(b => b.id === binding.id);
-        if (!active?.active || active.revision !== binding.revision) throw new Error('input_capture_revision_conflict');
+        if (!active?.active || active.revision !== binding.revision) {
+          throw terminalCaptureRejection('input_capture_revision_conflict');
+        }
         if (event.threadId) {
           const known = bindingThreads(index, active);
           if (known.size && !known.has(event.threadId) || current.bindings.some(b => b.id !== binding.id && b.active
             && b.chatId === event.chatId && b.ownerOpenId === event.senderOpenId && bindingThreads(index, b).has(event.threadId!))) {
-            throw new Error('input_capture_anchor_conflict');
+            throw terminalCaptureRejection('input_capture_anchor_conflict');
           }
         }
         const id = captureDigest([binding.id, event.messageId]);
@@ -212,7 +256,9 @@ export function createInputCaptureRuntime(options: InputCaptureOptions) {
         if (prior) {
           if (prior.senderOpenId !== event.senderOpenId || prior.text !== event.text
             || prior.threadId && event.threadId && prior.threadId !== event.threadId
-            || JSON.stringify(parseCaptureAttachments(prior.attachments)) !== JSON.stringify(attachments)) throw new Error('input_capture_message_conflict');
+            || JSON.stringify(parseCaptureAttachments(prior.attachments)) !== JSON.stringify(attachments)) {
+            throw terminalCaptureRejection('input_capture_message_conflict');
+          }
           return;
         }
         if (event.threadId) current.schemaVersion = 3;

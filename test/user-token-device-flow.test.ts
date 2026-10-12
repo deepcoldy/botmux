@@ -1,4 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -104,6 +106,64 @@ describe('user authorization device flow', () => {
     expect(readdirSync(tokenDir)).toEqual([`user-token-${APP}-${USER}.json`]);
     expect(await auth.poll()).toEqual({ status: 'ready', token: TOKEN });
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps previously granted scopes when requesting an incremental authorization', async () => {
+    const path = join(tokenDir, `user-token-${APP}-${USER}.json`);
+    writeFileSync(path, JSON.stringify({
+      access_token: 'old-token',
+      refresh_token: 'old-refresh',
+      token_type: 'Bearer',
+      expires_at: '2026-09-19T01:00:00.000Z',
+      refresh_expires_at: '2026-10-19T00:00:00.000Z',
+      scope: 'docs:document.comment:read offline_access',
+      appId: APP,
+      brand: 'feishu',
+      openId: USER,
+    }));
+
+    const auth = await requestUserAuthorization(
+      APP,
+      'secret',
+      'feishu',
+      ['contact:user.base:readonly'],
+      USER,
+      () => current,
+    );
+
+    expect(auth.scopes).toEqual([
+      'im:message:readonly',
+      'im:resource',
+      'offline_access',
+      'contact:user.base:readonly',
+      'docs:document.comment:read',
+    ]);
+    expect(grantedScope).toBe(auth.scopes.join(' '));
+  });
+
+  it('does not overwrite a token whose scopes expanded while authorization was pending', async () => {
+    const path = join(tokenDir, `user-token-${APP}-${USER}.json`);
+    const oldToken = {
+      access_token: 'old-token',
+      refresh_token: 'old-refresh',
+      token_type: 'Bearer',
+      expires_at: '2026-09-19T01:00:00.000Z',
+      refresh_expires_at: '2026-10-19T00:00:00.000Z',
+      scope: 'offline_access',
+      appId: APP,
+      brand: 'feishu',
+      openId: USER,
+    };
+    writeFileSync(path, JSON.stringify(oldToken));
+    const auth = await requestUserAuthorization(APP, 'secret', 'feishu', [], USER, () => current);
+    writeFileSync(path, JSON.stringify({
+      ...oldToken,
+      scope: `${grantedScope} docs:document.comment:read`,
+    }));
+
+    advance(5);
+    expect(await auth.poll()).toEqual({ status: 'failed', error: 'authorization_scope_stale' });
+    expect(JSON.parse(readFileSync(path, 'utf8')).access_token).toBe('old-token');
   });
 
   it('shares concurrent polls and waits for the provider interval after pending', async () => {

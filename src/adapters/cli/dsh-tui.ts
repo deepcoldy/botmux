@@ -175,8 +175,8 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // 45s, which — with supportsTypeAhead — would flush into a composer that may
     // not be mounted yet and pre-empt the 90s protection above. That alignment
     // is this explicit opt-in, not a derivation from the shared
-    // `deferFirstPromptTimeoutUntilReady` + readyPattern flags: grok declares
-    // both of those and must keep its 45s fallback.
+    // `deferFirstPromptTimeoutUntilReady` + readyPattern flags: the other
+    // adapters carrying both of those (Hermes, Grok) do not arm the gate at all.
     injectsReadyHook: true,
     readyGateFallbackAlignedWithHardCap: true,
     // Turn ends come from the same plugin, not from PTY silence: `agent/status`

@@ -81,6 +81,24 @@ describe('botmux skill session command', () => {
     expect(runSkillSessionCommand(['read', 'deploy', 'references/release.md'], { BOTMUX_SESSION_ID: 's1' }).stdout).toContain('# Release');
   });
 
+  it('enumerates an empty resource set for an in-memory built-in without a session manifest', () => {
+    const result = runSkillSessionCommand(['resources', 'botmux-send'], {
+      BOTMUX_SESSION_ID: 'missing-session',
+    });
+    expect(result).toEqual({ code: 0, stdout: '\n', stderr: '' });
+  });
+
+  it('reports that in-memory built-ins have no readable sidecar resources', () => {
+    const result = runSkillSessionCommand(['read', 'botmux-send', 'references/demo.md'], {
+      BOTMUX_SESSION_ID: 'missing-session',
+    });
+    expect(result).toEqual({
+      code: 1,
+      stdout: '',
+      stderr: 'built-in skill botmux-send has no resources\n',
+    });
+  });
+
   it('refuses to run without a session id', () => {
     expect(runSkillSessionCommand(['list'], {}).stderr).toContain('missing BOTMUX_SESSION_ID');
   });

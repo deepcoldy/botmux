@@ -229,15 +229,15 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
 
 /**
  * Whether markPromptReady must treat the first post-spawn ready as
- * "pre-execution SessionStart" (report working, keep busy) rather than true
+ * "pre-execution working" (report working, keep busy) rather than true
  * end-of-turn idle.
  *
- * Strict conditions (PR #633 review):
+ * Strict conditions:
  *  - adapter actually bakes the first prompt into argv (`passesInitialPromptViaArgs`)
  *  - an argv prompt exists and was NOT deferred to the write queue
- *  - SessionStart ready exists (`injectsReadyHook`) so first ready ≠ completion
- *  - turn terminal is authoritative (`reliableTurnTerminal`) so a later
- *    assistant_final/fireIdle will produce a real idle edge
+ *  - turn terminal is authoritative (`reliableTurnTerminal`), meaning turn
+ *    completion is signaled independently (e.g. structured updates.jsonl)
+ *    rather than by quiescence / initial ready edge.
  *
  * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
  * — must return false, or the first markPromptReady would clear isPromptReady
@@ -245,16 +245,19 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
  * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
  * idle signal — first ready IS completion; must return false or they stick
  * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
+ *
+ * Grok passes prompt via argv and provides an authoritative turn terminal
+ * via updates.jsonl (`reliableTurnTerminal`), so its first ready (when the
+ * composer/TUI mounts) is pre-execution / in-flight (not completion) and must
+ * arm busy to avoid a false working→idle transition before updates.jsonl completes.
  */
 export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   passesInitialPromptViaArgs: boolean;
   preparedInitialPrompt?: string | null;
   queuedInitialPrompt?: string | null;
-  injectsReadyHook: boolean;
   reliableTurnTerminal: boolean;
 }): boolean {
   if (!shouldTrackArgvBakedFirstPrompt(opts)) return false;
-  if (!opts.injectsReadyHook) return false;
   if (!opts.reliableTurnTerminal) return false;
   return true;
 }

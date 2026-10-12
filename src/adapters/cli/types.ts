@@ -607,9 +607,8 @@ export interface CliAdapter {
    *  ~45-51s, into a composer that may not be mounted yet.
    *
    *  Deliberately NOT derived from `deferFirstPromptTimeoutUntilReady` +
-   *  readyPattern: grok carries both flags, and moving its fallback from 45s to
-   *  90s would delay every first prompt by ~45s whenever its SessionStart signal
-   *  is missing. undefined/false → the shared 45s fallback, unchanged. */
+   *  readyPattern: the other adapters carrying both of those (Hermes, Grok)
+   *  do not arm the gate at all. undefined/false → the shared 45s fallback, unchanged. */
   readonly readyGateFallbackAlignedWithHardCap?: boolean;
 
   /** CLI-specific system hints injected into the initial prompt.
@@ -648,6 +647,12 @@ export interface CliAdapter {
    *  Durable meeting delivery is fail-closed for adapters without this
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
+
+  /** Whether the CLI supports the Program Status Protocol (OSC 7501).
+   *  When true, the worker mounts a ProgramStatusFramingStream on the PTY stream
+   *  to handle the \x1b]7501;?\x1b\ handshake probe, strip 7501 control codes,
+   *  and observe authoritative program status events in IdleDetector. */
+  readonly supportsProgramStatus?: boolean;
 
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,

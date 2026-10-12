@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { createMinimaxAdapter, minimaxDataDir } from '../src/adapters/cli/minimax.js';
@@ -45,7 +45,8 @@ function runner(extra: string[] = [], hiddenEntry = false) {
   const child = spawnTsScript(resolve('src/minimax-runner.ts'), [...(hiddenEntry ? ['__minimax-runner'] : []), '--mcode-bin', f.executable, '--cwd', f.root, ...extra],
     { env: { ...process.env, MCODE_TEST_LOG: f.log, BOTMUX_OWNER_OPEN_ID: 'ou_owner', __OWNER_OPEN_ID: 'ou_stale' } }) as ChildProcessWithoutNullStreams;
   children.push(child);
-  const h = { ...f, child, stdout: '', stderr: '' };
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(r => child.once('close', (code, signal) => r({ code, signal })));
+  const h = { ...f, child, closed, stdout: '', stderr: '' };
   child.stdout.on('data', chunk => { h.stdout += chunk.toString(); });
   child.stderr.on('data', chunk => { h.stderr += chunk.toString(); });
   return { h, send(content: string, id: string) {
@@ -54,6 +55,72 @@ function runner(extra: string[] = [], hiddenEntry = false) {
 }
 
 describe('MiniMax Code adapter', () => {
+  function installation(official: boolean) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mcode-install-'))); roots.push(root);
+    const packageRoot = join(root, 'lib', 'node_modules', '@minimax-ai', 'code');
+    const executable = official ? join(root, 'bin', 'mcode') : join(packageRoot, 'dist', 'cli.js');
+    mkdirSync(dirname(executable), { recursive: true });
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    writeFileSync(join(packageRoot, 'package.json'), JSON.stringify({ name: '@minimax-ai/code' }));
+    if (official) writeFileSync(join(root, 'install.json'), '{}');
+    const node = join(root, 'runtime', 'bin', 'node');
+    mkdirSync(dirname(node), { recursive: true });
+    symlinkSync(process.execPath, node);
+    return { root, packageRoot, executable, node, dataDir: join(root, 'state', 'data') };
+  }
+
+  it('binds the npm package behind its global bin symlink without exposing sibling packages', () => {
+    const f = installation(false);
+    const bin = join(f.root, 'bin', 'mcode'); mkdirSync(dirname(bin)); symlinkSync(f.executable, bin);
+    const adapter = createMinimaxAdapter(bin);
+    const args = adapter.buildArgs({ sessionId: 'npm', resume: false,
+      env: { MINIMAX_DATA_DIR: f.dataDir, PATH: dirname(f.node) } });
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([f.packageRoot]);
+    expect(adapter.sandboxExtraExecPaths?.()).toEqual([f.executable, realpathSync(f.node)]);
+    expect(args[args.indexOf('--node-bin') + 1]).toBe(realpathSync(f.node));
+    expect(adapter.authPaths).toEqual([f.dataDir]);
+    expect(existsSync(join(f.root, '.mcode-active'))).toBe(false);
+  });
+
+  it('prepares first-run persistent bind sources before the worker filters authPaths', () => {
+    const f = installation(true);
+    const adapter = createMinimaxAdapter(f.executable);
+    expect(existsSync(f.dataDir)).toBe(false);
+    expect(existsSync(join(f.root, '.mcode-active'))).toBe(false);
+    const args = adapter.buildArgs({ sessionId: 'official', resume: false, env: { MINIMAX_DATA_DIR: f.dataDir } });
+    expect(adapter.authPaths).toEqual([f.dataDir, join(f.root, '.mcode-active')]);
+    expect(adapter.authPaths?.every(path => existsSync(path))).toBe(true);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([f.root]);
+    expect(adapter.sandboxExtraExecPaths?.()).toEqual([f.executable]);
+    expect(args).not.toContain('--node-bin');
+    writeFileSync(join(f.dataDir, 'persisted'), 'keep');
+    adapter.buildArgs({ sessionId: 'official', resume: true, resumeSessionId: 'native', env: { MINIMAX_DATA_DIR: f.dataDir } });
+    expect(readFileSync(join(f.dataDir, 'persisted'), 'utf8')).toBe('keep');
+  });
+
+  it('exposes an official installer runtime outside its installation root read-only', () => {
+    const f = installation(true);
+    writeFileSync(join(f.root, 'install.json'), JSON.stringify({ nodeExecutable: f.node }));
+    const adapter = createMinimaxAdapter(f.executable);
+    adapter.buildArgs({ sessionId: 'official-external-node', resume: false, env: { MINIMAX_DATA_DIR: f.dataDir } });
+    expect(adapter.sandboxExtraExecPaths?.()).toEqual([f.executable, realpathSync(f.node)]);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([f.root]);
+    expect(adapter.authPaths).toEqual([f.dataDir, join(f.root, '.mcode-active')]);
+  });
+
+  it.each(['{"name":"other-cli"}', '{invalid json'])('does not grant an unrelated or unreadable package root: %s', manifest => {
+    const f = installation(false);
+    writeFileSync(join(f.packageRoot, 'package.json'), manifest);
+    expect(createMinimaxAdapter(f.executable).sandboxReadonlyPaths?.()).toEqual([]);
+  });
+
+  it('reports a missing npm Node runtime before attempting to start the runner', () => {
+    const f = installation(false);
+    expect(() => createMinimaxAdapter(f.executable).buildArgs({ sessionId: 'npm', resume: false,
+      env: { MINIMAX_DATA_DIR: f.dataDir, PATH: '' } })).toThrow('requires node on PATH');
+  });
+
   it('keeps native identity, exact resume and permission policy while migrating bare models', () => {
     const f = fixture(); vi.stubEnv('MINIMAX_DATA_DIR', join(f.root, 'data'));
     const adapter = createMinimaxAdapter(f.executable);
@@ -77,6 +144,53 @@ describe('MiniMax Code adapter', () => {
     expect(minimaxDataDir({ MINIMAX_DATA_DIR: '/tmp/primary', MAVIS_DATA_DIR: '/tmp/legacy' })).toBe('/tmp/primary');
     expect(minimaxDataDir({ MAVIS_DATA_DIR: '/tmp/legacy' })).toBe('/tmp/legacy');
   });
+});
+
+it.each([
+  ['bad base64/json', '::botmux-minimax:%%%'],
+  ['invalid message shape', `::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content: 42 })).toString('base64')}`],
+  ['foreign input', 'ordinary text without a runner frame'],
+])('ignores %s without starting native work and accepts the next valid turn', async (_, line) => {
+  const { h, send } = runner();
+  await waitFor(() => h.stdout.includes('ready'));
+  h.child.stdin.write(`${line}\n`);
+  await waitFor(() => h.stdout.includes('invalid input frame') || h.stdout.includes('ignoring non-frame input'));
+  expect(existsSync(h.log)).toBe(false);
+  expect(markers(h.stdout)).toEqual([]);
+  send('healthy', 'next');
+  await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
+  expect(markers(h.stdout).filter(m => m.kind === 'final').map(m => m.payload))
+    .toEqual([expect.objectContaining({ content: 'answer:healthy', turnId: 'next' })]);
+  expect(readFileSync(h.log, 'utf8').trim().split('\n')).toHaveLength(1);
+});
+
+it('accepts a buffer at the frame limit and closes on overflow without native execution', async () => {
+  const { h } = runner();
+  await waitFor(() => h.stdout.includes('ready'));
+  h.child.stdin.write('x'.repeat(4 * 1024 * 1024) + '\n');
+  await waitFor(() => h.stdout.includes('ignoring non-frame input'));
+  expect(h.child.exitCode).toBeNull();
+  expect(h.stderr).not.toContain('exceeds limit');
+  h.child.stdin.write('x'.repeat(4 * 1024 * 1024 + 1));
+  await waitFor(() => h.child.exitCode !== null);
+  expect(await h.closed).toEqual({ code: 0, signal: null });
+  expect(h.stderr).toContain('MiniMax input frame exceeds limit');
+  expect(existsSync(h.log)).toBe(false);
+  expect(markers(h.stdout)).toEqual([]);
+});
+
+it('SIGTERM aborts the active native process and never executes queued turns or reports a final', async () => {
+  const { h, send } = runner();
+  send('hang', 'active'); send('must-not-run', 'queued');
+  await waitFor(() => existsSync(h.log));
+  const call = JSON.parse(readFileSync(h.log, 'utf8').trim());
+  expect(call.input).toBe('hang');
+  h.child.kill('SIGTERM');
+  await waitFor(() => h.child.exitCode !== null);
+  expect(await h.closed).toEqual({ code: 0, signal: null });
+  expect(readFileSync(h.log, 'utf8').trim().split('\n')).toHaveLength(1);
+  expect(() => process.kill(call.pid, 0)).toThrow();
+  expect(markers(h.stdout).filter(m => m.kind === 'final')).toEqual([]);
 });
 
 it('preserves multiline messages, tools, owner and exact session across turns', async () => {
@@ -136,6 +250,20 @@ it('accepts the hidden entry token retained by compiled CLI dispatch', async () 
   const { h, send } = runner([], true); send('compiled entry', 'one');
   await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
   expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.content).toBe('answer:compiled entry');
+});
+
+it('uses the declared npm Node runtime ahead of inherited PATH entries', async () => {
+  const f = fixture();
+  const node = join(f.root, 'runtime', 'bin', 'node'); mkdirSync(dirname(node), { recursive: true });
+  const prefix = tsRunnerPrefix();
+  writeFileSync(node, `#!/bin/sh\nexport MCODE_TEST_NODE_USED=canonical\nexec ${quote(prefix.command)} "$@"\n`, { mode: 0o700 });
+  const { h, send } = runner(['--node-bin', node]);
+  // Exercise an npm-style shebang, rather than the fixture's absolute runtime.
+  writeFileSync(h.executable, '#!/usr/bin/env node\n' + readFileSync(resolve('test/fixtures/fake-mcode-exec.mjs'), 'utf8'), { mode: 0o700 });
+  send('npm runtime', 'one');
+  await waitFor(() => markers(h.stdout).some(m => m.kind === 'final'));
+  expect(markers(h.stdout).find(m => m.kind === 'final')?.payload.content).toBe('answer:npm runtime');
+  expect(JSON.parse(readFileSync(h.log, 'utf8').trim()).nodeUsed).toBe('canonical');
 });
 
 it.each(['incomplete', 'nonzero', 'mismatch', 'failed'])('does not report success for native %s', async content => {

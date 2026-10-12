@@ -13,7 +13,7 @@ Every line is one JSON request or response with:
 - protocol `botmux.durable-coordination-provider`;
 - wire version `1`;
 - a stable `requestId`;
-- an initial `hello` that proves durable contract version `1`;
+- an initial `hello` that proves durable contract version `3`; older providers are intentionally rejected because lane-aware inbox and durable control-operation methods are breaking contract changes;
 - a `call` for one public store method.
 
 The provider may respond out of order. BotMux correlates by `requestId`, bounds line size and request time, rejects unknown request ids, and terminates the provider after a timeout or malformed response. Provider failures carry a bounded public code, a redacted message, and explicit retryability; retryability never changes outbox ambiguity rules.
@@ -57,6 +57,8 @@ A canonical-dispatch bridge defines the callback seam used by the primary consum
 Only a narrow versioned projection is eligible for this stage: session id, application id, routing anchor, scope, active/closed status and lifecycle timestamps. Prompt content, titles, identities, paths, attachments, tokens and provider/terminal state are excluded. The daemon invokes this mirror only after an ordinary Lark session has committed to SQLite and won active-session registration. It is therefore shadow evidence, not a complete Session source: restore, close, multi-row transactions, lineage batches and the synchronous Session API remain SQLite-only.
 
 A provider-neutral primary inbox consumer now defines the later claim-to-admission state machine without enabling it. Multiple boot-scoped slots can process independent partitions. Each claim is revalidated before dispatch, renewed while dispatch is active, and completed only after a validated `committed` or explicitly `ignored` receipt. A committed result must carry a versioned durable-admission receipt that binds the claimed event/app/partition to the fenced Session key, lease epoch, record revision and store timestamp. A bare committed marker or a receipt copied from another event is retried instead of completing the inbox row. Dispatch errors retry only while ownership is still proven. A stale/failed renewal aborts the callback and leaves the row for lease-expiry recovery; bounded shutdown likewise never fabricates a completion.
+
+Durable control operations use a separate table and stable `operationId` to fence lifecycle side effects such as close or resume. Enqueue requires the current Session lease; `beginControlOperationAttempt` is the side-effect boundary and binds one exact attempt to the current owner and epoch. A proven pre-effect failure may return that attempt to `pending`, but an ownership change freezes an in-flight attempt as `ambiguous` instead of replaying it. Only the exact late completion token or backend reconciliation with non-empty evidence may settle ambiguous work.
 
 Shadow mode keeps its ACK-after-live-route mirror unchanged. Primary instead constructs the consumer, replaces the live callback with enqueue-before-ACK and completes the claim only after the canonical Session receipt validates. Store-generated inbox sequence and application ingress leadership provide the cross-replica ordering authority.
 

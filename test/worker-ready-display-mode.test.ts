@@ -163,9 +163,13 @@ import {
   __testOnly_setupWorkerHandlers,
   __testOnly_waitForPinStreamingCardIdle,
   setActiveSessionsRegistry,
+  managedAuxUiSuppressedFor,
+  commitCaptureIdentity,
+  displayableStreamingCardImageKey,
+  canExpectFreshStreamingScreenshot,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
-import { activeSessionKey, sessionKey, type DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
@@ -1751,6 +1755,211 @@ describe('Worker ready: set_display_mode re-sync', () => {
 });
 
 
+describe('screenshot_uploaded: turn-exact target and source isolation', () => {
+  let sessionReplyMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    } as any);
+    sessionReplyMock = vi.fn(async () => 'om_successor_card');
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    setActiveSessionsRegistry(new Map());
+  });
+
+  function screenshotDs(overrides?: Partial<DaemonSession>): { ds: DaemonSession; worker: any } {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      displayMode: 'screenshot',
+      workerReady: true,
+      streamCardPending: false,
+      streamCardId: 'om_live_card',
+      streamCardNonce: 'nonce_live',
+      currentTurnId: 'om_turn_current',
+      worker,
+      ...overrides,
+    } as Partial<DaemonSession>);
+    setupActiveWorkerHandlers(ds, worker);
+    return { ds, worker };
+  }
+
+  it('accepts a same-turn frame, records its provenance and PATCHes the current card', async () => {
+    const { ds, worker } = screenshotDs();
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_current', status: 'working',
+      turnId: 'om_turn_current', dispatchAttempt: 1,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_current');
+    expect(ds.currentImageSource).toEqual({ imageKey: 'img_current', turnId: 'om_turn_current', dispatchAttempt: 1 });
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock.mock.calls[0][1]).toBe('om_live_card');
+  });
+
+  it('keeps accepting frames without a turnId (idle/local input compatibility)', async () => {
+    const { ds, worker } = screenshotDs();
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_idle', status: 'idle' });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_idle');
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('attempt high-water: a newer attempt observed via managed_turn_origin rejects an older attempt frame; the newer one lands', async () => {
+    const { ds, worker } = screenshotDs({ currentTurnId: 'om_turn_current' });
+    worker.emit('message', {
+      type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'cap',
+      turnId: 'om_turn_current', dispatchAttempt: 3,
+    });
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_attempt_2', status: 'working', turnId: 'om_turn_current', dispatchAttempt: 2,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_attempt_3', status: 'working', turnId: 'om_turn_current', dispatchAttempt: 3,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_attempt_3');
+    // A later older-attempt frame cannot overwrite the cached newer one.
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_attempt_1', status: 'working', turnId: 'om_turn_current', dispatchAttempt: 1,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_attempt_3');
+  });
+
+  it('a silent scheduled turn frame never lands in the cache in an ordinary group', async () => {
+    const { ds, worker } = screenshotDs({
+      silentScheduledTurns: new Map([['om_turn_current', Date.now()]]),
+    });
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_silent', status: 'working', turnId: 'om_turn_current',
+    });
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('a durable-suppressed (managed replay) attempt frame never lands in the cache', async () => {
+    const { ds, worker } = screenshotDs({
+      suppressedFinalOutputTurns: new Map([['om_turn_current', 2]]),
+    } as Partial<DaemonSession>);
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_replay', status: 'working',
+      turnId: 'om_turn_current', dispatchAttempt: 2,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('a chat-scope substitute turn frame is not cached even when the card is force-enabled', async () => {
+    const { ds, worker } = screenshotDs({
+      streamingCardForced: true,
+      currentReplyTarget: {
+        rootMessageId: 'om_substitute_trigger',
+        turnId: 'om_turn_current',
+        updatedAt: new Date().toISOString(),
+        substitute: true,
+      },
+    });
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_substitute', status: 'working', turnId: 'om_turn_current',
+    });
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('managedAuxUiSuppressedFor stays in parity with the inline handler gate', async () => {
+    const cases: Array<[string, Partial<DaemonSession>, string | undefined, number | undefined, boolean]> = [
+      ['plain user turn', {}, 'om_turn_current', undefined, false],
+      ['no turn id', {}, undefined, undefined, false],
+      ['silent scheduled', { silentScheduledTurns: new Map([['om_turn_current', Date.now()]]) }, 'om_turn_current', undefined, true],
+      ['replay attempt at watermark', { suppressedFinalOutputTurns: new Map([['om_turn_current', 2]]) } as any, 'om_turn_current', 2, true],
+      ['newer attempt above watermark', { suppressedFinalOutputTurns: new Map([['om_turn_current', 2]]) } as any, 'om_turn_current', 3, false],
+    ];
+    for (const [label, overrides, turnId, attempt, expected] of cases) {
+      vi.clearAllMocks();
+      const { ds, worker } = screenshotDs(overrides);
+      expect(managedAuxUiSuppressedFor(ds, turnId, attempt), label).toBe(expected);
+      worker.emit('message', {
+        type: 'screenshot_uploaded', imageKey: `img_${label}`, status: 'working',
+        ...(turnId ? { turnId } : {}), ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
+      });
+      await flush();
+      // The inline closure gate decides whether the frame is cached.
+      expect(ds.currentImageKey === undefined, label).toBe(expected);
+    }
+    // Meeting-driven (dispatchAttempt on a receiver session) and apiOnly.
+    const { ds: meeting, worker: meetingWorker } = screenshotDs();
+    (meeting.session as any).vcMeetingReceiver = true;
+    expect(managedAuxUiSuppressedFor(meeting, 'om_turn_current', 1)).toBe(true);
+    meetingWorker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_meeting', status: 'working', turnId: 'om_turn_current', dispatchAttempt: 1,
+    });
+    await flush();
+    expect(meeting.currentImageKey).toBeUndefined();
+  });
+
+  it('records the publication proof when worker-ready POSTs a fresh card', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker, streamCardTurnGeneration: 3 });
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    expect(ds.streamCardId).toBe('om_successor_card');
+    expect(ds.lastPublishedStreamingCardIdentity).toEqual({
+      messageId: 'om_successor_card',
+      nonce: ds.streamCardNonce,
+      sessionId: 'sid-ready-test',
+      larkAppId: 'app_test',
+      anchorId: sessionAnchorId(ds),
+      runtimeKey: activeSessionKey(ds),
+      turnGeneration: 3,
+    });
+  });
+
+  it('records the proof after a verified PATCH of the persisted card, and drops it when that PATCH fails', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: false, streamCardId: 'om_persisted', streamCardNonce: 'nonce_persisted', worker,
+    });
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    expect(ds.lastPublishedStreamingCardIdentity).toMatchObject({ messageId: 'om_persisted', nonce: 'nonce_persisted' });
+
+    const worker2 = makeFakeWorker();
+    const ds2 = makeDs({
+      streamCardPending: false, streamCardId: 'om_persisted_gone', streamCardNonce: 'nonce_gone', worker: worker2,
+      lastPublishedStreamingCardIdentity: {
+        messageId: 'om_persisted_gone', nonce: 'nonce_gone', sessionId: 'sid-ready-test',
+        larkAppId: 'app_test', anchorId: 'oc_chat', runtimeKey: 'x', turnGeneration: 0,
+      },
+    });
+    updateMessageMock.mockImplementationOnce(async () => { throw new MessageWithdrawnError('om_persisted_gone'); });
+    // The follow-up fresh POST also fails, so nothing re-records a proof.
+    sessionReplyMock.mockRejectedValueOnce(new Error('post failed'));
+    setupActiveWorkerHandlers(ds2, worker2);
+    worker2.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+    expect(ds2.streamCardId).toBeUndefined();
+    // The withdrawn message is never provable as the current card again.
+    expect(ds2.lastPublishedStreamingCardIdentity).toBeUndefined();
+  });
+});
+
 describe('worker-authoritative handoff live card', () => {
   const handoff = { source: { type: 'ui' as const }, target: { kind: 'turn' as const },
     envelope: { format: 'handoff', sourceName: 'team', trusted: false as const },
@@ -1841,5 +2050,725 @@ describe('worker-authoritative handoff live card', () => {
     ds.worker = makeFakeWorker();
     worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
     await flush(); expect(onStart).not.toHaveBeenCalled(); expect(reply).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Ported from Alex's independent acceptance review (round 1) ───────────
+describe('independent acceptance screenshot gates', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_fresh'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+  });
+  it('independent acceptance: untagged frame must not bypass a silent current turn', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, displayMode: 'screenshot', streamCardId: 'om_visible', currentTurnId: 'silent_turn', silentScheduledTurns: new Map([['silent_turn', Date.now()]]) });
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_private_untagged', status: 'working' });
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+  it('independent acceptance: old same-turn dispatch attempt must not replace current capture', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, displayMode: 'screenshot', streamCardId: 'om_visible', currentTurnId: 'same_turn', managedTurnOrigin: { capability: 'test', turnId: 'same_turn', dispatchAttempt: 2 } });
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_old_attempt', status: 'idle', turnId: 'same_turn', dispatchAttempt: 1 });
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+  it('independent acceptance: disconnected worker must not promise a fresh frame', async () => {
+    const { canExpectFreshStreamingScreenshot } = await import('../src/core/worker-pool.js');
+    const ds = makeDs({ workerReady: true, streamCardId: 'om_visible' });
+    (ds.worker as any).connected = false;
+    expect(canExpectFreshStreamingScreenshot(ds)).toBe(false);
+  });
+});
+
+
+describe('independent acceptance currentTurnId compatibility', () => {
+  it('independent acceptance: a legitimate committed HTTP turn must not be rejected by the earlier IM lineage id', async () => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_fresh'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, workerGeneration: 1, displayMode: 'screenshot', streamCardId: 'om_existing_card', currentTurnId: 'om_previous_im_turn', scope: 'chat' });
+    ds.session.workerGeneration = 1;
+    setupActiveWorkerHandlers(ds, worker);
+    // trigger-session.ts prepareTriggerPresentation calls this for every HTTP
+    // follow-up. Without presentation.liveCard='on-start' it leaves the older
+    // IM currentTurnId intact; input-commit below is the actual worker receipt.
+    armTriggerStreamingCard(ds, { target: { sessionId: ds.session.sessionId }, prompt: 'next', options: { asyncReturnSessionId: true } } as any, 'trg_http_current', false);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_http_current' });
+    await flush();
+    expect(ds.currentTurnId).toBe('om_previous_im_turn');
+    expect(ds.replyCardRunningTurnId).toBe('trg_http_current');
+    updateMessageMock.mockClear();
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_http_current', status: 'working', turnId: 'trg_http_current' });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_http_current');
+    expect(updateMessageMock).toHaveBeenCalled();
+  });
+});
+
+
+// ─── V3 capture identity + display target (daemon side) ──────────────────
+//
+// Sequences follow docs/superpowers/specs/2026-10-11-card-display-capture-identity-v3.md §5.
+// Identity comes ONLY from capture_identity (worker write points). Input
+// receipts are emitted as distractors and must never advance or roll it back.
+
+describe('V3 capture identity and display target', () => {
+  let sessionReplyMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    } as any);
+    sessionReplyMock = vi.fn(async () => 'om_unused_card');
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    setActiveSessionsRegistry(new Map());
+  });
+
+  function liveDs(overrides?: Partial<DaemonSession>): { ds: DaemonSession; worker: any } {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'chat',
+      displayMode: 'screenshot',
+      workerReady: true,
+      streamCardPending: false,
+      streamCardId: 'om_card_A',
+      streamCardNonce: 'nonce_A',
+      currentTurnId: 'om_turn_A',
+      streamCardTurnGeneration: 1,
+      worker,
+      ...overrides,
+    } as Partial<DaemonSession>);
+    setupActiveWorkerHandlers(ds, worker);
+    return { ds, worker };
+  }
+  const identity = (worker: any, revision: number, turnId?: string, dispatchAttempt?: number) =>
+    worker.emit('message', {
+      type: 'capture_identity', revision,
+      ...(turnId !== undefined ? { turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    });
+  const frame = (worker: any, imageKey: string, captureRevision?: number, turnId?: string, dispatchAttempt?: number) =>
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey, status: 'working',
+      ...(captureRevision !== undefined ? { captureRevision } : {}),
+      ...(turnId !== undefined ? { turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    });
+  const patchedIds = () => updateMessageMock.mock.calls.map(c => c[1]);
+  async function publishNewTurnCard(ds: DaemonSession, turnId: string, messageId: string): Promise<void> {
+    ds.currentTurnId = turnId;
+    ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = turnId;
+    ds.currentImageKey = undefined;
+    sessionReplyMock.mockResolvedValueOnce(messageId);
+    expect(await postTurnStartingCard(ds, sessionReplyMock as any, turnId)).toBe(true);
+    await flush();
+    expect(ds.streamCardId).toBe(messageId);
+    expect(ds.streamCardPending).toBe(false);
+  }
+
+  it('seq 1: enqueue ACKs for B/C never move identity off A; a duplicate old ACK never rolls back active C', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_turn_B' }); // enqueue ACK
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_turn_C' }); // enqueue ACK
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 1, turnId: 'om_turn_A' });
+    frame(worker, 'img_A_running', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_A_running');
+    expect(patchedIds()).toEqual(['om_card_A']);
+
+    identity(worker, 2, 'om_turn_C'); // C really written (B was cancelled)
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_turn_A' }); // historical re-ACK
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 2, turnId: 'om_turn_C' });
+    frame(worker, 'img_C_current', 2, 'om_turn_C');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_C_current');
+    frame(worker, 'img_A_late', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_C_current');
+  });
+
+  it('seq 2: B card then C card published while A runs (rev-min counterexample): A and B frames never fill C; C unlocks only on its own match', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 10, 'om_turn_A');
+    await flush();
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_B', mode: 'waiting-exact-turn', turnId: 'om_turn_B' });
+    await publishNewTurnCard(ds, 'om_turn_C', 'om_card_C');
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_C', mode: 'waiting-exact-turn', turnId: 'om_turn_C' });
+    updateMessageMock.mockClear();
+
+    frame(worker, 'img_A_on_C', 10, 'om_turn_A');
+    await flush();
+    identity(worker, 11, 'om_turn_B'); // B starts at rev 11 (> both "min" values)
+    frame(worker, 'img_B_on_C', 11, 'om_turn_B');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.streamCardDisplayTarget?.mode).toBe('waiting-exact-turn');
+
+    identity(worker, 12, 'om_turn_C');
+    await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_C', mode: 'follow-live' });
+    frame(worker, 'img_C', 12, 'om_turn_C');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_C');
+    expect(patchedIds()).toEqual(['om_card_C']);
+  });
+
+  it('seq 2b: a new-turn card whose turn is already being captured follows live at once', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 3, 'om_turn_B'); // worker wrote B before the card POST committed
+    await flush();
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_B', mode: 'follow-live', turnId: 'om_turn_B' });
+    frame(worker, 'img_B', 3, 'om_turn_B');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_B');
+  });
+
+  it('seq 2c: a re-posted card for the same turn does not inherit the previous card\'s match; a POST failure keeps the old card\'s own target', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    await flush();
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    const waitingB = ds.streamCardDisplayTarget;
+    // /card while B is still waiting: the copy re-evaluates for B (still waiting).
+    sessionReplyMock.mockResolvedValueOnce('om_card_B2');
+    expect(await postFreshStreamingCard(ds, sessionReplyMock as any)).toBe(true);
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_B2', mode: 'waiting-exact-turn', turnId: 'om_turn_B' });
+    expect(ds.streamCardDisplayTarget!.publication).not.toBe(waitingB!.publication);
+    // A failed POST leaves the current card and its target untouched.
+    const before = ds.streamCardDisplayTarget;
+    sessionReplyMock.mockRejectedValueOnce(new Error('post failed'));
+    expect(await postFreshStreamingCard(ds, sessionReplyMock as any)).toBe(false);
+    expect(ds.streamCardId).toBe('om_card_B2');
+    expect(ds.streamCardDisplayTarget).toBe(before);
+    frame(worker, 'img_A_on_B2', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+  });
+
+  it('seq 3: after the card matched, HTTP D and raw R real writes (no input ACK) advance identity and display', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    frame(worker, 'img_A', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_A');
+    identity(worker, 2, 'trg_http_D'); // HTTP/async turn write; currentTurnId stays om_turn_A
+    frame(worker, 'img_D', 2, 'trg_http_D');
+    await flush();
+    expect(ds.currentTurnId).toBe('om_turn_A');
+    expect(ds.currentImageKey).toBe('img_D');
+    identity(worker, 3, 'om_raw_compact'); // raw input write, never ACKed
+    frame(worker, 'img_R', 3, 'om_raw_compact');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_R');
+    expect(patchedIds()).toEqual(['om_card_A', 'om_card_A', 'om_card_A']);
+  });
+
+  it('seq 4: initial empty snapshot on a restored card follows live; a pending-T card waits for T', async () => {
+    const { ds, worker } = liveDs({ currentTurnId: undefined });
+    identity(worker, 0); // initial (undefined, undefined) snapshot
+    frame(worker, 'img_idle_restored', 0);
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 0 });
+    expect(ds.currentImageKey).toBe('img_idle_restored');
+
+    await publishNewTurnCard(ds, 'om_turn_T', 'om_card_T');
+    expect(ds.streamCardDisplayTarget?.mode).toBe('waiting-exact-turn');
+    frame(worker, 'img_idle_on_T', 0);
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    identity(worker, 1, 'om_turn_T');
+    frame(worker, 'img_T', 1, 'om_turn_T');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_T');
+  });
+
+  it('seq 4b: a ready-restored existing card follows live (never bound to a past turn)', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: false, streamCardId: 'om_persisted', streamCardNonce: 'nonce_p', worker,
+      displayMode: 'screenshot', currentTurnId: 'om_turn_old',
+    });
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'capture_identity', revision: 0 });
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok' });
+    await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_persisted', mode: 'follow-live' });
+    expect(ds.streamCardDisplayTarget?.turnId).toBeUndefined();
+  });
+
+  it('seq 5: out-of-order, same-revision-different-tuple, unknown future, downgrade and foreign-generation frames are rejected', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 3, 'om_turn_A');
+    identity(worker, 2, 'om_turn_B'); // older revision: ignored
+    identity(worker, 3, 'om_turn_X'); // same revision, different tuple: ignored
+    identity(worker, 3, 'om_turn_A'); // identical: idempotent
+    identity(worker, -1, 'om_turn_Y'); // invalid
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 3, turnId: 'om_turn_A' });
+    expect(ds.captureIdentity?.dispatchAttempt).toBeUndefined();
+
+    frame(worker, 'img_future', 4, 'om_turn_A'); // unobserved higher revision
+    frame(worker, 'img_tuple', 3, 'om_turn_A', 1); // same rev, attempt differs (undefined is meaningful)
+    frame(worker, 'img_old_rev', 2, 'om_turn_A');
+    frame(worker, 'img_downgrade', undefined, 'om_turn_A'); // generation already speaks the protocol
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+
+    // A new worker generation: the previous generation's high revision is void.
+    const worker2 = makeFakeWorker();
+    ds.worker = worker2;
+    setupActiveWorkerHandlers(ds, worker2);
+    frame(worker2, 'img_gen2_unannounced', 3, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    identity(worker2, 0, 'om_turn_A');
+    frame(worker2, 'img_gen2', 0, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_gen2');
+    // Old worker's late messages cannot touch the new generation.
+    identity(worker, 9, 'om_turn_Z');
+    frame(worker, 'img_stale_worker', 9, 'om_turn_Z');
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 0, turnId: 'om_turn_A' });
+    expect(ds.currentImageKey).toBe('img_gen2');
+  });
+
+  it('seq 5b: a pre-protocol worker keeps the conservative legacy path, but a waiting card needs a positive match', async () => {
+    const { ds, worker } = liveDs();
+    frame(worker, 'img_legacy_A', undefined, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_legacy_A');
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    frame(worker, 'img_legacy_untagged', undefined); // undefined cannot match B
+    frame(worker, 'img_legacy_other', undefined, 'om_turn_Q'); // "not A" is not "is B"
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    frame(worker, 'img_legacy_B', undefined, 'om_turn_B');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_legacy_B');
+  });
+
+  it('seq 6: a suppressed managed T/attempt2 never reaches cache, callback or PATCH — new protocol or legacy with missing fields', async () => {
+    const { ds, worker } = liveDs({
+      currentTurnId: 'om_public_prior',
+      suppressedFinalOutputTurns: new Map([['trg_managed_T', 2]]),
+    } as Partial<DaemonSession>);
+    worker.emit('message', {
+      type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'cap',
+      turnId: 'trg_managed_T', dispatchAttempt: 2,
+    });
+    // Legacy worker: missing turn, and missing attempt.
+    frame(worker, 'img_legacy_no_turn', undefined);
+    frame(worker, 'img_legacy_no_attempt', undefined, 'trg_managed_T');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    // New protocol, full tuple.
+    identity(worker, 1, 'trg_managed_T', 2);
+    frame(worker, 'img_new_protocol', 1, 'trg_managed_T', 2);
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(displayableStreamingCardImageKey(ds)).toBeUndefined();
+  });
+
+  it('seq 6b: filling a missing attempt never splices one source\'s turn with another\'s attempt', async () => {
+    const { ds, worker } = liveDs({
+      suppressedFinalOutputTurns: new Map([['om_turn_A', 2]]),
+    } as Partial<DaemonSession>);
+    // The live managed origin is for a DIFFERENT turn (B/attempt 2). A legacy
+    // frame for A without attempt must not borrow B's attempt (which would make
+    // A look like suppressed replay A/2 — or, conversely, launder it).
+    worker.emit('message', {
+      type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'cap',
+      turnId: 'om_turn_B', dispatchAttempt: 2,
+    });
+    frame(worker, 'img_A_no_attempt', undefined, 'om_turn_A');
+    await flush();
+    // A with unknown attempt is not provably replay A/2 → accepted (ordinary).
+    expect(ds.currentImageKey).toBe('img_A_no_attempt');
+  });
+
+  it('seq 7: clearing a suppressed tuple to (undefined, undefined) does not launder its pixels as public idle', async () => {
+    const { ds, worker } = liveDs({
+      silentScheduledTurns: new Map([['sch_silent', Date.now()]]),
+    });
+    identity(worker, 1, 'sch_silent');
+    identity(worker, 2); // CLI exit / clear: tuple empty, pixels still the silent turn's
+    frame(worker, 'img_private_after_clear', 2);
+    await flush();
+    expect(ds.captureIdentity).toMatchObject({ revision: 2, lastSource: { turnId: 'sch_silent' } });
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(canExpectFreshStreamingScreenshot(ds)).toBe(false);
+    // A new public write makes frames displayable again.
+    identity(worker, 3, 'om_turn_public');
+    frame(worker, 'img_public', 3, 'om_turn_public');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_public');
+  });
+
+  it('R3 P1-1: suppressed-source evidence outlives the worker generation (new-protocol AND legacy replacement)', async () => {
+    for (const replacementAnnounces of [true, false]) {
+      vi.clearAllMocks();
+      const { ds, worker } = liveDs({
+        currentTurnId: 'om_public_prior',
+        silentScheduledTurns: new Map([['sch_private', Date.now()]]),
+      });
+      identity(worker, 3, 'sch_private');
+      identity(worker, 4); // cleared, pixels remain
+      await flush();
+      expect(ds.retainedCaptureSource).toEqual({ turnId: 'sch_private' });
+
+      const replacement = makeFakeWorker();
+      ds.worker = replacement;
+      setupActiveWorkerHandlers(ds, replacement);
+      if (replacementAnnounces) identity(replacement, 0);
+      frame(replacement, 'img_retained', replacementAnnounces ? 0 : undefined);
+      await flush();
+      expect(ds.currentImageKey, `announces=${replacementAnnounces}`).toBeUndefined();
+      expect(updateMessageMock).not.toHaveBeenCalled();
+      expect(canExpectFreshStreamingScreenshot(ds)).toBe(false);
+      // Evidence restricts display only: the replacement's own public write
+      // replaces it and frames flow again.
+      if (replacementAnnounces) {
+        identity(replacement, 1, 'om_public_new');
+        frame(replacement, 'img_public_new', 1, 'om_public_new');
+      } else {
+        frame(replacement, 'img_public_new', undefined, 'om_public_new');
+      }
+      await flush();
+      expect(ds.currentImageKey).toBe('img_public_new');
+    }
+  });
+
+  it('R3 P1-2: a waiting target persists while the runtime card id is absent, for both cache writes and cached rendering', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    frame(worker, 'img_A', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_A');
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    ds.streamCardId = undefined; // reference temporarily lost; proof + target remain
+    frame(worker, 'img_A_while_missing', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    // A source-less cache may not be rendered while waiting for B either.
+    ds.currentImageKey = 'img_sourceless';
+    ds.currentImageSource = undefined;
+    expect(displayableStreamingCardImageKey(ds)).toBeUndefined();
+    ds.currentImageKey = undefined;
+    // B's own frame still lands once the card is current again.
+    ds.streamCardId = 'om_card_B';
+    identity(worker, 2, 'om_turn_B');
+    frame(worker, 'img_B', 2, 'om_turn_B');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_B');
+    expect(displayableStreamingCardImageKey(ds)).toBe('img_B');
+  });
+
+  it('R3 P1-2b: a withdrawn or replaced old target is cleared and never constrains a different card', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    await flush();
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    // The withdrawn-card path clears its own target.
+    const { forgetStreamCardDisplayTarget } = await import('../src/core/worker-pool.js');
+    forgetStreamCardDisplayTarget(ds, 'om_card_B');
+    ds.streamCardId = undefined;
+    expect(ds.streamCardDisplayTarget).toBeUndefined();
+    // A different real card with no recorded target follows live.
+    ds.streamCardId = 'om_card_other';
+    frame(worker, 'img_A_other', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_A_other');
+  });
+
+  it('R4 #1: a waiting target stays in force through a manual re-send POST window (and a failed POST keeps it)', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    await flush();
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    // Held manual re-send: sentinel set, streamCardPending false.
+    let resolveManual!: (id: string) => void;
+    const manualReply = vi.fn(() => new Promise<string>(resolve => { resolveManual = resolve; }));
+    const manualPost = postFreshStreamingCard(ds, manualReply as any);
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+    expect(ds.streamCardPending).toBe(false);
+    frame(worker, 'img_A_during_repost', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    resolveManual('om_card_B2');
+    expect(await manualPost).toBe(true);
+    await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_B2', mode: 'waiting-exact-turn', turnId: 'om_turn_B' });
+    // A failed re-send rolls back to B2 and keeps B2's own target.
+    sessionReplyMock.mockRejectedValueOnce(new Error('post failed'));
+    const before = ds.streamCardDisplayTarget;
+    expect(await postFreshStreamingCard(ds, sessionReplyMock as any)).toBe(false);
+    expect(ds.streamCardId).toBe('om_card_B2');
+    expect(ds.streamCardDisplayTarget).toBe(before);
+    frame(worker, 'img_A_after_failed_repost', 1, 'om_turn_A');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    // B's own write still unlocks the re-sent card.
+    identity(worker, 2, 'om_turn_B');
+    frame(worker, 'img_B', 2, 'om_turn_B');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_B');
+    expect(patchedIds().at(-1)).toBe('om_card_B2');
+  });
+
+  it('R4 #2: retained evidence is released only by an ACCEPTED verified public frame; source-less and rejected frames keep it', async () => {
+    const { ds, worker } = liveDs({
+      currentTurnId: 'om_public_prior',
+      silentScheduledTurns: new Map([['sch_private', Date.now()]]),
+    });
+    identity(worker, 3, 'sch_private');
+    identity(worker, 4);
+    await flush();
+    const replacement = makeFakeWorker();
+    ds.worker = replacement;
+    setupActiveWorkerHandlers(ds, replacement); // legacy: never sends capture_identity
+    // Source-less legacy frame: rejected, evidence kept.
+    frame(replacement, 'img_untagged');
+    // Tagged frame from a (different) suppressed source: rejected, evidence kept.
+    frame(replacement, 'img_tagged_private', undefined, 'sch_private');
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(ds.retainedCaptureSource).toEqual({ turnId: 'sch_private' });
+    expect(displayableStreamingCardImageKey(ds)).toBeUndefined();
+    expect(canExpectFreshStreamingScreenshot(ds)).toBe(false);
+    // Verified public frame: accepted into cache AND consistently displayable.
+    frame(replacement, 'img_public_new', undefined, 'om_public_new');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_public_new');
+    expect(ds.retainedCaptureSource).toEqual({ turnId: 'om_public_new' });
+    expect(displayableStreamingCardImageKey(ds)).toBe('img_public_new');
+    expect(canExpectFreshStreamingScreenshot(ds)).toBe(true);
+  });
+
+  it('R5 #1: a legacy worker\'s live private origin is a known source even against a differently tagged frame; a live public origin still releases', async () => {
+    const { ds, worker } = liveDs({
+      currentTurnId: 'om_public_A',
+      silentScheduledTurns: new Map([['sch_private_S', Date.now()]]),
+    });
+    identity(worker, 3, 'sch_private_S');
+    identity(worker, 4);
+    await flush();
+    const replacement = makeFakeWorker();
+    ds.worker = replacement;
+    setupActiveWorkerHandlers(ds, replacement); // legacy
+    replacement.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'c1', turnId: 'sch_private_S' });
+    frame(replacement, 'img_old_public_A', undefined, 'om_public_A'); // conflicting old tag
+    await flush();
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(ds.retainedCaptureSource).toEqual({ turnId: 'sch_private_S' });
+    expect(displayableStreamingCardImageKey(ds)).toBeUndefined();
+    // The current worker genuinely switches to public P: matching frame releases.
+    replacement.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'c2', turnId: 'om_public_P' });
+    frame(replacement, 'img_P', undefined, 'om_public_P');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_P');
+    expect(ds.retainedCaptureSource).toEqual({ turnId: 'om_public_P' });
+    // New protocol unchanged: identity decides, a foreign stale origin is not spliced in.
+    const w3 = makeFakeWorker();
+    ds.worker = w3;
+    setupActiveWorkerHandlers(ds, w3);
+    w3.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'c3', turnId: 'sch_private_S' });
+    identity(w3, 0, 'om_public_Q');
+    frame(w3, 'img_Q', 0, 'om_public_Q');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_Q');
+  });
+
+  it('R5 #2: B activation during a held re-send is kept on rollback, and a successful re-send does not re-wait for an activated turn', async () => {
+    // Failure path (both orders of D vs rollback are covered by Alex's port).
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    await flush();
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    let resolveHeld!: (id: string) => void;
+    const held = vi.fn(() => new Promise<string>(resolve => { resolveHeld = resolve; }));
+    const repost = postFreshStreamingCard(ds, held as any);
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+    identity(worker, 2, 'om_turn_B'); // B starts in the window
+    await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_B', mode: 'follow-live' });
+    identity(worker, 3, 'trg_http_D');
+    await flush();
+    // Success path: the copy follows live (B was activated), so D lands on it.
+    resolveHeld('om_card_B2');
+    expect(await repost).toBe(true);
+    await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_B2', mode: 'follow-live' });
+    frame(worker, 'img_D', 3, 'trg_http_D');
+    await flush();
+    expect(ds.currentImageKey).toBe('img_D');
+    expect(patchedIds().at(-1)).toBe('om_card_B2');
+  });
+
+  it('R5 #2b: a re-send of a card still waiting (no activation in the window) still re-waits, and an unrelated new-turn card binds its own target', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    await flush();
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    sessionReplyMock.mockResolvedValueOnce('om_card_B2');
+    expect(await postFreshStreamingCard(ds, sessionReplyMock as any)).toBe(true);
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_B2', mode: 'waiting-exact-turn', turnId: 'om_turn_B' });
+    // An unrelated new-turn card C never inherits B's state.
+    await publishNewTurnCard(ds, 'om_turn_C', 'om_card_C');
+    expect(ds.streamCardDisplayTarget).toMatchObject({ messageId: 'om_card_C', mode: 'waiting-exact-turn', turnId: 'om_turn_C' });
+    identity(worker, 2, 'om_turn_B'); // B activates late: C keeps waiting for C
+    await flush();
+    expect(ds.streamCardDisplayTarget?.mode).toBe('waiting-exact-turn');
+  });
+
+  it('seq 7b: commitCaptureIdentity is synchronous — a frame emitted right after its identity in the same tick is accepted', () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    expect(ds.captureIdentity).toMatchObject({ revision: 1, turnId: 'om_turn_A' });
+    expect(commitCaptureIdentity(ds, ds.workerGeneration!, { revision: 1, turnId: 'om_turn_A' })).toBe(true);
+    expect(commitCaptureIdentity(ds, ds.workerGeneration!, { revision: 1, turnId: 'om_turn_B' })).toBe(false);
+    expect(commitCaptureIdentity(ds, ds.workerGeneration!, { revision: 1.5 })).toBe(false);
+  });
+});
+
+// ─── Ported from Alex's R2 review (producer semantics), fixtures adjusted ─
+// capture_identity establishes the real capture identity; the original ACK
+// events are kept as distractors.
+
+describe('R2 producer semantics acceptance', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_fresh'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+  });
+  function start() {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, displayMode: 'screenshot', streamCardId: 'om_a_card', currentTurnId: 'om_a', scope: 'chat' } as Partial<DaemonSession>);
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'capture_identity', revision: 1, turnId: 'om_a' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_a' });
+    return { ds, worker };
+  }
+  it('R2 producer acceptance: Claude queue commit B does not mean A stopped producing frames', async () => {
+    const { ds, worker } = start();
+    ds.currentTurnId = 'om_b';
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_b' }); // enqueue-only ACK (distractor)
+    await flush(); updateMessageMock.mockClear();
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_a_running', status: 'working', turnId: 'om_a', captureRevision: 1 });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_a_running');
+    expect(updateMessageMock).toHaveBeenCalled();
+  });
+  it('R2 producer acceptance: a raw command changes worker capture turn without sending turn_input_committed', async () => {
+    const { ds, worker } = start();
+    worker.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'raw_cap', turnId: 'om_raw_compact' });
+    worker.emit('message', { type: 'capture_identity', revision: 2, turnId: 'om_raw_compact' }); // raw write, no ACK
+    await flush(); updateMessageMock.mockClear();
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_raw_result', status: 'idle', turnId: 'om_raw_compact', captureRevision: 2 });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_raw_result');
+    expect(updateMessageMock).toHaveBeenCalled();
+  });
+});
+
+// ─── Ported verbatim from Alex's R4 review ────────────────────────────────
+
+describe('R4 retained source narrow acceptance', () => {
+  it('R4 release: accepted public frame from legacy replacement must also be renderable after old suppressed source', async () => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const oldWorker = makeFakeWorker();
+    const ds = makeDs({ worker: oldWorker, workerReady: true, displayMode: 'screenshot', streamCardId: 'om_visible', currentTurnId: 'om_public_prior', silentScheduledTurns: new Map([['sch_private', Date.now()]]) });
+    setupActiveWorkerHandlers(ds, oldWorker);
+    oldWorker.emit('message', { type: 'capture_identity', revision: 3, turnId: 'sch_private' });
+    oldWorker.emit('message', { type: 'capture_identity', revision: 4 });
+    await flush();
+    const replacement = makeFakeWorker(); ds.worker = replacement;
+    setupActiveWorkerHandlers(ds, replacement);
+    replacement.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_public_new', status: 'idle', turnId: 'om_public_new' });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_public_new');
+    const { displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot } = await import('../src/core/worker-pool.js');
+    expect(displayableStreamingCardImageKey(ds)).toBe('img_public_new');
+    expect(canExpectFreshStreamingScreenshot(ds)).toBe(true);
+  });
+});
+
+// ─── Ported from Alex's R5 review (bodies verbatim; control wrapped in describe) ─
+
+describe('R5 retained source live contradiction acceptance', () => {
+  it('R5 live source: an old public tag cannot release a current legacy private origin and admit subsequent untagged private pixels', async () => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const oldWorker = makeFakeWorker();
+    const ds = makeDs({ worker: oldWorker, workerReady: true, displayMode: 'screenshot', streamCardId: 'om_visible', currentTurnId: 'om_public_A', silentScheduledTurns: new Map([['sch_private_S', Date.now()]]) });
+    setupActiveWorkerHandlers(ds, oldWorker);
+    oldWorker.emit('message', { type: 'capture_identity', revision: 3, turnId: 'sch_private_S' });
+    oldWorker.emit('message', { type: 'capture_identity', revision: 4 });
+    await flush();
+    const replacement = makeFakeWorker(); ds.worker = replacement;
+    setupActiveWorkerHandlers(ds, replacement); // legacy, no capture_identity
+    // Current-generation origin positively identifies the terminal producer S.
+    replacement.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'current-private-origin', turnId: 'sch_private_S' });
+    await flush();
+    expect(ds.managedTurnOrigin?.turnId).toBe('sch_private_S');
+    replacement.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_old_public_A', status: 'working', turnId: 'om_public_A' });
+    await flush();
+    // After this tag, an untagged frame still must be judged against the live
+    // private source, not against public A left in retainedCaptureSource.
+    replacement.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_current_private_pixels', status: 'idle' });
+    await flush();
+    expect({ retained: ds.retainedCaptureSource, currentOrigin: ds.managedTurnOrigin?.turnId, cache: ds.currentImageKey }).toEqual({ retained: { turnId: 'sch_private_S' }, currentOrigin: 'sch_private_S', cache: undefined });
+    expect(updateMessageMock.mock.calls.map(c => c[2])).not.toContainEqual(expect.stringContaining('img_current_private_pixels'));
+  });
+});
+
+
+describe('R5 retained source live contradiction acceptance (control)', () => {
+  it('R5 live source: legitimate new public origin and matching frame release private evidence', async () => {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, displayMode: 'screenshot', streamCardId: 'om_visible', currentTurnId: 'om_public_prior', silentScheduledTurns: new Map([['sch_private_S', Date.now()]]), retainedCaptureSource: { turnId: 'sch_private_S' } } as any);
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'private_origin', turnId: 'sch_private_S' });
+    worker.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'public_origin', turnId: 'om_new_public_P' });
+    await flush();
+    expect(ds.managedTurnOrigin?.turnId).toBe('om_new_public_P');
+    worker.emit('message', { type: 'screenshot_uploaded', imageKey: 'img_new_public_P', status: 'working', turnId: 'om_new_public_P' });
+    await flush();
+    const { displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot } = await import('../src/core/worker-pool.js');
+    expect(ds.retainedCaptureSource).toEqual({ turnId: 'om_new_public_P' });
+    expect(displayableStreamingCardImageKey(ds)).toBe('img_new_public_P');
+    expect(canExpectFreshStreamingScreenshot(ds)).toBe(true);
   });
 });

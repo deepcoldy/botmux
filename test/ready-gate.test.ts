@@ -428,19 +428,14 @@ describe('first-prompt fallback alignment', () => {
     })).toBe(true);
   });
 
-  it('grok keeps the 45s fallback: the 90s alignment is an explicit opt-in, not a shared-flags derivation', () => {
+  it('grok does not opt into 90s alignment: opt-in is explicit, not inferred from defer flags', () => {
     const grok = createGrokAdapter();
-    // Grok carries BOTH flags the old derivation keyed on…
+    // Grok carries BOTH defer flags, but does not arm ready-gate (no injectsReadyHook);
+    // this test locks down that resolveReadySignalTimeoutMs does not derive alignment
+    // from defer flags.
     expect(grok.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(!!grok.readyPattern).toBe(true);
-    // …so a flag-derived alignment silently moved its gate fallback from 45s to
-    // 90s, delaying every first prompt by ~45s whenever its SessionStart signal
-    // is missing. Counterfactual of that old derivation, on this same adapter:
-    const legacyDerivedFallbackMs = grok.deferFirstPromptTimeoutUntilReady === true && !!grok.readyPattern
-      ? Math.max(READY_SIGNAL_TIMEOUT_MS, FIRST_PROMPT_HARD_TIMEOUT_MS)
-      : READY_SIGNAL_TIMEOUT_MS;
-    expect(legacyDerivedFallbackMs).toBe(90_000);
-    // It never opted in, so it keeps the shared fallback.
+    // Grok does not opt in, so resolveReadySignalTimeoutMs returns the default fallback.
     expect(grok.readyGateFallbackAlignedWithHardCap).toBeUndefined();
     expect(resolveReadySignalTimeoutMs({
       alignFallbackWithFirstPromptHardCap: grok.readyGateFallbackAlignedWithHardCap === true,

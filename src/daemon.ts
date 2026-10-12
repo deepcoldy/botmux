@@ -1,6 +1,8 @@
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
+import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
@@ -115,8 +117,11 @@ import {
   startDurableLarkPrimaryRuntime,
   type DurableLarkPrimaryRuntime,
 } from './services/durable-lark-primary-runtime.js';
-import { deliverDurableLarkOutbox } from './services/durable-lark-outbox.js';
-import { durableLarkOutboxMessage } from './services/durable-lark-outbox.js';
+import {
+  deliverDurableLarkOutbox,
+  durableLarkOutboxMessage,
+  type DurableLarkOutboxTarget,
+} from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import { parseDurablePrimarySessionRecord } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
@@ -7553,6 +7558,30 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+const explicitAskContinuation = createExplicitAskContinuation({
+  dir: join(config.session.dataDir, 'explicit-ask-receipts'),
+  get appId() { return selfDaemonLarkAppId ?? ''; },
+  register: input => registerHostAsk(input),
+  releaseHandoff: releaseExplicitAskHandoff,
+  hasHandoff: hasExplicitAskHandoff,
+  canResume: receipt => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    return sessionsRestored && !!ds && ds.larkAppId === receipt.input.larkAppId
+      && ds.chatId === receipt.input.chatId
+      && (ds.session.scope === 'chat' ? null : ds.session.rootMessageId) === receipt.input.rootMessageId
+      && (!receipt.result || !ds.worker || ds.lastScreenStatus === 'idle');
+  },
+  dispatch: async (receipt, key) => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    const result = await triggerSessionTurn(
+      explicitAskRecoveryRequest(receipt, key, ds?.chatType),
+      { larkAppId: receipt.input.larkAppId, activeSessions },
+    );
+    return result.ok && result.action !== 'ignored';
+  },
+  onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
+});
+
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
   try {
@@ -7656,7 +7685,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  const result = await registerAskForResponse({
+  const askInput = {
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
@@ -7674,7 +7703,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  }, res);
+  };
+  const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
+  const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
+  if (body.acknowledge === true) {
+    if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
+    const result = explicitAskContinuation.acknowledge(explicitInput);
+    return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
+  }
+  const result = managedExplicit
+    ? await explicitAskContinuation.wait(explicitInput)
+    : await registerAskForResponse(askInput, res);
   if (res.destroyed) return;
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
@@ -19705,7 +19744,12 @@ export const __testOnly_forkReservedInitialSession = forkReservedInitialSession;
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
  * live worker after it. */
-function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[], trustedCaller?: TrustedCaller): boolean {
+function forkReservedInitialSession(
+  ds: DaemonSession,
+  availableBots: AvailableBot[],
+  trustedCaller?: TrustedCaller,
+  forkOptions: ForkWorkerOptions = {},
+): boolean {
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
   if (trustedCaller) input.trustedCaller = trustedCaller;
@@ -19732,7 +19776,10 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
     }
   }
   let accepted = false;
-  const admissionOpts: ForkWorkerOptions = {};
+  // Worker admission writes marginalReclaimScheduled as an out-flag. Keep the
+  // caller's object identity so durablePrimaryWorkerAdmission can observe the
+  // deferred path and hold the Inbox claim until the final admission result.
+  const admissionOpts = forkOptions;
   try {
     accepted = forkWorker(ds, input, turnId ? {
       turnId,
@@ -22187,6 +22234,106 @@ function markIngressAdmitted(ctx: RoutingContext): void {
   else ctx.ingressAdmission = { admitted: true };
 }
 
+function durableOutboxTargetForTurn(ds: DaemonSession, turnId: string): DurableLarkOutboxTarget {
+  const target = frozenReplyContextForTurn(ds, turnId).target;
+  return target.mode === 'plain'
+    ? { kind: 'send', chatId: target.chatId }
+    : {
+        kind: 'reply',
+        messageId: target.rootMessageId,
+        replyInThread: target.mode === 'thread',
+      };
+}
+
+/**
+ * Bind a worker-admission decision to the durable-primary handler that owns
+ * this inbound event. Hard rejection queues synchronously. Marginal memory
+ * reclaim is the only async admission path, so its final decision is awaited
+ * before the handler returns and before canonical Session admission flushes
+ * the queued Outbox effect.
+ */
+function durablePrimaryWorkerAdmission(
+  ctx: RoutingContext,
+  ds: DaemonSession,
+  defaultTurnId: string,
+): {
+  options: ForkWorkerOptions;
+  markForkReturned(): void;
+  waitIfMarginal(): Promise<void>;
+} | undefined {
+  const queue = ctx.queuePostAdmissionOutput;
+  if (!queue) return undefined;
+  let forkReturned = false;
+  let settled = false;
+  let resolveFinal!: () => void;
+  const final = new Promise<void>(resolve => { resolveFinal = resolve; });
+  const settle = (): void => {
+    if (settled) return;
+    settled = true;
+    resolveFinal();
+  };
+  const options: ForkWorkerOptions = {
+    onAdmission(admission) {
+      if (admission === 'deferred') {
+        // The first deferred signal schedules marginal reclaim before the
+        // original fork returns. A later deferred signal means the re-entry
+        // was durably parked behind another gate (for example device freeze),
+        // so the Inbox claim no longer has to wait for that independent gate.
+        if (forkReturned && options.marginalReclaimScheduled === true) settle();
+        return;
+      }
+      settle();
+    },
+    onAdmissionBlocked(notice) {
+      const turnId = notice.turnId ?? defaultTurnId;
+      const providerUuid = `admission_blocked_${createHash('sha256')
+        .update(JSON.stringify([ds.larkAppId, ds.session.sessionId, turnId, 'worker-admission']))
+        .digest('hex')
+        .slice(0, 24)}`;
+      try {
+        queue({
+          target: durableOutboxTargetForTurn(ds, turnId),
+          content: notice.content,
+          msgType: 'text',
+          providerUuid,
+          hookContext: { sessionId: ds.session.sessionId, turnId },
+        });
+      } catch (error) {
+        // A timed-out/retried Inbox claim may close its in-memory queue before
+        // an old marginal-admission callback arrives. The replacement claim
+        // owns the durable retry; never fall back to a direct provider effect.
+        logger.warn(
+          `[durable-primary:${ds.larkAppId}] discarded late worker-admission notice: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    },
+  };
+  return {
+    options,
+    markForkReturned() { forkReturned = true; },
+    async waitIfMarginal() {
+      if (options.marginalReclaimScheduled !== true || settled) return;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          final,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => {
+              reject(new Error('durable primary worker admission did not settle'));
+            }, 30_000);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+  };
+}
+
+export const __testOnly_durablePrimaryWorkerAdmission = durablePrimaryWorkerAdmission;
+
 /**
  * 普通消息处理链的终态失败收口：transport 已 ACK（用户看到消息发出去了），但
  * 异常把整条投递链掀翻——此前只剩 dispatcher 的 log-only catch，用户视角就是
@@ -23215,7 +23362,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots, trustedCaller);
+    const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
+    forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
+    primaryAdmission?.markForkReturned();
+    await primaryAdmission?.waitIfMarginal();
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
@@ -23288,7 +23438,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots, trustedCaller);
+    const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
+    forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
+    primaryAdmission?.markForkReturned();
+    await primaryAdmission?.waitIfMarginal();
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -25705,7 +25858,10 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
+      const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
+      primaryAdmission?.markForkReturned();
+      await primaryAdmission?.waitIfMarginal();
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
@@ -25760,7 +25916,10 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
+      const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
+      primaryAdmission?.markForkReturned();
+      await primaryAdmission?.waitIfMarginal();
     }
 
     return;
@@ -26311,6 +26470,9 @@ async function handleThreadReplyAdmitted(
     let reforkAccepted = true;
     let xpiAdmission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
     let xpiAdmissionAcquired = false;
+    const primaryAdmission = ds.adoptedFrom
+      ? undefined
+      : durablePrimaryWorkerAdmission(ctx, ds, parsed.messageId);
     if (ds.session.xpiSharedCwdAdmissionGroupId) {
       if (!threadTrustedCaller || queuedHasDurableTail || queuedDashboardTurn) {
         throw new Error('grouped XPI refork requires one exact interactive turn and trusted caller');
@@ -26410,8 +26572,10 @@ async function handleThreadReplyAdmitted(
                 },
               }
             : {}),
-        });
+        }, primaryAdmission?.options);
       }
+      primaryAdmission?.markForkReturned();
+      await primaryAdmission?.waitIfMarginal();
     } catch (e) {
       rollbackXpiSharedCwdAdmission(ds, xpiAdmission, parsed.messageId);
       if (openingTurn) releaseInitialUserTurn(ds);
@@ -29453,6 +29617,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // reconnecting ask hook that raced the restore got retryable 503s until here.
     markSessionsRestored: () => {
       sessionsRestored = true;
+      const askRecoveryTimer = setInterval(() => { void explicitAskContinuation.sweep(); }, 5000);
+      askRecoveryTimer.unref();
+      void explicitAskContinuation.sweep();
     },
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
