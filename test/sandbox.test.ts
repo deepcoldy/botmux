@@ -218,6 +218,63 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
   });
 });
 
+describe('prepareDirectSandbox mcode data alias', () => {
+  function fixture() {
+    const root = mkdtempSync(join(tmpdir(), 'sbx-mcode-alias-'));
+    const data = join(root, 'native-data');
+    mkdirSync(data);
+    const target = realpathSync(data);
+    const lexicalHome = join(root, 'lexical-home');
+    symlinkSync(root, lexicalHome);
+    const alias = join(lexicalHome, 'native-data');
+    const opts = { sessionId: 'mcode-alias', dataDir: join(root, 'botmux'),
+      policy: { rules: [{ path: target, access: 'readWrite' as const, source: 'internal' as const }], net: true, writeRegexes: [] },
+      chdir: target, home: root, cliBin: '/bin/true', cliArgs: [] };
+    return { root, target, alias, opts };
+  }
+  it.each([false, true])('preserves only the granted native data alias (args file: %s)', useBwrapArgsFile => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ ...f.opts, minimaxDataDir: f.alias, useBwrapArgsFile });
+      if (!plan) return;
+      const args = plan.argsFile ? readFileSync(plan.argsFile, 'utf8').split('\0') : plan.args;
+      const aliasAt = args.findIndex((arg, i) => arg === '--symlink' && args[i + 2] === f.alias);
+      expect(aliasAt).toBeGreaterThan(-1);
+      expect(args[aliasAt + 1]).toBe(f.target);
+      const bindAt = args.findIndex((arg, i) => arg === '--bind' && args[i + 1] === f.target);
+      expect(bindAt).toBeGreaterThan(aliasAt);
+      expect(args[bindAt + 2]).toBe(f.target);
+      // No host bind of the lexical home or additional credential directory.
+      expect(args.filter((arg, i) => ['--bind', '--ro-bind'].includes(args[i - 1])).includes(f.alias)).toBe(false);
+    } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
+  });
+  it.each([false, true])('does not add an alias for other CLIs or a canonical data path: %s', canonical => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({ ...f.opts, ...(canonical ? { minimaxDataDir: f.target } : {}) });
+      if (!plan) return;
+      expect(plan.args).not.toContain(f.alias);
+    } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
+  });
+  it.each(['missing', 'denied', 'collision'] as const)('rejects an alias with %s access instead of expanding the grant', scenario => {
+    if (process.platform !== 'linux') return;
+    const f = fixture();
+    const baseline = prepareDirectSandbox(f.opts);
+    try {
+      if (!baseline) return;
+      baseline.cleanup();
+      const rules = scenario === 'missing' ? [] : [...f.opts.policy.rules,
+        { path: scenario === 'denied' ? f.target : f.alias, access: 'deny' as const, source: 'user' as const }];
+      expect(() => prepareDirectSandbox({ ...f.opts, policy: { ...f.opts.policy, rules }, minimaxDataDir: f.alias })).toThrow(/exact canonical writable grant/);
+      expect(existsSync(join(f.opts.dataDir, 'sandboxes', f.opts.sessionId))).toBe(false);
+    } finally { baseline?.cleanup(); rmSandboxScratch(f.root); }
+  });
+});
+
 describe('prepareDirectSandbox tmux argument transport', () => {
   it('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {
     if (process.platform !== 'linux') return;

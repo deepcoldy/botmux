@@ -21,6 +21,7 @@ import {
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
 import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
+import { readMinimaxUsage } from '../services/minimax-usage.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1374,10 +1375,18 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
 }
 
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+  if (q.cliId === 'minimax') return getSessionUsageSnapshot(q).tokens;
   return readSessionUsage(q)?.result ?? null;
 }
 
 export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsageSnapshot {
+  if (q.cliId === 'minimax') {
+    const resolved = resolveSessionTranscriptPath(q);
+    const snapshot = resolved ? readMinimaxUsage(resolved.path, q.cliSessionId || q.sessionId, q.fresh) : null;
+    const costCny = snapshot?.tokens ? estimateCostCny(snapshot.tokens, q.pricing) : null;
+    return { ...(snapshot ?? { context: null, tokens: null, turnTokens: null }),
+      ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}) };
+  }
   const read = readSessionUsage(q);
   const agg = read?.agg;
   // Per-turn delta only for dialects that track it (Claude family). Codex/coco

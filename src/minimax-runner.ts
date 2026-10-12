@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-/** Long-lived Botmux stdin bridge around MiniMax Code's native exec sessions.
+/** Long-lived Botmux stdin bridge around MiniMax Code's native ACP sessions.
  * No latest-session lookup, shell-interpolated prompts, or mmx compatibility. */
 import { delimiter, dirname, resolve } from 'node:path';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { runMcodeExec } from './services/mcode-exec.js';
+import { runMcodeAcp } from './services/mcode-acp.js';
+import { bridgeMinimaxForm, bridgeMinimaxPermission } from './services/minimax-user-input.js';
 
 const output = new RunnerControlWriter();
 const values = new Map<string, string>();
@@ -12,7 +14,7 @@ const argOffset = process.argv[2] === '__minimax-runner' ? 3 : 2;
 for (let i = argOffset; i < process.argv.length; i += 2) {
   const key = process.argv[i];
   const value = process.argv[i + 1];
-  if (!['--mcode-bin', '--node-bin', '--data-dir', '--cwd', '--native-session-id', '--model', '--effort', '--permission', '--turn-timeout-ms'].includes(key) || value === undefined) {
+  if (!['--mcode-bin', '--node-bin', '--data-dir', '--cwd', '--native-session-id', '--model', '--effort', '--permission', '--turn-timeout-ms', '--transport'].includes(key) || value === undefined) {
     output.error('Invalid minimax runner arguments\n'); process.exit(2);
   }
   values.set(key, value);
@@ -20,14 +22,15 @@ for (let i = argOffset; i < process.argv.length; i += 2) {
 const executable = values.get('--mcode-bin');
 const permission = values.get('--permission') ?? 'full';
 const timeoutMs = Number(values.get('--turn-timeout-ms') ?? 600_000);
-if (!executable || !['full', 'smart'].includes(permission) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+const transport = values.get('--transport') ?? 'acp';
+if (!executable || !['acp', 'exec'].includes(transport) || !['full', 'smart'].includes(permission) || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
   output.error('minimax runner requires --mcode-bin, a valid permission policy and timeout\n'); process.exit(2);
 }
 const cwd = resolve(values.get('--cwd') ?? process.cwd());
 // npm's executable uses /usr/bin/env node. Its host PATH entry may be a symlink
 // under /run, absent inside bwrap; use the same canonical runtime the adapter
 // declared as an executable bind. Official launchers supply their own runtime.
-const nativeEnv = { ...process.env,
+const nativeEnv: NodeJS.ProcessEnv = { ...process.env,
   ...(values.has('--data-dir') ? { MINIMAX_DATA_DIR: values.get('--data-dir') } : {}),
   ...(values.has('--node-bin') ? { PATH: [dirname(values.get('--node-bin')!), process.env.PATH ?? ''].join(delimiter) } : {}),
 };
@@ -63,14 +66,45 @@ async function drain(): Promise<void> {
       const startedAtMs = Date.now();
       const controller = new AbortController();
       active = controller;
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let remainingMs = timeoutMs;
+      let resumedAt = Date.now();
+      let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => controller.abort(), remainingMs);
+      const waitingForHuman = (waiting: boolean) => {
+        if (waiting) {
+          if (timer) remainingMs = Math.max(1, remainingMs - (Date.now() - resumedAt));
+          clearTimeout(timer); timer = undefined;
+        } else if (!controller.signal.aborted && !closing) {
+          resumedAt = Date.now();
+          timer = setTimeout(() => controller.abort(), remainingMs);
+        }
+      };
       output.line('[MiniMax Code] running…');
       const streamedItems = new Set<string>();
       try {
-        const result = await runMcodeExec({ executable: executable!, cwd, env: nativeEnv,
+        const common = { executable: executable!, cwd, env: nativeEnv,
           content: turn.content, nativeSessionId, model: values.get('--model'), effort: values.get('--effort'),
-          permission: permission as 'full' | 'smart', timeoutMs,
-          onEvent(event) {
+          permission: permission as 'full' | 'smart', timeoutMs };
+        const result = transport === 'acp' ? await runMcodeAcp({ ...common,
+          onSession(sessionId) {
+            nativeSessionId = sessionId;
+            output.marker('thread', { threadId: sessionId });
+          },
+          onInteractionPending: waitingForHuman,
+          onUserInput(method, params, signal) {
+            const context = { sessionId: nativeEnv.BOTMUX_SESSION_ID ?? '',
+              larkAppId: nativeEnv.BOTMUX_LARK_APP_ID ?? '', chatId: nativeEnv.BOTMUX_CHAT_ID ?? '',
+              rootMessageId: nativeEnv.BOTMUX_ROOT_MESSAGE_ID, originTurnId: turn.turnId, env: nativeEnv };
+            return method === 'elicitation/create' ? bridgeMinimaxForm(context, params, signal)
+              : bridgeMinimaxPermission(context, params, signal);
+          },
+          onUpdate(update) {
+            if (update.sessionUpdate === 'agent_message_chunk') displayText(update.content.text);
+            else if (update.sessionUpdate === 'tool_call') {
+              finishDisplay(); displayText(`[tool] ${update.title ?? 'tool'}`); finishDisplay();
+            }
+          },
+        }, controller.signal) : await runMcodeExec({ ...common,
+          onEvent(event: Record<string, any>) {
             // Publish the authoritative ID as soon as native execution starts,
             // so a runner death mid-turn still resumes THIS conversation.
             if (!nativeSessionId) {
@@ -150,5 +184,5 @@ process.stdin.on('data', (data: string) => {
 process.stdin.on('end', close);
 process.stdin.resume();
 if (nativeSessionId) output.marker('thread', { threadId: nativeSessionId });
-output.line('MiniMax Code runner ready (mcode exec stream-json).');
+output.line(`MiniMax Code runner ready (mcode ${transport === 'acp' ? 'ACP' : 'exec stream-json'}).`);
 prompt();

@@ -526,20 +526,23 @@ export function getDaemonStreamingCardUsageSnapshot(
   const remoteReasoningEffort = remoteRunner ? snapshot.reasoningEffort?.trim() : undefined;
   const remoteModelBackendVariant = remoteRunner ? snapshot.modelBackendVariant?.trim() : undefined;
   // Model normally comes from an explicitly-wired executor runtime (TRAE/Codex
-  // set ds.activeModel) or launch config. Grok's native snapshot is the one
-  // exception: its signals.json exposes a stable user-facing primaryModelId.
+  // set ds.activeModel) or launch config. Grok and MiniMax also expose native,
+  // user-facing model identity in their usage snapshots.
   // We still never surface snapshot.tokens.model, which can be an internal
   // routing code for Relay-family CLIs (e.g. `ark/relay-code`).
-  const grokModel = effectiveCliId === 'grok' ? snapshot.model?.trim() : undefined;
-  const grokReasoningEffort = effectiveCliId === 'grok' ? snapshot.reasoningEffort?.trim() : undefined;
+  const nativeRuntime = effectiveCliId === 'grok' || effectiveCliId === 'minimax';
+  const nativeModel = nativeRuntime ? snapshot.model?.trim() : undefined;
+  const nativeReasoningEffort = nativeRuntime ? snapshot.reasoningEffort?.trim() : undefined;
   return {
     ...snapshot,
     ...(remoteModel ? { model: remoteModel }
+      : effectiveCliId === 'minimax' && nativeModel ? { model: nativeModel }
       : runtimeModel ? { model: runtimeModel }
-        : grokModel ? { model: grokModel } : {}),
+        : nativeModel ? { model: nativeModel } : {}),
     ...(remoteReasoningEffort ? { reasoningEffort: remoteReasoningEffort }
+      : effectiveCliId === 'minimax' && nativeReasoningEffort ? { reasoningEffort: nativeReasoningEffort }
       : reasoningEffort ? { reasoningEffort }
-        : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
+        : nativeReasoningEffort ? { reasoningEffort: nativeReasoningEffort } : {}),
     ...(remoteModelBackendVariant ? { modelBackendVariant: remoteModelBackendVariant }
       : modelBackendVariant ? { modelBackendVariant } : {}),
     ...(modelFallback ? { modelFallback } : {}),

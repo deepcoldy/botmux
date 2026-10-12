@@ -16,8 +16,9 @@ import { antigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
+import { minimaxDataDirForBot } from './minimax-paths.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity';
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity' | 'minimax';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -295,7 +296,7 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).
@@ -337,6 +338,10 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
   const svMappings = sessionScratchMappings(q);
   const v = (hostPath: string): string => scratchViewPath(svMappings, hostPath);
   switch (q.cliId) {
+    case 'minimax': {
+      const path = join(v(minimaxDataDirForBot(q.larkAppId)), 'v2', 'sqlite', 'runtime-state.sqlite');
+      return existsSync(path) ? { path, kind: 'minimax' } : null;
+    }
     case 'claude-code': {
       const homeRoot = v(join(homedir(), '.claude'));
       // cwd must be remapped too: on macOS Claude runs with the CLONE path as

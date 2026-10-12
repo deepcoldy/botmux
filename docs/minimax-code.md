@@ -27,19 +27,41 @@ mcode login                    # 国内账号
 
 数据根默认 `~/.minimax`，`MINIMAX_DATA_DIR` 优先于兼容变量 `MAVIS_DATA_DIR`。目录包含 config.yaml、登录态、SQLite 和会话，文件沙盒会保留整个目录；全局 Skills 位于 `<data-dir>/skills`。不同账号/区域使用独立的绝对路径，并在对应数据目录下分别登录。
 
+mcode 的 OAuth 账号键包含数据目录的原始路径。Linux 上 HOME 或数据目录含软链接时，仅为 mcode 在沙盒内保留该目录到已授权真实数据目录的路径别名，避免路径规范化后误报未登录；别名必须对应精确的可写授权，不额外挂载宿主目录，也不改变其他 CLI 的沙盒路径。
+
 文件沙盒自动识别两种安装布局：官方安装器的 `install.json` 根目录，以及 npm 全局安装中真实可执行文件所属的 `@minimax-ai/code` 包根（通过最近的 `package.json` 校验）。官方安装根或 npm 包及其内部依赖只读挂载，不扩大到整个全局 npm 目录；仅数据目录和官方 `.mcode-active` 标记目录可写。官方安装器若复用安装根外的 Node，还会按 `install.json` 的 `nodeExecutable` 加入运行时可执行目录的只读覆盖。npm 布局则解析当前/机器人配置 PATH 中的 Node 并传给 runner，在沙盒内使用同一个真实运行时；Bun 启动 Botmux 时也仍需安装兼容的 Node。未知的自定义包装布局需自行在文件沙盒 policy 中允许读取安装依赖及运行时。
 
 适配器的 `buildArgs` 同时承担启动准备：在 worker 对沙盒 bind 源进行存在性过滤前，预建数据目录与官方 `.mcode-active`。这是首次启动持久化所需的顺序，不能延迟到沙盒内的 runner；准备步骤幂等，不覆盖既有会话数据。
 
 ## 执行与恢复
 
-接入使用常驻 Botmux runner，每条消息通过 stdin 交给原生 `mcode exec --output-format stream-json --input -`，保留多行文本，不把用户正文拼进 shell 或命令参数。mcode 仍可读写文件、执行 Shell、加载原生 Skills/插件，并执行 `botmux send`；网页终端展示流式文本和工具进度。
+接入使用常驻 Botmux runner，每条消息通过 ACP 的 `session/prompt` 交给原生 `mcode acp`，保留多行文本，不把用户正文拼进 shell 或命令参数。mcode 仍可读写文件、执行 Shell、加载原生 Skills/插件，并执行 `botmux send`；网页终端展示流式文本和工具进度。ACP v1 通过双向 NDJSON 通信，无新增 SDK 依赖。
 
-第一轮从原生事件取得 Session ID，后续轮次和重启后的第一轮均指定 `--session <id>`。不使用 `--continue`，避免同目录多个话题串线。缺失精确 ID 时启动新会话并沿用 Botmux 的恢复失败提示。仅收到成功 `exec.completed` 且子进程正常退出后交付最终回复；非零退出、协议不完整和超时均报告失败。Ctrl+C 中断当前任务；runner 退出会回收其原生进程组。会话关闭卡中的 `mcode --session <id>` 可在原数据目录下进入 TUI。
+第一轮从 `session/new` 取得原生 Session ID，后续轮次和重启后的第一轮均按精确 ID 调用 `session/resume`（不支持时使用 `session/load` 并忽略历史回放）。不使用最新会话查找，避免同目录多个话题串线。缺失精确 ID 时启动新会话并沿用 Botmux 的恢复失败提示。协议不完整、提前退出、恢复身份不匹配和超时均报告失败。Ctrl+C 中断当前任务并取消待答卡片；runner 退出会终止其原生进程组。会话关闭卡中的 `mcode --session <id>` 仍可在原数据目录下进入 TUI。
 
-默认使用 `--permission full`，`disableCliBypass: true` 时使用原生 `smart` 策略。mcode headless 无法处理需人工确认的权限面板或问卷；遇到这类请求会明确失败，用户可进入 TUI/ACP 处理后继续。`reasoningEffort` 转为原生 `--effort`，是否支持由目标模型原生校验。当前 exec 入口不支持 Botmux 的会话 fork，明确拒绝此操作。
+默认权限对应 ACP 的 `bypassPermissions`，`disableCliBypass: true` 时对应原生 `auto`（与原 exec 的 `full` / `smart` 一致）。模型和思考等级通过原生 `session/set_config_option` 配置，只接受 CLI 实际提供的选项，不支持时明确失败。Botmux 会话 fork 仍明确拒绝。
+
+### 原生提问选择卡
+
+mcode 调用原生 `ask_user` 工具时，ACP 发出 `elicitation/create` 表单请求；runner 将其转换成现有 Botmux Ask 服务的问题，显示飞书选择卡。用户提交后按原始选项 ID 返回 ACP 响应，原生会话接着执行。纯选择题可批量展示；自由文本按字段分别收集；原生 Other 字段仅在选择 Other 时追问。单个允许 Other 的选择题也接受直接文字回复，多题文字不会被猜测分配到每个字段。可选项允许明确跳过。推荐项不会自动作答。
+
+原生 `session/request_permission` 也通过 Ask 服务收集显式权限选择。沿用现有会话归属、当轮 capability、点击权限和取消机制，不增加公共 Markdown 解析，也不改变其他 CLI 的提问路径。正文里的普通编号列表仍是普通文本；`botmux ask` 保留为模型主动调用的方式。
+
+支持范围是原生问卷的字符串、单选、多选及对应 Other 字段；URL、数值或带额外校验约束的表单明确拒绝，避免漏题或返回伪造答案。用户等待时间不消耗模型执行超时预算，Ask 仍有自己的截止时间。
+
+mcode 0.6.5 实测会在问卷作答时提前结束原来的 ACP prompt，答案的续跑仍在运行。Botmux 用只读原生 SQLite 按问卷请求 ID 关联续跑轮次，等实际完成再交付最终回复；数据库不可读、问卷失效、续跑失败或中断都不会被当成成功。一次用户回复内的原轮次与问卷续跑用量合并显示为「本轮」，累计和当前上下文仍读取该原生会话。
+
+![mcode ACP 选择卡示意](assets/minimax-acp-ask-card.png)
+
+示意图来自真实 ACP 问卷转换后的卡片 JSON，不代表飞书客户端截图。Linux 上已用真实账号在 PTY、tmux 和文件沙盒 PTY 下验证原生提问、通过实际 Ask broker 的受控客户端提交第二选项、拒绝未授权提交、答案后续跑、精确会话恢复，以及模型／思考等级／上下文／用量读取；PTY 下等待问卷时中断并重新恢复同一会话也已通过。文件沙盒下真实账号的 Shell 写入与读取已通过。客户端点击体验仍需在飞书话题中实测。
 
 runner 忽略坏帧及非协议输入，后续合法消息仍可执行。输入缓冲区超过 `4 * 1024 * 1024` 字符时报告错误并关闭 runner；SIGTERM 也会关闭 runner，两者均清空待执行队列并中断当前原生进程，不发送成功 final。
+
+对话卡片的用量栏按精确原生 Session ID，只读查询当前账号数据目录下的 `v2/sqlite/runtime-state.sqlite`，一次读取中的上下文、本轮和累计用量使用同一个数据库快照。上下文使用原生 `context_usage` 的当前占用和窗口上限，累计输入包含新输入、缓存读取和缓存写入；二者分别展示，压缩后的上下文不会被累计输入替代。模型和思考等级取该会话的原生请求记录，模型还可从原生用量记录补充；恢复后的会话沿用同一读取方式。缺少原生记录时不推测上下文或思考等级。卡片显示仍遵循机器人的用量显示配置，不读取登录凭证。
+
+卡片示意（使用原生用量读取结果生成的卡片 JSON 渲染，实际样式以飞书为准）：
+
+![MiniMax 原生上下文、累计用量、模型及思考等级](assets/minimax-native-usage-card.png)
 
 本次升级影响 `minimax` 的 PTY/tmux 普通话题和恢复会话，并增加 runner 的编译态入口；其余 CLI 的参数与输入方式不变。MiniMax TTS/语音配置不受影响。
 
@@ -50,11 +72,13 @@ runner 忽略坏帧及非协议输入，后续合法消息仍可执行。输入�
 ## 验证
 
 ```bash
+bun run test -- test/mcode-acp.test.ts test/minimax-user-input.test.ts test/minimax-acp-continuation.test.ts test/minimax-usage.test.ts test/sandbox.test.ts test/fs-policy.test.ts
 bun x vitest run --project unit test/minimax-runner.test.ts test/cli-adapters.test.ts test/cli-runner-compiled-entries.test.ts test/cli-id-roster-derivation.test.ts test/ipc-constrained-invocation.test.ts test/worker-app-runner-control-wiring.test.ts test/worker-pipe-initial-screen-order.test.ts test/runner-control-channel.test.ts test/constrained-invocation.test.ts test/model-only-print.test.ts
 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
 BOTMUX_MCODE_SANDBOX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
 BOTMUX_MCODE_TMUX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun run test:e2e -- test/minimax-tmux.e2e.ts
 bun run test -- test/pty-reader-compat.test.ts
+bun run test -- test/minimax-usage.test.ts
 bun run build
 ```
 

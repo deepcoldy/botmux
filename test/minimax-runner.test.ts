@@ -42,7 +42,7 @@ async function waitFor(check: () => boolean) {
 }
 function runner(extra: string[] = [], hiddenEntry = false) {
   const f = fixture();
-  const child = spawnTsScript(resolve('src/minimax-runner.ts'), [...(hiddenEntry ? ['__minimax-runner'] : []), '--mcode-bin', f.executable, '--cwd', f.root, ...extra],
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), [...(hiddenEntry ? ['__minimax-runner'] : []), '--mcode-bin', f.executable, '--cwd', f.root, '--transport', 'exec', ...extra],
     { env: { ...process.env, MCODE_TEST_LOG: f.log, BOTMUX_OWNER_OPEN_ID: 'ou_owner', __OWNER_OPEN_ID: 'ou_stale' } }) as ChildProcessWithoutNullStreams;
   children.push(child);
   const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(r => child.once('close', (code, signal) => r({ code, signal })));

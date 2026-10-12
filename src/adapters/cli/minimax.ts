@@ -1,5 +1,4 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
@@ -9,14 +8,8 @@ import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
 import { locateExecutable } from '../../utils/executable.js';
 import type { CliAdapter } from './types.js';
-
-/** MCode owns config.yaml, OAuth, SQLite and native sessions under this root.
- * Match the official CLI's override precedence; bind the entire persistent root. */
-export function minimaxDataDir(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.MINIMAX_DATA_DIR?.trim() || env.MAVIS_DATA_DIR?.trim();
-  if (configured) return configured.startsWith('~/') ? join(homedir(), configured.slice(2)) : resolve(configured);
-  return join(homedir(), '.minimax');
-}
+import { minimaxDataDir } from '../../services/minimax-paths.js';
+export { minimaxDataDir } from '../../services/minimax-paths.js';
 
 function runnerPath(): string {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -60,10 +53,10 @@ function prepareNativeDirectories(dataDir: string, officialRoot?: string): void 
 }
 
 /** Keep the stable minimax ID/setup number, replacing mmx completely.
- * A long-lived runner drives native `mcode exec` per turn. Native Session IDs
- * from stream-json are persisted through the runner control channel; every
+ * A long-lived runner drives native `mcode acp` per turn. Native Session IDs
+ * from ACP are persisted through the runner control channel; every
  * later turn uses --session, never the shared/racy --continue shortcut.
- * Headless execution preserves file/shell tools and native skills/plugins. */
+ * ACP preserves file/shell tools and bridges native questions to Lark. */
 export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'mcode';
   let cachedBin: string | undefined;
