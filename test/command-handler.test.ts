@@ -9014,6 +9014,24 @@ describe('Codex App /effort command', () => {
     expect(killWorker).not.toHaveBeenCalled();
   });
 
+  it.each(['step_model_switching_disabled', 'target_unavailable'] as const)('explains future-only updates caused by %s', async reason => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status: 'future_only', reason });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t(`cmd.effort.${reason}`, { effort: 'high' }), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+  });
+
+  it.each([{ choices: [] }, { choices: undefined }])('omits the choices label when no levels are advertised ($choices)', async ({ choices }) => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status: 'invalid', choices });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t('cmd.effort.invalid_without_choices'), undefined, LARK_APP_ID, 'msg_001');
+  });
+
   it.each(['/effort', '/effort invalid', '/effort high extra'])('shows usage for %s', async text => {
     const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
     await handleCommand('/effort', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);

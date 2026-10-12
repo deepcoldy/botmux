@@ -11502,12 +11502,16 @@ async function handleTrustedCodexAppMarker(
   if (kind === 'effort_result' && lastInitConfig?.cliId === 'codex-app') {
     if (typeof payload.requestId !== 'string'
       || !['applied', 'future_only', 'invalid', 'unavailable', 'error'].includes(String(payload.status))
+      || (payload.reason !== undefined
+        && (payload.status !== 'future_only'
+          || !['step_model_switching_disabled', 'target_unavailable'].includes(String(payload.reason))))
       || (payload.choices !== undefined && (!Array.isArray(payload.choices)
         || !payload.choices.every(choice => typeof choice === 'string')))) return false;
     send({
       type: 'codex_app_effort_result', requestId: payload.requestId,
       status: payload.status as import('./types.js').CodexAppEffortResult['status'],
       ...(payload.choices ? { choices: payload.choices as string[] } : {}),
+      ...(payload.reason ? { reason: payload.reason as import('./types.js').CodexAppEffortResult['reason'] } : {}),
     });
     return true;
   }

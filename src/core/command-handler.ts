@@ -1769,7 +1769,11 @@ export async function handleCommand(
           break;
         }
         const result = await updateCodexAppEffort(ds, effort);
-        await sessionReply(rootId, t(`cmd.effort.${result.status}`, {
+        const replyKey = result.status === 'future_only' && result.reason
+          ? `cmd.effort.${result.reason}`
+          : result.status === 'invalid' && !result.choices?.length
+            ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
+        await sessionReply(rootId, t(replyKey, {
           effort, choices: result.choices?.join(', ') ?? '',
         }, loc));
         break;

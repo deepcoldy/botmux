@@ -1747,6 +1747,7 @@ export interface PendingRepoSetup {
 export interface CodexAppEffortResult {
   status: 'applied' | 'future_only' | 'invalid' | 'unavailable' | 'error';
   choices?: string[];
+  reason?: 'step_model_switching_disabled' | 'target_unavailable';
 }
 
 /** Messages sent from Daemon to Worker */

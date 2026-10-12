@@ -9850,7 +9850,7 @@ export function updateCodexAppEffort(
   timeoutMs = 35_000,
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
-  if ((ds.initConfig?.cliId ?? ds.session.cliId) !== 'codex-app'
+  if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex-app'
     || !worker || worker.killed || !ds.workerReady || !ds.cliReady
     || ds.session.status !== 'active' || isSessionTransferring(ds)
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) {

@@ -431,20 +431,29 @@ function handle(request) {
       respond(request.id, { data: [], nextCursor: 'next-model-page' });
       return;
     }
-    respond(request.id, { data: [{ model: 'gpt-6-astra', supportedReasoningEfforts:
-      (behavior === 'effort-invalid' ? ['low', 'medium'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+    if (behavior === 'effort-paginated' && request.params.cursor === 'next-model-page') {
+      respond(request.id, { data: [{ model: 'other-model' }], nextCursor: 'last-model-page' });
+      return;
+    }
+    respond(request.id, { data: [{ model: behavior === 'effort-model-missing' ? 'other-model' : 'gpt-6-astra', supportedReasoningEfforts:
+      (behavior === 'effort-empty-choices' ? [] : behavior === 'effort-invalid' ? ['low', 'medium'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
         .map(reasoningEffort => ({ reasoningEffort })) }], nextCursor: null });
     return;
   }
   if (request.method === 'thread/settings/update') {
     if (behavior === 'effort-unsupported') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-thread-rejected') reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
     else respond(request.id, {});
     return;
   }
   if (request.method === 'turn/settings/update') {
     if (behavior === 'effort-partial') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-feature-disabled' || behavior === 'effort-feature-disabled-complete') {
+      reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    } else if (behavior === 'effort-rejected') reject(request.id, -32600, 'another invalid request');
+    else if (behavior === 'effort-serial') setTimeout(() => respond(request.id, { status: 'applied' }), 100);
     else respond(request.id, { status: behavior === 'effort-race' ? 'targetUnavailable' : 'applied' });
-    if (behavior === 'effort-complete' && activeTurn) {
+    if ((behavior === 'effort-complete' || behavior === 'effort-feature-disabled-complete') && activeTurn) {
       const turn = activeTurn;
       activeTurn = undefined;
       setTimeout(() => emitTurnCompletion(turn.threadId, turn.turnId, turn.outputSchema), 100);

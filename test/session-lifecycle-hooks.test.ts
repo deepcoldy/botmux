@@ -669,6 +669,30 @@ describe('Codex App effort IPC', () => {
     }
   });
 
+  it.each(['codex-app', 'codex'] as const)('uses the frozen %s CLI before session and init config', async cliId => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true });
+    ds.session.cliId = cliId === 'codex-app' ? 'codex' : 'codex-app';
+    ds.initConfig = { cliId: ds.session.cliId } as NonNullable<DaemonSession['initConfig']>;
+    ds.session.cliLaunchSnapshot = {
+      version: 1, state: 'pending', entryId: cliId, cliId, cliRuntime: null,
+      cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null,
+      launchShell: null, startupCommands: [],
+    };
+    const pending = updateCodexAppEffort(ds, 'high');
+    if (cliId === 'codex-app') {
+      const request = worker.send.mock.calls[0][0];
+      worker.emit('message', {
+        type: 'codex_app_effort_result', requestId: request.requestId,
+        status: 'future_only', reason: 'step_model_switching_disabled',
+      });
+      expect(await pending).toMatchObject({ status: 'future_only', reason: 'step_model_switching_disabled' });
+    } else {
+      expect(await pending).toEqual({ status: 'unavailable' });
+      expect(worker.send).not.toHaveBeenCalled();
+    }
+  });
+
   it('rejects unready and ordinary CLI sessions before sending', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, workerReady: true, cliReady: true });

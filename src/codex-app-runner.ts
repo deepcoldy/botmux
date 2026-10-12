@@ -2526,6 +2526,7 @@ async function updateReasoningEffort(
     });
     saved = true;
     let status = 'future_only';
+    let reason: import('./types.js').CodexAppEffortResult['reason'];
     // Capture the native id on command arrival. Never retarget a later turn
     // when the original completes while model/list or settings/update waits.
     if (targetTurnId) {
@@ -2533,12 +2534,20 @@ async function updateReasoningEffort(
         timeoutMs: Math.min(10_000, deadline - Date.now()),
       });
       if (result.status === 'applied') status = 'applied';
-      else if (result.status !== 'targetUnavailable') throw new Error('unknown settings status');
+      else if (result.status === 'targetUnavailable') reason = 'target_unavailable';
+      else throw new Error('unknown settings status');
     }
-    emitMarker('effort_result', { requestId, status });
-  } catch {
+    emitMarker('effort_result', { requestId, status, ...(reason ? { reason } : {}) });
+  } catch (error) {
+    // Only the specific turn-settings gate proves the feature is disabled.
+    const featureDisabled = saved && error instanceof AppServerRpcError
+      && error.method === 'turn/settings/update' && error.code === -32600
+      && error.message.includes('turn settings updates require the step_model_switching feature');
     // An ambiguous settings response never cancels/replays the business turn.
-    emitMarker('effort_result', { requestId, status: saved ? 'future_only' : 'error' });
+    emitMarker('effort_result', {
+      requestId, status: saved ? 'future_only' : 'error',
+      ...(featureDisabled ? { reason: 'step_model_switching_disabled' } : {}),
+    });
   }
 }
 

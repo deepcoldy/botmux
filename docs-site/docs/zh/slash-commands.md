@@ -139,9 +139,24 @@ botmux tabs add "https://example.com/project/releases/2026" \
 
 CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会话时可传 `--session-id`，要覆盖目标群可传 `--chat-id`。`add` 按 URL 幂等：同一个页面已有 Tab 时复用，并按需更新名称，适用于 MR、项目看板、发布页等自动化场景。后台还可使用 `botmux tabs list|update|remove|sort`。
 
+## Codex App 会话内调整推理强度
+
+已有 Codex App 会话可发送 `/effort low|medium|high|xhigh|max|ultra`，档位按当前模型通告的信息校验。命令保存后续轮次的设置，不会追加模型消息或中断任务。
+
+**更新正在运行的当前轮需要显式启用 Codex 实验特性 `step_model_switching`。** 在已核对的 Codex 0.160 / 0.162.1 中，该特性为 UnderDevelopment，默认关闭，Botmux 不自动开启。希望启用时，在该会话 app-server 实际使用的 `CODEX_HOME/config.toml` 中合并以下配置，并在 app-server 下次启动后使用（已有 `[features]` 表时只添加或修改对应键）：
+
+```toml
+[features]
+step_model_switching = true
+```
+
+未开启时，运行中发送命令仍可保存后续轮次设置，并明确提示当前轮因未开特性而未更新；目标轮次已经结束或不可用时会给出不同提示。只有原生接口返回 `applied` 才确认服务端接受当前轮更新；已经发出的模型请求保持原参数，当前轮也可能没有后续推理步骤。
+
+普通 Codex CLI、Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
+
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex App 的 `/effort` 例外，见上文）。
 
 `/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
 
