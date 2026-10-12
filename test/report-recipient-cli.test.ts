@@ -8,7 +8,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import { composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
 import { createBinding, updateBinding } from '../src/services/issue-board-store.js';
+import type { Session } from '../src/types.js';
 
 const APP_ID = 'cli_report_worker';
 const REVIEWER = 'ou_report_reviewer';
@@ -41,6 +43,7 @@ async function runReport(options: {
   turnPlacement?: 'thread' | 'quote' | 'top-level';
   relayStatus?: number;
   relayBody?: Record<string, unknown>;
+  daemonLookup?: boolean;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'report-cli-'));
   roots.push(root);
@@ -67,11 +70,12 @@ async function runReport(options: {
       updatedAt: '2026-08-07T08:00:00.000Z',
     } } } : {}),
   };
-  seedPersistedSessionRows(data, APP_ID, {
+  const rows: Record<string, Record<string, unknown>> = {
     [source.sessionId]: { ...source, replyTargets: current.replyTargets, currentReplyTarget: current.currentReplyTarget, ...options.source },
     [current.sessionId]: { ...current, ...options.current },
     ...(options.ambiguous ? { duplicate: { ...source, sessionId: 'duplicate', creatorOpenId: 'ou_other_human' } } : {}),
-  });
+  };
+  seedPersistedSessionRows(data, APP_ID, rows);
   if (options.issueInReview) {
     // Use an already-settled local issue: the real report path must not call
     // the platform API just to retry its independent delivery notice.
@@ -95,7 +99,18 @@ async function runReport(options: {
     token: CAPABILITY, turnId: 'turn-report', dispatchAttempt: 2,
   }), { mode: 0o600 });
   const requests: Array<{ url?: string; body: Record<string, unknown> }> = [];
+  const lookups: string[] = [];
   const server = createServer(async (req, res) => {
+    const lookup = options.daemonLookup && req.method === 'GET'
+      ? /^\/api\/sessions\/([^/?]+)$/.exec(req.url ?? '') : null;
+    const row = lookup ? rows[decodeURIComponent(lookup[1])] : undefined;
+    if (row) {
+      // Answer like the daemon's by-id route: the dashboard projection, not the persisted row.
+      lookups.push(req.url!);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ session: composeRowFromPersistedActive(row as unknown as Session, { includeTokenUsage: false }) }));
+      return;
+    }
     // A read-only context probe is not a report submission.
     if (req.method !== 'POST') {
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -109,6 +124,14 @@ async function runReport(options: {
     res.end(JSON.stringify(options.relayBody ?? { error: 'dispatch_target_unavailable' }));
   });
   await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
+  if (options.daemonLookup) {
+    mkdirSync(join(home, '.botmux'));
+    writeFileSync(join(home, '.botmux', '.dashboard-secret'), 'report-cli-fixture', { mode: 0o600 });
+    mkdirSync(join(data, 'dashboard-daemons'));
+    writeFileSync(join(data, 'dashboard-daemons', `${APP_ID}.json`), JSON.stringify({
+      larkAppId: APP_ID, ipcPort: (server.address() as AddressInfo).port, pid: process.pid, lastHeartbeat: Date.now(),
+    }));
+  }
   if (options.turnPlacement) {
     const markers = join(data, '.botmux-cli-pids');
     mkdirSync(markers);
@@ -173,7 +196,7 @@ async function runReport(options: {
     const outputLine = result.stdout.split('\n').find(line => line.startsWith('{"success":'));
     return {
       topicReads: existsSync(topicReadsFile) ? JSON.parse(readFileSync(topicReadsFile, 'utf8')) as string[] : [],
-      ...result, output: outputLine ? JSON.parse(outputLine) : undefined, requests,
+      ...result, output: outputLine ? JSON.parse(outputLine) : undefined, requests, lookups,
       outbound: existsSync(captureFile) ? JSON.parse(readFileSync(captureFile, 'utf8')) : undefined,
     };
   } finally {
@@ -214,6 +237,21 @@ describe('report CLI recipient root and authenticated relay', () => {
 
   it('keeps the session creator without an explicit recipient root', async () => {
     expectRecipient(await runReport(), USER);
+  });
+
+  it('resolves the recipient root from the persisted row when the daemon answers the session lookup', async () => {
+    const result = await runReport({ recipientRoot: SEED, daemonLookup: true });
+    expect(result.lookups).toContain('/api/sessions/current-thread');
+    expectRecipient(result, REVIEWER);
+    expect(result.output.recipient).toMatchObject({ source: 'recipient-root-chat-creator', sourceSessionId: 'source-chat' });
+    expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
+  });
+
+  it('keeps the persisted creator ahead of owner and quote sender when the daemon answers the session lookup', async () => {
+    const result = await runReport({ chatScope: true, daemonLookup: true, source: { ownerOpenId: USER, quoteTargetSenderOpenId: USER } });
+    expect(result.lookups).toContain('/api/sessions/source-chat');
+    expectRecipient(result, REVIEWER);
+    expect(result.output.recipient.source).toBe('session-creator');
   });
 
   it('accepts an equals-form recipient root and inline content', async () => {

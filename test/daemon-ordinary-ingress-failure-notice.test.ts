@@ -1,4 +1,7 @@
-import { __testOnly_handleDocComment } from '../src/daemon.js';
+import {
+  __testOnly_durablePrimaryWorkerAdmission,
+  __testOnly_handleDocComment,
+} from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
 /**
  * 普通消息处理链终态失败的可行动提示（ingress failure notice）。
@@ -424,6 +427,102 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     await handleThreadReply(makeEventData('om_msg_4', 'all good'), makeCtx(anchor, 'om_msg_4'));
 
     expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('freezes a blocked primary reply for post-admission durable delivery', async () => {
+    const anchor = 'om_primary_blocked';
+    const ds = seedThreadSession(anchor, 'seeded');
+    const ctx = makeCtx(anchor, 'om_primary_turn');
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    const gate = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_turn',
+    );
+    expect(gate).toBeDefined();
+
+    gate!.options.onAdmissionBlocked?.({
+      content: 'Memory pressure is critical',
+      turnId: 'om_primary_turn',
+    });
+
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith({
+      target: { kind: 'reply', messageId: anchor, replyInThread: true },
+      content: 'Memory pressure is critical',
+      msgType: 'text',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+      hookContext: {
+        sessionId: ds.session.sessionId,
+        turnId: 'om_primary_turn',
+      },
+    });
+
+    gate!.options.marginalReclaimScheduled = true;
+    gate!.markForkReturned();
+    let settled = false;
+    const waiting = gate!.waitIfMarginal().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    gate!.options.onAdmission?.('rejected');
+    await waiting;
+    expect(settled).toBe(true);
+
+    const deferredAgain = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_turn',
+    )!;
+    deferredAgain.options.marginalReclaimScheduled = true;
+    deferredAgain.markForkReturned();
+    deferredAgain.options.onAdmission?.('deferred');
+    await expect(deferredAgain.waitIfMarginal()).resolves.toBeUndefined();
+  });
+
+  it('keeps the primary gate attached to marginal admission through the initial fork', async () => {
+    const anchor = 'om_primary_marginal_initial';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.pendingPrompt = 'start after reclaim';
+    ds.pendingTurnId = 'om_primary_marginal_turn';
+    const ctx = makeCtx(anchor, 'om_primary_marginal_turn');
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    const gate = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_marginal_turn',
+    )!;
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    let forkOptions: any;
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: unknown, _turn: unknown, options: any) => {
+      forkOptions = options;
+      options.marginalReclaimScheduled = true;
+      return true;
+    });
+
+    expect(forkReservedInitialSession(ds, [], trustedCaller, gate.options)).toBe(true);
+    gate.markForkReturned();
+    let settled = false;
+    const waiting = gate.waitIfMarginal().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    forkOptions.onAdmissionBlocked({
+      content: 'Memory pressure is critical',
+      turnId: 'om_primary_marginal_turn',
+    });
+    forkOptions.onAdmission('rejected');
+    await waiting;
+
+    expect(settled).toBe(true);
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'Memory pressure is critical',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+    }));
   });
 
   it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {
@@ -2373,6 +2472,44 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(repliedText()).not.toContain(resendNotice());
     expect(repliedText()).not.toContain(chooseRepoNotice());
     expect(messageQueue.readUnread(anchor).length).toBe(1);
+  });
+
+  it('keeps the real new-topic handler pending until marginal admission reaches a terminal decision', async () => {
+    const anchor = 'om_primary_marginal_handler';
+    const ctx = makeCtx(anchor, anchor);
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    let forkOptions: any;
+    mocks.forkWorker.mockImplementationOnce((ds: any, _input: unknown, _turn: unknown, options: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      forkOptions = options;
+      options.marginalReclaimScheduled = true;
+      options.onAdmission?.('deferred');
+      return true;
+    });
+
+    let resolved = false;
+    const handling = handleNewTopic(
+      makeEventData(anchor, 'start after marginal reclaim'),
+      ctx,
+    ).then(() => { resolved = true; });
+    await vi.waitFor(() => expect(forkOptions).toBeDefined());
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
+
+    forkOptions.onAdmissionBlocked({
+      content: 'Memory pressure is critical',
+      turnId: anchor,
+    });
+    forkOptions.onAdmission('rejected');
+    await handling;
+
+    expect(resolved).toBe(true);
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'Memory pressure is critical',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+    }));
   });
 
   // 同一降级的另外两个发卡点。三处的 fallback 各自不同（raw passthrough 走

@@ -4,6 +4,7 @@ import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolve
 import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
 import type { AskOptionLayout } from '../../im/lark/ask-option-layout.js';
 import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
+import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 
 export type CliOption = {
@@ -23,6 +24,11 @@ export type CliOptionsState = {
   options: CliOption[];
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
+};
+
+export type ModelCapabilities = {
+  slug: string;
+  serviceTiers: string[];
 };
 
 /** Keep the browser payload contract tied to the daemon's canonical schema. */
@@ -74,6 +80,7 @@ export type BotDefaultsRow = {
   model?: string;
   modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
   turnTimeoutMs?: number;
@@ -177,6 +184,8 @@ export type BotDefaultsRow = {
   substituteMode?: BotSubstituteMode | null;
   feedback?: FeedbackPolicyLayer | null;
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
+  /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
+  noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   idleSuspendMinutes?: number | null;
@@ -302,14 +311,25 @@ export function mergeModelCandidates(
  */
 export async function fetchDetectedModels(
   key: string,
-): Promise<{ models: string[]; source: 'live' | 'static' } | null> {
+  botId?: string,
+): Promise<{ models: string[]; source: 'live' | 'static'; modelCapabilities?: ModelCapabilities[] } | null> {
   try {
-    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}`);
+    const botQuery = botId ? `&bot=${encodeURIComponent(botId)}` : '';
+    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}${botQuery}`);
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !body || !Array.isArray(body.models)) return null;
     const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
     const source: 'live' | 'static' = body.source === 'live' ? 'live' : 'static';
-    return { models, source };
+    const modelCapabilities = Array.isArray(body.modelCapabilities)
+      ? body.modelCapabilities.flatMap((item: unknown) => {
+          if (typeof item !== 'object' || item === null) return [];
+          const { slug, serviceTiers } = item as { slug?: unknown; serviceTiers?: unknown };
+          if (typeof slug !== 'string' || !Array.isArray(serviceTiers)) return [];
+          const tiers = serviceTiers.filter((tier): tier is string => typeof tier === 'string');
+          return [{ slug, serviceTiers: tiers }];
+        })
+      : undefined;
+    return { models, source, ...(modelCapabilities ? { modelCapabilities } : {}) };
   } catch {
     return null;
   }

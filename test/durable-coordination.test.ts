@@ -124,6 +124,10 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.enqueueInbox({
       eventId: 'event-1', partitionKey: 'chat-a', payload: { a: 9 }, visibleAt: 0, createdAt: 1,
     })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId: 'event-1', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'chat-a', payload: { b: 2, a: 1 }, visibleAt: 0, createdAt: 1,
+    })).toEqual({ kind: 'conflict' });
     await store.enqueueInbox({
       eventId: 'event-2', partitionKey: 'chat-a', payload: { n: 2 }, visibleAt: 0, createdAt: 2,
     });
@@ -155,12 +159,12 @@ describe('SQLite durable coordination contract', () => {
   it('isolates inbox lanes and lets an owner claim only its local partitions', async () => {
     const store = makeStore(() => 10);
     await store.enqueueInbox({
-      eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
-      partitionKey: 'session-a', payload: { type: 'message' }, visibleAt: 0, createdAt: 1,
+      eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-a', payload: { action: 'close' }, visibleAt: 0, createdAt: 1,
     });
     await store.enqueueInbox({
-      eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
-      partitionKey: 'session-a', payload: { action: 'close' }, visibleAt: 0, createdAt: 2,
+      eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      partitionKey: 'session-a', payload: { type: 'message' }, visibleAt: 0, createdAt: 2,
     });
     await store.enqueueInbox({
       eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
@@ -189,7 +193,9 @@ describe('SQLite durable coordination contract', () => {
       workerId: 'owner-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
       partitionKeys: ['session-a', 'session-a'], leaseDurationMs: 20,
     });
-    expect(controlA).toMatchObject({ event: { eventId: 'control-a' } });
+    expect(controlA).toMatchObject({
+      event: { eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL },
+    });
     await store.close();
   });
 
@@ -354,7 +360,6 @@ describe('SQLite durable coordination contract', () => {
     ).get()).toEqual({ schema_version: 3 });
     migrated.close();
   });
-
   it('retries claimed inbox work only after the requested visibility time', async () => {
     let now = 1;
     const store = makeStore(() => now);
@@ -641,6 +646,10 @@ describe('SQLite durable coordination contract', () => {
       payload: { action: 'close', expectedGeneration: 3 },
       createdAt: 1,
     } as const;
+    await expect(store.enqueueControlOperation({
+      lease,
+      operation: { ...operation, sessionKey: 'session-other' },
+    })).rejects.toThrow(/sessionKey must match the fencing lease/);
     expect(await store.enqueueControlOperation({ lease, operation })).toEqual({ kind: 'inserted' });
     expect(await store.enqueueControlOperation({
       lease, operation: { ...operation, createdAt: 99 },
@@ -659,6 +668,10 @@ describe('SQLite durable coordination contract', () => {
       attempt: { ownerId: 'worker-a', leaseEpoch: 1, attempt: 1 },
     });
     if (first.kind !== 'applied') throw new Error('expected first control attempt');
+    expect(await store.completeControlOperationAttempt({
+      attempt: { ...first.attempt, sessionKey: 'session-other' },
+      result: { closed: true },
+    })).toEqual({ kind: 'stale' });
     now = 3;
     expect(await store.retryControlOperationAttempt({
       attempt: first.attempt,
@@ -678,6 +691,10 @@ describe('SQLite durable coordination contract', () => {
       kind: 'applied', record: { state: 'attempting', attempts: 2 },
     });
     if (second.kind !== 'applied') throw new Error('expected second control attempt');
+    expect(await store.markControlOperationAmbiguous({
+      attempt: first.attempt,
+      error: 'old attempt must not mutate the new attempt',
+    })).toEqual({ kind: 'stale' });
     now = 5;
     expect(await store.completeControlOperationAttempt({
       attempt: second.attempt,
@@ -693,6 +710,58 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.beginControlOperationAttempt({
       lease, operationId: operation.operationId,
     })).toMatchObject({ kind: 'not_pending', record: { state: 'completed' } });
+    await store.close();
+  });
+
+  it('rejects stale begin tokens and freezes the same owner after its lease epoch changes', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const firstLease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-same-owner', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:pending-stale-lease',
+        sessionKey: 'session-same-owner',
+        payload: { action: 'close' },
+        createdAt: 1,
+      },
+    });
+    await store.enqueueControlOperation({
+      lease: firstLease,
+      operation: {
+        operationId: 'control:same-owner-new-epoch',
+        sessionKey: 'session-same-owner',
+        payload: { action: 'resume' },
+        createdAt: 1,
+      },
+    });
+    expect(await store.beginControlOperationAttempt({
+      lease: firstLease,
+      operationId: 'control:same-owner-new-epoch',
+    })).toMatchObject({ kind: 'applied', attempt: { leaseEpoch: 1 } });
+
+    now = 11;
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-same-owner', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    expect(takeover.epoch).toBe(2);
+    expect(await store.beginControlOperationAttempt({
+      lease: firstLease,
+      operationId: 'control:pending-stale-lease',
+    })).toEqual({ kind: 'stale_lease' });
+    expect(await store.beginControlOperationAttempt({
+      lease: takeover,
+      operationId: 'control:same-owner-new-epoch',
+    })).toMatchObject({
+      kind: 'not_pending',
+      record: {
+        state: 'ambiguous',
+        attempts: 1,
+        lastError: 'control attempt lost its session lease before result',
+      },
+    });
     await store.close();
   });
 
@@ -848,6 +917,16 @@ describe('SQLite durable coordination contract', () => {
         },
       },
     });
+    expect(await store.reconcileControlOperation({
+      lease: takeover,
+      operationId: 'control:reconcile-not-applied',
+      expectedAttempt: 1,
+      outcome: {
+        kind: 'completed',
+        result: { status: 'must-not-complete-pending' },
+        evidence: { source: 'backend', terminal: true },
+      },
+    })).toEqual({ kind: 'stale' });
     expect(await store.completeControlOperationAttempt({
       attempt: notAppliedAttempt.attempt,
       result: { status: 'resumed' },

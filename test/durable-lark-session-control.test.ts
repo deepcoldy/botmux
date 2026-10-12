@@ -90,4 +90,18 @@ describe('durable Lark session control envelope', () => {
     }))).toThrow(/invalid envelope/);
     expect(event.lane).toBe(DURABLE_INBOX_LANE_SESSION_CONTROL);
   });
+
+  it.each([
+    [{ operator: { open_id: 'on_operator' } }, /principal\/card identity/],
+    [{ context: { open_message_id: 'oc_card' } }, /principal\/card identity/],
+    [{ action: { value: { action: 'close', session_id: 'session-1', root_id: 'ou_root' } } }, /root identity/],
+  ])('rejects invalid operator/card/root identity prefixes', (patch, error) => {
+    expect(() => durableLarkSessionControlEvent({
+      larkAppId: 'cli_test',
+      eventId: durableLarkSessionControlEventId('cli_test', 'evt_control_1'),
+      partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+      data: { ...rawControl(), ...patch },
+      now: 10,
+    })).toThrow(error);
+  });
 });

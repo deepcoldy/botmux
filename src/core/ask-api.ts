@@ -27,6 +27,7 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  acknowledge?: boolean;
 }
 
 export type AskApiBodyError =
@@ -49,7 +50,8 @@ export type AskApiBodyError =
   | 'bad_multiSelect'
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
-  | 'bad_originKind';
+  | 'bad_originKind'
+  | 'bad_acknowledge';
 
 /** Validate the request body. Returns either the parsed body or an error code
  *  ready to be sent back as `{ ok: false, error }` with HTTP 400.
@@ -89,8 +91,18 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     if (typeof r.originKind !== 'string' || !r.originKind.trim() || r.originKind.length > 32) {
       return { error: 'bad_originKind' };
     }
+    // The `host_*` namespace ('host_explicit', 'host_cross_principal_*') is
+    // daemon-internal: those claimants are constructed in-process and the
+    // broker grants the label GC / handoff / persistence exemptions. An HTTP
+    // client must never mint one by typing it — it would collect the privileges
+    // without any daemon-owned record. Reject at the boundary.
+    if (r.originKind.startsWith('host_')) {
+      return { error: 'bad_originKind' };
+    }
     originKind = r.originKind;
   }
+
+  if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
 
   let questions: AskQuestion[];
 
@@ -130,6 +142,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
   };
   // Reject semantics this receiver did not parse instead of silently creating
   // a different kind of Ask. Identity claims remain on the raw body for the

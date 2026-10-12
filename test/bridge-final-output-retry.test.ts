@@ -17,6 +17,7 @@ import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { bindGroupContextDelivery, readGroupContextDeliveryBinding, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
+import MarkdownIt from 'markdown-it';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
@@ -335,6 +336,60 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
     },
   );
+
+  it.each((['bridge', 'local-turn', 'local-turn-headless'] as const).flatMap(kind =>
+    (['minimax', 'traex', 'codex', 'claude-code'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
+    const content = ['实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = cliId;
+    if (kind === 'bridge') ds.adoptedFrom = undefined;
+    const msg = { ...finalOutputMsg(), kind, content, userText: '查看进程状态' };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const card = JSON.parse(sessionReply.mock.calls[0][1]);
+    const markdown = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    const code = new MarkdownIt().parse(markdown, {}).find(token => token.type === 'fence')!;
+    expect(code.content).toBe('123 update\n└ 456 download\n');
+    expect(msg.content).toBe(content);
+  });
+
+  it('keeps valid Codex code and following prose unchanged', async () => {
+    const content = ['实际进程：', '```plain_text', '123 update', '```', '', '**请选择：**', '1. 保持下载'].join('\n');
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); ds.session.cliId = 'codex'; ds.adoptedFrom = undefined;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const card = JSON.parse(sessionReply.mock.calls[0][1]);
+    const markdown = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    const code = new MarkdownIt().parse(markdown, {}).find(token => token.type === 'fence')!;
+    expect(code.content).toBe('123 update\n');
+    expect(markdown).toContain('**请选择：**');
+  });
+
+  it('repairs reply display even when the frozen launch identity differs', async () => {
+    const content = ['实际进程：```plain_text', '123 update', '```', '', '**请选择：**'].join('\n');
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); ds.session.cliId = 'minimax'; ds.adoptedFrom = undefined;
+    ds.session.cliLaunchSnapshot = {
+      version: 1, state: 'resolved', entryId: 'fixture', cliId: 'codex', cliRuntime: null,
+      cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+    };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const card = JSON.parse(sessionReply.mock.calls[0][1]);
+    const markdown = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(new MarkdownIt().parse(markdown, {}).find(token => token.type === 'fence')!.content).toBe('123 update\n');
+    expect(markdown).toContain('**请选择：**');
+  });
 
   it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)('uploads an adopted session screenshot before delivering the %s card', async kind => {
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');

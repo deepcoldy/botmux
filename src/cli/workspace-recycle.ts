@@ -15,6 +15,8 @@ exact targets while the directory exists. finish requires a successful generic
 reclamation event AND a missing old directory. A failed event closes nothing.
 The optional hook consumes botmux.workspace-recycle.v1 JSON from a generic
 lifecycle adapter; Botmux must be installed outside the reclaimed directory.
+A failed after-reclaim event for an operation that was never prepared returns
+status not_prepared and closes nothing.
 JSON output; exit 0 = verified/prepared, 1 = partial/blocked, 2 = invalid input,
 3 = durable initiator handoff pending (poll status). No force/global-delete mode.`;
 
@@ -66,7 +68,11 @@ export async function runWorkspaceRecycleCommand(args: string[]): Promise<number
         result = await recycler.prepare(event.operationId, event.workspacePath, event.initiatorSessionId ?? initiator(event.workspacePath));
       } else if (event.phase === 'after-reclaim') {
         if (typeof event.eventId !== 'string' || !['succeeded', 'failed'].includes(event.outcome)) throw new Error('invalid_hook_outcome');
-        result = await recycler.finish(event.operationId, { eventId: event.eventId, outcome: event.outcome });
+        // A lifecycle can report a failed reclaim whose before event never prepared
+        // (it failed earlier, or prepare itself was refused): nothing to abort.
+        result = event.outcome === 'failed' && !recycler.hasOperation(event.operationId)
+          ? { ok: true, status: 'not_prepared', operationId: event.operationId }
+          : await recycler.finish(event.operationId, { eventId: event.eventId, outcome: event.outcome });
       } else throw new Error('invalid_hook_phase');
     }
     console.log(JSON.stringify(result, null, 2));

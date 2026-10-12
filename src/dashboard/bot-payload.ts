@@ -9,6 +9,7 @@ import { normalizeSparseReplyStyleConfig } from './reply-style.js';
 import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
 import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
+import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
 
 export interface DashboardBotDescriptor {
@@ -27,6 +28,7 @@ export interface DashboardBotDescriptor {
   model?: string;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
   turnTimeoutMs?: number;
@@ -91,6 +93,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
+    ...(bot.serviceTier ? { serviceTier: bot.serviceTier } : {}),
     ...(bot.nativeSubagentRuntime ? { nativeSubagentRuntime: bot.nativeSubagentRuntime } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
@@ -192,6 +195,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
+    noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,

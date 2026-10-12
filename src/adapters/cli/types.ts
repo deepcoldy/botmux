@@ -1,5 +1,7 @@
 import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import type { CodexServiceTier } from '../../services/codex-service-tier.js';
+import type { DebugModelCapabilities } from './model-catalog-json.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -188,10 +190,14 @@ export interface CliAdapter {
     noTransport?: boolean;
     /** Trigger-user CLI auth is enabled for this bot. injectsSessionContext
      *  adapters forward it so the credential-boundary block is added to the
-     *  system prompt: the session acts with ONE person's credentials while the
-     *  on-disk store holds everyone else's, and nothing in the OS currently
-     *  stops an agent from reading those files. Off → no extra prompt text. */
+     *  system prompt: the governed tools act with ONE person's credentials
+     *  while the on-disk store holds everyone else's. A managed lark-cli is
+     *  excluded from this claim and described separately by larkToolAppId. */
     triggerUserAuth?: TriggerUserAuthConfig;
+    /** Current session's managed lark-cli app id. Injecting adapters use this
+     *  to state that lark-cli defaults to the bot even when other tools keep
+     *  per-turn initiator credentials. */
+    larkToolAppId?: string;
     /** Env the CLI must forward to the SHELL COMMANDS it runs, not merely hold
      *  itself. Codex does not pass its own environment to shell subprocesses,
      *  so the trigger-user wrapper vars (BOTMUX_IDENTITY_BIN / ZDOTDIR /
@@ -231,6 +237,8 @@ export interface CliAdapter {
      *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Codex-only thread service tier. Missing inherits the executor's config. */
+    serviceTier?: CodexServiceTier;
     /** Optional TraeX process-scoped backend variant. Missing means inherit
      * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
     modelBackendVariant?: 'standard' | 'max';
@@ -607,9 +615,8 @@ export interface CliAdapter {
    *  ~45-51s, into a composer that may not be mounted yet.
    *
    *  Deliberately NOT derived from `deferFirstPromptTimeoutUntilReady` +
-   *  readyPattern: grok carries both flags, and moving its fallback from 45s to
-   *  90s would delay every first prompt by ~45s whenever its SessionStart signal
-   *  is missing. undefined/false → the shared 45s fallback, unchanged. */
+   *  readyPattern: the other adapters carrying both of those (Hermes, Grok)
+   *  do not arm the gate at all. undefined/false → the shared 45s fallback, unchanged. */
   readonly readyGateFallbackAlignedWithHardCap?: boolean;
 
   /** CLI-specific system hints injected into the initial prompt.
@@ -648,6 +655,12 @@ export interface CliAdapter {
    *  Durable meeting delivery is fail-closed for adapters without this
    *  capability; `queued` and `final_output` are not completion receipts. */
   readonly reliableTurnTerminal?: boolean;
+
+  /** Whether the CLI supports the Program Status Protocol (OSC 7501).
+   *  When true, the worker mounts a ProgramStatusFramingStream on the PTY stream
+   *  to handle the \x1b]7501;?\x1b\ handshake probe, strip 7501 control codes,
+   *  and observe authoritative program status events in IdleDetector. */
+  readonly supportsProgramStatus?: boolean;
 
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
@@ -736,6 +749,12 @@ export interface CliAdapter {
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
   readonly detectModels?: () => Promise<readonly string[] | null>;
+
+  /** Optional richer form of {@link detectModels}. Adapters that already parse
+   *  a model catalogue should implement this and derive detectModels from it,
+   *  so one probe can serve both slug enumeration and per-model capabilities. */
+  readonly detectModelCapabilities?: (options?: { env?: NodeJS.ProcessEnv })
+    => Promise<readonly DebugModelCapabilities[] | null>;
 
   /** Claude-family CLIs only (claude-code, seed). The data root holding
    *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,

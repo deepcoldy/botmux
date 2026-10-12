@@ -17,13 +17,25 @@ interface CloseResult {
   ok: boolean;
   outcome?: 'closed' | 'closed_with_residual';
   alreadyClosed?: boolean;
-  residual?: unknown;
+  residual?: { reason?: string; taskId?: string };
   error?: string;
+  taskId?: string;
 }
 
 type ResumeResult =
   | { ok: true; ds: DaemonSession; recoveryPending?: true }
   | { ok: false; error: string; activeSessionId?: string };
+
+const TERMINAL_RESUME_REFUSALS = new Set([
+  'anchor_occupied',
+  'resume_start_failed',
+  'workspace_retired',
+  'deferred_unmaterialized',
+  'adopt_unsupported',
+  'not_found',
+  'not_closed',
+  'resume_cancelled',
+]);
 
 export interface DurableLarkSessionControlRuntimeOptions {
   larkAppId: string;
@@ -41,7 +53,9 @@ export interface DurableLarkSessionControlRuntimeOptions {
   resumeSession(sessionId: string): Promise<ResumeResult>;
   buildClosedCard(session: DaemonSession | Session): string;
   buildActiveCard(session: DaemonSession): string;
-  resumeRefusedText(error: string, activeSessionId?: string): string;
+  closeResidualText(residual: { reason?: string; taskId?: string }): string;
+  closeRefusedText(error: string, taskId?: string): string;
+  resumeRefusedText(error: string, activeSessionId?: string, sessionId?: string): string;
   now?: () => number;
 }
 
@@ -278,15 +292,21 @@ export function createDurableLarkSessionControlRuntime(
           if (control.action === 'close') {
             const closed = await options.closeSession(control.sessionId);
             if (closed.ok) {
+              const residual = closed.outcome === 'closed_with_residual'
+                ? closed.residual
+                : undefined;
               return {
                 kind: 'completed',
                 result: result(
                   'closed',
-                  closed.outcome === 'closed' ? closeCard : undefined,
+                  residual ? undefined : closeCard,
                   {
                     alreadyClosed: closed.alreadyClosed === true,
-                    ...(closed.outcome === 'closed_with_residual'
-                      ? { residual: closed.residual as DurableJson }
+                    ...(residual
+                      ? {
+                          residual: residual as DurableJson,
+                          noticeText: options.closeResidualText(residual),
+                        }
                       : {}),
                   },
                 ),
@@ -294,9 +314,15 @@ export function createDurableLarkSessionControlRuntime(
             }
             const after = observed();
             if (after) return { kind: 'completed', result: after.result };
+            const stillActive = options.findActiveSession(control.sessionId);
             return {
-              kind: 'ambiguous',
-              error: `close result requires reconciliation: ${closed.error ?? 'unknown'}`,
+              kind: 'completed',
+              result: result('active', stillActive ? options.buildActiveCard(stillActive) : undefined, {
+                applied: false,
+                error: closed.error ?? 'unknown',
+                ...(closed.taskId ? { taskId: closed.taskId } : {}),
+                noticeText: options.closeRefusedText(closed.error ?? 'unknown', closed.taskId),
+              }),
             };
           }
           const resumed = await options.resumeSession(control.sessionId);
@@ -318,7 +344,9 @@ export function createDurableLarkSessionControlRuntime(
               ),
             };
           }
-          if (resumed.error === 'anchor_occupied' || resumed.error === 'resume_start_failed') {
+          const after = observed();
+          if (after) return { kind: 'completed', result: after.result };
+          if (TERMINAL_RESUME_REFUSALS.has(resumed.error)) {
             const closed = options.getPersistedSession(control.sessionId);
             if (!closed || closed.status !== 'closed') {
               return {
@@ -331,12 +359,18 @@ export function createDurableLarkSessionControlRuntime(
               result: result('closed', resumeRollbackCard, {
                 applied: false,
                 error: resumed.error,
-                noticeText: options.resumeRefusedText(resumed.error, resumed.activeSessionId),
+                noticeText: options.resumeRefusedText(
+                  resumed.error,
+                  resumed.activeSessionId,
+                  control.sessionId,
+                ),
               }),
             };
           }
-          const after = observed(true);
-          if (after) return { kind: 'completed', result: after.result };
+          const reconciledAfterFailure = observed(true);
+          if (reconciledAfterFailure) {
+            return { kind: 'completed', result: reconciledAfterFailure.result };
+          }
           return {
             kind: 'ambiguous',
             error: `resume result requires reconciliation: ${resumed.error}`,
@@ -357,7 +391,9 @@ export function createDurableLarkSessionControlRuntime(
               || parsed.action !== control.action
               || parsed.sessionId !== control.sessionId
               || (status !== 'closed' && status !== 'active')
-              || (control.action === 'close' && status !== 'closed')
+              || (control.action === 'close'
+                && status !== 'closed'
+                && !(status === 'active' && parsed.applied === false))
               || (control.action === 'resume'
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))

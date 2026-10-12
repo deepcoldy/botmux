@@ -5,7 +5,13 @@ import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { store } from './store.js';
-import { updateResponseNeedsRestart } from './update-action.js';
+import {
+  updateResponseNeedsRestart,
+  pollUpdateStatus,
+  classifyOtherUpdate,
+  observedInstallCompleted,
+  binaryProgressText,
+} from './update-action.js';
 import { ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
@@ -285,6 +291,7 @@ function SettingsPage() {
   const tr = useT();
   const mountedRef = useRef(false);
   const timersRef = useRef<Set<number>>(new Set());
+  const updatePollStopRef = useRef<(() => void) | null>(null);
   const [settings, setSettings] = useState<DashboardSettings | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -391,6 +398,8 @@ function SettingsPage() {
     return () => {
       mountedRef.current = false;
       clearTimers();
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
     };
   }, [clearTimers, loadSettings]);
 
@@ -605,11 +614,58 @@ function SettingsPage() {
     if (!await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
     setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
+    const stopUpdatePoll = (): void => {
+      updatePollStopRef.current?.();
+      updatePollStopRef.current = null;
+    };
+    // Standalone-binary updates download a ~174MB asset; surface measured byte
+    // progress from /api/update/status while the long POST is in flight.
+    updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+      if (mountedRef.current && snap.binaryUpdate) {
+        setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+      }
+    }, 1000);
     try {
       const r = await fetch('/api/update/run', { method: 'POST' });
       const body = await r.json().catch(() => ({}));
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) { stopUpdatePoll(); return; }
       if (!r.ok || body.ok === false) {
+        // Another update (another dashboard tab, the CLI, or scheduled
+        // maintenance) owns the shared install lock. Track it via status rather
+        // than reporting a failure: the cross-process flag is invisible, so
+        // install completion is decided from version state. "Installed" does NOT
+        // reload the page — the winner may be sitting on its own restart
+        // confirmation, and a CLI update never restarts; surface the pending
+        // restart and let the existing restart flow apply it.
+        if (body?.error === 'update_in_flight') {
+          const startVersion = String(s.current);
+          stopUpdatePoll();
+          updatePollStopRef.current = pollUpdateStatus(fetch, snap => {
+            if (!mountedRef.current) return;
+            const kind = classifyOtherUpdate(snap);
+            if (observedInstallCompleted(snap, startVersion, false)) {
+              stopUpdatePoll();
+              setUpBusy(false);
+              setUpMsg({ text: tr('update.noRestartHint'), cls: 'hint-ok' });
+              void fetchStatus();
+              return;
+            }
+            if (kind === 'progress' && snap.binaryUpdate) {
+              setUpMsg({ text: binaryProgressText(snap.binaryUpdate, tr) });
+            } else {
+              setUpMsg({ text: tr(kind === 'busy' ? 'update.inProgressBusy' : 'update.inProgressExternal') });
+            }
+          }, 1000, 10 * 60_000, () => {
+            // Independent of status responses: persistent 503s, a dead
+            // network, or a hung request must still reach this terminal state.
+            if (!mountedRef.current) return;
+            updatePollStopRef.current = null;
+            setUpBusy(false);
+            setUpMsg({ text: tr('update.inProgressSlow'), cls: 'hint-warn-inline' });
+          });
+          return;
+        }
+        stopUpdatePoll();
         // Dirty worktree fails closed — surface the file list so the user can act.
         if (body?.error === 'dirty_worktree') {
           setUpBusy(false);
@@ -621,6 +677,7 @@ function SettingsPage() {
         setUpMsg({ text: tr('update.updateFailed', { detail }), cls: 'hint-warn-inline' });
         return;
       }
+      stopUpdatePoll();
       // A restart is needed when the server says so (local-dev build always
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
@@ -646,6 +703,7 @@ function SettingsPage() {
         await fetchStatus();
       }
     } catch (e) {
+      stopUpdatePoll();
       if (!mountedRef.current) return;
       setUpBusy(false);
       setUpMsg({ text: tr('update.updateFailed', { detail: e instanceof Error ? e.message : String(e) }), cls: 'hint-warn-inline' });

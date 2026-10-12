@@ -89,3 +89,4 @@ afterAll(() => {
   // shutdown; retry the disposable home tree if removal races that final write.
   rmSync(fileRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
+

@@ -100,8 +100,8 @@ describe('dsh-tui adapter', () => {
     // composer may not be mounted yet (a first run also shells out to
     // `dsh plugin add`), silently pre-empting the adapter's own 90s protection.
     // The alignment is this explicit opt-in — NOT a derivation from
-    // deferFirstPromptTimeoutUntilReady + readyPattern, which grok also carries
-    // while it must keep 45s (see ready-gate.test.ts).
+    // deferFirstPromptTimeoutUntilReady + readyPattern, which other adapters carry
+    // without arming the gate (see ready-gate.test.ts).
     expect(adapter.readyGateFallbackAlignedWithHardCap).toBe(true);
     expect(resolveReadySignalTimeoutMs({
       alignFallbackWithFirstPromptHardCap: adapter.readyGateFallbackAlignedWithHardCap === true,

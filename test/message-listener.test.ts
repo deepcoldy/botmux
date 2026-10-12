@@ -975,4 +975,36 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
     // Title recovered from the merged card is surfaced as an attribute too.
     expect(prompt).toContain('message_title="Argos 报警"');
   });
+
+  it('resolves <at id=...> tags when extracting listener interactive card text (P3-1)', () => {
+    const message = {
+      message_type: 'interactive',
+      content: JSON.stringify({
+        schema: '2.0',
+        body: {
+          elements: [
+            { tag: 'markdown', content: '<at id=ou_pure></at> 线上报警请关注' },
+          ],
+        },
+      }),
+      mentions: [
+        { key: '@_user_1', name: 'Pure(pi)', openId: 'ou_pure' },
+      ],
+    };
+    expect(extractListenerMessageText(message)).toBe('@Pure(pi) 线上报警请关注');
+
+    // And strips bare tags when mentions is absent / unmatched
+    const messageWithoutMention = {
+      message_type: 'interactive',
+      content: JSON.stringify({
+        schema: '2.0',
+        body: {
+          elements: [
+            { tag: 'markdown', content: '<at id=ou_deadbeef></at> 线上报警请关注' },
+          ],
+        },
+      }),
+    };
+    expect(extractListenerMessageText(messageWithoutMention)).toBe('线上报警请关注');
+  });
 });

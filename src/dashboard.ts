@@ -14,7 +14,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
-import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName } from './core/binary-self-update.js';
+import { currentUpdateStrategy, replaceStandaloneBinary, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
@@ -158,6 +158,7 @@ import {
 import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
+  selectionKeyForBot,
   isTtadkWrapper,
   ttadkAcceptsModel,
   TTADK_DEFAULT_MODEL,
@@ -232,7 +233,7 @@ import {
   writeManualIntentIfAbsent,
   writeRestartIntent,
 } from './services/restart-intent-store.js';
-import { withFileLock } from './utils/file-lock.js';
+import { withFileLock, FileLockTimeoutError } from './utils/file-lock.js';
 // Host children the dashboard forks (start/stop-bot, global install). They live
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
@@ -252,6 +253,7 @@ import {
   setPinStreamingCardForGroup,
   setDefaultModelsForGroup,
   setSerialInputForGroup,
+  setIdleCloseForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -294,6 +296,7 @@ import {
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -1914,6 +1917,15 @@ let updateInFlight = false;
 // update, and restart requests do not reuse the removed old runtime realpath.
 let lastSuccessfulUpdatePlan: GlobalInstallPlan | undefined;
 let pendingBinaryRestart: { target: string; version: string } | undefined;
+// Live progress of a standalone-binary download running in THIS dashboard
+// process (the ~174MB asset makes the run request long-lived). Surfaced via
+// /api/update/status for the UI poller; undefined outside a binary swap.
+let binaryUpdateProgress: {
+  version: string;
+  phase: BinaryUpdatePhase;
+  bytesReceived: number;
+  bytesTotal: number | null;
+} | undefined;
 
 // Local-dev counterpart: the checkout a successful /api/update/run built, and
 // its post-build HEAD. Pinned so the follow-up /api/update/restart applies THIS
@@ -2905,7 +2917,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2919,6 +2931,7 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       model: b.model,
       modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
+      serviceTier: b.serviceTier,
       nativeSubagentRuntime: b.nativeSubagentRuntime,
       turnTimeoutMs: b.turnTimeoutMs,
       dshRuntime: b.dshRuntime,
@@ -2967,6 +2980,7 @@ async function configuredBotDefaultsRecoveryRows(
           model: bot.model,
           modelBackendVariant: bot.modelBackendVariant,
           reasoningEffort: bot.reasoningEffort,
+          serviceTier: bot.serviceTier,
           nativeSubagentRuntime: bot.nativeSubagentRuntime,
           turnTimeoutMs: bot.turnTimeoutMs,
           dshRuntime: bot.dshRuntime,
@@ -2992,12 +3006,12 @@ async function configuredBotDefaultsRecoveryRows(
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant'] }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
+  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier'] }>,
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -3008,6 +3022,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     model: bot.model || fallback?.model,
     modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    serviceTier: bot.serviceTier || fallback?.serviceTier,
     nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
     dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
@@ -3234,7 +3249,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
-          defaultModels, serialInput, agentCliId, agentModel, agentReasoningEffort,
+          defaultModels, serialInput, idleClose, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3261,6 +3276,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           oncallChat: oncallChat ?? null,
           defaultModels: defaultModels ?? {},
           serialInput: serialInput === true,
+          idleClose,
           agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
@@ -4745,6 +4761,12 @@ const server = createServer(async (req, res) => {
           : installPlan ? formatGlobalInstallCommand(installPlan) : null,
         node: checkNode(),
         installs: detectBotmuxInstalls(),
+        // In-process only: a CLI/maintenance update in another process holds
+        // the same file lock but does not flip this flag. The UI treats a 409
+        // plus `updateInFlight === false` as a cross-process update with unknown
+        // progress rather than declaring success.
+        updateInFlight,
+        ...(binaryUpdateProgress ? { binaryUpdate: binaryUpdateProgress } : {}),
       });
     }
 
@@ -4789,7 +4811,7 @@ const server = createServer(async (req, res) => {
             result = await runLocalDevUpdate();
           }, { maxWaitMs: 2_000 });
         } catch (e) {
-          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
           const code = (e as { code?: string }).code;
           if (code === 'dirty_worktree') {
             return jsonRes(res, 409, {
@@ -4849,14 +4871,19 @@ const server = createServer(async (req, res) => {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            await replaceStandaloneBinary(newVersion, runStrategy.target);
+            await replaceStandaloneBinary(newVersion, runStrategy.target, {
+              onProgress: (progress) => {
+                binaryUpdateProgress = { version: newVersion, ...progress };
+              },
+            });
             pendingBinaryRestart = { target: runStrategy.target, version: newVersion };
           }, { maxWaitMs: 2_000 });
         } catch (e) {
-          if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+          if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
           return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
         } finally {
           updateInFlight = false;
+          binaryUpdateProgress = undefined;
         }
         if (blockedByRestart) return jsonRes(res, 409, { ok: false, error: 'restart_in_flight' });
         return jsonRes(res, 200, {
@@ -4915,7 +4942,7 @@ const server = createServer(async (req, res) => {
           await runGlobalInstall(installPlan);
         }, { maxWaitMs: 2_000 });
       } catch (e) {
-        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
       } finally {
         updateInFlight = false;
@@ -5032,7 +5059,11 @@ const server = createServer(async (req, res) => {
               return;
             }
           } else {
-            await replaceStandaloneBinary(targetVersion, binaryTarget!);
+            await replaceStandaloneBinary(targetVersion, binaryTarget!, {
+              onProgress: (progress) => {
+                binaryUpdateProgress = { version: targetVersion, ...progress };
+              },
+            });
             pendingBinaryRestart = { target: binaryTarget!, version: targetVersion };
           }
 
@@ -5108,7 +5139,7 @@ const server = createServer(async (req, res) => {
         if (leaseId && !clearRestartLeaseLocked(leaseId)) {
           logger.warn('[dashboard] rollback lease cleanup deferred because the update lock is busy');
         }
-        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        if (!acquired && error instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         if (!res.headersSent) {
           return jsonRes(res, 500, {
             ok: false,
@@ -5120,6 +5151,7 @@ const server = createServer(async (req, res) => {
         return;
       } finally {
         updateInFlight = false;
+        binaryUpdateProgress = undefined;
       }
     }
 
@@ -5222,7 +5254,7 @@ const server = createServer(async (req, res) => {
           shouldLaunch = true;
         }, { maxWaitMs: 2_000 });
       } catch (error) {
-        if (!acquired) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+        if (!acquired && error instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
         throw error;
       }
       // Spawn the detached driver after the lock is released. The lease guards
@@ -5639,7 +5671,37 @@ const server = createServer(async (req, res) => {
       if (!isKnownSelectionKey(key)) {
         return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
       }
-      const body = await buildModelChoicesResponse(key);
+      const appId = url.searchParams.get('bot')?.trim() || undefined;
+      let botConfig: BotConfig | undefined;
+      try {
+        botConfig = appId
+          ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId)
+          : undefined;
+      } catch {
+        botConfig = undefined;
+      }
+      const cliId = resolveCliSelection(key).cliId;
+      const runtimeApplies = botConfig
+        && selectionKeyForBot(botConfig.cliId, botConfig.wrapperCli, botConfig.cliLaunchMode) === key;
+      const cliPath = runtimeApplies
+        ? botConfig?.cliRuntime?.executable
+          ?? (botConfig?.cliRuntime ? undefined : botConfig?.cliPathOverride)
+        : undefined;
+      const body = await buildModelChoicesResponse(key, {
+        runtimeContext: botConfig && runtimeApplies
+          ? `${botConfig.larkAppId}:${cliId}:${cliPath ?? 'default'}`
+          : undefined,
+        probeEnv: botConfig && runtimeApplies
+          ? {
+              ...buildSessionChildEnv(process.env, botConfig.envPolicy),
+              ...botInjectedEnv(botConfig.env, botConfig.envPolicy),
+            }
+          : undefined,
+        adapterFactory: requestedCliId => createCliAdapterSync(
+          requestedCliId,
+          requestedCliId === cliId ? cliPath : undefined,
+        ),
+      });
       return jsonRes(res, 200, body);
     }
 
@@ -6984,6 +7046,18 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    let mIdleClose: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mIdleClose = url.pathname.match(/^\/api\/groups\/([^/]+)\/idle-close\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setIdleCloseForGroup(
+        decodeURIComponent(mIdleClose[1]), decodeURIComponent(mIdleClose[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
+    }
+
     let mSerialInput: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mSerialInput = url.pathname.match(/^\/api\/groups\/([^/]+)\/serial-input\/([^/]+)$/))) {
       let body: unknown;
@@ -7063,6 +7137,7 @@ const server = createServer(async (req, res) => {
               ? j.modelBackendVariant ?? undefined
               : d.modelBackendVariant,
             reasoningEffort: j.reasoningEffort || d.reasoningEffort,
+            serviceTier: j.serviceTier || d.serviceTier,
             nativeSubagentRuntime: Object.prototype.hasOwnProperty.call(j, 'nativeSubagentRuntime')
               ? j.nativeSubagentRuntime ?? undefined
               : d.nativeSubagentRuntime,
@@ -7971,6 +8046,25 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-max-live-workers`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/no-progress-notify — proxy to that bot's daemon.
+    // Body `{ noProgressNotify: { enabled?: boolean; timeoutMs?: number } | null }`
+    // (null = clear → enabled nudge at the built-in 90s window).
+    let mBotNoProgress: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotNoProgress = url.pathname.match(/^\/api\/bots\/([^/]+)\/no-progress-notify$/))) {
+      const appId = decodeURIComponent(mBotNoProgress[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-no-progress-notify`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

@@ -207,6 +207,7 @@ import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { InputCaptureTerminalRejection } from '../src/core/plugins/input-capture/runtime.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { resolve } from 'node:path';
 
@@ -1092,6 +1093,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime: ReturnType<typeof createLarkEventDispatcherRuntime>,
     data: ReturnType<typeof makeUserMessageEvent>,
     messageId: string,
+    queuePostAdmissionOutput?: (output: unknown) => void,
   ) => runtime.processDurableMessage({
     eventType: 'lark.im.message.receive_v1',
     eventId: `im.message.receive_v1:${MY_APP_ID}:${messageId}`,
@@ -1110,6 +1112,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts: 1,
     },
     signal: new AbortController().signal,
+    queuePostAdmissionOutput: queuePostAdmissionOutput ?? (() => undefined),
   });
 
   it('routes without opening WS and returns the admitted canonical Session', async () => {
@@ -1139,6 +1142,122 @@ describe('Lark event dispatcher — durable primary processor', () => {
       session: { sessionId: 'session-primary' },
     });
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
+  it('exposes the canonical post-admission output queue to the routed handler', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.queuePostAdmissionOutput({
+        target: { kind: 'reply', messageId: 'om_primary_output', replyInThread: true },
+        content: 'blocked',
+        providerUuid: 'primary_output',
+      });
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn(() => ({
+      sessionId: 'session-primary-output', chatId: 'chat-primary', rootMessageId: 'om_primary_output',
+      scope: 'thread', title: 'Primary output', status: 'active',
+      createdAt: '2026-10-06T00:00:00.000Z', larkAppId: MY_APP_ID,
+    }));
+    const queued = vi.fn();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA hello' }),
+      messageId: 'om_primary_output',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_output', queued))
+      .resolves.toMatchObject({ kind: 'admitted' });
+    expect(queued).toHaveBeenCalledWith({
+      target: { kind: 'reply', messageId: 'om_primary_output', replyInThread: true },
+      content: 'blocked',
+      providerUuid: 'primary_output',
+    });
+    runtime.close();
+  });
+
+  it('captures human input only after durable primary claims the event', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => true);
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary captured human input',
+    });
+    expect(handlers.captureHumanInput).toHaveBeenCalledOnce();
+    expect(handlers.captureHumanInput).toHaveBeenCalledWith(data);
+    expect(hasTriggeredMessage(MY_APP_ID, 'om_primary_capture')).toBe(true);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('retries the durable claim when captured-input persistence fails', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => {
+      throw new Error('capture store unavailable');
+    });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture_retry',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture_retry'))
+      .rejects.toThrow('capture store unavailable');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('settles a deterministic input-capture rejection without routing the message', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => {
+      throw new InputCaptureTerminalRejection('input_capture_authority_changed');
+    });
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'approved' }),
+      messageId: 'om_primary_capture_rejected',
+      rootId: 'om_primary_question',
+      threadId: 'omt_primary_question',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_capture_rejected')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary input capture rejected: input_capture_authority_changed',
+    });
+    expect(hasTriggeredMessage(MY_APP_ID, 'om_primary_capture_rejected')).toBe(true);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     runtime.close();
   });
 
@@ -1346,6 +1465,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
   it('awaits primary durable enqueue in the WS callback and bypasses the legacy route', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();
+    handlers.captureHumanInput = vi.fn(() => true);
     let release!: () => void;
     const persisted = new Promise<void>(resolve => { release = resolve; });
     const enqueuePrimary = vi.fn(() => persisted);
@@ -1375,6 +1495,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
       data,
     });
+    expect(handlers.captureHumanInput).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     release();
     await callback;

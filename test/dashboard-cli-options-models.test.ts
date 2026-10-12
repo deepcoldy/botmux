@@ -74,6 +74,21 @@ describe('GET /api/cli-options/models — 200 响应 shape', () => {
     expect(body.models).not.toContain('gpt-5.2');
   });
 
+  it('live 能力目录作为可选 modelCapabilities 字段追加，不替换旧三字段', async () => {
+    const body = await buildModelChoicesResponse('gemini', {
+      now: () => 1_700_000_000_002,
+      adapterFactory: () => ({
+        detectModelCapabilities: async () => [{ slug: 'gemini-live', serviceTiers: ['priority'] }],
+      } as any),
+    });
+    expect(body.modelCapabilities).toEqual([
+      { slug: 'gemini-live', serviceTiers: ['priority'] },
+    ]);
+    expect(body.source).toBe('live');
+    expect(body.detectedAt).toBe(1_700_000_000_002);
+    expect(body.models).toContain('gemini-live');
+  });
+
   it('未知 key 的响应构造也是 fail-soft（空 models + static），400 由路由在更外层拦截', async () => {
     // 注意：真实路由先经 isKnownSelectionKey 拦截返回 400，不会走到这里；
     // 这里验证 helper 自身对未知 key 不抛异常。
@@ -110,7 +125,17 @@ describe('dashboard.ts 路由接线（source-lock）', () => {
   it('200 分支走 buildModelChoicesResponse（静态+live 合并的单一事实源）', () => {
     const routeStart = source.indexOf("url.pathname === '/api/cli-options/models'");
     const routeBlock = source.slice(routeStart, routeStart + 1200);
-    expect(routeBlock).toContain('buildModelChoicesResponse(key)');
+    expect(routeBlock).toContain('buildModelChoicesResponse(key, {');
+  });
+
+  it('带 bot 参数时按该 Bot 的已保存 runtime/env 探测', () => {
+    const routeStart = source.indexOf("url.pathname === '/api/cli-options/models'");
+    const routeBlock = source.slice(routeStart, routeStart + 2000);
+    expect(routeBlock).toContain("url.searchParams.get('bot')");
+    expect(routeBlock).toContain('getBot(appId).config');
+    expect(routeBlock).toContain('buildSessionChildEnv(process.env, botConfig.envPolicy)');
+    expect(routeBlock).toContain('botInjectedEnv(botConfig.env, botConfig.envPolicy)');
+    expect(routeBlock).toContain('runtimeContext');
   });
 
   it('/api/cli-options 每个 option 带 modelChoices 字段（静态候选）', () => {

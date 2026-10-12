@@ -14,12 +14,70 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { bindGroupContextDelivery, confirmGroupContextDelivery, getDeliveredGroupContextSeqs, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import { DEFAULT_BRAND_LABEL } from '../src/im/lark/md-card.js';
+import MarkdownIt from 'markdown-it';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' };
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 
 describe('real CLI send into a running reply card', () => {
+  it.each<{ cliId: string; configuredCliId: string; frozenCliId?: string; mode?: 'legacy' | 'unified'; layout?: 'result' }>([
+    { cliId: 'minimax', configuredCliId: 'minimax' },
+    { cliId: 'codex', configuredCliId: 'codex' },
+    { cliId: 'traex', configuredCliId: 'traex' },
+    { cliId: 'claude-code', configuredCliId: 'claude-code' },
+    { cliId: 'codex', configuredCliId: 'codex', layout: 'result' },
+    { cliId: 'codex', configuredCliId: 'minimax' },
+    { cliId: 'minimax', configuredCliId: 'codex' },
+    { cliId: 'minimax', configuredCliId: 'minimax', frozenCliId: 'codex' },
+    { cliId: 'codex', configuredCliId: 'codex', frozenCliId: 'minimax' },
+    ...['minimax', 'traex', 'codex', 'claude-code'].map(cliId => ({ cliId, configuredCliId: cliId, mode: 'unified' as const })),
+  ])('repairs reply fences for $cliId (default $configuredCliId, launch $frozenCliId, mode $mode, layout $layout)', ({ cliId, configuredCliId, frozenCliId, mode = 'legacy', layout }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-reply-markdown-'));
+    const dataDir = join(root, 'data');
+    const content = [ ...(layout ? ['# 依赖检查完成', ''] : []), '实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '配置： ```JSON', '{\"workingDir\":\"/workspace\"}', '```', '', '执行： ```bash', 'echo ready', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
+    try {
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: configuredCliId, replyCardMode: mode,
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId, cliSessionId: 'native_reply',
+        larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+        ...(frozenCliId ? { cliLaunchSnapshot: {
+          version: 1, state: 'resolved', entryId: 'fixture', cliId: frozenCliId, cliRuntime: null,
+          cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+        } } : {}),
+      } });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', ...(layout ? ['--layout', layout] : []), content], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(requests).toHaveLength(1);
+      const card = JSON.parse(requests[0].body.content);
+      const markdown = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+      if (layout) {
+        expect(card.header.title.content).toBe('结果 · 依赖检查完成');
+        expect(markdown).not.toContain('# 依赖检查完成');
+      }
+      const code = new MarkdownIt().parse(markdown, {}).find(token => token.type === 'fence')!;
+      expect(code.content).toBe('123 update\n└ 456 download\n');
+      const blocks = new MarkdownIt().parse(markdown, {}).filter(token => token.type === 'fence');
+      expect(blocks.map(b => b.info.toLowerCase())).toEqual(['plain_text', 'json', 'bash']);
+      expect(blocks[2].content).toBe('echo ready\n');
+      expect(markdown).toContain('**请选择：**');
+      const store = openDatabaseSyncOrThrow(join(dataDir, 'session-stores', key.larkAppId, 'sessions.db'), { readOnly: true });
+      try {
+        const row = store.prepare('SELECT row FROM sessions WHERE session_id = ?').get(key.sessionId) as { row: string };
+        expect(JSON.parse(row.row).cliId).toBe(cliId);
+      } finally { store.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each<{
     cliId: string; args: string[]; senderIsBot: boolean | undefined; merged: boolean;
     sandbox?: boolean; sandboxEnv?: NodeJS.ProcessEnv; reserveCard?: boolean; oncall?: boolean;
@@ -108,7 +166,17 @@ describe('real CLI send into a running reply card', () => {
       } else expect(getDeliveredGroupContextSeqs(binding.appId, binding.chatId, binding.sessionId, binding.epoch, dataDir)).toEqual([]);
       if (!merged && responseKind !== null) {
         expect(projectGroupContextCard(requests[0].body.content)?.kind).toBe(responseKind === 'progress' ? 'runtime' : 'conversation');
-        expect(requests[0].body.content).toContain('\u2063'.repeat(responseKind === 'progress' ? 12 : 13));
+        const purposeMarker = '\u2063'.repeat(responseKind === 'progress' ? 12 : 13);
+        expect(requests[0].body.content).toContain(purposeMarker);
+        const sentCard = JSON.parse(requests[0].body.content);
+        if (responseKind === 'progress' || responseKind === 'auxiliary') {
+          expect(sentCard.body.elements.some((element: any) =>
+            element.tag === 'markdown' && typeof element.content === 'string'
+            && element.content.endsWith(purposeMarker))).toBe(true);
+        }
+        expect(sentCard.body.elements.filter((element: any) =>
+          element.tag === 'markdown' && typeof element.content === 'string'
+          && element.content.replace(/<[^>]+>/g, '').replace(/\u2063/g, '').trim() === '')).toEqual([]);
       } else if (responseKind === null) {
         expect(requests[0].body.content).not.toContain('\u2063'.repeat(12));
       }

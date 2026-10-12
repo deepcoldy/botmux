@@ -14,7 +14,7 @@
  *
  * Run:  npx vitest run --project unit test/credential-boundary-prompt.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   buildCredentialBoundaryBlock,
   buildBotmuxSystemPromptText,
@@ -28,6 +28,7 @@ const policy = parseTriggerUserAuthConfig({ enabled: true })!;
 /** Stub only getBot: the credential block is gated on this bot's config, and
  *  everything else session-manager imports from the registry must stay real. */
 const stubbedBots = new Map<string, unknown>();
+const stubbedSessions = new Map<string, unknown>();
 vi.mock('../src/bot-registry.js', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getBot: (id: string) => {
@@ -35,6 +36,12 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => ({
     throw new Error(`unknown bot ${id}`);
   },
 }));
+vi.mock('../src/services/session-store.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getSession: (id: string) => stubbedSessions.get(id),
+}));
+
+afterEach(() => stubbedSessions.clear());
 
 describe('buildCredentialBoundaryBlock', () => {
   it.each(['zh', 'en'] as const)('names the governed tools and configured git host in %s', (locale) => {
@@ -144,6 +151,68 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
     });
     expect(text.match(/<botmux_credentials>/g)).toHaveLength(1);
   });
+
+  it.each(['claude-code', 'genius', 'grok', 'pi', 'oh-my-pi'] as const)(
+    '%s describes a managed lark-cli as bot-default without changing bytedcli identity',
+    (cli) => {
+      const env: Record<string, string> = {};
+      const args = createCliAdapterSync(cli).buildArgs({
+        sessionId: 'sess-bound', resume: false, locale: 'zh', larkAppId: 'cli_current',
+        triggerUserAuth: { ...policy, tools: ['lark-cli', 'bytedcli'] },
+        larkToolAppId: 'cli_current',
+        env,
+      });
+      const text = cli === 'pi' || cli === 'oh-my-pi'
+        ? env.BOTMUX_APPEND_SYSTEM_PROMPT
+        : args.find(arg => arg.includes('<botmux_lark_tool>'));
+      expect(text).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
+      expect(text).toContain('默认以 bot 身份调用');
+      expect(text).toContain('--as user');
+      expect(text).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
+      expect(text).not.toContain('已为 lark-cli / bytedcli 启用');
+      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    },
+  );
+
+  it('keeps managed lark-cli guidance when trigger-user auth is off', () => {
+    const text = buildBotmuxSystemPromptText({
+      locale: 'zh', larkToolAppId: 'cli_current',
+    });
+    expect(text).toContain('<botmux_lark_tool>');
+    expect(text).toContain('默认以 bot 身份调用');
+    expect(text).not.toContain('<botmux_credentials>');
+  });
+
+  it.each(['codex-app', 'dsh', 'mir'] as const)(
+    '%s does not duplicate the managed lark app on argv',
+    (cli) => {
+      const args = createCliAdapterSync(cli).buildArgs({
+        sessionId: 'sess-bound', resume: false, locale: 'zh', larkToolAppId: 'cli_current',
+      });
+      expect(args).not.toContain('--lark-tool-app-id');
+    },
+  );
+
+  it('includes managed local guidance for Codex but excludes cloud Mira', () => {
+    const appId = 'cli_mira_control';
+    stubbedBots.set(appId, {
+      config: {
+        larkAppId: appId,
+        triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      },
+    });
+    try {
+      const opening = (cliId: 'codex' | 'mira') => buildNewTopicPrompt(
+        'read the linked doc', `sess-${cliId}`, cliId, undefined, undefined, undefined,
+        undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: appId, chatId: 'oc_chat', larkToolResume: false },
+      );
+      expect(opening('codex')).toContain('<botmux_lark_tool>');
+      expect(opening('mira')).not.toContain('<botmux_lark_tool>');
+    } finally {
+      stubbedBots.delete(appId);
+    }
+  });
 });
 
 /**
@@ -166,12 +235,12 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
   const inlineCli = 'codex';
   const APP = 'cli_credboundary';
 
-  function withTriggerUserAuth(enabled: boolean, run: () => void): void {
+  function withTriggerUserAuth(enabled: boolean, run: () => void, tools = ['lark-cli']): void {
     stubbedBots.set(APP, {
       config: {
         larkAppId: APP,
         ...(enabled
-          ? { triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' } }
+          ? { triggerUserAuth: { enabled: true, tools, fallback: 'bot-identity' } }
           : {}),
       },
     });
@@ -182,6 +251,11 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
     'read the linked doc', 'sess-cred', inlineCli, undefined, undefined, undefined,
     undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
     larkAppId ? { larkAppId } : {},
+  );
+  const boundOpening = () => buildNewTopicPrompt(
+    'read the linked doc', 'sess-bound', inlineCli, undefined, undefined, undefined,
+    undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+    { larkAppId: APP, chatId: 'oc_chat', larkToolResume: false },
   );
 
   it('includes the credential boundary when the policy is on', () => {
@@ -201,6 +275,84 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
   it('omits it when no bot is named (uncertain answer must not claim a boundary)', () => {
     withTriggerUserAuth(true, () => {
       expect(opening(undefined)).not.toContain('<botmux_credentials>');
+    });
+  });
+
+  it('uses managed bot-default identity and preserves only other trigger-user tools', () => {
+    withTriggerUserAuth(true, () => {
+      const text = boundOpening();
+      expect(text).toContain('<botmux_lark_tool>');
+      expect(text).toContain('lark-cli 固定使用当前机器人的应用 cli_credboundary');
+      expect(text).toContain('默认以 bot 身份调用');
+      expect(text).toContain('--as user');
+      expect(text).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
+      expect(text).not.toContain('已为 lark-cli / bytedcli 启用');
+      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    }, ['lark-cli', 'bytedcli']);
+  });
+
+  it('keeps common credential safety rules for managed lark-only policy', () => {
+    withTriggerUserAuth(true, () => {
+      const text = boundOpening();
+      expect(text).toContain('不得读取、列举、复制或输出');
+      expect(text).toContain('不得把任何 token、JWT、access key');
+      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    });
+  });
+
+  it('still explains managed lark-cli when trigger-user auth is off', () => {
+    withTriggerUserAuth(false, () => {
+      const text = boundOpening();
+      expect(text).toContain('<botmux_lark_tool>');
+      expect(text).toContain('默认以 bot 身份调用');
+      expect(text).not.toContain('<botmux_credentials>');
+    });
+  });
+
+  it.each([
+    ['an adopted session', { adoptedFrom: { cwd: '/tmp' } }],
+    ['an external app-server session', { existingAppServerEndpoint: 'http://127.0.0.1:3000' }],
+    ['a remote backend session', { backendType: 'riff' }],
+  ])('does not claim managed lark identity for %s without a binding', (_name, session) => {
+    withTriggerUserAuth(true, () => {
+      stubbedSessions.set('sess-bound', session);
+      const text = boundOpening();
+      expect(text).not.toContain('<botmux_lark_tool>');
+      expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    });
+  });
+
+  it('keeps managed identity on a fresh retry even when lastCliInput was pre-persisted', () => {
+    withTriggerUserAuth(true, () => {
+      stubbedSessions.set('sess-bound', { lastCliInput: 'pre-persisted before failed first spawn' });
+      const text = boundOpening();
+      expect(text).toContain('<botmux_lark_tool>');
+      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    });
+  });
+
+  it('defaults an omitted launch decision to legacy-safe resume semantics', () => {
+    withTriggerUserAuth(true, () => {
+      const text = buildNewTopicPrompt(
+        'read the linked doc', 'sess-bound', inlineCli, undefined, undefined, undefined,
+        undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: APP, chatId: 'oc_chat' },
+      );
+      expect(text).not.toContain('<botmux_lark_tool>');
+      expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    });
+  });
+
+  it('does not claim managed lark identity inside workflow workers', () => {
+    withTriggerUserAuth(true, () => {
+      process.env.BOTMUX_WORKFLOW = '1';
+      try {
+        const text = boundOpening();
+        expect(text).not.toContain('<botmux_lark_tool>');
+        expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+      } finally {
+        delete process.env.BOTMUX_WORKFLOW;
+      }
     });
   });
 });

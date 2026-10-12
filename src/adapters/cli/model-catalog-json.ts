@@ -8,13 +8,18 @@
  */
 
 /**
- * 解析 `debug models` 的 JSON 输出为模型 slug 列表。
+ * 解析 `debug models` 的 JSON 输出为模型能力列表。
  * 过滤：slug 必须为非空字符串，且 visibility === 'list'（隐藏内部模型）。
  * 容错：JSON 非法 / 顶层结构不符 / models 不是数组 → 返回 []；
  * 单个元素缺 slug、slug 非字符串或 visibility 非 'list' 则跳过该元素
  * （一条坏数据不影响其余模型，避免整个目录因单条异常而不可选）。
  */
-export function parseDebugModelsJson(stdout: string): string[] {
+export interface DebugModelCapabilities {
+  slug: string;
+  serviceTiers: string[];
+}
+
+export function parseDebugModelCapabilitiesJson(stdout: string): DebugModelCapabilities[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -24,14 +29,26 @@ export function parseDebugModelsJson(stdout: string): string[] {
   if (typeof parsed !== 'object' || parsed === null) return [];
   const models = (parsed as { models?: unknown }).models;
   if (!Array.isArray(models)) return [];
-  const slugs: string[] = [];
+  const capabilities: DebugModelCapabilities[] = [];
   for (const entry of models) {
     if (typeof entry !== 'object' || entry === null) continue;
-    const slug = (entry as { slug?: unknown }).slug;
-    const visibility = (entry as { visibility?: unknown }).visibility;
+    const record = entry as { slug?: unknown; visibility?: unknown; service_tiers?: unknown };
+    const slug = record.slug;
+    const visibility = record.visibility;
     if (typeof slug !== 'string' || slug.length === 0) continue;
     if (visibility !== 'list') continue;
-    slugs.push(slug);
+    const serviceTiers = Array.isArray(record.service_tiers)
+      ? record.service_tiers
+        .map(tier => (typeof tier === 'object' && tier !== null
+          ? (tier as { id?: unknown }).id
+          : undefined))
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : [];
+    capabilities.push({ slug, serviceTiers });
   }
-  return slugs;
+  return capabilities;
+}
+
+export function parseDebugModelsJson(stdout: string): string[] {
+  return parseDebugModelCapabilitiesJson(stdout).map(model => model.slug);
 }

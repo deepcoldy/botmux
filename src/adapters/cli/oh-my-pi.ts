@@ -166,6 +166,7 @@ export function createOhMyPiAdapter(
       botOpenId,
       replyDelivery,
       triggerUserAuth,
+      larkToolAppId,
       noTransport,
       solo,
       skillPluginDir,
@@ -195,6 +196,7 @@ export function createOhMyPiAdapter(
         botOpenId,
         noTransport,
         triggerUserAuth,
+        larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
       });

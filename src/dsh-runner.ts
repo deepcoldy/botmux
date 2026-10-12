@@ -34,6 +34,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -614,6 +615,10 @@ function buildPreamble(): string {
     `你是飞书群机器人「${name}」，通过 deepseek-harness 运行。`,
     '- 你的最终回复文本会被自动捕获并发送到群里，不要执行 botmux send 或任何发消息命令。',
     `- 工作目录：${cwd}。语言：${locale}。`,
+    ...(() => {
+      const prompt = larkToolPromptFromEnv(locale);
+      return prompt ? [`- ${prompt}`] : [];
+    })(),
     '</botmux_identity>',
     '',
   ].join('\n');

@@ -3,7 +3,7 @@ const args = process.argv.slice(2);
 const option = name => args[args.indexOf(name) + 1];
 let input = '';
 for await (const chunk of process.stdin) input += chunk;
-appendFileSync(process.env.MCODE_TEST_LOG, JSON.stringify({ args, input, owner: process.env.BOTMUX_OWNER_OPEN_ID,
+appendFileSync(process.env.MCODE_TEST_LOG, JSON.stringify({ args, input, pid: process.pid, nodeUsed: process.env.MCODE_TEST_NODE_USED, owner: process.env.BOTMUX_OWNER_OPEN_ID,
   legacyOwner: process.env.__OWNER_OPEN_ID, cwd: process.cwd() }) + '\n');
 if (input === 'hang') { setInterval(() => {}, 1000); }
 else {

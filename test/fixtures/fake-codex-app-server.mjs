@@ -423,7 +423,41 @@ function handle(request) {
     return;
   }
   if (request.method === 'thread/start') {
-    respond(request.id, { thread: { id: 'thread-fake' } });
+    respond(request.id, { thread: { id: 'thread-fake' }, model: 'gpt-6-astra' });
+    return;
+  }
+  if (request.method === 'model/list') {
+    if (behavior === 'effort-paginated' && !request.params.cursor) {
+      respond(request.id, { data: [], nextCursor: 'next-model-page' });
+      return;
+    }
+    if (behavior === 'effort-paginated' && request.params.cursor === 'next-model-page') {
+      respond(request.id, { data: [{ model: 'other-model' }], nextCursor: 'last-model-page' });
+      return;
+    }
+    respond(request.id, { data: [{ model: behavior === 'effort-model-missing' ? 'other-model' : 'gpt-6-astra', supportedReasoningEfforts:
+      (behavior === 'effort-empty-choices' ? [] : behavior === 'effort-invalid' ? ['low', 'medium'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+        .map(reasoningEffort => ({ reasoningEffort })) }], nextCursor: null });
+    return;
+  }
+  if (request.method === 'thread/settings/update') {
+    if (behavior === 'effort-unsupported') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-thread-rejected') reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    else respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/settings/update') {
+    if (behavior === 'effort-partial') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-feature-disabled' || behavior === 'effort-feature-disabled-complete') {
+      reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    } else if (behavior === 'effort-rejected') reject(request.id, -32600, 'another invalid request');
+    else if (behavior === 'effort-serial') setTimeout(() => respond(request.id, { status: 'applied' }), 100);
+    else respond(request.id, { status: behavior === 'effort-race' ? 'targetUnavailable' : 'applied' });
+    if ((behavior === 'effort-complete' || behavior === 'effort-feature-disabled-complete') && activeTurn) {
+      const turn = activeTurn;
+      activeTurn = undefined;
+      setTimeout(() => emitTurnCompletion(turn.threadId, turn.turnId, turn.outputSchema), 100);
+    }
     return;
   }
   if (request.method === 'thread/resume') {
@@ -440,7 +474,7 @@ function handle(request) {
       respond(request.id, { thread: { id: 'thread-unexpected' } });
       return;
     }
-    respond(request.id, { thread: { id: request.params.threadId } });
+    respond(request.id, { thread: { id: request.params.threadId }, model: 'gpt-6-astra' });
     return;
   }
   if (request.method === 'thread/read') {
@@ -743,7 +777,7 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
@@ -752,6 +786,9 @@ function handle(request) {
     }
     respond(request.id, { turn: { id: turnId } });
     notify('turn/started', { threadId, turn: { id: turnId } });
+    if (behavior.startsWith('effort-')) {
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'effort-progress', delta: 'effort task running' });
+    }
     return;
   }
   if (behavior === 'steer-started-first') {

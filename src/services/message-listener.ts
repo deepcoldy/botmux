@@ -94,7 +94,7 @@ export function extractListenerMessageText(message: any): string {
   const content = listenerMessageContent(message);
   if (!content) return '';
   const msgType = messageTypeOf(message);
-  if (msgType === 'interactive') return extractCardContent(content);
+  if (msgType === 'interactive') return extractCardContent(content, undefined, message?.mentions ?? []);
   if (msgType === 'image') {
     try {
       const obj = JSON.parse(content);

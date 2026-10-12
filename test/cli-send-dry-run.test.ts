@@ -51,6 +51,15 @@ describe('send --dry-run', () => {
     expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: '**加粗**' });
   });
 
+  it('previews positional paragraph escapes the same way as a real send', () => {
+    const result = run(['send', '--dry-run', '第一段\\n\\n第二段']);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({
+      tag: 'markdown',
+      content: '第一段\n\n第二段',
+    });
+  });
+
   it('reports degraded charts on stderr and in the JSON', () => {
     const body = '```vega-lite\n{"title":"远程","data":{"url":"http://evil.example"},"mark":"bar"}\n```';
     const result = run(['send', '--dry-run', '--content-file', '@body'], body);

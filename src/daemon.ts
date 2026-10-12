@@ -1,6 +1,8 @@
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
+import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
@@ -115,11 +117,15 @@ import {
   startDurableLarkPrimaryRuntime,
   type DurableLarkPrimaryRuntime,
 } from './services/durable-lark-primary-runtime.js';
-import { deliverDurableLarkOutbox } from './services/durable-lark-outbox.js';
-import { durableLarkOutboxMessage } from './services/durable-lark-outbox.js';
+import {
+  deliverDurableLarkOutbox,
+  durableLarkOutboxMessage,
+  type DurableLarkOutboxTarget,
+} from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import { parseDurablePrimarySessionRecord } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
+import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -492,6 +498,7 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
+import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
@@ -7554,6 +7561,30 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+const explicitAskContinuation = createExplicitAskContinuation({
+  dir: join(config.session.dataDir, 'explicit-ask-receipts'),
+  get appId() { return selfDaemonLarkAppId ?? ''; },
+  register: input => registerHostAsk(input),
+  releaseHandoff: releaseExplicitAskHandoff,
+  hasHandoff: hasExplicitAskHandoff,
+  canResume: receipt => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    return sessionsRestored && !!ds && ds.larkAppId === receipt.input.larkAppId
+      && ds.chatId === receipt.input.chatId
+      && (ds.session.scope === 'chat' ? null : ds.session.rootMessageId) === receipt.input.rootMessageId
+      && (!receipt.result || !ds.worker || ds.lastScreenStatus === 'idle');
+  },
+  dispatch: async (receipt, key) => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    const result = await triggerSessionTurn(
+      explicitAskRecoveryRequest(receipt, key, ds?.chatType),
+      { larkAppId: receipt.input.larkAppId, activeSessions },
+    );
+    return result.ok && result.action !== 'ignored';
+  },
+  onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
+});
+
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
   try {
@@ -7657,7 +7688,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  const result = await registerAskForResponse({
+  const askInput = {
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
@@ -7675,7 +7706,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  }, res);
+  };
+  const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
+  const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
+  if (body.acknowledge === true) {
+    if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
+    const result = explicitAskContinuation.acknowledge(explicitInput);
+    return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
+  }
+  const result = managedExplicit
+    ? await explicitAskContinuation.wait(explicitInput)
+    : await registerAskForResponse(askInput, res);
   if (res.destroyed) return;
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
@@ -18396,6 +18437,9 @@ function buildReservedInitialInput(
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
       sessionBackendType: ds.session.backendType,
       promptInjection: sessionPromptInjection(ds),
+      // Reserved initial admission is the fresh launch owned by this session.
+      // Reforks of restored/live workers use the explicit opening paths below.
+      larkToolResume: false,
       // transcript + solo（resolveSoloSessionForTurn 在注册会话后算好）：首轮去壳。
       solo: ds.soloSession,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -19706,7 +19750,12 @@ export const __testOnly_forkReservedInitialSession = forkReservedInitialSession;
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
  * live worker after it. */
-function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[], trustedCaller?: TrustedCaller): boolean {
+function forkReservedInitialSession(
+  ds: DaemonSession,
+  availableBots: AvailableBot[],
+  trustedCaller?: TrustedCaller,
+  forkOptions: ForkWorkerOptions = {},
+): boolean {
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
   if (trustedCaller) input.trustedCaller = trustedCaller;
@@ -19733,7 +19782,10 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
     }
   }
   let accepted = false;
-  const admissionOpts: ForkWorkerOptions = {};
+  // Worker admission writes marginalReclaimScheduled as an out-flag. Keep the
+  // caller's object identity so durablePrimaryWorkerAdmission can observe the
+  // deferred path and hold the Inbox claim until the final admission result.
+  const admissionOpts = forkOptions;
   try {
     accepted = forkWorker(ds, input, turnId ? {
       turnId,
@@ -22188,6 +22240,106 @@ function markIngressAdmitted(ctx: RoutingContext): void {
   else ctx.ingressAdmission = { admitted: true };
 }
 
+function durableOutboxTargetForTurn(ds: DaemonSession, turnId: string): DurableLarkOutboxTarget {
+  const target = frozenReplyContextForTurn(ds, turnId).target;
+  return target.mode === 'plain'
+    ? { kind: 'send', chatId: target.chatId }
+    : {
+        kind: 'reply',
+        messageId: target.rootMessageId,
+        replyInThread: target.mode === 'thread',
+      };
+}
+
+/**
+ * Bind a worker-admission decision to the durable-primary handler that owns
+ * this inbound event. Hard rejection queues synchronously. Marginal memory
+ * reclaim is the only async admission path, so its final decision is awaited
+ * before the handler returns and before canonical Session admission flushes
+ * the queued Outbox effect.
+ */
+function durablePrimaryWorkerAdmission(
+  ctx: RoutingContext,
+  ds: DaemonSession,
+  defaultTurnId: string,
+): {
+  options: ForkWorkerOptions;
+  markForkReturned(): void;
+  waitIfMarginal(): Promise<void>;
+} | undefined {
+  const queue = ctx.queuePostAdmissionOutput;
+  if (!queue) return undefined;
+  let forkReturned = false;
+  let settled = false;
+  let resolveFinal!: () => void;
+  const final = new Promise<void>(resolve => { resolveFinal = resolve; });
+  const settle = (): void => {
+    if (settled) return;
+    settled = true;
+    resolveFinal();
+  };
+  const options: ForkWorkerOptions = {
+    onAdmission(admission) {
+      if (admission === 'deferred') {
+        // The first deferred signal schedules marginal reclaim before the
+        // original fork returns. A later deferred signal means the re-entry
+        // was durably parked behind another gate (for example device freeze),
+        // so the Inbox claim no longer has to wait for that independent gate.
+        if (forkReturned && options.marginalReclaimScheduled === true) settle();
+        return;
+      }
+      settle();
+    },
+    onAdmissionBlocked(notice) {
+      const turnId = notice.turnId ?? defaultTurnId;
+      const providerUuid = `admission_blocked_${createHash('sha256')
+        .update(JSON.stringify([ds.larkAppId, ds.session.sessionId, turnId, 'worker-admission']))
+        .digest('hex')
+        .slice(0, 24)}`;
+      try {
+        queue({
+          target: durableOutboxTargetForTurn(ds, turnId),
+          content: notice.content,
+          msgType: 'text',
+          providerUuid,
+          hookContext: { sessionId: ds.session.sessionId, turnId },
+        });
+      } catch (error) {
+        // A timed-out/retried Inbox claim may close its in-memory queue before
+        // an old marginal-admission callback arrives. The replacement claim
+        // owns the durable retry; never fall back to a direct provider effect.
+        logger.warn(
+          `[durable-primary:${ds.larkAppId}] discarded late worker-admission notice: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    },
+  };
+  return {
+    options,
+    markForkReturned() { forkReturned = true; },
+    async waitIfMarginal() {
+      if (options.marginalReclaimScheduled !== true || settled) return;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          final,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => {
+              reject(new Error('durable primary worker admission did not settle'));
+            }, 30_000);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+  };
+}
+
+export const __testOnly_durablePrimaryWorkerAdmission = durablePrimaryWorkerAdmission;
+
 /**
  * 普通消息处理链的终态失败收口：transport 已 ACK（用户看到消息发出去了），但
  * 异常把整条投递链掀翻——此前只剩 dispatcher 的 log-only catch，用户视角就是
@@ -23216,7 +23368,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots, trustedCaller);
+    const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
+    forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
+    primaryAdmission?.markForkReturned();
+    await primaryAdmission?.waitIfMarginal();
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
@@ -23289,7 +23444,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots, trustedCaller);
+    const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
+    forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
+    primaryAdmission?.markForkReturned();
+    await primaryAdmission?.waitIfMarginal();
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }
@@ -23343,6 +23501,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   // 透传闸、DAEMON_COMMANDS 与会话政策全在 schema 驱动的一处判定里；下面只按决策执行。
   // 新话题入口不查 activeSessions，相位恒为 none；透传集按 live bot 配置求值（R2）。
   const slashDecision = classifySlash({
+    cliId: getBot(larkAppId).config.cliId,
     text: cmdContent,
     context: 'new-topic',
     phase: 'none',
@@ -25706,7 +25865,10 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
+      const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
+      primaryAdmission?.markForkReturned();
+      await primaryAdmission?.waitIfMarginal();
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
@@ -25761,7 +25923,10 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller);
+      const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
+      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
+      primaryAdmission?.markForkReturned();
+      await primaryAdmission?.waitIfMarginal();
     }
 
     return;
@@ -25897,6 +26062,11 @@ async function handleThreadReplyAdmitted(
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
             sessionBackendType: ds.session.backendType,
+            // This opening is being delivered to an already-running worker.
+            // Preserve the identity mode that worker was actually launched
+            // with; legacy empty-start sessions can reach this path after a
+            // daemon restore with resume=true and no managed binding.
+            larkToolResume: ds.initConfig?.resume === true,
             promptInjection: sessionPromptInjection(ds),
             solo: ds.soloSession,
             selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -26225,6 +26395,7 @@ async function handleThreadReplyAdmitted(
     // its normal `--resume` instead of being cold-spawned over.
     const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
+    const openingResume = ds.hasHistory && !(openingTurn && !hadPriorCliInput);
     // 先选 builder：opening 轮用 buildNewTopicCliInput，非 opening 才 buildRefork。
     // 不能无条件先跑 buildRefork——它现在有副作用（写 follow-up sidecar），opening 时
     // 结果会被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
@@ -26258,6 +26429,7 @@ async function handleThreadReplyAdmitted(
           // queued dashboard 场景的 turnId 是合成的，权威流不同，保持 inline。
           turnId: queuedHasDurableTail ? undefined : parsed.messageId,
           sessionBackendType: ds.session.backendType,
+          larkToolResume: openingResume,
           promptInjection: sessionPromptInjection(ds),
         },
       );
@@ -26301,7 +26473,7 @@ async function handleThreadReplyAdmitted(
         userPrompt: promptContent,
         title: stripCrossPrincipalAsToken(parsed.content).text,
         cliInput: wrappedInput,
-        resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+        resume: openingResume,
         ...(codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       });
       markIngressAdmitted(ctx);
@@ -26312,6 +26484,9 @@ async function handleThreadReplyAdmitted(
     let reforkAccepted = true;
     let xpiAdmission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
     let xpiAdmissionAcquired = false;
+    const primaryAdmission = ds.adoptedFrom
+      ? undefined
+      : durablePrimaryWorkerAdmission(ctx, ds, parsed.messageId);
     if (ds.session.xpiSharedCwdAdmissionGroupId) {
       if (!threadTrustedCaller || queuedHasDurableTail || queuedDashboardTurn) {
         throw new Error('grouped XPI refork requires one exact interactive turn and trusted caller');
@@ -26323,7 +26498,7 @@ async function handleThreadReplyAdmitted(
           caller: threadTrustedCaller,
           userPrompt: promptContent,
           cliInput: wrappedInput,
-          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          resume: openingResume,
         });
         markIngressAdmitted(ctx);
         if (openingTurn) releaseInitialUserTurn(ds);
@@ -26360,7 +26535,7 @@ async function handleThreadReplyAdmitted(
                       caller: threadTrustedCaller!,
                       userPrompt: promptContent,
                       cliInput: wrappedInput,
-                      resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+                      resume: openingResume,
                     });
                     if (xpiAdmission.kind !== 'acquired') {
                       throw new Error('XPI shared-cwd admission changed at the adopt reservation boundary');
@@ -26386,7 +26561,7 @@ async function handleThreadReplyAdmitted(
         reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.
-          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          resume: openingResume,
           turnId: queuedHasDurableTail
             ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
             : parsed.messageId,
@@ -26402,7 +26577,7 @@ async function handleThreadReplyAdmitted(
                     caller: threadTrustedCaller!,
                     userPrompt: promptContent,
                     cliInput: wrappedInput,
-                    resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+                    resume: openingResume,
                   });
                   if (xpiAdmission.kind !== 'acquired') {
                     throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
@@ -26411,8 +26586,10 @@ async function handleThreadReplyAdmitted(
                 },
               }
             : {}),
-        });
+        }, primaryAdmission?.options);
       }
+      primaryAdmission?.markForkReturned();
+      await primaryAdmission?.waitIfMarginal();
     } catch (e) {
       rollbackXpiSharedCwdAdmission(ds, xpiAdmission, parsed.messageId);
       if (openingTurn) releaseInitialUserTurn(ds);
@@ -26431,7 +26608,7 @@ async function handleThreadReplyAdmitted(
           caller: threadTrustedCaller,
           userPrompt: promptContent,
           cliInput: wrappedInput,
-          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          resume: openingResume,
         });
         markIngressAdmitted(ctx);
       }
@@ -26543,6 +26720,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   const slashDecision = ctx.messageListener
     ? null
     : classifySlash({
+      cliId: passthroughCliId,
       text: cmdContent,
       context: 'thread',
       phase: deriveSessionPhase(existingDs),
@@ -27972,6 +28150,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 重投，那句话是假的。后果不是晚同步：in_progress 那次写只要失败一次，5 分钟后平台就把
   // 任务打成 needs_attention(claim_activate_timeout)，而那是单向门，群里的活直接废掉。
   // 同时启动时把卡在 inflight 的行退回待发，否则崩溃一次就永久堵死该 binding 的串行队列。
+  if (!existsSync(config.session.dataDir)) {
+    mkdirSync(config.session.dataDir, { recursive: true });
+  }
   startIssueOutboxPump({ dataDir: config.session.dataDir });
 
   // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
@@ -29392,17 +29573,53 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               ds,
               ds.session.suspendedColdResume ? 'idle' : undefined,
             ),
-            resumeRefusedText: (error, activeSessionId) => {
+            closeResidualText: residual => {
               const loc = localeForBot(cfg.larkAppId);
-              return error === 'anchor_occupied'
-                ? tr('card.action.resume_anchor_occupied', {
-                    detail: activeSessionId
-                      ? tr('card.action.resume_anchor_holder', {
-                          short: activeSessionId.substring(0, 8),
-                        }, loc)
-                      : '',
-                  }, loc)
-                : tr('card.action.resume_start_failed', undefined, loc);
+              return tr(
+                closeResidualIsLocal(residual)
+                  ? 'card.action.close_residual_local'
+                  : 'card.action.close_residual',
+                { taskId: describeCloseResidual(residual) },
+                loc,
+              );
+            },
+            closeRefusedText: (error, taskId) => {
+              const loc = localeForBot(cfg.larkAppId);
+              return taskId
+                ? tr('card.action.close_refused_with_task', { error, taskId }, loc)
+                : tr('card.action.close_refused', { error }, loc);
+            },
+            resumeRefusedText: (error, activeSessionId, sessionId) => {
+              const loc = localeForBot(cfg.larkAppId);
+              if (error === 'not_found') {
+                return tr('card.action.resume_not_found', {
+                  short: sessionId?.substring(0, 8) ?? '',
+                }, loc);
+              }
+              if (error === 'not_closed') {
+                return tr('card.action.resume_not_closed', undefined, loc);
+              }
+              if (error === 'anchor_occupied') {
+                return tr('card.action.resume_anchor_occupied', {
+                  detail: activeSessionId
+                    ? tr('card.action.resume_anchor_holder', {
+                        short: activeSessionId.substring(0, 8),
+                      }, loc)
+                    : '',
+                }, loc);
+              }
+              const key = error === 'workspace_retired'
+                ? 'card.action.resume_workspace_retired'
+                : error === 'deferred_unmaterialized'
+                  ? 'card.action.resume_deferred_unmaterialized'
+                  : error === 'adopt_unsupported'
+                    ? 'card.action.resume_adopt_unsupported'
+                    : error === 'resume_cancelled'
+                      ? 'card.action.resume_cancelled'
+                      : error === 'resume_reconciliation_required'
+                        ? 'card.action.resume_reconciliation_required'
+                        : 'card.action.resume_start_failed';
+              return tr(key, undefined, loc);
             },
           });
           primaryRuntime = startDurableLarkPrimaryRuntime({
@@ -29477,6 +29694,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // reconnecting ask hook that raced the restore got retryable 503s until here.
     markSessionsRestored: () => {
       sessionsRestored = true;
+      const askRecoveryTimer = setInterval(() => { void explicitAskContinuation.sweep(); }, 5000);
+      askRecoveryTimer.unref();
+      void explicitAskContinuation.sweep();
     },
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
@@ -29725,10 +29945,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (err: any) {
     logger.warn(`[sandbox-sweep] failed: ${err?.message ?? err}`);
   }
+  const closeIdleGroupSessions = createGroupIdleCloseSweeper({
+    larkAppId: cfg.larkAppId,
+    sessions: activeSessions,
+    getSettings: chatId => getBot(cfg.larkAppId).config.groupIdleClose?.[chatId],
+    isTransferring: isSessionTransferring,
+    close: closeSessionForBackgroundCleanup,
+    log: message => logger.info(message),
+  });
   const idleWorkerSweepTimer = setInterval(() => {
     // Dashboard config edits need no restart; the timer also backstops any
     // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
     enforceLiveSessionCap('periodic');
+    void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 

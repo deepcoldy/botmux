@@ -1,9 +1,17 @@
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type BrowserContextOptions,
+  type Page,
+} from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import 'dotenv/config';
+import { E2E_VIDEO_DIR, e2eVideoRecordingEnabled } from './e2e-video.js';
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '../..');
 
@@ -105,13 +113,25 @@ export async function createBrowser(headless = true): Promise<Browser> {
 export async function createPage(
   browser: Browser,
 ): Promise<{ context: BrowserContext; page: Page }> {
-  const contextOpts: Record<string, unknown> = {
+  const contextOpts: BrowserContextOptions = {
     viewport: BROWSER_CONFIG.viewport,
     deviceScaleFactor: BROWSER_CONFIG.deviceScaleFactor,
     locale: BROWSER_CONFIG.locale,
   };
   if (existsSync(STORAGE_STATE_PATH)) {
     contextOpts.storageState = STORAGE_STATE_PATH;
+  }
+  // Continuous WebM of this context. Enabled only for Midscene runs
+  // (`BOTMUX_E2E_RECORD_VIDEO=1`); the file is saved when the context closes.
+  if (e2eVideoRecordingEnabled()) {
+    await mkdir(E2E_VIDEO_DIR, { recursive: true });
+    contextOpts.recordVideo = {
+      dir: E2E_VIDEO_DIR,
+      size: {
+        width: BROWSER_CONFIG.viewport.width,
+        height: BROWSER_CONFIG.viewport.height,
+      },
+    };
   }
   const context = await browser.newContext(contextOpts);
   const page = await context.newPage();
@@ -181,6 +201,7 @@ export async function openChat(
   // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
   // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
   const chatName = botChatName(botName);
+  let opened = false;
   // Try clicking directly first
   try {
     await agent.aiAct(
@@ -189,8 +210,17 @@ export async function openChat(
         `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
         '也不要点话题里的消息或群聊。',
     );
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 8_000, checkIntervalMs: 2_000 },
+    );
+    opened = true;
   } catch {
-    // Chat not visible in sidebar — use search to find it
+    opened = false;
+  }
+
+  if (!opened) {
+    // Chat not visible or direct click failed — use search to find it
     await page.keyboard.press('Control+k');
     await page.waitForTimeout(1000);
     await page.keyboard.type(chatName);
@@ -202,13 +232,12 @@ export async function openChat(
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
+    // Wait for chat to load
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 15_000, checkIntervalMs: 3_000 },
+    );
   }
-  // Wait for chat to load — the header must show the prefixed bot name (this
-  // also guards against having opened the native agent).
-  await agent.aiWaitFor(
-    `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
-    { timeoutMs: 15_000, checkIntervalMs: 3_000 },
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -282,23 +311,6 @@ export async function waitForCardStatus(
       '不要把左侧话题列表预览或历史旧话题当作当前会话结果',
     { timeoutMs: opts?.timeoutMs ?? 60_000, checkIntervalMs: 3_000 },
   );
-}
-
-export async function waitForIdleOrCodexUsageLimit(
-  agent: PlaywrightAgent,
-  opts?: { timeoutMs?: number },
-): Promise<'idle' | 'codex-usage-limit'> {
-  await agent.aiWaitFor(
-    '主内容区正在显示的测试话题最底部，当前 Codex 会话已经进入可验证的结束态：' +
-      '要么最新流式卡片标题包含"等待输入"，要么最新 Codex 回复或卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
-      '不要把左侧话题列表预览或历史旧话题当作当前会话结果',
-    { timeoutMs: opts?.timeoutMs ?? 120_000, checkIntervalMs: 5_000 },
-  );
-
-  const isUsageLimited = await agent.aiBoolean(
-    '主内容区正在显示的测试话题最底部，当前 Codex 会话的最新回复或最新流式卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示',
-  );
-  return isUsageLimited ? 'codex-usage-limit' : 'idle';
 }
 
 /**
@@ -421,7 +433,7 @@ export async function openThreadForMessage(
   await agent.aiWaitFor(
     `页面右侧主内容区（宽版，占据页面大部分空间，不是那一条窄的侧栏）已经打开包含"${tag}"的测试话题；` +
       '区域内可见该测试消息，以及下方的机器人相关内容（普通文本气泡、"项目仓库管理"卡、"直接开启会话"按钮或流式卡片之一）',
-    { timeoutMs: 20_000, checkIntervalMs: 3_000 },
+    { timeoutMs: 35_000, checkIntervalMs: 3_000 },
   );
 
   await scrollThreadToBottom(agent);
@@ -476,8 +488,20 @@ export async function showStreamingOutput(
   agent: PlaywrightAgent,
   page: Page,
 ): Promise<void> {
+  // The ACK text bubble is the last item after a successful reply, so "the
+  // bottom of the thread" is that bubble (thumbs-up / copy / forward), not
+  // the streaming card. Bring the card's own button into view first.
+  const cardButton = page.getByRole('button', { name: /显示输出|隐藏输出/ }).last();
+  try {
+    await cardButton.scrollIntoViewIfNeeded({ timeout: 15_000 });
+  } catch {
+    // The vision checks below report a real miss.
+  }
+  const cardClause =
+    '主内容区正在显示的测试话题里，当前会话的流式卡片（带"打开 Web 终端"或"显示输出/隐藏输出"的那张，可能在 ACK 文本气泡上方）。' +
+    '不要把文本气泡右侧的点赞、复制、转发或更多选项当成卡片按钮。';
   const needShow = await agent.aiBoolean(
-    '主内容区正在显示的测试话题最底部，当前会话的流式卡片操作按钮中有"📖 显示输出"按钮',
+    `${cardClause}这张卡片的操作按钮中有"📖 显示输出"按钮`,
   );
   if (needShow) {
     try {
@@ -487,14 +511,15 @@ export async function showStreamingOutput(
         .click({ timeout: 5_000 });
     } catch {
       await agent.aiAct(
-        '点击主内容区正在显示的测试话题最底部，当前会话流式卡片里的"📖 显示输出"按钮；不要点击"打开 Web 终端"按钮',
+        `点击${cardClause}里的"📖 显示输出"按钮；不要点击"打开 Web 终端"，也不要点文本气泡上的按钮`,
       );
     }
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
   }
-  await agent.aiAssert(
-    '主内容区正在显示的测试话题最底部，当前会话的流式卡片操作按钮中有"📕 隐藏输出"，' +
+  await agent.aiWaitFor(
+    `${cardClause}这张卡片的操作按钮中有"📕 隐藏输出"，` +
       '并且卡片正文显示终端截图、终端区域，或"等待第一张截图"占位',
+    { timeoutMs: 30_000, checkIntervalMs: 2_000 },
   );
 }
 
@@ -550,11 +575,18 @@ export async function waitForCodexSideResponse(
   agent: PlaywrightAgent,
   opts?: { marker?: string; timeoutMs?: number },
 ): Promise<void> {
-  const markerClause = opts?.marker
-    ? `要么来自 Codex 的回复包含"${opts.marker}"，`
-    : '';
+  if (opts?.marker) {
+    await agent.aiWaitFor(
+      `主内容区正在显示的测试话题里出现一条来自 Codex 或机器人的独立文本气泡（不是流式卡片、不是仓库选择卡、绝对不是用户自己发出的提问消息），` +
+        `气泡正文中必须同时包含"【MOCK-REPLY】"和"${opts.marker}"（"【MOCK-REPLY】"是模型回复专用的固定前缀，用户提问中绝无此标记），` +
+        '不要把流式卡片标题或用户提问误认为回复',
+      { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
+    );
+    return;
+  }
   await agent.aiWaitFor(
-    `主内容区正在显示的测试话题中，当前测试话题已经收到 Codex 侧响应：${markerClause}` +
+    '主内容区正在显示的测试话题中，当前测试话题已经收到 Codex 侧响应：' +
+      '要么来自 Codex 的独立文本气泡回复，' +
       '要么来自 Codex 的回复或流式卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
       '同时当前测试话题中没有出现"没能确认提交"或"可能卡在输入框里"的 botmux 提交失败警告',
     { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },

@@ -269,7 +269,7 @@ describe('turn-idle opt-in surface', () => {
       .filter(name => name.endsWith('.ts'))
       .filter(name => source(join('src', 'adapters', 'cli', name)).includes('injectsReadyHook: true'))
       .sort();
-    // claude-code + grok already shipped it; this change added dsh-tui only.
-    expect(readyOptIn).toEqual(['claude-code.ts', 'dsh-tui.ts', 'grok.ts']);
+    // claude-code + dsh-tui opt into injectsReadyHook; grok dropped it to avoid 45s ready-gate hold.
+    expect(readyOptIn).toEqual(['claude-code.ts', 'dsh-tui.ts']);
   });
 });

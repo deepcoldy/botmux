@@ -3,6 +3,15 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — 修改 Codex App 后续轮次推理强度；更新当前轮需显式启用实验特性 step_model_switching（默认关闭，档位以当前模型为准）',
+  'cmd.effort.applied': '后续轮次的推理强度已设为 {effort}，服务端已接受当前轮更新。若当前轮还有后续推理步骤，可取用新设置；已经发出的模型请求保持原参数。',
+  'cmd.effort.future_only': '后续轮次的推理强度已设为 {effort}；当前轮未确认更新（可能已结束或接口不可用）。',
+  'cmd.effort.step_model_switching_disabled': '后续轮次的推理强度已设为 {effort}；当前轮未更新：Codex 未启用实验特性 step_model_switching（默认关闭，Botmux 不自动开启）。启用条件见 /help 和斜杠命令文档。',
+  'cmd.effort.target_unavailable': '后续轮次的推理强度已设为 {effort}；目标轮次已结束或不可用，当前轮未更新。',
+  'cmd.effort.invalid_without_choices': '当前模型未提供可用的推理档位，无法修改。',
+  'cmd.effort.invalid': '当前模型不支持该档位。可选：{choices}',
+  'cmd.effort.unavailable': '当前 Codex App 连接尚未就绪或正在切换，请稍后重试。',
+  'cmd.effort.error': '未能确认推理强度修改结果，请稍后重试。',
   'worker.steer_accepted': '收到，引导成功',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': '终端正在启动',
@@ -67,6 +76,7 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 会话已搬迁',
   'card.status.selected': '已选择',
   'card.status.waiting_screenshot': '_(等待第一张截图…)_',
+  'card.status.screenshot_unavailable': '_(当前没有可用截图，请在会话恢复后刷新。)_',
   'card.status.truncated_prefix': '… (已截断)',
   'card.pending.detoured_title': '已发送',
   'card.pending.detoured_body': '最终回复已发送到其他目标。',
@@ -951,7 +961,8 @@ export const messages: Record<string, string> = {
   'ai.routing.intro': '你在飞书（Lark）会话中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
-  'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`（详见 `botmux send --help`）',
+  'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`；尺寸/排版选择先 `botmux skill show botmux-send`',
+  'ai.routing.ask_wait': '等待 botmux ask 真人回答时，无输出属正常等待；不得发送 Ctrl-C、kill 或取消等待工具来提前结束。复用原等待进程直到回答或正常超时；传输错误、超时和机器人回复不代表真人授权。收到 Ask 接续事件时回读原任务、问题与方案版本，只消费对应决定，不重跑已完成工作。',
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
   'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': '`botmux send` 成功即已送达；本轮终端无可见输出、直接结束是正常的。若看到「上一条回复没有可见输出，请继续」之类提示，那是底层 CLI 误判，不要因此重发——除非 `botmux send` 本身报错。',
@@ -1192,6 +1203,8 @@ export const messages: Record<string, string> = {
   'card.action.compact_unsupported': '⚠️ 当前环境不支持卡片压缩，请直接发送 /compact',
   'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
   'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
+  'card.action.close_residual': '会话已在本地关闭，但远端会话未取消（{taskId}），需要人工清理。',
+  'card.action.close_residual_local': '会话已在本地关闭、远端会话已取消，但本机可能残留带凭证子进程未确认终止（{taskId}）。请人工核查该主机进程。',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
@@ -1712,6 +1725,7 @@ export const messages: Record<string, string> = {
   'toast.action_received_no_repeat': '操作已收到，请勿重复点击',
   'toast.action_in_progress': '操作正在处理中，请稍候',
   'toast.action_received_bg': '操作已收到，后台处理中',
+  'toast.card_update_busy_retry': '卡片正在更新，请稍后再点一次',
   'toast.not_in_approver_list': '你不在该审批人名单里，无法操作',
 
   // Quote hint (injected into the CLI prompt)

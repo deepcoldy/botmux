@@ -37,6 +37,7 @@ import {
   resolveUpdateStrategy,
 } from '../src/core/binary-install-shape.js';
 import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary } from '../src/core/binary-self-update.js';
+import type { BinaryUpdateProgress } from '../src/core/binary-self-update.js';
 import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestartInvocation, verifyBinaryRestartTarget } from '../src/core/maintenance.js';
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
 import { withFileLock, FileLockTimeoutError } from '../src/utils/file-lock.js';
@@ -924,6 +925,58 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     expect(statSync(target).size).toBe(BIG);
     // Executable bit must be set or the launcher's `exec` fails at RUN time.
     expect(statSync(target).mode & 0o111).not.toBe(0);
+  });
+
+  it('emits download byte progress and ordered stage transitions', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const payload = fakeAsset();
+    const events: BinaryUpdateProgress[] = [];
+    const stream = Object.assign(Readable.from([payload]), {
+      headers: { 'content-length': String(payload.length) },
+    });
+    await replaceStandaloneBinary('3.99.0', target, {
+      fetchStream: async () => stream,
+      fetchChecksum: async () => null,
+      probeBinary: probeOk,
+      onProgress: event => events.push({ ...event }),
+    });
+    const stages = events.map(e => e.phase);
+    expect(stages[0]).toBe('download');
+    expect(stages).toContain('checksum');
+    expect(stages).toContain('probe');
+    expect(stages[stages.length - 1]).toBe('swap');
+    const downloads = events.filter(e => e.phase === 'download');
+    expect(downloads[0].bytesTotal).toBe(BIG);
+    expect(downloads[downloads.length - 1].bytesReceived).toBe(BIG);
+    // Counts are monotonic and never exceed the declared total.
+    let previous = -1;
+    for (const event of downloads) {
+      expect(event.bytesReceived).toBeGreaterThan(previous);
+      expect(event.bytesReceived).toBeLessThanOrEqual(BIG);
+      previous = event.bytesReceived;
+    }
+    // Post-download stages keep the full size so the UI stays busy past 100%.
+    for (const phase of ['checksum', 'probe', 'swap'] as const) {
+      expect(events.find(e => e.phase === phase)?.bytesReceived).toBe(BIG);
+    }
+  });
+
+  it('reports null bytesTotal when the stream announces no Content-Length', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const payload = fakeAsset();
+    const events: BinaryUpdateProgress[] = [];
+    await replaceStandaloneBinary('3.99.0', target, {
+      fetchStream: async () => Readable.from([payload]),
+      fetchChecksum: async () => null,
+      probeBinary: probeOk,
+      onProgress: event => events.push({ ...event }),
+    });
+    expect(events[0].bytesTotal).toBeNull();
+    expect(events.at(-1)?.phase).toBe('swap');
   });
 
   it('a checksum mismatch leaves the WORKING binary in place', async () => {

@@ -82,7 +82,7 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('cold-start argv prompts seed working for card-off; Grok holds busy, quiescence seeds idle', () => {
-    // Grok: argv + SessionStart → hold working until assistant_final.
+    // Grok: argv + reliable turn terminal → hold working until assistant_final.
     // Pi/Gemini: argv but first ready IS turn end → seed working then idle.
     // Arming is centralized (not bare preparedInitialPrompt) so Riff is safe.
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
@@ -318,9 +318,9 @@ describe('worker pipe initial screen ordering', () => {
     // adapter.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
-    const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
+    const decideIdx = source.indexOf("decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead)", fallbackStart);
     const markReadyIdx = source.indexOf('markPromptReady();', decideIdx);
-    const flushIdx = source.indexOf("if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')", fallbackStart);
+    const flushIdx = source.indexOf("if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush')", fallbackStart);
 
     expect(fallbackStart).toBeGreaterThan(-1);
     expect(decideIdx).toBeGreaterThan(fallbackStart);

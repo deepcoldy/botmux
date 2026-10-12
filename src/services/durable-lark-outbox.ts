@@ -7,6 +7,8 @@ import type {
   DurableOutboxDeliveryResult,
 } from './durable-outbox-pump.js';
 import { classifyFeishuError } from '../workflows/hostExecutors/feishu-send.js';
+import { MessageUpdateExpiredError, MessageWithdrawnError } from '../im/lark/client.js';
+import { TopicSendError } from '../cli/topic-send-guard.js';
 import { PROVIDER_TTL_MS } from '../workflows/shared/provider-reconciler.js';
 
 export const DURABLE_LARK_OUTBOX_VERSION = 1 as const;
@@ -309,6 +311,37 @@ export async function deliverDurableLarkOutbox(
     };
   } catch (error) {
     const detail = describeSendFailure(error);
+    // PATCH has no provider idempotency key. A withdrawn card and a card past
+    // Lark's edit window are nevertheless definitive no-effect outcomes: the
+    // exact target can never be updated by a retry. Settle this row through the
+    // store's terminal state (with an explicit discarded receipt) so its
+    // per-Session FIFO fence does not permanently block later durable replies.
+    if (parsed.target.kind === 'update'
+        && (error instanceof MessageWithdrawnError
+          || error instanceof MessageUpdateExpiredError
+          || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'))) {
+      return {
+        kind: 'delivered',
+        receipt: {
+          provider: 'lark',
+          providerMessageId: parsed.target.messageId,
+          providerUuid: parsed.providerUuid,
+          operation: 'update',
+          targetId: parsed.target.messageId,
+          disposition: 'discarded',
+          reason: error instanceof MessageUpdateExpiredError
+            ? 'message_update_expired'
+            : error instanceof MessageWithdrawnError
+              ? 'message_withdrawn'
+              : 'topic_unavailable',
+        },
+      };
+    }
+    if (parsed.target.kind === 'update'
+        && error instanceof TopicSendError
+        && error.code === 'TOPIC_SEND_CHECK_FAILED') {
+      return safeRetry(detail, 'no_side_effect');
+    }
     const classification = classifyFeishuError(error);
     if (classification?.errorClass === 'retryable') {
       return safeRetry(detail, 'stable_target_idempotency');

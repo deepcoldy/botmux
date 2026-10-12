@@ -105,6 +105,39 @@ describe('fetchDetectedModels (fail-soft)', () => {
     expect(await fetchDetectedModels('codex')).toEqual({ models: ['a', 'b'], source: 'live' });
   });
 
+  it('携带 Bot ID 让服务端按该 Bot 的 runtime/env 探测', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ models: ['a'], source: 'static' }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchDetectedModels('codex', 'cli_runtime_bot');
+    expect(fetchMock).toHaveBeenCalledWith('/api/cli-options/models?key=codex&bot=cli_runtime_bot');
+  });
+
+  it('200 可选返回模型能力目录，并过滤形状异常的条目', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        detectedAt: 123,
+        modelCapabilities: [
+          { slug: 'gpt-6-astra', serviceTiers: ['priority', 1] },
+          { slug: 2, serviceTiers: ['priority'] },
+          'bad',
+        ],
+      }),
+    })));
+    expect(await fetchDetectedModels('codex')).toEqual({
+      models: ['gpt-6-astra'],
+      source: 'live',
+      modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+    });
+  });
+
   it('过滤非字符串项；source 非 live 归为 static', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({
       ok: true,

@@ -1216,7 +1216,7 @@ function BotDefaultsCard(props: {
             {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
                 选了别的 agent 就隐藏，避免无效开关。 */}
             {bot.cliId === 'codex-app' ? (
-              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
+              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
             ) : null}
             {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
             {bot.cliId === 'claude-code' ? (
@@ -2360,6 +2360,8 @@ export function BotAgentSection(props: {
   const [modelBackendVariant, setModelBackendVariant] = useState<'' | 'standard' | 'max'>(bot.modelBackendVariant ?? '');
   const [modelBackendVariantTouched, setModelBackendVariantTouched] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
+  const [serviceTier, setServiceTier] = useState<'' | 'default' | 'priority' | 'ultrafast'>(bot.serviceTier ?? '');
+  const [serviceTierTouched, setServiceTierTouched] = useState(false);
   const [nativeModelMode, setNativeModelMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
   const [nativeModel, setNativeModel] = useState(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
   const [nativeEffortMode, setNativeEffortMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
@@ -2398,6 +2400,8 @@ export function BotAgentSection(props: {
     setModelBackendVariant(bot.modelBackendVariant ?? '');
     setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setServiceTier(bot.serviceTier ?? '');
+    setServiceTierTouched(false);
     setNativeModelMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
     setNativeModel(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
     setNativeEffortMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
@@ -2421,6 +2425,7 @@ export function BotAgentSection(props: {
     bot.model,
     bot.modelBackendVariant,
     bot.reasoningEffort,
+    bot.serviceTier,
     bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
     bot.dshRuntime,
@@ -2435,7 +2440,7 @@ export function BotAgentSection(props: {
   const suggestions = modelSuggestionsForOption(option, cliState);
   const modelDisabledByCli = option?.gateway === 'ttadk' && option.acceptsModel === false;
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
-  const [detectedModels, setDetectedModels] = useState<{ models: string[]; source: 'live' | 'static' } | null>(null);
+  const [detectedModels, setDetectedModels] = useState<Awaited<ReturnType<typeof fetchDetectedModels>>>(null);
   const [detectingModels, setDetectingModels] = useState(false);
   useEffect(() => {
     if (option?.gateway === 'ttadk') {
@@ -2445,13 +2450,15 @@ export function BotAgentSection(props: {
     }
     // stale 标志防卸载/竞态：cliKey 快速切换时旧响应不得覆盖新 CLI 的候选。
     let stale = false;
+    setDetectedModels(null);
     setDetectingModels(true);
-    fetchDetectedModels(cliKey)
+    fetchDetectedModels(cliKey, bot.larkAppId)
       .then(result => { if (!stale) setDetectedModels(result); })
       .finally(() => { if (!stale) setDetectingModels(false); });
     return () => { stale = true; };
-    // 只按 cliKey 重新探测；cliState 刷新带来的静态候选经 suggestions 合入，无需重探。
-  }, [cliKey]);
+    // Runtime/path/env-policy/env edits save into the bot row first. A new row
+    // identity is the probe revision; env values themselves stay write-only.
+  }, [cliKey, bot]);
   // Fetch DSH profile list when dsh is selected.
   useEffect(() => {
     if (cliKey !== 'dsh') return;
@@ -2461,6 +2468,19 @@ export function BotAgentSection(props: {
   }, [cliKey]);
   const modelCandidates = mergeModelCandidates(suggestions, detectedModels?.models ?? null);
   const detectedLiveCount = detectedModels?.source === 'live' ? detectedModels.models.length : 0;
+  const modelName = model.trim().toLowerCase();
+  const modelCapabilities = detectedModels?.modelCapabilities
+    ?.find(item => item.slug.toLowerCase() === modelName);
+  const serviceTierChoices = modelCapabilities
+    ? modelCapabilities.serviceTiers.filter((tier): tier is 'priority' | 'ultrafast' =>
+        tier === 'priority' || tier === 'ultrafast')
+    : [];
+  const serviceTierValues = [
+    ...serviceTierChoices,
+    ...((serviceTier && serviceTier !== 'default' && !serviceTierChoices.includes(serviceTier))
+      ? [serviceTier]
+      : []),
+  ];
 
   function updateCli(nextKey: string): void {
     const previousKey = cliKey;
@@ -2581,6 +2601,9 @@ export function BotAgentSection(props: {
         model,
         ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
+        ...(serviceTierTouched && (saveCliId === 'codex' || saveCliId === 'codex-app')
+          ? { serviceTier }
+          : {}),
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
         // never send it (the daemon drops any stored value for non-dsh CLIs).
@@ -2635,6 +2658,7 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          serviceTier: res.body.serviceTier ?? undefined,
           nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
           dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
@@ -2734,10 +2758,12 @@ export function BotAgentSection(props: {
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          serviceTier: res.body.serviceTier ?? undefined,
           nativeSubagentRuntime: savedNativePolicy ?? undefined,
           agentSelectionKey: res.body.selectionKey ?? 'riff',
         });
         setReasoningEffort(res.body.reasoningEffort ?? '');
+        setServiceTier(res.body.serviceTier ?? '');
         setNativeModelMode(nativePolicyModeFrom(savedNativePolicy?.model));
         setNativeModel(savedNativePolicy?.model?.mode === 'custom' ? savedNativePolicy.model.value : '');
         setNativeEffortMode(nativePolicyModeFrom(savedNativePolicy?.reasoningEffort));
@@ -3190,6 +3216,35 @@ export function BotAgentSection(props: {
                 })),
               ]}
               onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')}
+            />
+          </div>
+        </div>
+      )}
+      {isCodexSelection && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.agentServiceTierHelp')}>{tr('botDefaults.agentServiceTier')}</FieldTitle>
+            <DropdownField
+              dataInput="agentServiceTier"
+              ariaLabel={tr('botDefaults.agentServiceTier')}
+              value={serviceTier}
+              disabled={agentBusy}
+              options={[
+                { value: '', label: tr('botDefaults.agentServiceTierInherit') },
+                { value: 'default', label: tr('botDefaults.agentServiceTierDefault') },
+                ...serviceTierValues.map(value => ({
+                  value,
+                  label: value === 'priority'
+                    ? tr('botDefaults.agentServiceTierPriority')
+                    : value === 'ultrafast'
+                      ? tr('botDefaults.agentServiceTierUltrafast')
+                      : value,
+                })),
+              ]}
+              onChange={next => {
+                setServiceTier(next as 'default' | 'priority' | 'ultrafast');
+                setServiceTierTouched(true);
+              }}
             />
           </div>
         </div>
@@ -4764,12 +4819,24 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   );
 }
 
-export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse>; patchBot: PatchBot }) {
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
   const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState<'clean-input' | 'browser' | null>(null);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | 'no-progress' | null>(null);
+  // 无进展提醒（#1162）：null 配置 = 默认（开启，90s）。UI 状态与 bot 配置同步，
+  // 两个控件独立保存但总是提交完整对象，避免 toggle 顺手丢掉已配置的阈值。
+  const noProgress = props.bot.noProgressNotify ?? null;
+  const nudgeOn = noProgress?.enabled !== false;
+  const nudgeTimeoutSec = noProgress?.timeoutMs != null ? Math.round(noProgress.timeoutMs / 1000) : null;
+  const nudgeLabel = useId();
+  const [nudgeInput, setNudgeInput] = useState(nudgeTimeoutSec == null ? '' : String(nudgeTimeoutSec));
+  useEffect(() => {
+    const policy = props.bot.noProgressNotify ?? null;
+    const sec = policy?.timeoutMs != null ? Math.round(policy.timeoutMs / 1000) : null;
+    setNudgeInput(sec == null ? '' : String(sec));
+  }, [props.bot.noProgressNotify]);
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
   useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
@@ -4816,6 +4883,36 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
     }
   }
 
+  async function saveNoProgress(next: { enabled: boolean; timeoutMs?: number } | null): Promise<void> {
+    setBusy('no-progress');
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.noProgressNotify ?? null;
+        props.patchBot(props.bot.larkAppId, { noProgressNotify: saved });
+        const sec = saved?.timeoutMs != null ? Math.round(saved.timeoutMs / 1000) : null;
+        setNudgeInput(sec == null ? '' : String(sec));
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function saveNudgeTimeout(): void {
+    const sec = Number(nudgeInput);
+    if (!Number.isInteger(sec) || sec < 10 || sec > 3600) {
+      setStatus({ text: `✗ ${tr('botDefaults.noProgressNotifyTimeoutRange')}` });
+      return;
+    }
+    void saveNoProgress({ enabled: nudgeOn, timeoutMs: sec * 1000 });
+  }
+
   return (
     <section className="bd-section" data-codex-app-display>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
@@ -4838,6 +4935,36 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
         onChange={checked => void saveBrowser(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
+      <ToggleRow
+        checked={nudgeOn}
+        disabled={busy !== null}
+        dataAction="toggle-codex-app-no-progress"
+        title={tr('botDefaults.noProgressNotify')}
+        help={tr('botDefaults.noProgressNotifyHelp')}
+        onChange={checked => void saveNoProgress({ enabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) })}
+      />
+      <div className="bd-row">
+        <label htmlFor={nudgeLabel}>{tr('botDefaults.noProgressNotifyTimeoutLabel')}</label>
+        <input
+          id={nudgeLabel}
+          type="number"
+          min={10}
+          max={3600}
+          step={1}
+          data-input="no-progress-timeout-sec"
+          placeholder="90"
+          value={nudgeInput}
+          disabled={busy !== null || !nudgeOn}
+          onChange={event => setNudgeInput(event.currentTarget.value)}
+        />
+        <button type="button" className="primary" data-action="save-no-progress-timeout" disabled={busy !== null || !nudgeOn} onClick={saveNudgeTimeout}>
+          {tr('botDefaults.noProgressNotifyTimeoutSave')}
+        </button>
+        <button type="button" data-action="reset-no-progress" disabled={busy !== null || noProgress === null} onClick={() => void saveNoProgress(null)}>
+          {tr('botDefaults.noProgressNotifyReset')}
+        </button>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.noProgressNotifyTimeoutHelp')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>

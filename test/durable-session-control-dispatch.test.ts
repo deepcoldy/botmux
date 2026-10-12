@@ -166,4 +166,83 @@ describe('durable session control dispatch', () => {
     });
     await store.close();
   });
+
+  it('does not execute while another owner holds the canonical Session lease', async () => {
+    const store = makeStore(() => 10);
+    await store.acquireSessionLease({
+      sessionKey: 'om_root::cli_test',
+      ownerId: 'other-owner',
+      leaseDurationMs: 1_000,
+    });
+    const execute = vi.fn();
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: 'session-owner',
+      resolve: async () => ({
+        kind: 'target',
+        target: {
+          sessionKey: 'om_root::cli_test',
+          operationPayload: { action: 'close', sessionId: 'session-1' },
+          execute,
+          reconcile: vi.fn(),
+          commit: vi.fn(),
+        },
+      }),
+    });
+    const input = controlInput();
+
+    await expect(dispatch(input.control, input.context)).rejects.toThrow(/occupied by other-owner/);
+    expect(execute).not.toHaveBeenCalled();
+    await store.close();
+  });
+
+  it('never replays an operation whose effect attempt is still in progress', async () => {
+    const store = makeStore(() => 10);
+    const acquisition = await store.acquireSessionLease({
+      sessionKey: 'om_root::cli_test',
+      ownerId: 'session-owner',
+      leaseDurationMs: 1_000,
+    });
+    if (acquisition.kind !== 'acquired') throw new Error('expected Session lease');
+    const input = controlInput();
+    await store.enqueueControlOperation({
+      lease: acquisition.lease,
+      operation: {
+        operationId: input.control.operationId,
+        sessionKey: 'om_root::cli_test',
+        payload: { action: 'close', sessionId: 'session-1' },
+        createdAt: 1,
+      },
+    });
+    const begun = await store.beginControlOperationAttempt({
+      lease: acquisition.lease,
+      operationId: input.control.operationId,
+    });
+    expect(begun).toMatchObject({ kind: 'applied' });
+    const execute = vi.fn();
+    const commit = vi.fn();
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: 'session-owner',
+      resolve: async () => ({
+        kind: 'target',
+        target: {
+          sessionKey: 'om_root::cli_test',
+          operationPayload: { action: 'close', sessionId: 'session-1' },
+          execute,
+          reconcile: vi.fn(),
+          commit,
+        },
+      }),
+    });
+
+    await expect(dispatch(input.control, input.context)).rejects.toThrow(/attempt is still owned/);
+    expect(execute).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'attempting',
+      attempts: 1,
+    });
+    await store.close();
+  });
 });

@@ -24,13 +24,12 @@ import { PI_INITIAL_PROMPT_COMMAND } from '../src/adapters/cli/pi-initial-prompt
 process.env.BOTMUX_TIME_SCALE ??= '0.01';
 
 describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
-  it('arms only for Grok-class argv + SessionStart + reliable terminal', () => {
+  it('arms for Grok-class argv + reliable terminal (even without injectsReadyHook)', () => {
     const grok = createGrokAdapter('/bin/grok');
     expect(shouldArmSpawnArgvInitialPromptBusy({
       passesInitialPromptViaArgs: grok.passesInitialPromptViaArgs === true,
       preparedInitialPrompt: 'review this MR',
       queuedInitialPrompt: undefined,
-      injectsReadyHook: grok.injectsReadyHook === true,
       reliableTurnTerminal: grok.reliableTurnTerminal === true,
     })).toBe(true);
   });
@@ -44,7 +43,6 @@ describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
       passesInitialPromptViaArgs: riff.passesInitialPromptViaArgs === true,
       preparedInitialPrompt: 'hello from feishu',
       queuedInitialPrompt: undefined,
-      injectsReadyHook: riff.injectsReadyHook === true,
       reliableTurnTerminal: riff.reliableTurnTerminal === true,
     })).toBe(false);
   });
@@ -63,7 +61,6 @@ describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
       // Must NOT hold busy across first ready (first ready IS turn end).
       expect(shouldArmSpawnArgvInitialPromptBusy({
         ...base,
-        injectsReadyHook: adapter.injectsReadyHook === true,
         reliableTurnTerminal: adapter.reliableTurnTerminal === true,
       })).toBe(false);
     }
@@ -74,7 +71,6 @@ describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
       passesInitialPromptViaArgs: true,
       preparedInitialPrompt: 'argv-form',
       queuedInitialPrompt: 'queued command',
-      injectsReadyHook: true,
       reliableTurnTerminal: true,
     })).toBe(false);
   });

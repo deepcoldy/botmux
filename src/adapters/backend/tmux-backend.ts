@@ -1,4 +1,4 @@
-import * as pty from 'node-pty';
+import * as pty from '../../utils/pty.js';
 import { execSync, execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { randomBytes } from 'node:crypto';

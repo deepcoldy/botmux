@@ -31,6 +31,7 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { PricingOverrides } from './services/model-pricing.js';
@@ -61,6 +62,7 @@ import {
 } from './core/codex-browser-config.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
+import { normalizeNoProgressNotifyPolicy, type NoProgressNotifyPolicy } from './services/no-progress-notify-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import {
@@ -73,6 +75,7 @@ import {
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from './services/codex-service-tier.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
   type NativeSubagentRuntimePolicy,
@@ -1529,6 +1532,8 @@ export interface BotConfig {
   groupDefaultModels?: Record<string, GroupDefaultModels>;
   /** Explicit per-group FIFO for authenticated managed-session IM inputs. Default off; independent of Oncall. */
   groupSerialInput?: Record<string, boolean>;
+  /** Per-group inactivity auto-close; absent entries are disabled. */
+  groupIdleClose?: Record<string, GroupIdleCloseSettings>;
   /** Optional TraeX backend variant. Missing inherits TraeX global config. */
   modelBackendVariant?: 'standard' | 'max';
   /**
@@ -1556,6 +1561,8 @@ export interface BotConfig {
   dshRuntime?: 'official' | 'tui';
   /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Codex-only service tier for newly created sessions. Missing inherits Codex. */
+  serviceTier?: CodexServiceTier;
   /** Native TraeCode spawn_agent model/effort override policy. */
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /**
@@ -1568,6 +1575,16 @@ export interface BotConfig {
    * `additionalContext`, so the desktop user bubble stays clean. Missing/false
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
+  /**
+   * Codex App only: tune or mute the once-per-turn "no observable progress"
+   * nudge (#1162). `enabled: false` silences just the Lark push — the worker
+   * keeps polling, so the dashboard stalled projection and the
+   * `session.requires_attention` hook stay observable. `timeoutMs` overrides
+   * the 90s liveness window from the next worker fork (same live-read
+   * semantics as `turnTimeoutMs`) and never touches the reconciliation
+   * keep-pending window. Missing preserves the built-in defaults (on, 90s).
+   */
+  noProgressNotify?: NoProgressNotifyPolicy;
   /**
    * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
    * backed by the locally installed Codex Chrome/Edge extension plugin.
@@ -3850,6 +3867,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       apiOnly: entry.apiOnly === true || undefined,
       groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
+      noProgressNotify: entry.noProgressNotify === undefined ? undefined : normalizeNoProgressNotifyPolicy(entry.noProgressNotify),
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
@@ -3880,6 +3898,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
       groupSerialInput: normalizeGroupSerialInput(entry.groupSerialInput),
+      groupIdleClose: normalizeGroupIdleClose(entry.groupIdleClose),
       modelBackendVariant: isBackendVariantCliId(entryCliId)
         && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
         ? entry.modelBackendVariant
@@ -3899,6 +3918,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           entry.reasoningEffort,
         )
         ? entry.reasoningEffort : undefined,
+      serviceTier: isCodexServiceTierCliId(entryCliId) && isCodexServiceTier(entry.serviceTier)
+        ? entry.serviceTier
+        : undefined,
       nativeSubagentRuntime: entryCliId === 'traex' && normalizedNativeSubagentRuntime.ok
         ? normalizedNativeSubagentRuntime.value
         : undefined,

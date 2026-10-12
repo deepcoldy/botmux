@@ -1,5 +1,14 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — Change Codex App reasoning effort for future turns; active-turn updates require explicitly enabling the experimental step_model_switching feature (off by default; levels depend on the current model)',
+  'cmd.effort.applied': 'Future turns will use {effort}; the server accepted the active-turn update. If further inference steps occur in this turn, they can use the new setting; requests already issued keep their original parameters.',
+  'cmd.effort.future_only': 'Future turns will use {effort}; the active turn update was not confirmed (it may have completed or the API may be unavailable).',
+  'cmd.effort.step_model_switching_disabled': 'Future turns will use {effort}; the active turn was not updated because Codex has not enabled the experimental step_model_switching feature (off by default; Botmux does not enable it automatically). See /help and the slash command documentation for prerequisites.',
+  'cmd.effort.target_unavailable': 'Future turns will use {effort}; the target turn has ended or is unavailable and was not updated.',
+  'cmd.effort.invalid_without_choices': 'The current model advertises no supported reasoning effort levels; the setting cannot be changed.',
+  'cmd.effort.invalid': 'This model does not support that effort. Available: {choices}',
+  'cmd.effort.unavailable': 'The Codex App connection is not ready or is being replaced. Please retry shortly.',
+  'cmd.effort.error': 'The reasoning effort update could not be confirmed. Please retry shortly.',
   'worker.steer_accepted': 'Got it — guidance accepted',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': 'Terminal is starting',
@@ -64,6 +73,7 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 Relayed away',
   'card.status.selected': 'Selected',
   'card.status.waiting_screenshot': '_(Waiting for first screenshot…)_',
+  'card.status.screenshot_unavailable': '_(No screenshot is available. Refresh after the session resumes.)_',
   'card.status.truncated_prefix': '… (truncated)',
   'card.pending.detoured_title': 'Sent',
   'card.pending.detoured_body': 'The final reply was sent to another target.',
@@ -953,7 +963,8 @@ export const messages: Record<string, string> = {
   'ai.routing.intro': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output — you MUST reply via `botmux send`.',
   'ai.routing.usage_send': '- Send: `botmux send "message"`',
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
-  'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos` (see `botmux send --help`)',
+  'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos`; for size/layout choices run `botmux skill show botmux-send`',
+  'ai.routing.ask_wait': 'While botmux ask awaits a human, empty output is normal. Do not send Ctrl-C, kill the process, or cancel the waiting tool to finish the turn early. Reuse the original wait until an answer or normal timeout. Transport failures, timeouts and bot replies are not human approval. On Ask recovery, read the original task, question and solution revision; consume only the matching decision without replaying completed work.',
   'ai.routing.usage_helpers': '- Context: `botmux history`; collaborator bots: `botmux bots list`',
   'ai.routing.usage_silence': '- If the message is not for you, final reply must be just `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': 'A successful `botmux send` means delivered; ending with no visible terminal output is normal. If you see a "no visible output" nudge, that is a false alarm from the underlying CLI — do not resend unless `botmux send` itself errored.',
@@ -1191,6 +1202,8 @@ export const messages: Record<string, string> = {
   'card.action.compact_unsupported': '⚠️ Card compact is not supported here; send /compact directly',
   'card.action.close_refused': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry and the remote may still be running. Retry later.',
   'card.action.close_refused_with_task': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry. Remote session id: {taskId}. The remote may still be running; retry later.',
+  'card.action.close_residual': 'The session was closed locally, but the remote session was not cancelled ({taskId}). Manual cleanup is required.',
+  'card.action.close_residual_local': 'The session was closed locally and the remote session was cancelled, but a credentialed local subprocess may still be running ({taskId}). Inspect the host process manually.',
   'card.action.no_output': '(no output yet)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
@@ -1709,6 +1722,7 @@ export const messages: Record<string, string> = {
   'toast.action_received_no_repeat': 'Action received — please don’t click again',
   'toast.action_in_progress': 'Action in progress — please wait',
   'toast.action_received_bg': 'Action received — processing in the background',
+  'toast.card_update_busy_retry': 'The card is updating — please tap again in a moment',
   'toast.not_in_approver_list': 'You’re not on the approver list — no action taken',
 
   // Quote hint (injected into the CLI prompt)

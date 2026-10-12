@@ -1451,6 +1451,24 @@ describe('parseBotConfigsFromText — dshProfile cold read', () => {
   });
 });
 
+describe('parseBotConfigsFromText — serviceTier cold read', () => {
+  it('keeps valid tiers only on codex-family CLIs and drops invalid values', async () => {
+    const mod = await freshImport();
+    const [tui, app, unset, invalid, nonCodex] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'tier-tui', larkAppSecret: 's', cliId: 'codex', serviceTier: 'priority' },
+      { larkAppId: 'tier-app', larkAppSecret: 's', cliId: 'codex-app', serviceTier: 'ultrafast' },
+      { larkAppId: 'tier-unset', larkAppSecret: 's', cliId: 'codex' },
+      { larkAppId: 'tier-invalid', larkAppSecret: 's', cliId: 'codex', serviceTier: 'flex' },
+      { larkAppId: 'tier-claude', larkAppSecret: 's', cliId: 'claude-code', serviceTier: 'priority' },
+    ]));
+    expect(tui.serviceTier).toBe('priority');
+    expect(app.serviceTier).toBe('ultrafast');
+    expect(unset.serviceTier).toBeUndefined();
+    expect(invalid.serviceTier).toBeUndefined();
+    expect(nonCodex.serviceTier).toBeUndefined();
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {

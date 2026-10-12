@@ -358,6 +358,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return { attemptId: 'attempt-test', joined: false };
   }),
   isSessionTransferring: vi.fn(() => false),
+  updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
   sendWorkerSessionInput: vi.fn(() => true),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
@@ -604,7 +605,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -850,10 +851,11 @@ describe('/cli session selection', () => {
   it('persists a pending CLI selection and allows pre-freeze reselection', async () => {
     const ds = makeDaemonSession({
       hasHistory: false,
-      session: makeSession({ cliId: undefined, cliLaunchSnapshot: undefined }),
+      session: makeSession({ cliId: undefined, cliLaunchSnapshot: undefined, serviceTier: 'priority' }),
     });
     const deps = makeDeps(ds);
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), deps, LARK_APP_ID);
+    expect(ds.session.serviceTier).toBe('priority');
     expect(ds.session.cliLaunchSnapshot).toEqual(expect.objectContaining({
       state: 'pending', entryId: 'codex', cliId: 'codex', cliRuntime: expect.objectContaining({ id: 'codex' }), wrapperCli: null,
       cliPathOverride: null, launchShell: null, startupCommands: [],
@@ -861,6 +863,9 @@ describe('/cli session selection', () => {
     expect(ds.session.agentFrozen).toBeUndefined();
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli hermes'), deps, LARK_APP_ID);
     expect(ds.session.cliLaunchSnapshot?.entryId).toBe('hermes');
+    expect(ds.session.serviceTier).toBe('priority');
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), deps, LARK_APP_ID);
+    expect(ds.session.serviceTier).toBe('priority');
   });
 
   it('rejects selection after history and does not mutate the snapshot', async () => {
@@ -6960,6 +6965,7 @@ describe('handleCommand', () => {
           // remote attach must clear it before the new fork.
           wrapperCli: 'old-wrapper codex',
           agentFrozen: true,
+          serviceTier: 'priority',
         }),
       });
       const deps = makeDeps(ds);
@@ -6972,6 +6978,7 @@ describe('handleCommand', () => {
       expect(ds.session.existingAppServerEndpoint)
         .toBe('unix:///home/testuser/.codex/app-server-control/app-server-control.sock');
       expect(ds.session.wrapperCli).toBeUndefined();
+      expect(ds.session.serviceTier).toBe('inherit');
       expect(ds.session.agentFrozen).toBeUndefined();
       expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
@@ -8990,5 +8997,62 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
     await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('发送失败');
+  });
+});
+
+describe('Codex App /effort command', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    vi.mocked(getBot).mockImplementation(defaultGetBot as typeof getBot);
+  });
+
+  it.each(['applied', 'future_only', 'error', 'unavailable', 'invalid'] as const)('replies with the native %s result without creating business input', async status => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }), lastScreenStatus: 'working' });
+    const deps = makeDeps(ds);
+    vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status, choices: ['low', 'high'] });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort HIGH'), deps, LARK_APP_ID);
+    expect(updateCodexAppEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t(`cmd.effort.${status}`, { effort: 'high', choices: 'low, high' }), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+  });
+
+  it.each(['step_model_switching_disabled', 'target_unavailable'] as const)('explains future-only updates caused by %s', async reason => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status: 'future_only', reason });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t(`cmd.effort.${reason}`, { effort: 'high' }), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+  });
+
+  it.each([{ choices: [] }, { choices: undefined }])('omits the choices label when no levels are advertised ($choices)', async ({ choices }) => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status: 'invalid', choices });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t('cmd.effort.invalid_without_choices'), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it.each(['/effort', '/effort invalid', '/effort high extra'])('shows usage for %s', async text => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+    expect(updateCodexAppEffort).not.toHaveBeenCalled();
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('cmd.effort.usage'), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('rejects unauthorized callers and missing sessions', async () => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('daemon.cmd_allowed_users_only', { cmd: '/effort' }), undefined, LARK_APP_ID, 'msg_001');
+    const missing = makeDeps();
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), missing, LARK_APP_ID);
+    expect(missing.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('cmd.no_active_session'), undefined, LARK_APP_ID, 'msg_001');
+    expect(updateCodexAppEffort).not.toHaveBeenCalled();
   });
 });

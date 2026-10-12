@@ -13,6 +13,7 @@ import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effec
 import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
+import { hasLarkToolBinding } from './lark-tool-binding.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
@@ -43,7 +44,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -1754,6 +1755,30 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/effort': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
+          break;
+        }
+        const effort = message.content.replace(/^\/effort\b/i, '').trim().toLowerCase();
+        if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) {
+          await sessionReply(rootId, t('cmd.effort.usage', undefined, loc));
+          break;
+        }
+        const result = await updateCodexAppEffort(ds, effort);
+        const replyKey = result.status === 'future_only' && result.reason
+          ? `cmd.effort.${result.reason}`
+          : result.status === 'invalid' && !result.choices?.length
+            ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
+        await sessionReply(rootId, t(replyKey, {
+          effort, choices: result.choices?.join(', ') ?? '',
+        }, loc));
+        break;
+      }
       case '/cli': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2879,6 +2904,9 @@ export async function handleCommand(
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
                   chatContext: current.pendingChatContext,
+                  // Pending repo selection still owns the original fresh
+                  // launch; the paired forkWorker call does not resume.
+                  larkToolResume: false,
                 },
               );
             }
@@ -3639,10 +3667,21 @@ export async function handleCommand(
         // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
         // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
         const loginOpenId = message.senderId;
+        // Only sessions created with the new entry use the receiving app here.
+        // Existing sessions keep the original login flow below.
+        if (ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId)
+          && (subCmd === '' || subCmd === 'lark')) {
+          const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand), [], loginOpenId);
+          await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
+          break;
+        }
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
-          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+          if (ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId)) {
+            lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
+          } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
@@ -3670,8 +3709,11 @@ export async function handleCommand(
         // matching side suppressing the other.
         if (subCmd === 'done' || subCmd === '完成') {
           const doneLines: string[] = [];
-          const larkPending = pendingLarkCliChallenge(loginOpenId);
-          if (larkPending) {
+          const boundLark = !!ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId);
+          const larkPending = boundLark ? null : pendingLarkCliChallenge(loginOpenId);
+          if (boundLark) {
+            doneLines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
+          } else if (larkPending) {
             const { state, detail } = await completeLarkCliLogin(loginOpenId);
             doneLines.push(state === 'authorized'
               ? t('cmd.login.lark_ok', undefined, loc)
@@ -5914,6 +5956,8 @@ export async function handleCommand(
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
+          ...((ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId) === 'codex-app'
+            ? [t('cmd.effort.usage', undefined, loc)] : []),
           t('help.close', { cliName }, loc),
           t('help.dismiss', undefined, loc),
           t('help.cleanup_wt', undefined, loc),
@@ -6193,6 +6237,7 @@ export async function startCodexAppThreadSession(
       delete current.session.cliLaunchMode;
       delete current.session.model;
       delete current.session.reasoningEffort;
+      current.session.serviceTier = 'inherit';
       delete current.session.agentFrozen;
     } else {
       delete current.session.existingAppServerEndpoint;
@@ -6307,6 +6352,7 @@ export async function startAdoptSession(
     current.workingDir = target.cwd;
     current.session.workingDir = target.cwd;
     current.session.title = `Adopt: ${project}`;
+    current.session.serviceTier = 'inherit';
     current.adoptedFrom = {
       source: zellij ? 'zellij' : target.source,
       tmuxTarget: zellij ? undefined : target.tmuxTarget,
@@ -6583,7 +6629,13 @@ export async function startForkSubtopicSession(
           { name: bot.botName, openId: bot.botOpenId },
           loc,
           triggerSender,
-          { larkAppId: appId, chatId },
+          {
+            larkAppId: appId,
+            chatId,
+            // /fork creates a new child session and never resumes an existing
+            // worker generation for this opening.
+            larkToolResume: false,
+          },
         ),
       },
     );
