@@ -17,7 +17,7 @@
  */
 import {
   DAEMON_COMMANDS,
-  EXISTING_SESSION_ONLY_DAEMON_COMMANDS,
+  commandSpec,
   MULTILINE_COMMANDS,
   ROUTE_SPECIAL_COMMANDS,
   SESSIONLESS_DAEMON_COMMANDS,
@@ -180,13 +180,11 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   const special = ROUTE_SPECIAL_COMMANDS.get(cmd);
   if (special) return { kind: 'special', cmd, content, handler: special };
 
-  // Codex App has no TUI: settings are a control request, never model input.
-  if (input.cliId === 'codex-app' && cmd === '/effort') {
-    return { kind: 'daemon', cmd, content, sessionPolicy: 'existing_only' };
-  }
+  const spec = commandSpec(cmd);
+  const cliCommand = spec?.cliId !== undefined && spec.cliId === input.cliId;
 
   // ④ 透传闸（先于 DAEMON_COMMANDS；两集合恒不相交，顺序因此不可观测）。
-  if (input.passthrough.has(cmd)) {
+  if (!cliCommand && input.passthrough.has(cmd)) {
     const hasSession = phaseHasSession(input.phase);
     if (!hasSession && input.coldStartPassthrough.has(cmd)) {
       return { kind: 'passthrough', cmd, content, delivery: 'cold_start' };
@@ -194,12 +192,12 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
     return { kind: 'passthrough', cmd, content, delivery: 'to_session' };
   }
 
-  // ⑤ DAEMON_COMMANDS。
-  if (DAEMON_COMMANDS.has(cmd)) {
+  // ⑤ 全局 daemon 命令，以及 schema 中匹配当前 CLI 的命令。
+  if (cliCommand || DAEMON_COMMANDS.has(cmd)) {
     if (isSessionlessCommandInvocation(cmd, content)) {
       return { kind: 'daemon', cmd, content, sessionPolicy: 'sessionless' };
     }
-    if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
+    if (spec?.sessionPolicy === 'existingOnly') {
       return { kind: 'daemon', cmd, content, sessionPolicy: 'existing_only' };
     }
     return { kind: 'daemon', cmd, content, sessionPolicy: phaseHasSession(input.phase) ? 'existing' : 'precreate' };
