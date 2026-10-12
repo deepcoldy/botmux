@@ -70,12 +70,18 @@ describe('mcode ACP wire client', () => {
 
   it('reuses an answered request slot while the other seven requests are still pending', async () => {
     const f = fixture(); const waiting = vi.fn(); let release: (value: unknown) => void = () => {};
+    let releaseFirst: (value: unknown) => void = () => {};
     const response = { outcome: { outcome: 'selected', optionId: 'deny' } };
     const answer = new Promise(resolve => { release = resolve; });
+    const firstAnswer = new Promise(resolve => { releaseFirst = resolve; });
     const input = vi.fn().mockImplementation((_method, params) => {
-      if (params.toolCall.title === 'Write 1') return Promise.resolve(response);
+      if (params.toolCall.title === 'Write 1') return firstAnswer;
+      // Wait for all eight requests to arrive before answering the first.
+      // NDJSON writes can span multiple stdout chunks under parallel load.
+      if (input.mock.calls.length === 8) releaseFirst(response);
       if (params.toolCall.title === 'Write 9') {
         expect(input).toHaveBeenCalledTimes(9);
+        expect(waiting.mock.calls.map(c => c[0])).toEqual([true]);
         expect(f.calls().filter(c => c.message?.id?.startsWith?.('burst-')).map(c => c.message.id)).toEqual(['burst-1']);
         release(response);
       }
