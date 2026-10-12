@@ -83,3 +83,12 @@ describe('messageListenerConfigFromUpdate — disabled drafts persist', () => {
     expect(config?.replyPolicy).toEqual({ mode: 'thread', sessionMode: 'per_message' });
   });
 });
+
+describe('listener automatic close opt-in', () => {
+  it.each([true, false, undefined, 'true', 1])('normalizes and persists strict boolean %s', value => {
+    const update = sanitizeMessageListenerUpdate({ enabled: true, prompt: 'inspect', autoCloseAfterCompletion: value });
+    expect(update).toBeDefined();
+    const saved = messageListenerConfigFromUpdate(update!);
+    expect(saved?.autoCloseAfterCompletion === true).toBe(value === true);
+  });
+});

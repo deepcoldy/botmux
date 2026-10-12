@@ -1008,3 +1008,15 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
     expect(extractListenerMessageText(messageWithoutMention)).toBe('线上报警请关注');
   });
 });
+
+describe('listener completion policy', () => {
+  it.each([true, false, undefined])('propagates opt-in %s to a matched message', enabled => {
+    const match = evaluateMessageListener({
+      bot: bot({ globalMessageListener: { enabled: true, prompt: 'inspect', autoCloseAfterCompletion: enabled } }),
+      chatId: 'oc_chat', message: textMessage(), senderOpenId: 'ou_user',
+      senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    });
+    expect(match).not.toBeNull();
+    expect(match?.autoCloseAfterCompletion === true).toBe(enabled === true);
+  });
+});

@@ -645,6 +645,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       'tag', 0, onComplete, () => true);
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
 
+    // Sending the card starts an async delivery/persistence chain. Wait for its
+    // completion before changing ownership to exercise the saved write fence.
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_reply'));
     expect(beforeWrite).toBeTypeOf('function');
     bot.config.apiOnly = true;
     await expect(Promise.resolve().then(() => beforeWrite!()))
