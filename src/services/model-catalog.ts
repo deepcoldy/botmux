@@ -4,8 +4,9 @@
  * Dashboard 模型选择器的后端目录服务：把「某个 CLI 选择键能用哪些模型」拆成两层——
  *   - static：与适配器共用的模型元数据（或 ttadk 网关的建议列表），shell-free、
  *     同步读取，不构造适配器（部分构造器会同步解析 CLI 路径）；
- *   - live：适配器可选的 detectModels() 按需探测（如 `traex debug models`），
- *     单进程短超时、fail-soft，成功结果按 key 缓存 10 分钟。
+ *   - live：适配器可选的 detectModels()/detectModelCapabilities() 按需探测
+ *     （如 `traex debug models`），单进程短超时、fail-soft，成功结果按 key 缓存
+ *     10 分钟；能力目录只由实现了丰富探测的适配器提供。
  *
  * 只探测「当前选中的单个 CLI」，绝不做全量扫描（20+ CLI 各自 shell out 会让
  * 打开表单卡到不可用）。所有公开函数都 fail-soft：任何异常都回退到静态候选，
@@ -19,8 +20,10 @@ import {
 } from '../setup/cli-selection.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { CLI_MODEL_CHOICES } from '../adapters/cli/model-choices.js';
+import type { DebugModelCapabilities } from '../adapters/cli/model-catalog-json.js';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { detectAidenCodexModels } from './aiden-model-catalog.js';
+import { createHash } from 'node:crypto';
 
 export type ModelSource = 'static' | 'live';
 
@@ -35,6 +38,15 @@ export interface DetectModelsOptions {
   readonly adapterFactory?: (cliId: CliId) => CliAdapter;
   /** Aiden AIPROXY 探测器注入，默认调用 `aiden x models --codex --json`。 */
   readonly aidenCodexDetector?: () => Promise<readonly string[] | null>;
+  /** Bot-specific runtime identity; never returned to clients. */
+  readonly runtimeContext?: string;
+  /** Bot-specific environment for a capability probe. */
+  readonly probeEnv?: NodeJS.ProcessEnv;
+}
+
+export interface DetectedModelCatalog {
+  readonly models: readonly string[];
+  readonly modelCapabilities?: readonly DebugModelCapabilities[];
 }
 
 // ─── 静态候选 ────────────────────────────────────────────────────────────────
@@ -69,19 +81,20 @@ interface DetectCacheEntry {
   /** 探测完成时刻（epoch millis）。 */
   readonly at: number;
   readonly models: readonly string[];
+  readonly modelCapabilities?: readonly DebugModelCapabilities[];
 }
 
 /**
- * On-demand live 探测的核心实现，缓存表由调用方持有——模块级单例给生产用，
+ * On-demand live 目录探测的核心实现，缓存表由调用方持有——模块级单例给生产用，
  * {@link createModelCatalog} 给需要隔离缓存的测试用。
  * 绝不抛异常：未知 key / ttadk 网关项 / 适配器无 detectModels / 任何异常 → null。
  */
-async function detectModelsWith(
+async function detectModelCatalogWith(
   key: string,
   opts: DetectModelsOptions | undefined,
   cache: Map<string, DetectCacheEntry>,
-  inFlight: Map<string, Promise<readonly string[] | null>>,
-): Promise<readonly string[] | null> {
+  inFlight: Map<string, Promise<DetectedModelCatalog | null>>,
+): Promise<DetectedModelCatalog | null> {
   const now = opts?.now ?? (() => Date.now());
   const factory = opts?.adapterFactory ?? ((cliId: CliId) => createCliAdapterSync(cliId));
   try {
@@ -90,37 +103,58 @@ async function detectModelsWith(
     if (!opt || isTtadkWrapper(opt.wrapperCli)) return null;
 
     // TTL 内的成功缓存直接复用。
-    const cached = cache.get(opt.key);
+    const envKey = opts?.probeEnv
+      ? createHash('sha256').update(JSON.stringify(
+        Object.keys(opts.probeEnv).sort().map(key => [key, opts.probeEnv![key]]),
+      )).digest('hex')
+      : '';
+    const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}`;
+    const cached = cache.get(cacheKey);
     if (cached && now() - cached.at < MODEL_DETECT_TTL_MS) {
-      return cached.models;
+      return { models: cached.models, ...(cached.modelCapabilities ? { modelCapabilities: cached.modelCapabilities } : {}) };
     }
 
     // 同一 key 并发调用复用 in-flight Promise（去重）。
-    const pending = inFlight.get(opt.key);
+    const pending = inFlight.get(cacheKey);
     if (pending) return pending;
 
-    const promise = (async (): Promise<readonly string[] | null> => {
+    const promise = (async (): Promise<DetectedModelCatalog | null> => {
       try {
-        const models = opt.key === 'aiden-x-codex'
-          ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
-          : await (async () => {
-            const adapter = factory(opt.cliId);
-            // 适配器未声明 detectModels = 该 CLI 无法枚举模型 → null。
-            return adapter.detectModels ? adapter.detectModels() : null;
-          })();
-        // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
-        if (models && models.length > 0) {
-          cache.set(opt.key, { at: now(), models: [...models] });
+        if (opt.key === 'aiden-x-codex') {
+          const models = await (opts?.aidenCodexDetector ?? detectAidenCodexModels)();
+          if (models === null) return null;
+          return { models: [...models] };
         }
-        return models;
+        const adapter = factory(opt.cliId);
+        const capabilities = adapter.detectModelCapabilities
+          ? await adapter.detectModelCapabilities({ env: opts?.probeEnv })
+          : undefined;
+        const models = adapter.detectModelCapabilities
+          ? capabilities?.map(model => model.slug) ?? null
+          : adapter.detectModels
+            ? await adapter.detectModels()
+            : null;
+        // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
+        if (models === null) return null;
+        if (models.length === 0) return { models: [] };
+        const detected = {
+          models: [...models],
+          // A wrapper can remap models or credentials. Until its probe runs
+          // through the real launcher, expose only the legacy slug list.
+          ...(!opt.wrapperCli && capabilities && capabilities.length > 0
+            ? { modelCapabilities: capabilities }
+            : {}),
+        };
+        cache.set(cacheKey, { at: now(), ...detected });
+        return detected;
       } catch {
         return null;
       } finally {
-        inFlight.delete(opt.key);
+        inFlight.delete(cacheKey);
       }
     })();
 
-    inFlight.set(opt.key, promise);
+    inFlight.set(cacheKey, promise);
     return promise;
   } catch {
     return null;
@@ -129,7 +163,7 @@ async function detectModelsWith(
 
 /** 进程级单例的缓存表（生产路径共用）。 */
 const singletonCache = new Map<string, DetectCacheEntry>();
-const singletonInFlight = new Map<string, Promise<readonly string[] | null>>();
+const singletonInFlight = new Map<string, Promise<DetectedModelCatalog | null>>();
 
 /**
  * On-demand live 探测（异步，fail-soft，绝不抛异常）。
@@ -142,7 +176,7 @@ export function detectModels(
   key: string,
   opts?: DetectModelsOptions,
 ): Promise<readonly string[] | null> {
-  return detectModelsWith(key, opts, singletonCache, singletonInFlight);
+  return detectModelCatalogWith(key, opts, singletonCache, singletonInFlight).then(detected => detected?.models ?? null);
 }
 
 /**
@@ -151,14 +185,15 @@ export function detectModels(
  */
 export interface ModelCatalog {
   detectModels(key: string, opts?: DetectModelsOptions): Promise<readonly string[] | null>;
+  detectModelCatalog(key: string, opts?: DetectModelsOptions): Promise<DetectedModelCatalog | null>;
 }
 
 export function createModelCatalog(): ModelCatalog {
   const cache = new Map<string, DetectCacheEntry>();
-  const inFlight = new Map<string, Promise<readonly string[] | null>>();
+  const inFlight = new Map<string, Promise<DetectedModelCatalog | null>>();
   return {
-    detectModels: (key: string, opts?: DetectModelsOptions) =>
-      detectModelsWith(key, opts, cache, inFlight),
+    detectModels: (key, opts) => detectModelCatalogWith(key, opts, cache, inFlight).then(detected => detected?.models ?? null),
+    detectModelCatalog: (key, opts) => detectModelCatalogWith(key, opts, cache, inFlight),
   };
 }
 
@@ -205,6 +240,7 @@ export interface ModelChoicesResponse {
   readonly models: string[];
   readonly source: ModelSource;
   readonly detectedAt: number;
+  readonly modelCapabilities?: readonly DebugModelCapabilities[];
 }
 
 export async function buildModelChoicesResponse(
@@ -213,7 +249,12 @@ export async function buildModelChoicesResponse(
 ): Promise<ModelChoicesResponse> {
   const now = opts?.now ?? (() => Date.now());
   const staticChoices = staticModelChoices(key);
-  const live = await detectModels(key, opts);
-  const { models, source } = mergeModelChoices(staticChoices, live);
-  return { models, source, detectedAt: now() };
+  const live = await detectModelCatalogWith(key, opts, singletonCache, singletonInFlight);
+  const { models, source } = mergeModelChoices(staticChoices, live?.models ?? null);
+  return {
+    models,
+    source,
+    detectedAt: now(),
+    ...(live?.modelCapabilities && live.modelCapabilities.length > 0 ? { modelCapabilities: live.modelCapabilities } : {}),
+  };
 }

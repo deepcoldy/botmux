@@ -6193,7 +6193,7 @@ export async function startCodexAppThreadSession(
       delete current.session.cliLaunchMode;
       delete current.session.model;
       delete current.session.reasoningEffort;
-      delete current.session.serviceTier;
+      current.session.serviceTier = 'inherit';
       delete current.session.agentFrozen;
     } else {
       delete current.session.existingAppServerEndpoint;
@@ -6308,7 +6308,7 @@ export async function startAdoptSession(
     current.workingDir = target.cwd;
     current.session.workingDir = target.cwd;
     current.session.title = `Adopt: ${project}`;
-    delete current.session.serviceTier;
+    current.session.serviceTier = 'inherit';
     current.adoptedFrom = {
       source: zellij ? 'zellij' : target.source,
       tmuxTarget: zellij ? undefined : target.tmuxTarget,

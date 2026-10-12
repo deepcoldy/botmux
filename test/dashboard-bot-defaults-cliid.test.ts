@@ -238,7 +238,7 @@ describe('Codex-compatible runtime editor', () => {
       });
       expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: '' }]);
 
-      act(() => picker.props.onChange('ultrafast'));
+      act(() => picker.props.onChange('default'));
       await act(async () => {
         root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
         await Promise.resolve();
@@ -248,10 +248,90 @@ describe('Codex-compatible runtime editor', () => {
         cliId: 'codex',
         model: 'gpt-6.1-sol',
         reasoningEffort: '',
-        serviceTier: 'ultrafast',
+        serviceTier: 'default',
       });
     } finally {
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('renders service tier options from the selected model capabilities and keeps a saved value', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            models: ['gpt-6-astra'],
+            source: 'live',
+            modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority', 'experimental'] }],
+          }),
+        } as any;
+      }
+      return { ok: true, status: 200, json: async () => ({ profiles: [] }) } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-6-astra', serviceTier: 'ultrafast' });
+      await flushEffects();
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.options.map((option: any) => option.value)).toEqual(['', 'default', 'priority', 'ultrafast']);
+      expect(picker.props.options.map((option: any) => option.label)).toContain('Fast');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('falls back to inherit and standard when the selected model is absent from the capabilities', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'unknown-model' });
+      await flushEffects();
+      const picker = root.findByProps({ dataInput: 'agentServiceTier' });
+      expect(picker.props.options.map((option: any) => option.value)).toEqual(['', 'default']);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('refetches model capabilities whenever the saved bot row identity changes', async () => {
+    const previousFetch = globalThis.fetch;
+    const modelFetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+      }),
+    } as any));
+    globalThis.fetch = modelFetch;
+    try {
+      const bot = { larkAppId: 'cli_runtime', cliId: 'codex', model: 'gpt-6-astra' };
+      const { renderer } = renderAgent(bot);
+      await flushEffects();
+      expect(modelFetch).toHaveBeenCalledTimes(1);
+
+      renderer.update(React.createElement(BotAgentSection, {
+        bot: { ...bot, env: '', envKeys: ['OPENAI_API_KEY'] },
+        sessionFallback: 'codex',
+        cliState,
+        patchBot: vi.fn(),
+      }));
+      await flushEffects();
+      expect(modelFetch).toHaveBeenCalledTimes(2);
+      expect(modelFetch.mock.calls[1]?.[0]).toBe('/api/cli-options/models?key=codex&bot=cli_runtime');
+    } finally {
+      globalThis.fetch = previousFetch;
     }
   });
 

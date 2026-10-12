@@ -26,6 +26,11 @@ export type CliOptionsState = {
   ttadkModelSuggestions: string[];
 };
 
+export type ModelCapabilities = {
+  slug: string;
+  serviceTiers: string[];
+};
+
 /** Keep the browser payload contract tied to the daemon's canonical schema. */
 export type CliRuntimeConfig = SharedCliRuntimeConfig;
 export type CliRuntimeUpdateProvider = NonNullable<SharedCliRuntimeConfig['update']>['provider'];
@@ -306,14 +311,25 @@ export function mergeModelCandidates(
  */
 export async function fetchDetectedModels(
   key: string,
-): Promise<{ models: string[]; source: 'live' | 'static' } | null> {
+  botId?: string,
+): Promise<{ models: string[]; source: 'live' | 'static'; modelCapabilities?: ModelCapabilities[] } | null> {
   try {
-    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}`);
+    const botQuery = botId ? `&bot=${encodeURIComponent(botId)}` : '';
+    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}${botQuery}`);
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !body || !Array.isArray(body.models)) return null;
     const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
     const source: 'live' | 'static' = body.source === 'live' ? 'live' : 'static';
-    return { models, source };
+    const modelCapabilities = Array.isArray(body.modelCapabilities)
+      ? body.modelCapabilities.flatMap((item: unknown) => {
+          if (typeof item !== 'object' || item === null) return [];
+          const { slug, serviceTiers } = item as { slug?: unknown; serviceTiers?: unknown };
+          if (typeof slug !== 'string' || !Array.isArray(serviceTiers)) return [];
+          const tiers = serviceTiers.filter((tier): tier is string => typeof tier === 'string');
+          return [{ slug, serviceTiers: tiers }];
+        })
+      : undefined;
+    return { models, source, ...(modelCapabilities ? { modelCapabilities } : {}) };
   } catch {
     return null;
   }

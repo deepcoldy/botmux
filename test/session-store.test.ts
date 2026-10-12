@@ -5011,6 +5011,17 @@ describe('session service tier snapshot', () => {
     expect(getSession('tier_legacy_missing')?.serviceTier).toBeUndefined();
   });
 
+  it('persists an intentional inherit clear across store reloads', () => {
+    const appId = 'cli_tier_intentional_inherit';
+    registerCodexInstanceBot({ larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any);
+    init(appId);
+    const session = createSession('oc_tier_clear', 'om_tier_clear', 'clear');
+    session.serviceTier = 'inherit';
+    updateSession(session);
+    init(appId);
+    expect(getSession(session.sessionId)?.serviceTier).toBe('inherit');
+  });
+
   it('re-snapshots forks from the target Bot instead of copying the source session', () => {
     const appId = 'cli_tier_fork';
     const bot = { larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any;

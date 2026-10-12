@@ -2380,11 +2380,14 @@ function sessionAgentConfig(
       : undefined;
     const launchShell = selected.launchShell ?? undefined;
     const startupCommands = [...selected.startupCommands];
-    const serviceTier = ds.session.serviceTier !== undefined && ds.session.serviceTier !== 'inherit'
+    const serviceTier = isCodexServiceTierCliId(selected.cliId)
+      && ds.session.serviceTier !== undefined && ds.session.serviceTier !== 'inherit'
       ? ds.session.serviceTier
       : undefined;
-    if (serviceTier && !isCodexServiceTierCliId(selected.cliId)) {
-      throw new Error(`CLI selection rejected: ${selected.cliId} cannot use serviceTier ${serviceTier}`);
+    if (!isCodexServiceTierCliId(selected.cliId)
+        && ds.session.serviceTier !== undefined && ds.session.serviceTier !== 'inherit') {
+      ds.session.serviceTier = 'inherit';
+      if (selected.state !== 'pending') sessionStore.updateSession(ds.session);
     }
     if (selected.state === 'pending') {
       selected.state = 'resolved';

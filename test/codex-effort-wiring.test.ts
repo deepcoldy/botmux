@@ -132,7 +132,7 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     const commandHandler = readFileSync(new URL('../src/core/command-handler.ts', import.meta.url), 'utf8');
     expect(source).toContain("cfg.adoptMode && cfg.serviceTier");
     expect(source).toContain("cfg.serviceTier !== undefined");
-    expect(commandHandler.match(/delete current\.session\.serviceTier;/g)).toHaveLength(2);
+    expect(commandHandler.match(/current\.session\.serviceTier = 'inherit';/g)).toHaveLength(2);
   });
 
   it('freezes the per-Bot default onto a newly created session for supported CLIs', () => {

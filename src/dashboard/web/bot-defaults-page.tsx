@@ -2440,7 +2440,7 @@ export function BotAgentSection(props: {
   const suggestions = modelSuggestionsForOption(option, cliState);
   const modelDisabledByCli = option?.gateway === 'ttadk' && option.acceptsModel === false;
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
-  const [detectedModels, setDetectedModels] = useState<{ models: string[]; source: 'live' | 'static' } | null>(null);
+  const [detectedModels, setDetectedModels] = useState<Awaited<ReturnType<typeof fetchDetectedModels>>>(null);
   const [detectingModels, setDetectingModels] = useState(false);
   useEffect(() => {
     if (option?.gateway === 'ttadk') {
@@ -2450,13 +2450,15 @@ export function BotAgentSection(props: {
     }
     // stale 标志防卸载/竞态：cliKey 快速切换时旧响应不得覆盖新 CLI 的候选。
     let stale = false;
+    setDetectedModels(null);
     setDetectingModels(true);
-    fetchDetectedModels(cliKey)
+    fetchDetectedModels(cliKey, bot.larkAppId)
       .then(result => { if (!stale) setDetectedModels(result); })
       .finally(() => { if (!stale) setDetectingModels(false); });
     return () => { stale = true; };
-    // 只按 cliKey 重新探测；cliState 刷新带来的静态候选经 suggestions 合入，无需重探。
-  }, [cliKey]);
+    // Runtime/path/env-policy/env edits save into the bot row first. A new row
+    // identity is the probe revision; env values themselves stay write-only.
+  }, [cliKey, bot]);
   // Fetch DSH profile list when dsh is selected.
   useEffect(() => {
     if (cliKey !== 'dsh') return;
@@ -2466,6 +2468,19 @@ export function BotAgentSection(props: {
   }, [cliKey]);
   const modelCandidates = mergeModelCandidates(suggestions, detectedModels?.models ?? null);
   const detectedLiveCount = detectedModels?.source === 'live' ? detectedModels.models.length : 0;
+  const modelName = model.trim().toLowerCase();
+  const modelCapabilities = detectedModels?.modelCapabilities
+    ?.find(item => item.slug.toLowerCase() === modelName);
+  const serviceTierChoices = modelCapabilities
+    ? modelCapabilities.serviceTiers.filter((tier): tier is 'priority' | 'ultrafast' =>
+        tier === 'priority' || tier === 'ultrafast')
+    : [];
+  const serviceTierValues = [
+    ...serviceTierChoices,
+    ...((serviceTier && serviceTier !== 'default' && !serviceTierChoices.includes(serviceTier))
+      ? [serviceTier]
+      : []),
+  ];
 
   function updateCli(nextKey: string): void {
     const previousKey = cliKey;
@@ -3217,8 +3232,14 @@ export function BotAgentSection(props: {
               options={[
                 { value: '', label: tr('botDefaults.agentServiceTierInherit') },
                 { value: 'default', label: tr('botDefaults.agentServiceTierDefault') },
-                { value: 'priority', label: tr('botDefaults.agentServiceTierPriority') },
-                { value: 'ultrafast', label: tr('botDefaults.agentServiceTierUltrafast') },
+                ...serviceTierValues.map(value => ({
+                  value,
+                  label: value === 'priority'
+                    ? tr('botDefaults.agentServiceTierPriority')
+                    : value === 'ultrafast'
+                      ? tr('botDefaults.agentServiceTierUltrafast')
+                      : value,
+                })),
               ]}
               onChange={next => {
                 setServiceTier(next as 'default' | 'priority' | 'ultrafast');

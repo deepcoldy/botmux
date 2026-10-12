@@ -611,6 +611,24 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     expect(cfg.model).toBe('gpt-5.6');          // same CLI → live bot model applies (== /restart)
   });
 
+  it('clears a Codex service tier only when a cross-CLI selection resolves', () => {
+    const ds = selectedDs('claude-code', {});
+    ds.session.serviceTier = 'priority';
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+    expect(cfg.cliId).toBe('claude-code');
+    expect(cfg.serviceTier).toBeUndefined();
+    expect(ds.session.serviceTier).toBe('inherit');
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('keeps a Codex service tier for a same-CLI selection', () => {
+    const ds = selectedDs('codex', {});
+    ds.session.serviceTier = 'priority';
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+    expect(cfg.serviceTier).toBe('priority');
+    expect(ds.session.serviceTier).toBe('priority');
+  });
+
   it('honors a per-trigger spawnModelOverride on a /cli session', () => {
     const ds = selectedDs('codex', { spawnModelOverride: 'gpt-5.6-terra' } as any);
     const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });

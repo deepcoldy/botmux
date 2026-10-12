@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const execFileCalls: { file: string; args: string[] }[] = [];
+const execFileCalls: { file: string; args: string[]; env?: NodeJS.ProcessEnv }[] = [];
 let execFileStdout = '';
 let execFileError: Error | null = null;
 
@@ -24,10 +24,10 @@ vi.mock('node:child_process', () => {
     execFile: (
       file: string,
       args: string[],
-      _opts: unknown,
+      opts: { env?: NodeJS.ProcessEnv },
       cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
     ) => {
-      execFileCalls.push({ file, args });
+      execFileCalls.push({ file, args, env: opts.env });
       if (execFileError) cb(execFileError);
       else cb(null, { stdout: execFileStdout, stderr: '' });
     },
@@ -36,6 +36,7 @@ vi.mock('node:child_process', () => {
 
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 // 绝对路径：resolveCommand 对绝对路径原样返回（registry.ts），detectModels
 // 不会 shell out，mock 只需覆盖 execFile。
@@ -58,11 +59,34 @@ describe('codex detectModels（mock child_process）', () => {
   });
 
   it('成功：spawn `codex debug models` 并返回解析出的 slug 列表', async () => {
-    execFileStdout = REAL_SHAPE([modelEntry('gpt-5.6-sol'), modelEntry('gpt-5.5')]);
+    execFileStdout = REAL_SHAPE([
+      { ...modelEntry('gpt-5.6-sol'), service_tiers: [{ id: 'priority' }] },
+      modelEntry('gpt-5.5'),
+    ]);
     const adapter = createCodexAdapter(CODEX_BIN);
     const models = await adapter.detectModels!();
     expect(models).toEqual(['gpt-5.6-sol', 'gpt-5.5']);
-    expect(execFileCalls).toEqual([{ file: CODEX_BIN, args: ['debug', 'models'] }]);
+    expect(execFileCalls.map(({ file, args }) => ({ file, args })))
+      .toEqual([{ file: CODEX_BIN, args: ['debug', 'models'] }]);
+  });
+
+  it('detectModelCapabilities 返回同一目录的 serviceTiers', async () => {
+    execFileStdout = REAL_SHAPE([
+      { ...modelEntry('gpt-6-astra'), service_tiers: [{ id: 'priority' }, { id: 'ultrafast' }] },
+      { ...modelEntry('gpt-6.1-sol'), service_tiers: [{ id: 'priority' }] },
+    ]);
+    const adapter = createCodexAdapter(CODEX_BIN);
+    await expect(adapter.detectModelCapabilities!()).resolves.toEqual([
+      { slug: 'gpt-6-astra', serviceTiers: ['priority', 'ultrafast'] },
+      { slug: 'gpt-6.1-sol', serviceTiers: ['priority'] },
+    ]);
+  });
+
+  it('能力探测使用调用方提供的 Bot 环境', async () => {
+    execFileStdout = REAL_SHAPE([modelEntry('gpt-6-astra')]);
+    const env = { PATH: '/bot-runtime/bin', CODEX_HOME: '/bot-runtime/.codex' };
+    await createCodexAdapter(CODEX_BIN).detectModelCapabilities!({ env });
+    expect(execFileCalls[0]?.env).toBe(env);
   });
 
   it('过滤 visibility !== "list" 的模型', async () => {
@@ -91,6 +115,29 @@ describe('codex detectModels（mock child_process）', () => {
     execFileStdout = REAL_SHAPE([]);
     const adapter = createCodexAdapter(CODEX_BIN);
     await expect(adapter.detectModels!()).resolves.toBeNull();
+  });
+});
+
+describe('codex-app detectModels（mock child_process）', () => {
+  beforeEach(() => {
+    execFileCalls.length = 0;
+    execFileStdout = '';
+    execFileError = null;
+  });
+
+  it('探测底层 codex binary 并复用能力目录生成 slug 列表', async () => {
+    execFileStdout = REAL_SHAPE([
+      { ...modelEntry('gpt-6-astra'), service_tiers: [{ id: 'priority' }] },
+    ]);
+    const adapter = createCodexAppAdapter(CODEX_BIN);
+    await expect(adapter.detectModelCapabilities!()).resolves.toEqual([
+      { slug: 'gpt-6-astra', serviceTiers: ['priority'] },
+    ]);
+    await expect(adapter.detectModels!()).resolves.toEqual(['gpt-6-astra']);
+    expect(execFileCalls.map(({ file, args }) => ({ file, args }))).toEqual([
+      { file: CODEX_BIN, args: ['debug', 'models'] },
+      { file: CODEX_BIN, args: ['debug', 'models'] },
+    ]);
   });
 });
 

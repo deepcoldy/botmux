@@ -158,6 +158,7 @@ import {
 import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
+  selectionKeyForBot,
   isTtadkWrapper,
   ttadkAcceptsModel,
   TTADK_DEFAULT_MODEL,
@@ -294,6 +295,7 @@ import {
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -5642,7 +5644,37 @@ const server = createServer(async (req, res) => {
       if (!isKnownSelectionKey(key)) {
         return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
       }
-      const body = await buildModelChoicesResponse(key);
+      const appId = url.searchParams.get('bot')?.trim() || undefined;
+      let botConfig: BotConfig | undefined;
+      try {
+        botConfig = appId
+          ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId)
+          : undefined;
+      } catch {
+        botConfig = undefined;
+      }
+      const cliId = resolveCliSelection(key).cliId;
+      const runtimeApplies = botConfig
+        && selectionKeyForBot(botConfig.cliId, botConfig.wrapperCli, botConfig.cliLaunchMode) === key;
+      const cliPath = runtimeApplies
+        ? botConfig?.cliRuntime?.executable
+          ?? (botConfig?.cliRuntime ? undefined : botConfig?.cliPathOverride)
+        : undefined;
+      const body = await buildModelChoicesResponse(key, {
+        runtimeContext: botConfig && runtimeApplies
+          ? `${botConfig.larkAppId}:${cliId}:${cliPath ?? 'default'}`
+          : undefined,
+        probeEnv: botConfig && runtimeApplies
+          ? {
+              ...buildSessionChildEnv(process.env, botConfig.envPolicy),
+              ...botInjectedEnv(botConfig.env, botConfig.envPolicy),
+            }
+          : undefined,
+        adapterFactory: requestedCliId => createCliAdapterSync(
+          requestedCliId,
+          requestedCliId === cliId ? cliPath : undefined,
+        ),
+      });
       return jsonRes(res, 200, body);
     }
 

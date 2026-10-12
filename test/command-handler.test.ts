@@ -850,10 +850,11 @@ describe('/cli session selection', () => {
   it('persists a pending CLI selection and allows pre-freeze reselection', async () => {
     const ds = makeDaemonSession({
       hasHistory: false,
-      session: makeSession({ cliId: undefined, cliLaunchSnapshot: undefined }),
+      session: makeSession({ cliId: undefined, cliLaunchSnapshot: undefined, serviceTier: 'priority' }),
     });
     const deps = makeDeps(ds);
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), deps, LARK_APP_ID);
+    expect(ds.session.serviceTier).toBe('priority');
     expect(ds.session.cliLaunchSnapshot).toEqual(expect.objectContaining({
       state: 'pending', entryId: 'codex', cliId: 'codex', cliRuntime: expect.objectContaining({ id: 'codex' }), wrapperCli: null,
       cliPathOverride: null, launchShell: null, startupCommands: [],
@@ -861,6 +862,9 @@ describe('/cli session selection', () => {
     expect(ds.session.agentFrozen).toBeUndefined();
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli hermes'), deps, LARK_APP_ID);
     expect(ds.session.cliLaunchSnapshot?.entryId).toBe('hermes');
+    expect(ds.session.serviceTier).toBe('priority');
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli codex'), deps, LARK_APP_ID);
+    expect(ds.session.serviceTier).toBe('priority');
   });
 
   it('rejects selection after history and does not mutate the snapshot', async () => {
@@ -6973,7 +6977,7 @@ describe('handleCommand', () => {
       expect(ds.session.existingAppServerEndpoint)
         .toBe('unix:///home/testuser/.codex/app-server-control/app-server-control.sock');
       expect(ds.session.wrapperCli).toBeUndefined();
-      expect(ds.session.serviceTier).toBeUndefined();
+      expect(ds.session.serviceTier).toBe('inherit');
       expect(ds.session.agentFrozen).toBeUndefined();
       expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
