@@ -54,7 +54,7 @@ describe('managed lark-cli binding', () => {
     for (const args of [['schema', 'sheets.spreadsheet.sheets.find'], ['auth', 'login', '--help'], ['--version']]) {
       expect(parseLarkToolInvocation(args, defaults).offline).toBe(true);
     }
-    expect(parseLarkToolInvocation(['skills', 'install'], defaults).offline).toBe(false);
+    expect(() => parseLarkToolInvocation(['skills', 'install'], defaults)).toThrow();
   });
   it('installs an isolated entry, retains the application across RPC and viewer setup', () => {
     const bin = join(dir, 'bin'); mkdirSync(bin);

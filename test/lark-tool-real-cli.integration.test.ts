@@ -15,15 +15,18 @@ const canIsolateNetwork = process.platform === 'linux' && spawnSync('bwrap', [
 ], { stdio: 'ignore', timeout: 5000 }).status === 0;
 describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials)', () => {
   let root: string, binding: LarkToolBinding, server: ReturnType<typeof createServer>, port: number, requests: string[];
+  let credentialTypeOverride: string | undefined;
   beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), 'real-lark-contract-')); requests = [];
+    credentialTypeOverride = undefined;
     binding = prepareLarkToolEnv({ env: { PATH: process.env.PATH }, dataDir: root, sessionId: 'contract', appId: 'cli_contract' });
     server = createServer(async (req, res) => {
       let raw = ''; for await (const chunk of req) raw += chunk;
       const mode = JSON.parse(raw).mode; requests.push(mode);
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ ok: true, appId: binding.appId, mode,
-        credentialType: mode === 'bot' ? 'tenant_access_token' : 'user_access_token', credential: 'fake-not-a-live-credential' }));
+        credentialType: credentialTypeOverride ?? (mode === 'bot' ? 'tenant_access_token' : 'user_access_token'),
+        credential: 'fake-not-a-live-credential' }));
     });
     await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
     port = (server.address() as { port: number }).port;
@@ -50,6 +53,10 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
       env, encoding: 'utf8', timeout: 10_000,
     });
     expect(result.error).toBeUndefined();
+    // lark-cli 1.0.96 classifies an unreachable API caused by --unshare-net as
+    // a network error and exits 4. Keep both assertions so a CLI upgrade that
+    // changes this contract is diagnosed here instead of being mistaken for an
+    // identity-binding regression.
     expect(result.status, result.stderr).toBe(4);
     expect(JSON.parse(result.stderr)).toMatchObject({ identity: 'bot', error: { type: 'network' } });
   });
@@ -62,10 +69,18 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     expect(requests).toEqual(['bot']);
   });
   it('preserves replacement text without switching to user', async () => {
-    const result = await run(['sheets', '+replace', '--spreadsheet-token', 'sheet-fixture', '--sheet-id', 'tab', '--range', 'tab!A1', '--find', 'old', '--replacement', '--as=user', '--dry-run']);
+    const result = await run(['sheets', '+cells-replace', '--spreadsheet-token', 'sheet-fixture', '--sheet-id', 'tab', '--range', 'tab!A1', '--find', 'old', '--replacement', '--as=user', '--dry-run']);
     expect(result.code, result.err).toBe(0);
     expect(JSON.parse(result.out).dry_run).toBe(true);
     expect(result.out).toContain('--as=user');
+    expect(requests).toEqual(['bot']);
+  });
+  it('rejects a daemon response whose credential type does not match the invocation', async () => {
+    credentialTypeOverride = 'user_access_token';
+    const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--dry-run']);
+    expect(result.code).toBe(77);
+    expect(result.err).toContain('identity does not match');
+    expect(result.out).toBe('');
     expect(requests).toEqual(['bot']);
   });
   it.each([['event', 'list', '--json'], ['event', 'schema', 'im.message.receive_v1', '--json'], ['doctor', '--offline']])(

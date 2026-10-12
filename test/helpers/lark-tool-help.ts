@@ -38,20 +38,20 @@ Global Flags:
 export const LARK_TOOL_HELP: Record<string, string> = {
   '': root,
   docs: group('docs', ['+fetch']),
-  sheets: group('sheets', ['+replace']),
+  sheets: group('sheets', ['+cells-replace']),
   im: group('im', ['+send']),
   event: group('event', ['list', 'schema', 'consume']),
   auth: group('auth', ['login', 'status']),
   profile: group('profile', ['use']),
   config: group('config', ['init']),
-  skills: group('skills', ['list', 'read', 'install']),
+  skills: group('skills', ['list', 'read']),
   'docs +fetch': leaf('docs +fetch', `      --as string      identity
       --doc string     document
       --scope string   scope
       --keyword string   keyword
       --dry-run        preview
   -q, --jq string      query`),
-  'sheets +replace': leaf('sheets +replace', `      --as string       identity
+  'sheets +cells-replace': leaf('sheets +cells-replace', `      --as string       identity
       --replacement string   replacement
       --description string   description
       --dry-run         preview`),
@@ -70,7 +70,6 @@ export const LARK_TOOL_HELP: Record<string, string> = {
   schema: leaf('schema', ''),
   'skills list': leaf('skills list', ''),
   'skills read': leaf('skills read', ''),
-  'skills install': leaf('skills install', ''),
 };
 export function readLarkToolHelp(command: readonly string[]): string {
   const text = LARK_TOOL_HELP[command.join(' ')];

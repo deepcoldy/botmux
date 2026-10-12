@@ -2,6 +2,10 @@
 
 正常由 Botmux 创建的新会话会自动将 `lark-cli` 绑定到当前 bot 配置中的 App ID 和品牌。不增加 UI 配置，不修改个人终端的默认 profile。
 
+该绑定依赖支持 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 的较新 lark-cli；请使用
+`npm i -g @larksuite/cli@latest` 保持更新。旧版只识别 App Secret，无法使用
+Botmux 提供的短期 bot token。
+
 ## 使用
 
 ```sh

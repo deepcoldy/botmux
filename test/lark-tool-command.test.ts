@@ -16,8 +16,8 @@ describe('lark-cli argv metadata', () => {
 
   it.each([
     ['docs', '+fetch', '--doc', 'doc-fixture', '--scope', 'keyword', '--keyword', '--as=user', '--dry-run'],
-    ['sheets', '+replace', '--replacement', '--as=user', '--dry-run'],
-    ['sheets', '+replace', '--description', '--profile=cli_other', '--dry-run'],
+    ['sheets', '+cells-replace', '--replacement', '--as=user', '--dry-run'],
+    ['sheets', '+cells-replace', '--description', '--profile=cli_other', '--dry-run'],
     ['docs', '+fetch', '--keyword', '--', '--dry-run'],
     ['docs', '+fetch', '--keyword', '--help', '--dry-run'],
     ['docs', '+fetch', '-q', '--as=user', '--dry-run'],
