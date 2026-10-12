@@ -26,6 +26,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { logger } from './logger.js';
+import { withFileLockSync } from './file-lock.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 import { readGlobalConfig } from '../global-config.js';
 
@@ -165,13 +166,75 @@ function loadTokenFromPath(path: string): TokenStore | null {
   }
 }
 
-function saveTokenForApp(token: TokenStore, appId: string, openId?: string): void {
+function saveTokenForAppUnlocked(token: TokenStore, appId: string, openId?: string): void {
   const path = tokenPathForApp(appId, openId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   // 0600：OAuth token 是密钥，且原子写每次重建文件，不传 mode 会把用户
   // 手动收紧过的权限在自动刷新时悄悄改回 0644。
   atomicWriteFileSync(path, JSON.stringify(token, null, 2), { mode: 0o600 });
+}
+
+interface TokenReplacementResult {
+  saved: boolean;
+  token: TokenStore;
+  droppedScopes: string[];
+  superseded: boolean;
+}
+
+type TokenReplacementPolicy = 'authorization' | 'refresh';
+
+function sameTokenVersion(left: TokenStore, right: TokenStore): boolean {
+  return left.access_token === right.access_token
+    && left.refresh_token === right.refresh_token
+    && left.expires_at === right.expires_at
+    && left.refresh_expires_at === right.refresh_expires_at
+    && left.scope === right.scope;
+}
+
+/**
+ * The only token-file writer. The lock makes the final re-read, monotonic
+ * scope check and atomic rename one cross-process critical section shared by
+ * daemon, dashboard and refresh paths.
+ *
+ * `expected` is used by refresh: if another process replaced the credential
+ * while the network request was in flight, the fresh on-disk token wins.
+ */
+function replaceTokenForApp(
+  token: TokenStore,
+  appId: string,
+  brand: Brand,
+  openId?: string,
+  expected?: TokenStore,
+  policy: TokenReplacementPolicy = 'authorization',
+): TokenReplacementResult {
+  const path = tokenPathForApp(appId, openId);
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return withFileLockSync(path, () => {
+    const current = loadTokenForApp(appId, brand, openId);
+    if (expected && current && !sameTokenVersion(current.token, expected)) {
+      return {
+        saved: false,
+        token: current.token,
+        droppedScopes: [],
+        superseded: true,
+      };
+    }
+    const replacementScopes = new Set(splitScopes(token.scope));
+    const droppedScopes = splitScopes(current?.token.scope)
+      .filter(scope => !replacementScopes.has(scope));
+    if (policy === 'authorization' && droppedScopes.length > 0) {
+      return {
+        saved: false,
+        token: current!.token,
+        droppedScopes,
+        superseded: false,
+      };
+    }
+    saveTokenForAppUnlocked(token, appId, openId);
+    return { saved: true, token, droppedScopes, superseded: false };
+  }, { maxWaitMs: 30_000 });
 }
 
 function isValid(isoDate: string): boolean {
@@ -315,10 +378,31 @@ async function refreshToken(
     };
 
     // 写回原来那个文件：per-person token 刷新后仍是 per-person，不能落到
-    // per-app 路径去覆盖别的东西。
-    try { saveTokenForApp(updated, appId, token.openId); } catch { /* best-effort */ }
-    logger.info('[user-token] Refreshed User Access Token');
-    return updated;
+    // per-app 路径去覆盖别的东西。网络请求期间若另一进程已经换发了 token，
+    // 锁内版本检查会保留较新的磁盘版本。
+    try {
+      const replacement = replaceTokenForApp(
+        updated,
+        appId,
+        brand,
+        token.openId,
+        token,
+        'refresh',
+      );
+      if (replacement.saved) {
+        if (replacement.droppedScopes.length > 0) {
+          logger.warn(
+            `[user-token] Refreshed User Access Token with reduced scopes: `
+            + replacement.droppedScopes.join(', '),
+          );
+        } else {
+          logger.info('[user-token] Refreshed User Access Token');
+        }
+      }
+      return replacement.token;
+    } catch {
+      return null;
+    }
   } catch (err: any) {
     logger.debug(`[user-token] Refresh failed: ${err.message}`);
     return null;
@@ -402,13 +486,41 @@ const DEFAULT_PORT = 9768;
  * 普通登录只申请消息读取、资源访问和授权续期。
  * 飞书会校验授权链接里的每个 scope；默认捆绑文档权限会让仅开通消息能力的
  * 应用在授权页直接失败（20027），连基础登录也无法完成。其它能力通过
- * `/login --scope ...` 或专项入口按需追加，不根据已有 token 隐式扩大申请范围。
+ * `/login --scope ...` 或专项入口按需追加。对已经授权过的同一用户，再次按需
+ * 授权时必须同时带上旧 token 的 scope，否则飞书返回的新 token 会覆盖旧 token，
+ * 把本次未显式请求的既有能力静默降权。
  */
 const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
   'offline_access',
 ].join(' ');
+
+function splitScopes(scope: string | undefined): string[] {
+  return (scope ?? '').split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Build a monotonic authorization request for one verified app/user pair.
+ *
+ * The stored token is consulted only through the strict per-user lookup, so
+ * Alice's incremental authorization can never inherit Bob's scopes. Token
+ * validity is irrelevant here: even an expired access token is authoritative
+ * metadata for which scopes must not be dropped by its replacement.
+ */
+function authorizationScopes(
+  appId: string,
+  brand: Brand,
+  extraScopes: string[],
+  openId: string,
+): string[] {
+  const existing = loadTokenForApp(appId, brand, openId);
+  return [...new Set([
+    ...DEFAULT_SCOPES.split(' '),
+    ...extraScopes,
+    ...splitScopes(existing?.token.scope),
+  ])];
+}
 
 type UserAuthorizationPollResult =
   | { status: 'pending' }
@@ -429,7 +541,7 @@ export async function requestUserAuthorization(
   poll: () => Promise<UserAuthorizationPollResult>;
 }> {
   if (!isUsableOpenId(openId) || !isCurrent()) throw new Error('authorization_origin_changed');
-  const scopes = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])];
+  const scopes = authorizationScopes(appId, brand, extraScopes, openId);
   const response = await fetch(`${larkHosts(brand).accounts}/oauth/v1/device_authorization`, {
     method: 'POST',
     headers: {
@@ -501,7 +613,7 @@ export async function requestUserAuthorization(
       if (!isCurrent()) return { status: 'failed', error: 'authorization_origin_changed' };
       if (Date.now() >= expiresAt) return { status: 'failed', error: 'expired_token' };
       const now = Date.now();
-      saveTokenForApp({
+      const replacement = replaceTokenForApp({
         access_token: data.access_token,
         refresh_token: data.refresh_token,
         token_type: data.token_type,
@@ -514,7 +626,10 @@ export async function requestUserAuthorization(
         brand,
         openId,
         ...(authorized.userName ? { userName: authorized.userName } : {}),
-      }, appId, openId);
+      }, appId, brand, openId);
+      if (!replacement.saved) {
+        return { status: 'failed', error: 'authorization_scope_stale' };
+      }
       return { status: 'ready', token: data.access_token };
     } catch {
       return { status: 'failed', error: signal.aborted ? 'authorization_timeout' : 'authorization_failed' };
@@ -600,8 +715,12 @@ export function generateAuthUrl(
   const state = randomBytes(32).toString('hex');
   const redirectUri = resolveOAuthRedirectUri();
 
-  // 基础 scope + 调用方按需追加（去重）。文档订阅入口会带 DOC_COMMENT_OAUTH_SCOPES。
-  const scope = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])].join(' ');
+  // 基础 scope + 调用方按需追加 + 这个用户已有的 scope（去重）。旧 scope 必须
+  // 一起申请，否则新 token 覆盖同一用户的旧文件时会造成静默降权。
+  const scopes = isUsableOpenId(openId)
+    ? authorizationScopes(appId, brand, extraScopes, openId)
+    : [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])];
+  const scope = scopes.join(' ');
   const params = new URLSearchParams({
     client_id: appId,
     redirect_uri: redirectUri,
@@ -799,7 +918,6 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
 
     const ownerOpenId = authorized.openId;
     const mismatched = isUsableOpenId(pending.openId) && pending.openId !== authorized.openId;
-
     const token: TokenStore = {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
@@ -815,7 +933,16 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       ...(authorized.userName ? { userName: authorized.userName } : {}),
     };
 
-    saveTokenForApp(token, pending.appId, ownerOpenId);
+    // Normally generateAuthUrl already merged the requester's stored scopes.
+    // Re-check against the actual clicker before overwrite as well: a forwarded
+    // link (or a concurrent token update) can make those two identities/states
+    // differ. Never replace a broader credential with a narrower one.
+    const replacement = replaceTokenForApp(token, pending.appId, pending.brand, ownerOpenId);
+    if (!replacement.saved) {
+      logger.warn(`[user-token] 放弃保存：新 token 缺少旧 scope（${replacement.droppedScopes.join(', ')}）`);
+      return `❌ 授权未完成：新 token 缺少已有权限 ${replacement.droppedScopes.join(' ')}，`
+        + '为避免覆盖后降权，本次没有保存。请由本人重新发起授权。';
+    }
     logger.info(`[user-token] OAuth login successful, token saved for ${pending.appId} (per-user)`);
 
     const expiresAt = new Date(token.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
