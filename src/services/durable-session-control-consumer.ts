@@ -59,6 +59,13 @@ interface Slot {
   running?: Promise<void>;
 }
 
+// SqliteDurableCoordinationStore deliberately caps one filtered claim at 256
+// unique partitions so the generated IN clause stays bounded. A bot can own
+// many more persisted (especially closed) Sessions, so the consumer must page
+// that ownership set instead of forwarding it wholesale and disabling the
+// entire control lane once the 257th Session appears.
+const MAX_PARTITION_KEYS_PER_CLAIM = 256;
+
 function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
@@ -129,9 +136,26 @@ export function startDurableSessionControlConsumer(
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
   let stopPromise: Promise<DurableSessionControlConsumerStopResult> | undefined;
+  let partitionCursor = 0;
 
   const reportError = (error: unknown): void => {
     try { options.onError?.(error); } catch { /* observers cannot alter claim state */ }
+  };
+
+  const nextOwnedPartitionBatch = (): string[] => {
+    const partitionKeys = normalizedPartitionKeys(options.ownedPartitionKeys());
+    if (partitionKeys.length <= MAX_PARTITION_KEYS_PER_CLAIM) {
+      partitionCursor = 0;
+      return partitionKeys;
+    }
+    if (partitionCursor >= partitionKeys.length) partitionCursor = 0;
+    const nextCursor = Math.min(
+      partitionCursor + MAX_PARTITION_KEYS_PER_CLAIM,
+      partitionKeys.length,
+    );
+    const batch = partitionKeys.slice(partitionCursor, nextCursor);
+    partitionCursor = nextCursor === partitionKeys.length ? 0 : nextCursor;
+    return batch;
   };
 
   const processClaim = async (initialClaim: InboxClaim): Promise<void> => {
@@ -208,7 +232,7 @@ export function startDurableSessionControlConsumer(
     for (let index = 0; index < batchSize && !stopped; index++) {
       let claim: InboxClaim | undefined;
       try {
-        const partitionKeys = normalizedPartitionKeys(options.ownedPartitionKeys());
+        const partitionKeys = nextOwnedPartitionBatch();
         if (partitionKeys.length === 0) return;
         claim = await options.store.claimNextInbox({
           workerId: slotWorkerId,

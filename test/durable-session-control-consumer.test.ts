@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { DurableInboxStore, InboxClaim } from '../src/services/durable-coordination.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import {
   durableLarkSessionControlEvent,
@@ -11,6 +12,16 @@ import {
 import { startDurableSessionControlConsumer } from '../src/services/durable-session-control-consumer.js';
 
 const tempDirs: string[] = [];
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 function makeStore(now: () => number): SqliteDurableCoordinationStore {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-control-consumer-'));
@@ -111,6 +122,35 @@ describe('durable session control consumer', () => {
     await store.close();
   });
 
+  it('round-robins more than 256 owned partitions through bounded claims', async () => {
+    const store = makeStore(() => 10);
+    const partitionKeys = Array.from({ length: 300 }, (_, index) =>
+      durableLarkSessionControlPartition('cli_test', `session-${index}`));
+    await store.enqueueInbox(controlEvent('session-0', 'evt-first', 1));
+    await store.enqueueInbox(controlEvent('session-299', 'evt-last', 2));
+    const dispatched: string[] = [];
+    const errors: unknown[] = [];
+    const consumer = startDurableSessionControlConsumer({
+      store,
+      workerId: 'control-many',
+      ownedPartitionKeys: () => partitionKeys,
+      dispatch: async control => {
+        dispatched.push(control.sessionId);
+        return { kind: 'settled' };
+      },
+      concurrency: 2,
+      batchSize: 1,
+      intervalMs: 60_000,
+      onError: error => errors.push(error),
+    });
+    await consumer.ready;
+
+    expect(new Set(dispatched)).toEqual(new Set(['session-0', 'session-299']));
+    expect(errors).toEqual([]);
+    await consumer.stop();
+    await store.close();
+  });
+
   it('retries dispatch failures without completing the control row', async () => {
     let now = 10;
     const store = makeStore(() => now);
@@ -146,5 +186,66 @@ describe('durable session control consumer', () => {
       leaseDurationMs: 100,
     })).toMatchObject({ attempts: 2 });
     await store.close();
+  });
+
+  it('aborts dispatch without completing or retrying after claim ownership is lost', async () => {
+    vi.useFakeTimers();
+    try {
+      const event = controlEvent('session-a', 'evt-a', 1);
+      const claim: InboxClaim = {
+        event,
+        workerId: 'control-a:0',
+        claimEpoch: 1,
+        claimUntil: 1_000,
+        attempts: 1,
+      };
+      let offered = false;
+      const completeInboxClaim = vi.fn(async () => ({ kind: 'applied' as const }));
+      const retryInboxClaim = vi.fn(async () => ({ kind: 'applied' as const }));
+      const store = {
+        claimNextInbox: vi.fn(async () => {
+          if (offered) return undefined;
+          offered = true;
+          return claim;
+        }),
+        renewInboxClaim: vi.fn(async () => ({ kind: 'stale' as const })),
+        completeInboxClaim,
+        retryInboxClaim,
+      } as unknown as DurableInboxStore;
+      const started = deferred<void>();
+      let aborted = false;
+      const errors: unknown[] = [];
+      const consumer = startDurableSessionControlConsumer({
+        store,
+        workerId: 'control-a',
+        ownedPartitionKeys: () => [event.partitionKey],
+        dispatch: async (_control, { signal }) => {
+          started.resolve();
+          await new Promise<void>(resolve => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener('abort', () => resolve(), { once: true });
+          });
+          aborted = signal.aborted;
+          return { kind: 'settled' };
+        },
+        concurrency: 1,
+        batchSize: 1,
+        intervalMs: 60_000,
+        leaseDurationMs: 1_000,
+        renewalIntervalMs: 100,
+        onError: error => errors.push(error),
+      });
+      await started.promise;
+      await vi.advanceTimersByTimeAsync(100);
+      await consumer.ready;
+
+      expect(aborted).toBe(true);
+      expect(completeInboxClaim).not.toHaveBeenCalled();
+      expect(retryInboxClaim).not.toHaveBeenCalled();
+      expect(errors.some(error => String(error).includes('renewal lost'))).toBe(true);
+      await consumer.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

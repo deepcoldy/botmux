@@ -99,6 +99,7 @@ describe('durable Lark session control runtime', () => {
       active = undefined;
       return { ok: true, outcome: 'closed' as const, alreadyClosed: false };
     });
+    let operatorAllowed = true;
     const runtime = createDurableLarkSessionControlRuntime({
       larkAppId: 'cli_test',
       privateCard: false,
@@ -108,7 +109,7 @@ describe('durable Lark session control runtime', () => {
       findActiveSession: () => active || undefined,
       listPersistedSessions: () => [persisted],
       getPersistedSession: () => persisted,
-      canOperate: () => true,
+      canOperate: () => operatorAllowed,
       closeSession,
       resumeSession: async () => ({ ok: false, error: 'not_closed' }),
       buildClosedCard: () => '{"header":{"title":"closed"}}',
@@ -119,11 +120,33 @@ describe('durable Lark session control runtime', () => {
       now: () => now,
     });
     const input = control();
+    const resolved = await runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    });
+    if (resolved.kind !== 'target') throw new Error('expected control target');
+    await expect(resolved.target.commit({
+      version: 1,
+      type: 'botmux.lark.session-control-result',
+      action: 'resume',
+      sessionId: 'session-1',
+      status: 'closed',
+    }, new AbortController().signal)).rejects.toThrow(/result is invalid/);
     expect(runtime.authorizeBeforeAck(input.data)).toBe(true);
     expect(runtime.authorizeBeforeAck({
       ...input.data,
       context: { open_message_id: 'om_stale_card' },
     })).toBe(false);
+    operatorAllowed = false;
+    expect(runtime.authorizeBeforeAck(input.data)).toBe(false);
+    await expect(runtime.resolve(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'operator is not allowed to control this Session',
+    });
+    operatorAllowed = true;
     expect(runtime.ownedPartitionKeys()).toEqual([
       'lark-session-control:cli_test:session-1',
     ]);
@@ -356,8 +379,101 @@ describe('durable Lark session control runtime', () => {
         target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
         content: 'refused:remote_cancel_unverified:remote-9',
       });
-    expect(await store.readOutbox(`control_update_${digest}`)).toBeUndefined();
+    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_update_${digest}`))!))
+      .toMatchObject({
+        target: { kind: 'update', messageId: 'om_card' },
+        content: 'active',
+      });
     await facade.stop();
+    await store.close();
+  });
+
+  it.each([
+    'workspace_retired',
+    'deferred_unmaterialized',
+    'not_found',
+    'not_closed',
+    'resume_cancelled',
+  ])('settles deterministic resume refusal %s without retrying the control operation', async error => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-deterministic-refusal-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const persisted = session({ status: 'closed', closedAt: '2026-10-09T00:01:00.000Z' });
+    await admitDurableLarkSession({ facade, message: message(), session: persisted });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [persisted],
+      getPersistedSession: () => persisted,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not active' }),
+      resumeSession: async () => ({ ok: false, error }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: residual => `residual:${residual.taskId}`,
+      closeRefusedText: (closeError, taskId) => `refused:${closeError}:${taskId}`,
+      resumeRefusedText: resumeError => `resume-refused:${resumeError}`,
+      now: () => 10,
+    });
+    const input = control('resume');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(await store.readControlOperation(input.control.operationId)).toMatchObject({
+      state: 'completed',
+      attempts: 1,
+      result: { applied: false, error },
+    });
+    const digest = createHash('sha256').update(input.control.operationId).digest('hex');
+    expect(parseDurableLarkOutboxRecord((await store.readOutbox(`control_notice_${digest}`))!))
+      .toMatchObject({ content: `resume-refused:${error}` });
+    await facade.stop();
+    await store.close();
+  });
+
+  it('rejects a non-local active Session before acquiring its canonical lease', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-non-local-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'));
+    const persisted = session();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => { throw new Error('must not acquire'); },
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [persisted],
+      getPersistedSession: () => persisted,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'must not close' }),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: () => 'resume-refused',
+    });
+
+    await expect(runtime.resolve(control('close').control, {
+      claim: control('close').claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'active control target is not local to this replica',
+    });
     await store.close();
   });
 });

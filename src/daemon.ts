@@ -29554,17 +29554,37 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 ? tr('card.action.close_refused_with_task', { error, taskId }, loc)
                 : tr('card.action.close_refused', { error }, loc);
             },
-            resumeRefusedText: (error, activeSessionId) => {
+            resumeRefusedText: (error, activeSessionId, sessionId) => {
               const loc = localeForBot(cfg.larkAppId);
-              return error === 'anchor_occupied'
-                ? tr('card.action.resume_anchor_occupied', {
-                    detail: activeSessionId
-                      ? tr('card.action.resume_anchor_holder', {
-                          short: activeSessionId.substring(0, 8),
-                        }, loc)
-                      : '',
-                  }, loc)
-                : tr('card.action.resume_start_failed', undefined, loc);
+              if (error === 'not_found') {
+                return tr('card.action.resume_not_found', {
+                  short: sessionId?.substring(0, 8) ?? '',
+                }, loc);
+              }
+              if (error === 'not_closed') {
+                return tr('card.action.resume_not_closed', undefined, loc);
+              }
+              if (error === 'anchor_occupied') {
+                return tr('card.action.resume_anchor_occupied', {
+                  detail: activeSessionId
+                    ? tr('card.action.resume_anchor_holder', {
+                        short: activeSessionId.substring(0, 8),
+                      }, loc)
+                    : '',
+                }, loc);
+              }
+              const key = error === 'workspace_retired'
+                ? 'card.action.resume_workspace_retired'
+                : error === 'deferred_unmaterialized'
+                  ? 'card.action.resume_deferred_unmaterialized'
+                  : error === 'adopt_unsupported'
+                    ? 'card.action.resume_adopt_unsupported'
+                    : error === 'resume_cancelled'
+                      ? 'card.action.resume_cancelled'
+                      : error === 'resume_reconciliation_required'
+                        ? 'card.action.resume_reconciliation_required'
+                        : 'card.action.resume_start_failed';
+              return tr(key, undefined, loc);
             },
           });
           primaryRuntime = startDurableLarkPrimaryRuntime({
