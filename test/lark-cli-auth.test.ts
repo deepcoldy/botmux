@@ -143,6 +143,9 @@ describe('begin / complete device flow', () => {
 
     expect(challenge?.authUrl).toBe('https://v/verify');
     expect(seen[0].args).toEqual(['auth', 'login', '--no-wait', '--json', '--scope', LARK_CLI_DEVICE_SCOPES.join(' ')]);
+    const scopes = seen[0].args[seen[0].args.indexOf('--scope') + 1].split(' ');
+    expect(scopes).toEqual(expect.arrayContaining(['base:field:read', 'base:record:read']));
+    expect(scopes.some(scope => /^base:.*(?:write|create|delete|update)/.test(scope))).toBe(false);
     // The call already ran inside this person's HOME.
     expect(seen[0].home).toBe(larkCliHomeFor(OPEN));
   });
@@ -285,6 +288,44 @@ describe('begin / complete device flow', () => {
     expect(failed.detail).toMatch(/expired/);
     // A terminal failure drops the challenge so the next begin mints a fresh
     // link instead of reusing the dead code until the TTL expires.
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+  });
+
+  it.each(['[lark-cli-auth] timed out', 'connect ETIMEDOUT', 'upstream HTTP 503'])(
+    'retains the same link after %s and completes a later approval', async (error) => {
+      seedMachine();
+      const runner = vi.fn(async () => ({
+        ok: true, stdout: JSON.stringify({ verification_url: 'https://v/stable', device_code: 'dc-stable' }), stderr: '',
+      }));
+      __setLarkCliRunnerForTest(runner);
+      await beginLarkCliLogin(OPEN);
+      __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: error }));
+      expect(await completeLarkCliLogin(OPEN)).toEqual({ state: 'failed', detail: error });
+      expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-stable');
+      __setLarkCliRunnerForTest(runner);
+      expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/stable');
+      expect(runner).toHaveBeenCalledTimes(1);
+      __setLarkCliRunnerForTest(async () => {
+        simulateUserToken();
+        return { ok: true, stdout: '{}', stderr: '' };
+      });
+      expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+      expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+      expect(larkCliHomeForTurn(OPEN_B)).toBeNull();
+    },
+  );
+
+  it('reads a terminal device-code failure from the stderr JSON envelope', async () => {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-invalid' }), stderr: '',
+    }));
+    await beginLarkCliLogin(OPEN);
+    const message = 'authorization failed: The device_code is invalid. Please restart the device authorization flow.';
+    __setLarkCliRunnerForTest(async () => ({
+      ok: false, stdout: '', stderr: JSON.stringify({ ok: false, error: { type: 'authentication', message } }),
+    }));
+    expect(await completeLarkCliLogin(OPEN)).toEqual({ state: 'failed', detail: message });
     expect(pendingLarkCliChallenge(OPEN)).toBeNull();
   });
 

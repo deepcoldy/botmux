@@ -116,6 +116,8 @@ const LARK_CLI_TIMEOUT_MS = 30_000;
  *  switching the issuing app does not silently narrow what works. */
 export const LARK_CLI_DEVICE_SCOPES = [
   'offline_access',
+  'base:field:read',
+  'base:record:read',
   'docx:document:readonly',
   'docs:document.content:read',
   'drive:drive.metadata:readonly',
@@ -412,14 +414,18 @@ export async function completeLarkCliLogin(
     // ok but no token file yet — treat as pending rather than authorized.
     return { state: 'pending' };
   }
+  // CLI error envelopes are written to stderr; older runners used stdout.
+  if (!parsed?.error) {
+    try { parsed = JSON.parse(stderr) as Record<string, unknown>; } catch { /* plain stderr */ }
+  }
   const raw = String((parsed?.error as Record<string, unknown> | undefined)?.message ?? stderr).trim();
-  // "authorization_pending"-style messages are the normal not-scanned-yet case.
   if (/pending|not yet|waiting/i.test(raw)) return { state: 'pending' };
-  // A terminal failure (expired / denied / unknown code) never turns into a
-  // success by re-polling the same code: drop it so the next begin mints a
-  // fresh link instead of reusing a dead one until the TTL expires. A transient
-  // transport error costs one extra link, which the refusal hands over at once.
-  clearChallenge(openId);
+  // A bounded local wait or transport failure does not invalidate the server's
+  // device code. Keep the same challenge so a later approval can still finish.
+  // Only explicit terminal authorization outcomes justify issuing a new link.
+  if (/expired|access_denied|authorization_declined|authorization denied|device[_ ]code.*(?:invalid|unknown)|invalid.*device[_ ]code/i.test(raw)) {
+    clearChallenge(openId);
+  }
   return { state: 'failed', detail: raw || undefined };
 }
 
