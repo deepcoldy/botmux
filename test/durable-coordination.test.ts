@@ -124,6 +124,10 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.enqueueInbox({
       eventId: 'event-1', partitionKey: 'chat-a', payload: { a: 9 }, visibleAt: 0, createdAt: 1,
     })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId: 'event-1', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'chat-a', payload: { b: 2, a: 1 }, visibleAt: 0, createdAt: 1,
+    })).toEqual({ kind: 'conflict' });
     await store.enqueueInbox({
       eventId: 'event-2', partitionKey: 'chat-a', payload: { n: 2 }, visibleAt: 0, createdAt: 2,
     });
@@ -155,12 +159,12 @@ describe('SQLite durable coordination contract', () => {
   it('isolates inbox lanes and lets an owner claim only its local partitions', async () => {
     const store = makeStore(() => 10);
     await store.enqueueInbox({
-      eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
-      partitionKey: 'session-a', payload: { type: 'message' }, visibleAt: 0, createdAt: 1,
+      eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-a', payload: { action: 'close' }, visibleAt: 0, createdAt: 1,
     });
     await store.enqueueInbox({
-      eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
-      partitionKey: 'session-a', payload: { action: 'close' }, visibleAt: 0, createdAt: 2,
+      eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      partitionKey: 'session-a', payload: { type: 'message' }, visibleAt: 0, createdAt: 2,
     });
     await store.enqueueInbox({
       eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
@@ -189,7 +193,9 @@ describe('SQLite durable coordination contract', () => {
       workerId: 'owner-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
       partitionKeys: ['session-a', 'session-a'], leaseDurationMs: 20,
     });
-    expect(controlA).toMatchObject({ event: { eventId: 'control-a' } });
+    expect(controlA).toMatchObject({
+      event: { eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL },
+    });
     await store.close();
   });
 
@@ -326,7 +332,6 @@ describe('SQLite durable coordination contract', () => {
     ).get()).toEqual({ schema_version: 3 });
     migrated.close();
   });
-
   it('retries claimed inbox work only after the requested visibility time', async () => {
     let now = 1;
     const store = makeStore(() => now);

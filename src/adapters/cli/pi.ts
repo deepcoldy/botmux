@@ -322,6 +322,7 @@ export function createPiAdapter(
     // custom-terminate turn has no on-disk boundary — see the header for why
     // that stronger promise is unsafe (and why type-ahead does not need it).
     supportsTypeAhead: true,
+    supportsProgramStatus: true,
     systemHints: [],
     altScreen: true,
     skillsDir: '~/.pi/agent/skills',

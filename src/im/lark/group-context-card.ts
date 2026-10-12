@@ -15,6 +15,7 @@ type CardNode = Record<string, any>;
 const PURPOSE_LENGTH: Record<GroupContextCardPurpose, number> = { runtime: 12, message: 13, 'turn-message': 14 };
 const PURPOSE_BY_LENGTH = new Map(Object.entries(PURPOSE_LENGTH).map(([purpose, length]) => [length, purpose as GroupContextCardPurpose]));
 const CARRIER = /\u2063{4,}/g;
+const TRAILING_PURPOSE_CARRIER = /\u2063{12,14}$/;
 
 function nodes(value: unknown, visibleOnly = false): CardNode[] {
   if (!value || typeof value !== 'object') return [];
@@ -39,6 +40,28 @@ function renderedText(value: any): string {
   return renderedText(value.property?.elements ?? value.elements);
 }
 
+/** Remove only the reserved trailing purpose carrier, not ordinary U+2063 text. */
+export function stripTrailingGroupContextCardPurposeMarker(value: string): string {
+  return value.replace(TRAILING_PURPOSE_CARRIER, '');
+}
+
+function inlinePurposeCarrier(root: any[], marker: string): boolean {
+  // Prefer the first authored Markdown block. A signed visible footer is
+  // always the final paragraph after Lark's B→A flattening; putting the inline
+  // carrier first lets the Format A parser distinguish body text from that
+  // footer without relying on a particular brand string.
+  for (let index = 0; index < root.length; index++) {
+    const node = root[index];
+    if (node?.tag !== 'markdown' || node.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
+      || RUNTIME_ID.test(node.element_id ?? '') || typeof node.content !== 'string') continue;
+    node.content = TRAILING_PURPOSE_CARRIER.test(node.content)
+      ? node.content.replace(TRAILING_PURPOSE_CARRIER, marker)
+      : `${node.content}${marker}`;
+    return true;
+  }
+  return false;
+}
+
 /** Stamp an outgoing structured card without mutating the caller's object. */
 export function markGroupContextCardPurpose<T extends Record<string, any>>(card: T, purpose: GroupContextCardPurpose): T;
 export function markGroupContextCardPurpose(card: string, purpose: GroupContextCardPurpose): string;
@@ -54,7 +77,11 @@ export function markGroupContextCardPurpose(card: string | Record<string, any>, 
   if (footer) {
     if (footer.content.includes(REPLY_CARD_FOOTER_MARKER)) footer.content = footer.content.replace(CARRIER, marker);
     else footer.content = footer.content.replace(/(?=<\/font>\s*$)|$/, marker);
-  } else {
+  } else if (!inlinePurposeCarrier(root, marker)) {
+    // Image/table-only cards have no text carrier. Keep the compatibility
+    // fallback for those rare shapes; ordinary text progress cards stay on
+    // their existing Markdown element so an invisible protocol marker does
+    // not allocate a blank footer row in Lark.
     root.push({ tag: 'markdown', element_id: REPLY_CARD_FOOTER_ELEMENT_ID, text_size: 'notation',
       content: `<font color='grey'>${marker}</font>` });
   }

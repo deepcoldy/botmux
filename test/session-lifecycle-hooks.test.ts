@@ -112,6 +112,7 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -297,6 +298,51 @@ describe('worker-pool lifecycle hook integration', () => {
       newState: 'idle',
       source: 'screenshot_uploaded',
     }));
+  });
+
+  it('mutes only the Lark push for codex_app_no_progress when the live bot opts out', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const botWith = (noProgressNotify?: { enabled: boolean }) => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', ...(noProgressNotify ? { noProgressNotify } : {}) },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    });
+    const restoreGetBot = vi.mocked(getBot).mockImplementation(() => botWith() as never);
+
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    // Muted: the attention hook still fires, but no Lark reply is sent.
+    vi.mocked(getBot).mockImplementation(() => botWith({ enabled: false }) as never);
+    worker.emit('message', { type: 'user_notify', kind: 'codex_app_no_progress', message: 'nudge stalled' });
+    await flush();
+    expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
+      reason: 'user_notify',
+      message: 'nudge stalled',
+    }));
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    // Unmuted (config read is live): the same nudge goes through.
+    vi.mocked(getBot).mockImplementation(() => botWith({ enabled: true }) as never);
+    worker.emit('message', { type: 'user_notify', kind: 'codex_app_no_progress', message: 'nudge delivered' });
+    await flush();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    // Plain user_notify without the kind is never affected by the opt-out.
+    vi.mocked(getBot).mockImplementation(() => botWith({ enabled: false }) as never);
+    worker.emit('message', { type: 'user_notify', message: 'unrelated warning' });
+    await flush();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    restoreGetBot.mockRestore();
   });
 
   it('emits session.requires_attention from tui_prompt and user_notify IPC', async () => {

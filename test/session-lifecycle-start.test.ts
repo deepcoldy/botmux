@@ -415,6 +415,40 @@ describe('host memory pressure worker admission', () => {
     );
   });
 
+  it('hands blocked admission to a durable caller without a direct provider reply', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValue({
+      allowed: false,
+      reasons: ['MemAvailable 1.0 GiB is below the reserved 8.0 GiB'],
+      pressure: { warnings: [] },
+      policy: {
+        minAvailableMemoryBytes: 8 * 1024 ** 3,
+        maxMemoryFullAvg10: 20,
+        minAvailableMemorySource: 'default',
+        maxMemoryFullAvg10Source: 'default',
+      },
+    } as any);
+    const ds = makeDs({ hasHistory: true });
+    const blocked = vi.fn();
+
+    expect(forkWorker(ds, 'resume me', { resume: true, turnId: 'om_durable_retry' }, {
+      onAdmissionBlocked: blocked,
+    })).toBe(true);
+
+    expect(blocked).toHaveBeenCalledWith({
+      content: expect.stringMatching(/memory pressure.*retry/i),
+      turnId: 'om_durable_retry',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
   it('reports accepted after a worker receives its init message', () => {
     const ds = makeDs();
     const admissions: string[] = [];

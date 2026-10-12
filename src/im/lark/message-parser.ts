@@ -7,6 +7,8 @@ import {
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
+import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
+import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -485,10 +487,7 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
           for (const block of rootElements) {
             if (!Array.isArray(block)) continue;
             for (const node of block) {
-              const key = node.image_key ?? node.img_key;
-              if ((node.tag === 'img' || node.tag === 'image') && key) {
-                pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
-              }
+              extractElementImages(node, resources, pushIfNew);
             }
           }
         } else {
@@ -1168,6 +1167,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
           for (const node of paragraph) {
             if (inSignedFooter) continue;
             if (node.tag === 'text') {
+              const visibleText = typeof node.text === 'string'
+                ? stripTrailingGroupContextCardPurposeMarker(node.text)
+                : node.text;
+              if (visibleText !== node.text
+                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                if (visibleText) textNodes.push(visibleText);
+                continue;
+              }
               if (hasCurrentFooterMarker(node.text)) {
                 textNodes.push(node.text.slice(0, node.text.indexOf(REPLY_CARD_FOOTER_MARKER)));
                 inSignedFooter = true;
@@ -1696,6 +1703,25 @@ function extractElementImages(el: any, resources: MessageResource[], pushIfNew: 
     pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
   }
 
+  // `botmux send --images` keeps ordinary full-width/inline images inside a
+  // Markdown element as `![alt](img_vN_...)`.  Feishu does not always promote
+  // those tokens to native `img` nodes on readback, so native-node-only
+  // extraction made `quoted` render the image while returning resources: [].
+  // Reuse the outbound Markdown parser so code examples and escaped syntax do
+  // not become fake downloadable attachments.
+  if (tag === 'markdown' || tag === 'md' || tag === 'lark_md') {
+    const markdown = typeof el.content === 'string'
+      ? el.content
+      : typeof el.text === 'string'
+        ? el.text
+        : typeof el.text?.content === 'string'
+          ? el.text.content
+          : '';
+    for (const markdownKey of extractFeishuCardMarkdownImageKeys(markdown)) {
+      pushIfNew(resources, { type: 'image', key: markdownKey, name: `${markdownKey}.jpg` });
+    }
+  }
+
   // div.extra can contain an image
   if (el.extra) extractElementImages(el.extra, resources, pushIfNew);
 
@@ -1743,7 +1769,9 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   if (tag === 'markdown' && typeof el.element_id === 'string') {
     const idMatch = REPLY_CARD_HEADING_ELEMENT_ID_RE.exec(el.element_id);
     if (idMatch) {
-      const heading = (typeof elementText === 'string' ? elementText : nestedCardText(el))?.trim();
+      const heading = stripTrailingGroupContextCardPurposeMarker(
+        (typeof elementText === 'string' ? elementText : nestedCardText(el)) ?? '',
+      ).trim();
       if (heading) {
         parts.push(`${'#'.repeat(Number(idMatch[1]))} ${heading}`);
         return;
@@ -1754,7 +1782,12 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // div / markdown / plain_text blocks
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {
     const text = el.text?.content ?? el.content;
-    if (text) parts.push(text);
+    if (text) {
+      const visibleText = typeof text === 'string'
+        ? stripTrailingGroupContextCardPurposeMarker(text)
+        : text;
+      if (visibleText) parts.push(visibleText);
+    }
   }
 
   if (tag === 'table') {

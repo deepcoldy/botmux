@@ -330,6 +330,24 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('points to the send guide in both locales and injection paths', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const prompts = [
+        buildBotmuxSystemPromptText({ locale }),
+        buildBotmuxShellHints(locale).join('\n'),
+      ];
+      for (const prompt of prompts) {
+        expect(prompt).toContain('botmux skill show botmux-send');
+      }
+      // No-transport and transcript delivery must keep their existing contract:
+      // these modes do not advertise explicit send commands in routing hints.
+      expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
+    }
+  });
+
   it('keeps the final-answer feedback hint aligned across both injection paths', () => {
     // 回归守卫：feedbackResponseKindHint 必须同时出现在 system-prompt 路径
     // （injectsSessionContext CLI）与 shell-hints 路径，否则启用最终回答反馈时
@@ -3394,7 +3412,7 @@ describe('readyPattern', () => {
     // on this opt-in being present, so pin it (the worker reads it === true).
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
-    expect(adapter.supportsTypeAhead).toBe(false);
+    expect(adapter.supportsTypeAhead).toBe(true);
     expect(adapter.postTerminalPromptFence).toBe(true);
     expect(adapter.quarantineUnconfirmedSubmits).toBe(true);
   });

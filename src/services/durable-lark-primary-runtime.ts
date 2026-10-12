@@ -89,6 +89,7 @@ export function startDurableLarkPrimaryRuntime(
   });
   const dispatch = createDurableLarkCanonicalDispatch({
     facade: session,
+    store: options.store,
     handle: options.handleCanonical,
   });
   const inbox = startDurableInboxPrimaryConsumer({

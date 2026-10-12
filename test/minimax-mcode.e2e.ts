@@ -1,13 +1,14 @@
 import { afterEach, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { runMcodeExec } from '../src/services/mcode-exec.js';
 import { collectNativePrint } from '../src/services/constrained-invocation/print-process.js';
-import * as pty from 'node-pty';
+import * as pty from '../src/utils/pty.js';
 import { applySessionOwnerEnv } from '../src/utils/child-env.js';
 import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 
 const sandbox = process.env.BOTMUX_MCODE_SANDBOX_E2E === '1';
 const executable = process.env.BOTMUX_MCODE_E2E_BIN;
@@ -25,6 +26,10 @@ it.skipIf(!executable)('real mcode: executes a shell tool, preserves owner and r
   const requests: any[] = [];
   let toolSent = false;
   let nativeExecutable = executable!;
+  const adapter = createMinimaxAdapter(executable!);
+  const adapterArgs = adapter.buildArgs({ sessionId: 'mcode-native', resume: false, env: { MINIMAX_DATA_DIR: dataDir } });
+  const nodeBin = adapterArgs.includes('--node-bin') ? adapterArgs[adapterArgs.indexOf('--node-bin') + 1] : undefined;
+  const readonlyRoots = adapter.sandboxReadonlyPaths?.() ?? [];
   let cleanupSandbox: (() => void) | undefined;
   const server = createServer(async (req, res) => {
     let raw = ''; for await (const chunk of req) raw += chunk;
@@ -43,7 +48,8 @@ it.skipIf(!executable)('real mcode: executes a shell tool, preserves owner and r
     }
     const deltas = tool ? [
       { choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'proof-call', type: 'function',
-        function: { name: 'bash', arguments: JSON.stringify({ command: 'printf mcode-tool-ok > proof.txt; printf "%s" "$BOTMUX_OWNER_OPEN_ID" > owner.txt' }) } }] }, finish_reason: null }] },
+        function: { name: 'bash', arguments: JSON.stringify({ command: 'printf mcode-tool-ok > proof.txt; printf "%s" "$BOTMUX_OWNER_OPEN_ID" > owner.txt'
+          + (sandbox ? `; if test -w '${readonlyRoots[0]!.replace(/'/g, "'\\''")}'; then printf writable; else printf readonly; fi > sandbox-readonly.txt` : '') }) } }] }, finish_reason: null }] },
       { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
     ] : [
       { choices: [{ index: 0, delta: { role: 'assistant', content: 'NATIVE_MCODE_OK' }, finish_reason: null }] },
@@ -61,17 +67,17 @@ it.skipIf(!executable)('real mcode: executes a shell tool, preserves owner and r
     '--api-format', 'openai-completions', '--model', 'fixture-model', '--use'], { cwd, env, input: '' }, AbortSignal.timeout(30_000));
   if (sandbox) {
     const canonicalRoot = realpathSync(root);
-    const installRoot = dirname(dirname(realpathSync(executable!)));
-    mkdirSync(join(installRoot, '.mcode-active'), { recursive: true });
+    expect(readonlyRoots.length).toBeGreaterThan(0);
     const plan = prepareDirectSandbox({ sessionId: 'mcode-native', dataDir: join(root, 'botmux'),
       policy: { rules: [
         { path: '/usr', access: 'readOnly', source: 'internal' },
         { path: '/etc', access: 'readOnly', source: 'internal' },
         { path: canonicalRoot, access: 'readWrite', source: 'internal' },
-        { path: installRoot, access: 'readOnly', source: 'internal' },
-        { path: join(installRoot, '.mcode-active'), access: 'readWrite', source: 'internal' },
+        ...readonlyRoots.map(path => ({ path: realpathSync(path), access: 'readOnly' as const, source: 'internal' as const })),
+        ...(adapter.sandboxExtraExecPaths?.() ?? []).map(path => ({ path: dirname(realpathSync(path)), access: 'readOnly' as const, source: 'adapter' as const })),
+        ...(adapter.authPaths ?? []).map(path => ({ path: realpathSync(path), access: 'readWrite' as const, source: 'adapter' as const })),
       ], net: true, writeRegexes: [] }, chdir: realpathSync(cwd), home: realpathSync(home),
-      cliBin: realpathSync(executable!), cliArgs: [], tempDir: join(root, 'temp'),
+      cliBin: nodeBin ?? realpathSync(executable!), cliArgs: nodeBin ? [realpathSync(executable!)] : [], tempDir: join(root, 'temp'),
     });
     expect(plan, 'file sandbox must be available for this opt-in native verification').not.toBeNull();
     cleanupSandbox = plan!.cleanup;
@@ -114,6 +120,7 @@ it.skipIf(!executable)('real mcode: executes a shell tool, preserves owner and r
   expect(first.content).toBe('NATIVE_MCODE_OK');
   expect(readFileSync(join(cwd, 'proof.txt'), 'utf8')).toBe('mcode-tool-ok');
   expect(readFileSync(join(cwd, 'owner.txt'), 'utf8')).toBe('ou_native_owner');
+  if (sandbox) expect(readFileSync(join(cwd, 'sandbox-readonly.txt'), 'utf8')).toBe('readonly');
   expect(events.some(event => event.item?.type === 'tool_call')).toBe(true);
   expect(requests.some(req => req.tools?.some((tool: any) => tool.function?.name === 'bash'))).toBe(true);
   const before = requests.length;
@@ -123,7 +130,8 @@ it.skipIf(!executable)('real mcode: executes a shell tool, preserves owner and r
   expect(JSON.stringify(requests.slice(before))).toContain('NATIVE_TOOL_TEST');
   expect(JSON.stringify(requests.slice(before))).toContain('NATIVE_SECOND_TURN');
   } catch (error) {
-    if (sandbox) throw new Error(`${String(error)}: ${readFileSync(join(root, 'sandbox-stderr.log'), 'utf8')}`);
+    const stderrPath = join(root, 'sandbox-stderr.log');
+    if (sandbox && existsSync(stderrPath)) throw new Error(`${String(error)}: ${readFileSync(stderrPath, 'utf8')}`);
     throw error;
   } finally { cleanupSandbox?.(); }
 }, sandbox ? 200_000 : 90_000);

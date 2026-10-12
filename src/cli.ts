@@ -8654,6 +8654,7 @@ import {
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
 } from './services/send-policy.js';
+import { normalizePositionalSendContent } from './services/send-content.js';
 
 /**
  * Sandbox relay mode for `botmux send`. Inside a file-sandbox the CLI cannot
@@ -8722,7 +8723,9 @@ async function relaySend(
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent']);
-    content = pos.length > 0 ? pos.join(' ') : await readStdin();
+    content = pos.length > 0
+      ? normalizePositionalSendContent(pos.join(' '))
+      : await readStdin();
   }
   content = stripTrailingOaiMemoryCitation(content);
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
@@ -9271,7 +9274,9 @@ async function sendDryRun(rest: string[]): Promise<void> {
     content = readFileSync(contentFile, 'utf-8');
   } else {
     const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
-    content = pos.length > 0 ? pos.join(' ') : await readStdin();
+    content = pos.length > 0
+      ? normalizePositionalSendContent(pos.join(' '))
+      : await readStdin();
   }
   content = extractCardText(stripTrailingOaiMemoryCitation(content));
   if (!content.trim()) {
@@ -10072,10 +10077,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     if (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined || noQuote
       || customCardRequested || asVoice || isSlashSend || asChoice || replyLayout
-      || images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0
+      || files.length > 0 || videos.length > 0 || videoCovers.length > 0
       || mentionArgs.length > 0 || mentionDecisionCount !== 1
       || attention.requested || urgent.requested || expectedLinks.length > 0) {
-      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown with one none/requester mention decision');
+      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown/images with one none/requester mention decision');
       process.exit(2);
     }
   }
@@ -10347,7 +10352,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   } else {
     const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound']);
     if (pos.length > 0) {
-      content = pos.join(' ');
+      content = normalizePositionalSendContent(pos.join(' '));
     } else {
       content = await readStdin();
     }
@@ -14543,10 +14548,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       ? { questions: [{ prompt, options, multiSelect: true }] }
       : { options, prompt }),
     timeoutMs,
-    // Explicit `botmux ask buttons` has no reconnecting claimant (the CLI exits
-    // on daemon restart), so mark it non-hook: the broker won't persist/handoff
-    // it and can never confuse it with a hook ask's card (codex P1-4/P1-3).
+    // Stable invocation identity: reconnect without posting a second card.
     originKind: 'explicit',
+    requestId: randomUUID(),
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
@@ -14554,13 +14558,26 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
   };
 
-  let result;
+  const protectAskWait = () => {
+    console.error('botmux ask: 正在等待真人回答；Ctrl-C 不取消确认，请等待回答或正常超时。');
+  };
+  process.on('SIGINT', protectAskWait);
+  const reconnectDeadline = Date.now() + timeoutMs + 60_000;
+  let result: import('./core/ask-types.js').AskResult;
   try {
-    result = await postAsk(body);
+    while (true) {
+      try { result = await postAsk(body); break; }
+      catch (err) {
+        if (!(err as { retryable?: boolean }).retryable || Date.now() >= reconnectDeadline) throw err;
+        // The daemon owns the deadline and receipt. Reuse the same request;
+        // don't convert a transport failure into a human decision/timeout.
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
   } catch (err) {
-    const code = (err as any).exitCode ?? 3;
+    process.removeListener('SIGINT', protectAskWait);
     console.error((err as Error).message);
-    process.exit(code);
+    process.exit((err as { exitCode?: number }).exitCode ?? 3);
   }
 
   // result.kind==='answered' 时用 toLegacySelected 取回旧的 string（单问单选）
@@ -14597,6 +14614,13 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     const value = multiSelect ? (result.answers[0]?.join(',') ?? '') : (selected ?? '');
     process.stdout.write(value + '\n');
   }
+
+  // Flush the actual result before acknowledging delivery. If this process
+  // disappears first, the daemon can still recover its unconsumed receipt.
+  await new Promise<void>(resolve => process.stdout.write('', () => resolve()));
+  try { await postAsk({ ...body, acknowledge: true }); }
+  catch { /* durable receipt + same-session recovery handles ambiguous delivery */ }
+  process.removeListener('SIGINT', protectAskWait);
 
   switch (result.kind) {
     case 'answered':

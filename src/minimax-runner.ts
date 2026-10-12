@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Long-lived Botmux stdin bridge around MiniMax Code's native exec sessions.
  * No latest-session lookup, shell-interpolated prompts, or mmx compatibility. */
-import { resolve } from 'node:path';
+import { delimiter, dirname, resolve } from 'node:path';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { runMcodeExec } from './services/mcode-exec.js';
 
@@ -12,7 +12,7 @@ const argOffset = process.argv[2] === '__minimax-runner' ? 3 : 2;
 for (let i = argOffset; i < process.argv.length; i += 2) {
   const key = process.argv[i];
   const value = process.argv[i + 1];
-  if (!['--mcode-bin', '--data-dir', '--cwd', '--native-session-id', '--model', '--effort', '--permission', '--turn-timeout-ms'].includes(key) || value === undefined) {
+  if (!['--mcode-bin', '--node-bin', '--data-dir', '--cwd', '--native-session-id', '--model', '--effort', '--permission', '--turn-timeout-ms'].includes(key) || value === undefined) {
     output.error('Invalid minimax runner arguments\n'); process.exit(2);
   }
   values.set(key, value);
@@ -24,6 +24,13 @@ if (!executable || !['full', 'smart'].includes(permission) || !Number.isSafeInte
   output.error('minimax runner requires --mcode-bin, a valid permission policy and timeout\n'); process.exit(2);
 }
 const cwd = resolve(values.get('--cwd') ?? process.cwd());
+// npm's executable uses /usr/bin/env node. Its host PATH entry may be a symlink
+// under /run, absent inside bwrap; use the same canonical runtime the adapter
+// declared as an executable bind. Official launchers supply their own runtime.
+const nativeEnv = { ...process.env,
+  ...(values.has('--data-dir') ? { MINIMAX_DATA_DIR: values.get('--data-dir') } : {}),
+  ...(values.has('--node-bin') ? { PATH: [dirname(values.get('--node-bin')!), process.env.PATH ?? ''].join(delimiter) } : {}),
+};
 let nativeSessionId = values.get('--native-session-id');
 let active: AbortController | undefined;
 let closing = false;
@@ -60,7 +67,7 @@ async function drain(): Promise<void> {
       output.line('[MiniMax Code] running…');
       const streamedItems = new Set<string>();
       try {
-        const result = await runMcodeExec({ executable: executable!, cwd, env: { ...process.env, ...(values.has('--data-dir') ? { MINIMAX_DATA_DIR: values.get('--data-dir') } : {}) },
+        const result = await runMcodeExec({ executable: executable!, cwd, env: nativeEnv,
           content: turn.content, nativeSessionId, model: values.get('--model'), effort: values.get('--effort'),
           permission: permission as 'full' | 'smart', timeoutMs,
           onEvent(event) {
