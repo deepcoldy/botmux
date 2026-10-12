@@ -150,6 +150,44 @@ describe('resolveUserToken — per-user isolation', () => {
     expect(files.get(perUserPath(APP, ALICE))).toBe(original);
   });
 
+  it('keeps a newer token that replaces the credential while refresh is in flight', async () => {
+    const path = perUserPath(APP, ALICE);
+    files.set(path, tokenFor({
+      access_token: 'EXPIRED',
+      refresh_token: 'OLD_RT',
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+    }, -60_000));
+    let release!: (body: unknown) => void;
+    const json = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json })));
+
+    const { resolveUserToken } = await fresh();
+    const task = resolveUserToken(APP, 'sec', 'feishu', ALICE);
+    await vi.waitFor(() => expect(json).toHaveBeenCalled());
+
+    const newer = tokenFor({
+      access_token: 'NEWER',
+      refresh_token: 'NEWER_RT',
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+    });
+    files.set(path, newer);
+    release({
+      access_token: 'LATE',
+      refresh_token: 'LATE_RT',
+      token_type: 'Bearer',
+      expires_in: 7200,
+      refresh_token_expires_in: 2_592_000,
+      scope: 's',
+    });
+
+    expect(await task).toBe('NEWER');
+    expect(files.get(path)).toBe(newer);
+  });
+
   it('refreshes into the same person\'s file, never the per-app path', async () => {
     // Access token already expired, refresh token still good.
     files.set(perUserPath(APP, ALICE), tokenFor(
