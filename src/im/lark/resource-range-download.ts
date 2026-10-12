@@ -66,6 +66,7 @@ export async function downloadResourceWithRange(
 ): Promise<void> {
   let total = 0;
   // A one-byte probe avoids the ordinary endpoint's whole-file size limit.
+  // Intentionally fail fast here: data retries start only after range metadata is validated.
   let probe: ResourceStream | undefined;
   try {
     probe = await request(0, 0);
@@ -106,6 +107,8 @@ export async function downloadResourceWithRange(
             break;
           } catch (error) {
             response?.destroy();
+            // Defensive rollback: each retry overwrites the full range, but discard any
+            // partial tail first so the temporary file contains only completed ranges.
             await file.truncate(offset);
             if (attempt >= 2 || !transient(error)) throw error;
             await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
