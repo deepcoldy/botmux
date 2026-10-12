@@ -13,7 +13,7 @@ Every line is one JSON request or response with:
 - protocol `botmux.durable-coordination-provider`;
 - wire version `1`;
 - a stable `requestId`;
-- an initial `hello` that proves durable contract version `1`;
+- an initial `hello` that proves durable contract version `2`; version `1` providers are intentionally rejected because lane-aware inbox operations are a breaking contract change;
 - a `call` for one public store method.
 
 The provider may respond out of order. BotMux correlates by `requestId`, bounds line size and request time, rejects unknown request ids, and terminates the provider after a timeout or malformed response. Provider failures carry a bounded public code, a redacted message, and explicit retryability; retryability never changes outbox ambiguity rules.
