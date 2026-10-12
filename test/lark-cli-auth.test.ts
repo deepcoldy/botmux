@@ -144,8 +144,8 @@ describe('begin / complete device flow', () => {
     expect(challenge?.authUrl).toBe('https://v/verify');
     expect(seen[0].args).toEqual(['auth', 'login', '--no-wait', '--json', '--scope', LARK_CLI_DEVICE_SCOPES.join(' ')]);
     const scopes = seen[0].args[seen[0].args.indexOf('--scope') + 1].split(' ');
-    expect(scopes).toEqual(expect.arrayContaining(['base:field:read', 'base:record:read']));
-    expect(scopes.some(scope => /^base:.*(?:write|create|delete|update)/.test(scope))).toBe(false);
+    // Task-specific permissions belong to incremental authorization, not login.
+    expect(scopes.some(scope => scope.startsWith('base:'))).toBe(false);
     // The call already ran inside this person's HOME.
     expect(seen[0].home).toBe(larkCliHomeFor(OPEN));
   });

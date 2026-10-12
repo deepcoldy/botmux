@@ -116,8 +116,6 @@ const LARK_CLI_TIMEOUT_MS = 30_000;
  *  switching the issuing app does not silently narrow what works. */
 export const LARK_CLI_DEVICE_SCOPES = [
   'offline_access',
-  'base:field:read',
-  'base:record:read',
   'docx:document:readonly',
   'docs:document.content:read',
   'drive:drive.metadata:readonly',

@@ -88,6 +88,15 @@ describe('buildCredentialBoundaryBlock', () => {
     expect(zh).toContain('/login');
   });
 
+  it.each(['zh', 'en'] as const)('bundles only the planned task permissions after missing_scope in %s', locale => {
+    const prompt = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli'] }, locale);
+    expect(prompt).toContain('base:field:read base:record:read');
+    expect(prompt).toContain(locale === 'zh' ? '不要重跑普通 /login' : 'do not repeat ordinary /login');
+    expect(prompt).toContain(locale === 'zh' ? '只读字段则不要附加记录权限' : 'a fields-only task must not add record access');
+    expect(prompt).toContain(locale === 'zh' ? '不要申请当前任务之外或未经核实的权限' : 'Do not request unrelated or unverified permissions');
+    expect(prompt).toContain('botmux auth wait --request-id &lt;requestId&gt; --json');
+  });
+
   it('covers forwarding, not just reading', () => {
     // Reading is one leak path; pasting a token the agent legitimately holds
     // into a message or a commit is another, and far easier to do by accident.
