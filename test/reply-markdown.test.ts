@@ -53,6 +53,14 @@ describe('display repair for misplaced reply fences', () => {
     expect(repairReplyMarkdown(input)).toBe(input);
   });
 
+  it.each(['    ', '\t'])('preserves %j indentation on a paragraph continuation with an unindented closing fence', indent => {
+    // CommonMark keeps an indented continuation inside the top-level paragraph.
+    // The unindented closing fence cannot mask a missing opening-line guard.
+    const input = ['示例说明', indent + '实例：' + fence + 'plain_text', body, fence].join('\n');
+    expect(repairReplyMarkdown(input)).toBe(input);
+    expect(repairReplyMarkdown(repairReplyMarkdown(input))).toBe(input);
+  });
+
   it('preserves CRLF and every original body character', () => {
     const input = malformed.replaceAll('\n', '\r\n');
     expect(repairReplyMarkdown(input)).toBe(expected.replaceAll('\n', '\r\n'));
