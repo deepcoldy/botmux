@@ -35,6 +35,10 @@ vi.mock('../src/utils/atomic-write.js', () => ({
   atomicWriteFileSync: vi.fn((p: string, data: string) => { files.set(p, data); }),
 }));
 
+vi.mock('../src/utils/file-lock.js', () => ({
+  withFileLockSync: vi.fn((_path: string, fn: () => unknown) => fn()),
+}));
+
 vi.mock('node:fs', async (importOriginal) => {
   const orig = await importOriginal<typeof import('node:fs')>();
   return {
@@ -169,6 +173,36 @@ describe('resolveUserToken — per-user isolation', () => {
     expect(files.has(perAppPath(APP))).toBe(false);
   });
 
+  it('persists rotated credentials when refresh returns a reduced scope set', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      access_token: 'EXPIRED',
+      refresh_token: 'OLD_RT',
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+      scope: 'offline_access docs:document.comment:read',
+    }, -60_000));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      access_token: 'FRESH',
+      refresh_token: 'ROTATED_RT',
+      token_type: 'Bearer',
+      expires_in: 7200,
+      refresh_token_expires_in: 2_592_000,
+      scope: 'offline_access',
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+
+    const { resolveUserToken } = await fresh();
+    expect(await resolveUserToken(APP, 'sec', 'feishu', ALICE)).toBe('FRESH');
+
+    const written = JSON.parse(files.get(perUserPath(APP, ALICE))!);
+    expect(written).toMatchObject({
+      access_token: 'FRESH',
+      refresh_token: 'ROTATED_RT',
+      scope: 'offline_access',
+      openId: ALICE,
+    });
+  });
+
   it('does not invent an owner when refreshing an unattributed file', async () => {
     files.set(perAppPath(APP), tokenFor({ access_token: 'OLD', appId: APP, brand: 'feishu' }, -60_000));
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
@@ -288,12 +322,53 @@ describe('handleCallbackUrl — attribution must be proven, never assumed', () =
     expect(files.has(perUserPath(APP, ALICE))).toBe(true);
   });
 
+  it('includes the same user\'s existing scopes in an incremental browser authorization', async () => {
+    files.set(perUserPath(APP, ALICE), tokenFor({
+      appId: APP,
+      brand: 'feishu',
+      openId: ALICE,
+      scope: 'docs:document.comment:read offline_access',
+    }));
+    const mod = await fresh();
+    const { authUrl } = mod.generateAuthUrl(
+      APP,
+      'sec',
+      'feishu',
+      ['contact:user.base:readonly'],
+      ALICE,
+    );
+    expect(new URL(authUrl).searchParams.get('scope')?.split(' ')).toEqual([
+      'im:message:readonly',
+      'im:resource',
+      'offline_access',
+      'contact:user.base:readonly',
+      'docs:document.comment:read',
+    ]);
+  });
+
   // The forwarded-link case: Bob clicked Alice's link. Bob's token is Bob's.
   it('files under the clicker, not the requester, and says so', async () => {
     const { msg } = await runCallback({ body: { code: 0, data: { open_id: BOB, name: '鲍勃' } } });
     expect(files.has(perUserPath(APP, BOB))).toBe(true);
     expect(files.has(perUserPath(APP, ALICE))).toBe(false);
     expect(msg).toContain('不是同一个人');
+  });
+
+  it('refuses to overwrite the clicker when a forwarded link would drop their existing scopes', async () => {
+    const original = tokenFor({
+      access_token: 'TOK_BOB',
+      appId: APP,
+      brand: 'feishu',
+      openId: BOB,
+      scope: 'docs:document.comment:read offline_access',
+    });
+    files.set(perUserPath(APP, BOB), original);
+
+    const { msg } = await runCallback({ body: { code: 0, data: { open_id: BOB, name: '鲍勃' } } });
+
+    expect(files.get(perUserPath(APP, BOB))).toBe(original);
+    expect(msg).toContain('避免覆盖后降权');
+    expect(msg).toContain('docs:document.comment:read');
   });
 
   it.each([
