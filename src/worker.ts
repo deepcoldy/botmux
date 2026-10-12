@@ -2093,7 +2093,7 @@ let lastSpawnCodexLauncherActive = false;
 let lastSpawnCodexExecutable: string | undefined;
 /**
  * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
- * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
+ * baked first prompt + reliable turn terminal (Grok-class). First markPromptReady
  * then reports working (not idle). Cleared on first consume. Must stay false
  * for Riff/queue-after-spawn and for quiescence-only argv adapters.
  */
@@ -12771,7 +12771,7 @@ function noteSpawnArgvTurnStartTranscriptEvidence(events: readonly { kind: strin
   // serves Grok — another argv-baked + structured-bridge + type-ahead CLI —
   // so without this guard the flush side effect below would add a new
   // startup-window write for Grok (whose first ready is owned by the
-  // SessionStart busy arm, not by this gate).
+  // reliable-terminal busy arm, not by this gate).
   if (!structuredBridgeIsPi()) return;
   if (spawnArgvTurnStartEvidenceSeen || !spawnArgvNeedsWorkingSeed) return;
   if (!events.some(ev => ev.kind === 'user' || ev.kind === 'assistant_final')) return;
@@ -12976,7 +12976,7 @@ function markPromptReady(): void {
   // fireIdle() can drive the real ready edge.
   if (hasStructuredLifecycleBlock() && !spawnArgvInitialPromptBusy) {
     // Grok is lifecycle-blocking, but its FIRST ready is still a pre-execution
-    // SessionStart / idle-detector edge while the argv-baked prompt is running.
+    // composer / idle-detector edge while the argv-baked prompt is running.
     // The spawnArgvInitialPromptBusy arm below must publish working and consume
     // itself on that first edge. After the arm is gone, later TUI redraws stay
     // blocked until turn_completed so they cannot publish idle mid-turn.
@@ -13101,8 +13101,8 @@ function markPromptReady(): void {
   // real work. Skip pure idle when:
   //  - messages are pending — flushPending() will immediately make the CLI
   //    busy (avoids a false "就绪" flash on daemon restart);
-  //  - Grok-class argv+SessionStart arming: first ready is pre-execution, so
-  //    park as working until assistant_final/fireIdle;
+  //  - Grok-class argv-baked prompt + reliable turn terminal: first ready is
+  //    pre-execution, so park as working until assistant_final/fireIdle;
   //  - quiescence argv CLIs (Pi/Gemini/MTR/OpenCode): first ready IS turn end
   //    — seed working then idle so card-off gets working→idle (review P2).
   const hasPendingWork =
@@ -17307,7 +17307,7 @@ async function spawnCli(
   // Argv-baked first prompt tracking (PR #633 P2 / second-round review):
   //  - needsWorkingSeed: any argv CLI (Pi/Gemini/MTR/OpenCode/Grok) so card-off
   //    reactions can form working→idle (seeded at first ready or Grok arm).
-  //  - busy arm: only Grok-class SessionStart (first ready ≠ turn end).
+  //  - busy arm: argv-baked prompt + reliable turn terminal (Grok-class; first ready is pre-execution).
   const argvBakedOpts = {
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
     preparedInitialPrompt,
@@ -17316,7 +17316,6 @@ async function spawnCli(
   spawnArgvNeedsWorkingSeed = shouldTrackArgvBakedFirstPrompt(argvBakedOpts);
   spawnArgvInitialPromptBusy = shouldArmSpawnArgvInitialPromptBusy({
     ...argvBakedOpts,
-    injectsReadyHook: cliAdapter.injectsReadyHook === true,
     reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
   });
   // Fresh evidence window for the argv first-turn start gate (Pi): the new
@@ -19727,10 +19726,12 @@ async function spawnCli(
   const readyHookAvailable = effectiveReadyHookInstall
     ? hasInstalledSessionReadyHook(effectiveReadyHookInstall)
     : true; // No config-file hook to verify → assume a direct ready-command
-            // integration (env-injected BOTMUX_READY_COMMAND). No current adapter
-            // takes this branch: claude-code and grok both ship a hookInstall
-            // config. (Hermes formerly did, on a BOTMUX_READY_COMMAND contract the
-            // shipped binary never honored — it no longer sets injectsReadyHook.)
+            // integration (env-injected BOTMUX_READY_COMMAND). dsh-tui is the
+            // only adapter on this branch today: it sets injectsReadyHook with
+            // no hookInstall (its wrapper plugin runs the ready command itself).
+            // The Claude family ships a hookInstall config, and Grok still
+            // carries one for historical parity even though it no longer arms
+            // the gate.
   const isolatedReadyTransportRequired = sandboxRequested || credentialBoundaryActive;
   const readyPortAvailable = !isolatedReadyTransportRequired
     || parseDaemonIpcPort(childEnv.BOTMUX_DAEMON_IPC_PORT) !== undefined;
@@ -19770,8 +19771,8 @@ async function spawnCli(
     // earlier would settle + flush through the type-ahead allowance into a
     // composer that may not be mounted yet, silently pre-empting the adapter's
     // cap. Such an adapter opts in explicitly
-    // (`readyGateFallbackAlignedWithHardCap`) — deriving it from the shared
-    // defer/readyPattern flags would also move grok from 45s to 90s.
+    // (`readyGateFallbackAlignedWithHardCap`) — other adapters carrying
+    // defer/readyPattern flags (Hermes, Grok) do not arm the gate at all.
     const readySignalTimeoutMs = resolveReadySignalTimeoutMs({
       alignFallbackWithFirstPromptHardCap: cliAdapter.readyGateFallbackAlignedWithHardCap === true,
       readySignalTimeoutMs: READY_SIGNAL_TIMEOUT_MS,

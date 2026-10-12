@@ -306,11 +306,11 @@ export function shouldReleaseFirstPromptTimeout(state: {
  *
  * The alignment is therefore an EXPLICIT, per-adapter opt-in
  * (`readyGateFallbackAlignedWithHardCap`) and is deliberately not derived from
- * the shared `deferFirstPromptTimeoutUntilReady` + readyPattern flags: grok
- * carries both of those, yet its 45s gate fallback is a pre-existing behavior
- * it must keep (its SessionStart hook is the primary signal, and the fallback is
- * simply the other ready edge). Deriving it from shared flags silently moved
- * every deferring adapter — grok included — from 45s to 90s.
+ * the shared `deferFirstPromptTimeoutUntilReady` + readyPattern flags: dsh-tui
+ * explicitly opts in because its multi-stage boot needs the 90s hard cap, whereas
+ * other adapters (such as Hermes or Grok) rely on their own readyPattern /
+ * composer detection without aligning ready-gate fallbacks. Deriving it from
+ * shared flags would silently move unrelated deferring adapters from 45s to 90s.
  *
  * For an adapter that opts in, aligning the fallback with its hard cap keeps one
  * deadline: the readyPattern still releases the gate as soon as it proves the

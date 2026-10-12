@@ -92,8 +92,14 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  poll window (the bound is the running turn's duration, unbounded) and
  *  the caller sees a spurious「提交未确认」. Pre-existing on master; the
  *  verify-semantics fix (dequeue-independent evidence) is a separate PR.
- *  Ready gate: global `$GROK_HOME/hooks/botmux-session-ready.json`
- *  SessionStart → `botmux session-ready` (`injectsReadyHook`).
+ *  Ready gate: Do NOT arm ready-gate (no `injectsReadyHook`).
+ *  Measured on Grok 1.0.46 / 1.0.50: a bare spawn DOES create a session and
+ *  DOES fire the SessionStart hook pre-prompt (~1.2s on a light GROK_HOME).
+ *  The failure this removes is different: on a heavy production `~/.grok`
+ *  (marketplace + MCP servers such as lynx-devtool) session creation can run
+ *  past the gate's whole window, so the signal arrives after the 45s fallback
+ *  — the gate then holds the first prompt for 45s for no benefit. Readiness is
+ *  driven by `readyPattern: /❯/` and quiescence, the same shape as Hermes.
  *
  *  ## Session context / system prompt
  *  Grok's append flag is `--rules` (docs: alias of Claude's
@@ -140,11 +146,17 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // idle. Crash/submit failures are reconciled by the worker's exact-attempt
     // terminal path.
     reliableTurnTerminal: true,
-    injectsReadyHook: true,
+    // Do NOT arm Botmux's ready-gate for Grok. The gate exists to hold the
+    // first prompt until a SessionStart hook proves an outer startup selector
+    // has been passed. Grok has no such selector, and its SessionStart fires
+    // pre-prompt only after the TUI has finished bringing the session up
+    // (measured ~1.2s on a light GROK_HOME; the production `~/.grok` with
+    // marketplace + MCP servers can take far longer, and a hook pointing at a
+    // stale checkout path never signals at all). Arming it therefore buys no
+    // safety and only adds a 45s hold whenever the signal is late or absent.
+    // Instead, like Hermes, Grok relies on `readyPattern: /❯/` and
+    // `deferFirstPromptTimeoutUntilReady: true` to detect composer readiness.
     injectsSessionContext: true,
-    // Hold soft first-prompt timeout until SessionStart ready signal or the
-    // composer's readyPattern — cold-start TUI can accept (and drop) stdin
-    // before the real composer exists.
     deferFirstPromptTimeoutUntilReady: true,
 
     buildArgs({
@@ -364,9 +376,10 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    // Composer box `❯` renders once the TUI is interactive — pairs with
+    // Composer box `❯` renders once the TUI is interactive. This is Grok's
+    // ONLY readiness signal (no ready-gate): pairs with
     // deferFirstPromptTimeoutUntilReady to keep the first prompt held past
-    // the soft timeout (the SessionStart ready hook is the primary signal).
+    // the soft timeout until the composer actually exists.
     readyPattern: /❯/,
     // Busy markers verified on 0.2.93: "⠧ Waiting for response…" spinner
     // during the model phase, and the "Ctrl+c:cancel" shortcut-bar entry
@@ -382,7 +395,15 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // Global skill root under $GROK_HOME (TUI has no --plugin-dir); layout is
     // `skills/<name>/SKILL.md`, same operational model as Codex.
     get skillsDir(): string { return grokSkillsDir(); },
-    // SessionStart → botmux session-ready for injectsReadyHook gate.
+    // Installed for historical / diagnostic parity only: the worker no longer
+    // arms a ready-gate for Grok, so no `session_ready` IPC is consumed.
+    // Deliberately kept rather than deleted: dropping this block does NOT
+    // uninstall the already-written `$GROK_HOME/hooks/botmux-session-ready.json`
+    // (installHook only ever writes, there is no uninstall path), so the hook
+    // would keep firing either way — while removing it here would also discard
+    // the only code that can rewrite that file. The hook itself is fail-open
+    // (`botmux session-ready` exits 0 without a matching session), so the cost
+    // is one no-op subprocess per session. Revisit together with the gate.
     hookInstall: {
       get configPath(): string { return join(grokHooksDir(), 'botmux-session-ready.json'); },
       format: 'grok-hooks',
