@@ -63,7 +63,9 @@ describe('Range transfer', () => {
     const bytes = Buffer.alloc(8 * 1024 * 1024 + 17, 19);
     const request = vi.fn(async (start: number, end: number) => partial(start, end, bytes.length, bytes.subarray(start, end + 1)));
     await downloadResourceWithRange(request, output);
-    expect(await readFile(output)).toEqual(bytes);
+    const written = await readFile(output);
+    expect(written.length).toBe(bytes.length);
+    expect(written.equals(bytes)).toBe(true);
     expect(request.mock.calls).toEqual([[0, 0], [0, 8388607], [8388608, 8388624]]);
     expect(await readdir(dirs[dirs.length - 1])).toEqual(['attachment.zip']);
   });
@@ -116,13 +118,46 @@ describe('Range transfer', () => {
     await expect(downloadResourceWithRange(async () => partial(0, 0, 2 ** 31 + 1), output)).rejects.toThrow('2 GiB');
     expect(await readdir(dirs[dirs.length - 1])).toEqual([]);
   });
-  it('does not retry 403 or publish a partial file', async () => {
+  it('does not retry a probe 403 or publish a partial file', async () => {
     const output = await outputPath();
     const request = vi.fn(async () => partial(0, 0, 3));
     request.mockRejectedValueOnce(Object.assign(new Error('forbidden'), { status: 403 }));
     await expect(downloadResourceWithRange(request, output)).rejects.toThrow('forbidden');
     expect(request).toHaveBeenCalledTimes(1);
     expect(await readdir(dirs[dirs.length - 1])).toEqual([]);
+  });
+  it('does not retry a data-range 403 and preserves existing output', async () => {
+    const output = await outputPath();
+    await writeFile(output, 'previous-valid-file');
+    const forbidden = Object.assign(new Error('forbidden'), { response: { status: 403 } });
+    const request = vi.fn(async (start: number, end: number) => partial(start, end, 3));
+    request.mockImplementationOnce(async () => partial(0, 0, 3));
+    request.mockRejectedValueOnce(forbidden);
+    await expect(downloadResourceWithRange(request, output)).rejects.toBe(forbidden);
+    expect(request.mock.calls).toEqual([[0, 0], [0, 2]]);
+    expect(await readFile(output, 'utf8')).toBe('previous-valid-file');
+    expect(await readdir(dirs[dirs.length - 1])).toEqual(['attachment.zip']);
+  });
+  it.each([429, 500, 503])('retries a data-range HTTP %s at the same offset', async status => {
+    const output = await outputPath();
+    const request = vi.fn(async (start: number, end: number) => partial(start, end, 3));
+    request.mockImplementationOnce(async () => partial(0, 0, 3));
+    request.mockRejectedValueOnce(Object.assign(new Error('temporary failure'), { response: { status } }));
+    await downloadResourceWithRange(request, output);
+    expect(request.mock.calls).toEqual([[0, 0], [0, 2], [0, 2]]);
+    expect(await readFile(output)).toEqual(Buffer.alloc(3, 7));
+    expect(await readdir(dirs[dirs.length - 1])).toEqual(['attachment.zip']);
+  });
+  it.each([429, 500, 503])('bounds data-range HTTP %s retries and cleans up on exhaustion', async status => {
+    const output = await outputPath();
+    await writeFile(output, 'previous-valid-file');
+    const failure = Object.assign(new Error('temporary failure'), { response: { status } });
+    const request = vi.fn(async () => { throw failure; });
+    request.mockImplementationOnce(async () => partial(0, 0, 3));
+    await expect(downloadResourceWithRange(request, output)).rejects.toBe(failure);
+    expect(request.mock.calls).toEqual([[0, 0], [0, 2], [0, 2], [0, 2]]);
+    expect(await readFile(output, 'utf8')).toBe('previous-valid-file');
+    expect(await readdir(dirs[dirs.length - 1])).toEqual(['attachment.zip']);
   });
 });
 
