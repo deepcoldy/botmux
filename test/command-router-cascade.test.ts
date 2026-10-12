@@ -79,3 +79,21 @@ describe('MULTILINE_COMMANDS 豁免（§9 补测）', () => {
     expect(parseSlashCommandInvocation('/role set\n/清单')).toBeNull();
   });
 });
+
+describe('Codex App /effort routing', () => {
+  const input: SlashRouteInput = {
+    text: '/effort high', context: 'thread', phase: 'none',
+    passthrough: new Set(), coldStartPassthrough: new Set(),
+    senderIsBot: false, acceptSlashFromBots: true, cliId: 'codex-app',
+  };
+  it('uses the administrative lane without creating a session or model turn', () => {
+    expect(classifySlash(input)).toEqual({ kind: 'daemon', cmd: '/effort', content: '/effort high', sessionPolicy: 'existing_only' });
+    expect(classifySlash({ ...input, context: 'new-topic' })).toEqual(classifySlash(input));
+  });
+  it('preserves other CLIs, bot gating, and discussion text', () => {
+    expect(classifySlash({ ...input, cliId: 'codex', passthrough: PT }).kind).toBe('passthrough');
+    expect(classifySlash({ ...input, senderIsBot: true, acceptSlashFromBots: false }).kind).toBe('forward');
+    expect(classifySlash({ ...input, text: '/effort <level>' }).kind).toBe('forward');
+    expect(classifySlash({ ...input, text: '/effort high\nExplain this command' }).kind).toBe('forward');
+  });
+});

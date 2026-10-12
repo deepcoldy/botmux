@@ -3,6 +3,12 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — 修改 Codex App 推理强度（以当前模型支持的档位为准）',
+  'cmd.effort.applied': '推理强度已设为 {effort}，已更新当前轮和后续轮次。当前轮后续推理步骤可取用新设置，已经发出的模型请求保持原参数。',
+  'cmd.effort.future_only': '后续轮次的推理强度已设为 {effort}；当前轮未确认更新（可能已结束或接口不可用）。',
+  'cmd.effort.invalid': '当前模型不支持该档位。可选：{choices}',
+  'cmd.effort.unavailable': '当前 Codex App 连接尚未就绪或正在切换，请稍后重试。',
+  'cmd.effort.error': '未能确认推理强度修改结果，请稍后重试。',
   'worker.steer_accepted': '收到，引导成功',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': '终端正在启动',

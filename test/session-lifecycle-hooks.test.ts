@@ -108,6 +108,7 @@ import {
 } from '../src/services/session-lifecycle-hooks.js';
 import {
   detachWorkerForTransfer,
+  updateCodexAppEffort,
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
@@ -624,5 +625,57 @@ describe('worker-pool lifecycle hook integration', () => {
       workerGeneration: 1,
       disposition: 'queued_removed',
     });
+  });
+});
+
+describe('Codex App effort IPC', () => {
+  it('correlates the receipt while keeping a busy business turn intact', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true, lastScreenStatus: 'working' });
+    ds.session.cliId = 'codex-app';
+    const before = { ...ds };
+    const pending = updateCodexAppEffort(ds, 'high');
+    const request = worker.send.mock.calls[0][0];
+    expect(request).toMatchObject({ type: 'codex_app_effort', effort: 'high' });
+    worker.emit('message', { type: 'codex_app_effort_result', requestId: 'another-request', status: 'error' });
+    expect(worker.listenerCount('message')).toBe(1);
+    worker.emit('message', { type: 'codex_app_effort_result', requestId: request.requestId, status: 'applied' });
+    expect(await pending).toMatchObject({ status: 'applied' });
+    expect(worker.listenerCount('message')).toBe(0);
+    expect(worker.listenerCount('exit')).toBe(0);
+    expect(worker.send).toHaveBeenCalledTimes(1);
+    expect(ds).toEqual(before);
+  });
+
+  it.each(['timeout', 'exit', 'replacement'] as const)('cleans up on %s without accepting a stale success', async mode => {
+    vi.useFakeTimers();
+    try {
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker, workerReady: true, cliReady: true });
+      ds.session.cliId = 'codex-app';
+      const pending = updateCodexAppEffort(ds, 'high', 100);
+      const request = worker.send.mock.calls[0][0];
+      if (mode === 'timeout') await vi.advanceTimersByTimeAsync(100);
+      else if (mode === 'exit') worker.emit('exit', 1);
+      else {
+        ds.worker = makeFakeWorker();
+        worker.emit('message', { type: 'codex_app_effort_result', requestId: request.requestId, status: 'applied' });
+      }
+      expect(await pending).toEqual({ status: 'error' });
+      expect(worker.listenerCount('message')).toBe(0);
+      expect(worker.listenerCount('exit')).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects unready and ordinary CLI sessions before sending', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, cliReady: true });
+    expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
+    ds.session.cliId = 'codex-app';
+    ds.cliReady = false;
+    expect(await updateCodexAppEffort(ds, 'high')).toEqual({ status: 'unavailable' });
+    expect(worker.send).not.toHaveBeenCalled();
   });
 });

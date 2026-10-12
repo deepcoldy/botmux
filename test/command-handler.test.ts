@@ -358,6 +358,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return { attemptId: 'attempt-test', joined: false };
   }),
   isSessionTransferring: vi.fn(() => false),
+  updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
   sendWorkerSessionInput: vi.fn(() => true),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
@@ -604,7 +605,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -8990,5 +8991,44 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
     await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('发送失败');
+  });
+});
+
+describe('Codex App /effort command', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    vi.mocked(getBot).mockImplementation(defaultGetBot as typeof getBot);
+  });
+
+  it.each(['applied', 'future_only', 'error', 'unavailable', 'invalid'] as const)('replies with the native %s result without creating business input', async status => {
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }), lastScreenStatus: 'working' });
+    const deps = makeDeps(ds);
+    vi.mocked(updateCodexAppEffort).mockResolvedValueOnce({ status, choices: ['low', 'high'] });
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort HIGH'), deps, LARK_APP_ID);
+    expect(updateCodexAppEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t(`cmd.effort.${status}`, { effort: 'high', choices: 'low, high' }), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+  });
+
+  it.each(['/effort', '/effort invalid', '/effort high extra'])('shows usage for %s', async text => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+    expect(updateCodexAppEffort).not.toHaveBeenCalled();
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('cmd.effort.usage'), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('rejects unauthorized callers and missing sessions', async () => {
+    const deps = makeDeps(makeDaemonSession({ session: makeSession({ cliId: 'codex-app' }) }));
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('daemon.cmd_allowed_users_only', { cmd: '/effort' }), undefined, LARK_APP_ID, 'msg_001');
+    const missing = makeDeps();
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort high'), missing, LARK_APP_ID);
+    expect(missing.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('cmd.no_active_session'), undefined, LARK_APP_ID, 'msg_001');
+    expect(updateCodexAppEffort).not.toHaveBeenCalled();
   });
 });

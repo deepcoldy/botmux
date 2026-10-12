@@ -1,5 +1,11 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — Change Codex App reasoning effort (supported levels depend on the current model)',
+  'cmd.effort.applied': 'Reasoning effort set to {effort} for the active turn and future turns. Subsequent inference steps can use the new setting; requests already issued keep their original parameters.',
+  'cmd.effort.future_only': 'Future turns will use {effort}; the active turn update was not confirmed (it may have completed or the API may be unavailable).',
+  'cmd.effort.invalid': 'This model does not support that effort. Available: {choices}',
+  'cmd.effort.unavailable': 'The Codex App connection is not ready or is being replaced. Please retry shortly.',
+  'cmd.effort.error': 'The reasoning effort update could not be confirmed. Please retry shortly.',
   'worker.steer_accepted': 'Got it — guidance accepted',
   // ─── Terminal status pages ───────────────────────────────────────────────
   'terminal.status.starting.title': 'Terminal is starting',

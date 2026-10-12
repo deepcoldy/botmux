@@ -23492,6 +23492,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   // 透传闸、DAEMON_COMMANDS 与会话政策全在 schema 驱动的一处判定里；下面只按决策执行。
   // 新话题入口不查 activeSessions，相位恒为 none；透传集按 live bot 配置求值（R2）。
   const slashDecision = classifySlash({
+    cliId: getBot(larkAppId).config.cliId,
     text: cmdContent,
     context: 'new-topic',
     phase: 'none',
@@ -26703,6 +26704,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   const slashDecision = ctx.messageListener
     ? null
     : classifySlash({
+      cliId: passthroughCliId,
       text: cmdContent,
       context: 'thread',
       phase: deriveSessionPhase(existingDs),

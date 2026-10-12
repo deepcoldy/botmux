@@ -77,6 +77,8 @@ export function isSessionlessCommandInvocation(cmd: string, content: string): bo
 export type RouteContext = 'new-topic' | 'thread';
 
 export interface SlashRouteInput {
+  /** Effective, session-frozen CLI for native app-server commands. */
+  cliId?: string;
   /** 命令车道文本：已剥前导 @（今天的 `cmdContent`）。 */
   text: string;
   context: RouteContext;
@@ -177,6 +179,11 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   //    所以先后顺序不可观测。
   const special = ROUTE_SPECIAL_COMMANDS.get(cmd);
   if (special) return { kind: 'special', cmd, content, handler: special };
+
+  // Codex App has no TUI: settings are a control request, never model input.
+  if (input.cliId === 'codex-app' && cmd === '/effort') {
+    return { kind: 'daemon', cmd, content, sessionPolicy: 'existing_only' };
+  }
 
   // ④ 透传闸（先于 DAEMON_COMMANDS；两集合恒不相交，顺序因此不可观测）。
   if (input.passthrough.has(cmd)) {

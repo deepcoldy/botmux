@@ -43,7 +43,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -1754,6 +1754,26 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/effort': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
+          break;
+        }
+        const effort = message.content.replace(/^\/effort\b/i, '').trim().toLowerCase();
+        if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) {
+          await sessionReply(rootId, t('cmd.effort.usage', undefined, loc));
+          break;
+        }
+        const result = await updateCodexAppEffort(ds, effort);
+        await sessionReply(rootId, t(`cmd.effort.${result.status}`, {
+          effort, choices: result.choices?.join(', ') ?? '',
+        }, loc));
+        break;
+      }
       case '/cli': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -5914,6 +5934,8 @@ export async function handleCommand(
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
+          ...((ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId) === 'codex-app'
+            ? [t('cmd.effort.usage', undefined, loc)] : []),
           t('help.close', { cliName }, loc),
           t('help.dismiss', undefined, loc),
           t('help.cleanup_wt', undefined, loc),

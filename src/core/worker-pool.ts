@@ -9843,6 +9843,53 @@ export type ExactTurnInterruptResult =
   | { ok: true }
   | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
 
+/** Native settings use their own receipt, without rotating business-turn state. */
+export function updateCodexAppEffort(
+  ds: DaemonSession,
+  effort: string,
+  timeoutMs = 35_000,
+): Promise<import('../types.js').CodexAppEffortResult> {
+  const worker = ds.worker;
+  if ((ds.initConfig?.cliId ?? ds.session.cliId) !== 'codex-app'
+    || !worker || worker.killed || !ds.workerReady || !ds.cliReady
+    || ds.session.status !== 'active' || isSessionTransferring(ds)
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) {
+    return Promise.resolve({ status: 'unavailable' });
+  }
+  const requestId = randomUUID();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (result: import('../types.js').CodexAppEffortResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      resolve(result);
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type !== 'codex_app_effort_result' || msg.requestId !== requestId) return;
+      finish(ds.worker === worker ? msg : { status: 'error' });
+    };
+    const onExit = (): void => finish({ status: 'error' });
+    const timer = setTimeout(() => finish({ status: 'error' }), timeoutMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    try {
+      if (!afterWorkerIpcBootstrap(worker, () => {
+        if (settled) return;
+        if (ds.worker !== worker) return finish({ status: 'unavailable' });
+        worker.send({ type: 'codex_app_effort', requestId, effort } satisfies DaemonToWorker);
+      })) {
+        finish({ status: 'unavailable' });
+      }
+    } catch {
+      finish({ status: 'error' });
+    }
+  });
+}
+
 /** Ask the currently owning worker to interrupt one exact turn and wait for its
  * acknowledgement. IPC delivery alone is not proof: the worker compares the
  * immutable turn id with its active turn before it can inject Ctrl+C. */

@@ -785,6 +785,8 @@ let activeTurnEpoch = 0;
  * is incorrectly sent with turn/start and its completion can be discarded as
  * belonging to an "unexpected" native turn. */
 let nativeActiveTurnId: string | undefined;
+let currentModel: string | undefined;
+let effortUpdateTail: Promise<void> = Promise.resolve();
 const queue: QueuedInput[] = [];
 let inputBuffer = '';
 let processing = false;
@@ -1244,6 +1246,10 @@ async function reconcileCompletedTurn(
 function handleNotification(msg: JsonObject, replayedAfterResponse = false): void {
   const params = msg.params ?? {};
   if (params.threadId !== threadId) return;
+  if (msg.method === 'thread/settings/updated') {
+    if (typeof params.threadSettings?.model === 'string') currentModel = params.threadSettings.model;
+    return;
+  }
   const notificationTurnId = params.turnId ?? params.turn?.id;
 
   // Per-turn token usage rides on thread/tokenUsage/updated (NOT turn/completed).
@@ -1623,6 +1629,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         throw new Error(`Strict resume expected thread ${threadId}, received ${resumedThreadId}`);
       }
       threadId = resumedThreadId;
+      currentModel = resumed.model;
       threadReady = true;
       emitMarker('thread', { threadId: resumedThreadId });
       return resumedThreadId;
@@ -1665,6 +1672,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/start') });
   const startedThreadId = String(started.thread.id);
   threadId = startedThreadId;
+  currentModel = started.model;
   threadReady = true;
   emitMarker('thread', { threadId: startedThreadId });
   void client.request('thread/name/set', {
@@ -2485,6 +2493,55 @@ async function drainQueue(): Promise<void> {
   }
 }
 
+async function updateReasoningEffort(
+  requestId: string, effort: string, tid: string | undefined, targetTurnId: string | undefined, deadline: number,
+): Promise<void> {
+  const current = client;
+  const modelId = currentModel;
+  let saved = false;
+  try {
+    if (!runnerReady || !threadReady || !tid || tid !== threadId || !modelId
+      || generationFenced || current.hasExited || Date.now() >= deadline) {
+      emitMarker('effort_result', { requestId, status: 'unavailable' });
+      return;
+    }
+    let cursor: string | undefined;
+    let model: JsonObject | undefined;
+    do {
+      const page = await current.request('model/list', { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      model = page.data?.find((entry: JsonObject) => entry.model === modelId || entry.id === modelId);
+      cursor = page.nextCursor ?? undefined;
+    } while (!model && cursor);
+    if (!model) throw new Error('current model not advertised');
+    const choices = model.supportedReasoningEfforts?.map((entry: JsonObject) => entry.reasoningEffort) ?? [];
+    if (!choices.includes(effort)) {
+      emitMarker('effort_result', { requestId, status: 'invalid', choices });
+      return;
+    }
+    if (client !== current || threadId !== tid || currentModel !== modelId || generationFenced) throw new Error('runner changed');
+    await current.request('thread/settings/update', { threadId: tid, effort }, {
+      timeoutMs: Math.min(10_000, deadline - Date.now()),
+    });
+    saved = true;
+    let status = 'future_only';
+    // Capture the native id on command arrival. Never retarget a later turn
+    // when the original completes while model/list or settings/update waits.
+    if (targetTurnId) {
+      const result = await current.request('turn/settings/update', { threadId: tid, turnId: targetTurnId, effort }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      if (result.status === 'applied') status = 'applied';
+      else if (result.status !== 'targetUnavailable') throw new Error('unknown settings status');
+    }
+    emitMarker('effort_result', { requestId, status });
+  } catch {
+    // An ambiguous settings response never cancels/replays the business turn.
+    emitMarker('effort_result', { requestId, status: saved ? 'future_only' : 'error' });
+  }
+}
+
 function enqueueLine(line: string): void {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -2492,6 +2549,15 @@ function enqueueLine(line: string): void {
     const encoded = trimmed.slice('::botmux-codex-app:'.length);
     try {
       const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      if (decoded?.type === 'effort' && typeof decoded.requestId === 'string'
+        && decoded.requestId.length > 0 && decoded.requestId.length <= 128
+        && typeof decoded.effort === 'string' && /^(low|medium|high|xhigh|max|ultra)$/.test(decoded.effort)) {
+        const targetTurnId = activeTurn?.nativeTurnId ?? nativeActiveTurnId;
+        const targetThreadId = threadId;
+        const deadline = Date.now() + 30_000;
+        effortUpdateTail = effortUpdateTail.then(() => updateReasoningEffort(decoded.requestId, decoded.effort, targetThreadId, targetTurnId, deadline));
+        return;
+      }
       if (decoded?.type === 'message' && typeof decoded.content === 'string') {
         const codexAppInput = isCodexAppTurnInput(decoded.codexAppInput)
           ? decoded.codexAppInput
