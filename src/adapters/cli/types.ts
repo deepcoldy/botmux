@@ -188,10 +188,14 @@ export interface CliAdapter {
     noTransport?: boolean;
     /** Trigger-user CLI auth is enabled for this bot. injectsSessionContext
      *  adapters forward it so the credential-boundary block is added to the
-     *  system prompt: the session acts with ONE person's credentials while the
-     *  on-disk store holds everyone else's, and nothing in the OS currently
-     *  stops an agent from reading those files. Off → no extra prompt text. */
+     *  system prompt: the governed tools act with ONE person's credentials
+     *  while the on-disk store holds everyone else's. A managed lark-cli is
+     *  excluded from this claim and described separately by larkToolAppId. */
     triggerUserAuth?: TriggerUserAuthConfig;
+    /** Current session's managed lark-cli app id. Injecting adapters use this
+     *  to state that lark-cli defaults to the bot even when other tools keep
+     *  per-turn initiator credentials. */
+    larkToolAppId?: string;
     /** Env the CLI must forward to the SHELL COMMANDS it runs, not merely hold
      *  itself. Codex does not pass its own environment to shell subprocesses,
      *  so the trigger-user wrapper vars (BOTMUX_IDENTITY_BIN / ZDOTDIR /

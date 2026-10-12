@@ -163,6 +163,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       larkAppId,
       noTransport,
       triggerUserAuth,
+      larkToolAppId,
       promptInjection,
     }) {
       const args: string[] = [];
@@ -219,6 +220,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           botOpenId,
           noTransport,
           triggerUserAuth,
+          larkToolAppId,
           builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
             asksViaHook: false,
             whiteboardEnabled: whiteboardEnabled(),

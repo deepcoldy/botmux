@@ -136,6 +136,16 @@ export function larkToolPrompt(appId: string, locale?: string): string {
     : `lark-cli 固定使用当前机器人的应用 ${appId}，默认以 bot 身份调用（其他工具的按用户鉴权不改变此默认）。需要个人资源或 bot 无权时，可用 --as user 使用当前用户对同一应用的授权。缺授权时运行 botmux auth request --scope "<所需权限>" --json。不要切换 profile，也不要重复执行结果尚不确定的写操作。`;
 }
 
+export function larkToolPromptFromEnv(
+  locale?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const path = env.BOTMUX_LARK_TOOL_BINDING;
+  if (!path) return '';
+  try { return larkToolPrompt(readLarkToolBinding(path).appId, locale); }
+  catch { return ''; }
+}
+
 export { parseLarkToolInvocation } from './lark-tool-command.js';
 
 export function larkToolChildEnv(

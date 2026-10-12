@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
 
@@ -77,6 +77,9 @@ describe('managed lark-cli binding', () => {
     expect(userEnv.LARKSUITE_CLI_APP_SECRET).toBeUndefined();
     expect(userEnv.LARKSUITE_CLI_TENANT_ACCESS_TOKEN).toBeUndefined();
     expect(userEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBe('own-user');
+    expect(larkToolPromptFromEnv('en', env)).toContain('lark-cli uses application cli_current');
+    expect(larkToolPromptFromEnv('zh', env)).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
+    expect(larkToolPromptFromEnv('en', {})).toBe('');
   });
   it('keeps the configured PATH when viewer setup repeats an RPC binding', () => {
     const daemonBin = join(dir, 'daemon-bin'), botBin = join(dir, 'bot-bin');

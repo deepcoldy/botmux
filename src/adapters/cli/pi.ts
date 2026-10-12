@@ -213,6 +213,7 @@ export function createPiAdapter(
       locale,
       noTransport,
       triggerUserAuth,
+      larkToolAppId,
       replyDelivery,
       solo,
       skillPluginDir,
@@ -230,6 +231,7 @@ export function createPiAdapter(
         botOpenId,
         noTransport,
         triggerUserAuth,
+        larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
       });

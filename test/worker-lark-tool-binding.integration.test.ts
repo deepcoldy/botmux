@@ -53,6 +53,47 @@ setInterval(()=>{},1000);
   }
 }, 35_000);
 
+it('aligns a real worker system prompt with the managed bot-default lark identity', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'worker-lark-prompt-'));
+  const dataDir = join(root, 'data'); mkdirSync(dataDir);
+  const output = join(root, 'prompt-result.json');
+  const fakeCli = join(root, 'fake-pi');
+  const botBin = join(root, 'bot-bin'); mkdirSync(botBin);
+  writeFileSync(join(botBin, 'lark-cli'), '#!/usr/bin/env node\n' + fakeLarkHelpScript(), { mode: 0o755 });
+  writeFileSync(fakeCli, `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({prompt:process.env.BOTMUX_APPEND_SYSTEM_PROMPT}));
+process.stdout.write('Ready\\n');
+setInterval(()=>{},1000);
+`, { mode: 0o755 });
+  const env = { ...process.env, HOME: root, USERPROFILE: root, BOTMUX_HOME: join(root, '.botmux'),
+    SESSION_DATA_DIR: dataDir, PATH: process.env.PATH, BOTMUX_NO_CLAIM: '1' };
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], { env, cwd: resolve('.'), stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  let logs = ''; child.stdout?.on('data', b => logs += b); child.stderr?.on('data', b => logs += b);
+  const exit = new Promise(resolveExit => child.once('exit', resolveExit));
+  try {
+    child.send!({ type: 'init', sessionId: randomUUID(), chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
+      larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret', locale: 'zh',
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' },
+      env: { PATH: `${botBin}:${process.env.PATH}` } });
+    const deadline = Date.now() + 25_000;
+    while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+    expect(existsSync(output), logs).toBe(true);
+    const { prompt } = JSON.parse(readFileSync(output, 'utf8'));
+    expect(prompt).toContain('lark-cli 固定使用当前机器人的应用 cli_current_app');
+    expect(prompt).toContain('默认以 bot 身份调用');
+    expect(prompt).toContain('--as user');
+    expect(prompt).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
+    expect(prompt).not.toContain('已为 lark-cli / bytedcli 启用');
+    expect(prompt).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+  } finally {
+    if (child.connected) child.send!({ type: 'close' });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+    await exit; clearTimeout(timer); rmSync(root, { recursive: true, force: true });
+  }
+}, 35_000);
+
 const canSandbox = process.platform === 'linux' && spawnSync('bwrap', [
   '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--proc', '/proc', '--', '/bin/true',
 ], { stdio: 'ignore', timeout: 5000 }).status === 0;
