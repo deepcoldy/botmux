@@ -39,10 +39,6 @@ vi.mock('../src/bot-registry.js', () => ({
   getAllBots: () => [],
   getBotClient: () => undefined,
   getOwnerOpenId: () => undefined,
-  // message-parser (imported by summary-command) resolves mention display
-  // names through this export. Bun's mock is the whole module, so omitting it
-  // is a SyntaxError at import time; getAllBots() is [] here so it never runs.
-  effectiveBotDisplayName: () => 'Bot',
 }));
 
 const { buildSummaryCommandPrompt } = await import('../src/im/lark/summary-command.js');
