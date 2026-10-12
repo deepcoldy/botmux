@@ -44,6 +44,7 @@ export const ONE_SHOT_ARGV: Record<string, string[]> = {
   opencode: ['opencode', 'run'],
   gemini: ['gemini', '-p'],
   antigravity: ['agy', '-p'],
+  grok: ['grok', '-p'],
 };
 
 /** One in-flight title job per chat — birth and the heal-on-activity path

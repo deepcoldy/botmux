@@ -269,6 +269,14 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
       argv: ['/custom/bin/agy', '-p'],
     });
   });
+
+  it('supports grok in ONE_SHOT_ARGV with grok -p', () => {
+    expect(ONE_SHOT_ARGV.grok).toEqual(['grok', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.grok)).toEqual({ argv: ['grok', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/grok' }, ONE_SHOT_ARGV.grok)).toEqual({
+      argv: ['/custom/bin/grok', '-p'],
+    });
+  });
 });
 
 describe('buildTitlePrompt', () => {
