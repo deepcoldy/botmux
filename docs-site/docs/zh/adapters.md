@@ -149,6 +149,10 @@ Botmux 管理的 `codex-app` 会话，以及启用 app-server RPC 的 `codex` �
 
 验证时，在普通 Codex App 会话中让模型用原生 `request_user_input` 问一个选择题，确认飞书卡片能收到问题，提交后同一轮继续并能复述所选答案。原生工具是否可用仍由 Codex 的版本和运行模式决定。
 
+Codex App 的 `request_user_input_async` 会从带 `delivery: async` / `questions` 的消息事件生成独立飞书问答卡片。模型可以继续处理其他工作；原轮次正常结束后，卡片仍可作答。答案保留原调用 ID 和问题序号，经现有会话投递队列进入同一原生线程，开始后续轮次。重复事件只发一张卡片，推荐选项必须主动提交。
+
+异步卡片只允许发起轮次的用户答复，最多等待一小时。选择题、文字题和混合批次使用现有 Ask 作答方式；会话文字答复作为整批问题的共同备注。原轮次失败或中断、runner 退出、会话关闭或更换时会取消请求。异步卡片不跨 daemon 重启恢复，也不补发历史提问；原生可用性取决于 Codex 版本。此异步事件桥接适用于 `codex-app`。
+
 卡片结构示意（由实际卡片 JSON 本地渲染，尚未进行真人飞书点击验收）：
 
 ![Codex native user input card preview](/img/codex-native-user-input-preview.png)

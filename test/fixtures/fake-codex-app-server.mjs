@@ -125,7 +125,7 @@ function completeTurn(request) {
   const threadId = request.params.threadId;
   const turnId = `turn-fake-${turnAttempt}`;
   const responseLast = behavior === 'start-response-last'
-    || behavior === 'start-response-last-goal';
+    || behavior === 'start-response-last-goal' || behavior === 'async-user-input-early';
   if (!responseLast) respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
   // Exercise duplicate pre-response lifecycle notifications: the runner must
@@ -153,6 +153,29 @@ function completeTurn(request) {
       setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
     }
     if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
+    return;
+  }
+  if (behavior.startsWith('async-user-input') && turnAttempt === 1) {
+    const item = { type: 'agentMessage', id: 'call_async_question', delivery: 'async', phase: 'final_answer',
+      text: 'Which environment?\nPPE (Recommended) / Production', questions: [
+        { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
+        { title: 'Which voice?', options: null },
+      ] };
+    if (behavior === 'async-user-input-malformed') item.questions[0].options = ['only'];
+    if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
+    const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
+    notify('item/started', { threadId: notificationThread, turnId, item });
+    notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
+    notify('item/completed', { threadId: notificationThread, turnId, item });
+    if (behavior === 'async-user-input-duplicate') notify('item/completed', { threadId, turnId, item });
+    if (responseLast) respond(request.id, { turn: { id: turnId } });
+    if (behavior === 'async-user-input-exit') { setTimeout(() => process.exit(1), 400); return; }
+    setTimeout(() => {
+      const status = behavior === 'async-user-input-interrupted' ? 'interrupted' : 'completed';
+      notify('item/completed', { threadId, turnId,
+        item: { type: 'agentMessage', id: 'async-independent-final', phase: 'final_answer', text: 'Independent work completed' } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status } });
+    }, 400);
     return;
   }
   if (behavior === 'hang-turn-completion') return;

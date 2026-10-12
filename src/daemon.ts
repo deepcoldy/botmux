@@ -729,6 +729,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { deliverCodexAsyncAnswer } from './services/codex-async-user-input.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -7966,6 +7967,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   // 是 p2p（否则 checker 只有 chatId，p2pOpen 腿 fail-closed，对方点不动按钮）。
   // 必须从 capability 已认证的 session 取，不能信任请求体里的 larkAppId/chatId。
   const askChatType = askSession?.chatType;
+  const asyncInput = boundAsk.asyncUserInput;
+  const asyncWorker = askSession?.worker;
+  const asyncGeneration = askSession?.session.workerGeneration;
+  const asyncCaller = askSession?.session.lastCallerOpenId;
+  const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
+    ? body.originTurnId : askSession?.session.rootMessageId;
+  if (asyncInput && (!askSession || !asyncWorker || asyncWorker.killed || !asyncCaller
+    || (askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId) !== 'codex-app'
+    || askSession.session.cliSessionId !== asyncInput.threadId)) {
+    return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
+  }
   if (!askChatType) {
     // 查不到会话 → chatType 缺省 → p2pOpen 腿 fail-closed（答复权退回原语义）。不致命，但
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
@@ -7977,12 +7989,15 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
     questions: boundAsk.questions,
-    replyCardTarget: replyCardAskTarget(askSession, boundAsk, body),
+    // Inline asks end with their reply card. An async question intentionally
+    // outlives that turn and therefore always gets a standalone thread card.
+    replyCardTarget: asyncInput ? undefined : replyCardAskTarget(askSession, boundAsk, body),
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
+    ...(asyncInput ? { answererOpenId: asyncCaller } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
     // authenticated session's FROZEN backend, not the client's origin string. A
     // PTY-backed session dies with the daemon, so its ask must NOT persist; only
@@ -8001,6 +8016,53 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     ? await explicitAskContinuation.wait(explicitInput)
     : await registerAskForResponse(askInput, res);
   if (res.destroyed) return;
+
+  if (asyncInput && askSession && result.kind === 'answered') {
+    const isCurrent = () => findActiveBySessionId(boundAsk.sessionId) === askSession
+      && askSession.worker === asyncWorker && !!asyncWorker && !asyncWorker.killed
+      && askSession.session.workerGeneration === asyncGeneration
+      && askSession.session.cliSessionId === asyncInput.threadId
+      && askSession.session.lastCallerOpenId === asyncCaller;
+    const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {
+      isCurrent,
+      deliver: async (text, by) => {
+        const sender = await resolveSender(askSession.larkAppId, by, 'user');
+        // Never send an old card's answer into a replacement runner, another
+        // native thread or another principal's active session after this await.
+        if (!isCurrent() || by !== asyncCaller) return false;
+        const turnId = `codex-async-answer-${randomUUID()}`;
+        const bot = getBot(askSession.larkAppId);
+        askSession.session.quoteTargetId = asyncOriginMessageId;
+        askSession.session.quoteTargetSenderOpenId = by;
+        askSession.session.quoteTargetSenderIsBot = false;
+        beginReplyTargetTurn(askSession, boundAsk.rootMessageId ?? undefined, turnId, new Date().toISOString(), {
+          senderOpenId: by, participants: [{ openId: by, isBot: false }], inThread: !!boundAsk.rootMessageId,
+        });
+        const input = buildFollowUpCliInput(text, boundAsk.sessionId, {
+          cliId: 'codex-app', sender, codexAppText: text,
+          larkAppId: boundAsk.larkAppId, chatId: boundAsk.chatId,
+          selfMention: { name: bot.botName, openId: bot.botOpenId },
+          sessionBackendType: askSession.session.backendType,
+          promptInjection: sessionPromptInjection(askSession), turnId,
+        });
+        // Use the same accepted-input ledger and serial FIFO as human messages.
+        // A live turn is allowed to finish; its answer then starts a new turn in
+        // the SAME native thread, with its own Botmux delivery identity.
+        if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
+          trustedCaller: trustedCallerForTurn(boundAsk.larkAppId, by, undefined, false) })) return false;
+        beginNewTurn(askSession, '异步提问答复', turnId);
+        rememberLastCliInput(askSession, text, input);
+        markSessionActivity(askSession);
+        sessionStore.updateSession(askSession.session);
+        logger.info(`[${boundAsk.sessionId.slice(0, 8)}] async question ${asyncInput.itemId} answer admitted as ${turnId}`);
+        return true;
+      },
+    });
+    if (!delivered) {
+      logger.warn(`[${boundAsk.sessionId.slice(0, 8)}] async question ${asyncInput.itemId} answer not delivered: session changed`);
+      return jsonRes(res, 409, { ok: false, error: 'async_answer_not_delivered' });
+    }
+  }
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
   // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话

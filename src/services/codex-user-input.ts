@@ -93,11 +93,21 @@ export async function bridgeCodexUserInput(
   params: unknown,
   signal?: AbortSignal,
 ): Promise<CodexUserInputAnswer> {
+  const questions = parseCodexUserInputQuestions(params);
+  return codexUserInputAnswer(questions, await postCodexAsk(context, questions.map(q => q.question), signal));
+}
+
+/** Also used by nonblocking questions; the daemon owns answer admission. */
+export async function postCodexAsk(
+  context: CodexUserInputContext,
+  questions: AskQuestion[],
+  signal?: AbortSignal,
+  asyncUserInput?: { threadId: string; itemId: string },
+): Promise<AskResult> {
   const env = context.env ?? process.env;
   if (env.BOTMUX_WORKFLOW === '1') {
     throw new Error('requestUserInput is unavailable inside workflow subagents; use workflow humanGate / decision nodes');
   }
-  const questions = parseCodexUserInputQuestions(params);
   if (!context.sessionId || !context.larkAppId || !context.chatId) {
     throw new Error('requestUserInput requires a Botmux session with Lark transport');
   }
@@ -123,10 +133,12 @@ export async function bridgeCodexUserInput(
     body: JSON.stringify({
       sessionId: context.sessionId, larkAppId: context.larkAppId, chatId: context.chatId,
       rootMessageId: context.rootMessageId?.startsWith('om_') ? context.rootMessageId : null,
-      questions: questions.map(entry => entry.question), timeoutMs,
+      questions, timeoutMs,
       // A server request belongs to this process/turn. Do not reattach a card
       // from an older runner merely because its JSON-RPC id was reused.
-      requestId: randomUUID(), originKind: 'native-user-input',
+      requestId: asyncUserInput?.itemId ?? randomUUID(),
+      originKind: asyncUserInput ? 'native-user-input-async' : 'native-user-input',
+      ...(asyncUserInput ? { asyncUserInput } : {}),
       ...(claim ? { originCapability: claim.capability } : {}),
       ...((context.originTurnId ?? claim?.turnId) ? { originTurnId: context.originTurnId ?? claim?.turnId } : {}),
       ...((context.originDispatchAttempt ?? claim?.dispatchAttempt)
@@ -139,5 +151,5 @@ export async function bridgeCodexUserInput(
   if (!response.ok) throw new Error(`ask broker HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
   const result = await response.json() as AskResult;
   signal?.throwIfAborted();
-  return codexUserInputAnswer(questions, result);
+  return result;
 }
