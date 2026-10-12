@@ -10077,10 +10077,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     if (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined || noQuote
       || customCardRequested || asVoice || isSlashSend || asChoice || replyLayout
-      || images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0
+      || files.length > 0 || videos.length > 0 || videoCovers.length > 0
       || mentionArgs.length > 0 || mentionDecisionCount !== 1
       || attention.requested || urgent.requested || expectedLinks.length > 0) {
-      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown with one none/requester mention decision');
+      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown/images with one none/requester mention decision');
       process.exit(2);
     }
   }

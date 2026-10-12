@@ -94,7 +94,7 @@ provider 可以额外声明三项通用终端能力：
 
 ### 可选主动消息
 
-声明 `outbound_message` 后，provider 可以在一个仍为 active 的 turn 内请求 BotMux 向该 turn 的当前会话位置发送非终态正文。该能力只表达内容和寻址意图，不接受 chat、topic root、Bot 身份或任意用户 ID；真实路由、mention 门禁、卡片渲染、hook 和平台调用继续由 BotMux 的普通 `send` 链路负责。
+声明 `outbound_message` 后，provider 可以在一个仍为 active 的 turn 内请求 BotMux 向该 turn 的当前会话位置发送非终态正文和有界图片。该能力只表达内容、图片字节和寻址意图，不接受 chat、topic root、Bot 身份或任意用户 ID；真实路由、mention 门禁、图片上传、卡片渲染、hook 和平台调用继续由 BotMux 的普通 `send` 链路负责。
 
 ```json
 {
@@ -104,13 +104,21 @@ provider 可以额外声明三项通用终端能力：
   "generation": 3,
   "content": "已完成依赖检查，继续执行验证。",
   "responseKind": "progress",
-  "mention": "none"
+  "mention": "none",
+  "images": [
+    {
+      "name": "evidence.png",
+      "mimeType": "image/png",
+      "dataBase64": "iVBORw0KGgo..."
+    }
+  ]
 }
 ```
 
 - `content` 使用 BotMux Markdown；普通文本是其子集，单条最多 32 KiB。
 - `responseKind` 仅允许 `progress|auxiliary`，不能借此声明 turn 最终完成；`final|failure` 仍是唯一终态。
 - `mention` 仅允许 `none|requester`。`requester` 仍要通过当前 turn 的精确回复对象与多参与者门禁，provider 不能提供 open_id。
+- `images` 可省略；只允许 PNG/JPEG/GIF/WebP，最多 4 张、解码后合计最多 2 MiB。文件名、MIME、base64 canonical encoding 和文件 magic 都会在协议边界校验；宿主只在私有临时目录物化，并固定转成普通 `botmux send --images`，turn 仍不能发送任意文件、视频或语音。
 - `turnId` 必须等于 active turn，`generation` 必须等于当前 backend state；迟到或跨代事件会 fail-closed。
 - `operationId` 在单 turn 内幂等：同 key 同 payload 复用第一次结果，同 key 不同 payload 被拒绝；每 turn 最多接受 10 个不同 operation。
 
@@ -143,7 +151,7 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 - `bots.list`：固定为当前群 `chat` scope，不开放跨团队发现或邀请。
 - `skill.list|show|read|resources`：沿用当前 Session 的 skill manifest 和内置技能；resource path 必须是无 `.` / `..` 的安全相对路径。
 
-不属于 allowlist 的 schedule、ask、handoff、workflow、改名、管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、附件、加急、attention 或 final 能力。
+不属于 allowlist 的 schedule、ask、handoff、workflow、改名、管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急、attention 或 final 能力。
 
 ```json
 {

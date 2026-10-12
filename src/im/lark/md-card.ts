@@ -48,6 +48,10 @@ import {
 } from './vega-lite-chart.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { logger } from '../../utils/logger.js';
+import {
+  cardMarkdownImageReferences,
+  FEISHU_IMG_KEY,
+} from './card-markdown-image-references.js';
 
 /** Room kept for chrome that callers attach *after* a card is built and
  * fitted — today the on-call group button (≈483B of request body), added by
@@ -898,33 +902,6 @@ function unescapeFenceLines(input: string): string {
   return input.replace(/^[ ]{0,3}(?:\\`){3,}[^\n`]*$/gm, m => m.replace(/\\`/g, '`'));
 }
 
-/** Source markers let CommonMark identify actual image references without
- * rewriting code examples, escaped syntax, or the surrounding Markdown. */
-function cardImageReferences(input: string): Array<{ position: number; source: string }> {
-  if (!input.includes('![')) return [];
-  const prefix = chooseLinkMarkerPrefix(input);
-  const positions: number[] = [];
-  const marked = input.replace(/\\.|!\[/gs, (match: string, offset: number) => {
-    if (match !== '![') return match;
-    const id = positions.push(offset) - 1;
-    return `${prefix}${id}x![`;
-  });
-  const marker = new RegExp(`${escapeRegExp(prefix)}(\\d+)x$`);
-  const images: Array<{ position: number; source: string }> = [];
-  const inspect = (tokens: Token[]): void => {
-    for (let i = 0; i < tokens.length; i++) {
-      const token = tokens[i];
-      if (token.type === 'image') {
-        const match = tokens[i - 1]?.content.match(marker);
-        if (match) images.push({ position: positions[Number(match[1])], source: token.attrGet('src') ?? '' });
-      }
-      if (token.children) inspect(token.children);
-    }
-  };
-  inspect(imageScanMd.parse(marked, {}));
-  return images.sort((a, b) => a.position - b.position);
-}
-
 /** Resolve real Markdown images, preserving code examples and untouched source.
  * The image-only rule supplies exact source spans; the full parser above
  * decides which occurrences are actually images rather than literal code. */
@@ -933,7 +910,7 @@ export async function resolveCardMarkdownImages(
   resolveSource: (source: string) => Promise<string | undefined>,
 ): Promise<string> {
   input = unescapeFenceLines(input);
-  const references = cardImageReferences(input);
+  const references = cardMarkdownImageReferences(input);
   if (!references.length) return input;
   const env: Record<string, unknown> = {};
   imageScanMd.parse(input, env);
@@ -955,7 +932,7 @@ export async function resolveCardMarkdownImages(
 }
 
 function normalizeCardImages(input: string, omitAll = false): string {
-  const unsupported = new Set(cardImageReferences(input)
+  const unsupported = new Set(cardMarkdownImageReferences(input)
     .filter(image => omitAll || !FEISHU_IMG_KEY.test(image.source)).map(image => image.position));
   return input.replace(/!\[/g, (match: string, offset: number) =>
     unsupported.has(offset) ? '[Image omitted] [' : match);
@@ -1404,8 +1381,6 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  * and a native `img` element with a non-key as its "img_key" makes Feishu reject
  * the whole card. Non-key images are downgraded before this layout pass.
  */
-const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
-
 type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] } | { type: 'img'; key: string; alt: string };
 
 /**

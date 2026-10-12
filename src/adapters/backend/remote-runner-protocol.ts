@@ -112,6 +112,12 @@ export interface RemoteRunnerTrustedCaller {
 export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
 export type RemoteRunnerOutboundMention = 'none' | 'requester';
 
+export interface RemoteRunnerOutboundImage {
+  name: string;
+  mimeType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+  dataBase64: string;
+}
+
 /** A non-terminal message request emitted by a provider for the active turn.
  * Routing is intentionally absent: BotMux derives the only legal destination
  * from the authenticated session/turn that owns the backend. */
@@ -122,6 +128,7 @@ export interface RemoteRunnerOutboundMessage {
   content: string;
   responseKind: RemoteRunnerOutboundResponseKind;
   mention: RemoteRunnerOutboundMention;
+  images?: RemoteRunnerOutboundImage[];
 }
 
 export type RemoteRunnerOutboundMessageResult =
@@ -281,6 +288,7 @@ export type RemoteRunnerEvent =
       content: string;
       responseKind: RemoteRunnerOutboundResponseKind;
       mention: RemoteRunnerOutboundMention;
+      images?: RemoteRunnerOutboundImage[];
     })
   | (RemoteRunnerEventBase & {
       type: 'session_tool';
@@ -335,6 +343,8 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ERROR_CODE_RE = /^[a-z][a-z0-9._-]{0,127}$/;
 export const MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES = 32 * 1024;
+export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGES = 4;
+export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES = 2 * 1024 * 1024;
 export const MAX_REMOTE_RUNNER_SESSION_TOOL_TEXT_BYTES = 512 * 1024;
 export const MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES = 512 * 1024;
 const SENSITIVE_STATE_KEY_PARTS = [
@@ -525,6 +535,77 @@ function hasExactKeys(raw: Record<string, unknown>, keys: readonly string[]): bo
     && actual.every((key, index) => key === expected[index]);
 }
 
+const OUTBOUND_IMAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,122}\.(?:png|jpe?g|gif|webp)$/i;
+const OUTBOUND_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+] as const);
+
+function detectedImageMime(content: Buffer): RemoteRunnerOutboundImage['mimeType'] | undefined {
+  if (content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return 'image/png';
+  }
+  if (content.length >= 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (content.subarray(0, 6).toString('ascii') === 'GIF87a'
+      || content.subarray(0, 6).toString('ascii') === 'GIF89a') {
+    return 'image/gif';
+  }
+  if (content.subarray(0, 4).toString('ascii') === 'RIFF'
+      && content.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return 'image/webp';
+  }
+  return undefined;
+}
+
+function imageNameMatchesMime(name: string, mimeType: string): boolean {
+  const extension = name.toLowerCase().split('.').pop();
+  if (mimeType === 'image/png') return extension === 'png';
+  if (mimeType === 'image/jpeg') return extension === 'jpg' || extension === 'jpeg';
+  if (mimeType === 'image/gif') return extension === 'gif';
+  if (mimeType === 'image/webp') return extension === 'webp';
+  return false;
+}
+
+function normalizeRemoteRunnerOutboundImages(
+  value: unknown,
+): RemoteRunnerOutboundImage[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_REMOTE_RUNNER_OUTBOUND_IMAGES) return undefined;
+  const images: RemoteRunnerOutboundImage[] = [];
+  const names = new Set<string>();
+  let totalBytes = 0;
+  for (const item of value) {
+    const raw = record(item);
+    if (!raw || !hasExactKeys(raw, ['name', 'mimeType', 'dataBase64'])) return undefined;
+    const name = nonEmptyString(raw.name, 160);
+    const mimeType = raw.mimeType;
+    const dataBase64 = raw.dataBase64;
+    if (!name || !OUTBOUND_IMAGE_NAME_RE.test(name) || names.has(name)
+        || typeof mimeType !== 'string' || !OUTBOUND_IMAGE_MIME_TYPES.has(mimeType)
+        || !imageNameMatchesMime(name, mimeType)
+        || typeof dataBase64 !== 'string'
+        || dataBase64.length > Math.ceil(MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES / 3) * 4 + 4) {
+      return undefined;
+    }
+    const content = Buffer.from(dataBase64, 'base64');
+    if (content.length === 0 || content.toString('base64') !== dataBase64
+        || detectedImageMime(content) !== mimeType) return undefined;
+    totalBytes += content.length;
+    if (totalBytes > MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES) return undefined;
+    names.add(name);
+    images.push({
+      name,
+      mimeType: mimeType as RemoteRunnerOutboundImage['mimeType'],
+      dataBase64,
+    });
+  }
+  return images;
+}
+
 export function normalizeRemoteRunnerSessionToolRequest(
   value: unknown,
 ): RemoteRunnerSessionToolRequest | undefined {
@@ -646,6 +727,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
   if (raw.type === 'outbound_message') {
     const operationId = nonEmptyString(raw.operationId, 256);
     const turnId = nonEmptyString(raw.turnId, 256);
+    const images = normalizeRemoteRunnerOutboundImages(raw.images);
     if (!operationId || !ID_RE.test(operationId)
         || !turnId || !ID_RE.test(turnId)
         || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
@@ -653,7 +735,8 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         || !raw.content.trim()
         || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
         || !['progress', 'auxiliary'].includes(String(raw.responseKind))
-        || !['none', 'requester'].includes(String(raw.mention))) {
+        || !['none', 'requester'].includes(String(raw.mention))
+        || images === undefined) {
       return undefined;
     }
     return {
@@ -666,6 +749,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       content: raw.content,
       responseKind: raw.responseKind as RemoteRunnerOutboundResponseKind,
       mention: raw.mention as RemoteRunnerOutboundMention,
+      ...(images.length ? { images } : {}),
     };
   }
 

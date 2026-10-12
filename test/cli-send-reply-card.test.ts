@@ -108,7 +108,17 @@ describe('real CLI send into a running reply card', () => {
       } else expect(getDeliveredGroupContextSeqs(binding.appId, binding.chatId, binding.sessionId, binding.epoch, dataDir)).toEqual([]);
       if (!merged && responseKind !== null) {
         expect(projectGroupContextCard(requests[0].body.content)?.kind).toBe(responseKind === 'progress' ? 'runtime' : 'conversation');
-        expect(requests[0].body.content).toContain('\u2063'.repeat(responseKind === 'progress' ? 12 : 13));
+        const purposeMarker = '\u2063'.repeat(responseKind === 'progress' ? 12 : 13);
+        expect(requests[0].body.content).toContain(purposeMarker);
+        const sentCard = JSON.parse(requests[0].body.content);
+        if (responseKind === 'progress' || responseKind === 'auxiliary') {
+          expect(sentCard.body.elements.some((element: any) =>
+            element.tag === 'markdown' && typeof element.content === 'string'
+            && element.content.endsWith(purposeMarker))).toBe(true);
+        }
+        expect(sentCard.body.elements.filter((element: any) =>
+          element.tag === 'markdown' && typeof element.content === 'string'
+          && element.content.replace(/<[^>]+>/g, '').replace(/\u2063/g, '').trim() === '')).toEqual([]);
       } else if (responseKind === null) {
         expect(requests[0].body.content).not.toContain('\u2063'.repeat(12));
       }

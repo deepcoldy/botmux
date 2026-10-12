@@ -700,6 +700,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       message.content,
       message.responseKind,
       message.mention,
+      message.images ?? [],
     ])).digest('hex');
   }
 

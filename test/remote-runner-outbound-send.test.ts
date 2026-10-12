@@ -23,9 +23,11 @@ describe('remote runner outbound host send', () => {
 import fs from 'node:fs';
 const argv = process.argv.slice(2);
 const value = flag => argv[argv.indexOf(flag) + 1];
+const values = flag => argv.flatMap((item, index) => item === flag ? [argv[index + 1]] : []);
 fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify({
   argv,
   content: fs.readFileSync(value('--content-file'), 'utf8'),
+  images: values('--images').map(path => ({ name: ${JSON.stringify('placeholder')}, actualName: path.split('/').pop(), bytes: fs.readFileSync(path).toString('hex') })),
   authorized: process.env.BOTMUX_HOST_RELAY_AUTHORIZED,
   sessionId: process.env.BOTMUX_SESSION_ID,
   turnId: process.env.BOTMUX_TURN_ID,
@@ -42,6 +44,11 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
       content: '阶段进展',
       responseKind: 'progress',
       mention: 'requester',
+      images: [{
+        name: 'proof.png',
+        mimeType: 'image/png',
+        dataBase64: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64'),
+      }],
     }, {
       sessionId: 'session-1',
       turnId: 'turn-1',
@@ -56,9 +63,15 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
         '--response-kind', 'progress',
         '--mention-back',
         '--content-file', expect.any(String),
+        '--images', expect.any(String),
         '--session-id', 'session-1',
       ],
       content: '阶段进展',
+      images: [{
+        name: 'placeholder',
+        actualName: 'image-0-proof.png',
+        bytes: '89504e470d0a1a0a',
+      }],
       authorized: '1',
       sessionId: 'session-1',
       turnId: 'turn-1',
