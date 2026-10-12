@@ -42,6 +42,70 @@ async function stopped(pid: number) {
   });
 }
 describe('mcode ACP wire client', () => {
+  it.each(['missing', 'schema', 'locked'] as const)('completes native turns without questions when the questionnaire database is %s', async scenario => {
+    const f = fixture(); f.options.env.MCODE_ACP_SCENARIO = 'native-questionnaire';
+    let db: ReturnType<typeof openDatabaseSyncNow> = null;
+    if (scenario !== 'missing') {
+      mkdirSync(join(f.root, 'data/v2/sqlite'), { recursive: true });
+      db = openDatabaseSyncNow(join(f.root, 'data/v2/sqlite/runtime-state.sqlite'))!;
+      if (scenario === 'locked') {
+        db.exec('CREATE TABLE questionnaire_requests (session_id TEXT); BEGIN EXCLUSIVE');
+      }
+    }
+    try {
+      for (const nativeSessionId of [undefined, 'session_fixture']) {
+        const result = await runMinimaxAcp({ ...f.options, nativeSessionId }, bounded());
+        expect(result).toEqual({ sessionId: 'session_fixture', content: 'answer:hello' });
+      }
+      expect(f.calls().filter(c => c.message?.method === 'session/prompt')).toHaveLength(2);
+      expect(f.calls().some(c => c.message?.method === 'session/resume')).toBe(true);
+    } finally { if (scenario === 'locked') db?.exec('ROLLBACK'); db?.close(); }
+  });
+
+  it.each(['missing', 'schema', 'locked'] as const)('rejects a real native question at the elicitation boundary when its database is %s', async scenario => {
+    const f = fixture(); f.options.env.MCODE_ACP_SCENARIO = 'native-questionnaire';
+    const input = vi.fn();
+    let db: ReturnType<typeof openDatabaseSyncNow> = null;
+    if (scenario !== 'missing') {
+      mkdirSync(join(f.root, 'data/v2/sqlite'), { recursive: true });
+      db = openDatabaseSyncNow(join(f.root, 'data/v2/sqlite/runtime-state.sqlite'))!;
+      if (scenario === 'locked') db.exec('CREATE TABLE questionnaire_requests (session_id TEXT); BEGIN EXCLUSIVE');
+    }
+    try {
+      await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input }, bounded())).rejects.toThrow('启动边界不可读');
+      expect(f.calls().some(c => c.message?.method === 'session/prompt')).toBe(true);
+      expect(input).not.toHaveBeenCalled();
+    } finally { if (scenario === 'locked') db?.exec('ROLLBACK'); db?.close(); }
+  });
+
+  it('does not substitute cursor zero when the database becomes readable only after the prompt starts', async () => {
+    const f = fixture(); f.options.env.MCODE_ACP_SCENARIO = 'native-questionnaire';
+    const input = vi.fn(); let db: ReturnType<typeof openDatabaseSyncNow> = null;
+    try {
+      await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input,
+        onUpdate(update) {
+          if (update.toolCallId !== 'questionnaire') return;
+          mkdirSync(join(f.root, 'data/v2/sqlite'), { recursive: true });
+          db = openDatabaseSyncNow(join(f.root, 'data/v2/sqlite/runtime-state.sqlite'))!;
+          db.exec(`CREATE TABLE questionnaire_requests (request_id TEXT, session_id TEXT, status TEXT);
+            INSERT INTO questionnaire_requests VALUES ('stale','session_fixture','pending'), ('fresh','session_fixture','pending');`);
+        } }, bounded())).rejects.toThrow('启动边界不可读');
+      expect(input).not.toHaveBeenCalled();
+    } finally { db?.close(); }
+  });
+
+  it.each(['schema', 'locked'] as const)('keeps questionnaire reads fail-closed if the database becomes %s after the prompt starts', async scenario => {
+    const f = durableFixture(); const input = vi.fn();
+    try {
+      await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: input,
+        onUpdate(update) {
+          if (update.toolCallId === 'questionnaire') f.db.exec(scenario === 'schema' ? 'DROP TABLE questionnaire_requests' : 'BEGIN EXCLUSIVE');
+        } }, bounded())).rejects.toThrow(scenario === 'schema' ? 'no such table' : 'locked');
+      expect(f.calls().some(c => c.message?.method === 'session/prompt')).toBe(true);
+      expect(input).not.toHaveBeenCalled();
+    } finally { if (scenario === 'locked') f.db.exec('ROLLBACK'); f.db.close(); }
+  });
+
   it('initializes capabilities, creates exact native identity, configures and returns only the final message', async () => {
     const f = fixture(); const session = vi.fn(); const updates = vi.fn();
     const result = await runMinimaxAcp({ ...f.options, model: 'custom_provider:test/model', effort: 'high', onSession: session, onUpdate: updates }, bounded());

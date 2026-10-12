@@ -5,25 +5,28 @@ const json = (value: unknown): Record<string, any> | undefined => {
   try { const parsed = JSON.parse(value); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined; } catch { return; }
 };
 
+/** Capture the native insertion boundary immediately before session/prompt.
+ * SQLite rowids also distinguish requests created in the same millisecond;
+ * cancelled turns may leave older pending rows, which this turn must not own.
+ * Ordinary turns do not depend on this metadata. Unknown is distinct from an
+ * empty table's cursor 0; native questions must fail closed if it is unknown. */
+export function minimaxQuestionnaireCursor(databasePath: string, sessionId: string): number | undefined {
+  const db = openDatabaseSyncNow(databasePath, { readOnly: true });
+  if (!db) return;
+  try {
+    const row = db.prepare('SELECT COALESCE(MAX(rowid), 0) AS cursor FROM questionnaire_requests WHERE session_id = ?')
+      .get(sessionId) as { cursor: number };
+    if (!Number.isSafeInteger(row.cursor) || row.cursor < 0) return;
+    return row.cursor;
+  } catch { return; }
+  finally { try { db.close(); } catch { /* best-effort metadata */ } }
+}
+
 /** mcode 0.6.5 can send end_turn for the requesting turn when its answered
  * questionnaire emits dismiss, before the continuation finishes. Its native
  * durable ingress is the completion proof; do not kill that continuation or
  * deliver the pre-question text as the final answer. All reads are session-
  * scoped and read-only, and tied to the actual questionnaire request ids. */
-/** Capture the native insertion boundary immediately before session/prompt.
- * SQLite rowids also distinguish requests created in the same millisecond;
- * cancelled turns may leave older pending rows, which this turn must not own. */
-export function minimaxQuestionnaireCursor(databasePath: string, sessionId: string, required = false): number {
-  const db = openDatabaseSyncNow(databasePath, { readOnly: true });
-  if (!db) { if (required) throw new Error('mcode ACP 无法验证原生问卷：数据库不可读'); return 0; }
-  try {
-    const row = db.prepare('SELECT COALESCE(MAX(rowid), 0) AS cursor FROM questionnaire_requests WHERE session_id = ?')
-      .get(sessionId) as { cursor: number };
-    if (!Number.isSafeInteger(row.cursor) || row.cursor < 0) throw new Error('mcode ACP 原生问卷边界无效');
-    return row.cursor;
-  } finally { db.close(); }
-}
-
 export function pendingMinimaxQuestionnaires(databasePath: string, sessionId: string, afterRowId = 0, required = false): string[] {
   const db = openDatabaseSyncNow(databasePath, { readOnly: true });
   if (!db) { if (required) throw new Error('mcode ACP 无法验证原生问卷：数据库不可读'); return []; }

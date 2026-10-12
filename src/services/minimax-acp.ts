@@ -45,7 +45,7 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
   const pending = new Map<number, { method: string; resolve: (value: Json) => void; reject: (error: Error) => void; timer?: ReturnType<typeof setTimeout> }>();
   const incoming = new Set<number | string>();
   const nativeQuestions = new Set<string>();
-  let questionnaireCursor = 0;
+  let questionnaireCursor: number | undefined;
   const dbPath = join(minimaxDataDir(env), 'v2', 'sqlite', 'runtime-state.sqlite');
   const exited = new Promise<void>(resolve => child.once('close', () => resolve()));
   const kill = (sig: NodeJS.Signals) => {
@@ -89,6 +89,7 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
         if (incoming.size >= 8) throw new Error('mcode_acp_too_many_questions');
         incoming.add(id);
         if (message.method === 'elicitation/create') {
+          if (nativeRuntime && questionnaireCursor === undefined) throw new Error('mcode ACP 本轮问卷启动边界不可读');
           const questions = pendingMinimaxQuestionnaires(dbPath, sessionId, questionnaireCursor, nativeRuntime);
           if (nativeRuntime && !questions.length) throw new Error('mcode ACP 缺少本轮原生问卷记录');
           for (const requestId of questions) nativeQuestions.add(requestId);
@@ -203,7 +204,7 @@ export async function runMinimaxAcp(opts: MinimaxAcpOptions, signal: AbortSignal
     }
     if (opts.effort) await configure('thinkingEffort', opts.effort);
     const before = readMinimaxUsage(dbPath, sessionId!, true)?.tokens;
-    questionnaireCursor = minimaxQuestionnaireCursor(dbPath, sessionId!, nativeRuntime);
+    questionnaireCursor = minimaxQuestionnaireCursor(dbPath, sessionId!);
     prompting = true;
     const result = await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: opts.content }] }, false);
     if (incoming.size || failure || inputSignal.aborted) throw failure ?? new Error('mcode_acp_question_incomplete');

@@ -25,7 +25,7 @@ describe('native questionnaire continuation completion proof', () => {
   it('ignores stale pending requests while still waiting for new questionnaires in this prompt cycle', () => {
     for (let i = 0; i < 20; i++) db.prepare('INSERT INTO questionnaire_requests VALUES (?,?,?,?,?)')
       .run(`stale-${i}`, 'native', 'pending', null, 1);
-    const cursor = minimaxQuestionnaireCursor(path, 'native', true);
+    const cursor = minimaxQuestionnaireCursor(path, 'native');
     expect(pendingMinimaxQuestionnaires(path, 'native', cursor, true)).toEqual([]);
     // Equal timestamps deliberately rule out a clock-based ownership boundary.
     db.prepare('INSERT INTO questionnaire_requests VALUES (?,?,?,?,?)').run('fresh', 'native', 'pending', null, 1);
