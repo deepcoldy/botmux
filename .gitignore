@@ -20,6 +20,7 @@ midscene_run/
 .midscene/
 .codex
 .claude/
+.codegraph/
 .antigravitycli/
 .cjadk/
 .trae/

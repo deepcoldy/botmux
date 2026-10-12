@@ -8606,6 +8606,7 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
+import { repairReplyMarkdown } from './services/reply-markdown.js';
 import {
   buildReplyLayoutHeader,
   parseReplyLayoutRequest,
@@ -11925,12 +11926,13 @@ async function cmdSend(rest: string[]): Promise<void> {
       messageId = videoResult.sent[0];
     } else {
       // 回复一律卡片（纯文本 post 路径已删）。
+      const cardText = repairReplyMarkdown(text);
       // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
       // aware, see applyInlineMentions); any --mention not inlined here is
       // rendered on the footer `发送给：` line below, not the body.
       const layoutBody = replyLayout
-        ? extractFirstReplyCardHeading(text)
-        : { markdown: text, heading: undefined };
+        ? extractFirstReplyCardHeading(cardText)
+        : { markdown: cardText, heading: undefined };
       const layoutHeader = replyLayout
         ? buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)
         : undefined;
