@@ -1202,6 +1202,8 @@ export const messages: Record<string, string> = {
   'card.action.compact_unsupported': '⚠️ Card compact is not supported here; send /compact directly',
   'card.action.close_refused': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry and the remote may still be running. Retry later.',
   'card.action.close_refused_with_task': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry. Remote session id: {taskId}. The remote may still be running; retry later.',
+  'card.action.close_residual': 'The session was closed locally, but the remote session was not cancelled ({taskId}). Manual cleanup is required.',
+  'card.action.close_residual_local': 'The session was closed locally and the remote session was cancelled, but a credentialed local subprocess may still be running ({taskId}). Inspect the host process manually.',
   'card.action.no_output': '(no output yet)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',

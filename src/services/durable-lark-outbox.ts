@@ -7,6 +7,8 @@ import type {
   DurableOutboxDeliveryResult,
 } from './durable-outbox-pump.js';
 import { classifyFeishuError } from '../workflows/hostExecutors/feishu-send.js';
+import { MessageUpdateExpiredError, MessageWithdrawnError } from '../im/lark/client.js';
+import { TopicSendError } from '../cli/topic-send-guard.js';
 import { PROVIDER_TTL_MS } from '../workflows/shared/provider-reconciler.js';
 
 export const DURABLE_LARK_OUTBOX_VERSION = 1 as const;
@@ -19,7 +21,8 @@ const UUID_RE = /^[A-Za-z0-9_-]{1,50}$/;
 
 export type DurableLarkOutboxTarget =
   | { kind: 'send'; chatId: string }
-  | { kind: 'reply'; messageId: string; replyInThread: boolean };
+  | { kind: 'reply'; messageId: string; replyInThread: boolean }
+  | { kind: 'update'; messageId: string };
 
 export interface DurableLarkOutboxEnvelope {
   version: typeof DURABLE_LARK_OUTBOX_VERSION;
@@ -71,6 +74,11 @@ export interface DurableLarkOutboxDeliveryOptions {
 export interface DurableLarkOutboxDeps {
   sendMessage: SendMessageFn;
   replyMessage: ReplyMessageFn;
+  updateMessage?: (
+    larkAppId: string,
+    messageId: string,
+    content: string,
+  ) => Promise<void | boolean>;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -125,6 +133,11 @@ function target(value: unknown): DurableLarkOutboxTarget {
     if (!messageId.startsWith('om_')) throw new Error('durable Lark reply target must be a message id');
     if (typeof item.replyInThread !== 'boolean') throw new Error('durable Lark reply target requires replyInThread');
     return { kind: 'reply', messageId, replyInThread: item.replyInThread };
+  }
+  if (item?.kind === 'update') {
+    const messageId = nonempty(item.messageId, 'durable Lark update messageId', 256);
+    if (!messageId.startsWith('om_')) throw new Error('durable Lark update target must be a message id');
+    return { kind: 'update', messageId };
   }
   throw new Error('durable Lark outbox target is invalid');
 }
@@ -261,7 +274,8 @@ export async function deliverDurableLarkOutbox(
           hookContext,
           outboundOptions,
         )
-      : await deps.replyMessage(
+      : parsed.target.kind === 'reply'
+        ? await deps.replyMessage(
           parsed.larkAppId,
           parsed.target.messageId,
           parsed.content,
@@ -270,7 +284,21 @@ export async function deliverDurableLarkOutbox(
           parsed.providerUuid,
           hookContext,
           outboundOptions,
-        );
+        )
+        : await (async () => {
+            const updateTarget = parsed.target;
+            if (updateTarget.kind !== 'update') {
+              throw new Error('durable Lark update target changed during delivery');
+            }
+            if (!deps.updateMessage) throw new Error('durable Lark update transport is unavailable');
+            const updated = await deps.updateMessage(
+              parsed.larkAppId,
+              updateTarget.messageId,
+              parsed.content,
+            );
+            if (updated === false) throw new Error('durable Lark update transport did not confirm the patch');
+            return updateTarget.messageId;
+          })();
     return {
       kind: 'delivered',
       receipt: {
@@ -283,6 +311,37 @@ export async function deliverDurableLarkOutbox(
     };
   } catch (error) {
     const detail = describeSendFailure(error);
+    // PATCH has no provider idempotency key. A withdrawn card and a card past
+    // Lark's edit window are nevertheless definitive no-effect outcomes: the
+    // exact target can never be updated by a retry. Settle this row through the
+    // store's terminal state (with an explicit discarded receipt) so its
+    // per-Session FIFO fence does not permanently block later durable replies.
+    if (parsed.target.kind === 'update'
+        && (error instanceof MessageWithdrawnError
+          || error instanceof MessageUpdateExpiredError
+          || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'))) {
+      return {
+        kind: 'delivered',
+        receipt: {
+          provider: 'lark',
+          providerMessageId: parsed.target.messageId,
+          providerUuid: parsed.providerUuid,
+          operation: 'update',
+          targetId: parsed.target.messageId,
+          disposition: 'discarded',
+          reason: error instanceof MessageUpdateExpiredError
+            ? 'message_update_expired'
+            : error instanceof MessageWithdrawnError
+              ? 'message_withdrawn'
+              : 'topic_unavailable',
+        },
+      };
+    }
+    if (parsed.target.kind === 'update'
+        && error instanceof TopicSendError
+        && error.code === 'TOPIC_SEND_CHECK_FAILED') {
+      return safeRetry(detail, 'no_side_effect');
+    }
     const classification = classifyFeishuError(error);
     if (classification?.errorClass === 'retryable') {
       return safeRetry(detail, 'stable_target_idempotency');

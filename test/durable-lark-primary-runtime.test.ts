@@ -94,6 +94,28 @@ describe('durable Lark primary runtime', () => {
     await runtime.stop();
   });
 
+  it('starts and stops the optional owner-routed session control consumer', async () => {
+    const order: string[] = [];
+    const durableStore = store(order);
+    const ownedPartitionKeys = vi.fn(() => [] as string[]);
+    const resolve = vi.fn();
+    const runtime = startDurableLarkPrimaryRuntime({
+      store: durableStore,
+      larkAppId: 'cli_test',
+      handleCanonical: async () => ({ kind: 'ignored', reason: 'fixture' }),
+      deliverOutbox: async () => ({ kind: 'ambiguous', error: 'fixture' }),
+      control: { ownedPartitionKeys, resolve },
+    });
+    await runtime.ready;
+
+    expect(runtime.control).toBeDefined();
+    expect(ownedPartitionKeys).toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+    await expect(runtime.stop()).resolves.toMatchObject({
+      kind: 'stopped', control: { kind: 'stopped' },
+    });
+  });
+
   it('settles an exact delivered result that arrives after timeout ambiguity', async () => {
     const order: string[] = [];
     const durableStore = store(order);

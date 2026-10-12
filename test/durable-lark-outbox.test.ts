@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DurableOutboxRecord, OutboxAttempt } from '../src/services/durable-coordination.js';
 import {
   deliverDurableLarkOutbox,
@@ -6,7 +9,16 @@ import {
   LARK_OUTBOX_IDEMPOTENCY_TTL_MS,
   parseDurableLarkOutboxRecord,
 } from '../src/services/durable-lark-outbox.js';
-import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { startDurableOutboxPump } from '../src/services/durable-outbox-pump.js';
+import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
+import { MessageUpdateExpiredError, MessageWithdrawnError } from '../src/im/lark/client.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -56,6 +68,7 @@ function deps() {
   return {
     sendMessage: vi.fn(async () => 'om_sent'),
     replyMessage: vi.fn(async () => 'om_replied'),
+    updateMessage: vi.fn(async () => true),
   };
 }
 
@@ -155,6 +168,31 @@ describe('durable Lark outbox adapter', () => {
     expect(transport.sendMessage).not.toHaveBeenCalled();
   });
 
+  it('updates one stable card target idempotently through the durable outbox', async () => {
+    const record = row({ target: { kind: 'update', messageId: 'om_card' }, msgType: 'interactive' });
+    const transport = deps();
+    const result = await deliverDurableLarkOutbox(
+      record,
+      context(record),
+      transport,
+      { now: () => 2_000 },
+    );
+
+    expect(result).toEqual({
+      kind: 'delivered',
+      receipt: {
+        provider: 'lark',
+        providerMessageId: 'om_card',
+        providerUuid: 'bts_0123456789abcdef0123456789abcdef',
+        operation: 'update',
+        targetId: 'om_card',
+      },
+    });
+    expect(transport.updateMessage).toHaveBeenCalledWith('cli_test', 'om_card', 'hello');
+    expect(transport.sendMessage).not.toHaveBeenCalled();
+    expect(transport.replyMessage).not.toHaveBeenCalled();
+  });
+
   it('uses the provider UUID window for bounded safe retry', async () => {
     const record = row();
     const transport = deps();
@@ -208,6 +246,110 @@ describe('durable Lark outbox adapter', () => {
 
     expect(result).toMatchObject({ kind: 'ambiguous' });
     expect(transport.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['withdrawn', new MessageWithdrawnError('om_card'), 'message_withdrawn'],
+    ['expired', new MessageUpdateExpiredError('om_card'), 'message_update_expired'],
+    ['unavailable topic', new TopicSendError('TOPIC_SEND_BLOCKED', 'withdrawn'), 'topic_unavailable'],
+  ] as const)('terminally discards a %s card update and unblocks the next SQLite outbox row', async (
+    _case,
+    terminalError,
+    reason,
+  ) => {
+    let now = 10;
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-lark-outbox-terminal-update-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => now });
+    const acquired = await store.acquireSessionLease({
+      sessionKey: 'om_root::cli_test',
+      ownerId: 'session-owner',
+      leaseDurationMs: 1_000,
+    });
+    if (acquired.kind !== 'acquired') throw new Error('expected Session lease');
+    await store.enqueueOutbox({
+      lease: acquired.lease,
+      message: durableLarkOutboxMessage({
+        messageId: `control-update-${reason}`,
+        sessionKey: 'om_root::cli_test',
+        larkAppId: 'cli_test',
+        target: { kind: 'update', messageId: 'om_card' },
+        content: '{"card":"settled"}',
+        msgType: 'interactive',
+        providerUuid: `update_${reason}`,
+        createdAt: 1,
+        visibleAt: 1,
+      }),
+    });
+    await store.enqueueOutbox({
+      lease: acquired.lease,
+      message: durableLarkOutboxMessage({
+        messageId: `notice-${reason}`,
+        sessionKey: 'om_root::cli_test',
+        larkAppId: 'cli_test',
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        content: 'follow-up',
+        providerUuid: `notice_${reason}`,
+        createdAt: 2,
+        visibleAt: 2,
+      }),
+    });
+    const transport = deps();
+    transport.updateMessage.mockRejectedValueOnce(terminalError);
+    const pump = startDurableOutboxPump({
+      store,
+      workerId: `outbox-${reason}`,
+      concurrency: 1,
+      batchSize: 2,
+      intervalMs: 60_000,
+      now: () => now,
+      deliver: (record, deliveryContext) => deliverDurableLarkOutbox(
+        record,
+        deliveryContext,
+        transport,
+        { now: () => now },
+      ),
+    });
+    await pump.ready;
+
+    expect(await store.readOutbox(`control-update-${reason}`)).toMatchObject({
+      state: 'delivered',
+      receipt: { disposition: 'discarded', reason },
+    });
+    expect(await store.readOutbox(`notice-${reason}`)).toMatchObject({ state: 'delivered' });
+    expect(transport.replyMessage).toHaveBeenCalledWith(
+      'cli_test',
+      'om_root',
+      'follow-up',
+      'text',
+      true,
+      `notice_${reason}`,
+      undefined,
+      { suppressHook: true },
+    );
+    await pump.stop();
+    await store.close();
+    now++;
+  });
+
+  it('safely retries an update whose topic availability check failed before PATCH', async () => {
+    const record = row({ target: { kind: 'update', messageId: 'om_card' }, msgType: 'interactive' });
+    const transport = deps();
+    transport.updateMessage.mockRejectedValueOnce(
+      new TopicSendError('TOPIC_SEND_CHECK_FAILED', 'lookup unavailable'),
+    );
+    const result = await deliverDurableLarkOutbox(
+      record,
+      context(record),
+      transport,
+      { now: () => 2_000, retryDelaysMs: [500] },
+    );
+
+    expect(result).toMatchObject({
+      kind: 'retry',
+      visibleAt: 2_500,
+      proof: 'no_side_effect',
+    });
   });
 
   it('retries safely when authority fails before the provider call', async () => {
@@ -287,5 +429,6 @@ describe('durable Lark outbox adapter', () => {
     expect(result).toMatchObject({ kind: 'ambiguous' });
     expect(transport.sendMessage).not.toHaveBeenCalled();
     expect(transport.replyMessage).not.toHaveBeenCalled();
+    expect(transport.updateMessage).not.toHaveBeenCalled();
   });
 });
