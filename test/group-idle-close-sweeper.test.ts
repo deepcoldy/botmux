@@ -47,9 +47,11 @@ it('uses exact hour/day boundaries and latest persisted or runtime interaction',
 it.each([
   { lastScreenStatus: 'working' }, { lastScreenStatus: 'analyzing' }, { lastScreenStatus: 'starting' },
   { workerReady: false }, { pendingRepo: true }, { worktreeCreating: true },
+  { pendingRepoCommitInFlight: true },
   { pendingRawInput: 'input' }, { pendingFollowUpInput: {} }, { pendingFollowUps: ['input'] },
   { cascadeInFlight: true }, { cascadeDeferred: [{}] },
-  { tuiPromptCardId: 'card' }, { tuiPromptOptions: [{}] }, { agentAttention: {} },
+  { tuiPromptCardId: 'card' }, { tuiPromptOptions: [{}] }, { tuiPromptProcessing: true },
+  { agentAttention: {} },
   { finalOutputDeliveriesInFlight: new Set([Promise.resolve()]) }, { initialStartPending: true },
   { adoptedFrom: {} }, { usageLimit: {} }, { chatType: 'p2p' },
 ])('retains sessions that own work or need attention: %j', patch => {
@@ -74,6 +76,9 @@ it.each(['pty', 'tmux', 'zmx', 'remote-runner'])('supports idle and dormant sess
   ds.lastScreenStatus = undefined;
   ds.session.suspendedColdResume = true;
   expect(isGroupIdleCloseCandidate(ds, settings, now)).toBe(true);
+  ds.workerPort = 8080;
+  expect(isGroupIdleCloseCandidate(ds, settings, now)).toBe(false);
+  ds.workerPort = null;
   ds.hasHistory = false;
   expect(isGroupIdleCloseCandidate(ds, settings, now)).toBe(false);
 });
