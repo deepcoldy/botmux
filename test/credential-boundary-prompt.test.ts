@@ -193,11 +193,25 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
     },
   );
 
-  it('excludes cloud Mira from managed local lark guidance', () => {
-    const args = createCliAdapterSync('mira').buildArgs({
-      sessionId: 'sess-bound', resume: false, locale: 'zh', larkToolAppId: 'cli_current',
+  it('includes managed local guidance for Codex but excludes cloud Mira', () => {
+    const appId = 'cli_mira_control';
+    stubbedBots.set(appId, {
+      config: {
+        larkAppId: appId,
+        triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      },
     });
-    expect(args).not.toContain('--lark-tool-app-id');
+    try {
+      const opening = (cliId: 'codex' | 'mira') => buildNewTopicPrompt(
+        'read the linked doc', `sess-${cliId}`, cliId, undefined, undefined, undefined,
+        undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: appId, chatId: 'oc_chat', larkToolResume: false },
+      );
+      expect(opening('codex')).toContain('<botmux_lark_tool>');
+      expect(opening('mira')).not.toContain('<botmux_lark_tool>');
+    } finally {
+      stubbedBots.delete(appId);
+    }
   });
 });
 
@@ -241,7 +255,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
   const boundOpening = () => buildNewTopicPrompt(
     'read the linked doc', 'sess-bound', inlineCli, undefined, undefined, undefined,
     undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
-    { larkAppId: APP, chatId: 'oc_chat' },
+    { larkAppId: APP, chatId: 'oc_chat', larkToolResume: false },
   );
 
   it('includes the credential boundary when the policy is on', () => {
@@ -314,6 +328,18 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       const text = boundOpening();
       expect(text).toContain('<botmux_lark_tool>');
       expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    });
+  });
+
+  it('defaults an omitted launch decision to legacy-safe resume semantics', () => {
+    withTriggerUserAuth(true, () => {
+      const text = buildNewTopicPrompt(
+        'read the linked doc', 'sess-bound', inlineCli, undefined, undefined, undefined,
+        undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
+        { larkAppId: APP, chatId: 'oc_chat' },
+      );
+      expect(text).not.toContain('<botmux_lark_tool>');
+      expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
     });
   });
 

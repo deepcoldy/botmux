@@ -2880,6 +2880,9 @@ export async function handleCommand(
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
                   chatContext: current.pendingChatContext,
+                  // Pending repo selection still owns the original fresh
+                  // launch; the paired forkWorker call does not resume.
+                  larkToolResume: false,
                 },
               );
             }
@@ -6598,7 +6601,13 @@ export async function startForkSubtopicSession(
           { name: bot.botName, openId: bot.botOpenId },
           loc,
           triggerSender,
-          { larkAppId: appId, chatId },
+          {
+            larkAppId: appId,
+            chatId,
+            // /fork creates a new child session and never resumes an existing
+            // worker generation for this opening.
+            larkToolResume: false,
+          },
         ),
       },
     );

@@ -237,6 +237,10 @@ async function resumeRestoredPendingRepoSetup(
         codexAppText: ds.pendingCodexAppText,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: ds.pendingCodexAppMessageContext,
+        // This recovery completes the original fresh pending-repo launch.
+        // `hasHistory` may be true after daemon restore, but the paired
+        // forkWorker call below is authoritatively resume:false.
+        larkToolResume: false,
       },
     );
     rememberLastCliInput(ds, setup.prompt, input);
@@ -1324,7 +1328,9 @@ type NewTopicOpts = {
   /** Exact worker launch decision for this opening input. This cannot be
    * inferred from persisted prompt/history fields: a failed fresh start may
    * already have lastCliInput, while a legacy empty-start session may deliver
-   * its first user message through an already resumed live worker. */
+   * its first user message through an already resumed live worker. Omission is
+   * treated as resume=true (legacy-safe): an uncertain caller must not claim a
+   * managed bot binding that may not exist. */
   larkToolResume?: boolean;
   /** replyDelivery=transcript 且本轮是 solo 会话（daemon 算好的 ds.soloSession）：
    *  去掉 <user_message> 壳与 sender/attachments/mentions 块，改用裸文本 +
@@ -1491,7 +1497,7 @@ function buildNewTopicBlocks(
       opts?.larkAppId,
       sessionId,
       opts?.chatId,
-      opts?.larkToolResume === true,
+      opts?.larkToolResume !== false,
       locale,
     );
     if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
@@ -4569,7 +4575,16 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, trustedCaller: scheduledTrustedCaller, promptInjection: sessionPromptInjection(ds) });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, {
+      larkAppId,
+      chatId: task.chatId,
+      whiteboardId: ds.session.whiteboardId,
+      trustedCaller: scheduledTrustedCaller,
+      promptInjection: sessionPromptInjection(ds),
+      // This branch always creates a fresh Session; the paired forkWorker call
+      // below receives no resume flag.
+      larkToolResume: false,
+    });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -4681,6 +4696,9 @@ async function forkOrShowRepoCard(
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
       codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+      // createSession's direct/pending-repo launch is fresh. Any continuation
+      // was handled before this builder is reached.
+      larkToolResume: false,
     },
   );
 
