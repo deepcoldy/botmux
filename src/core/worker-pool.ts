@@ -52,10 +52,9 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnRe
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { appendTurnTerminalReceiptToCard, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
-import { codexServiceTierBadge } from '../services/codex-service-tier.js';
+import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
-import { isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
@@ -2357,6 +2356,16 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
   sessionStore.updateSession(ds.session);
 }
 
+function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier | undefined {
+  const tier = ds.session.serviceTier;
+  if (tier === undefined || tier === 'inherit') return undefined;
+  if (isCodexServiceTierCliId(cliId)) return tier;
+  // 有意清除必须落盘 inherit，避免持久层当作陈旧写入复活。
+  ds.session.serviceTier = 'inherit';
+  sessionStore.updateSession(ds.session);
+  return undefined;
+}
+
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
@@ -2380,15 +2389,6 @@ function sessionAgentConfig(
       : undefined;
     const launchShell = selected.launchShell ?? undefined;
     const startupCommands = [...selected.startupCommands];
-    const serviceTier = isCodexServiceTierCliId(selected.cliId)
-      && ds.session.serviceTier !== undefined && ds.session.serviceTier !== 'inherit'
-      ? ds.session.serviceTier
-      : undefined;
-    if (!isCodexServiceTierCliId(selected.cliId)
-        && ds.session.serviceTier !== undefined && ds.session.serviceTier !== 'inherit') {
-      ds.session.serviceTier = 'inherit';
-      if (selected.state !== 'pending') sessionStore.updateSession(ds.session);
-    }
     if (selected.state === 'pending') {
       selected.state = 'resolved';
       ds.session.cliId = selected.cliId;
@@ -2409,7 +2409,7 @@ function sessionAgentConfig(
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
     const model = resolveSessionLaunchModel(ds, botCfg);
     recordLaunchModel(ds, model);
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, serviceTier, launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -2509,12 +2509,6 @@ function sessionAgentConfig(
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
   }
-  const serviceTier = ds.session.serviceTier !== undefined && ds.session.serviceTier !== 'inherit'
-    ? ds.session.serviceTier
-    : undefined;
-  if (serviceTier && !isCodexServiceTierCliId(ds.session.cliId ?? botCfg.cliId)) {
-    throw new Error(`Session service tier ${serviceTier} is not supported by CLI ${ds.session.cliId ?? botCfg.cliId}`);
-  }
   return {
     cliId: ds.session.cliId ?? botCfg.cliId,
     cliRuntime: ds.session.cliRuntime,
@@ -2524,7 +2518,7 @@ function sessionAgentConfig(
     model,
     modelBackendVariant: ds.session.modelBackendVariant,
     reasoningEffort: ds.session.reasoningEffort,
-    serviceTier,
+    serviceTier: sessionServiceTier(ds, ds.session.cliId ?? botCfg.cliId),
     launchShell: botCfg.launchShell,
     startupCommands: botCfg.startupCommands,
   };

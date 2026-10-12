@@ -115,6 +115,24 @@ describe('detectModels（live 探测，fail-soft）', () => {
     expect(adapterCalls).toBe(0);
   });
 
+  it('Aiden 的成功目录沿用缓存，过期后重探', async () => {
+    const catalog = createModelCatalog();
+    let now = 1_000;
+    let calls = 0;
+    const opts = {
+      now: () => now,
+      adapterFactory: () => { throw new Error('must not construct Codex adapter'); },
+      aidenCodexDetector: async () => { calls++; return ['deepseek-v4-pro']; },
+    };
+    for (let i = 0; i < 2; i++) {
+      expect(await catalog.detectModels('aiden-x-codex', opts)).toEqual(['deepseek-v4-pro']);
+    }
+    expect(calls).toBe(1);
+    now += MODEL_DETECT_TTL_MS;
+    expect(await catalog.detectModels('aiden-x-codex', opts)).toEqual(['deepseek-v4-pro']);
+    expect(calls).toBe(2);
+  });
+
   it('适配器无 detectModels（claude-code）→ null', async () => {
     expect(await detectModels('claude-code')).toBeNull();
   });

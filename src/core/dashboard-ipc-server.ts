@@ -7684,11 +7684,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (!tierCheck.ok) {
       return jsonRes(res, 400, {
         ok: false,
-        error: tierCheck.error === 'model_required'
-          ? 'service_tier_model_required'
-          : tierCheck.error === 'catalog_unavailable'
-            ? 'service_tier_catalog_unavailable'
-            : 'service_tier_not_supported_by_model',
+        error: `service_tier_${tierCheck.error}`,
       });
     }
   }

@@ -120,20 +120,15 @@ async function detectModelCatalogWith(
 
     const promise = (async (): Promise<DetectedModelCatalog | null> => {
       try {
-        if (opt.key === 'aiden-x-codex') {
-          const models = await (opts?.aidenCodexDetector ?? detectAidenCodexModels)();
-          if (models === null) return null;
-          return { models: [...models] };
-        }
-        const adapter = factory(opt.cliId);
-        const capabilities = adapter.detectModelCapabilities
+        const adapter = opt.key === 'aiden-x-codex' ? undefined : factory(opt.cliId);
+        const capabilities = adapter?.detectModelCapabilities
           ? await adapter.detectModelCapabilities({ env: opts?.probeEnv })
           : undefined;
-        const models = adapter.detectModelCapabilities
-          ? capabilities?.map(model => model.slug) ?? null
-          : adapter.detectModels
-            ? await adapter.detectModels()
-            : null;
+        const models = opt.key === 'aiden-x-codex'
+          ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
+          : adapter?.detectModelCapabilities
+            ? capabilities?.map(model => model.slug) ?? null
+            : await adapter?.detectModels?.() ?? null;
         // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
         if (models === null) return null;
         if (models.length === 0) return { models: [] };

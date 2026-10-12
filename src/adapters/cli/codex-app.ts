@@ -1,11 +1,10 @@
-import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
-import { parseDebugModelCapabilitiesJson, type DebugModelCapabilities } from './model-catalog-json.js';
+import type { DebugModelCapabilities } from './model-catalog-json.js';
+import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
@@ -90,27 +89,14 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     // 与 codex CLI 同一模型目录（app-server 后端就是 codex binary）：静态列表是
     // `codex debug models` visibility=list 的快照，live 探测补充目录增量。
     modelChoices: CLI_MODEL_CHOICES['codex-app'],
-    // Live 模型枚举：直接 spawn 被 wrap 的 codex binary 跑 `debug models`
-    // （resolvedBin 是 node runner 不是 codex，故这里用懒解析的 cachedCodexBin）。
-    // 8s 超时、16MB maxBuffer、fail-soft → null，picker 回退上面的静态快照。
+    // resolvedBin 是 runner；能力探测使用其实际启动的 Codex binary。
     async detectModelCapabilities(options?: { env?: NodeJS.ProcessEnv }): Promise<readonly DebugModelCapabilities[] | null> {
       try {
-        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
-        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
-        // 的 try/catch 兜住（契约：任何异常 → null）。
-        const execFileAsync = promisify(execFile);
         // Shares `cachedCodexBin` with the two call sites above, so it must use the
         // same resolver or whichever runs first would decide the cached value and
         // silently change what the other two get. It also execs the binary itself.
         const codexBin = (cachedCodexBin ??= resolveCommandReal(rawCodexBin));
-        const { stdout } = await execFileAsync(codexBin, ['debug', 'models'], {
-          timeout: 8000,
-          maxBuffer: 16 * 1024 * 1024,
-          windowsHide: true,
-          env: options?.env ?? process.env,
-        });
-        const catalog = parseDebugModelCapabilitiesJson(stdout);
-        return catalog.length > 0 ? catalog : null;
+        return await loadCodexServiceTierCatalog({ cliBin: codexBin, env: options?.env });
       } catch {
         return null;
       }

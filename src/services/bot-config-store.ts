@@ -354,11 +354,7 @@ async function applyConfigFieldInternal(
     if (!tierCheck.ok) {
       return {
         ok: false,
-        reason: tierCheck.error === 'model_required'
-          ? 'service_tier_model_required'
-          : tierCheck.error === 'catalog_unavailable'
-            ? 'service_tier_catalog_unavailable'
-            : 'service_tier_not_supported_by_model',
+        reason: `service_tier_${tierCheck.error}`,
       };
     }
   }

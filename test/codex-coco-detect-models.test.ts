@@ -37,6 +37,7 @@ vi.mock('node:child_process', () => {
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { clearCodexServiceTierCatalogCache, validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
 
 // 绝对路径：resolveCommand 对绝对路径原样返回（registry.ts），detectModels
 // 不会 shell out，mock 只需覆盖 execFile。
@@ -53,6 +54,7 @@ const modelEntry = (slug: string, visibility: string = 'list') => ({
 
 describe('codex detectModels（mock child_process）', () => {
   beforeEach(() => {
+    clearCodexServiceTierCatalogCache();
     execFileCalls.length = 0;
     execFileStdout = '';
     execFileError = null;
@@ -120,6 +122,7 @@ describe('codex detectModels（mock child_process）', () => {
 
 describe('codex-app detectModels（mock child_process）', () => {
   beforeEach(() => {
+    clearCodexServiceTierCatalogCache();
     execFileCalls.length = 0;
     execFileStdout = '';
     execFileError = null;
@@ -134,8 +137,11 @@ describe('codex-app detectModels（mock child_process）', () => {
       { slug: 'gpt-6-astra', serviceTiers: ['priority'] },
     ]);
     await expect(adapter.detectModels!()).resolves.toEqual(['gpt-6-astra']);
+    await expect(createCodexAdapter(CODEX_BIN).detectModels!()).resolves.toEqual(['gpt-6-astra']);
+    await expect(validateCodexServiceTier({
+      cliBin: CODEX_BIN, model: 'gpt-6-astra', serviceTier: 'priority',
+    })).resolves.toEqual({ ok: true });
     expect(execFileCalls.map(({ file, args }) => ({ file, args }))).toEqual([
-      { file: CODEX_BIN, args: ['debug', 'models'] },
       { file: CODEX_BIN, args: ['debug', 'models'] },
     ]);
   });
