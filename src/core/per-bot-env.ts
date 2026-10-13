@@ -122,3 +122,107 @@ export function sanitizePerBotEnv(raw: unknown): Record<string, string> {
   }
   return out;
 }
+
+/**
+ * Compute the env map to persist from a dashboard save. `replace` = `incoming`
+ * as-is; `merge` = `prev` minus `remove`, then `incoming` overrides same-named
+ * keys. Returns `null` when the result is empty (= clear the field).
+ */
+export function nextPerBotEnv(opts: {
+  prev?: Record<string, string>;
+  incoming: Record<string, string>;
+  mode: 'replace' | 'merge';
+  remove?: readonly string[];
+}): Record<string, string> | null {
+  let next: Record<string, string>;
+  if (opts.mode === 'merge') {
+    next = { ...(opts.prev ?? {}) };
+    for (const k of opts.remove ?? []) delete next[k];
+    Object.assign(next, opts.incoming);
+  } else {
+    next = { ...opts.incoming };
+  }
+  return Object.keys(next).length ? next : null;
+}
+
+/** Input format recognised by {@link parsePerBotEnvText}. */
+export type PerBotEnvTextFormat = 'json' | 'dotenv';
+
+export type PerBotEnvTextParse =
+  | {
+    ok: true;
+    format: PerBotEnvTextFormat;
+    /** Raw `KEY -> value` (last duplicate wins); NOT yet sanitized. */
+    env: Record<string, unknown>;
+    /** 1-based line numbers skipped as non-assignments (shell glue such as
+     *  `exec env \` or `claude "$@"`); always empty for JSON. */
+    ignoredLines: number[];
+  }
+  | { ok: false; reason: 'invalid_json' | 'invalid_env_line' | 'empty'; line?: number };
+
+/**
+ * Parse the per-bot env editor text into a raw key/value map. Accepts:
+ *  - a JSON object `{"KEY":"v"}`, or a Claude settings snippet `{"env":{...}}`
+ *    (unwrapped only when `env` is the sole key and holds an object — env
+ *    values are primitives, so this can't shadow a real variable);
+ *  - dotenv / shell lines: `KEY=v`, `export KEY=v`, `KEY='v'`, `KEY="v\n"`,
+ *    `# comments`, inline ` # comments` after unquoted values, and the
+ *    `exec env \` + `  KEY='v' \` launcher-script shape (trailing `\` and
+ *    non-assignment lines are skipped and reported via `ignoredLines`).
+ * `$VAR` references are kept literally — nothing is expanded or executed.
+ * Pure + total: never throws. Name/reserved-key validation stays with
+ * {@link sanitizePerBotEnv} / {@link isReservedPerBotEnvKey}.
+ */
+export function parsePerBotEnvText(text: string): PerBotEnvTextParse {
+  const src = text.replace(/^\uFEFF/, '').trim();
+  if (!src) return { ok: false, reason: 'empty' };
+  // `[`/`"` can't start a dotenv line — treat as (non-object) JSON so the
+  // error says "not a JSON object" rather than "bad line 1".
+  if (/^[{["]/.test(src)) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(src); } catch { return { ok: false, reason: 'invalid_json' }; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
+    let obj = parsed as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.length === 1 && keys[0] === 'env' && obj.env && typeof obj.env === 'object' && !Array.isArray(obj.env)) {
+      obj = obj.env as Record<string, unknown>;
+    }
+    return { ok: true, format: 'json', env: { ...obj }, ignoredLines: [] };
+  }
+
+  const env: Record<string, unknown> = {};
+  const ignoredLines: number[] = [];
+  const lines = src.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i].trim();
+    if (!line || line.startsWith('#')) continue;
+    if (/(^|\s)\\$/.test(line)) line = line.slice(0, -1).trimEnd();
+    line = line.replace(/^export\s+/, '');
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!m) { ignoredLines.push(i + 1); continue; }
+    const value = parseEnvValue(m[2]);
+    if (value === null) return { ok: false, reason: 'invalid_env_line', line: i + 1 };
+    env[m[1]] = value;
+  }
+  if (Object.keys(env).length === 0) return { ok: false, reason: 'invalid_env_line', line: ignoredLines[0] };
+  return { ok: true, format: 'dotenv', env, ignoredLines };
+}
+
+/** Unquote one dotenv value; `null` = unterminated quote / trailing junk. */
+function parseEnvValue(raw: string): string | null {
+  const v = raw.trim();
+  const q = v[0];
+  if (q !== "'" && q !== '"') return v.replace(/\s+#.*$/, '');
+  let out = '';
+  for (let i = 1; i < v.length; i++) {
+    const ch = v[i];
+    if (ch === q) return /^\s*(#.*)?$/.test(v.slice(i + 1)) ? out : null;
+    if (q === '"' && ch === '\\' && i + 1 < v.length) {
+      const nx = v[++i];
+      out += nx === 'n' ? '\n' : nx === 't' ? '\t' : nx === 'r' ? '\r' : nx;
+      continue;
+    }
+    out += ch;
+  }
+  return null;
+}

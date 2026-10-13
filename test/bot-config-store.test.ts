@@ -579,6 +579,17 @@ describe('bot-config store', () => {
 
     // Reserved-only object also fails as reserved_env (not invalid_json).
     expect(store.coerceConfigValue(spec, '{"BOTMUX_X":"y"}')).toEqual({ ok: false, reason: 'reserved_env' });
+    // Same rule for dotenv input — CLAUDE_CONFIG_DIR from a launcher script is refused.
+    expect(store.coerceConfigValue(spec, 'CLAUDE_CONFIG_DIR=/x\nANTHROPIC_MODEL=m')).toEqual({ ok: false, reason: 'reserved_env' });
+  });
+
+  it('accepts dotenv / settings-snippet env text and normalizes to the same map as JSON', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('env')!;
+    const want = { ok: true, value: { ANTHROPIC_BASE_URL: 'http://gw:8080', ANTHROPIC_MODEL: 'claude-opus-5-5' } };
+    expect(store.coerceConfigValue(spec, 'ANTHROPIC_BASE_URL=http://gw:8080\nexport ANTHROPIC_MODEL="claude-opus-5-5"')).toEqual(want);
+    expect(store.coerceConfigValue(spec, '{"env":{"ANTHROPIC_BASE_URL":"http://gw:8080","ANTHROPIC_MODEL":"claude-opus-5-5"}}')).toEqual(want);
+    expect(store.coerceConfigValue(spec, 'A="unterminated')).toEqual({ ok: false, reason: 'invalid_env' });
   });
 
   it('boolean field writes true / deletes key on false (keeps bots.json tidy)', async () => {

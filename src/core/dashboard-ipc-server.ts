@@ -136,6 +136,7 @@ import type {
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult } from '../services/bot-config-store.js';
+import { nextPerBotEnv } from './per-bot-env.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
@@ -8432,28 +8433,42 @@ ipcRoute('GET', '/api/feedback-effective', async (req, res) => {
   }) });
 });
 
-// Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如
-// `{"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"}` 让本 bot 走 GLM/第三方
-// 服务商）：空白 → 清除；否则按 json kind 解析 + sanitizePerBotEnv 过滤后落盘。
-// 走 applyConfigField（与 /botconfig 同一写盘 + 内存热更新路径），next-session 生效
-// （下个会话起注入到 CLI 进程）。回包返回脱敏后的 pretty JSON 供 textarea 回填。
+// Per-bot 环境变量 env。Body `{ env: string, mode?: 'replace'|'merge', remove?: string[] }`。
+// env 是原始文本：JSON 对象 / `{"env":{…}}` settings 片段 / .env / `export K=V` /
+// `env \` 启动脚本行都认（parsePerBotEnvText），如 ANTHROPIC_BASE_URL+AUTH_TOKEN
+// 让本 bot 走 GLM/第三方服务商。
+//   • mode 缺省 'replace'（老客户端/脚本语义不变）：空白 → 清除；否则整份替换。
+//   • mode 'merge'：在现有 env 上覆盖同名键；remove 列出的键删除。合并后为空 → 清除。
+// 走 applyConfigField（与 /botconfig 同一写盘 + 内存热更新路径），next-session 生效。
+// 值只写不读：回包只给变量名。
 ipcRoute('PUT', '/api/bot-env', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { env?: unknown };
-  try { body = await readJsonBody<{ env?: unknown }>(req); }
+  let body: { env?: unknown; mode?: unknown; remove?: unknown };
+  try { body = await readJsonBody<{ env?: unknown; mode?: unknown; remove?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const spec = findConfigField('env');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  if (body.mode !== undefined && body.mode !== 'replace' && body.mode !== 'merge') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  }
+  if (body.remove !== undefined && (!Array.isArray(body.remove) || body.remove.some(k => typeof k !== 'string'))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_remove' });
+  }
+  const merge = body.mode === 'merge';
   const raw = typeof body.env === 'string' ? body.env : '';
-  let value: Record<string, string> | null;
-  if (!raw.trim()) {
-    value = null;  // 清除
-  } else {
+  let incoming: Record<string, string> = {};
+  if (raw.trim()) {
     const coerced = coerceConfigValue(spec, raw);
     if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
-    value = coerced.value as Record<string, string>;
+    incoming = coerced.value as Record<string, string>;
   }
+  let prev: Record<string, string> | undefined;
+  if (merge) {
+    try { prev = getBot(cachedLarkAppId).config.env; }
+    catch { /* 未注册 bot → applyConfigField 会给出 bot_not_registered */ }
+  }
+  const value = nextPerBotEnv({ prev, incoming, mode: merge ? 'merge' : 'replace', remove: body.remove as string[] | undefined });
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, env: '', envKeys: value ? Object.keys(value).sort() : [] });

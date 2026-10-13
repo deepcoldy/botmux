@@ -41,6 +41,8 @@ import {
   type BotDescriptionSnapshot,
 } from './bot-description.js';
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { isReservedPerBotEnvKey, parsePerBotEnvText, sanitizePerBotEnv } from '../../core/per-bot-env.js';
+import { confirm } from './confirm-modal.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { DropdownField, ModelPickerField, type DropdownFieldOption } from './field-controls.js';
@@ -7135,49 +7137,197 @@ export function EnvPolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBo
   </div>;
 }
 
+type EnvEntryTag = 'new' | 'overwrite' | 'reserved' | 'skipped';
+
+/** Live analysis of the env textarea against the stored names. Names only —
+ *  parsed values never leave this function. */
+function analyzeEnvDraft(text: string, storedKeys: readonly string[], mode: 'merge' | 'replace') {
+  if (!text.trim()) return null;
+  const parsed = parsePerBotEnvText(text);
+  if (!parsed.ok) return { ok: false as const, reason: parsed.reason, line: parsed.line };
+  const sanitized = sanitizePerBotEnv(parsed.env);
+  const stored = new Set(storedKeys);
+  const entries = Object.keys(parsed.env).map((key): { key: string; tag: EnvEntryTag } => ({
+    key,
+    tag: isReservedPerBotEnvKey(key) ? 'reserved'
+      : !(key in sanitized) ? 'skipped'
+      : stored.has(key) ? 'overwrite' : 'new',
+  }));
+  const reserved = entries.filter(e => e.tag === 'reserved').map(e => e.key);
+  const dropped = mode === 'replace' ? storedKeys.filter(k => !(k in sanitized)) : [];
+  return {
+    ok: true as const,
+    format: parsed.format,
+    entries,
+    reserved,
+    dropped,
+    ignoredLines: parsed.ignoredLines,
+    savable: reserved.length === 0 && Object.keys(sanitized).length > 0,
+  };
+}
+
 export function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [value, setValue] = useState('');
+  const [mode, setMode] = useState<'merge' | 'replace'>('merge');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const storedKeys = props.bot.envKeys ?? [];
 
-  useEffect(() => setValue(''), [props.bot.larkAppId]);
+  useEffect(() => { setValue(''); setMode('merge'); setStatus(null); }, [props.bot.larkAppId]);
 
-  async function save(): Promise<void> {
+  const draft = useMemo(() => analyzeEnvDraft(value, storedKeys, mode), [value, storedKeys, mode]);
+
+  async function put(body: { env: string; mode?: 'merge' | 'replace'; remove?: string[] }): Promise<boolean> {
     setStatus(null);
     setBusy(true);
     try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env`, { env: value });
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env`, body);
       if (res.ok && res.body.ok) {
-        const next = ''; // Never echo stored values, including older daemon responses.
-        setValue(next);
-        props.patchBot(props.bot.larkAppId, { env: next, envKeys: Array.isArray(res.body.envKeys) ? res.body.envKeys : [] });
+        // Never echo stored values, including older daemon responses.
+        props.patchBot(props.bot.larkAppId, { env: '', envKeys: Array.isArray(res.body.envKeys) ? res.body.envKeys : [] });
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
+        return true;
       }
+      setStatus({ text: `✗ ${responseErrorText(res)}` });
     } catch (e: any) {
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
       setBusy(false);
     }
+    return false;
   }
 
+  async function save(): Promise<void> {
+    if (!draft?.ok || !draft.savable) return;
+    if (await put({ env: value, mode })) setValue('');
+  }
+
+  async function removeKey(key: string): Promise<void> {
+    const ok = await confirm({
+      title: tr('botDefaults.envRemoveConfirmTitle'),
+      message: tr('botDefaults.envRemoveConfirm', { key }),
+      danger: true,
+    });
+    if (ok) await put({ env: '', mode: 'merge', remove: [key] });
+  }
+
+  async function clearAll(): Promise<void> {
+    const ok = await confirm({
+      title: tr('botDefaults.envClearConfirmTitle'),
+      message: tr('botDefaults.envClearConfirm', { count: storedKeys.length }),
+      danger: true,
+    });
+    if (ok) await put({ env: '', mode: 'replace' });
+  }
+
+  const parseError = draft && !draft.ok
+    ? draft.reason === 'invalid_json'
+      ? tr('botDefaults.envParseInvalidJson')
+      : draft.line ? tr('botDefaults.envParseInvalidLine', { line: draft.line }) : tr('botDefaults.envParseNoAssignment')
+    : null;
+  const tagLabel: Record<EnvEntryTag, string> = {
+    new: tr('botDefaults.envPreviewNew'),
+    overwrite: tr('botDefaults.envPreviewOverwrite'),
+    reserved: tr('botDefaults.envPreviewReserved'),
+    skipped: tr('botDefaults.envPreviewSkipped'),
+  };
+
   return (
-    <div className="bd-subsection">
+    <div className="bd-subsection bd-env">
       <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.envHelp')}>{tr('botDefaults.sectionEnv')}</FieldTitle></h4>
-      <p>{tr('botDefaults.envStoredNames', { names: (props.bot.envKeys ?? []).join(', ') || '∅' })}</p>
-      <p className="muted">{tr('botDefaults.envWriteOnly')}</p>
+      <div className="bd-env-stored" data-env-stored="">
+        <div className="bd-env-stored-head">
+          <span className="muted">
+            {storedKeys.length ? tr('botDefaults.envStoredLabel', { count: storedKeys.length }) : tr('botDefaults.envStoredEmpty')}
+          </span>
+          {storedKeys.length > 0 && (
+            <button type="button" className="bd-env-clear" data-action="clear-env" disabled={busy} onClick={() => void clearAll()}>
+              {tr('botDefaults.envClearAll')}
+            </button>
+          )}
+        </div>
+        {storedKeys.length > 0 && (
+          <ul className="bd-env-chips">
+            {storedKeys.map(key => (
+              <li key={key} className="bd-env-chip" data-env-key={key}>
+                <code>{key}</code>
+                <button
+                  type="button"
+                  className="bd-env-chip-remove"
+                  data-action="remove-env-key"
+                  aria-label={tr('botDefaults.envRemoveKey', { key })}
+                  title={tr('botDefaults.envRemoveKey', { key })}
+                  disabled={busy}
+                  onClick={() => void removeKey(key)}
+                >×</button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
       <textarea
         data-input="env"
-        rows={5}
+        rows={6}
+        spellCheck={false}
+        autoComplete="off"
         placeholder={tr('botDefaults.envPlaceholder')}
         value={value}
         disabled={busy}
+        aria-invalid={parseError || (draft?.ok && draft.reserved.length) ? true : undefined}
         onChange={event => setValue(event.currentTarget.value)}
       />
+      {parseError && <p className="bd-env-preview is-error" data-env-preview="">{parseError}</p>}
+      {draft?.ok && (
+        <div className="bd-env-preview" data-env-preview="">
+          <div className="bd-env-preview-head">
+            {tr('botDefaults.envPreview', {
+              format: tr(draft.format === 'json' ? 'botDefaults.envFormatJson' : 'botDefaults.envFormatDotenv'),
+              count: draft.entries.length,
+            })}
+          </div>
+          <ul className="bd-env-chips">
+            {draft.entries.map(e => (
+              <li key={e.key} className={`bd-env-chip is-${e.tag}`}>
+                <code>{e.key}</code>
+                <span className="bd-env-chip-tag">{tagLabel[e.tag]}</span>
+              </li>
+            ))}
+          </ul>
+          {draft.reserved.length > 0 && (
+            <p className="is-error">{tr('botDefaults.envReservedBlocked', { keys: draft.reserved.join(', ') })}</p>
+          )}
+          {draft.dropped.length > 0 && (
+            <p className="is-warning">{tr('botDefaults.envPreviewDropped', { count: draft.dropped.length, names: draft.dropped.join(', ') })}</p>
+          )}
+          {draft.ignoredLines.length > 0 && (
+            <p className="muted">{tr('botDefaults.envPreviewIgnored', { lines: draft.ignoredLines.join(', ') })}</p>
+          )}
+        </div>
+      )}
+      <div className="bd-env-mode" role="radiogroup">
+        {(['merge', 'replace'] as const).map(m => (
+          <label key={m}>
+            <input
+              type="radio"
+              name={`bd-env-mode-${props.bot.larkAppId}`}
+              data-input={`envMode-${m}`}
+              checked={mode === m}
+              disabled={busy}
+              onChange={() => setMode(m)}
+            />
+            {tr(m === 'merge' ? 'botDefaults.envModeMerge' : 'botDefaults.envModeReplace')}
+          </label>
+        ))}
+      </div>
       <div className="actions">
-        <button type="button" className="primary" data-action="save-env" disabled={busy} onClick={() => void save()}>{tr('botDefaults.envSave')}</button>
+        <button
+          type="button"
+          className="primary"
+          data-action="save-env"
+          disabled={busy || !draft?.ok || !draft.savable}
+          onClick={() => void save()}
+        >{tr('botDefaults.envSave')}</button>
         <StatusSpan status={status} attr={{ 'data-env-status': '' }} />
       </div>
     </div>

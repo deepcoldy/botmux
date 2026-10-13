@@ -29,7 +29,7 @@ import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
-import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { isReservedPerBotEnvKey, parsePerBotEnvText, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
@@ -790,7 +790,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -815,6 +815,19 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
   }
   const s = String(raw ?? '').trim();
   if (!s) return { ok: false, reason: 'empty' };
+  if (spec.configKey === 'env') {
+    // JSON object, `{"env":{...}}` settings snippet, or dotenv/shell lines (see
+    // parsePerBotEnvText); sanitize to valid env keys + primitive values.
+    // Reserved keys (CODEX_HOME / GROK_HOME / BOTMUX_* / …) are rejected
+    // visibly — silent drop would hide split-brain configs (CLI gets a
+    // custom home via injectEnv while daemon paths stay on default).
+    // Empty text is handled as "clear" by the caller before coerce.
+    const parsed = parsePerBotEnvText(s);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason === 'invalid_env_line' ? 'invalid_env' : 'invalid_json' };
+    if (Object.keys(parsed.env).some((k) => isReservedPerBotEnvKey(k))) return { ok: false, reason: 'reserved_env' };
+    const sanitized = sanitizePerBotEnv(parsed.env);
+    return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
+  }
   switch (spec.kind) {
     case 'stringList': {
       const arr = (spec.parseList ?? parseCustomPassthroughInput)(s);
@@ -854,19 +867,6 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           catch { return { ok: false, reason: 'invalid_json' }; }
         }
         if (spec.configKey === 'envPolicy') return { ok: true, value: normalizeEnvPolicy(parsed) };
-        if (spec.configKey === 'env') {
-          // Must be a JSON object; sanitize to valid env keys + primitive values.
-          // Reserved keys (CODEX_HOME / GROK_HOME / BOTMUX_* / …) are rejected
-          // visibly — silent drop would hide split-brain configs (CLI gets a
-          // custom home via injectEnv while daemon paths stay on default).
-          // Empty text is handled as "clear" by the caller before coerce.
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
-          const reserved = Object.keys(parsed as Record<string, unknown>)
-            .filter((k) => isReservedPerBotEnvKey(k));
-          if (reserved.length > 0) return { ok: false, reason: 'reserved_env' };
-          const sanitized = sanitizePerBotEnv(parsed);
-          return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
-        }
         if (spec.configKey === 'mojo') {
           // Same SHARED normalizer as the bots.json parser, so the two config
           // doors cannot drift: unknown keys, internal launch-identity keys and
