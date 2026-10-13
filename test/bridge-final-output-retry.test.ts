@@ -556,6 +556,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
     expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply');
+    const terminalCarrier = ds.turnTerminalCarriers?.get('turn-1');
+    expect(terminalCarrier?.cardJson).toContain('[Image omitted]');
+    expect(terminalCarrier?.cardJson).not.toContain('![Preview]');
   });
 
   it.each([

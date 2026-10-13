@@ -1327,12 +1327,18 @@ const TURN_TERMINAL_CARRIER_MAX = 64;
 function recordTurnTerminalCarrier(
   ds: DaemonSession,
   turnId: string,
-  carrier: { messageId: string; kind: 'standard_reply_card' | 'non_patchable' },
+  carrier: { messageId: string; kind: 'standard_reply_card' | 'non_patchable'; cardJson?: string },
 ): void {
   if (!turnId || !carrier.messageId) return;
   const carriers = ds.turnTerminalCarriers ?? (ds.turnTerminalCarriers = new Map());
+  const previous = carriers.get(turnId);
   carriers.delete(turnId);
-  carriers.set(turnId, carrier);
+  carriers.set(turnId, {
+    ...carrier,
+    cardJson: carrier.cardJson ?? (previous?.messageId === carrier.messageId && previous.kind === carrier.kind
+      ? previous.cardJson
+      : undefined),
+  });
   while (carriers.size > TURN_TERMINAL_CARRIER_MAX) {
     const oldest = carriers.keys().next().value;
     if (oldest === undefined) break;
@@ -1351,19 +1357,20 @@ function messageCardContent(detail: any, expectedChatId: string): string | undef
 
 async function patchTurnTerminalCarrier(
   ds: DaemonSession,
-  messageId: string,
+  carrier: { messageId: string; cardJson?: string },
   kind: TurnTerminalReceiptKind,
 ): Promise<boolean> {
-  const detail = await getTopicMessageDetail(ds.larkAppId, messageId, { userCardContent: true });
+  const detail = await getTopicMessageDetail(ds.larkAppId, carrier.messageId, { userCardContent: true });
   const cardJson = messageCardContent(detail, ds.chatId);
   if (!cardJson) return false;
   const patched = appendTurnTerminalReceiptToCard(
     cardJson,
     kind,
     localeForBot(ds.larkAppId),
+    carrier.cardJson,
   );
   if (!patched) return false;
-  await updateMessage(ds.larkAppId, messageId, patched);
+  await updateMessage(ds.larkAppId, carrier.messageId, patched);
   return true;
 }
 
@@ -16327,6 +16334,7 @@ function setupWorkerHandlers(
           recordTurnTerminalCarrier(ds, msg.turnId, {
             messageId: msg.messageId,
             kind: msg.terminalCarrier,
+            ...(msg.terminalCarrierCard ? { cardJson: msg.terminalCarrierCard } : {}),
           });
         }
         if (ds.session.principalLane && msg.messageId) {
@@ -16827,7 +16835,7 @@ function setupWorkerHandlers(
                     try {
                       if (await patchTurnTerminalCarrier(
                         ds,
-                        carrier.messageId,
+                        carrier,
                         terminalReceiptKind,
                       )) return;
                       // A marker can outlive a manually replaced/non-card
@@ -18880,8 +18888,10 @@ function deliverFinalOutput(
               frozenReplyTarget ? { uuid, beforeWrite, replyTarget: frozenReplyTarget } : { uuid, beforeWrite }),
             { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
           : undefined;
+      const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
+      let terminalCarrierCard = explicit?.finalCard ?? cardJson;
       const sendFinal = (content: string) => scopedReply(
-        content,
+        (terminalCarrierCard = content),
         canonicalOutput.msgType,
         msg.replyTurnId ?? msg.turnId,
         frozenReplyTarget && !managedReceiver
@@ -18898,10 +18908,10 @@ function deliverFinalOutput(
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
           kind: 'standard_reply_card',
+          cardJson: terminalCarrierCard,
         });
       }
       recordPrimaryOutput(messageId);
-      const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
       if (!managedReceiver) {
         recordOncallGroupDelivery(config.session.dataDir, {
           appId: ds.larkAppId, chatId: ds.chatId, messageId,

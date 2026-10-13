@@ -89,7 +89,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
-import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
+import { appendTurnTerminalReceiptToCard, buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
 import { getMessageDetail, updateMessage } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -218,6 +218,120 @@ describe('independent turn terminal receipt', () => {
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
+  it('passes the captured standard reply card into the terminal patcher', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_card_source');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    const originalCard = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: '配置 `example.json`:\n```diff\n+ok\n```\n\n**outside**' }] },
+    });
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_card_source',
+      messageId: 'om_answer_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+      terminalCarrierCard: originalCard,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_card_source'));
+
+    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith(
+      'app_test',
+      'om_answer_card',
+      expect.stringContaining('"terminal":"completed"'),
+    ));
+    expect(getMessageDetail).toHaveBeenCalledWith(
+      'app_test',
+      'om_answer_card',
+      { userCardContent: true },
+    );
+    expect(appendTurnTerminalReceiptToCard).toHaveBeenCalledWith(
+      expect.any(String),
+      'completed',
+      expect.anything(),
+      originalCard,
+    );
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps an existing card snapshot when a later carrier update has no card JSON', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_card_overwrite');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    const originalCard = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'authoritative answer' }] },
+    });
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_card_overwrite',
+      messageId: 'om_answer_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+      terminalCarrierCard: originalCard,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_card_overwrite',
+      messageId: 'om_answer_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_card_overwrite'));
+
+    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledTimes(1));
+    expect(appendTurnTerminalReceiptToCard).toHaveBeenCalledWith(
+      expect.any(String),
+      'completed',
+      expect.anything(),
+      originalCard,
+    );
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('does not inherit a card snapshot across different carrier messages', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_card_cross_message');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    const firstCard = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'progress card content' }] },
+    });
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_card_cross_message',
+      messageId: 'om_progress_card',
+      responseKind: 'progress',
+      terminalCarrier: 'standard_reply_card',
+      terminalCarrierCard: firstCard,
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_card_cross_message',
+      messageId: 'om_final_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_card_cross_message'));
+
+    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledTimes(1));
+    expect(appendTurnTerminalReceiptToCard).toHaveBeenCalledWith(
+      expect.any(String),
+      'completed',
+      expect.anything(),
+      undefined,
+    );
+    expect(updateMessage).toHaveBeenCalledWith(
+      'app_test',
+      'om_final_card',
+      expect.any(String),
+    );
+  });
+
   it('treats a suppression sentinel as completed when an explicit body was sent', async () => {
     const ds = makeDs();
     bindLarkTurn(ds, 'om_turn_explicit_then_sentinel');
@@ -229,6 +343,7 @@ describe('independent turn terminal receipt', () => {
       messageId: 'om_answer_card',
       responseKind: 'final',
       terminalCarrier: 'standard_reply_card',
+      terminalCarrierCard: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }] } }),
     } satisfies WorkerToDaemon);
     (ds.worker as any).emit('message', terminalMsg('om_turn_explicit_then_sentinel', {
       outputDisposition: 'nothing_to_send',

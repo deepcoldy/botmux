@@ -5744,6 +5744,7 @@ function notifyExplicitRepliesObserved(
       ...(marker.messageId ? { messageId: marker.messageId } : {}),
       ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
       ...(marker.terminalCarrier ? { terminalCarrier: marker.terminalCarrier } : {}),
+      ...(marker.terminalCarrierCard ? { terminalCarrierCard: marker.terminalCarrierCard } : {}),
     });
   }
 }

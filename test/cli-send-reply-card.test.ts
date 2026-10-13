@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -201,18 +201,26 @@ describe('real CLI send into a running reply card', () => {
         expect(store.read(key)?.lastCard).not.toContain('本轮没有提供最终答复');
         expect(store.read(key)?.lastCard?.includes('oncall_group_create')).toBe(oncall);
         const markers = readFileSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8');
-        expect(JSON.parse(markers.trim())).toMatchObject({
+        const marker = JSON.parse(markers.trim());
+        expect(marker).toMatchObject({
           messageId: 'om_original_card',
           replyCardResponseKind: 'final',
           terminalCarrier: 'standard_reply_card',
         });
+        expect(marker.terminalCarrierCard).toContain('Hello! 这是完整答复。');
+        expect(statSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`)).mode & 0o777).toBe(0o600);
       } else {
         expect(requests[0].method).toBe('POST');
         expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
         expect(store.read(key)?.finalDelivered).not.toBe(true);
         const markers = readFileSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8');
         expect(JSON.parse(markers.trim())).not.toHaveProperty('replyCardResponseKind');
-        expect(JSON.parse(markers.trim())).toMatchObject({ terminalCarrier: 'standard_reply_card' });
+        const marker = JSON.parse(markers.trim());
+        expect(marker).toMatchObject({ terminalCarrier: 'standard_reply_card' });
+        if (responseKind === 'final') {
+          expect(marker.terminalCarrierCard).toContain('Hello! 这是完整答复。');
+        }
+        expect(statSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`)).mode & 0o777).toBe(0o600);
         if (!reserveCard) expect(store.read(key)).toBeUndefined();
       }
     } finally {

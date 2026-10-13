@@ -69,6 +69,114 @@ describe('appendTurnTerminalReceiptToCard', () => {
     );
   });
 
+  it('uses readback for mutable controls while restoring authored markdown from the sent card', () => {
+    const readback = JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      body: { direction: 'vertical', elements: [
+        { tag: 'markdown', content: '配置 `example.json`:```diff\n+ok\n```\n**outside swallowed**' },
+        {
+          tag: 'column_set',
+          element_id: 'botmux_feedback',
+          columns: [{ tag: 'column', elements: [{ tag: 'markdown', content: 'feedback already clicked' }] }],
+        },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const sent = JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      body: { direction: 'vertical', elements: [
+        { tag: 'markdown', content: '配置 `example.json`:\n```diff\n+ok\n```\n\n**outside**' },
+        {
+          tag: 'column_set',
+          element_id: 'botmux_feedback',
+          columns: [{ tag: 'column', elements: [{ tag: 'markdown', content: 'old feedback' }] }],
+        },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const patched = JSON.parse(appendTurnTerminalReceiptToCard(readback, 'completed', 'zh', sent)!);
+    expect(patched.body.elements[0].content).toBe('配置 `example.json`:\n```diff\n+ok\n```\n\n**outside**');
+    expect(patched.body.elements[1].columns[0].elements[0].content).toBe('feedback already clicked');
+    expect(patched.body.elements[2].content).toBe(
+      "[botmux](url) · <font color='grey'>✓ 本轮已结束 · 等待输入</font>",
+    );
+  });
+
+  it('does not restore daemon-owned runtime chrome markdown', () => {
+    const readback = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', element_id: 'botmux_turn_status', content: '✅ **已完成 · 2.0s**' },
+        { tag: 'markdown', content: '配置 `example.json`:```diff\n+ok\n```\n**outside swallowed**' },
+        { tag: 'markdown', element_id: 'botmux_feedback_status', content: '已选择：**有用**' },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const sent = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', element_id: 'botmux_turn_status', content: '💭 **处理中 · 0.4s**' },
+        { tag: 'markdown', content: '配置 `example.json`:\n```diff\n+ok\n```\n\n**outside**' },
+        { tag: 'markdown', element_id: 'botmux_feedback_status', content: '请选择反馈' },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const patched = JSON.parse(appendTurnTerminalReceiptToCard(readback, 'completed', 'zh', sent)!);
+    expect(patched.body.elements[0].content).toBe('✅ **已完成 · 2.0s**');
+    expect(patched.body.elements[1].content).toBe('配置 `example.json`:\n```diff\n+ok\n```\n\n**outside**');
+    expect(patched.body.elements[2].content).toBe('已选择：**有用**');
+  });
+
+  it('keeps readback unchanged when authored markdown structure drifts', () => {
+    const readback = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', element_id: 'botmux_turn_status', content: '✅ **已完成**' },
+        { tag: 'markdown', content: 'final answer from readback' },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const sent = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', element_id: 'botmux_turn_status', content: '💭 **处理中**' },
+        { tag: 'markdown', content: 'old tool narration' },
+        { tag: 'markdown', content: 'final answer from sent card' },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const patched = JSON.parse(appendTurnTerminalReceiptToCard(readback, 'completed', 'zh', sent)!);
+    expect(patched.body.elements[1].content).toBe('final answer from readback');
+    expect(JSON.stringify(patched)).not.toContain('old tool narration');
+  });
+
+  it('keeps readback unchanged when authored markdown paths drift with the same count', () => {
+    const readback = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', element_id: 'botmux_turn_status', content: '✅ **已完成**' },
+        { tag: 'markdown', content: 'final answer from readback' },
+        { tag: 'markdown', content: 'tail note from readback' },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const sent = JSON.stringify({
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', element_id: 'botmux_turn_status', content: '💭 **处理中**' },
+        { tag: 'column_set', columns: [{ tag: 'column', elements: [{ tag: 'markdown', content: 'old nested tool text' }] }] },
+        { tag: 'markdown', content: 'final answer from sent card' },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: '[botmux](url)' },
+      ] },
+    });
+    const patched = JSON.parse(appendTurnTerminalReceiptToCard(readback, 'completed', 'zh', sent)!);
+    expect(patched.body.elements[1].content).toBe('final answer from readback');
+    expect(patched.body.elements[2].content).toBe('tail note from readback');
+    expect(JSON.stringify(patched)).not.toContain('old nested tool text');
+  });
+
   it('finds a footer nested in the voice-control row', () => {
     const input = JSON.stringify({
       schema: '2.0',
