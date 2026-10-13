@@ -205,6 +205,28 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     expect(order).not.toContain('7501');
   }, 30_000);
 
+  it.skipIf(!hasTmux)('is byte-transparent: the pane does not re-translate output the inner PTY already processed', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-osc7501-'));
+    const done = join(dir, 'done');
+    const pipeLog = join(dir, 'pipe.log');
+    // The app disables its own output processing and moves the cursor with a
+    // bare LF; libuv raw mode alone would turn that into CRLF and \r\n into \r\r\n.
+    const script = `sleep 0.5; stty -opost; printf 'A\\nB\\r\\nC'; sleep 0.3; : > '${done}'`;
+    const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
+    const plan = join(planDir, 'plan.json');
+    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', script] }));
+    const { command, prefixArgs } = tsRunnerPrefix();
+    const created = tmux('new-session', '-d', '-s', 'b', '-x', '80', '-y', '24', '-c', REPO_ROOT, '--',
+      command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan);
+    expect(created.status, created.stderr).toBe(0);
+    tmux('pipe-pane', '-O', '-t', 'b', `cat >> '${pipeLog}'`);
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(done) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+    await new Promise(r => setTimeout(r, 200));
+    const piped = readFileSync(pipeLog, 'latin1');
+    expect(piped.slice(piped.indexOf('A'), piped.indexOf('C') + 1)).toBe('A\nB\r\nC');
+  }, 30_000);
+
   it.skipIf(!hasTmux)('with the relay the 7501 answer precedes tmux\'s DA1 answer and the probe never reaches the pane', async () => {
     dir = mkdtempSync(join(tmpdir(), 'botmux-osc7501-'));
     const fake = join(dir, 'fake.cjs');

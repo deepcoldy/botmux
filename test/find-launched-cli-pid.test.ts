@@ -62,6 +62,9 @@ function runWorkerWiring(late: boolean, options: {
   comm?: string;
   /** argv of the pane pid (100); defaults to a plain launcher. */
   paneCmdline?: string[];
+  /** This spawn wrapped the CLI in the OSC 7501 relay / backend reused an existing pane. */
+  relayLaunched?: boolean;
+  reattached?: boolean;
   cliRuntime?: { source: string; executable: string };
 } = {}) {
   const scheduler = makeScheduler();
@@ -93,6 +96,8 @@ function runWorkerWiring(late: boolean, options: {
     findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
     readCmdline: (pid: number) => (pid === 100 ? (options.paneCmdline ?? ['launcher']) : []),
     isProgramStatusRelayArgv,
+    programStatusRelayLaunched: options.relayLaunched ?? false,
+    actuallyReattachedPersistent: options.reattached ?? false,
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
@@ -125,6 +130,25 @@ describe('worker wrapper PID wiring', () => {
     expect(result.backend.cliPid).toBe(200);
     expect(result.bridgeCliPid).toBe(200);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('resolves Claude behind a fresh relay while the pane is still the launch shell (late PID=%s)', late => {
+    // Right after spawn the pane pid may not have exec'd into the relay yet.
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', relayLaunched: true,
+      paneCmdline: ['/bin/sh', '-c', 'cd -- "$1" && shift && exec /usr/bin/env "$@"'],
+    });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'claude-code');
+    expect(result.backend.cliPid).toBe(200);
+  });
+
+  it.each([false, true])('does not assume a relay when the backend reused a pre-existing non-relay pane (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', relayLaunched: true, reattached: true,
+      paneCmdline: ['/root/.local/bin/claude'],
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(100);
   });
 
   it.each([false, true])('resolves Claude behind the relay even under sandbox (late PID=%s)', late => {

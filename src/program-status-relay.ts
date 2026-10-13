@@ -14,7 +14,7 @@
  * Fail-open: if the inner PTY cannot be created the CLI runs directly on the
  * pane terminal (handshake lost, session intact).
  */
-import { spawn as spawnChild } from 'node:child_process';
+import { spawn as spawnChild, spawnSync } from 'node:child_process';
 import { consumeProgramStatusRelayPlan } from './core/program-status-relay-launch.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import { PROGRAM_STATUS_PROBE_REPLY, ProgramStatusProbeRelay } from './utils/program-status-probe-relay.js';
@@ -107,7 +107,17 @@ function relayThrough(term: pty.IPty): void {
     exitWithChildStatus(exitCode, signal);
   });
 
-  if (stdin.isTTY) stdin.setRawMode(true);
+  if (stdin.isTTY) {
+    stdin.setRawMode(true);
+    // libuv's raw mode deliberately keeps OPOST|ONLCR, so bytes the inner PTY
+    // already processed would be rewritten again on the way out (`\r\n` →
+    // `\r\r\n`, and an app's bare-LF cursor moves turned into CRLF). The pane
+    // must be a byte-transparent transport: full `stty raw` on it.
+    const stty = spawnSync('stty', ['raw', '-echo'], { stdio: ['inherit', 'ignore', 'pipe'] });
+    if (stty.status !== 0) {
+      process.stderr.write(`[botmux] program-status relay: stty raw failed (${stty.error?.message ?? stty.stderr?.toString().trim()}); output may be double-translated\n`);
+    }
+  }
   stdin.on('data', (data: Buffer) => term.write(data));
   stdin.on('error', () => { /* pane gone; SIGHUP handles teardown */ });
   stdout.on('error', () => { /* pane gone; SIGHUP handles teardown */ });

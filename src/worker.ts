@@ -19172,6 +19172,7 @@ async function spawnCli(
   // the candidate and proves the new key. The worker trusts cryptographic
   // proof, not a backend's prediction flag.
   let programStatusRelayPlanCleanup: (() => void) | undefined;
+  let programStatusRelayLaunched = false;
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
@@ -19193,6 +19194,7 @@ async function spawnCli(
         spawnBin = relayed.bin;
         spawnArgs = relayed.args;
         programStatusRelayPlanCleanup = relayed.cleanup;
+        programStatusRelayLaunched = true;
         log('[program-status] launching CLI behind in-pane OSC 7501 relay');
       } else {
         log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
@@ -19443,9 +19445,12 @@ async function spawnCli(
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
   const startWrapperRealPidResolve = (launcherPid: number): void => {
     // The OSC 7501 relay is the same launcher shape (pane pid = relay, CLI is a
-    // descendant). Detected from the live cmdline rather than this spawn's
-    // decision so a daemon-restart reattach to a relayed pane is covered too.
-    const viaRelay = isProgramStatusRelayArgv(readCmdline(launcherPid));
+    // descendant). A fresh relayed launch is known from this spawn's decision —
+    // the pane may still be the launch shell that has not exec'd the relay yet,
+    // so its cmdline cannot be trusted at this instant. A daemon-restart
+    // reattach to an already-relayed pane is recognised from its cmdline.
+    const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
+      || isProgramStatusRelayArgv(readCmdline(launcherPid));
     const viaWrapper = !!cfg.wrapperCli?.trim() && !sandboxRequested;
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
     if ((!viaWrapper && !viaRelay) || (!claudeDataDir && cfg.cliId !== 'codex')) return;
