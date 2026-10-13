@@ -91,6 +91,9 @@ describe('parsePerBotEnvText', () => {
   it('keeps dotenv `KEY = value` compatibility instead of silently skipping it', () => {
     expect(parsePerBotEnvText('TOKEN = secret\nA =1\nMODEL=x')).toMatchObject({ ok: true, env: { TOKEN: 'secret', A: '1', MODEL: 'x' }, ignoredLines: [] });
     expect(parsePerBotEnvText('TOKEN = a b')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+    expect(parsePerBotEnvText('MODEL=x\nTOKEN = a b c')).toEqual({ ok: false, reason: 'invalid_env_line', line: 2 });
+    expect(parsePerBotEnvText('TOKEN ="" secret')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+    expect(parsePerBotEnvText('TOKEN =""\nEMPTY =')).toMatchObject({ ok: true, env: { TOKEN: '', EMPTY: '' } });
   });
 
   it('accepts quoted NAME=value arguments of an env launcher', () => {

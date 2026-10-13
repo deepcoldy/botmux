@@ -203,11 +203,13 @@ export function parsePerBotEnvText(text: string): PerBotEnvTextParse {
     if (words.length === 0) continue;
     // dotenv-style `KEY = value` / `KEY =value` (spaces around `=`): one
     // assignment, exactly one value word — never silently skipped.
-    if (words.length >= 2 && words.length <= 3 && !words[0].quoted && ENV_KEY_RE.test(words[0].text)
+    if (words.length >= 2 && !words[0].quoted && ENV_KEY_RE.test(words[0].text)
         && !words[1].nameQuoted && words[1].text.startsWith('=')) {
-      const rest = words[1].text.slice(1);
-      if (rest && words.length === 3) return { ok: false, reason: 'invalid_env_line', line };
-      env[words[0].text] = rest || (words[2]?.text ?? '');
+      // A bare unquoted `=` word takes the next word as the value; `=v` / `=""`
+      // already carries it. Anything beyond that is an error, not a skip.
+      const bareEquals = words[1].text === '=' && !words[1].quoted;
+      if (words.length > (bareEquals ? 3 : 2)) return { ok: false, reason: 'invalid_env_line', line };
+      env[words[0].text] = bareEquals ? (words[2]?.text ?? '') : words[1].text.slice(1);
       continue;
     }
     let i = 0;
