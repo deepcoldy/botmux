@@ -8,10 +8,10 @@ cd botmux
 bun install --frozen-lockfile
 bun run build
 
-# Run directly (no PM2)
+# Run directly (foreground)
 bun run daemon
 
-# Or with PM2
+# Or under the built-in supervisor
 bun run daemon:start
 bun run daemon:logs
 ```

@@ -7,7 +7,6 @@ const paths = {
   botmuxHome: '/home/.botmux',
   dataDir: '/home/.botmux/data',
   logsDir: '/home/.botmux/logs',
-  pm2Home: '/home/.botmux/pm2',
 };
 
 describe('desktop external CLI runtime discovery', () => {

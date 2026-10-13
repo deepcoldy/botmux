@@ -1,6 +1,6 @@
 # Core-only (apiOnly) API Control
 
-> Embed botmux as a **controlled HTTP service** inside your own system: one process, a fixed port, bound to `127.0.0.1`, with **no Feishu credentials / bots.json / pm2 / dashboard**. Your orchestrator (task runner, CI, backend, sandbox) drives it over HTTP to run a CLI (codex / claude-code / …), poll results, and get a writable web terminal on demand.
+> Embed botmux as a **controlled HTTP service** inside your own system: one process, a fixed port, bound to `127.0.0.1`, with **no Feishu credentials / bots.json / supervisor / dashboard**. Your orchestrator (task runner, CI, backend, sandbox) drives it over HTTP to run a CLI (codex / claude-code / …), poll results, and get a writable web terminal on demand.
 
 This doc is for integrators **embedding botmux into their own product** (e.g. an in-sandbox botmux running codex). If you just want an external system to trigger a **normal bot already running in a Feishu group**, see [Triggering Tasks via API](/en/api-task-trigger) — that covers the trigger/poll/cancel four-state contract. The two are complementary: **the same trigger/poll contract applies under core-only**; this doc only covers the core-only-specific startup, auth, route boundary, writable terminal, and security model.
 
@@ -10,7 +10,7 @@ This doc is for integrators **embedding botmux into their own product** (e.g. an
 
 | | `botmux start` (fleet) | `botmux serve --api-only` (core-only) |
 |---|---|---|
-| Process model | pm2 + dashboard + one daemon per bot | **single process**, foreground; process lifetime = service lifetime |
+| Process model | built-in supervisor + dashboard + one daemon per bot | **single process**, foreground; process lifetime = service lifetime |
 | Feishu creds | requires `larkAppSecret`, fails without | **none needed**; never constructs a Feishu Client |
 | Bot identity/config source | `~/.botmux/bots.json` / `BOTS_CONFIG` | **ignores bots.json and `BOTS_CONFIG`**; synthesizes exactly one apiOnly bot (still reads the global `~/.botmux/.env` and global config) |
 | Outbound | replies posted to a Feishu topic | **no Feishu transport**; results retrieved over HTTP only |
