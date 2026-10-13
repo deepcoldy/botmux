@@ -67,6 +67,7 @@ beforeEach(() => {
   __setLarkCliRunnerForTest(null);
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   __setLarkCliHomeRootForTest(null);
   __setMachineHomeForTest(null);
   __setLarkCliRunnerForTest(null);
@@ -291,8 +292,9 @@ describe('begin / complete device flow', () => {
     expect(pendingLarkCliChallenge(OPEN)).toBeNull();
   });
 
-  it.each(['[lark-cli-auth] timed out', 'connect ETIMEDOUT', 'upstream HTTP 503'])(
+  it.each(['[lark-cli-auth] timed out', 'connect ETIMEDOUT', 'upstream HTTP 503', ''])(
     'retains the same link after %s and completes a later approval', async (error) => {
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
       seedMachine();
       const runner = vi.fn(async () => ({
         ok: true, stdout: JSON.stringify({ verification_url: 'https://v/stable', device_code: 'dc-stable' }), stderr: '',
@@ -300,7 +302,7 @@ describe('begin / complete device flow', () => {
       __setLarkCliRunnerForTest(runner);
       await beginLarkCliLogin(OPEN);
       __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: error }));
-      expect(await completeLarkCliLogin(OPEN)).toEqual({ state: 'failed', detail: error });
+      expect(await completeLarkCliLogin(OPEN)).toEqual({ state: 'failed', detail: error || undefined });
       expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-stable');
       __setLarkCliRunnerForTest(runner);
       expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/stable');
@@ -309,6 +311,7 @@ describe('begin / complete device flow', () => {
         simulateUserToken();
         return { ok: true, stdout: '{}', stderr: '' };
       });
+      clock.mockReturnValue(1_800_000_060_000);
       expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
       expect(pendingLarkCliChallenge(OPEN)).toBeNull();
       expect(larkCliHomeForTurn(OPEN_B)).toBeNull();
@@ -329,6 +332,31 @@ describe('begin / complete device flow', () => {
     expect(pendingLarkCliChallenge(OPEN)).toBeNull();
   });
 
+  it.each([
+    ['unknown', 'Authorization denied by user', 'failed', true],
+    ['unknown', 'access_denied', 'failed', true],
+    ['unknown', 'authorization_declined', 'failed', true],
+    ['unknown', 'The device_code has expired', 'failed', true],
+    ['unknown', 'expired_token', 'failed', true],
+    ['unknown', 'An unrecognized upstream error', 'failed', false],
+    ['unknown', 'network request expired', 'failed', false],
+    ['unknown', 'authorization_pending', 'pending', false],
+    ['unknown', 'Authorization not yet completed', 'pending', false],
+    ['unknown', 'waiting for approval', 'pending', false],
+  ] as const)('classifies stderr %s / %s without guessing from unknown subtype', async (subtype, message, state, cleared) => {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-envelope' }), stderr: '',
+    }));
+    await beginLarkCliLogin(OPEN);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: false, stdout: '', stderr: JSON.stringify({ ok: false, error: { type: 'authentication', subtype, message } }),
+    }));
+    expect((await completeLarkCliLogin(OPEN)).state).toBe(state);
+    expect(pendingLarkCliChallenge(OPEN) === null).toBe(cleared);
+    expect(hasLarkCliHome(OPEN)).toBe(false);
+  });
+
   it('fails without an in-progress challenge', async () => {
     seedMachine();
     const r = await completeLarkCliLogin(OPEN);
@@ -338,6 +366,90 @@ describe('begin / complete device flow', () => {
 });
 
 describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
+  async function startChallenge(openId = OPEN) {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'https://v/stable', device_code: 'dc-' + openId }), stderr: '',
+    }));
+    await beginLarkCliLogin(openId);
+  }
+
+  it('skips automatic polls for 60 seconds after failure without extending the challenge TTL', async () => {
+    const started = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    await startChallenge();
+    const runner = vi.fn(async () => ({ ok: false, stdout: '', stderr: '[lark-cli-auth] timed out' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    const saved = JSON.parse(readFileSync(join(larkCliHomeFor(OPEN), '.botmux-login-challenge'), 'utf8'));
+    expect(saved).toMatchObject({ createdAt: started, autoPollAfter: started + 60_000 });
+    clock.mockReturnValue(started + 59_999);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/stable');
+    expect(runner).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(started + 60_000);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(pendingLarkCliChallenge(OPEN)?.createdAt).toBe(started);
+    clock.mockReturnValue(started + 9 * 60_000 + 1);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows explicit login completion during cooldown and clears the challenge on success', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    await startChallenge();
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    await resolveLarkCliHomeForTurn(OPEN);
+    const runner = vi.fn(async () => {
+      simulateUserToken();
+      return { ok: true, stdout: '{}', stderr: '' };
+    });
+    __setLarkCliRunnerForTest(runner);
+    expect((await completeLarkCliLogin(OPEN)).state).toBe('authorized');
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not apply one person’s cooldown to another person', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    await startChallenge(OPEN);
+    await startChallenge(OPEN_B);
+    const runner = vi.fn(async (_args: string[], _home: string) => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(await resolveLarkCliHomeForTurn(OPEN_B)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(runner.mock.calls.map(call => call[1])).toEqual([larkCliHomeFor(OPEN), larkCliHomeFor(OPEN_B)]);
+  });
+
+  it('does not put a replacement challenge into cooldown for a stale poll', async () => {
+    await startChallenge();
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    expect((await completeLarkCliLogin(OPEN, 'older-device-code')).state).toBe('failed');
+    expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-' + OPEN);
+    expect(pendingLarkCliChallenge(OPEN)?.autoPollAfter).toBeUndefined();
+  });
+
+  it('does not delay a normal pending approval or an already available user token', async () => {
+    await startChallenge();
+    const runner = vi.fn(async () => ({ ok: false, stdout: '', stderr: 'authorization_pending' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(pendingLarkCliChallenge(OPEN)?.autoPollAfter).toBeUndefined();
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(runner).toHaveBeenCalledTimes(2);
+    __setLarkCliRunnerForTest(async () => ({ ok: false, stdout: '', stderr: 'connect ETIMEDOUT' }));
+    await resolveLarkCliHomeForTurn(OPEN);
+    simulateUserToken();
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
   it('returns an existing HOME without polling anything', async () => {
     seedMachine();
     simulateUserToken();

@@ -1017,7 +1017,7 @@ export const messages: Record<string, string> = {
   'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify 或 ByteCloud/cloud.bytedance 链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
   // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑普通授权，
   // 那只会拿到同样的权限再失败一次。补授权按已确定的任务步骤汇总，不逐个报错逐次申请。
-  'ai.credentials.on_missing_scope': '如果报 missing_scope（99991679），这是按需补权限，不要重跑普通 /login。先依据当前任务已确定的操作步骤和工具文档核对所需权限，再由 Agent 运行一次 `botmux auth request --scope "<本任务所需的多个权限，以空格分隔>" --json`，用 `botmux send` 发回 authUrl。例如任务需要读取多维表格字段并查询记录时，一次请求 `base:field:read base:record:read`；只读字段则不要附加记录权限。不要只申请首个报错的权限、等下一步失败再发新链接；不要申请当前任务之外或未经核实的权限。飞书错误若列出满足同一操作的候选权限，选择其中一个即可，例如 im:chat、im:chat:readonly、im:chat:read 选择 im:chat:read。说明本次补授权的用途和权限，再运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 后以本轮用户身份重试原操作；仍失败时按实际错误处理，不循环发授权链接。',
+  'ai.credentials.on_missing_scope': '遇到 missing_scope 时不要重跑普通 /login。依据当前任务已确定的操作和工具文档，一次合并所需权限；同一操作的候选权限只选一个，不逐项发链接，不申请无关或未经核实的权限。运行 `botmux auth request --scope "<所需权限>" --json`，说明用途并用 `botmux send` 发送 authUrl；再运行 `botmux auth wait --request-id <requestId> --json`，仅在 ready 后以本轮用户身份重试。仍失败时按实际错误处理，不循环登录。示例见 docs/guide/lark-device-authorization.md。',
   'ai.identity.routing_intro': '群里可能有多个 bot，按 @名字 和 open_id 区分归属：',
   'ai.identity.rule_own_part': '- 只做分给自己的部分，不抢别的 bot 的活',
   'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的 bot 时保持沉默',
