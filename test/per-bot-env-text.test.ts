@@ -56,7 +56,9 @@ describe('parsePerBotEnvText', () => {
       ok: true,
       format: 'dotenv',
       env: { ANTHROPIC_BASE_URL: 'http://160.191.8.131:8080', ANTHROPIC_MODEL: 'claude-opus-5-5' },
-      ignoredLines: [2, 3, 6],
+      // The continued `exec env … claude "$@"` is one logical line with
+      // assignments; only `set -euo pipefail` is reported as skipped.
+      ignoredLines: [2],
     });
   });
 
@@ -64,6 +66,30 @@ describe('parsePerBotEnvText', () => {
     expect(parsePerBotEnvText('A=1\nB="oops')).toEqual({ ok: false, reason: 'invalid_env_line', line: 2 });
     expect(parsePerBotEnvText("A='x' junk")).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
     expect(parsePerBotEnvText('hello world')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+  });
+
+  it('keeps the backslash of unknown escapes inside double quotes', () => {
+    expect(parsePerBotEnvText('REGEX="^\\d+$"\nWIN="C:\\Users\\x"\nQ="a\\"b\\\\c\\$d"'))
+      .toMatchObject({ ok: true, env: { REGEX: '^\\d+$', WIN: 'C:\\Users\\x', Q: 'a"b\\c$d' } });
+  });
+
+  it('joins backslash continuations like the shell and rejects a dangling one', () => {
+    expect(parsePerBotEnvText('TOKEN=abc\\\ndef')).toMatchObject({ ok: true, env: { TOKEN: 'abcdef' } });
+    expect(parsePerBotEnvText('TOKEN=abc \\')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+  });
+
+  it('splits words with shell quoting instead of swallowing them into one value', () => {
+    expect(parsePerBotEnvText('A=1 B=2')).toMatchObject({ ok: true, env: { A: '1', B: '2' } });
+    // A reserved assignment after a normal one is still seen (and later rejected).
+    expect(parsePerBotEnvText('A=1 CLAUDE_CONFIG_DIR=/x')).toMatchObject({ ok: true, env: { A: '1', CLAUDE_CONFIG_DIR: '/x' } });
+    expect(parsePerBotEnvText('TOKEN=abc; exec claude')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+    expect(parsePerBotEnvText('TOKEN=abc"def')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+    expect(parsePerBotEnvText('TOKEN=abc def')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+    expect(parsePerBotEnvText('"A=1"')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('treats a comment after an empty assignment as a comment', () => {
+    expect(parsePerBotEnvText('TOKEN= # comment\nHASH=a#b')).toMatchObject({ ok: true, env: { TOKEN: '', HASH: 'a#b' } });
   });
 });
 

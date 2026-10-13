@@ -556,6 +556,24 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.env).toBeUndefined();
   });
 
+  it('merges dashboard env saves inside the file lock so concurrent merge/remove keep both changes', async () => {
+    const { registry, store } = await loaded({ env: { A: '1' } });
+    // Both requests start from the same stale snapshot {A}; computing the merge
+    // outside the lock would let the remove drop B (or the add resurrect A).
+    const [r1, r2] = await Promise.all([
+      store.applyPerBotEnvChange('app_default', { incoming: {}, mode: 'merge', remove: ['A'] }),
+      store.applyPerBotEnvChange('app_default', { incoming: { B: '2' }, mode: 'merge' }),
+    ]);
+    expect(r1.ok && r2.ok).toBe(true);
+    expect(readConfig().env).toEqual({ B: '2' });
+    expect(registry.getBot('app_default').config.env).toEqual({ B: '2' });
+
+    const r3 = await store.applyPerBotEnvChange('app_default', { incoming: {}, mode: 'replace' });
+    expect(r3).toEqual({ ok: true, envKeys: [] });
+    expect(readConfig().env).toBeUndefined();
+    expect(registry.getBot('app_default').config.env).toBeUndefined();
+  });
+
   it('rejects reserved env keys (BOTMUX_*/GROK_HOME/CODEX_HOME) instead of silent drop', async () => {
     const { store } = await loaded();
     const spec = store.findConfigField('env')!;

@@ -29,7 +29,7 @@ import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
-import { isReservedPerBotEnvKey, parsePerBotEnvText, sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { isReservedPerBotEnvKey, nextPerBotEnv, parsePerBotEnvText, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
@@ -279,6 +279,35 @@ export type ApplyFieldResult =
 let displayNameRefresher: (() => void) | null = null;
 export function setDisplayNameRefresher(fn: (() => void) | null): void {
   displayNameRefresher = fn;
+}
+
+/**
+ * Dashboard env save. Unlike {@link applyConfigField}, the merged map is
+ * computed INSIDE the bots.json file lock from the on-disk `env`, so two
+ * concurrent merge/remove saves can't lose each other's keys (computing from
+ * an in-memory snapshot first would let the later write resurrect a removed
+ * key or drop a concurrently added one). `incoming` must already be
+ * sanitized (coerceConfigValue). Returns the persisted key names.
+ */
+export async function applyPerBotEnvChange(
+  larkAppId: string,
+  change: { incoming: Record<string, string>; mode: 'replace' | 'merge'; remove?: readonly string[] },
+): Promise<{ ok: true; envKeys: string[] } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<Record<string, string> | null>(larkAppId, (entry) => {
+    const prev = sanitizePerBotEnv(entry.env);
+    const next = nextPerBotEnv({ prev, ...change });
+    if (next) entry.env = next;
+    else delete entry.env;
+    return { write: true, result: next };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  const spec = findConfigField('env')!;
+  const oldText = formatFieldValue(spec, bot.config.env, bot.config);
+  bot.config.env = r.result ?? undefined;
+  logger.info(`[config:${larkAppId}] set env (${change.mode}): ${oldText} -> ${formatFieldValue(spec, bot.config.env, bot.config)}`);
+  return { ok: true, envKeys: r.result ? Object.keys(r.result).sort() : [] };
 }
 
 /**

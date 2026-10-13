@@ -135,8 +135,7 @@ import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
-import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult } from '../services/bot-config-store.js';
-import { nextPerBotEnv } from './per-bot-env.js';
+import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
@@ -8463,15 +8462,14 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
     if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
     incoming = coerced.value as Record<string, string>;
   }
-  let prev: Record<string, string> | undefined;
-  if (merge) {
-    try { prev = getBot(cachedLarkAppId).config.env; }
-    catch { /* 未注册 bot → applyConfigField 会给出 bot_not_registered */ }
-  }
-  const value = nextPerBotEnv({ prev, incoming, mode: merge ? 'merge' : 'replace', remove: body.remove as string[] | undefined });
-  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  // 合并在 bots.json 文件锁内基于盘上最新 env 计算，并发 merge/remove 不丢更新。
+  const r = await applyPerBotEnvChange(cachedLarkAppId, {
+    incoming,
+    mode: merge ? 'merge' : 'replace',
+    remove: body.remove as string[] | undefined,
+  });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-  jsonRes(res, 200, { ok: true, env: '', envKeys: value ? Object.keys(value).sort() : [] });
+  jsonRes(res, 200, { ok: true, env: '', envKeys: r.envKeys });
 });
 
 // Codex credential policy: shared global login or an independent per-bot CODEX_HOME.

@@ -154,8 +154,8 @@ export type PerBotEnvTextParse =
     format: PerBotEnvTextFormat;
     /** Raw `KEY -> value` (last duplicate wins); NOT yet sanitized. */
     env: Record<string, unknown>;
-    /** 1-based line numbers skipped as non-assignments (shell glue such as
-     *  `exec env \` or `claude "$@"`); always empty for JSON. */
+    /** 1-based start lines of logical lines skipped as non-assignments (shell
+     *  glue such as `set -euo pipefail`); always empty for JSON. */
     ignoredLines: number[];
   }
   | { ok: false; reason: 'invalid_json' | 'invalid_env_line' | 'empty'; line?: number };
@@ -165,10 +165,15 @@ export type PerBotEnvTextParse =
  *  - a JSON object `{"KEY":"v"}`, or a Claude settings snippet `{"env":{...}}`
  *    (unwrapped only when `env` is the sole key and holds an object — env
  *    values are primitives, so this can't shadow a real variable);
- *  - dotenv / shell lines: `KEY=v`, `export KEY=v`, `KEY='v'`, `KEY="v\n"`,
- *    `# comments`, inline ` # comments` after unquoted values, and the
- *    `exec env \` + `  KEY='v' \` launcher-script shape (trailing `\` and
- *    non-assignment lines are skipped and reported via `ignoredLines`).
+ *  - dotenv / shell lines, tokenized with shell quoting rules: `KEY=v`,
+ *    `export KEY=v`, several `A=1 B=2` per line, `'literal'`, `"v\n"`, `#`
+ *    comments (only at a word start, so `HASH=a#b` stays a value), and `\`
+ *    line continuations joined like the shell does — which is what makes the
+ *    `exec env \ KEY='v' \ claude "$@"` launcher shape work: assignments after
+ *    an `exec`/`env` prefix are taken, the trailing command is dropped.
+ * Rejected rather than guessed (so nothing is silently stored wrong):
+ * unterminated quotes, a dangling final `\`, unquoted `; & | < > ( ) \``,
+ * and words after plain assignments (`TOKEN=abc def` — likely missing quotes).
  * `$VAR` references are kept literally — nothing is expanded or executed.
  * Pure + total: never throws. Name/reserved-key validation stays with
  * {@link sanitizePerBotEnv} / {@link isReservedPerBotEnvKey}.
@@ -192,37 +197,108 @@ export function parsePerBotEnvText(text: string): PerBotEnvTextParse {
 
   const env: Record<string, unknown> = {};
   const ignoredLines: number[] = [];
-  const lines = src.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i].trim();
-    if (!line || line.startsWith('#')) continue;
-    if (/(^|\s)\\$/.test(line)) line = line.slice(0, -1).trimEnd();
-    line = line.replace(/^export\s+/, '');
-    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
-    if (!m) { ignoredLines.push(i + 1); continue; }
-    const value = parseEnvValue(m[2]);
-    if (value === null) return { ok: false, reason: 'invalid_env_line', line: i + 1 };
-    env[m[1]] = value;
+  for (const logical of tokenizeShellLines(src.replace(/\r\n?/g, '\n'))) {
+    if ('error' in logical) return { ok: false, reason: 'invalid_env_line', line: logical.line };
+    const { words, line } = logical;
+    if (words.length === 0) continue;
+    let i = 0;
+    let launcher = false;
+    while (i < words.length && LAUNCHER_PREFIX_WORDS.has(words[i].text) && !words[i].quoted) {
+      if (words[i].text !== 'export') launcher = true;
+      i++;
+    }
+    const assignments: Array<[string, string]> = [];
+    for (; i < words.length; i++) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(words[i].text);
+      // The name and `=` must be unquoted shell syntax, like `A=` — not `"A=1"`.
+      if (!m || words[i].nameQuoted) break;
+      assignments.push([m[1], words[i].text.slice(m[0].length)]);
+    }
+    if (assignments.length === 0) { ignoredLines.push(line); continue; }
+    // `exec env A=1 claude "$@"` — the trailing command is expected glue.
+    // `A=1 junk` is not: most likely an unquoted value with a space.
+    if (i < words.length && !launcher) return { ok: false, reason: 'invalid_env_line', line };
+    for (const [k, v] of assignments) env[k] = v;
   }
   if (Object.keys(env).length === 0) return { ok: false, reason: 'invalid_env_line', line: ignoredLines[0] };
   return { ok: true, format: 'dotenv', env, ignoredLines };
 }
 
-/** Unquote one dotenv value; `null` = unterminated quote / trailing junk. */
-function parseEnvValue(raw: string): string | null {
-  const v = raw.trim();
-  const q = v[0];
-  if (q !== "'" && q !== '"') return v.replace(/\s+#.*$/, '');
-  let out = '';
-  for (let i = 1; i < v.length; i++) {
-    const ch = v[i];
-    if (ch === q) return /^\s*(#.*)?$/.test(v.slice(i + 1)) ? out : null;
-    if (q === '"' && ch === '\\' && i + 1 < v.length) {
-      const nx = v[++i];
-      out += nx === 'n' ? '\n' : nx === 't' ? '\t' : nx === 'r' ? '\r' : nx;
+/** Unquoted leading words allowed before assignments on one logical line. */
+const LAUNCHER_PREFIX_WORDS = new Set(['export', 'exec', 'env']);
+
+interface ShellWord {
+  text: string;
+  /** Any part of the word was quoted. */
+  quoted: boolean;
+  /** A quote/escape appeared before the first unquoted `=` (so it isn't an assignment). */
+  nameQuoted: boolean;
+}
+
+/**
+ * Split text into logical lines of shell words. Handles `'…'` (literal),
+ * `"…"` (dotenv-style `\n \t \r` plus shell `\" \\ \$ \``; any other escape
+ * keeps its backslash), unquoted `\x`, `\`-newline continuation, and `#`
+ * comments at a word start. Yields `{ error }` for constructs we refuse.
+ */
+function* tokenizeShellLines(src: string): Generator<{ words: ShellWord[]; line: number } | { error: true; line: number }> {
+  let lineNo = 1;
+  let startLine = 1;
+  let words: ShellWord[] = [];
+  let cur: ShellWord | null = null;
+  const word = () => (cur ??= { text: '', quoted: false, nameQuoted: false });
+  const markQuoted = (w: ShellWord) => {
+    w.quoted = true;
+    if (!w.text.includes('=')) w.nameQuoted = true;
+  };
+  const endWord = () => { if (cur) { words.push(cur); cur = null; } };
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '\n') {
+      endWord();
+      yield { words, line: startLine };
+      words = [];
+      lineNo++;
+      startLine = lineNo;
       continue;
     }
-    out += ch;
+    if (ch === ' ' || ch === '\t') { endWord(); continue; }
+    if (ch === '#' && !cur) {
+      while (i + 1 < src.length && src[i + 1] !== '\n') i++;
+      continue;
+    }
+    if (ch === '\\') {
+      if (i + 1 >= src.length) return yield { error: true, line: startLine };  // dangling continuation
+      if (src[i + 1] === '\n') { i++; lineNo++; continue; }  // continuation: join lines
+      const w = word();
+      markQuoted(w);
+      w.text += src[++i];
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const w = word();
+      markQuoted(w);
+      let closed = false;
+      for (i++; i < src.length; i++) {
+        const c = src[i];
+        if (c === ch) { closed = true; break; }
+        if (c === '\n') lineNo++;
+        if (ch === '"' && c === '\\' && i + 1 < src.length) {
+          const nx = src[++i];
+          if (nx === '\n') { lineNo++; continue; }
+          w.text += nx === 'n' ? '\n' : nx === 't' ? '\t' : nx === 'r' ? '\r'
+            : nx === '"' || nx === '\\' || nx === '$' || nx === '`' ? nx
+            : '\\' + nx;
+          continue;
+        }
+        w.text += c;
+      }
+      if (!closed) return yield { error: true, line: startLine };
+      continue;
+    }
+    if (';&|<>()`'.includes(ch)) return yield { error: true, line: startLine };
+    word().text += ch;
   }
-  return null;
+  endWord();
+  yield { words, line: startLine };
 }
