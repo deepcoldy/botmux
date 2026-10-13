@@ -59,8 +59,6 @@ export function buildTurnTerminalReceiptCard(
   });
 }
 
-const TURN_TERMINAL_RECEIPT_ELEMENT_ID = 'botmux_turn_terminal_receipt';
-
 function findCardElementById(value: unknown, elementId: string): any | undefined {
   if (Array.isArray(value)) {
     for (const child of value) {
@@ -104,55 +102,23 @@ function appendTurnTerminalReceiptToFooter(content: string, label: string): stri
   return `${base} · <font color='grey'>${label}</font>`;
 }
 
-/** Merge the daemon-owned terminal state into an existing standard BotMux
- * reply card. Prefer the canonical footer so the card keeps one bottom divider
- * and one compact metadata/status line. Cards without a footer receive only a
- * small trailing line, without another divider. The source card is read back
- * from Lark immediately before this patch, so late feedback/control mutations
- * are preserved. Undefined means the message is no longer a patchable Card 2.0
- * payload and the caller must use the independent-strip fallback instead. */
-export function appendTurnTerminalReceiptToCard(
+/** Build a footer-only CardKit update. Message reads may normalize Markdown;
+ * never submit their body as the source of a full-card update. */
+export function buildTurnTerminalFooterPatch(
   cardJson: string,
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
-): string | undefined {
+): { content: string } | undefined {
   let card: any;
-  try {
-    card = JSON.parse(cardJson);
-  } catch {
-    return undefined;
-  }
-  if (!card || card.schema !== '2.0' || !card.body || !Array.isArray(card.body.elements)) {
-    return undefined;
-  }
-  const label = t(`worker.turn_terminal_receipt.${kind}`, undefined, locale);
-  const terminalElement = {
-    tag: 'markdown',
-    element_id: TURN_TERMINAL_RECEIPT_ELEMENT_ID,
-    text_size: 'notation_small_v2',
-    content: `<font color='grey'>${label}</font>`,
-  };
-
-  // Migrate cards patched by the first implementation: remove its standalone
-  // terminal line and the immediately preceding divider before folding the
-  // same state into the canonical footer.
-  const existing = card.body.elements.findIndex(
-    (element: any) => element?.element_id === TURN_TERMINAL_RECEIPT_ELEMENT_ID,
-  );
-  if (existing >= 0) {
-    card.body.elements.splice(existing, 1);
-    if (existing > 0 && card.body.elements[existing - 1]?.tag === 'hr') {
-      card.body.elements.splice(existing - 1, 1);
-    }
-  }
-
+  try { card = JSON.parse(cardJson); } catch { return undefined; }
+  if (card?.schema !== '2.0' || !Array.isArray(card.body?.elements)) return undefined;
   const footer = findCardElementById(card.body.elements, REPLY_CARD_FOOTER_ELEMENT_ID);
-  if (footer && typeof footer.content === 'string' && footer.content.trim()) {
-    footer.content = appendTurnTerminalReceiptToFooter(footer.content, label);
-  } else {
-    card.body.elements.push(terminalElement);
+  if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
+    return undefined;
   }
-  return JSON.stringify(card);
+  return { content: appendTurnTerminalReceiptToFooter(
+    footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
+  ) };
 }
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
