@@ -9,7 +9,9 @@ import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
+import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
+import { TRANSIENT_LARK_CODES } from './api-gate.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
 import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
 
@@ -102,28 +104,6 @@ export function createLarkAskCardDispatcher(
   };
 }
 
-/**
- * Feishu business error codes that mean "the request is transient — retry
- * later", per the official IM v1 send/reply error table + frequency-control
- * guide (codex P1-3). These must be retryable EVEN when the HTTP status is a
- * 4xx (some legacy freq-control surfaces as HTTP 400) or a 2xx-body business
- * error — otherwise a same-uuid partial-success convergence (the second request
- * arriving while the first is still "being sent") is wrongly given up on.
- *
- *   230049  the message is being sent — official "please retry"
- *   230020  message API per-chat rate limit
- *   99991400 generic OpenAPI frequency control (modern = HTTP 429, legacy = 400)
- *
- * NOT included: 11232 / 11233 are the old V4 message API; the current im.v1
- * create/reply path never returns them, so mixing them in would only widen the
- * whitelist without cause.
- *
- * Rate-limit codes (99991400 / HTTP 429) ideally honour `x-ogw-ratelimit-reset`
- * as the retry delay — the broker's short fixed backoff can't outlast a long
- * official reset window. Plumbing that through AskDispatchError.retryAfterMs is
- * a follow-up (see PR notes); 230049/230020 converge within the short backoff.
- */
-const TRANSIENT_LARK_CODES = new Set([230049, 230020, 99991400]);
 
 /** Extract a Lark business code from either error shape:
  *  - axios path A: `response.data.code` / top-level `code` (number)
@@ -354,6 +334,7 @@ function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArme
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
   const locale = localeForBot(ask.larkAppId);
+  const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
@@ -392,21 +373,26 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     // 未 settle：只用 action/buttons，避免 form+select 被飞书服务端静默丢弃。
     elements.push({ tag: 'hr' });
 
-    const requiresSubmit = ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect);
+    const textReplyRequired = ask.questions.some(q => q.inputMode === 'text');
+    const requiresSubmit = textReplyRequired || ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect || q.defaultSelectedKeys !== undefined);
     const selections = ask.selections ?? ask.questions.map(() => []);
 
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
+
+      const prompt = textReplyRequired && q.options.length
+        ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt;
 
       // 问题标题
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(prompt, 512, locale))}`,
         },
       });
 
+      if (textReplyRequired) continue; // A batch with text inputs is answered in conversation.
       const selected = new Set(selections[i] ?? []);
       const optionButtons = q.options.map((opt) => ({
         tag: 'button',
@@ -430,10 +416,10 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
               key: opt.key,
             },
       }));
-      appendActionRows(elements, optionButtons);
+      appendActionRows(elements, optionButtons, optionLayout);
     }
 
-    if (requiresSubmit) {
+    if (requiresSubmit && !textReplyRequired) {
       elements.push({ tag: 'hr' });
       // 空提交二次确认：用户一个选项都没勾就点了提交，且至少有一问是多选（多选允许
       // 「一个都不选」，但极可能是手滑）。第一次拦下来、渲染警示 + 把 Submit 按钮的
@@ -476,7 +462,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     elements.push({
       tag: 'note',
       elements: [
-        { tag: 'plain_text', content: t('card.ask.custom_reply_hint', undefined, locale) },
+        { tag: 'plain_text', content: t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
       ],
     });
   }
@@ -682,7 +668,25 @@ function optionLabel(multiSelect: boolean, selected: boolean, label: string): st
   return `${selected ? '◉' : '○'} ${label}`;
 }
 
-function appendActionRows(elements: Array<Record<string, unknown>>, actions: Array<Record<string, unknown>>): void {
+function appendActionRows(
+  elements: Array<Record<string, unknown>>,
+  actions: Array<Record<string, unknown>>,
+  layout: AskOptionLayout,
+): void {
+  if (layout === 'vertical') {
+    // 竖放：一行一按钮。单列 column_set（flex_mode:'none' + weighted 列宽）让按钮
+    // 单列排布，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
+    // 受支持，无需迁移 schema 2.0。
+    for (const action of actions) {
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [action] }],
+      });
+    }
+    return;
+  }
   for (let i = 0; i < actions.length; i += MAX_BUTTONS_PER_ACTION_ROW) {
     elements.push({
       tag: 'action',

@@ -6,6 +6,8 @@
  * (`botmux ask buttons` subcommand) — no runtime cross-imports.
  */
 
+import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
+
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
  *  writes `--options "yes,no"`, `key === label`. With `--options "yes=继续"`,
@@ -19,12 +21,18 @@ export interface AskOption {
  *  `label` 是人类可读的标题（暂保留向后兼容），`prompt` 是问题正文，
  *  `options` 是该问题的选项列表，`multiSelect` 表示是否允许多选。 */
 export interface AskQuestion {
+  /** Native text-only questions use the existing conversation text-reply path.
+   * They have no options and cannot be settled by an empty button submit. */
+  inputMode?: 'text';
   /** 问题正文文本，展示给用户。 */
   prompt: string;
-  /** 该问题的选项列表，调用方保证 `options.length ≥ 2` 且 `key` 唯一。 */
+  /** 该问题的选项列表，调用方保证 `options.length ≥ 2（inputMode=text 时为空）` 且 `key` 唯一。 */
   options: ReadonlyArray<AskOption>;
   /** true = 多选（可选多个 key）；false = 单选（恰好 1 个 key）。 */
   multiSelect: boolean;
+  /** Optional draft selection. Presence (even []) requires a Submit button;
+   * never an answer until an authorized user explicitly submits. */
+  defaultSelectedKeys?: ReadonlyArray<string>;
 }
 
 /** Terminal result of an ask, returned to the CLI caller. Discriminated by
@@ -88,7 +96,10 @@ export interface AskJsonOutput {
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
-  replyCardTarget?: { turnId: string; dispatchAttempt?: number };
+  replyCardTarget?: { turnId: string; dispatchAttempt?: number;
+    /** Frozen by authenticated daemon admission; never accepted from CLI JSON. */
+    groupContextAuthorOrigin?: GroupContextDeliveryBinding;
+  };
   larkAppId: string;
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
@@ -113,7 +124,7 @@ export interface CreateAskInput {
    *  record that can never be re-claimed. Undefined → treated as false (fail
    *  closed: don't persist when the backend is unknown). */
   backendSurvivesRestart?: boolean;
-  /** 问题列表，调用方保证每问 `options.length ≥ 2` 且 key 唯一。 */
+  /** 问题列表，调用方保证每问 `options.length ≥ 2（inputMode=text 时为空）` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
    *  re-compute. */

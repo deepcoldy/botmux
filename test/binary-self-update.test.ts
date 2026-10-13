@@ -37,10 +37,12 @@ import {
   resolveUpdateStrategy,
 } from '../src/core/binary-install-shape.js';
 import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary } from '../src/core/binary-self-update.js';
-import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestartInvocation } from '../src/core/maintenance.js';
+import type { BinaryUpdateProgress } from '../src/core/binary-self-update.js';
+import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestartInvocation, verifyBinaryRestartTarget } from '../src/core/maintenance.js';
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
 import { withFileLock, FileLockTimeoutError } from '../src/utils/file-lock.js';
 import { botmuxVersionAt, diskVersionAt } from '../src/utils/install-info.js';
+import { fileURLToPath } from 'node:url';
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -161,13 +163,10 @@ describe('classifyBinaryInstall — where the binary lives decides who updates i
     });
   });
 
-  it('a custom-dir install without the env var at runtime fails CLOSED, not wrong', () => {
-    // The honest limitation: nothing is damaged (we never write), but self-update is
-    // unavailable for that install. Asserted so the behaviour is deliberate rather
-    // than an accident, and so the docs cannot drift into claiming full coverage.
+  it('a custom-dir install without the env var migrates through the canonical launcher', () => {
     expect(classifyBinaryInstall('/opt/bm/botmux', {}, '/home/u')).toBe('unknown');
     expect(resolveUpdateStrategy(true, '/opt/bm/botmux', '/', {}, '/home/u'))
-      .toEqual({ kind: 'unsupported', reason: 'unknown-binary-location' });
+      .toEqual({ kind: 'install-release', target: '/home/u/.botmux/bin/botmux' });
   });
 
   it('FAIL CLOSED: anything else is unknown, so no caller writes where it should not', () => {
@@ -348,9 +347,14 @@ describe('resolveUpdateStrategy', () => {
       .toBe('npm install -g --prefix C:/Users/u/AppData/Roaming/npm botmux@latest');
   });
 
-  it('an unidentifiable standalone binary stays unsupported (fail closed)', () => {
+  it('a self-deployed binary installs a release through the canonical launcher', () => {
     expect(resolveUpdateStrategy(true, '/tmp/dist-bin/botmux', '/', {}, '/home/u'))
-      .toEqual({ kind: 'unsupported', reason: 'unknown-binary-location' });
+      .toEqual({ kind: 'install-release', target: '/home/u/.botmux/bin/botmux' });
+  });
+
+  it('an exported custom install directory keeps its in-place update strategy', () => {
+    expect(resolveUpdateStrategy(true, '/opt/bm/botmux', '/', { BOTMUX_INSTALL_DIR: '/opt/bm' }, '/home/u'))
+      .toEqual({ kind: 'self-replace', target: '/opt/bm/botmux' });
   });
 });
 
@@ -524,7 +528,12 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
     expect(resolveAutoUpdateSupport({ kind: 'unsupported', reason: 'unknown-binary-location' }).supported).toBe(false);
   });
 
-  it('NO ASYMMETRY: whatever status claims supportable, rollback can resolve too', () => {
+  it('a self-deployed binary requires a manual release installation', () => {
+    const strategy = resolveUpdateStrategy(true, '/opt/custom/botmux', '/', {}, '/home/u');
+    expect(resolveAutoUpdateSupport(strategy)).toEqual({ supported: false, plan: null });
+  });
+
+  it('an npm-installed binary resolves a package-manager root for rollback', () => {
     /**
      * The bug this pins: `/api/update/status` reported `rollbackSupported: true`
      * for an npm-installed compiled binary (it resolves the MAPPED package root),
@@ -549,11 +558,9 @@ describe('auto-update support is ONE predicate for UI and save-time validation',
     // ...and the pre-fix root, to show the two really differ (the defect).
     expect(tryResolveGlobalInstallPlan('/', 'linux')).toBeNull();
 
-    // A self-replacing binary is the reverse case: update supported, rollback NOT,
-    // which is why rollbackSupported is reported separately rather than derived.
     const curl = resolveUpdateStrategy(true, '/home/u/.botmux/bin/botmux', '/', {}, '/home/u');
     expect(resolveAutoUpdateSupport(curl).supported).toBe(true);
-    expect(resolveAutoUpdateSupport(curl).plan).toBeNull(); // ⟹ rollbackSupported false
+    expect(resolveAutoUpdateSupport(curl).plan).toBeNull();
   });
 
 });
@@ -661,7 +668,7 @@ describe('concurrent updates report mutual exclusion, not lock internals', () =>
     expect(branchStart, 'the self-replace branch moved — update this guard').toBeGreaterThan(0);
     const lockAt = cli.indexOf('withFileLock', branchStart);
     expect(lockAt, 'the self-replace branch no longer takes the update lock').toBeGreaterThan(branchStart);
-    const block = cli.slice(branchStart, lockAt + 1200);
+    const block = cli.slice(branchStart, lockAt + 1800);
     // The friendly notice must be gated on BOTH halves: callback-not-entered AND a
     // genuine lock timeout. Guarding on `!acquired` alone is the over-broad version
     // that reported ENOSPC/ENOENT as "another update is running".
@@ -721,8 +728,8 @@ describe('concurrent updates report mutual exclusion, not lock internals', () =>
     // asserting against real code rather than passing on an empty search.
     expect(src).toMatch(/runStrategy\.kind === 'package-manager' \? runStrategy\.packageRoot/);
     expect(src).toMatch(/\?\?\s*rollbackStrategy\.packageRoot/);
-    // And rollback must refuse anything that is not package-manager driveable.
-    expect(src).toMatch(/rollbackStrategy\.kind !== 'package-manager'/);
+    expect(src).toMatch(/rollbackStrategy\.kind === 'package-manager'/);
+    expect(src).toMatch(/rollbackSupported: installPlan !== null \|\| selfReplace/);
   });
 });
 
@@ -815,11 +822,87 @@ describe('resolveRestartInvocation — target and calling convention must agree'
     expect(resolveRestartInvocation(true, '/opt/bm/botmux', 'curl-binary', LAUNCHER, true))
       .toEqual({ executable: '/opt/bm/botmux', selfDispatching: true });
   });
+
+  it('a plain self-deployed restart keeps using the running binary', () => {
+    expect(resolveRestartInvocation(true, '/opt/custom/botmux', 'unknown', LAUNCHER, true))
+      .toEqual({ executable: '/opt/custom/botmux', selfDispatching: true });
+  });
+});
+
+describe('self-deployed release installation', () => {
+  function fixture(version = '3.99.0') {
+    const home = tmp();
+    const custom = join(home, 'custom', 'botmux');
+    mkdirSync(join(home, 'custom'));
+    const original = '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "3.100.0\\n"; else printf "custom:%s\\n" "$1"; fi\n';
+    writeFileSync(custom, original, { mode: 0o755 });
+    const strategy = resolveUpdateStrategy(true, custom, '/', {}, home);
+    if (strategy.kind !== 'install-release') throw new Error('release installation required');
+    mkdirSync(join(home, '.botmux', 'bin'), { recursive: true });
+    const launcher = `#!/bin/sh\nexec "${custom}" "$@"\n`;
+    writeFileSync(strategy.target, launcher, { mode: 0o755 });
+    const payload = Buffer.from(`#!/bin/sh\nif [ "$1" = "--version" ]; then printf "${version}\\n"; else printf "release:%s\\n" "$1"; fi\n#` + 'x'.repeat(1_100_000));
+    return { home, custom, original, strategy, launcher, payload };
+  }
+
+  it.each(['self-replace', 'install-release'])('%s installs and restarts an older release', async kind => {
+    const { home, custom, original, strategy: customStrategy, payload } = fixture();
+    const runningBinary = kind === 'self-replace' ? customStrategy.target : custom;
+    if (kind === 'self-replace') writeFileSync(runningBinary, original, { mode: 0o755 });
+    const strategy = resolveUpdateStrategy(true, runningBinary, '/', {}, home);
+    if (strategy.kind !== 'self-replace' && strategy.kind !== 'install-release') throw new Error('binary strategy required');
+    expect(strategy.kind).toBe(kind);
+    expect(execFileSync(runningBinary, ['--version'], { encoding: 'utf-8' }).trim()).toBe('3.100.0');
+    await replaceStandaloneBinary('3.99.0', strategy.target, {
+      fetchStream: async url => {
+        expect(url).toContain('/releases/download/v3.99.0/');
+        return Readable.from([payload]);
+      },
+      fetchChecksum: async () => createHash('sha256').update(payload).digest('hex'),
+    });
+    expect(execFileSync(strategy.target, ['--version'], { encoding: 'utf-8' }).trim()).toBe('3.99.0');
+    expect(resolveUpdateStrategy(true, strategy.target, '/', {}, home))
+      .toEqual({ kind: 'self-replace', target: strategy.target });
+    verifyBinaryRestartTarget({ target: strategy.target, version: '3.99.0' });
+    const invocation = resolveRestartInvocation(true, runningBinary, kind === 'self-replace' ? 'curl-binary' : 'unknown', strategy.target, true, false, strategy.target);
+    const restart = buildRestartLauncher(invocation.executable, '/dist/cli.js', false, invocation.selfDispatching);
+    expect(execFileSync(restart.cmd, restart.args, { encoding: 'utf-8' })).toBe('release:restart\n');
+    expect(readFileSync(custom, 'utf-8')).toBe(original);
+  });
+
+  it.each(['download', 'checksum', 'probe', 'version'])('%s failure preserves the launcher and original build', async failure => {
+    const { custom, original, strategy, launcher, payload } = fixture(failure === 'version' ? '3.98.0' : '3.99.0');
+    await expect(replaceStandaloneBinary('3.99.0', strategy.target, {
+      fetchStream: async () => {
+        if (failure === 'download') throw new Error('download interrupted');
+        return Readable.from([payload]);
+      },
+      fetchChecksum: async () => failure === 'checksum' ? 'f'.repeat(64) : createHash('sha256').update(payload).digest('hex'),
+      ...(failure === 'probe' ? { probeBinary: () => ({ status: 1, stderr: 'incompatible runtime' }) } : {}),
+    })).rejects.toThrow();
+    expect(readFileSync(custom, 'utf-8')).toBe(original);
+    expect(readFileSync(strategy.target, 'utf-8')).toBe(launcher);
+    expect(execFileSync(strategy.target, ['restart'], { encoding: 'utf-8' })).toBe('custom:restart\n');
+  });
+
+  it('verifies the pending restart target: accepts an out-of-band upgrade, rejects older builds, and recovers', () => {
+    const { strategy } = fixture();
+    const pending = { target: strategy.target, version: '3.99.0' };
+    // The untouched launcher forwards to the custom build, which reports 3.100.0:
+    // a newer release landed out of band, so the restart proceeds on it.
+    expect(verifyBinaryRestartTarget(pending)).toBe('3.100.0');
+    writeFileSync(strategy.target, '#!/bin/sh\nprintf "3.98.0\\n"\n', { mode: 0o755 });
+    expect(() => verifyBinaryRestartTarget(pending)).toThrow(/版本校验/);
+    writeFileSync(strategy.target, '#!/bin/sh\nprintf "3.99.0-canary.0\\n"\n', { mode: 0o755 });
+    expect(() => verifyBinaryRestartTarget(pending)).toThrow(/版本校验/);
+    writeFileSync(strategy.target, '#!/bin/sh\nprintf "3.99.0\\n"\n', { mode: 0o755 });
+    expect(verifyBinaryRestartTarget(pending)).toBe('3.99.0');
+  });
 });
 
 describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
   const BIG = 1_100_000; // over the "this is an error page, not a binary" floor
-  const probeOk = () => ({ status: 0 });
+  const probeOk = () => ({ status: 0, stdout: '3.99.0\n' });
 
   function fakeAsset(byte = 0x41, size = BIG): Buffer {
     return Buffer.alloc(size, byte);
@@ -842,6 +925,58 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     expect(statSync(target).size).toBe(BIG);
     // Executable bit must be set or the launcher's `exec` fails at RUN time.
     expect(statSync(target).mode & 0o111).not.toBe(0);
+  });
+
+  it('emits download byte progress and ordered stage transitions', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const payload = fakeAsset();
+    const events: BinaryUpdateProgress[] = [];
+    const stream = Object.assign(Readable.from([payload]), {
+      headers: { 'content-length': String(payload.length) },
+    });
+    await replaceStandaloneBinary('3.99.0', target, {
+      fetchStream: async () => stream,
+      fetchChecksum: async () => null,
+      probeBinary: probeOk,
+      onProgress: event => events.push({ ...event }),
+    });
+    const stages = events.map(e => e.phase);
+    expect(stages[0]).toBe('download');
+    expect(stages).toContain('checksum');
+    expect(stages).toContain('probe');
+    expect(stages[stages.length - 1]).toBe('swap');
+    const downloads = events.filter(e => e.phase === 'download');
+    expect(downloads[0].bytesTotal).toBe(BIG);
+    expect(downloads[downloads.length - 1].bytesReceived).toBe(BIG);
+    // Counts are monotonic and never exceed the declared total.
+    let previous = -1;
+    for (const event of downloads) {
+      expect(event.bytesReceived).toBeGreaterThan(previous);
+      expect(event.bytesReceived).toBeLessThanOrEqual(BIG);
+      previous = event.bytesReceived;
+    }
+    // Post-download stages keep the full size so the UI stays busy past 100%.
+    for (const phase of ['checksum', 'probe', 'swap'] as const) {
+      expect(events.find(e => e.phase === phase)?.bytesReceived).toBe(BIG);
+    }
+  });
+
+  it('reports null bytesTotal when the stream announces no Content-Length', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const payload = fakeAsset();
+    const events: BinaryUpdateProgress[] = [];
+    await replaceStandaloneBinary('3.99.0', target, {
+      fetchStream: async () => Readable.from([payload]),
+      fetchChecksum: async () => null,
+      probeBinary: probeOk,
+      onProgress: event => events.push({ ...event }),
+    });
+    expect(events[0].bytesTotal).toBeNull();
+    expect(events.at(-1)?.phase).toBe('swap');
   });
 
   it('a checksum mismatch leaves the WORKING binary in place', async () => {
@@ -966,5 +1101,73 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     expect(() => execFileSync(process.execPath, ['-e',
       `require('fs').renameSync(${JSON.stringify(fresh)}, ${JSON.stringify(bin)})`,
     ])).not.toThrow();
+  });
+});
+
+describe('the compiled dashboard must not compare daemons against its OWN baked version', () => {
+  // Source guard (same rule as diskVersionAt above): in the compiled binary
+  // `current` is the running dashboard's baked version, so the "running daemon
+  // vs disk" comparison is undetermined there and must stay silent — never
+  // inverted after a partial respawn.
+  const dashboardSrc = readFileSync(fileURLToPath(new URL('../src/dashboard.ts', import.meta.url)), 'utf-8');
+  const sessionsPageSrc = readFileSync(fileURLToPath(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url)), 'utf-8');
+
+  it('/api/update/status uses a completed binary installation as its disk version', () => {
+    expect(dashboardSrc.includes('const diskVersion = pendingBinaryRestart?.version ?? (isStandaloneBinary() ? undefined : current);')).toBe(true);
+    expect(dashboardSrc).toMatch(/formatRunningDaemonsRestartSummary\(\s*runningDaemons\.map\(d => d\.version\),\s*diskVersion,\s*\)/);
+    expect(dashboardSrc).toContain("...(diskVersion ? { diskVersion } : {}),");
+  });
+
+  it('the history staleHint compares against diskVersion, never against current', () => {
+    expect(sessionsPageSrc).toContain('daemonVersionDiffersFromDisk(running, status.diskVersion)');
+    expect(sessionsPageSrc).not.toMatch(/daemonVersionDiffersFromDisk\([^)]*status\.current/);
+  });
+});
+
+describe('self-deployed release migration — dashboard HTTP wiring', () => {
+  // 编译态 HTTP 接线无法在单测里起真实服务，沿用本文件 diskVersion 的源码守卫惯
+  // 例：删掉任一分线都会让这里变红，而不是静默退化成按钮能点必失败。
+  const dashboardSrc = readFileSync(fileURLToPath(new URL('../src/dashboard.ts', import.meta.url)), 'utf-8');
+
+  it('status only offers install/release actions when this platform ships an asset', () => {
+    expect(dashboardSrc).toContain(
+      "const releaseInstallAvailable = updateStrategy.kind === 'install-release' && releaseAssetName() !== null;",
+    );
+    expect(dashboardSrc).toContain('const selfReplace = updateStrategy.kind === \'self-replace\' || releaseInstallAvailable;');
+    expect(dashboardSrc).toContain('releaseInstallRequired: releaseInstallAvailable,');
+    expect(dashboardSrc).toContain('rollbackSupported: installPlan !== null || selfReplace,');
+  });
+
+  it('run installs through the launcher, pins the pending restart, and refuses platforms without an asset', () => {
+    expect(dashboardSrc).toContain(
+      "if (runStrategy.kind === 'self-replace' || runStrategy.kind === 'install-release') {",
+    );
+    expect(dashboardSrc).toMatch(/runStrategy\.kind === 'install-release' && releaseAssetName\(\) === null[\s\S]{0,160}release_asset_unavailable/);
+    expect(dashboardSrc).toContain('pendingBinaryRestart = { target: runStrategy.target, version: newVersion };');
+  });
+
+  it('rollback through a release binary is gated on a published asset too', () => {
+    expect(dashboardSrc).toMatch(/rollbackStrategy\.kind === 'install-release' && releaseAssetName\(\) === null[\s\S]{0,160}release_asset_unavailable/);
+    expect(dashboardSrc).toContain("spawnDetachedRestart('dashboard', installPlan?.activePackageRoot, leaseId!, binaryTarget)");
+  });
+
+  it('restart verifies and refreshes the pending target, anchors the driver, and 409s on mismatch', () => {
+    expect(dashboardSrc).toContain('const verifiedVersion = verifyBinaryRestartTarget(pendingBinaryRestart);');
+    expect(dashboardSrc).toContain("error: 'binary_restart_target_changed'");
+    expect(dashboardSrc).toContain(
+      "spawnDetachedRestart('dashboard', activePackageRoot, leaseId!, binaryRestartTarget)",
+    );
+  });
+});
+
+describe('self-deployed release migration — CLI wiring', () => {
+  const cliSrc = readFileSync(fileURLToPath(new URL('../src/cli.ts', import.meta.url)), 'utf-8');
+
+  it('points the post-migration restart hint at the absolute launcher path', () => {
+    expect(cliSrc).toContain('? `"${r.target}" restart`');
+  });
+
+  it('an implicit update does not downgrade a self-deployed build newer than latest', () => {
+    expect(cliSrc).toContain('&& !isNewerVersion(current, resolvedVersion)');
   });
 });

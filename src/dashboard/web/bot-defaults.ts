@@ -2,7 +2,9 @@ import { store } from './store.js';
 import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
 import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
+import type { AskOptionLayout } from '../../im/lark/ask-option-layout.js';
 import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
+import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 
 export type CliOption = {
@@ -22,6 +24,11 @@ export type CliOptionsState = {
   options: CliOption[];
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
+};
+
+export type ModelCapabilities = {
+  slug: string;
+  serviceTiers: string[];
 };
 
 /** Keep the browser payload contract tied to the daemon's canonical schema. */
@@ -73,6 +80,7 @@ export type BotDefaultsRow = {
   model?: string;
   modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); rendered as a dsh-only field. */
   turnTimeoutMs?: number;
@@ -90,7 +98,19 @@ export type BotDefaultsRow = {
   brandLabel?: string | null;
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;
+  /** Per-bot ask option layout; null means the built-in compact default. */
+  askOptionLayout?: AskOptionLayout | null;
   sandbox?: boolean;
+  /** Tri-state sandbox selection ('off' absent historically → derive from sandbox). */
+  sandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  scratchStorage?: 'tmpfs' | 'disk' | null;
+  /** Whether the tmpfs/disk storage segmented control applies (Linux only;
+   *  macOS scratch is always APFS-clonefile backed). */
+  scratchStorageSelectable?: boolean;
+  scratchTmpfsSizeMb?: number | null;
+  scratchDenyPaths?: string[] | null;
+  /** Whether the scratch mode is available on this platform (Linux only). */
+  scratchSupported?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).
@@ -103,8 +123,10 @@ export type BotDefaultsRow = {
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
-  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
-   *  null/absent = none configured (pure deny-by-default baseline). */
+  /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
+  sandboxNetworkPolicyPlatform?: string | null;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
@@ -150,7 +172,9 @@ export type BotDefaultsRow = {
   envelopeInjection?: 'auto' | 'off' | null;
   /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
    *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   replyDelivery?: 'send' | 'transcript' | null;
+  promptInjection?: 'default' | 'none';
   /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
   replyDeliveryDefault?: 'send' | 'transcript';
   /** 当前 cliId 是否有转写采集通道（claude-code / 结构化转写白名单）；false 时开关禁用。 */
@@ -160,6 +184,8 @@ export type BotDefaultsRow = {
   substituteMode?: BotSubstituteMode | null;
   feedback?: FeedbackPolicyLayer | null;
   oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
+  /** Codex App 无进展提醒（#1162）。null = 默认（开启，90s）。 */
+  noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   idleSuspendMinutes?: number | null;
@@ -177,6 +203,8 @@ export type BotDefaultsRow = {
   canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
+  envKeys?: string[];
+  envPolicy?: { mode: 'inherit' | 'strict'; inherit?: string[] };
   riff?: Record<string, unknown> | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
@@ -188,9 +216,11 @@ export type BotDefaultsRow = {
   groupJoinCommandEnabled?: boolean;
   groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
+  autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
+  grantRequestToOwnerDm?: boolean;
   grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;
@@ -281,14 +311,25 @@ export function mergeModelCandidates(
  */
 export async function fetchDetectedModels(
   key: string,
-): Promise<{ models: string[]; source: 'live' | 'static' } | null> {
+  botId?: string,
+): Promise<{ models: string[]; source: 'live' | 'static'; modelCapabilities?: ModelCapabilities[] } | null> {
   try {
-    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}`);
+    const botQuery = botId ? `&bot=${encodeURIComponent(botId)}` : '';
+    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}${botQuery}`);
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !body || !Array.isArray(body.models)) return null;
     const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
     const source: 'live' | 'static' = body.source === 'live' ? 'live' : 'static';
-    return { models, source };
+    const modelCapabilities = Array.isArray(body.modelCapabilities)
+      ? body.modelCapabilities.flatMap((item: unknown) => {
+          if (typeof item !== 'object' || item === null) return [];
+          const { slug, serviceTiers } = item as { slug?: unknown; serviceTiers?: unknown };
+          if (typeof slug !== 'string' || !Array.isArray(serviceTiers)) return [];
+          const tiers = serviceTiers.filter((tier): tier is string => typeof tier === 'string');
+          return [{ slug, serviceTiers: tiers }];
+        })
+      : undefined;
+    return { models, source, ...(modelCapabilities ? { modelCapabilities } : {}) };
   } catch {
     return null;
   }
@@ -433,6 +474,22 @@ export async function resolveSubstituteTarget(
     return { ok: true, resolution: body?.resolution ?? {} };
   } catch (e: any) {
     return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/** Machine-wide reply-card footer brand switch from GET /api/settings.
+ *  Fail-OPEN: any fetch/shape error returns true (per-bot editing stays usable)
+ *  rather than wrongly greying the field — the server is the enforcement point
+ *  anyway, this flag only drives the disabled UI state. */
+export async function fetchCardBrandLabelEnabled(): Promise<boolean> {
+  try {
+    const r = await fetch('/api/settings');
+    if (!r.ok) return true;
+    const body = await r.json().catch(() => ({}));
+    // Present even for tokenless public-readOnly visitors (not redacted).
+    return body?.settings?.cardBrandLabel !== false;
+  } catch {
+    return true;
   }
 }
 

@@ -1,5 +1,5 @@
 /**
- * triggered-message-store.ts — 记录「已经触发过任务」的入站消息（按 message_id
+ * triggered-message-store.ts — 记录「已经触发过任务或开始执行授权命令」的入站消息（按 message_id
  * 持久化），专供 im.message.updated_v1（消息编辑）路径做幂等。
  *
  * 背景：用户发出一条**未 @ 机器人**的群消息后，可用飞书的「修改」功能补 @ 机器人，
@@ -104,7 +104,8 @@ export function hasTriggeredMessage(larkAppId: string, messageId: string, now = 
 
 /**
  * 标记一条消息「已触发任务」。幂等：重复标记只刷新 TTL，不重复落盘内容。
- * 在消息**已确定进入任务派发**之后调用（而非入站即标记），这样被权限闸/@ 闸
+ * 在消息**已确定进入任务派发**之后调用（而非入站即标记）。授权元命令则在通过
+ * 权限 / 参数校验后、副作用开始前同步检查并标记，以挡住跨事件并发执行。被权限闸/@ 闸
  * 丢弃的消息不会被记成「已触发」——用户之后补 @ 仍能正常触发。
  */
 export function markMessageTriggered(larkAppId: string, messageId: string, now = Date.now()): void {

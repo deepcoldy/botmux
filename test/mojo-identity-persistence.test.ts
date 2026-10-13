@@ -34,7 +34,7 @@ let dir: string;
 async function freshStore() {
   vi.resetModules();
   const store = await import('../src/services/session-store.js');
-  store.init();
+  store.init('app_persist');
   return store;
 }
 

@@ -128,7 +128,7 @@ describe('hasBytedcliHome — provider-owned login state', () => {
   ])('refuses failed, malformed or non-personal status: %j', async status => {
     const mod = await fresh(); authorize(mod, ALICE);
     statuses.set(mod.bytedcliHomeFor(ALICE), status);
-    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
+    await expect(mod.hasBytedcliHome(ALICE)).rejects.toThrow('unavailable');
   });
   it('keeps two people isolated and observes revocation on the next check', async () => {
     const mod = await fresh(); authorize(mod, ALICE);
@@ -194,6 +194,7 @@ describe('login — device code, in two steps', () => {
 
   it('clears the challenge once the login lands', async () => {
     const mod = await fresh();
+    authorize(mod, ALICE);
     replies = [
       { code: 0, stdout: envelope({ verification_uri_complete: 'https://x/y', complete_token: 'tok-1' }) },
       { code: 0, stdout: envelope({ status: 'ok' }) },
@@ -280,7 +281,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   it('returns nothing once their login has expired', async () => {
     const mod = await fresh();
     authorize(mod, ALICE);
-    replies = [{ code: 1, stderr: 'not logged in' }];
+    statuses.set(mod.bytedcliHomeFor(ALICE), { code: 0, stdout: envelope({ authenticated: false, bytecloud_auth: { status: 'need_login' } }) });
     expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
   });
 
@@ -344,12 +345,12 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
     await beginOnce(mod);
     authorize(mod, ALICE);
     replies = [
-      { code: 1, stdout: envelope(null, 'error') + JSON.stringify({ error: { message: 'token expired' } }) + '\n' },
+      { code: 1, stdout: envelope(null, 'error') + JSON.stringify({ error: { code: 'BYTECLOUD_AUTH_LOGIN_EXPIRED', message: 'token expired' } }) + '\n' },
       { code: 0, stdout: 'cloud.jwt\n' },
       { code: 0, stdout: 'code.jwt\n' },
     ];
     // Build the failure envelope properly below instead of the concat above.
-    replies[0] = { code: 1, stdout: JSON.stringify({ status: 'error', data: null, error: { message: 'token expired' } }) + '\n' };
+    replies[0] = { code: 1, stdout: JSON.stringify({ status: 'error', data: null, error: { code: 'BYTECLOUD_AUTH_LOGIN_EXPIRED', message: 'token expired' } }) + '\n' };
     expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
     expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
   });
@@ -390,5 +391,96 @@ describe('clearBytedcliAuth', () => {
     mod.clearBytedcliAuth(ALICE);
     expect(existsSync(mod.bytedcliHomeFor(ALICE))).toBe(false);
     expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
+  });
+});
+
+
+describe('authorization loop regressions', () => {
+  async function begin(mod: Awaited<ReturnType<typeof fresh>>) {
+    replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://example.test/login', complete_token: 'challenge' }) }];
+    await mod.beginBytedcliLogin(ALICE);
+  }
+
+  it.each([{ login_status: 'pending' }, { status: 'pending' }])('retains and reuses a pending challenge: %j', async data => {
+    const mod = await fresh(); await begin(mod);
+    replies = [{ code: 0, stdout: envelope(data) }];
+    expect(await mod.completeBytedcliLogin(ALICE, 'challenge')).toEqual({ state: 'pending' });
+    expect((await mod.beginBytedcliLogin(ALICE))?.completeToken).toBe('challenge');
+    expect(calls.filter(c => c.args.includes('--begin'))).toHaveLength(1);
+  });
+
+  it.each([
+    { code: 1, stderr: 'network unavailable' },
+    { code: 0, stdout: 'malformed output' },
+    { code: 0, stdout: envelope({ login_status: 'unexpected' }) },
+    { code: 0, stdout: envelope({ login_status: 'success' }, 'error') },
+    { code: 0, stdout: envelope({ login_status: 'success' }) },
+  ])('does not turn an unverified completion into success or discard its challenge: %j', async reply => {
+    const mod = await fresh(); await begin(mod); replies = [reply];
+    expect((await mod.completeBytedcliLogin(ALICE, 'challenge')).state).toBe('unavailable');
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBe('challenge');
+  });
+
+  it('accepts modern success only after the personal provider confirms it', async () => {
+    const mod = await fresh(); await begin(mod); authorize(mod, ALICE);
+    replies = [{ code: 0, stdout: envelope({ login_status: 'success' }) }];
+    expect(await mod.completeBytedcliLogin(ALICE, 'challenge')).toEqual({ state: 'authorized' });
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+  });
+
+  it('does not report exit-zero expiration as authorized', async () => {
+    const mod = await fresh(); await begin(mod);
+    replies = [{ code: 0, stdout: envelope({ login_status: 'expired' }) }];
+    expect((await mod.completeBytedcliLogin(ALICE, 'challenge')).state).toBe('failed');
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+  });
+
+  it('coalesces simultaneous login attempts for the same user', async () => {
+    const mod = await fresh();
+    replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://example.test/login', complete_token: 'challenge' }) }];
+    const results = await Promise.all(Array.from({ length: 8 }, () => mod.beginBytedcliLogin(ALICE)));
+    expect(results.every(r => r?.completeToken === 'challenge')).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    { code: 1, stderr: 'provider offline' },
+    { code: 0, stdout: 'not JSON' },
+    { code: 0, stdout: envelope({ authenticated: false, bytecloud_auth: { status: 'error' } }) },
+  ])('distinguishes provider failures from missing authorization: %j', async reply => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    statuses.set(mod.bytedcliHomeFor(ALICE), reply);
+    await expect(mod.mintBytedcliJwts(ALICE)).rejects.toThrow('service unavailable');
+    expect(calls).toEqual([]);
+  });
+
+  it('reports a failed JWT mint as unavailable instead of asking for another login', async () => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    replies = [{ code: 1, stderr: 'network down' }];
+    await expect(mod.mintBytedcliJwts(ALICE)).rejects.toThrow('service unavailable');
+  });
+});
+
+
+describe('provider timeout', () => {
+  it('settles and releases singleflight even when inherited pipes never close', async () => {
+    const mod = await fresh();
+    const { spawn } = await import('node:child_process');
+    const { PassThrough } = await import('node:stream');
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(),
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    vi.useFakeTimers();
+    try {
+      const first = mod.beginBytedcliLogin(ALICE);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await first).toBeNull();
+      expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+      expect(child.stdout.destroyed).toBe(true);
+      expect(child.stderr.destroyed).toBe(true);
+    } finally { vi.useRealTimers(); }
+    replies = [{ code: 0, stdout: envelope({ verification_uri_complete: 'https://example.test/login', complete_token: 'retry' }) }];
+    expect((await mod.beginBytedcliLogin(ALICE))?.completeToken).toBe('retry');
   });
 });

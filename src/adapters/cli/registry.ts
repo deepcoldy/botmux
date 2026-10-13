@@ -36,6 +36,7 @@ import { createDshAdapter } from './dsh.js';
 import { createDshTuiAdapter } from './dsh-tui.js';
 import { createMojoAdapter } from './mojo.js';
 import { createMinimaxAdapter } from './minimax.js';
+import { createRemoteRunnerAdapter } from './remote-runner.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -89,8 +90,9 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // Declaring it lets `botmux setup` fail fast on a missing install instead of
   // letting the first IM message die with ENOENT.
   mojo: 'mojo',
-  // MiniMax CLI — `mmx text repl` is the interactive chat surface.
-  minimax: 'mmx',
+  // MiniMax Code — native exec stream-json, wrapped by minimax-runner.
+  minimax: 'mcode',
+  'remote-runner': 'botmux-remote-runner',
 };
 
 /**
@@ -229,7 +231,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -266,6 +268,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'dsh-tui': return createDshTuiAdapter(pathOverride);
     case 'mojo': return createMojoAdapter(pathOverride);
     case 'minimax': return createMinimaxAdapter(pathOverride);
+    case 'remote-runner': return createRemoteRunnerAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

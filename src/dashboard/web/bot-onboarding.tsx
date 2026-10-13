@@ -2,7 +2,7 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DropdownMenu } from './dashboard-components.js';
 import { fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } from './bot-defaults.js';
-import { ModelPickerField } from './bot-defaults-page.js';
+import { ModelPickerField } from './field-controls.js';
 import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
 

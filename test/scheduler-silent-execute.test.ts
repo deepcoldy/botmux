@@ -29,6 +29,7 @@ let sessionSeq = 0;
 const findActiveThreadSessionsByChatMock = vi.fn((_chatId: string): Session[] => []);
 const scheduleStoreUpdateTaskMock = vi.fn();
 const scheduleStoreGetTaskMock = vi.fn();
+const scheduleTasks = new Map<string, ScheduledTask>();
 vi.mock('../src/services/schedule-store.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/services/schedule-store.js')>()),
   updateTask: (...a: any[]) => scheduleStoreUpdateTaskMock(...a),
@@ -159,7 +160,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 }));
 
 const BOT = {
-  config: { larkAppId: 'cli_app_test', cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp' },
+  config: { larkAppId: 'cli_app_test', cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp', topicUnavailablePolicy: 'legacy' as 'legacy' | 'stop' },
   botName: 'TestBot',
   botOpenId: 'ou_bot',
 };
@@ -198,6 +199,7 @@ import { recordDispatchInputCommit, foldableChatSessionAppIds } from '../src/cor
 import { sessionKey } from '../src/core/types.js';
 import { writeDeferredTopicBinding, removeDeferredTopicBinding } from '../src/core/deferred-topic-binding.js';
 import { config } from '../src/config.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import {
   __testOnly_activeSessions as daemonActiveSessions,
   __testOnly_promoteMaterializedTaskPositionSession as promoteTaskPositionSession,
@@ -209,7 +211,7 @@ const ROOT = 'om_root_thread';
 const refreshCliVersion = vi.fn(() => true);
 
 function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
-  return {
+  const task: ScheduledTask = {
     id: 'task0001',
     name: '服务巡检',
     schedule: 'every 30m',
@@ -222,6 +224,8 @@ function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
     createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
     ...overrides,
   };
+  scheduleTasks.set(task.id, task);
+  return task;
 }
 
 function forkedCliInput(): string {
@@ -238,11 +242,16 @@ function forkedPayload(): any {
 }
 
 beforeEach(() => {
+  BOT.config.topicUnavailablePolicy = 'legacy';
   store.clear();
   sessionSeq = 0;
   forkWorkerMock.mockClear();
   closeSessionMock.mockClear();
-  sessionStoreCloseMock.mockClear();
+  sessionStoreCloseMock.mockReset();
+  sessionStoreCloseMock.mockImplementation((id: string) => {
+    const session = store.get(id);
+    if (session) session.status = 'closed';
+  });
   sendWorkerInputMock.mockClear();
   sendWorkerInputMock.mockReturnValue(true);
   sendMessageMock.mockClear();
@@ -251,6 +260,12 @@ beforeEach(() => {
   findActiveThreadSessionsByChatMock.mockImplementation(() => []);
   scheduleStoreUpdateTaskMock.mockClear();
   scheduleStoreGetTaskMock.mockReset();
+  scheduleTasks.clear();
+  scheduleStoreUpdateTaskMock.mockImplementation((id: string, patch: Partial<ScheduledTask>) => {
+    const current = scheduleTasks.get(id);
+    if (current) scheduleTasks.set(id, { ...current, ...patch });
+  });
+  scheduleStoreGetTaskMock.mockImplementation((id: string) => scheduleTasks.get(id));
   getChatModeMock.mockClear();
   getChatModeMock.mockResolvedValue('group');
   getMessageThreadIdMock.mockClear();
@@ -258,7 +273,51 @@ beforeEach(() => {
   delete (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode;
 });
 
+describe('retained-topic scheduled send policy', () => {
+  it.each(['TOPIC_SEND_BLOCKED', 'TOPIC_SEND_CHECK_FAILED', 'network'] as const)(
+    'does not escape into a new topic or start a worker after %s under stop', async kind => {
+      BOT.config.topicUnavailablePolicy = 'stop';
+      const failure = kind === 'network' ? new Error('provider unavailable') : new TopicSendError(kind, 'original topic unavailable');
+      replyMessageMock.mockRejectedValueOnce(failure);
+      const active = new Map<string, DaemonSession>();
+      await expect(executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion))
+        .rejects.toBe(failure);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(forkWorkerMock).not.toHaveBeenCalled(); expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(active.size).toBe(0); expect(store.size).toBe(0);
+    },
+  );
+  it('preserves the legacy fallback after a failed retained-topic reply', async () => {
+    replyMessageMock.mockRejectedValueOnce(new Error('withdrawn'));
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion);
+    expect(sendMessageMock).toHaveBeenCalledOnce(); expect(forkWorkerMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe('executeScheduledTask — silent thread fire', () => {
+  it('prepares an exact scheduled-turn identity before the worker is forked', async () => {
+    const active = new Map<string, DaemonSession>();
+    let prepared = false;
+    forkWorkerMock.mockImplementationOnce(() => { expect(prepared).toBe(true); });
+    const prepareTurnIdentity = vi.fn(async (session: DaemonSession, turnId: string) => {
+      expect(session.session.sessionId).toBe('sess-1');
+      expect(turnId).toMatch(/^schedule:task0001:/);
+      prepared = true;
+    });
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      undefined,
+      { prepareTurnIdentity },
+    );
+    expect(prepareTurnIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: 'sess-1' }) }),
+      expect.stringMatching(/^schedule:task0001:/),
+    );
+  });
+
   it('posts nothing, anchors at rootMessageId, arms the exact forked turn, wraps the prompt', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
@@ -594,8 +653,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
       patch: { rootMessageId?: string },
     ) => { writtenRoot = patch.rootMessageId; });
     scheduleStoreGetTaskMock.mockImplementation((id: string, appId: string) => (
-      id === 'task0001' && appId === APP && writtenRoot
-        ? { ...baseTask({ executionPosition: 'task' }), rootMessageId: writtenRoot }
+      id === 'task0001' && appId === APP
+        ? { ...baseTask({ executionPosition: 'task' }), ...(writtenRoot ? { rootMessageId: writtenRoot } : {}) }
         : undefined
     ));
 
@@ -1001,6 +1060,39 @@ describe('executeScheduledTask — live-session injection', () => {
     };
   }
 
+  it.each(['live', 'cold'] as const)('preserves retained routing and prompts when identity preparation rejects (%s)', async mode => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    const anchor = 'schedule-task:task0001';
+    existing.scope = 'chat';
+    existing.session.rootMessageId = anchor;
+    existing.session.cliId = 'claude-code';
+    existing.lastUserPrompt = 'previous prompt';
+    existing.session.lastCliInput = 'previous input';
+    existing.session.deferredScheduleRun = {
+      taskId: 'task0001', turnId: 'previous-turn', routingAnchor: anchor,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    if (mode === 'cold') existing.worker = null;
+    active.set(sessionKey(anchor, APP), existing);
+    const before = structuredClone(existing.session);
+    const failure = new Error('schedule authority state is revoked; refusing identity');
+    await expect(executeScheduledTask(
+      baseTask({ executionPosition: 'task', silent: true }),
+      active, refreshCliVersion, undefined, {
+        prepareTurnIdentity: async () => { throw failure; },
+      },
+    )).rejects.toBe(failure);
+    expect(active.get(sessionKey(anchor, APP))).toBe(existing);
+    expect(existing.session).toEqual(before);
+    expect(store.get(existing.session.sessionId)).toEqual(before);
+    expect(existing.lastMessageAt).toBe(0);
+    expect(existing.lastUserPrompt).toBe('previous prompt');
+    expect(sessionStoreCloseMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
   it('idle session: injects with the exact scheduled turn armed, no banner', async () => {
     const active = new Map<string, DaemonSession>();
     const existing = liveSession('idle');
@@ -1270,6 +1362,47 @@ describe('executeScheduledTask — live-session injection', () => {
 });
 
 describe('executeScheduledTask — registration rejection', () => {
+  it.each([false, true])('closes an unregistered candidate when identity preparation rejects (silent=%s)', async silent => {
+    const active = new Map<string, DaemonSession>();
+    const failure = new Error('schedule authority state is paused; refusing identity');
+    const task = baseTask({ rootMessageId: ROOT, scope: 'thread', silent });
+    await expect(executeScheduledTask(task, active, refreshCliVersion, undefined, {
+      prepareTurnIdentity: async ds => {
+        expect([...active.values()]).not.toContain(ds);
+        throw failure;
+      },
+    })).rejects.toBe(failure);
+
+    expect(active.size).toBe(0);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-1');
+    expect(store.get('sess-1')?.status).toBe('closed');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+
+    // A later authorized fire must not be blocked by initialStartPending on
+    // the rejected candidate's old active registration.
+    await executeScheduledTask(task, active, refreshCliVersion);
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+    expect([...active.values()][0].session.sessionId).toBe('sess-2');
+  });
+
+  it('preserves a concurrent registration winner when candidate identity preparation rejects', async () => {
+    const active = new Map<string, DaemonSession>();
+    const winner = { session: { sessionId: 'sess-winner', status: 'active' } } as DaemonSession;
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined, {
+        prepareTurnIdentity: async () => {
+          active.set(sessionKey(ROOT, APP), winner);
+          throw new Error('revoked');
+        },
+      },
+    )).rejects.toThrow('revoked');
+    expect(active.get(sessionKey(ROOT, APP))).toBe(winner);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-1');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
   it('throws after closing the rejected candidate instead of reporting a false success', async () => {
     const active = new Map<string, DaemonSession>();
     const winner: DaemonSession = {
@@ -1536,6 +1669,7 @@ describe('task-position promotion on materialization (daemon)', () => {
   });
 
   it('promotes the virtual slot to the real om_ key and writes the root back to the task', async () => {
+    baseTask({ executionPosition: 'task' });
     const ds = hiddenTaskDs();
     daemonActiveSessions.set(sessionKey('schedule-task:task0001', APP), ds);
     // Production precondition: settleDeferredScheduleRun's reconcile already
@@ -1680,6 +1814,7 @@ describe('task-position restart recovery', () => {
   }
 
   it('a materialized binding promotes on restore: real-key registration, root writeback, marker cleared', async () => {
+    baseTask({ executionPosition: 'task' });
     const row = persistedRow('sess-restore-materialized');
     writeDeferredTopicBinding(config.session.dataDir, {
       sessionId: row.sessionId,

@@ -59,6 +59,7 @@ let currentThreadName;
 let goalTurn = null;
 let reconciledTurn = null;
 let activeTurn;
+let pendingUserInput;
 let steerCount = 0;
 /** For steer-group-mismatch: the clientIds actually sent (root + steers), so the
  *  fixture can emit a full-items terminal turn that OMITS one — exercising the
@@ -136,6 +137,23 @@ function completeTurn(request) {
       method: 'item/tool/call',
       params: { threadId, turnId, tool: 'forbidden-test-tool' },
     });
+  }
+  if (behavior.startsWith('user-input')) {
+    pendingUserInput = { threadId, turnId, requestId: behavior === 'user-input-string' ? 'native-question-1' : 9200 + turnAttempt };
+    const questions = [
+      { id: 'environment', header: 'Environment', question: 'Choose environment', isOther: true, isSecret: false,
+        options: [{ label: 'Staging (Recommended)', description: 'Test first' }, { label: 'Production', description: 'Live traffic' }] },
+      { id: 'notify', header: 'Notify', question: 'Choose channel', isOther: true, isSecret: false,
+        options: [{ label: 'Lark', description: 'In this chat' }, { label: 'Email', description: 'Send later' }] },
+    ];
+    if (behavior === 'user-input-unsupported') questions[1].options = [{ label: 'Only one' }];
+    if (behavior === 'user-input-text') questions[1].options = null;
+    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, turnId, questions } });
+    if (behavior === 'user-input-cancelled') {
+      setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
+    }
+    if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
+    return;
   }
   if (behavior === 'hang-turn-completion') return;
   const finish = () => {
@@ -378,7 +396,25 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
 
 function handle(request) {
   if (logPath) appendFileSync(logPath, JSON.stringify(request) + '\n');
-  if (request.result !== undefined || request.error !== undefined) return;
+  if (request.result !== undefined || request.error !== undefined) {
+    if (behavior.startsWith('user-input') && pendingUserInput && request.id === pendingUserInput.requestId) {
+      const { threadId, turnId } = pendingUserInput;
+      pendingUserInput = undefined;
+      notify('item/completed', { threadId, turnId, item: {
+        id: 'message-user-input', type: 'agentMessage', phase: 'final_answer', text: `Answered: ${JSON.stringify(request.result)}`,
+      } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
+    }
+    return;
+  }
+  if (request.method === 'turn/interrupt' && behavior.startsWith('user-input')) {
+    if (behavior === 'user-input-interrupt-error') { reject(request.id, -32000, 'interrupt failed'); return; }
+    const pending = pendingUserInput;
+    pendingUserInput = undefined;
+    respond(request.id, {});
+    if (pending) notify('turn/completed', { threadId: pending.threadId, turn: { id: pending.turnId, status: 'interrupted' } });
+    return;
+  }
   if (typeof request.id !== 'number') return;
 
   if (request.method === 'initialize') {
@@ -387,7 +423,41 @@ function handle(request) {
     return;
   }
   if (request.method === 'thread/start') {
-    respond(request.id, { thread: { id: 'thread-fake' } });
+    respond(request.id, { thread: { id: 'thread-fake' }, model: 'gpt-6-astra' });
+    return;
+  }
+  if (request.method === 'model/list') {
+    if (behavior === 'effort-paginated' && !request.params.cursor) {
+      respond(request.id, { data: [], nextCursor: 'next-model-page' });
+      return;
+    }
+    if (behavior === 'effort-paginated' && request.params.cursor === 'next-model-page') {
+      respond(request.id, { data: [{ model: 'other-model' }], nextCursor: 'last-model-page' });
+      return;
+    }
+    respond(request.id, { data: [{ model: behavior === 'effort-model-missing' ? 'other-model' : 'gpt-6-astra', supportedReasoningEfforts:
+      (behavior === 'effort-empty-choices' ? [] : behavior === 'effort-invalid' ? ['low', 'medium'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+        .map(reasoningEffort => ({ reasoningEffort })) }], nextCursor: null });
+    return;
+  }
+  if (request.method === 'thread/settings/update') {
+    if (behavior === 'effort-unsupported') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-thread-rejected') reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    else respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/settings/update') {
+    if (behavior === 'effort-partial') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-feature-disabled' || behavior === 'effort-feature-disabled-complete') {
+      reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    } else if (behavior === 'effort-rejected') reject(request.id, -32600, 'another invalid request');
+    else if (behavior === 'effort-serial') setTimeout(() => respond(request.id, { status: 'applied' }), 100);
+    else respond(request.id, { status: behavior === 'effort-race' ? 'targetUnavailable' : 'applied' });
+    if ((behavior === 'effort-complete' || behavior === 'effort-feature-disabled-complete') && activeTurn) {
+      const turn = activeTurn;
+      activeTurn = undefined;
+      setTimeout(() => emitTurnCompletion(turn.threadId, turn.turnId, turn.outputSchema), 100);
+    }
     return;
   }
   if (request.method === 'thread/resume') {
@@ -404,7 +474,7 @@ function handle(request) {
       respond(request.id, { thread: { id: 'thread-unexpected' } });
       return;
     }
-    respond(request.id, { thread: { id: request.params.threadId } });
+    respond(request.id, { thread: { id: request.params.threadId }, model: 'gpt-6-astra' });
     return;
   }
   if (request.method === 'thread/read') {
@@ -707,7 +777,7 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
@@ -716,6 +786,9 @@ function handle(request) {
     }
     respond(request.id, { turn: { id: turnId } });
     notify('turn/started', { threadId, turn: { id: turnId } });
+    if (behavior.startsWith('effort-')) {
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'effort-progress', delta: 'effort task running' });
+    }
     return;
   }
   if (behavior === 'steer-started-first') {

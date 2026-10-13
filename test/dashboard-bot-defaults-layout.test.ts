@@ -21,6 +21,16 @@ describe('bot defaults focused layout', () => {
     expect(page).toContain('<RuntimeEnvironmentSection');
   });
 
+  it('keeps session-group lifecycle settings inside the existing session configuration', () => {
+    const panel = page.slice(page.indexOf('id="bd-panel-sessions"'), page.indexOf('id="bd-panel-security"'));
+    expect(panel).toContain('<SessionModeSection');
+    const mode = page.slice(page.indexOf('function SessionModeSection'), page.indexOf('type CommandTriggerCheck'));
+    expect(mode).toContain("p2p === 'group'");
+    expect(mode).toContain('<SessionGroupTagRow');
+    expect(mode).toContain('data-session-group-lifecycle');
+    expect(page.match(/<SessionGroupTagRow /g)).toHaveLength(1);
+  });
+
   it('lays task tiles out as a two-column waterfall so short tiles do not strand a gap', () => {
     // A row-major grid locks each row to its tallest tile, leaving dead space
     // under a short tile next to a tall one. BdTabGrid measures every tile and

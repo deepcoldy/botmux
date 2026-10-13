@@ -50,12 +50,8 @@ afterEach(() => {
   }
 });
 
-/**
- * The CLI runs without `BOTMUX_LARK_APP_ID`, so its rows live in the legacy
- * flat store (`<dataDir>/sessions.db`), not a per-bot one.
- */
 function storedSession(dataDir: string, sessionId: string): Record<string, any> {
-  return readPersistedSessionRows(dataDir)[sessionId];
+  return readPersistedSessionRows(dataDir, 'cli-target')[sessionId];
 }
 
 function makeFixture(): {
@@ -87,7 +83,7 @@ function makeFixture(): {
       agentName: 'agent-a',
     },
   };
-  seedPersistedSessionRows(dataDir, undefined, { [session.sessionId]: session });
+  seedPersistedSessionRows(dataDir, 'cli-target', { [session.sessionId]: { ...session, larkAppId: 'cli-target' } });
 
   const fakeHerdr = join(binDir, 'herdr');
   writeFileSync(fakeHerdr, `#!/usr/bin/env node
@@ -158,7 +154,10 @@ describe('CLI persisted backend targets', () => {
       ...first, sessionId: 'abcdef12-5555-6666-7777-888888888888', rootMessageId: 'om_other', title: 'namespace-b',
       persistentBackendTarget: { backendType: 'zmx', sessionName, socketDir: '/tmp/list-zmx-b' },
     };
-    seedPersistedSessionRows(fixture.dataDir, undefined, { [first.sessionId]: first, [second.sessionId]: second });
+    seedPersistedSessionRows(fixture.dataDir, 'cli-target', {
+      [first.sessionId]: { ...first, larkAppId: 'cli-target' },
+      [second.sessionId]: { ...second, larkAppId: 'cli-target' },
+    });
     const fakeZmx = join(fixture.binDir, 'zmx');
     writeFileSync(fakeZmx, `#!/usr/bin/env node
 const { appendFileSync } = require('node:fs');
@@ -218,7 +217,7 @@ if (process.env.ZMX_DIR === '/tmp/list-zmx-a') {
 
     const sessionId = 'abcdef12-1111-2222-3333-444444444444';
     const sessionName = 'bmx-abcdef12';
-    seedPersistedSessionRows(dataDir, undefined, {
+    seedPersistedSessionRows(dataDir, 'cli-target', {
       [sessionId]: {
         sessionId,
         chatId: 'oc_zmx_target',
@@ -226,6 +225,7 @@ if (process.env.ZMX_DIR === '/tmp/list-zmx-a') {
         title: 'owned-zmx-target',
         status: 'active',
         createdAt: '2026-07-30T00:00:00.000Z',
+        larkAppId: 'cli-target',
         cliId: 'codex',
         backendType: 'zmx',
         persistentBackendTarget: {

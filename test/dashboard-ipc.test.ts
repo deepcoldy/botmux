@@ -1,11 +1,16 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+
+vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
+  validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+}));
 import { createHmac, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -201,6 +206,7 @@ afterEach(async () => {
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
   setCrossPrincipalInterruptionDisableHandler(null);
+  setDurableSessionSendHandler(null);
   clearMessageListenerRunPreviewStore();
 });
 
@@ -1993,6 +1999,32 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — autoStartExcludedChats', () => {
+  it('validates IDs, normalizes duplicates, exposes saved values and supports clearing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-exclusions-'));
+    const prev = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = join(dir, 'bots.json');
+      writeFileSync(process.env.BOTS_CONFIG, JSON.stringify([{ larkAppId: 'app_exclusions', larkAppSecret: 'secret', cliId: 'claude-code' }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId('app_exclusions');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (ids: unknown) => fetch(`${base}/api/bot-card-prefs`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ autoStartExcludedChats: ids }) });
+      expect((await save([' oc_one ', 'oc_one', 'oc_two'])).status).toBe(200);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ autoStartExcludedChats: ['oc_one', 'oc_two'] });
+      for (const invalid of ['oc_one', [42], ['om_message'], ['oc_']]) expect((await save(invalid)).status).toBe(400);
+      expect(getBot('app_exclusions').config.autoStartExcludedChats).toEqual(['oc_one', 'oc_two']);
+      expect((await save([])).status).toBe(200);
+      expect(getBot('app_exclusions').config.autoStartExcludedChats).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — autoInviteOwnerOnGroupAdd', () => {
   it('is default-on, persists explicit false, and rejects non-boolean values fail-closed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-invite-owner-'));
@@ -2243,6 +2275,33 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
     body: JSON.stringify({ replyDelivery }),
   });
   const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+  it('topic unavailable policy defaults to legacy and persists both choices with immediate readback', async () => {
+    await withBot('codex', async (base, configPath, appId) => {
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: 'legacy' });
+      const setPolicy = (value: unknown) => fetch(`${base}/api/bot-topic-unavailable-policy`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topicUnavailablePolicy: value }),
+      });
+      for (const policy of ['stop', 'legacy']) {
+        const response = await setPolicy(policy);
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ ok: true, topicUnavailablePolicy: policy });
+        expect(persisted(configPath).topicUnavailablePolicy).toBe(policy);
+        expect(getBot(appId).config.topicUnavailablePolicy).toBe(policy);
+        expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: policy });
+      }
+      for (const invalid of ['unknown', undefined, null, 0, {}, []]) {
+        expect((await setPolicy(invalid)).status).toBe(400);
+      }
+      for (const body of ['null', '[]', '3', '{']) {
+        const invalid = await fetch(`${base}/api/bot-topic-unavailable-policy`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' }, body,
+        });
+        expect(invalid.status).toBe(400);
+      }
+      expect(persisted(configPath).topicUnavailablePolicy).toBe('legacy');
+    });
+  });
 
   it('claude-code: GET 生效值缺省 send（不随 CLI 翻转），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
     await withBot('claude-code', async (base, configPath, appId) => {
@@ -2788,6 +2847,65 @@ describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
   });
 });
 
+describe('PUT /api/bot-grant-prefs — grantRequestToOwnerDm (申请卡转投 owner 私聊)', () => {
+  it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-owner-dm-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-owner-dm-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.grantRequestToOwnerDm).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).grantRequestToOwnerDm).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
+
+      const bogus = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: 'on' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence (Bug2: 二刷消失)', () => {
   it('persists a disabled listener that still has a prompt, and GET returns it after reload', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-draft-'));
@@ -3257,6 +3375,111 @@ describe('PUT /api/bot-reply-style — sparse reply-card appearance', () => {
   });
 });
 
+describe('PUT /api/bot-ask-option-layout — per-bot ask option layout', () => {
+  it('persists vertical, hot-updates GET, rejects invalid writes, and clears back to compact', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-ask-option-layout-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-ask-option-layout-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'must-not-leak',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // 未配置时 GET 投影为 null（内建 compact 缺省）
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ askOptionLayout: null });
+
+      const put = await fetch(`${base}/api/bot-ask-option-layout`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ askOptionLayout: 'vertical' }),
+      });
+      expect(put.status).toBe(200);
+      const body = await put.json();
+      expect(body).toMatchObject({ ok: true, askOptionLayout: 'vertical' });
+      expect(body).not.toHaveProperty('larkAppSecret');
+
+      const disk = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(disk.askOptionLayout).toBe('vertical');
+      expect(disk.larkAppSecret).toBe('must-not-leak');
+      expect((getBot(appId).config as any).askOptionLayout).toBe('vertical');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ askOptionLayout: 'vertical' });
+
+      // 非法布局值 / 非对象 body / 多余字段：全部 400，磁盘保持不变
+      for (const raw of [
+        '{"askOptionLayout":"sideways"}',
+        '{"askOptionLayout":42}',
+        '{"askOptionLayout":true}',
+        'null',
+        '[]',
+        '{}',
+        '{"askOptionLayout":"vertical","extra":true}',
+      ]) {
+        const invalid = await fetch(`${base}/api/bot-ask-option-layout`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        expect(invalid.status, raw).toBe(400);
+        expect(await invalid.json()).toMatchObject({ ok: false });
+        expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].askOptionLayout).toBe('vertical');
+      }
+
+      // 超过 1KB 上限的 body → 413
+      const oversized = await fetch(`${base}/api/bot-ask-option-layout`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ askOptionLayout: 'vertical', pad: 'x'.repeat(2048) }),
+      });
+      expect(oversized.status).toBe(413);
+      expect(await oversized.json()).toMatchObject({ ok: false, error: 'body_too_large' });
+
+      // compact 即缺省：稀疏存储删除该键
+      const compact = await fetch(`${base}/api/bot-ask-option-layout`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ askOptionLayout: 'compact' }),
+      });
+      expect(compact.status).toBe(200);
+      expect(await compact.json()).toMatchObject({ ok: true, askOptionLayout: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].askOptionLayout).toBeUndefined();
+      expect((getBot(appId).config as any).askOptionLayout).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ askOptionLayout: null });
+
+      // 先写回 vertical 再 null 清除
+      await fetch(`${base}/api/bot-ask-option-layout`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ askOptionLayout: 'vertical' }),
+      });
+      const clear = await fetch(`${base}/api/bot-ask-option-layout`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ askOptionLayout: null }),
+      });
+      expect(clear.status).toBe(200);
+      expect(await clear.json()).toMatchObject({ ok: true, askOptionLayout: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].askOptionLayout).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('POST /api/grants/chat', () => {
   it('requires loopback HMAC before invoking the permission service', async () => {
     const handler = vi.fn();
@@ -3586,7 +3809,7 @@ describe('GET /api/sessions', () => {
     } finally {
       usageSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3632,7 +3855,7 @@ describe('GET /api/sessions', () => {
       });
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3715,6 +3938,57 @@ describe('GET /api/sessions/:sessionId/usage', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/live-stage', () => {
+  const path = '/api/sessions/handoff-fixture/live-stage';
+  const event = { turnId: 'trg_fixture', sequence: 1, kind: 'stage', title: '等待验证' };
+
+  it('requires host authentication before forwarding a validated event', async () => {
+    const ds = { session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group' } as any;
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const body = JSON.stringify(event);
+      const denied = await requestJson(handle.port, path, { method: 'POST', body });
+      expect(denied.status).toBe(401);
+      expect(update).not.toHaveBeenCalled();
+      const accepted = await requestJson(handle.port, path, {
+        method: 'POST', body, headers: trustedHostHeaders('POST', path, handle.port),
+      });
+      expect(accepted.status).toBe(200);
+      expect(update).toHaveBeenCalledExactlyOnceWith(ds, event);
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('rejects malformed, missing and API-only targets without card effects', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const post = (value: unknown) => requestJson(handle!.port, path, { method: 'POST', body: JSON.stringify(value) });
+      expect((await post({ ...event, kind: 'complete' })).status).toBe(400);
+      expect((await post(event)).json.error).toBe('session_not_active');
+      find.mockReturnValue({ session: { status: 'active' }, chatId: 'http_async_fixture', scope: 'chat', chatType: 'group' } as any);
+      expect((await post(event)).json.error).toBe('live_stage_unavailable');
+      expect(update).not.toHaveBeenCalled();
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('returns a conflict when a delayed connector event belongs to an old turn', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group',
+    } as any);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockRejectedValue(new Error('stale_live_stage'));
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await requestJson(handle.port, path, { method: 'POST', body: JSON.stringify(event) });
+      expect(res.status).toBe(409);
+      expect(res.json).toEqual({ ok: false, error: 'stale_live_stage' });
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/rename', () => {
   it.each([
     ['codex', '/bin/codex'],
@@ -3728,7 +4002,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
     let findSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       const session = sessionStore.createSession('oc_rename', 'om_rename', 'Old title', 'group');
       session.cliId = cliId;
       session.cliPathOverride = cliPathOverride;
@@ -3794,7 +4068,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
     } finally {
       findSpy?.mockRestore();
       off();
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3816,6 +4090,94 @@ describe('POST /api/sessions/:sessionId/close', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/durable-send', () => {
+  it('authenticates the Session and returns only the daemon-settled message id', async () => {
+    const active = {
+      session: {
+        sessionId: 'session-durable-send',
+        rootMessageId: 'om_root',
+        chatId: 'oc_chat',
+        scope: 'thread',
+        title: 'fixture',
+        status: 'active',
+        createdAt: Date.now(),
+        larkAppId: 'cli_test',
+      },
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      chatType: 'group',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    const deliver = vi.fn(async () => ({ kind: 'delivered' as const, messageId: 'om_outbox' }));
+    setDurableSessionSendHandler(deliver);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/session-durable-send/durable-send';
+      const payload = {
+        turnId: 'om_turn',
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        content: '{"schema":"2.0"}',
+        msgType: 'interactive',
+        providerUuid: 'bts_fixture',
+        hookContext: { sessionId: 'session-durable-send' },
+      };
+      const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', path, handle.port),
+        },
+        body: JSON.stringify(payload),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        kind: 'delivered',
+        messageId: 'om_outbox',
+      });
+      expect(deliver).toHaveBeenCalledWith({
+        daemonSession: active,
+        ...payload,
+      });
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
+  it('fails closed when the durable handler is unavailable', async () => {
+    const active = {
+      session: { sessionId: 'session-durable-send', status: 'active' },
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/session-durable-send/durable-send';
+      const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', path, handle.port),
+        },
+        body: JSON.stringify({
+          turnId: 'om_turn',
+          target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+          content: 'hello',
+          msgType: 'text',
+          providerUuid: 'bts_fixture',
+        }),
+      });
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ ok: false, error: 'durable_primary_unavailable' });
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/lock', () => {
   it('persists the lock flag and publishes a dashboard patch', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-lock-'));
@@ -3825,7 +4187,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
     const off = dashboardEventBus.subscribe(e => seen.push(e));
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       const session = sessionStore.createSession('oc_lock', 'om_lock', 'lock me', 'group');
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -3854,7 +4216,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
       expect(sessionStore.getSession(session.sessionId)?.locked).toBeUndefined();
     } finally {
       off();
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -3959,7 +4321,7 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
         getActiveCount: () => 0,
         closeSession: vi.fn(),
       });
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = previousDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4754,7 +5116,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     let handle: IpcServerHandle | undefined;
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume_null', 'om_resume_null', 'resume null body', 'group');
@@ -4858,7 +5220,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       replySpy.mockRestore();
       deleteSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4871,7 +5233,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_listener', 'oc_listener', '[Meeting] meeting-42', 'group');
@@ -4906,7 +5268,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4920,7 +5282,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
@@ -4946,7 +5308,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -4962,7 +5324,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
@@ -4987,7 +5349,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -5041,7 +5403,7 @@ describe('GET /api/events', () => {
     const registry = new Map<string, any>();
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
 
       const session = sessionStore.createSession('oc_zombie', 'om_zombie', 'zombie topic', 'group');
@@ -5061,7 +5423,7 @@ describe('GET /api/events', () => {
       expect(typeof ev!.body.session.closedAt).toBe('number');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -5607,6 +5969,78 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
       expect(after.model).toBeUndefined();
       expect(after.reasoningEffort).toBeUndefined();
     });
+  });
+});
+
+describe('POST/PATCH /api/schedules — local work calendar', () => {
+  it('persists and reads the calendar, rejects bad bindings/once and clears with null', async () => {
+    const app = 'cli_calendar_api_test';
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-calendar-api-'));
+    const previous = config.session.dataDir;
+    const previousZone = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    let local: IpcServerHandle | undefined;
+    try {
+      config.session.dataDir = join(dir, 'data');
+      process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
+      scheduleStore.setScheduleScope(app);
+      setLarkAppId(app);
+      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'gemini', apiOnly: true });
+      const { workCalendarPath } = await import('../src/services/work-calendar.js');
+      const fixture = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
+      mkdirSync(join(dir, 'bots', app), { recursive: true });
+      writeFileSync(workCalendarPath(app), JSON.stringify(fixture));
+      local = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${local.port}`;
+      const catalog = await (await fetch(`${base}/api/schedules/calendars`)).json();
+      expect(catalog.calendars.find((row: any) => row.id === 'cn')).toMatchObject({ displayNames: { zh: '中国法定工作日历', en: 'China Statutory Work Calendar' } });
+      expect(catalog.calendars.some((row: any) => row.id === 'demo')).toBe(true);
+      const create = (body: Record<string, unknown>) => fetch(`${base}/api/schedules`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'fixture', schedule: '0 9 * * *', prompt: 'fixture', chatId: 'fixture_chat', ...body }),
+      });
+      const response = await create({ calendar: 'demo' });
+      expect(response.status).toBe(200);
+      const task = (await response.json()).task;
+      expect(task.calendar).toBe('demo');
+      expect(scheduleStore.getTask(task.id)?.calendar).toBe('demo');
+      const patch = (body: Record<string, unknown>) => fetch(`${base}/api/schedules/${task.id}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect((await create({ calendar: '../bad' })).status).toBe(400);
+      expect((await create({ calendar: 'demo', schedule: '30m' })).status).toBe(400);
+      expect((await patch({ calendar: 42 })).status).toBe(400);
+      expect((await patch({ calendarDayType: 'weekend' })).status).toBe(400);
+      expect((await create({ calendarDayType: 'restday' })).status).toBe(400);
+      expect((await patch({ calendarDayType: 'restday' })).status).toBe(200);
+      expect(scheduleStore.getTask(task.id)?.calendarDayType).toBe('restday');
+      expect((await patch({ calendarDayType: 'workday' })).status).toBe(200);
+      expect((await patch({ schedule: '30m' })).status).toBe(400);
+      // Readback uses the persisted raw next trigger and the calendar's own zone.
+      scheduleStore.updateTask(task.id, { nextRunAt: '2028-01-08T01:00:00.000Z' });
+      const listed = (await (await fetch(`${base}/api/schedules`)).json()).schedules.find((row: any) => row.id === task.id);
+      expect(listed).toMatchObject({ calendar: 'demo', nextEligibleRunAt: '2028-01-08T01:00:00.000Z' });
+      // Built-in CN works through the same API and does not read the corrupt local extension file.
+      writeFileSync(workCalendarPath(app), '{broken');
+      const cn = await patch({ calendar: 'cn' });
+      expect(cn.status).toBe(200);
+      expect((await cn.json()).task).toMatchObject({ calendar: 'cn', calendarCheck: { timeZone: 'Asia/Shanghai' } });
+      writeFileSync(workCalendarPath(app), JSON.stringify(fixture));
+      // Missing definitions remain diagnostic and never change unbound tasks.
+      const missing = await patch({ calendar: 'absent' });
+      expect((await missing.json()).task).toMatchObject({ calendar: 'absent', calendarCheck: { reason: 'calendar_missing' } });
+      const cleared = await patch({ calendar: null });
+      expect(cleared.status).toBe(200);
+      expect((await cleared.json()).task.calendar).toBeUndefined();
+      expect(scheduleStore.getTask(task.id)?.calendar).toBeUndefined();
+      expect(scheduleStore.getTask(task.id)?.calendarDayType).toBeUndefined();
+    } finally {
+      if (local) await local.close();
+      config.session.dataDir = previous;
+      if (previousZone === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = previousZone;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -6908,6 +7342,50 @@ describe('PUT /api/bot-oncall-group', () => {
   });
 });
 
+describe('PUT /api/bot-no-progress-notify', () => {
+  it('persists, rejects out-of-range values and clears back to default', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-no-progress-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-no-progress-app';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex-app' }]));
+      loadBotConfigs().forEach((bot: any) => registerBot(bot));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle!.port}`;
+      const put = (noProgressNotify: unknown) => fetch(`${base}/api/bot-no-progress-notify`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ noProgressNotify }),
+      });
+
+      // set: 200, response and bots.json agree, in-memory registry updated live.
+      const saved = await put({ enabled: false, timeoutMs: 300000 });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, noProgressNotify: { enabled: false, timeoutMs: 300000 } });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify)
+        .toEqual({ enabled: false, timeoutMs: 300000 });
+      expect(getBot(appId).config.noProgressNotify).toEqual({ enabled: false, timeoutMs: 300000 });
+
+      // invalid: out-of-range timeoutMs / unknown field → 400, disk untouched.
+      expect((await put({ timeoutMs: 5000 })).status).toBe(400);
+      expect((await put({ unknown: 1 })).status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify)
+        .toEqual({ enabled: false, timeoutMs: 300000 });
+
+      // null: clears back to the built-in default.
+      const cleared = await put(null);
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, noProgressNotify: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].noProgressNotify).toBeUndefined();
+      expect(getBot(appId).config.noProgressNotify).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-substitute-mode', () => {
   it('preserves quote reply mode in the response and bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));
@@ -6980,6 +7458,74 @@ describe('PUT /api/bot-agent', () => {
       expect(loadBotConfigs()[0]?.reasoningEffort).toBe('max');
       expect((await save('')).status).toBe(200);
       expect(loadBotConfigs()[0]?.reasoningEffort).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists codex serviceTier, keeps explicit default, and clears it on unsupported CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-service-tier-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-service-tier';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex' }]));
+      loadBotConfigs().forEach(c => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (body: Record<string, unknown>) => fetch(`${base}/api/bot-agent`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const saved = await save({ cliId: 'codex', model: '', serviceTier: 'priority' });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, serviceTier: 'priority' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ serviceTier: 'priority' });
+
+      const invalid = await save({ cliId: 'codex', model: '', serviceTier: 'fast' });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'invalid_service_tier' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      const explicitDefault = await save({ cliId: 'codex', model: '', serviceTier: 'default' });
+      expect(explicitDefault.status).toBe(200);
+      expect(await explicitDefault.json()).toMatchObject({ serviceTier: 'default' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('default');
+
+      const cleared = await save({ cliId: 'codex', model: '', serviceTier: null });
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ serviceTier: null });
+      expect(loadBotConfigs()[0]?.serviceTier).toBeUndefined();
+
+      const restored = await save({ cliId: 'codex', model: '', serviceTier: 'priority' });
+      expect(restored.status).toBe(200);
+      expect(await restored.json()).toMatchObject({ serviceTier: 'priority' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'not_supported_by_model' });
+      const unsupportedModel = await save({ cliId: 'codex', model: 'gpt-6-astra', serviceTier: 'priority' });
+      expect(unsupportedModel.status).toBe(400);
+      expect(await unsupportedModel.json()).toMatchObject({ error: 'service_tier_not_supported_by_model' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+
+      vi.mocked(validateCodexServiceTier).mockResolvedValueOnce({ ok: false, error: 'catalog_unavailable' });
+      const changedModel = await save({ cliId: 'codex', model: 'gpt-6-astra' });
+      expect(changedModel.status).toBe(400);
+      expect(await changedModel.json()).toMatchObject({ error: 'service_tier_catalog_unavailable' });
+      expect(loadBotConfigs()[0]?.serviceTier).toBe('priority');
+      expect(loadBotConfigs()[0]?.model).toBeUndefined();
+
+      const switched = await save({ cliId: 'claude-code', model: '' });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ serviceTier: null });
+      expect(loadBotConfigs()[0]?.serviceTier).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ serviceTier: null });
     } finally {
       if (previous === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = previous;
@@ -7505,6 +8051,55 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists Remote Runner model variant and reasoning effort for provider start', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-remote-runner-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-remote-runner-agent-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'remote-runner',
+          model: 'GPT-5.6-Sol',
+          modelBackendVariant: 'max',
+          reasoningEffort: 'xhigh',
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: true,
+        cliId: 'remote-runner',
+        model: 'GPT-5.6-Sol',
+        modelBackendVariant: 'max',
+        reasoningEffort: 'xhigh',
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+        model: 'GPT-5.6-Sol',
+        modelBackendVariant: 'max',
+        reasoningEffort: 'xhigh',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('persists, validates and clears the dsh turn timeout through bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-tt-ipc-'));
     const configPath = join(dir, 'bots.json');
@@ -7673,6 +8268,82 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists, validates, cold-reads and clears dshProfile through bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-dsh-profile-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-dsh-profile-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'dsh',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-agent`;
+
+      const invalid = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '../outside' }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'invalid_dsh_profile' });
+
+      const saved = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '  custom-profile_1  ' }),
+      });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, dshProfile: 'custom-profile_1' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBe('custom-profile_1');
+      expect(getBot(appId).config.dshProfile).toBe('custom-profile_1');
+      expect(botRegistry.loadBotConfigAtIndex(0).dshProfile).toBe('custom-profile_1');
+
+      // Old clients omit the field; retain the configured profile on dsh.
+      const preserved = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '' }),
+      });
+      expect(preserved.status).toBe(200);
+      expect(await preserved.json()).toMatchObject({ dshProfile: 'custom-profile_1' });
+
+      const cleared = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '   ' }),
+      });
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ dshProfile: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBeUndefined();
+      expect(getBot(appId).config.dshProfile).toBeUndefined();
+
+      await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: 'custom' }),
+      });
+      const switched = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'claude-code', model: '' }),
+      });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ dshProfile: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBeUndefined();
+      expect(getBot(appId).config.dshProfile).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unsettled Codex App session before config/readIsolation mutation or close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-pending-ipc-'));
     const dataDir = join(dir, 'data');
@@ -7747,7 +8418,7 @@ describe('PUT /api/bot-agent', () => {
       expect(send).not.toHaveBeenCalled();
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -7805,7 +8476,7 @@ describe('PUT /api/bot-agent', () => {
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliId).toBe('traex');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -7855,7 +8526,7 @@ describe('PUT /api/bot-agent', () => {
       expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(false);
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -8216,7 +8887,7 @@ describe('PUT /api/bot-agent riff backend pairing', () => {
         .toHaveProperty('closedMismatchedFailed');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -8765,6 +9436,7 @@ describe('GET /api/groups (Phase B)', () => {
       name: 'team',
       oncallChat: null,
       serialInput: false,
+      idleClose: { enabled: false, duration: 1, unit: 'days' },
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
@@ -8803,6 +9475,7 @@ describe('GET /api/groups (Phase B)', () => {
         agentCliId: 'codex',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -8847,6 +9520,7 @@ describe('GET /api/groups (Phase B)', () => {
         agentCliId: 'codex',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -8881,6 +9555,7 @@ describe('GET /api/groups (Phase B)', () => {
         name: 'config missing',
         oncallChat: null,
         serialInput: false,
+        idleClose: { enabled: false, duration: 1, unit: 'days' },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -8928,6 +9603,7 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -8942,6 +9618,7 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -8956,6 +9633,7 @@ describe('GET /api/groups (Phase B)', () => {
           agentCliId: 'codex',
           oncallChat: null,
           serialInput: false,
+          idleClose: { enabled: false, duration: 1, unit: 'days' },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -10585,5 +11263,84 @@ describe('PUT /api/bot-idle-suspend-minutes — 空闲会话自动休眠 TTL', (
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — tool result preference', () => {
+  it('persists tool result visibility without changing CoT visibility', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-modes-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-reply-modes-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+      }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
+      for (const [patch, enabled] of [
+        [{ thinkingCardToolResult: false }, true],
+        [{ thinkingCardToolResult: true }, true],
+      ] as const) {
+        const result = await fetch(url, {
+          method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),
+        });
+        expect(result.status).toBe(200);
+        expect(await result.json()).toMatchObject({ ok: true, cotEnabled: enabled });
+        expect(loadBotConfigs()[0].cotEnabled !== false).toBe(enabled);
+        const stored = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (patch.thinkingCardToolResult === false) {
+          expect(stored.thinkingCardToolResult).toBe(false);
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBe(false);
+        } else {
+          expect(stored).not.toHaveProperty('thinkingCardToolResult');
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBeUndefined();
+        }
+      }
+      expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('host interaction context observation', () => {
+  it('authenticates the real IPC route and reads current native talk policy', async () => {
+    const app = 'cli_interaction_test';
+    const sessionId = 'interaction-session';
+    registerBot({ larkAppId: app, larkAppSecret: 'fixture-secret', allowedUsers: ['ou_owner'] });
+    getBot(app).resolvedAllowedUsers = ['ou_owner'];
+    const previous = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map([['interaction', {
+      larkAppId: app, chatType: 'group',
+      session: { sessionId, larkAppId: app, status: 'active', chatId: 'oc_origin',
+        scope: 'thread', rootMessageId: 'om_origin', ownerOpenId: 'ou_owner' },
+    } as any]]));
+    try {
+      setLarkAppId(app); setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = `/api/sessions/${sessionId}/interaction-context`;
+      const body = JSON.stringify({ larkAppId: app, chatId: 'oc_forged', ownerOpenId: 'ou_forged' });
+      const denied = await requestJson(handle.port, path, { method: 'POST', body });
+      expect(denied.status).toBe(401);
+      const query = () => requestJson(handle!.port, path, { method: 'POST', body,
+        headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' } });
+      const permitted = await query();
+      expect(permitted.status).toBe(200);
+      expect(permitted.json.context).toMatchObject({ sessionId, ownerOpenId: 'ou_owner', actorOpenId: 'ou_owner',
+        chatId: 'oc_origin', rootMessageId: 'om_origin', canTalk: true });
+      getBot(app).config.allowedUsers = ['ou_other'];
+      getBot(app).resolvedAllowedUsers = ['ou_other'];
+      expect((await query()).json.context.canTalk).toBe(false);
+      expect(permitted.bodyText).not.toContain('forged');
+    } finally { workerPool.setActiveSessionsRegistry(previous ?? new Map()); }
   });
 });

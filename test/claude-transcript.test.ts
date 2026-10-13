@@ -22,6 +22,9 @@ import {
   jsonlContainsFingerprint,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
+  isScheduledTurnStartEvent,
+  cronCreateToolUseIds,
+  cronCreateAcks,
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
@@ -1098,6 +1101,128 @@ describe('isMeaningfulUserEvent', () => {
   });
   it('rejects assistant-role events', () => {
     expect(isMeaningfulUserEvent(assistantEv('hi'))).toBe(false);
+  });
+});
+
+describe('isScheduledTurnStartEvent', () => {
+  const fire = (extra: Record<string, unknown> = {}): TranscriptEvent =>
+    userEv('cron prompt', {
+      isMeta: true,
+      turnOrigin: 'scheduled',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-uuid-1',
+      ...extra,
+    });
+  it('recognises a real CronCreate fire record', () => {
+    expect(isScheduledTurnStartEvent(fire())).toBe(true);
+  });
+  it('stays excluded from meaningful human input (no fingerprint bind)', () => {
+    expect(isMeaningfulUserEvent(fire())).toBe(false);
+  });
+  it('rejects a plain isMeta record without turnOrigin scheduled', () => {
+    expect(isScheduledTurnStartEvent(userEv('x', { isMeta: true }))).toBe(false);
+  });
+  it('rejects turnOrigin scheduled without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, turnOrigin: 'scheduled' }),
+    )).toBe(false);
+  });
+  it('rejects sidechain / compact records', () => {
+    expect(isScheduledTurnStartEvent(fire({ isSidechain: true }))).toBe(false);
+    expect(isScheduledTurnStartEvent(fire({ isCompactSummary: true }))).toBe(false);
+  });
+  it('rejects assistant / nullish events', () => {
+    expect(isScheduledTurnStartEvent(assistantEv('hi'))).toBe(false);
+    expect(isScheduledTurnStartEvent(null)).toBe(false);
+    expect(isScheduledTurnStartEvent(undefined)).toBe(false);
+  });
+
+  // Legacy fire records (Claude Code ≤2.1.280) carry no turnOrigin; they mark
+  // the prompt with promptSource:"system". The predicate must accept that
+  // shape while staying strict about isMeta and the mandatory fire id.
+  it('recognises a LEGACY fire: isMeta + promptSource system, no turnOrigin', () => {
+    const legacy = userEv('cron prompt', {
+      isMeta: true,
+      promptSource: 'system',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-legacy-1',
+    });
+    expect(isScheduledTurnStartEvent(legacy)).toBe(true);
+  });
+  it('rejects a turnOrigin other than scheduled even with a fire id', () => {
+    expect(isScheduledTurnStartEvent(fire({ turnOrigin: 'human' }))).toBe(false);
+  });
+  it('rejects a non-isMeta record even when promptSource is system and a fire id exists', () => {
+    const sneaky = userEv('cron prompt', {
+      promptSource: 'system',
+      scheduledFireId: 'fire-x',
+    });
+    expect(isScheduledTurnStartEvent(sneaky)).toBe(false);
+  });
+  it('rejects a legacy-shaped isMeta+system record without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, promptSource: 'system' }),
+    )).toBe(false);
+  });
+  it('requires promptSource system for a legacy (no-turnOrigin) isMeta record', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, scheduledFireId: 'fire-y' }),
+    )).toBe(false);
+  });
+});
+
+describe('cronCreateToolUseIds / cronCreateAcks', () => {
+  const callEv = (blockId: string, name = 'CronCreate'): TranscriptEvent => ({
+    type: 'assistant',
+    uuid: `call-${blockId}`,
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: blockId, name }] as any },
+  } as TranscriptEvent);
+  const resultEv = (blockId: string, text: string): TranscriptEvent => ({
+    type: 'user',
+    uuid: `res-${blockId}`,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: blockId, content: text }] as any },
+  } as TranscriptEvent);
+
+  it('collects CronCreate tool_use block ids and ignores other tools', () => {
+    expect(cronCreateToolUseIds(callEv('b1'))).toEqual(['b1']);
+    expect(cronCreateToolUseIds(callEv('b2', 'Read'))).toEqual([]);
+    expect(cronCreateToolUseIds(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateToolUseIds(null)).toEqual([]);
+  });
+
+  it('parses the recurring and one-shot ack task ids using REAL CLI wording', () => {
+    const recurring = resultEv('b1', 'Scheduled recurring job 08e02324 (7,37 * * * *). Use CronDelete to cancel sooner.');
+    // Real one-shot success text uses TASK, not job (Claude Code 2.1.276/2.1.284).
+    const oneshotTask = resultEv('b2', 'Scheduled one-shot task bf15f538 (34 18 20 9 *). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(recurring)).toEqual([{ toolUseId: 'b1', taskId: '08e02324' }]);
+    expect(cronCreateAcks(oneshotTask)).toEqual([{ toolUseId: 'b2', taskId: 'bf15f538' }]);
+  });
+
+  it('still accepts the older "one-shot job" wording and rejects lookalikes', () => {
+    const oneshotLegacy = resultEv('b3', 'Scheduled one-shot job abc_12-3 (2026-10-01 ...). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(oneshotLegacy)).toEqual([{ toolUseId: 'b3', taskId: 'abc_12-3' }]);
+    // A different noun must not match (defence in depth beyond the pending gate).
+    expect(cronCreateAcks(resultEv('b4', 'Scheduled one-shot thing 02b077c4 (x)'))).toEqual([]);
+    expect(cronCreateAcks(resultEv('b5', 'Scheduled recurring task 02b077c4 (x)'))).toEqual([]);
+  });
+
+  it('ignores unrelated tool_results and array-of-block content', () => {
+    expect(cronCreateAcks(resultEv('b1', 'tool ran successfully'))).toEqual([]);
+    const arrayContent: TranscriptEvent = {
+      type: 'user',
+      uuid: 'res-x',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'b9',
+          content: [{ type: 'text', text: 'Scheduled recurring job de137a7b (x).' }],
+        }] as any,
+      },
+    } as TranscriptEvent;
+    expect(cronCreateAcks(arrayContent)).toEqual([{ toolUseId: 'b9', taskId: 'de137a7b' }]);
+    expect(cronCreateAcks(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateAcks(null)).toEqual([]);
   });
 });
 

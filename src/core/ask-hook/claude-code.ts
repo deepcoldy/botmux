@@ -46,7 +46,7 @@
  */
 
 import type { AskQuestion } from '../ask-types.js';
-import type { HookAskAdapter, ParsedAsk } from './types.js';
+import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY, type HookAskAdapter, type ParsedAsk } from './types.js';
 
 /** 从 payload 中提取原始 questions 数组（用于写回 updatedInput.questions）。 */
 function extractRawQuestions(payload: unknown): Array<Record<string, unknown>> {
@@ -128,7 +128,67 @@ const claudeCodeAdapter: HookAskAdapter = {
     // 错误地"答空"掉（非 botmux 会话 / daemon 不可达时尤其有害）。
     return '';
   },
+
+  parsePermissionRequest(payload: unknown): ParsedAsk | null {
+    if (!payload || typeof payload !== 'object') return null;
+    const p = payload as Record<string, unknown>;
+    if (p.hook_event_name !== 'PermissionRequest') return null;
+    // AskUserQuestion 的 PermissionRequest 由 parseQuestions 走提问卡片（迁移期兼容），
+    // 这里不当成权限确认，避免一次提问被拆成「允许/拒绝」。
+    const toolName = typeof p.tool_name === 'string' ? p.tool_name : '';
+    if (!toolName || toolName === 'AskUserQuestion') return null;
+
+    const prompt = [
+      `Claude 请求执行一个需要人工确认的操作（终端已弹出确认框，会话在等待）。`,
+      `工具：${toolName}`,
+      ...describeToolInput(p.tool_input),
+    ].join('\n');
+    return {
+      questions: [{
+        prompt,
+        multiSelect: false,
+        options: [
+          { key: PERMISSION_ALLOW_KEY, label: '允许执行' },
+          { key: PERMISSION_DENY_KEY, label: '拒绝' },
+        ],
+      }],
+      raw: payload,
+    };
+  },
+
+  formatPermissionDecision(allow: boolean, message?: string): string {
+    const decision: Record<string, unknown> = { behavior: allow ? 'allow' : 'deny' };
+    if (!allow && message) decision.message = message;
+    return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } });
+  },
 };
+
+/** 卡片问题正文会被截到 512 字，这里给每段留足余量，优先保住命令本体。 */
+const PERMISSION_INPUT_MAX = 360;
+
+function clip(text: string, max: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+function describeToolInput(toolInput: unknown): string[] {
+  if (!toolInput || typeof toolInput !== 'object') return [];
+  const ti = toolInput as Record<string, unknown>;
+  const lines: string[] = [];
+  if (typeof ti.description === 'string' && ti.description.trim()) {
+    lines.push(`说明：${clip(ti.description, 120)}`);
+  }
+  if (typeof ti.command === 'string') {
+    lines.push(`命令：${clip(ti.command, PERMISSION_INPUT_MAX)}`);
+  } else if (typeof ti.file_path === 'string') {
+    lines.push(`文件：${clip(ti.file_path, PERMISSION_INPUT_MAX)}`);
+  } else {
+    let json = '';
+    try { json = JSON.stringify(ti); } catch { /* 不可序列化 → 不展示参数 */ }
+    if (json && json !== '{}') lines.push(`参数：${clip(json, PERMISSION_INPUT_MAX)}`);
+  }
+  return lines;
+}
 
 function hookEventName(payload: unknown): 'PreToolUse' | 'PermissionRequest' {
   if (payload && typeof payload === 'object') {

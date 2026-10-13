@@ -1,3 +1,4 @@
+import type { WorkspaceMetadata } from '../../core/workspace-metadata.js';
 export const WORKBENCH_MAIN_ROUTE = '#/agent-workbench';
 export const WORKBENCH_DOCK_ROUTE = '#/agent-workbench-dock';
 export const WORKBENCH_RAIL_DEFAULT = 300;
@@ -11,9 +12,9 @@ export type WorkbenchSplitAxis = 'horizontal' | 'vertical';
 export type WorkbenchSessionGroup = 'needs-you' | 'active' | 'recent';
 
 /** 列表分组维度。'status' 是默认，也是旧三组（待你处理/进行中/最近）的那套语义。 */
-export type WorkbenchGroupDimension = 'status' | 'bot' | 'chat' | 'kind' | 'cli' | 'time';
+export type WorkbenchGroupDimension = 'status' | 'bot' | 'chat' | 'kind' | 'cli' | 'time' | 'worktree';
 
-/** 下拉里的六个维度，顺序即展示顺序。 */
+/** 下拉里的七个维度，顺序即展示顺序。 */
 export const WORKBENCH_GROUP_DIMENSIONS: readonly { value: WorkbenchGroupDimension; label: string }[] = [
   { value: 'status', label: '状态' },
   { value: 'bot', label: '机器人' },
@@ -21,6 +22,7 @@ export const WORKBENCH_GROUP_DIMENSIONS: readonly { value: WorkbenchGroupDimensi
   { value: 'kind', label: '类型' },
   { value: 'cli', label: 'CLI' },
   { value: 'time', label: '活跃时间' },
+  { value: 'worktree', label: 'Worktree' },
 ];
 
 export function isWorkbenchGroupDimension(value: unknown): value is WorkbenchGroupDimension {
@@ -33,6 +35,7 @@ export interface WorkbenchPreviewDescriptor {
 }
 
 export interface WorkbenchSessionRow {
+  workspace?: WorkspaceMetadata | null;
   sessionId: string;
   status: string;
   larkAppId?: string;
@@ -106,6 +109,7 @@ export interface WorkbenchDynamicGroup {
   key: string;
   label: string;
   kind: 'needs-you' | 'plain';
+  detail?: string;
   sessions: WorkbenchSessionRow[];
 }
 
@@ -119,6 +123,7 @@ export type WorkbenchListItem =
       groupKey: string;
       label: string;
       count: number;
+      detail?: string;
       isNeedsYou: boolean;
       /** 该组当前是折叠的：组头照常渲染，但它下面的会话行一个都不在列表里。 */
       collapsed?: boolean;
@@ -344,6 +349,9 @@ export function sessionSearchText(session: WorkbenchSessionRow): string {
     session.botName,
     session.cliId,
     session.repoName,
+    session.workspace?.rootPath,
+    session.workspace?.displayName,
+    session.workspace?.branch,
     session.workingDir,
     session.gitBranch,
     session.chatDisplayName,
@@ -434,12 +442,38 @@ function timeGroupLabel(activityAt: number, bounds: TimeBucketBounds): string {
 
 /** 一个会话在某个维度下落进哪个桶。key 带维度前缀，避免和 needs-you/active/recent
  *  这些保留 key 撞车（真有机器人叫「active」也不会串组）。 */
+/** The host owns path canonicalisation. Never fold case or resolve paths in the browser. */
+export function workbenchWorkspaceBucket(session: WorkbenchSessionRow): { key: string; label: string } {
+  const ws = session.workspace;
+  if (ws?.rootPath && ws.kind !== 'unknown') {
+    const name = ws.displayName || ws.rootPath;
+    const suffix = ws.kind === 'git' ? '' : ' · 工作目录';
+    const state = ws.state === 'missing' ? ' · 已删除' : ws.state === 'error' ? ' · 无法读取' : '';
+    return { key: `worktree:${JSON.stringify([ws.sourceId, ws.kind, ws.rootPath])}`,
+      label: `${name}${suffix}${state}` };
+  }
+  // An unsupported execution environment has no proven shared namespace.
+  // Keep its sessions separate, even when their textual cwd is identical.
+  if (session.workingDir) return {
+    key: `worktree:${JSON.stringify(['unresolved', session.larkAppId, session.sessionId])}`,
+    label: `${session.workingDir.split(/[\\/]/).filter(Boolean).pop() || session.workingDir} · 未识别工作区`,
+  };
+  return { key: 'worktree:unknown', label: '未识别工作区' };
+}
+
+export function workbenchWorkspaceDetail(session: WorkbenchSessionRow): string {
+  const ws = session.workspace;
+  return [ws?.rootPath || session.workingDir, ws?.branch,
+    ws?.sourceId ? `来源 ${ws.sourceId.slice(0, 8)}` : '来源未识别'].filter(Boolean).join(' · ');
+}
+
 function sessionBucket(
   session: WorkbenchSessionRow,
   dimension: WorkbenchGroupDimension,
   bounds: TimeBucketBounds,
 ): { key: string; label: string } {
   switch (dimension) {
+    case 'worktree': return workbenchWorkspaceBucket(session);
     case 'bot': {
       const label = trimmed(session.botName) || '未知机器人';
       return { key: `bot:${label}`, label };
@@ -510,9 +544,17 @@ export function groupWorkbenchSessionsForDimension(
     const bucket = sessionBucket(session, dimension, bounds);
     const existing = buckets.get(bucket.key);
     if (existing) existing.sessions.push(session);
-    else buckets.set(bucket.key, { key: bucket.key, label: bucket.label, kind: 'plain', sessions: [session] });
+    else buckets.set(bucket.key, { key: bucket.key, label: bucket.label, kind: 'plain', sessions: [session],
+      ...(dimension === 'worktree' ? { detail: workbenchWorkspaceDetail(session) } : {}) });
   }
 
+  if (dimension === 'worktree') {
+    const labels = new Map<string, number>();
+    for (const group of buckets.values()) labels.set(group.label, (labels.get(group.label) ?? 0) + 1);
+    for (const group of buckets.values()) {
+      if ((labels.get(group.label) ?? 0) > 1) group.label += ` · 来源 ${group.sessions[0].workspace?.sourceId.slice(0, 8) || '未知'} · ${group.sessions[0].workspace?.rootPath || group.sessions[0].workingDir || ''}`;
+    }
+  }
   const order = FIXED_GROUP_ORDER[dimension];
   const plain = [...buckets.values()];
   if (order) {
@@ -581,6 +623,7 @@ export function flattenWorkbenchGroups(
       groupKey: group.key,
       label: group.label,
       count: group.sessions.length,
+      detail: group.detail,
       isNeedsYou,
       collapsed,
     });

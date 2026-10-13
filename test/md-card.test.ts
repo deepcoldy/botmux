@@ -199,6 +199,102 @@ describe('buildCardBodyElements', () => {
     expect(content).toMatch(/```\n\nnext prose/);
   });
 
+  it('lifts a code fence out of an ordered list into its own card element', () => {
+    const input = [
+      '1. Read the value.',
+      '2. When it is missing, run:',
+      '   ```cpp',
+      '   values.assign(128, 0.f);',
+      '   return true;',
+      '   ```',
+      '3. Continue processing.',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '1. Read the value.\n2. When it is missing, run:' },
+      { tag: 'markdown', content: '```cpp\nvalues.assign(128, 0.f);\nreturn true;\n```' },
+      { tag: 'markdown', content: '3. Continue processing.' },
+    ]);
+  });
+
+  it.each([
+    ['- Run:', '  ', '- Done.'],
+    ['- Outer\n  - Run:', '    ', '  - Done.'],
+    ['> Run:', '> ', '> Done.'],
+    ['> - Run:', '>   ', '> - Done.'],
+  ])('lifts nested fences after %s without treating code as prose', (before, prefix, after) => {
+    const code = ['if (ready) {', '  execute();', '', '', '', '}', '![literal](https://example.com/image.png)', '', ''];
+    const input = [before, prefix + '````text', ...code.map(line => prefix + line), prefix + '````', after].join('\n');
+    const elements = buildCardBodyElements(input);
+    expect(elements).toHaveLength(3);
+    expect(elements[1]).toEqual({ tag: 'markdown', content: '````text\n' + code.join('\n') + '\n````' });
+    expect(elements[0].content).toContain('Run:');
+    expect(elements[2].content).toContain('Done.');
+  });
+
+  it('keeps multiple code blocks and intervening list-item prose in order', () => {
+    const input = [
+      '- Start', '  ```js', '  first();', '  ```',
+      '', '  Continue', '',
+      '  ~~~js', '  second();', '  ~~~', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue' },
+      { tag: 'markdown', content: '~~~js\nsecond();\n~~~' },
+      { tag: 'markdown', content: '- Done' },
+    ]);
+  });
+
+  it('lifts indented code in a list without closing on literal backticks', () => {
+    const input = ['- Example:', '', '      ```', '      literal', '      ```', '', '- Done'].join('\n');
+    expect(buildCardBodyElements(input)[1]).toEqual({
+      tag: 'markdown', content: '````\n```\nliteral\n```\n````',
+    });
+  });
+
+  it('does not turn deeply indented continuation paragraphs into code after a lifted fence', () => {
+    const input = [
+      '- Outer', '  - Start', '    ```js', '    first();', '    ```',
+      '', '    Continue', '', '    Another paragraph', '', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Outer\n  - Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue\n\nAnother paragraph\n\n- Done' },
+    ]);
+  });
+
+  it('keeps code-only list items and empty code fences', () => {
+    expect(buildCardBodyElements('- ```js\n  run();\n  ```\n- ```\n  ```')).toEqual([
+      { tag: 'markdown', content: '```js\nrun();\n```' },
+      { tag: 'markdown', content: '```\n```' },
+    ]);
+  });
+
+  it('keeps other blocks between lifted code and continuation paragraphs', () => {
+    const input = '- Start\n  ```js\n  run();\n  ```\n\n  ### Details\n\n  First paragraph\n\n  Second paragraph';
+    const elements = buildCardBodyElements(input);
+    expect(elements[2].content).toBe('### Details\n\nFirst paragraph\n\nSecond paragraph');
+  });
+
+  it('keeps source indentation of multi-paragraph list items when no code is lifted', () => {
+    // The startLine > map[0] guard must keep the generic source-slice path
+    // for paragraphs before any lifted code: stripping their indentation here
+    // would make CommonMark render the later paragraphs outside the list item.
+    const input = '- a\n\n  p1\n\n  p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- a\n\n  p1\n\n  p2' },
+    ]);
+  });
+
+  it('keeps source markers of multi-paragraph quotes when no code is lifted', () => {
+    const input = '> q\n>\n> p1\n>\n> p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '> q\n>\n> p1\n>\n> p2' },
+    ]);
+  });
+
   it('Bug B: 3-backtick nested fences don\'t corrupt later prose', () => {
     // CommonMark treats this as TWO adjacent code blocks (the "outer" closes
     // at the first inner ```). markdown-it parses the same way. The
@@ -1516,11 +1612,11 @@ describe('buildImageCardElements', () => {
     expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a)');
   });
 
-  it('group with all indices out of range → literal text preserved', () => {
+  it('group with all indices out of range → readable omitted-image notice', () => {
     const out = buildImageCardElements('![](img:7,8)', [K[0]]);
     expect(out.some(e => e.tag === 'column_set')).toBe(false);
     const md = mdElements(out).map(e => e.content).join('');
-    expect(md).toContain('![](img:7,8)');
+    expect(md).toContain('[Image omitted] [](img:7,8)');
   });
 });
 

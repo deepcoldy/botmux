@@ -52,6 +52,24 @@ describe('GET trigger-result — steer park-chain mirror after a daemon restart'
     rmSync(dataDir, { recursive: true, force: true });
   });
 
+  it('mirrors an interrupted steer successor after restart and preserves the interrupt timestamp', async () => {
+    const sid = 'sid-steer-park-interrupted';
+    asyncTriggerStore.recordPending(sid, 'trg_root', 1000, OWNER);
+    asyncTriggerStore.recordPending(sid, 'trg_mid', 1500, OWNER);
+    asyncTriggerStore.recordPending(sid, 'trg_head', 2000, OWNER);
+    asyncTriggerStore.recordSteerParked(sid, 'trg_root', 'trg_mid', 1200, OWNER);
+    asyncTriggerStore.recordSteerParked(sid, 'trg_mid', 'trg_head', 1700, OWNER);
+    asyncTriggerStore.recordInterruptedStrict(sid, 'trg_head', 3000, OWNER);
+
+    for (const triggerId of ['trg_root', 'trg_mid']) {
+      const res = await poll(sid, triggerId);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, state: 'interrupted', triggerId });
+      expect(asyncTriggerStore.lookup(sid, triggerId)?.result).toMatchObject({ status: 'interrupted', interruptedAt: 3000 });
+      expect(asyncTriggerStore.lookup(sid, triggerId)?.result.steerParkedBy).toBeUndefined();
+    }
+  });
+
   it('mirrors a completed successor: parked member resolves with the merged answer and NO usage', async () => {
     const sid = 'sid-steer-park-completed';
     asyncTriggerStore.recordPending(sid, 'trg_root', 1000, OWNER);

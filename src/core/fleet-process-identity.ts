@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readlinkSync } from 'node:fs';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import type { FleetState } from './fleet-supervisor-policy.js';
 
 export interface FleetProcessAttestation {
   pid: number;
@@ -25,6 +26,7 @@ export type FleetProcessInspection =
 const BUILTIN_FLEET_ENTRY_MARKERS = {
   daemon: { token: '__daemon', script: 'index-daemon.js' },
   dashboard: { token: '__dashboard', script: 'index-dashboard.js' },
+  supervisor: { token: '__supervisor', script: 'index-supervisor.js' },
 } as const;
 
 function commandLineHasArg(commandLine: string, arg: string): boolean {
@@ -39,7 +41,7 @@ function commandLineHasArg(commandLine: string, arg: string): boolean {
  * token. Both markers survive upgrades and worktree switches.
  */
 export function builtinFleetEntryMatches(
-  entry: 'daemon' | 'dashboard',
+  entry: keyof typeof BUILTIN_FLEET_ENTRY_MARKERS,
   commandLine: string,
 ): boolean {
   const { token, script } = BUILTIN_FLEET_ENTRY_MARKERS[entry];
@@ -145,6 +147,31 @@ export function inspectFleetProcess(
       },
     }
     : { status: 'stale' };
+}
+
+function supervisorCommandMatches(state: FleetState, commandLine: string): boolean {
+  if (state.supervisorEntry && !commandLine.includes(state.supervisorEntry)) return false;
+  // Pre-identity fleet-state rows have no persisted entry/command. Keep their
+  // one-release migration path narrow: require an exact built-in role marker;
+  // inspectFleetProcess still samples the process birth identity twice and the
+  // returned attestation rechecks both identity and command before signalling.
+  return builtinFleetEntryMatches('supervisor', commandLine);
+}
+
+export function inspectSupervisorState(
+  state: FleetState,
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): FleetProcessInspection {
+  const pid = state?.supervisorPid ?? 0;
+  return inspectFleetProcess(
+    pid,
+    state.supervisorProcessStart,
+    state.supervisorPidNamespace,
+    commandLine => state.supervisorCommand
+      ? commandLine === state.supervisorCommand
+      : supervisorCommandMatches(state, commandLine),
+    runtime,
+  );
 }
 
 /** Re-check the birth identity immediately before addressing a PID. */

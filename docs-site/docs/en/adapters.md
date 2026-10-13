@@ -40,6 +40,14 @@ The table lists the current built-in adapters (the **authoritative source** for 
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
 
+## Pi execution progress
+
+Bots configured with `cliId: "pi"` display Pi's persisted thinking text, narration, tool calls and results in the Lark progress bubble. Tool nodes show commands or file paths and finish with the current turn; the final answer is sent through the reply channel.
+
+Progress is enabled by default and respects `cotEnabled` and the chat-level `/cot on` / `/cot off` switches. `/cot show` displays activity accumulated in the current turn.
+
+Updates follow complete messages written by Pi: calls appear before tool execution and results after execution. Content that has not been persisted is not streamed token by token. Historical records are not replayed into a new turn's bubble.
+
 ## DeepSeek Harness (dsh)
 
 `cliId: "dsh"` drives a local `dsh` CLI (the [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner via `dsh --profile <name>` over the SDK JSON-RPC protocol. Prerequisites:
@@ -122,8 +130,24 @@ For the **specific wrapper scripts** of each gateway, use the docs published by 
 1. Create a new file under `src/adapters/cli/` implementing the `CliAdapter` interface
 2. Add the new ID to the `CliId` union type in `src/adapters/cli/types.ts`
 3. Add the import / switch case / export in `src/adapters/cli/registry.ts`
-4. Add the display name to `CLI_DISPLAY_NAMES` in `src/worker.ts` and `cliDisplayNames` in `card-builder.ts`
+4. Add the display name to `CLI_DISPLAY_NAMES` in `src/adapters/cli/display-names.ts` (shared by cards, the worker and the setup / dashboard pickers)
 5. Add an option to the setup interactive menu in `src/cli.ts`
 6. Update the README
 
 See [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md) for details.
+
+## Native Codex App questions
+
+Botmux-managed `codex-app` sessions and `codex` sessions using app-server RPC bridge native `request_user_input` requests to Lark ask cards. A selection or text reply in the current conversation is returned under the original question IDs to the same native turn. TRAE RPC uses the same bridge.
+
+A batch preserves all questions and option descriptions. Text-only questions appear on a card awaiting a conversation text reply. A batch containing text-only questions is answered entirely through one text reply. Recommended labels are never accepted automatically. A text reply supplies the same batch-level comment to the questions, without including unsubmitted selections. Existing Ask routing and responder permissions apply.
+
+The wait lasts up to one hour. Dispatch errors, timeout, invalidation, or unsupported questions interrupt the native turn instead of returning empty answers. Turn completion, process exit, and session shutdown cancel pending waits; late answers are ignored. Native waits are not retried or restored across daemon restarts.
+
+Choice questions require at least two options. Secret inputs and malformed batches fail explicitly without answering only part of the batch. Do not send secrets through chat cards. Workflow subagents use `humanGate` / decision nodes instead. API-only sessions without Lark transport, ordinary terminal paste mode, and the App history service do not use this bridge.
+
+To verify, ask a model in an ordinary Codex App session to use native `request_user_input` for a choice question. Confirm the Lark card appears, then submit and confirm the same turn continues with your answer. Native tool availability still depends on the Codex version and execution mode.
+
+Card structure preview (rendered locally from actual card JSON; live Lark interaction has not yet been manually verified):
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

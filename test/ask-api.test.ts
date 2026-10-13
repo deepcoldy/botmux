@@ -25,6 +25,23 @@ function validBody(over: Record<string, unknown> = {}) {
 }
 
 describe('parseAskBody — happy path', () => {
+  it('parses explicit result acknowledgement without treating it as a new Ask', () => {
+    expect(parseAskBody(validBody({ requestId: 'stable', originKind: 'explicit', acknowledge: true }))).toMatchObject({ acknowledge: true, requestId: 'stable' });
+  });
+  it.each(['true', 1, null])('rejects non-boolean acknowledgement %s', acknowledge => {
+    expect(parseAskBody(validBody({ acknowledge }))).toEqual({ error: 'bad_acknowledge' });
+  });
+  it.each(['host_explicit', 'host_cross_principal_wait', 'host_anything'])
+  ('rejects daemon-internal host_ originKind %s over HTTP', originKind => {
+    // host_* claimants are constructed in-process only; a client typing one
+    // would collect broker GC/handoff exemptions without a daemon-owned record.
+    expect(parseAskBody(validBody({ originKind }))).toEqual({ error: 'bad_originKind' });
+  });
+  it('still accepts the client-facing explicit originKind', () => {
+    const out = parseAskBody(validBody({ originKind: 'explicit' }));
+    expect('error' in out).toBe(false);
+  });
+
   it('accepts a fully populated body and returns the parsed shape', () => {
     const out = parseAskBody(validBody());
     expect('error' in out).toBe(false);
@@ -108,6 +125,26 @@ describe('parseAskBody — validation', () => {
       }),
     );
     expect(out).toEqual({ error: 'duplicate_option_key' });
+  });
+});
+
+describe('parseAskBody — supported request semantics', () => {
+  it('rejects an unsupported request contract instead of reducing it to an ordinary Ask', () => {
+    expect(parseAskBody(validBody({
+      requestId: 'original-request', originKind: 'explicit',
+      requiredContract: { kind: 'durable-approval', revision: 1 },
+    }))).toEqual({ error: 'unsupported_fields' });
+  });
+
+  it('preserves native hook identity while leaving route claims to the authorizer', () => {
+    const out = parseAskBody(validBody({
+      requestId: 'original-hook', originKind: 'hook',
+      originCapability: 'fixture-capability', originTurnId: 'original-turn', originDispatchAttempt: 2,
+    }));
+    expect(out).toMatchObject({ requestId: 'original-hook', originKind: 'hook' });
+    expect(out).not.toHaveProperty('originCapability');
+    expect(out).not.toHaveProperty('originTurnId');
+    expect(out).not.toHaveProperty('originDispatchAttempt');
   });
 });
 

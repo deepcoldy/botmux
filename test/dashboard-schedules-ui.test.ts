@@ -21,12 +21,25 @@ import {
   scheduleExecutionPlacement,
   initialScheduleEditPosition,
   scheduleTargetChatIds,
+  scheduleCalendarLabel,
 } from '../src/dashboard/web/schedules-page.js';
 
 const TRUSTED_FILE_ROOT = '/srv/botmux-data/schedule-preconditions/trusted-files';
 const TRUSTED_FILE_PATH = `${TRUSTED_FILE_ROOT}/check-ready.sh`;
 
 describe('dashboard schedules React page helpers', () => {
+  it('shows localized calendar names and day selections instead of a builtin ID', () => {
+    const names = { zh: '中国法定工作日历', en: 'China Statutory Work Calendar' };
+    expect(scheduleCalendarLabel('cn', names, 'zh')).toBe(names.zh);
+    expect(scheduleCalendarLabel('cn', names, 'en')).toBe(names.en);
+    expect(scheduleCalendarLabel('company', { zh: '公司日历' }, 'en')).toBe('公司日历');
+    expect(scheduleCalendarLabel('company', undefined, 'zh')).toBe('company');
+    for (const lang of ['zh', 'en'] as const) {
+      const t = createDashboardTranslator(lang);
+      expect(t('schedules.calendarDayType.workday')).not.toBe(t('schedules.calendarDayType.restday'));
+      expect(t('schedules.form.calendar')).not.toContain('schedules.form');
+    }
+  });
   it('clears the previous Bash source from the browser cache on a live replacement', () => {
     store.replaceSnapshot([], [{
       id: 'schedule-precondition-live',
@@ -152,6 +165,7 @@ describe('dashboard schedules React page helpers', () => {
     expect(countScheduleRunHistory(newestFirst)).toEqual({
       model_dispatched: 1,
       precondition_skipped: 1,
+      calendar_skipped: 0,
       error: 1,
     });
 

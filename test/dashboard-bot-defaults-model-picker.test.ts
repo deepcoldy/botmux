@@ -9,6 +9,7 @@ import {
 
 const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
 const onboarding = readFileSync(new URL('../src/dashboard/web/bot-onboarding.tsx', import.meta.url), 'utf8');
+const fieldControls = readFileSync(new URL('../src/dashboard/web/field-controls.tsx', import.meta.url), 'utf8');
 const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.url), 'utf8');
 
 const cliState: CliOptionsState = {
@@ -19,15 +20,18 @@ const cliState: CliOptionsState = {
 
 // 源码断言：两处模型输入都换成 ModelPickerField，旧的裸文本框 + datalist 已移除。
 describe('ModelPickerField 源码接线', () => {
-  it('bot-defaults-page 导出 ModelPickerField，BotAgentSection 使用它', () => {
-    expect(page).toMatch(/export function ModelPickerField\b/);
+  it('field-controls 导出 ModelPickerField，BotAgentSection 使用它', () => {
+    expect(fieldControls).toMatch(/export function ModelPickerField\b/);
     const agentSection = page.slice(page.indexOf('export function BotAgentSection'));
     expect(agentSection).toContain('<ModelPickerField');
     expect(agentSection).toContain('dataInput="agentModel"');
   });
 
-  it('onboarding 也使用 ModelPickerField', () => {
-    expect(onboarding).toContain("import { ModelPickerField } from './bot-defaults-page.js';");
+  it('onboarding 也使用 ModelPickerField，且不静态依赖懒加载的 bot-defaults-page', () => {
+    // onboarding 被 app.tsx 静态引入：若它从 bot-defaults-page 取控件，整页
+    // （8k 行）会被打进首屏 chunk，路由级懒加载失效。
+    expect(onboarding).toContain("import { ModelPickerField } from './field-controls.js';");
+    expect(onboarding).not.toContain("from './bot-defaults-page.js'");
     expect(onboarding).toContain('<ModelPickerField');
     expect(onboarding).toContain('dataInput="ob-model"');
   });
@@ -103,6 +107,39 @@ describe('fetchDetectedModels (fail-soft)', () => {
       json: async () => ({ models: ['a', 'b'], source: 'live', detectedAt: 123 }),
     })));
     expect(await fetchDetectedModels('codex')).toEqual({ models: ['a', 'b'], source: 'live' });
+  });
+
+  it('携带 Bot ID 让服务端按该 Bot 的 runtime/env 探测', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ models: ['a'], source: 'static' }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchDetectedModels('codex', 'cli_runtime_bot');
+    expect(fetchMock).toHaveBeenCalledWith('/api/cli-options/models?key=codex&bot=cli_runtime_bot');
+  });
+
+  it('200 可选返回模型能力目录，并过滤形状异常的条目', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: ['gpt-6-astra'],
+        source: 'live',
+        detectedAt: 123,
+        modelCapabilities: [
+          { slug: 'gpt-6-astra', serviceTiers: ['priority', 1] },
+          { slug: 2, serviceTiers: ['priority'] },
+          'bad',
+        ],
+      }),
+    })));
+    expect(await fetchDetectedModels('codex')).toEqual({
+      models: ['gpt-6-astra'],
+      source: 'live',
+      modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+    });
   });
 
   it('过滤非字符串项；source 非 live 归为 static', async () => {

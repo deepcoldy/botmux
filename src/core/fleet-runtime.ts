@@ -29,9 +29,11 @@ import {
   signalAttestedFleetProcess,
   type FleetProcessAttestation,
   type FleetProcessIdentityRuntime,
-  type FleetProcessInspection,
   fleetProcessIdentityRuntime,
+  inspectSupervisorState,
 } from './fleet-process-identity.js';
+
+export { inspectSupervisorState };
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -258,28 +260,6 @@ export function resolveFleetMembers(): FleetBotSpec[] {
   return [...resolveFleetBots(), resolveDashboardSpec()];
 }
 
-function supervisorCommandMatches(state: FleetState, commandLine: string): boolean {
-  if (!state.supervisorEntry || !commandLine.includes(state.supervisorEntry)) return false;
-  return state.supervisorEntry.includes('index-supervisor') || commandLine.includes('__supervisor');
-}
-
-export function inspectSupervisorState(
-  state: FleetState,
-  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
-): FleetProcessInspection {
-  const pid = state?.supervisorPid ?? 0;
-  if (pid > 1 && !state.supervisorCommand && !state.supervisorEntry) return { status: 'unverifiable' };
-  return inspectFleetProcess(
-    pid,
-    state.supervisorProcessStart,
-    state.supervisorPidNamespace,
-    commandLine => state.supervisorCommand
-      ? commandLine === state.supervisorCommand
-      : supervisorCommandMatches(state, commandLine),
-    runtime,
-  );
-}
-
 export function liveSupervisorTarget(
   statePath: string = fleetStatePath(),
   runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
@@ -323,8 +303,13 @@ export interface StartFleetResult {
  * outlives this CLI (detached + unref), with stdout/err to the botmux log dir;
  * boot persistence (systemd/launchd) re-invokes `botmux start` → here.
  *
- * NOTE: the caller must already hold the fleet-mutation file lock so two
- * concurrent `botmux start` invocations can't both pass the liveness check.
+ * NOTE: the caller must already hold the fleet-mutation file lock. That alone
+ * does NOT make the check-then-spawn exclusive: the spawned supervisor records
+ * itself in fleet-state only after its own boot, so a second `botmux start`
+ * in that window still sees no supervisor. The single-owner guarantee is
+ * completed supervisor-side by FleetSupervisor's ownership claim, which makes
+ * the later of two concurrently spawned supervisors exit without touching
+ * anything.
  */
 export interface StartFleetOptions {
   refreshPersistedEnv?: boolean;

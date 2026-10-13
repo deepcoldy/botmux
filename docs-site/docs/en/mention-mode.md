@@ -29,6 +29,28 @@ Send in a regular group (in a multi-bot group @ the specific bot):
 - Querying (`status`, or no argument) only requires talk access; **changing the mode requires operate rights** (owner / `allowedUsers`).
 - A per-group change takes effect immediately, affects only that group, and never touches the bot-level default.
 
+## Configure the single-human/single-bot exception
+
+A group with one human and one bot bypasses the mention requirement by default. To make these groups follow the mention policy too, configure the bot's [bots.json](/en/bots-json) entry:
+
+```json
+{
+  "regularGroupMentionMode": "always",
+  "soloGroupMentionBypass": false,
+  "chatSoloGroupMentionBypass": {
+    "oc_example": true
+  }
+}
+```
+
+- `soloGroupMentionBypass`: bot-level switch. Omitted / `true` preserves the existing bypass; `false` disables this exception.
+- `chatSoloGroupMentionBypass`: per-chat overrides. Explicit `true` / `false` takes precedence over the bot default; remove a chat entry to restore inheritance. The example keeps the exception for `oc_example` only. To disable it for just one chat, leave the bot default unchanged and set that chat to `false` in this map.
+- Run `botmux restart` after manual edits. The switch covers new and existing sessions in regular and topic groups, with no effect on DMs. Talk permissions and yielding to mentions of other members still apply.
+
+With the exception disabled, the **effective mention policy** (per-chat first) decides whether to respond: `always` requires @; `topic` still allows non-@ replies in owned threads; `never` / `ambient` retain their semantics. Under `always` / `topic`, ordinary top-level text and image messages without @ no longer trigger sessions merely because the group is small.
+
+Explicit message listeners, no-@ commands, substitute triggers and auto-start on group join / new topic remain independent. This switch only disables the implicit membership-based exception. For strict @-only operation, set it to `false`, set the target chat's mention policy to `always`, and check for other explicitly enabled triggers in that chat.
+
 ## Mode is `always`, so why does it still answer without an @? — the 8 no-@ exceptions
 
 "Must be @-mentioned" is the main default rule, but the code also has a set of parallel no-@ clauses; matching any one of them makes the bot respond. When the bot "won't listen", it is almost always one of these:
@@ -40,7 +62,7 @@ Send in a regular group (in a multi-bot group @ the specific bot):
 5. **The mode is `ambient` and the message does not @-mention anyone else**.
 6. **The mode is `topic` and the message is inside a topic the bot owns**.
 7. **No-@ slash commands**: commands configured in `commandTriggers` (e.g. `/solve` in some groups) also fire when sent bare in a regular group (top-level or inside an in-group thread); it only opens up allowlisted commands, not the whole group.
-8. **1-person-1-bot group**: when a group contains exactly 1 human and 1 bot, @ was never needed (decided live from group membership; the moment another member is @-mentioned the exception stops applying, preventing the old bot from grabbing the turn in the cache window right after a new bot is pulled in).
+8. **1-person-1-bot group**: @ is not required by default; disable this exception with `soloGroupMentionBypass` / `chatSoloGroupMentionBypass` above. When enabled, group membership decides; mentioning another member immediately disables the exception, preventing the old bot from grabbing the turn in the cache window right after a new bot is pulled in.
 
 Except for the message listener (clause 3), every clause still requires the sender to **have talk access**. In multi-bot groups where you want the bots not to talk over each other, prefer `ambient`: whoever is named answers.
 

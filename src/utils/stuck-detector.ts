@@ -125,8 +125,10 @@ export function matchHookReviewScreen(snapshot: string): 'hook review level 1' |
 /** Codex startup review is a separate three-choice screen from the detailed
  * Hooks browser. It owns Enter/arrow keys, so normal BotMux input must not be
  * pasted into it. The patterns below follow the official `rust-v0.147.0`
- * snapshot: every rendered line has a left margin and `›` may mark ANY
- * selected option. Keep the signature strict and footer-anchored to avoid
+ * snapshot: every rendered line has a left margin and `›`/`>`/`»` may mark the
+ * selected option (`»` is the cursor codex ≥0.154 draws; omitting it let the
+ * hold gate fail open on that version, so queued IM could land on this menu).
+ * Keep the signature strict and footer-anchored to avoid
  * treating quoted discussion text as an active menu.
  *
  * The footer is rendered from the active keymap. Like the existing detailed
@@ -147,9 +149,9 @@ function isStartupHookReviewScreen(snapshot: string): boolean {
   const region = trimmed.slice(Math.max(0, trimmed.length - 18)).join('\n');
   return /^\s*Hooks need review$/im.test(region)
     && /^\s*\d+\s+hooks?\s+(?:is|are) new or changed\.$/im.test(region)
-    && /^\s*[›>]?\s*1\.\s+Review hooks$/im.test(region)
-    && /^\s*[›>]?\s*2\.\s+Trust all and continue$/im.test(region)
-    && /^\s*[›>]?\s*3\.\s+Continue without trusting \(hooks won't run\)$/im.test(region);
+    && /^\s*[›>»]?\s*1\.\s+Review hooks$/im.test(region)
+    && /^\s*[›>»]?\s*2\.\s+Trust all and continue$/im.test(region)
+    && /^\s*[›>»]?\s*3\.\s+Continue without trusting \(hooks won't run\)$/im.test(region);
 }
 
 /** A Hook-review menu owns Enter/arrow keys instead of the normal Codex

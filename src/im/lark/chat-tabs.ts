@@ -72,13 +72,19 @@ export async function ensureUrlChatTab(
     && comparableUrl(tab.tab_content.url) === comparableUrl(url));
   if (!existing) {
     const created = await addUrlChatTab(larkAppId, chatId, url, name);
-    const tab = created[0];
+    // Feishu returns the complete post-mutation tab list, not necessarily the
+    // newly created tab first. The built-in message tab is commonly index 0.
+    const tab = created.find(candidate =>
+      candidate.tab_type === 'url'
+      && !!candidate.tab_content?.url
+      && comparableUrl(candidate.tab_content.url) === comparableUrl(url));
     if (!tab) throw new Error('create_returned_no_tab');
     return { created: true, tab };
   }
   if (name && existing.tab_name !== name && existing.tab_id) {
     const updated = await updateChatTab(larkAppId, chatId, existing.tab_id, { name, url });
-    return { created: false, tab: updated[0] ?? { ...existing, tab_name: name, tab_content: { url } } };
+    const tab = updated.find(candidate => candidate.tab_id === existing.tab_id);
+    return { created: false, tab: tab ?? { ...existing, tab_name: name, tab_content: { url } } };
   }
   return { created: false, tab: existing };
 }

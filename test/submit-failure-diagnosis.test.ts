@@ -86,6 +86,18 @@ const SCREEN_CASES: ScreenCase[] = [
     matched: 'interactive_menu:update_now',
   },
   {
+    name: 'Codex workspace trust title',
+    screenText: 'Trust this folder?\n› 1. Trust and continue\n  2. Quit',
+    reason: 'interactive_menu',
+    matched: 'interactive_menu:trust_this_folder',
+  },
+  {
+    name: 'Codex workspace trust option only',
+    screenText: '› 1. Trust and continue\n  2. Quit',
+    reason: 'interactive_menu',
+    matched: 'interactive_menu:trust_and_continue',
+  },
+  {
     name: '行首编号选择光标 ❯ 1.',
     screenText: 'Choose an option:\n\n❯ 1. Continue\n  2. Start over',
     reason: 'interactive_menu',

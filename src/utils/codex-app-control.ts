@@ -16,7 +16,6 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
-  existsSync,
   lstatSync,
   mkdirSync,
   openSync,

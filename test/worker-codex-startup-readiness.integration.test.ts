@@ -122,8 +122,14 @@ setInterval(() => {}, 1000);
       });
       if (mode === 'coloured-resume') expect(viewport).toMatch(/\x1b\[[0-9;]*m›/);
     }
-    await waitFor(() => existsSync(inputFile));
-    const text = readFileSync(inputFile, 'utf8');
+    // PTY/tmux input can arrive in separate chunks; file creation alone does
+    // not mean the bracketed paste and Enter have both reached the fake CLI.
+    let text = '';
+    await waitFor(() => {
+      if (!existsSync(inputFile)) return false;
+      text = readFileSync(inputFile, 'utf8');
+      return text.includes('\x1b[201~') && text.includes('\r');
+    });
     expect(text.match(/only-this-startup-prompt/g)).toHaveLength(1);
     expect(text).toContain('\x1b[200~');
     expect(messages.some(m => m.type === 'turn_input_committed')).toBe(false);

@@ -30,6 +30,7 @@ const {
   fingerprintPromptText,
   prefixOf,
   removePromptContextDir,
+  rekeyPromptContext,
 } = await import('../src/services/prompt-context-store.js');
 
 /** 测试辅助：模拟 hook 客户端——按 prompt 文本算指纹 + 前缀后，按 turnId claim。 */
@@ -202,5 +203,25 @@ describe('prompt-context-store', () => {
     writePromptContext('sess-other', 'turn-1', 'x', 'Y');
     removePromptContextDir('sess-rm');
     expect(claimByPrompt('sess-other', 'turn-1', 'x')).toBe('Y');
+  });
+
+  it('rekeys a sidecar to the final PTY text when dispatch rewrites the prompt', () => {
+    const assembled = '<shared_group_context>old background</shared_group_context>\n\n<user_message>\n任务\n</user_message>';
+    const dispatched = '<user_message>\n任务\n</user_message>';
+    writePromptContext('sess-1', 'turn-1', assembled, '<botmux_reminder>提醒</botmux_reminder>');
+    expect(rekeyPromptContext('sess-1', 'turn-1', assembled, dispatched)).toBe(true);
+    // The old key is gone; the final text claims the same envelope exactly once.
+    expect(claimByPrompt('sess-1', 'turn-1', assembled)).toBeUndefined();
+    expect(claimByPrompt('sess-1', 'turn-1', dispatched)).toBe('<botmux_reminder>提醒</botmux_reminder>');
+    expect(claimByPrompt('sess-1', 'turn-1', dispatched)).toBeUndefined();
+    // Unchanged text, another turn's sidecar, or a missing sidecar: nothing happens.
+    writePromptContext('sess-1', 'turn-2', assembled, 'E2');
+    expect(rekeyPromptContext('sess-1', 'turn-2', assembled, assembled)).toBe(false);
+    expect(rekeyPromptContext('sess-1', 'turn-3', assembled, dispatched)).toBe(false);
+    expect(claimByPrompt('sess-1', 'turn-2', assembled)).toBe('E2');
+    // A sidecar written for a text the dispatcher never saw is still found by turnId.
+    writePromptContext('sess-1', 'turn-4', 'builder text', 'E4');
+    expect(rekeyPromptContext('sess-1', 'turn-4', 'something else', dispatched)).toBe(true);
+    expect(claimByPrompt('sess-1', 'turn-4', dispatched)).toBe('E4');
   });
 });

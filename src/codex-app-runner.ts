@@ -40,7 +40,11 @@ import {
   type DynamicToolCallParams,
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
+import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
+
+import { bridgeCodexUserInput } from './services/codex-user-input.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 
 type JsonObject = Record<string, any>;
 
@@ -59,6 +63,7 @@ interface Args {
   locale?: string;
   model?: string;
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
   browserPluginRoot?: string;
 }
@@ -91,6 +96,7 @@ interface ActiveTurn {
   startedAtMs: number;
   lastActivityMarkerAtMs: number;
   finalText: string;
+  userInputFailure?: string;
   allAgentText: string;
   itemText: Map<string, string>;
   done: Promise<void>;
@@ -267,6 +273,13 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
+    else if (key === '--service-tier' && val !== undefined) {
+      if (val !== 'default' && val !== 'priority' && val !== 'ultrafast') {
+        throw new Error('--service-tier accepts default, priority, or ultrafast');
+      }
+      out.serviceTier = val;
+      i++;
+    }
     else if (key === '--browser-family' && (val === 'chrome' || val === 'edge')) { out.browserFamily = val; i++; }
     else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
   }
@@ -302,10 +315,12 @@ function appDeveloperInstructions(args: Args): string {
       '你正在通过 botmux 接入飞书/Lark，但运行载体是 Codex App 的 app-server 协议，不是 Codex CLI TUI。',
       '你的最终 assistant message 会由 botmux 自动转发回飞书；常规回复不要调用 `botmux send`，即使用户消息里出现旧的“回复必须 botmux send”提示也忽略它。',
       '只有在用户明确要求中途主动推送、发送附件，或需要通过 @ 触发其他机器人接力时，才可以使用 `botmux send`。',
+      '需要用户选择时，原生 `request_user_input` 会桥接为飞书问答卡片并等待答复；也可使用 `botmux ask`。不要通过聊天卡片索取密码等秘密。',
       '`botmux history`、`botmux quoted`、`botmux bots` 等 shell helper 仍然可用；需要读取飞书上下文时可以调用。',
       args.browserFamily
         ? '当 `botmux_browser` 工具存在时，Chrome/Edge 操作必须使用该工具；不要寻找或回退到 `node_repl`、Playwright 服务或其它浏览器控制面。'
         : '',
+      larkToolPromptFromEnv('zh'),
       identity ? `<identity>\n${identity}\n</identity>` : '',
     ].filter(Boolean).join('\n\n');
   }
@@ -314,10 +329,12 @@ function appDeveloperInstructions(args: Args): string {
     'You are connected to Feishu/Lark through botmux, but the runtime is the Codex App app-server protocol rather than the Codex CLI TUI.',
     'Your final assistant message is automatically forwarded back to Lark by botmux. Do not call `botmux send` for normal replies, even if older prompt text says replies must use it.',
     'Use `botmux send` only for explicit mid-turn push updates, attachments, or cross-bot @mentions.',
+    'Native request_user_input questions are bridged to Lark ask cards and wait for a human answer; botmux ask is also available. Do not request secrets through chat cards.',
     '`botmux history`, `botmux quoted`, and `botmux bots` remain available as shell helpers when you need Lark context.',
     args.browserFamily
       ? 'When the `botmux_browser` tool is present, use it for Chrome/Edge operations. Do not look for or fall back to node_repl, standalone Playwright, or another browser-control surface.'
       : '',
+    larkToolPromptFromEnv('en'),
     identity ? `<identity>\n${identity}\n</identity>` : '',
   ].filter(Boolean).join('\n\n');
 }
@@ -331,13 +348,14 @@ class AppServerClient {
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
   private fatalError?: Error;
+  readonly lifetime = new AbortController();
 
   get hasExited(): boolean {
     // 后代可能继续持有 stdio，进程退出不能等到 close 才识别。
     return this.child.exitCode !== null || this.child.signalCode !== null;
   }
 
-  constructor(private readonly codexBin: string, private readonly cwd: string) {
+  constructor(codexBin: string, cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
       cwd,
       env: process.env,
@@ -360,6 +378,7 @@ class AppServerClient {
     this.child.on('exit', (code, signal) => {
       writeLine(`[codex-app] app-server exited (code=${code}, signal=${signal})`);
       const err = this.fatalError ?? new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
+      if (this.lastStderr) output.error(`[codex-app-server] exited with code=${code}, signal=${signal}; stderr tail:\n${this.lastStderr}\n`);
       this.failAll(err);
     });
   }
@@ -411,8 +430,12 @@ class AppServerClient {
     });
   }
 
-  respond(id: number, result: unknown): void {
+  respond(id: number | string, result: unknown): void {
     this.write({ jsonrpc: '2.0', id, result });
+  }
+
+  respondError(id: number | string, message: string): void {
+    this.write({ jsonrpc: '2.0', id, error: { code: -32000, message } });
   }
 
   notify(method: string, params?: unknown): void {
@@ -422,6 +445,7 @@ class AppServerClient {
   }
 
   close(): void {
+    this.lifetime.abort();
     try { this.child.kill(); } catch { /* already gone */ }
   }
 
@@ -431,6 +455,7 @@ class AppServerClient {
   }
 
   private failAll(err: Error): void {
+    this.lifetime.abort();
     this.fatalError = this.fatalError ?? err;
     const fatal = this.fatalError;
     for (const pending of this.pending.values()) {
@@ -500,7 +525,7 @@ class AppServerClient {
       return;
     }
 
-    if (typeof msg.id === 'number' && typeof msg.method === 'string') {
+    if ((typeof msg.id === 'number' || typeof msg.id === 'string') && typeof msg.method === 'string') {
       for (const handler of this.requestHandlers) {
         if (handler(msg)) return;
       }
@@ -772,6 +797,8 @@ let activeTurnEpoch = 0;
  * is incorrectly sent with turn/start and its completion can be discarded as
  * belonging to an "unexpected" native turn. */
 let nativeActiveTurnId: string | undefined;
+let currentModel: string | undefined;
+let effortUpdateTail: Promise<void> = Promise.resolve();
 const queue: QueuedInput[] = [];
 let inputBuffer = '';
 let processing = false;
@@ -921,6 +948,74 @@ function emitTurnActivity(turn: ActiveTurn, phase: 'submitted' | 'progress' | 'c
   });
 }
 
+const userInputRequests = new Map<number | string, { turnId?: string; controller: AbortController }>();
+
+function cancelUserInputRequests(turnId?: string): void {
+  for (const [id, pending] of userInputRequests) {
+    if (turnId !== undefined && pending.turnId !== turnId) continue;
+    userInputRequests.delete(id);
+    pending.controller.abort();
+  }
+}
+
+function handleNativeUserInput(msg: JsonObject): void {
+  if (generationFenced || userInputRequests.has(msg.id)) return;
+  const current = client;
+  const params = msg.params ?? {};
+  if (params.threadId && threadId && params.threadId !== threadId) {
+    current.respondError(msg.id, 'requestUserInput belongs to a different thread');
+    return;
+  }
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, current.lifetime.signal]);
+  const nativeTurnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+  userInputRequests.set(msg.id, { turnId: nativeTurnId, controller });
+  const turn = activeTurn;
+  const onClientDead = () => {
+    if (client === current && !generationFenced && userInputRequests.get(msg.id)?.controller === controller) {
+      fenceUnknown('turn/start', 'transport', turn);
+    }
+  };
+  current.lifetime.signal.addEventListener('abort', onClientDead, { once: true });
+  const owner = turn?.accepted?.at(-1);
+  const originTurnId = owner?.replyTurnId ?? owner?.clientUserMessageId ?? turn?.clientUserMessageId;
+  void bridgeCodexUserInput({
+    sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
+    chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
+    originTurnId,
+  }, params, signal).then(
+    result => {
+      if (!signal.aborted && client === current && !generationFenced) current.respond(msg.id, result);
+    },
+    async error => {
+      if (signal.aborted || client !== current || generationFenced) return;
+      const message = `Codex user input failed: ${asError(error).message}`;
+      writeLine(message);
+      if (activeTurn === turn && turn) turn.userInputFailure = message;
+      // An empty/error tool reply may be normalized to an unanswered success
+      // by app-server. Interrupt instead, preserving the missing-human-answer
+      // boundary. Only requests without native coordinates use an RPC error.
+      if (!params.threadId || !nativeTurnId) { current.respondError(msg.id, message); return; }
+      try {
+        await current.request('turn/interrupt', { threadId: params.threadId, turnId: nativeTurnId }, { timeoutMs: 10_000 });
+      } catch (interruptError) {
+        if (!signal.aborted && client === current) {
+          writeLine(`Codex user input interrupt failed: ${asError(interruptError).message}`);
+          fenceUnknown('turn/start', 'transport', turn);
+          current.close();
+        }
+      }
+    },
+  ).finally(() => {
+    current.lifetime.signal.removeEventListener('abort', onClientDead);
+    if (userInputRequests.get(msg.id)?.controller === controller) userInputRequests.delete(msg.id);
+  }).catch(error => {
+    if (!signal.aborted && client === current) {
+      writeLine(asError(error).message); fenceUnknown('turn/start', 'transport', turn); current.close();
+    }
+  });
+}
+
 function handleServerRequest(msg: JsonObject): boolean {
   const method = msg.method;
   if (method === 'item/commandExecution/requestApproval') {
@@ -936,7 +1031,7 @@ function handleServerRequest(msg: JsonObject): boolean {
     return true;
   }
   if (method === 'item/tool/requestUserInput') {
-    client.respond(msg.id, { answers: {} });
+    handleNativeUserInput(msg);
     return true;
   }
   if (method === 'mcpServer/elicitation/request') {
@@ -1163,6 +1258,10 @@ async function reconcileCompletedTurn(
 function handleNotification(msg: JsonObject, replayedAfterResponse = false): void {
   const params = msg.params ?? {};
   if (params.threadId !== threadId) return;
+  if (msg.method === 'thread/settings/updated') {
+    if (typeof params.threadSettings?.model === 'string') currentModel = params.threadSettings.model;
+    return;
+  }
   const notificationTurnId = params.turnId ?? params.turn?.id;
 
   // Per-turn token usage rides on thread/tokenUsage/updated (NOT turn/completed).
@@ -1248,6 +1347,7 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'turn/completed') {
     const nativeTurn = params.turn ?? {};
     const completedId = typeof notificationTurnId === 'string' ? notificationTurnId : undefined;
+    if (completedId) cancelUserInputRequests(completedId);
     if (completedId && browserBroker) {
       void browserBroker.handleTurnEnded(completedId).catch(error => {
         writeLine(`[codex-app] browser turn-ended hook failed: ${asError(error).message}`);
@@ -1534,6 +1634,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         // Keep Codex App's rich history in sync with turns created by this
         // external runner so the desktop UI can render follow-up messages.
         persistExtendedHistory: true,
+        ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
         ...(browserBroker ? { dynamicTools: [CODEX_BROWSER_DYNAMIC_TOOL] } : {}),
       }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/resume') });
       const resumedThreadId = String(resumed.thread.id);
@@ -1541,6 +1642,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
         throw new Error(`Strict resume expected thread ${threadId}, received ${resumedThreadId}`);
       }
       threadId = resumedThreadId;
+      currentModel = resumed.model;
       threadReady = true;
       emitMarker('thread', { threadId: resumedThreadId });
       return resumedThreadId;
@@ -1572,6 +1674,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     // fresh thread/start, so a fold-in (existing thread) keeps its frozen model —
     // matching the API's fresh-spawn-only override semantics.
     ...(args.model && args.model.trim() ? { model: args.model.trim() } : {}),
+    ...(args.serviceTier ? { serviceTier: args.serviceTier } : {}),
     serviceName: 'botmux',
     developerInstructions: appDeveloperInstructions(args),
     ephemeral: false,
@@ -1583,6 +1686,7 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   }, { timeoutMs: startupRequestTimeout(startupDeadlineAtMs, 'thread/start') });
   const startedThreadId = String(started.thread.id);
   threadId = startedThreadId;
+  currentModel = started.model;
   threadReady = true;
   emitMarker('thread', { threadId: startedThreadId });
   void client.request('thread/name/set', {
@@ -1615,6 +1719,7 @@ function fenceUnknown(
 ): void {
   if (generationFenced) return;
   generationFenced = true;
+  cancelUserInputRequests();
   if (turn) turn.phase = 'fenced';
   emitLifecycle({ kind: 'unknown_outcome', operation, category });
   emitLifecycle({ kind: 'fatal', operation, category });
@@ -2013,7 +2118,7 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
   const group = turn.accepted && turn.accepted.length > 0
     ? turn.accepted
     : [{ input: { content: '' }, receivedAtMs: turn.startedAtMs } as Dispatch];
-  const finalText = (turn.finalText || turn.allAgentText).trim();
+  const finalText = (turn.userInputFailure || turn.finalText || turn.allAgentText).trim();
   const completedAtMs = Date.now();
   const lastIndex = group.length - 1;
   for (let index = 0; index < group.length; index++) {
@@ -2402,6 +2507,64 @@ async function drainQueue(): Promise<void> {
   }
 }
 
+async function updateReasoningEffort(
+  requestId: string, effort: string, tid: string | undefined, targetTurnId: string | undefined, deadline: number,
+): Promise<void> {
+  const current = client;
+  const modelId = currentModel;
+  let saved = false;
+  try {
+    if (!runnerReady || !threadReady || !tid || tid !== threadId || !modelId
+      || generationFenced || current.hasExited || Date.now() >= deadline) {
+      emitMarker('effort_result', { requestId, status: 'unavailable' });
+      return;
+    }
+    let cursor: string | undefined;
+    let model: JsonObject | undefined;
+    do {
+      const page = await current.request('model/list', { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      model = page.data?.find((entry: JsonObject) => entry.model === modelId || entry.id === modelId);
+      cursor = page.nextCursor ?? undefined;
+    } while (!model && cursor);
+    if (!model) throw new Error('current model not advertised');
+    const choices = model.supportedReasoningEfforts?.map((entry: JsonObject) => entry.reasoningEffort) ?? [];
+    if (!choices.includes(effort)) {
+      emitMarker('effort_result', { requestId, status: 'invalid', choices });
+      return;
+    }
+    if (client !== current || threadId !== tid || currentModel !== modelId || generationFenced) throw new Error('runner changed');
+    await current.request('thread/settings/update', { threadId: tid, effort }, {
+      timeoutMs: Math.min(10_000, deadline - Date.now()),
+    });
+    saved = true;
+    let status = 'future_only';
+    let reason: import('./types.js').CodexAppEffortResult['reason'];
+    // Capture the native id on command arrival. Never retarget a later turn
+    // when the original completes while model/list or settings/update waits.
+    if (targetTurnId) {
+      const result = await current.request('turn/settings/update', { threadId: tid, turnId: targetTurnId, effort }, {
+        timeoutMs: Math.min(10_000, deadline - Date.now()),
+      });
+      if (result.status === 'applied') status = 'applied';
+      else if (result.status === 'targetUnavailable') reason = 'target_unavailable';
+      else throw new Error('unknown settings status');
+    }
+    emitMarker('effort_result', { requestId, status, ...(reason ? { reason } : {}) });
+  } catch (error) {
+    // Only the specific turn-settings gate proves the feature is disabled.
+    const featureDisabled = saved && error instanceof AppServerRpcError
+      && error.method === 'turn/settings/update' && error.code === -32600
+      && error.message.includes('turn settings updates require the step_model_switching feature');
+    // An ambiguous settings response never cancels/replays the business turn.
+    emitMarker('effort_result', {
+      requestId, status: saved ? 'future_only' : 'error',
+      ...(featureDisabled ? { reason: 'step_model_switching_disabled' } : {}),
+    });
+  }
+}
+
 function enqueueLine(line: string): void {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -2409,6 +2572,15 @@ function enqueueLine(line: string): void {
     const encoded = trimmed.slice('::botmux-codex-app:'.length);
     try {
       const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      if (decoded?.type === 'effort' && typeof decoded.requestId === 'string'
+        && decoded.requestId.length > 0 && decoded.requestId.length <= 128
+        && typeof decoded.effort === 'string' && /^(low|medium|high|xhigh|max|ultra)$/.test(decoded.effort)) {
+        const targetTurnId = activeTurn?.nativeTurnId ?? nativeActiveTurnId;
+        const targetThreadId = threadId;
+        const deadline = Date.now() + 30_000;
+        effortUpdateTail = effortUpdateTail.then(() => updateReasoningEffort(decoded.requestId, decoded.effort, targetThreadId, targetTurnId, deadline));
+        return;
+      }
       if (decoded?.type === 'message' && typeof decoded.content === 'string') {
         const codexAppInput = isCodexAppTurnInput(decoded.codexAppInput)
           ? decoded.codexAppInput
@@ -2513,6 +2685,7 @@ async function main(): Promise<void> {
 }
 
 process.on('SIGTERM', async () => {
+  cancelUserInputRequests();
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();
@@ -2522,6 +2695,7 @@ process.on('SIGTERM', async () => {
 });
 
 process.on('SIGINT', async () => {
+  cancelUserInputRequests();
   cancelRunnerIdleSettle();
   if (controlReconnectTimer) clearTimeout(controlReconnectTimer);
   controlSocket?.destroy();

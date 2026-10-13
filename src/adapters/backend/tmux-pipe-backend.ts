@@ -32,6 +32,8 @@ import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
 import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneCommand } from './strict-env.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
@@ -376,8 +378,8 @@ export class TmuxPipeBackend implements SessionBackend {
   cliCwd?: string;
 
   /** Whether this backend re-attached to an existing bmx-* tmux session
-   *  (rather than creating a new detached one). Mirrors TmuxBackend.isReattach
-   *  so the worker can branch on reattach behaviour without a private-cast. */
+   *  (rather than creating a new detached one), so the worker can branch on
+   *  reattach behaviour without a private-cast. */
   get isReattach(): boolean {
     return this._isReattach;
   }
@@ -402,6 +404,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // TmuxPipeBackend is the live backend on this path, so the scrub must be
     // triggered here — TmuxBackend is only used for its static helpers.
     TmuxBackend.scrubServerGlobalEnvOnce();
+    if (opts.strictEnv && !this.createSession && !opts.strictEnvReattach) throw new Error('Refusing unverified strict tmux-pipe reattach');
     this.cols = opts.cols;
     this.rows = opts.rows;
 
@@ -412,10 +415,17 @@ export class TmuxPipeBackend implements SessionBackend {
       // been upgraded since the session was originally created, and options
       // like set-clipboard / window-size largest are idempotent to re-apply.
       this.applySessionOptions();
+      this.restoreDetachedOwnedSessionSize();
     }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
-    spawnSync('mkfifo', [this.fifoPath], { stdio: 'ignore' });
+    const fifoCreation = spawnSync('mkfifo', [this.fifoPath], { encoding: 'utf8' });
+    if (fifoCreation.error || fifoCreation.status !== 0) {
+      const detail = fifoCreation.error?.message
+        || String(fifoCreation.stderr || '').trim()
+        || `exit=${fifoCreation.status}, signal=${fifoCreation.signal}`;
+      throw new Error(`Could not create tmux FIFO ${this.fifoPath}: ${detail}. Check temporary storage capacity and free inodes.`);
+    }
 
     // Step 2: open the read end with O_RDWR (no O_NONBLOCK).
     //
@@ -1082,6 +1092,9 @@ export class TmuxPipeBackend implements SessionBackend {
     // the next spawn before the stream's queued close runs (Bun and Node).
     const stream = this.readStream;
     this.readStream = null;
+    // 有意保留：fifoFd 已无生产读者（#1394 起 fd 的关闭完全交给 ReadStream），但
+    // test/fixtures/tmux-pipe-exit-fixture.ts 通过类型断言读取它；此处显式读一次以满足 noUnusedLocals。
+    void this.fifoFd;
     this.fifoFd = null;
     stream?.destroy();
     if (this.fifoWakeFd !== null) {
@@ -1110,7 +1123,7 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
-    const shellSpec = resolveUserShell(process.env, opts.launchShell);
+    const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
     const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
     const script = shellWrapperScript(
       resolveBotmuxWrapperBinDir(opts.env ?? process.env),
@@ -1123,11 +1136,11 @@ export class TmuxPipeBackend implements SessionBackend {
       '-x', String(opts.cols),
       '-y', String(opts.rows),
       '--',
-      ...shellCommandArgv(shellSpec, script, [
+      ...(opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, script, [
         opts.cwd,
         ...envAssignments,
         bin, ...args,
-      ]),
+      ])),
     ];
     // Bounded retries against a stalled shared server (instant clean
     // ECONNREFUSED under backlog overflow), a command timeout, or a
@@ -1141,15 +1154,21 @@ export class TmuxPipeBackend implements SessionBackend {
           cwd: opts.cwd,
           stdio: ['ignore', 'ignore', 'pipe'],
           timeout: 5000,
-          env: tmuxEnv(opts.env),
+          env: tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env),
         });
         break;
       } catch (err: any) {
         const stderrText = (err?.stderr?.toString?.() ?? '').trim();
-        if (attempt > 0 && /duplicate session/i.test(stderrText)) break;
-        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) throw err;
+        if (attempt > 0 && /duplicate session/i.test(stderrText)) {
+          if (opts.strictEnv) throw new Error('Refusing unverified strict tmux-pipe generation after a startup retry');
+          break;
+        }
+        if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
+          if (opts.strictEnv) throw new Error('Strict tmux pane startup failed (command environment redacted)');
+          throw err;
+        }
         process.stderr.write(
-          `[tmux-pipe-backend] new-session failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${stderrText || err?.message || err}\n`,
+          `[tmux-pipe-backend] new-session failed (attempt ${attempt + 1}/${STARTUP_TMUX_RETRY_DELAYS_MS.length + 1}); retrying: ${opts.strictEnv ? 'strict command environment redacted' : stderrText || err?.message || err}\n`,
         );
         startupRetrySleepFn(STARTUP_TMUX_RETRY_DELAYS_MS[attempt]);
       }
@@ -1184,6 +1203,31 @@ export class TmuxPipeBackend implements SessionBackend {
         execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
       }
     } catch { /* session may not be ready yet — benign */ }
+  }
+
+  /**
+   * Repair geometry left behind by an old Web Terminal viewer before this
+   * worker reattaches. A detached owned session has no human client whose
+   * layout we could disrupt, so the worker's configured render dimensions are
+   * authoritative. An attached session is left untouched.
+   */
+  private restoreDetachedOwnedSessionSize(): void {
+    try {
+      const attached = execFileSync(
+        'tmux',
+        ['display-message', '-p', '-t', this.paneTarget, '#{session_attached}'],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000,
+          env: tmuxEnv(),
+        },
+      ).trim();
+      if (attached === '0') this.resize(this.cols, this.rows);
+    } catch {
+      // Reattach already proved the pane exists. Geometry repair is best-effort
+      // and must not turn a transient tmux control failure into session loss.
+    }
   }
 
   /** Snapshot the full pane history WITH ANSI escapes (`-S - -E -`).

@@ -14,6 +14,8 @@ import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
+import { herdrExecutable } from '../utils/herdr-executable.js';
+import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
 const IS_LINUX = platform() === 'linux';
@@ -358,10 +360,7 @@ export function readCwd(pid: number): string | undefined {
     }
   }
   try {
-    const out = execSync(`lsof -a -d cwd -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const out = execFileSync('lsof', ['-n', '-P', '-a', '-d', 'cwd', '-p', String(pid), '-Fn'], LSOF_EXEC_OPTIONS);
     for (const line of out.split('\n')) {
       if (line.startsWith('n')) return line.slice(1);
     }
@@ -621,6 +620,11 @@ export interface WrapperRealPidResolveDeps {
   applyRealPid: (realPid: number) => void;
   /** Timer scheduler (injectable for tests). */
   schedule: (fn: () => void, ms: number) => void;
+  /** When the launcher pid is itself the CLI leaf (e.g. a direct native
+   *  install, not a wrapper), descendant discovery can never find anything
+   *  realer: stop polling immediately instead of rescanning the tree on every
+   *  tick. */
+  isDirectLeaf?: (launcherPid: number) => boolean;
   intervalMs?: number;
   maxAttempts?: number;
 }
@@ -644,6 +648,7 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   let attempts = 0;
   const tick = () => {
     if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
+    if (deps.isDirectLeaf?.(launcherPid)) return;
     const realPid = deps.findRealPid(launcherPid);
     if (realPid && realPid !== launcherPid) {
       deps.applyRealPid(realPid);
@@ -733,7 +738,7 @@ type HerdrJsonResult = { ok: true; value: any | undefined } | { ok: false };
 
 function tryHerdrJson(args: string[], opts?: { timeout?: number }): HerdrJsonResult {
   try {
-    const out = execFileSync('herdr', args, {
+    const out = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: opts?.timeout ?? 5000,

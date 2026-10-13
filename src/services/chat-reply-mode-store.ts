@@ -87,6 +87,17 @@ export function resolveGroupMentionMode(larkAppId: string, chatId?: string): Gro
   }
 }
 
+/** Only controls the solo-group exception; explicit mention policies/triggers still apply. */
+export function isSoloGroupMentionBypassEnabled(larkAppId: string, chatId: string): boolean {
+  try {
+    const cfg = getBot(larkAppId).config;
+    const perChat = cfg.chatSoloGroupMentionBypass?.[chatId];
+    return typeof perChat === 'boolean' ? perChat : cfg.soloGroupMentionBypass !== false;
+  } catch {
+    return true;
+  }
+}
+
 /** Per-bot default mention policy (`regularGroupMentionMode`, default 'always'). */
 function groupMentionDefaultMode(larkAppId: string): GroupMentionMode {
   try {

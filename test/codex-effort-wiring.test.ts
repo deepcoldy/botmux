@@ -46,6 +46,38 @@ describe('codex adapter buildArgs — reasoningEffort injection', () => {
   });
 });
 
+describe('codex adapter buildArgs — serviceTier injection', () => {
+  const override = 'service_tier="priority"';
+
+  it('fresh launch injects the -c service_tier override', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, serviceTier: 'priority' });
+    const i = args.indexOf(override);
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it.each([
+    { command: 'resume', forkSession: false },
+    { command: 'fork', forkSession: true },
+  ])('keeps the -c override before the $command subcommand', ({ command, forkSession }) => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+      ...BASE, resume: true, resumeSessionId: 'codex-existing', forkSession, serviceTier: 'priority',
+    });
+    const i = args.indexOf(override);
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+    expect(i).toBeLessThan(args.indexOf(command));
+  });
+
+  it('pure --remote viewer carries no service_tier override', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+      ...BASE, resume: true, remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+      serviceTier: 'priority',
+    });
+    expect(args.some(a => a.startsWith('service_tier='))).toBe(false);
+  });
+});
+
 describe('codex-app adapter buildArgs — runner flags', () => {
   it('emits --model and --reasoning-effort (xhigh verbatim) for the runner', () => {
     const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE, model: 'gpt-5.6-terra', reasoningEffort: 'xhigh' });
@@ -67,6 +99,14 @@ describe('codex-app adapter buildArgs — runner flags', () => {
     const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE });
     expect(args).not.toContain('--model');
     expect(args).not.toContain('--reasoning-effort');
+    expect(args).not.toContain('--service-tier');
+  });
+
+  it('emits --service-tier for the runner', () => {
+    const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE, serviceTier: 'priority' });
+    const i = args.indexOf('--service-tier');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i + 1]).toBe('priority');
   });
 });
 
@@ -84,6 +124,15 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     const body = source.slice(ctor, end);
     expect(body).toContain('model: cfg.model');
     expect(body).toContain('reasoningEffort: cfg.reasoningEffort');
+    expect(body).toContain('serviceTier: cfg.serviceTier');
+  });
+
+  it('strips an explicit tier before adopt and external App Server attach', () => {
+    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    const commandHandler = readFileSync(new URL('../src/core/command-handler.ts', import.meta.url), 'utf8');
+    expect(source).toContain("cfg.adoptMode && cfg.serviceTier");
+    expect(source).toContain("cfg.serviceTier !== undefined");
+    expect(commandHandler.match(/current\.session\.serviceTier = 'inherit';/g)).toHaveLength(2);
   });
 
   it('freezes the per-Bot default onto a newly created session for supported CLIs', () => {

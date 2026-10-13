@@ -200,6 +200,7 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       triggerId: explicitFailure.triggerId,
       target: { kind: 'turn', sessionId, chatId },
       errorCode: 'trigger_failed',
+      terminalErrorCode: explicitFailure.terminalErrorCode,
       error: `worker reported terminal failure: ${explicitFailure.terminalErrorCode ?? 'unknown'}`,
       finishedAt: explicitFailure.failedAt
         ? new Date(explicitFailure.failedAt).toISOString()

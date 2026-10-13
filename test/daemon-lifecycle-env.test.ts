@@ -89,6 +89,24 @@ describe('resolveDaemonEnv()', () => {
     }));
   });
 
+  it('keeps durable coordination bootstrap across a session-origin restart', () => {
+    expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1' }, [
+      'BOTMUX_COORDINATION_MODE=primary',
+      'BOTMUX_COORDINATION_PROVIDER_BIN=/opt/botmux/provider',
+      'BOTMUX_COORDINATION_PROVIDER_ARGS_JSON=["--config","/etc/botmux/provider.json"]',
+      'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS=5000',
+      'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS=30000',
+      'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=0',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_COORDINATION_PROVIDER_BIN: '/opt/botmux/provider',
+      BOTMUX_COORDINATION_PROVIDER_ARGS_JSON: '["--config","/etc/botmux/provider.json"]',
+      BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS: '5000',
+      BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS: '30000',
+      BOTMUX_FORWARD_FOLLOWUP_WAIT_MS: '0',
+    });
+  });
+
   it('keeps ordinary shell overrides ahead of .env', () => {
     expect(resolveDaemonEnv({
       WEB_HOST: '127.0.0.2',

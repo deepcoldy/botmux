@@ -12,7 +12,7 @@ import type { CardActionData } from './card-handler.js';
 
 export function buildOncallGroupColumn(): Record<string, any> {
   return { tag: 'column', element_id: 'botmux_oncall_group_column', width: 'auto', elements: [{
-    tag: 'button', text: { tag: 'plain_text', content: '拉起 Oncall 群' }, type: 'primary_text',
+    tag: 'button', text: { tag: 'plain_text', content: '拉起 Oncall 群' }, type: 'primary',
     icon: { tag: 'standard_icon', token: 'chat_outlined' },
     behaviors: [{ type: 'callback', value: { action: 'oncall_group_create' } }],
   }] };

@@ -20,6 +20,8 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
 import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
+import { hasLarkToolBinding } from './lark-tool-binding.js';
+import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
 import {
   triggerUserAuthApplies,
   TRIGGER_USER_AUTH_TOOLS,
@@ -39,9 +41,10 @@ export interface ToolIdentityOutcome {
    * - `needs-authorization`: nothing published; the sender must authorize
    *   before the tool will work. Neither governed tool degrades to a machine
    *   identity anymore, so there is no other "allowed" outcome.
+   * - `unavailable`: the provider failed; retain login state without requesting a new login.
    * - `off`: the policy does not govern this tool; nothing was touched.
    */
-  state: 'user' | 'needs-authorization' | 'off';
+  state: 'user' | 'needs-authorization' | 'unavailable' | 'off';
 }
 
 /** Created only by the daemon after verifying the signed dispatch and resolving
@@ -84,8 +87,15 @@ export async function publishTurnCliIdentity(
   const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId } = args;
   const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
+  // Record before the new-entry shortcut (and before first worker spawn).
+  // The daemon has already verified the signed dispatch and target access.
+  rememberLarkToolDelegation(sessionDataDir, sessionId, turnId, args.delegatedIdentity);
 
   for (const tool of TRIGGER_USER_AUTH_TOOLS) {
+    if (tool === 'lark-cli' && hasLarkToolBinding(sessionDataDir, sessionId)) {
+      outcomes.push({ tool, state: 'off' }); // the new session entry resolves this itself
+      continue;
+    }
     if (!triggerUserAuthApplies(policy, tool)) {
       outcomes.push({ tool, state: 'off' });
       continue;
@@ -104,6 +114,18 @@ export async function publishTurnCliIdentity(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
+      if (tool === 'bytedcli') {
+        try {
+          writeSessionIdentity(sessionDataDir, sessionId, {
+            tool, mode: 'denied', ...(turnId ? { turnId } : {}),
+            message: locale === 'en'
+              ? 'botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.'
+              : 'botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。',
+          });
+        } catch { clearSessionIdentity(sessionDataDir, sessionId, tool); }
+        outcomes.push({ tool, state: 'unavailable' });
+        continue;
+      }
       outcomes.push(args.delegatedIdentity
         ? denyDelegated(tool, args, args.delegatedIdentity)
         : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
@@ -211,7 +233,9 @@ async function withholdIdentity(
       authUrl = tool === 'bytedcli'
         ? (await beginBytedcliLogin(senderOpenId))?.authUrl
         : (await beginLarkCliLogin(senderOpenId))?.authUrl;
+      if (tool === 'bytedcli' && !authUrl) throw new Error('bytedcli login provider unavailable');
     } catch (e) {
+      if (tool === 'bytedcli') throw e;
       logger.warn(
         `[trigger-user-auth] could not pre-fetch ${tool} auth link for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,

@@ -102,6 +102,18 @@ describe('skill injection-mode resolution', () => {
   describe('shouldInstallGlobalSkills (per shared dir, union across bots)', () => {
     const codexSkillsDir = () => createCliAdapterSync('codex').skillsDir!;
 
+    it('zero-injection bots do not install global skills, while another bot sharing the directory still can', () => {
+      const sub = { larkAppId: 'sub', larkAppSecret: 'secret', cliId: 'traex', promptInjection: 'none', skillInjection: 'global' };
+      const lead = { larkAppId: 'lead', larkAppSecret: 'secret', cliId: 'coco', skillInjection: 'global' };
+      const skillsDir = createCliAdapterSync('traex').skillsDir!;
+      writeBots([sub], home);
+      expect(shouldInstallGlobalSkills(skillsDir)).toBe(false);
+      writeBots([sub, lead], home);
+      expect(shouldInstallGlobalSkills(skillsDir)).toBe(true);
+      writeBots([sub, { ...lead, skillInjection: 'prompt' }], home);
+      expect(shouldInstallGlobalSkills(skillsDir)).toBe(false);
+    });
+
     it('false when every bot on the dir is prompt/off', () => {
       writeBots([codexBot({ skillInjection: 'prompt' })], home);
       expect(shouldInstallGlobalSkills(codexSkillsDir())).toBe(false);
@@ -127,12 +139,12 @@ describe('skill injection-mode resolution', () => {
 
 describe('resolveSkillInjectionSupport (dashboard control class)', () => {
   it('classifies the whole CLI matrix by capability', () => {
-    // claude-family (incl. the relay/seed forks) → dynamic --plugin-dir injection
-    for (const id of ['claude-code', 'seed', 'relay'] as const) {
+    // claude-family (incl. the relay/seed forks), cursor, pi, oh-my-pi → dynamic --plugin-dir / --skill injection
+    for (const id of ['claude-code', 'seed', 'relay', 'cursor', 'pi', 'oh-my-pi'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('dynamic');
     }
     // global skills-dir CLIs → the global|prompt|off knob applies
-    for (const id of ['codex', 'gemini', 'opencode', 'cursor', 'coco', 'traex', 'pi', 'oh-my-pi', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
+    for (const id of ['codex', 'gemini', 'opencode', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('global');
     }
     // no skill mechanism → control hidden

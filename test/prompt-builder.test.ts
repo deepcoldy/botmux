@@ -76,7 +76,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getOwnerOpenId: vi.fn(() => undefined),
 }));
 
+const mockGetSession = vi.fn(() => undefined as any);
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: (...args: any[]) => mockGetSession(...args),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -107,8 +109,10 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkCliInput, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
 import { config } from '../src/config.js';
+import { buildExternalEventApplicationContext, buildExternalEventDataContext, buildExternalEventVisibleText, buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
+import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { setBotLookup, setDefaultLocale } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -187,6 +191,17 @@ describe('buildNewTopicPrompt', () => {
   it('should NOT embed <session_id> for CLIs with injectsSessionContext (claude-code)', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'claude-code');
     expect(prompt).not.toContain('<session_id>');
+  });
+
+  it('should NOT embed <session_id>, <botmux_routing>, or <identity> for Pi and Oh My Pi (injectsSessionContext)', () => {
+    for (const cli of ['pi', 'oh-my-pi'] as const) {
+      const prompt = buildNewTopicPrompt('hello', SESSION_ID, cli);
+      expect(prompt).not.toContain('<session_id>');
+      expect(prompt).not.toContain('<botmux_routing>');
+      expect(prompt).not.toContain('<identity>');
+      expect(prompt).not.toContain('<botmux_builtin_skills>');
+      expect(prompt).toContain('<user_message>\nhello\n</user_message>');
+    }
   });
 
   it('should wrap the user message in <user_message>', () => {
@@ -589,9 +604,9 @@ describe('buildFollowUpContent', () => {
   });
 });
 
-// ─── buildReforkPrompt — wraps re-fork branch (resume / daemon-restart) ─────
+// ─── buildReforkCliInput — wraps re-fork branch (resume / daemon-restart) ───
 
-describe('buildReforkPrompt', () => {
+describe('buildReforkCliInput', () => {
   const SESSION_ID = 'refork-session-id';
 
   function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
@@ -621,7 +636,7 @@ describe('buildReforkPrompt', () => {
 
   it('wraps non-adopt re-fork prompt in <user_message> + <botmux_reminder>', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, '继续聊', { cliId: 'codex' });
+    const out = buildReforkCliInput(ds, '继续聊', { cliId: 'codex' }).content;
     expect(out).toContain('<user_message>');
     expect(out).toContain('继续聊');
     expect(out).toContain('</user_message>');
@@ -632,21 +647,21 @@ describe('buildReforkPrompt', () => {
 
   it('embeds <session_id> for CLIs without injectsSessionContext (codex)', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, 'hello', { cliId: 'codex' });
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'codex' }).content;
     expect(out).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
   it('omits <session_id> for claude-code (injectsSessionContext=true); reminder stays unless transcript is opted in', () => {
     const ds = makeDs();
     // 缺省 send：保留 reminder（模型仍要自己 botmux send）。
-    const out = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'claude-code' }).content;
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('<user_message>');
     expect(out).toContain('<botmux_reminder>');
     // 显式 transcript 才切换：最终回复由 daemon 从转写转发，不再注入 reminder。
     mockBotConfig.replyDelivery = 'transcript';
     try {
-      const transcriptOut = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
+      const transcriptOut = buildReforkCliInput(ds, 'hello', { cliId: 'claude-code' }).content;
       expect(transcriptOut).not.toContain('<session_id>');
       expect(transcriptOut).toContain('<user_message>');
       expect(transcriptOut).not.toContain('<botmux_reminder>');
@@ -655,9 +670,16 @@ describe('buildReforkPrompt', () => {
     }
   });
 
+  it('omits <session_id> for pi (injectsSessionContext=true)', () => {
+    const ds = makeDs();
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'pi' }).content;
+    expect(out).not.toContain('<session_id>');
+    expect(out).toContain('<user_message>');
+  });
+
   it('omits botmux_reminder for Mira re-fork prompts', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, 'hello', { cliId: 'mira' });
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'mira' }).content;
     expect(out).toContain('<user_message>');
     expect(out).not.toContain('<session_id>');
     expect(out).not.toContain('<botmux_reminder>');
@@ -666,7 +688,7 @@ describe('buildReforkPrompt', () => {
   it('places the whiteboard hint after <botmux_reminder> and before <user_message> on re-fork', () => {
     const ds = makeDs();
     (ds.session as any).whiteboardId = 'wb_refork';
-    const out = buildReforkPrompt(ds, '继续', { cliId: 'codex' });
+    const out = buildReforkCliInput(ds, '继续', { cliId: 'codex' }).content;
     expect(out).toContain('<whiteboard id="wb_refork">');
     expect(out.indexOf('<botmux_reminder>')).toBeLessThan(out.indexOf('<whiteboard '));
     expect(out.indexOf('<whiteboard ')).toBeLessThan(out.indexOf('<user_message>'));
@@ -674,11 +696,11 @@ describe('buildReforkPrompt', () => {
 
   it('forwards attachments and mentions to the wrapper', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, '看图', {
+    const out = buildReforkCliInput(ds, '看图', {
       cliId: 'codex',
       attachments: [{ type: 'image', path: '/tmp/x.jpg', name: 'x.jpg' }],
       mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice' }],
-    });
+    }).content;
     expect(out).toContain('path="/tmp/x.jpg"');
     expect(out).toContain('name="Alice"');
     expect(out).toContain('open_id="ou_alice"');
@@ -688,10 +710,10 @@ describe('buildReforkPrompt', () => {
     const ds = makeDs({
       adoptedFrom: { tmuxTarget: 'foo:0.0', originalCliPid: 1, cwd: '/tmp' },
     });
-    const out = buildReforkPrompt(ds, 'hello', {
+    const out = buildReforkCliInput(ds, 'hello', {
       cliId: 'claude-code',
       selfMention: { name: 'Claude', openId: 'ou_bot' },
-    });
+    }).content;
     expect(out).not.toContain('<user_message>');
     expect(out).not.toContain('<botmux_reminder>');
     expect(out).not.toContain('<session_id>');
@@ -1139,7 +1161,7 @@ describe('replyDelivery=transcript envelope', () => {
     expect(solo).not.toContain('- @Bot');
   });
 
-  it('buildReforkPrompt 读 ds.soloSession：transcript + solo 去壳，非 solo 保留壳', () => {
+  it('buildReforkCliInput 读 ds.soloSession：transcript + solo 去壳，非 solo 保留壳', () => {
     mockBotConfig.replyDelivery = 'transcript';
     const makeDs = (soloSession?: boolean): DaemonSession => ({
       session: {
@@ -1151,12 +1173,12 @@ describe('replyDelivery=transcript envelope', () => {
       spawnedAt: 0, cliVersion: '1.0.0', lastMessageAt: 0, hasHistory: true,
       soloSession,
     } as DaemonSession);
-    const bare = buildReforkPrompt(makeDs(true), '@Bot 继续', { cliId: 'claude-code', selfMention, sender });
+    const bare = buildReforkCliInput(makeDs(true), '@Bot 继续', { cliId: 'claude-code', selfMention, sender }).content;
     expect(bare).not.toContain('<botmux_reminder>');
     expect(bare).not.toContain('<user_message>');
     expect(bare).not.toContain('<sender ');
     expect(bare.startsWith('继续')).toBe(true);
-    const shelled = buildReforkPrompt(makeDs(false), '@Bot 继续', { cliId: 'claude-code', selfMention, sender });
+    const shelled = buildReforkCliInput(makeDs(false), '@Bot 继续', { cliId: 'claude-code', selfMention, sender }).content;
     expect(shelled).not.toContain('<botmux_reminder>');
     expect(shelled).toContain('<user_message>\n@Bot 继续\n</user_message>');
     expect(shelled).toContain('<sender ');
@@ -1223,4 +1245,94 @@ describe('builder locale fallback when the caller omits locale', () => {
     });
     expect(content).toContain('Respond to messages addressed to you');
   });
+});
+
+
+describe('per-bot zero prompt injection', () => {
+  afterEach(() => { delete mockBotConfig.promptInjection; delete mockBotConfig.envelopeInjection; mockGetSession.mockReset(); });
+
+  it.each(['default', 'none'] as const)('keeps persisted %s policy through bot toggles and cold resume', mode => {
+    mockGetSession.mockReturnValue({ sessionId: 'frozen', promptInjection: mode });
+    mockBotConfig.promptInjection = mode === 'none' ? 'default' : 'none';
+    const opts = { larkAppId: 'app_test', cliId: 'claude-code' as const, chatId: 'oc_group' };
+    const followUp = buildFollowUpCliInput('task', 'frozen', opts).content;
+    const opening = buildNewTopicCliInput('task', 'frozen', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, opts).content;
+    if (mode === 'none') {
+      expect(followUp).toBe('task');
+      expect(opening).toBe('task');
+    } else {
+      expect(followUp).toContain('<botmux_reminder>');
+      expect(opening).toContain('<user_message>');
+    }
+  });
+
+  it('preserves default mode on historical sessions with no snapshot', () => {
+    mockGetSession.mockReturnValue({ sessionId: 'old' });
+    mockBotConfig.promptInjection = 'none';
+    expect(buildFollowUpCliInput('task', 'old', { larkAppId: 'app_test', cliId: 'codex' }).content)
+      .toContain('<botmux_reminder>');
+  });
+
+  for (const cliId of ['codex', 'claude-code', 'traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'] as const) {
+    it(`${cliId}: opening, follow-up, hook and refork preserve only the task and attachment facts`, () => {
+      mockBotConfig.promptInjection = 'none';
+      mockBotConfig.envelopeInjection = 'auto';
+      const task = '检查 <botmux_reminder> 字样，保留用户原文';
+      const opts = { larkAppId: 'app_test', chatId: 'oc_group', whiteboardId: 'board',
+        cliId, sessionBackendType: 'pty' as const, turnId: 'om_turn',
+        sender: { type: 'bot' as const, openId: 'ou_lead', name: 'Lead' },
+        attachments: [{ type: 'file' as const, name: 'spec.md', path: '/tmp/spec.md' }] };
+      const expected = task + '\n\n[file] spec.md: /tmp/spec.md';
+      const opening = buildNewTopicCliInput(task, 'sid', cliId, undefined, opts.attachments,
+        undefined, undefined, undefined, { name: 'Sub', openId: 'ou_sub' }, 'zh', opts.sender, opts);
+      expect(opening.content).toBe(expected);
+      expect(buildFollowUpCliInput(task, 'sid', opts).content).toBe(expected);
+      const ds = { larkAppId: 'app_test', session: { sessionId: 'sid', chatId: 'oc_group', backendType: 'pty', promptInjection: 'none' } } as DaemonSession;
+      expect(buildReforkCliInput(ds, task, opts).content).toBe(expected);
+      expect(buildNewTopicPrompt(task, 'sid', cliId, undefined, undefined, undefined,
+        undefined, ['第二条'], undefined, 'zh', undefined, opts)).toBe(task + '\n\n第二条');
+      delete mockBotConfig.promptInjection;
+      expect(buildFollowUpCliInput('原有 bot', 'sid', opts).content).toContain(cliId === 'ebsd' ? 'BotMux service user message' : '<botmux_reminder>');
+    });
+  }
+});
+
+
+describe('async group message input contract', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => [false, true].map(allowChatMessages => ({ cliId, allowChatMessages }))))(
+    '$cliId carries allowChatMessages=$allowChatMessages through the real builder', ({ cliId, allowChatMessages }) => {
+      const req: TriggerRequest = {
+        source: { type: 'ui', connectorId: 'test' },
+        target: { kind: 'turn', sessionId: 'sid' },
+        envelope: { format: 'text', sourceName: 'test', trusted: false, rawText: 'untrusted event data' },
+        instruction: 'Perform the authorized task',
+        options: { asyncReturnSessionId: true, allowChatMessages },
+      };
+      const application = buildExternalEventApplicationContext(req);
+      const out = buildFollowUpCliInput(buildUntrustedEventPrompt(req, 'trg_test'), 'sid', {
+        cliId, larkAppId: 'app_test', chatId: 'oc_group',
+        codexAppText: buildExternalEventVisibleText(req),
+        codexAppApplicationContext: application,
+        codexAppMessageContext: buildExternalEventDataContext(req, 'trg_test'),
+      });
+      const expected = allowChatMessages ? 'may call botmux send' : 'Do not call botmux send; do not post';
+      if (cliId === 'codex-app') {
+        const entries = Object.entries(out.codexAppInput!.additionalContext!);
+        const policy = entries.filter(([key]) => key.startsWith('botmux_application_context'));
+        expect(policy.every(([, entry]) => entry.kind === 'application')).toBe(true);
+        expect(policy.map(([, entry]) => entry.value).join('')).toBe(application);
+        expect(application).toContain(expected);
+        expect(application).not.toContain('untrusted event data');
+        const data = entries.filter(([key]) => key.startsWith('botmux_message_context'));
+        expect(data.every(([, entry]) => entry.kind === 'untrusted')).toBe(true);
+        expect(data.map(([, entry]) => entry.value).join('')).toContain('untrusted event data');
+        expect(out.codexAppInput!.text).not.toContain('botmux_http_response_mode');
+      } else {
+        expect(out.codexAppInput).toBeUndefined();
+        expect(out.content).toContain(expected);
+        expect(out.content).toContain('untrusted event data');
+        expect(out.content).toContain('BOTMUX_NOTHING_TO_SEND');
+      }
+    });
 });

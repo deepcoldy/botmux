@@ -46,6 +46,7 @@ import {
   clearUsageLimitState,
   initWorkerPool,
 } from '../src/core/worker-pool.js';
+import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { __testOnly_resetQuotaFallbackEvents } from '../src/services/quota-fallback.js';
@@ -126,6 +127,7 @@ describe('daemon quota fallback handoff', () => {
     vi.clearAllMocks();
     __testOnly_resetQuotaFallbackEvents();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-quota-fallback-'));
+    sessionStore.init(SOURCE);
     registerBot({
       larkAppId: SOURCE,
       larkAppSecret: 'source-secret',

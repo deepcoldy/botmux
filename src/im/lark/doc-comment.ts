@@ -13,6 +13,7 @@
  * client.request，自动带 tenant_access_token）。和 client.ts 的资源下载同套路，
  * 只是 app/user 的优先级反过来。
  */
+import { withUserAccessToken as withPresetBearerToken } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBot } from '../../bot-registry.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { logger } from '../../utils/logger.js';
@@ -71,9 +72,37 @@ export function commentTriggerAllowed(
   mode: CommentTriggerMode,
   triggerMentions: string[],
   selfBotOpenId: string | undefined,
+  ownerOpenId?: string,
 ): boolean {
   if (mode === 'all') return true;
-  return !!selfBotOpenId && triggerMentions.includes(selfBotOpenId);
+  if (!selfBotOpenId) return false;
+  // @ 了本机器人始终相关。
+  if (triggerMentions.includes(selfBotOpenId)) return true;
+  // owner-mention（替身语义）：评论 @ 了订阅负责人才触发。WS 链路只在 @bot 时才会
+  // 推到这里，所以 owner 提及主要由 poller 侧的同款判定兜；这里保留谓词使两条链路
+  // 口径一致、也防御未来 WS 投递范围变化。
+  if (mode === 'owner-mention') return !!ownerOpenId && triggerMentions.includes(ownerOpenId);
+  return false;
+}
+
+/**
+ * 轮询路径（poller 读到一条评论后）的触发判定。调用方应已先排除 bot 自发评论与空
+ * 正文。与 WS 的 {@link commentTriggerAllowed} 同语义但面向轮询：
+ * - all：任何评论投递。
+ * - owner-mention（替身）：评论 @ 了订阅负责人 **或** @ 了本机器人才投递；既没 @
+ *   负责人也没 @bot 的普通评论跳过（推进游标但不回复）。ownerOpenId 缺失时保守不投。
+ * - mention-only：不靠轮询（WS 已覆盖 @bot），这里恒 false。
+ */
+export function polledReplyTriggerAllowed(
+  mode: CommentTriggerMode,
+  mentions: string[],
+  selfBotOpenId: string | undefined,
+  ownerOpenId: string | undefined,
+): boolean {
+  if (mode === 'all') return true;
+  if (mode !== 'owner-mention') return false;
+  if (selfBotOpenId && mentions.includes(selfBotOpenId)) return true;
+  return !!ownerOpenId && mentions.includes(ownerOpenId);
 }
 
 /** 飞书云文档评论里富文本元素的最小子集（够 bot 发纯文本 + @人）。 */
@@ -163,11 +192,28 @@ export async function resolveDocFile(larkAppId: string, input: string): Promise<
     // is how the file token is obtained, so there is no subscription to look an
     // owner up by yet. Resolution runs before any subscription exists (and for
     // documents that never get one), so it uses the bot's own identity.
-    const res = await driveApiCall(larkAppId, {
-      method: 'GET',
-      path: '/open-apis/wiki/v2/spaces/get_node',
-      params: { token: ref.token, obj_type: 'wiki' },
-    });
+    let res: any;
+    try {
+      res = await driveApiCall(larkAppId, {
+        method: 'GET',
+        path: '/open-apis/wiki/v2/spaces/get_node',
+        params: { token: ref.token, obj_type: 'wiki' },
+      });
+    } catch (error) {
+      // get_node 最常见失败是**该 bot 不在这篇知识空间/节点的可读范围**（飞书
+      // code 131006）。不是链接坏了：换一个被授权的 bot、或把当前 bot 加进文档
+      // 协作者即可。把原始 400 吞成通用「无法解析」会让用户无从下手，这里把飞书
+      // code/msg 翻成可操作提示继续抛。
+      const data = (error as any)?.response?.data ?? (error as any)?.data;
+      const code = data?.code ?? (error as any)?.code;
+      if (code === 131006) {
+        throw new Error('当前机器人没有这篇文档的读取权限（飞书 131006）。请换一个被授权的机器人，或在文档里把本机器人加为协作者后再试。');
+      }
+      if (typeof data?.msg === 'string' && data.msg) {
+        throw new Error(`读取 wiki 节点失败（飞书 ${code ?? '?'}）：${data.msg}`);
+      }
+      throw error;
+    }
     const node = res?.data?.node;
     if (!node?.obj_token || !node?.obj_type) {
       throw new Error(`wiki 节点 ${ref.token} 解析失败（缺 obj_token/obj_type）`);
@@ -176,6 +222,36 @@ export async function resolveDocFile(larkAppId: string, input: string): Promise<
   }
 
   return { fileToken: ref.token, fileType: pathKindToFileType(ref.kind) };
+}
+
+/**
+ * 取文档标题（best-effort，给列表/看板显示用）。
+ *
+ * 订阅表主键是 file_token，人眼认不出是哪篇文档；`docTitle` 字段若没人写，列表
+ * 就只能回退显示 token 前 12 位。拿不到一律返回 undefined、**绝不抛**：标题只是
+ * 显示用，不能让取标题失败挡住订阅登记或评论投递。飞书对 token/type 不匹配在
+ * `failed_list` 里给 970005 而非顶层错误，所以这里只认 `metas[0].title`，其它形态
+ * 一律降级 undefined。
+ */
+export async function fetchDocTitle(
+  larkAppId: string,
+  file: ResolvedDocFile,
+): Promise<string | undefined> {
+  try {
+    const res = await driveApiCall(larkAppId, {
+      method: 'POST',
+      path: '/open-apis/drive/v1/metas/batch_query',
+      data: {
+        request_docs: [{ doc_token: file.fileToken, doc_type: file.fileType }],
+      },
+    });
+    if (res?.code !== 0) return undefined;
+    const title = res?.data?.metas?.[0]?.title;
+    return typeof title === 'string' && title.trim() ? title.trim() : undefined;
+  } catch (err) {
+    logger.debug(`[doc-comment] fetchDocTitle failed for ${file.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
 }
 
 // ─── 通用调用：优先 user token，回退 tenant ─────────────────────────────────────
@@ -210,6 +286,8 @@ interface DriveCallOpts {
    * provider request. It deliberately sits outside fallback catch blocks so a
    * revoked origin aborts instead of being mistaken for an identity failure. */
   beforeProviderEffect?: () => void | Promise<void>;
+  providerRequestStarted?: () => void | Promise<void>;
+  providerRequestNotDelivered?: () => void | Promise<void>;
   /**
    * The document this call acts on, when known. Used ONLY to look up which
    * person owns the subscription (see `userOpenId`); it is not sent upstream.
@@ -235,6 +313,10 @@ interface DriveCallOpts {
 
 export interface DocProviderEffectOptions {
   beforeProviderEffect?: () => void | Promise<void>;
+  /** Called immediately before the HTTP client receives a write request. */
+  providerRequestStarted?: () => void | Promise<void>;
+  /** Called only after an HTTP/business response proves the write was rejected. */
+  providerRequestNotDelivered?: () => void | Promise<void>;
 }
 
 const DOC_SUBSCRIPTION_PERMISSION_CODE = 1069603;
@@ -383,14 +465,55 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand, actingUserOpenId);
 
   // tenant（应用身份）：走 SDK client.request（带 token/缓存/GET 空 body 守卫）。
+  const markRejectedResponse = async (res: any): Promise<any> => {
+    if (res?.code !== undefined && res.code !== 0) {
+      await opts.providerRequestNotDelivered?.();
+    }
+    return res;
+  };
+  const providerResponseProvesRejection = (error: unknown): boolean => {
+    const status = (error as any)?.response?.status
+      ?? (error as any)?.status
+      ?? (error as any)?.httpStatus;
+    return Number.isInteger(status) && status >= 400 && status < 500;
+  };
   const callTenant = async () => {
     const c = getBotClient(larkAppId);
-    return c.request({
-      method: opts.method,
-      url: opts.path,
-      params: opts.params,
-      ...(opts.data !== undefined ? { data: opts.data } : {}),
-    });
+    let requestOptions: ReturnType<typeof withPresetBearerToken> | undefined;
+    // Client.request resolves the tenant token internally. For a checkpointed
+    // comment write, doing that after providerRequestStarted would incorrectly
+    // classify token acquisition failures as an unknown delivery. Resolve and
+    // cache it first, then pass the known bearer header into request(). Calls
+    // outside the ledger lifecycle keep the original SDK-managed token path.
+    if (opts.providerRequestStarted) {
+      await opts.beforeProviderEffect?.();
+      const tenantAccessToken = await c.tokenManager.getTenantAccessToken();
+      if (!tenantAccessToken) throw new Error('无法获取 Tenant Token，未发送文档请求');
+      // The SDK's withTenantToken helper only adds a raw header; request()
+      // still performs its own tenant-token lookup and may fail after the
+      // checkpoint. The user-token option is the SDK's actual pre-resolved
+      // bearer path: despite its name, it only injects this bearer and skips
+      // that lookup. Passing the already resolved tenant token here therefore
+      // preserves tenant identity while making the effect boundary exact.
+      requestOptions = withPresetBearerToken(tenantAccessToken);
+    }
+    await opts.beforeProviderEffect?.();
+    await opts.providerRequestStarted?.();
+    try {
+      return await markRejectedResponse(await c.request({
+        method: opts.method,
+        url: opts.path,
+        params: opts.params,
+        ...(opts.data !== undefined ? { data: opts.data } : {}),
+      }, requestOptions));
+    } catch (error) {
+      // A 4xx response rejects this request. A 5xx may be returned after the
+      // write committed, so it remains an unknown delivery and fails closed.
+      if (providerResponseProvesRejection(error)) {
+        await opts.providerRequestNotDelivered?.();
+      }
+      throw error;
+    }
   };
   const callUser = async () => {
     // Token resolution may refresh an expired user token over the network.
@@ -400,7 +523,17 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     const userToken = await resolveActingUserToken();
     if (!userToken) throw new UserTokenMissingError('该操作需要 User Token（请在话题中 /login 授权）。');
     await opts.beforeProviderEffect?.();
-    return fetchWithUserToken(brand, userToken, opts);
+    await opts.providerRequestStarted?.();
+    try {
+      return await markRejectedResponse(await fetchWithUserToken(brand, userToken, opts));
+    } catch (error) {
+      if (error instanceof UserTokenMissingError
+        || error instanceof UserTokenForbiddenError
+        || (error instanceof DocProviderRejectedError && providerResponseProvesRejection(error))) {
+        await opts.providerRequestNotDelivered?.();
+      }
+      throw error;
+    }
   };
 
   // ⚠️ userOnly 与 tenantOnly 是互斥的硬约束，同时传是调用方的逻辑错误。
@@ -416,7 +549,6 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   // 主体归属的，以错误主体落地比不落地更糟。tenant 失败就让它失败，调用方决定
   // 怎么降级（当前唯一调用方 markCommentEventDropped 是 best-effort 放弃 + 日志）。
   if (opts.tenantOnly) {
-    await opts.beforeProviderEffect?.();
     const res = await callTenant();
     if (res?.code !== 0) {
       throw new Error(`tenant-only drive call 失败 (${opts.path}): ${res?.msg ?? 'unknown'} (code: ${res?.code})`);
@@ -426,12 +558,14 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
 
   // 发评论：优先应用身份（回复显示为 bot），bot 无访问权（抛错或 code!=0）时回退用户身份。
   if (opts.preferTenant) {
-    await opts.beforeProviderEffect?.();
     try {
       const res = await callTenant();
       if (res?.code === 0) return res;
       logger.debug(`[doc-comment] tenant call code=${res?.code} (${opts.path})；回退 user 身份`);
     } catch (err) {
+      if (opts.providerRequestStarted && !providerResponseProvesRejection(err)) {
+        throw err;
+      }
       logger.debug(`[doc-comment] tenant call threw (${opts.path})；回退 user 身份：${err instanceof Error ? err.message : err}`);
     }
     return callUser();
@@ -439,12 +573,16 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
 
   // 默认：优先 user（有 token），401/403 回退 tenant。
   let userForbidden: UserTokenForbiddenError | undefined;
+  // Token resolution may refresh over the network, so retain the original
+  // managed-origin fence even though reads do not participate in send-ledger
+  // lifecycle callbacks.
   await opts.beforeProviderEffect?.();
   const userToken = await resolveActingUserToken();
   if (userToken) {
     try {
       await opts.beforeProviderEffect?.();
-      const userResult = await fetchWithUserToken(brand, userToken, opts);
+      await opts.providerRequestStarted?.();
+      const userResult = await markRejectedResponse(await fetchWithUserToken(brand, userToken, opts));
       if (
         opts.classifySubscriptionPermission
         && userResult?.code === DOC_SUBSCRIPTION_PERMISSION_CODE
@@ -457,6 +595,11 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
         return userResult;
       }
     } catch (err) {
+      if (err instanceof UserTokenMissingError
+        || err instanceof UserTokenForbiddenError
+        || (err instanceof DocProviderRejectedError && providerResponseProvesRejection(err))) {
+        await opts.providerRequestNotDelivered?.();
+      }
       if (err instanceof UserTokenForbiddenError) {
         userForbidden = err;
       } else if (!(err instanceof UserTokenMissingError)) {
@@ -467,7 +610,6 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   }
 
   let tenantResult: any;
-  await opts.beforeProviderEffect?.();
   try {
     tenantResult = await callTenant();
   } catch (tenantError) {
@@ -504,6 +646,13 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   return tenantResult;
 }
 
+class DocProviderRejectedError extends Error {
+  constructor(message: string, readonly httpStatus: number) {
+    super(message);
+    this.name = 'DocProviderRejectedError';
+  }
+}
+
 /** 仅供测试：直接驱动身份选择逻辑，验证互斥约束等不经由具体端点的行为。 */
 export const __testOnly_driveApiCall = driveApiCall;
 
@@ -529,7 +678,10 @@ async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCa
     );
   }
   if (!res.ok) {
-    throw new Error(`drive API ${opts.path} HTTP ${res.status}: ${body?.msg ?? ''}`);
+    throw new DocProviderRejectedError(
+      `drive API ${opts.path} HTTP ${res.status}: ${body?.msg ?? ''}`,
+      res.status,
+    );
   }
   return body;
 }
@@ -841,6 +993,8 @@ export async function replyToDocComment(
       data: { content: { elements } },
       preferTenant: true, // 回复显示为 bot 本身（应用身份）；bot 无访问权时回退 user
       beforeProviderEffect: options.beforeProviderEffect,
+      providerRequestStarted: options.providerRequestStarted,
+      providerRequestNotDelivered: options.providerRequestNotDelivered,
     });
   } catch (err) {
     // 有的评论不允许被回复（飞书 1069302：全文评论 / 已解决 / 文档评论设置受限）。
@@ -905,6 +1059,8 @@ export async function createDocComment(
     data: { reply_list: { replies: [{ content: { elements } }] } },
     preferTenant: true, // 评论显示为 bot 本身（应用身份）；bot 无访问权时回退 user
     beforeProviderEffect: options.beforeProviderEffect,
+    providerRequestStarted: options.providerRequestStarted,
+    providerRequestNotDelivered: options.providerRequestNotDelivered,
   });
   const data = ensureOk(res, '发表评论');
   const commentId: string = data?.comment_id ?? '';

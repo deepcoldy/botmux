@@ -314,4 +314,63 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
   it('removeDocSubscription 只在那一个闭包里被调用，没有旁路', () => {
     expect(region.match(/removeDocSubscription\(/g) ?? []).toHaveLength(1);
   });
+
+
+  /**
+   * 运行态观测：六个丢弃出口 + 一个真接纳成功各记一种结局。dispatched 只能在
+   * daemon 真接纳（accepted）后记，未接纳落 pending 重试，提前记成功是假结局。
+   */
+  it('六个丢弃出口各记对应结局：no-comment / trigger-missing / self-authored / not-mentioned / empty-text / audit-rejected', () => {
+    // 同样只看非注释代码行，防止把 noteOutcome('x') 写进注释就骗过计数。
+    const codeLines = region
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0 && !line.startsWith('//'));
+    for (const outcome of ['no-comment', 'trigger-missing', 'self-authored', 'not-mentioned', 'empty-text', 'audit-rejected']) {
+      const hit = codeLines.some(line => line.includes(`noteOutcome('${outcome}')`));
+      expect(hit, `缺少真实的 noteOutcome('${outcome}') 调用（注释不算）`).toBe(true);
+    }
+  });
+
+  it("dispatched 只在 handleDocComment 真接纳（accepted=true）后记，且在 WS settle 之后", () => {
+    // ⚠️ 不能对整段 region 做 `toContain("if (accepted) noteOutcome(...)")`：那种纯
+    // 文本断言能被一行**注释**骗过（把同样的字串写进注释里，代码删了测试仍绿）。
+    // 这里只保留「非注释代码行」，再对真实语句断言。
+    const codeLines = region
+      .split('\n')
+      .map(line => line.trim())
+      // 去整行注释；行尾注释按最后一个 // 剥掉。本区间没有「字符串里含 //」的代码行，
+      // 且只匹配固定守卫前缀，误剥不影响结论。
+      .map(line => (line.startsWith('//') ? '' : line.replace(/\s*\/\/.*$/, '')))
+      .filter(line => line.length > 0);
+
+    // ① 必须存在一条真实的 accepted 守卫语句（注释里的同名字串不算）。
+    const guardedIdx = codeLines.findIndex(line => line.startsWith("if (accepted) noteOutcome('dispatched')"));
+    expect(guardedIdx, '缺少「if (accepted) noteOutcome(\'dispatched\')」真实语句（注释不算）').toBeGreaterThan(-1);
+
+    // ② 在 WS settle 之后。
+    const settleIdx = codeLines.findIndex(line => line.includes('const retryOutcome = settleDocCommentWsDelivery('));
+    expect(settleIdx).toBeGreaterThan(-1);
+    expect(guardedIdx).toBeGreaterThan(settleIdx);
+
+    // ③ 在 handleDocComment 调用之后（不能提前记成功）。
+    const dispatchIdx = codeLines.findIndex(line => line.includes('accepted = await handlers.handleDocComment(delivery)'));
+    expect(dispatchIdx).toBeGreaterThan(-1);
+    expect(guardedIdx).toBeGreaterThan(dispatchIdx);
+
+    // 反向保证：不允许出现别的「无条件」noteOutcome('dispatched')。
+    const unconditional = codeLines.filter(line =>
+      line.includes("noteOutcome('dispatched')") && !line.startsWith('if (accepted)'));
+    expect(unconditional).toEqual([]);
+  });
+
+  it('标题补齐 fire-and-forget 且不 await（热路径不能为显示字段插同步往返）', () => {
+    expect(region).toContain('void fetchDocTitle(');
+  });
+
+  it('auto-sub 占位带溯源三字段（陌生人 @ 出来的订阅要能事后审计是谁触发的）', () => {
+    const autoSubRegion = regionBetween('const autoSub: DocSubscription = {', 'putDocSubscription(config.session.dataDir, larkAppId, autoSub)');
+    expect(autoSubRegion).toContain('autoCreated: true');
+    expect(autoSubRegion).toContain('autoCreatedBy: operatorOpenId');
+  });
 });

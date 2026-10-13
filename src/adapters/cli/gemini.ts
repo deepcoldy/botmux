@@ -1,7 +1,7 @@
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
 
@@ -35,6 +35,9 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // -i bakes the full first prompt (routing envelope included) into argv.
+    // Same tmux command-string ceiling as OpenCode/Cursor.
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.sendText && pty.sendSpecialKeys) {

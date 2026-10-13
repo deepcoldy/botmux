@@ -25,6 +25,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     enableLocalCliOpen: false,
     localCliOpenMode: 'attach',
     chatBotDiscovery: true,
+    cardBrandLabel: true,
     herdrTraexPlugin: { enabled: false, source: '', ref: '', recommendedSource: '', recommendedRef: '' },
     codexRpcInput: false,
     autoUpgradeCodexSessions: true,
@@ -44,6 +45,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
     sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
+    multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
   };
@@ -170,6 +172,13 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ chatBotDiscovery: false }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
+  });
+
+  it.each([false, true])('writes cardBrandLabel=%s through the dashboard segment', async (enabled) => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: enabled }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ cardBrandLabel: enabled });
   });
 
   it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
@@ -320,6 +329,23 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ workflow: { enabled: 'yes' } }, deps);
     expect(r).toEqual({ ok: false, error: 'invalid_workflow_enabled' });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('writes multiTopic.enabled toggle while preserving sibling keys', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ multiTopic: { enabled: false } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ multiTopic: { enabled: false, futureFlag: 1 } });
+  });
+
+  it('rejects invalid multiTopic patches', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ multiTopic: 'off' }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic' });
+    expect(await applySettingsWrite({ multiTopic: { enabled: 'no' } }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic_enabled' });
   });
 
   it('writes vcMeetingAgent.enabled toggle via mergeGlobalConfig', async () => {
@@ -509,6 +535,15 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_chatBotDiscovery');
+  });
+
+  it('rejects non-boolean cardBrandLabel → invalid_cardBrandLabel (no merge)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ cardBrandLabel: 'off' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_cardBrandLabel');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('rejects non-boolean noVisibleOutputHint → invalid_noVisibleOutputHint', async () => {

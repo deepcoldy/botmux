@@ -135,6 +135,8 @@ async function bootstrap(): Promise<void> {
       void shell.openPath(paths.botmuxHome);
     },
   });
+  // 有意保留：模块级变量仅为持有 Tray 引用，防止其被 GC 后托盘图标消失（只写不读）。
+  void tray;
 }
 
 function configureDesktopCommandLine(): void {

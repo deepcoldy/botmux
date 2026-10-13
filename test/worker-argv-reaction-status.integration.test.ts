@@ -1098,7 +1098,7 @@ setInterval(() => {}, 1_000);
   }, 40_000);
 
   it('never lets an idle escape between the two working edges on a Grok-class first turn', async () => {
-    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt + injectsReadyHook +
+    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt +
     // reliableTurnTerminal): its FIRST ready edge is pre-execution — the argv-baked
     // first prompt is still running. markPromptReady() would otherwise publish a
     // generic snapshot (projected idle, since isPromptReady was just set true)

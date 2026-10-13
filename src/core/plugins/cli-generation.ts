@@ -8,6 +8,7 @@ import type { SessionSkillManifest } from '../skills/types.js';
 import { refreshSessionPluginManifest, type SessionPluginManifest } from './session-manifest.js';
 import { refreshSessionMcpRuntimeManifest } from './mcp/session-runtime.js';
 import { resolvePluginSkillPackages } from './skills.js';
+import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
 
 export interface CliPluginGenerationResult {
   pluginManifest: SessionPluginManifest;
@@ -44,6 +45,7 @@ export function prepareCliPluginGeneration(opts: {
   workingDir: string;
   prompt: string;
   replacesPriorGeneration: boolean;
+  promptInjection?: 'default' | 'none';
   now?: () => string;
 }): CliPluginGenerationResult {
   const pluginManifest = refreshSessionPluginManifest({
@@ -59,6 +61,14 @@ export function prepareCliPluginGeneration(opts: {
     dataDir: opts.dataDir,
     now: opts.now,
   });
+  if (opts.promptInjection === 'none') {
+    assertNoGlobalBotmuxSkills(opts.adapter.skillsDir);
+    // Keep operational MCP/plugin state, but do not advertise or materialize
+    // any skill catalog, including the replacement catalog on resume.
+    prepareSessionSkillPrompt({ sessionId: opts.sessionId, cliId: opts.cliId,
+      workingDir: opts.workingDir, prompt: opts.prompt, botPolicy: undefined });
+    return { pluginManifest, prompt: opts.prompt, diagnostics: [] };
+  }
   const pluginSkills = resolvePluginSkillPackages(pluginManifest.pluginIds);
   const preparedSkills = prepareSessionSkillPrompt({
     sessionId: opts.sessionId,

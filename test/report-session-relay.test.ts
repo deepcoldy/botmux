@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   authorizeReportSessionRelayRequest,
+  prepareAutomaticDispatchReport,
   buildOrchestratorReportTrigger,
   deliverReportSessionRelay,
   isReportRelayOriginalSessionUnavailable,
@@ -429,6 +430,33 @@ describe('report session relay fallback target', () => {
 });
 
 describe('report session relay delivery', () => {
+  it.each(['first', 'fallback'] as const)('does not emit a trigger when the source check fails at %s', async failure => {
+    const authorized = authorize();
+    if (!authorized.ok) throw new Error('invalid fixture');
+    const calls: string[] = [];
+    const error = new Error('source unavailable');
+    let checks = 0;
+    let unavailable = failure === 'first';
+    let projectUpdates = 0;
+    await expect(deliverReportSessionRelay({
+      decision: { ...authorized, targetChatId: 'oc_original', targetScope: 'chat' },
+      triggerMeta: { requestId: 'report:1', receivedAt: '2026-08-07T07:00:00.000Z' },
+      beforeWrite: async () => { checks++; if (unavailable) throw error; },
+      fetchTarget: async path => {
+        calls.push(path);
+        if (path === '/api/trigger') return { ok: false, status: 404, json: async () => ({ errorCode: 'session_not_found' }) };
+        unavailable = true;
+        return { ok: true, status: 200, json: async () => ({ sessions: [{
+          sessionId: 'session-current', larkAppId: 'cli_orchestrator', chatId: 'oc_original', scope: 'chat', status: 'idle',
+        }] }) };
+      },
+      postProjectUpdate: async () => { projectUpdates++; return { projectSynced: true }; },
+    })).rejects.toBe(error);
+    expect(calls).toEqual(failure === 'first' ? [] : ['/api/trigger', '/api/sessions']);
+    expect(checks).toBe(failure === 'first' ? 1 : 2);
+    expect(projectUpdates).toBe(0);
+  });
+
   it.each([
     { name: '403', response: { ok: false, status: 403, body: { ok: false, errorCode: 'forbidden' } } },
     { name: '500', response: { ok: false, status: 500, body: { ok: false, errorCode: 'trigger_failed' } } },
@@ -606,5 +634,20 @@ describe('report session relay wiring', () => {
       'raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);',
     );
     expect(daemonSource).toContain('if (error instanceof JsonBodyTooLargeError)');
+  });
+});
+
+
+describe('automatic zero-injection dispatch report', () => {
+  it('returns to the signed lead session without assuming task completion', () => {
+    const input = { registry: REGISTRY, bindingSecret: BINDING_SECRET, dispatchRoot: 'om_dispatch',
+      sourceSessionId: 'sub', sourceLarkAppId: 'cli_sub', content: '测试通过' };
+    const decision = prepareAutomaticDispatchReport(input)!;
+    expect(decision.target).toEqual({ sessionId: 'session-orchestrator', larkAppId: 'cli_orchestrator' });
+    expect(decision.content).toBe('测试通过');
+    expect(decision.projectUpdate).toEqual({});
+    expect(prepareAutomaticDispatchReport({ ...input, bindingSecret: 'forged' })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, dispatchRoot: undefined })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, sourceSessionId: 'session-orchestrator' })).toBeUndefined();
   });
 });

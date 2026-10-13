@@ -12,8 +12,14 @@ import { parseAidenCodexModelsJson } from '../src/services/aiden-model-catalog.j
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 
 /** 只带 detectModels 的最小适配器 fake（其余字段本服务不碰）。 */
-function fakeAdapter(detect: (() => Promise<readonly string[] | null>) | undefined): CliAdapter {
-  return { detectModels: detect } as unknown as CliAdapter;
+function fakeAdapter(
+  detect: (() => Promise<readonly string[] | null>) | undefined,
+  capabilities?: () => Promise<readonly { slug: string; serviceTiers: string[] }[] | null>,
+): CliAdapter {
+  return {
+    ...(detect ? { detectModels: detect } : {}),
+    ...(capabilities ? { detectModelCapabilities: capabilities } : {}),
+  } as unknown as CliAdapter;
 }
 
 describe('staticModelChoices（静态候选，shell-free）', () => {
@@ -107,6 +113,24 @@ describe('detectModels（live 探测，fail-soft）', () => {
     expect(models).toEqual(['deepseek-v4-pro', 'gpt-6-astra']);
     expect(aidenCalls).toBe(1);
     expect(adapterCalls).toBe(0);
+  });
+
+  it('Aiden 的成功目录沿用缓存，过期后重探', async () => {
+    const catalog = createModelCatalog();
+    let now = 1_000;
+    let calls = 0;
+    const opts = {
+      now: () => now,
+      adapterFactory: () => { throw new Error('must not construct Codex adapter'); },
+      aidenCodexDetector: async () => { calls++; return ['deepseek-v4-pro']; },
+    };
+    for (let i = 0; i < 2; i++) {
+      expect(await catalog.detectModels('aiden-x-codex', opts)).toEqual(['deepseek-v4-pro']);
+    }
+    expect(calls).toBe(1);
+    now += MODEL_DETECT_TTL_MS;
+    expect(await catalog.detectModels('aiden-x-codex', opts)).toEqual(['deepseek-v4-pro']);
+    expect(calls).toBe(2);
   });
 
   it('适配器无 detectModels（claude-code）→ null', async () => {
@@ -208,6 +232,81 @@ describe('detectModels（live 探测，fail-soft）', () => {
     const factory = () => ({}) as CliAdapter;
     expect(await catalog.detectModels('codex', { adapterFactory: factory })).toBeNull();
   });
+
+  it('detectModelCapabilities 一次探测同时服务 slug 与能力目录缓存', async () => {
+    let now = 20_000;
+    let calls = 0;
+    const catalog = createModelCatalog();
+    const factory = () => fakeAdapter(undefined, async () => {
+      calls++;
+      return [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }];
+    });
+    const opts = { now: () => now, adapterFactory: factory };
+
+    const detected = await catalog.detectModelCatalog('codex', opts);
+    expect(detected).toEqual({
+      models: ['gpt-6-astra'],
+      modelCapabilities: [{ slug: 'gpt-6-astra', serviceTiers: ['priority'] }],
+    });
+    now += MODEL_DETECT_TTL_MS - 1;
+    await expect(catalog.detectModels('codex', opts)).resolves.toEqual(['gpt-6-astra']);
+    await expect(catalog.detectModelCatalog('codex', opts)).resolves.toEqual(detected);
+    expect(calls).toBe(1);
+  });
+
+  it('能力探测器失败时不回落到 slug-only 探测器重复执行', async () => {
+    let calls = 0;
+    const catalog = createModelCatalog();
+    const factory = () => fakeAdapter(
+      async () => {
+        calls++;
+        return ['fallback'];
+      },
+      async () => {
+        calls++;
+        return null;
+      },
+    );
+
+    await expect(catalog.detectModelCatalog('codex', { adapterFactory: factory })).resolves.toBeNull();
+    expect(calls).toBe(1);
+  });
+
+  it('同一 CLI 的不同 runtime 与环境使用独立缓存', async () => {
+    let calls = 0;
+    let context = 'runtime-a';
+    let env: NodeJS.ProcessEnv = { PATH: '/runtime-a/bin' };
+    const catalog = createModelCatalog();
+    const factory = () => fakeAdapter(undefined, async probe => {
+      calls++;
+      expect(probe?.env).toBe(env);
+      return [{ slug: `model-${calls}`, serviceTiers: ['priority'] }];
+    });
+
+    const first = await catalog.detectModelCatalog('codex', {
+      adapterFactory: factory,
+      runtimeContext: context,
+      probeEnv: env,
+    });
+    context = 'runtime-b';
+    env = { PATH: '/runtime-b/bin' };
+    const second = await catalog.detectModelCatalog('codex', {
+      adapterFactory: factory,
+      runtimeContext: context,
+      probeEnv: env,
+    });
+    context = 'runtime-a';
+    env = { PATH: '/runtime-a/bin' };
+    await expect(catalog.detectModelCatalog('codex', {
+      adapterFactory: factory,
+      runtimeContext: context,
+      probeEnv: env,
+    })).resolves.toEqual(first);
+
+    expect(first?.models).toEqual(['model-1']);
+    expect(second?.models).toEqual(['model-2']);
+    expect(calls).toBe(2);
+  });
 });
 
 describe('parseAidenCodexModelsJson', () => {
@@ -256,5 +355,34 @@ describe('buildModelChoicesResponse（端点 200 响应体构造）', () => {
     expect(body.models).toContain('brand-new-model'); // live 增量追加
     expect(body.source).toBe('live');
     expect(body.detectedAt).toBe(99_000);
+  });
+
+  it('能力目录作为可选字段进入 live 响应，slug-only 探测不产生该字段', async () => {
+    const capabilitiesFactory = () => fakeAdapter(undefined, async () => [
+      { slug: 'gpt-6-astra', serviceTiers: ['priority'] },
+    ]);
+    const withCapabilities = await buildModelChoicesResponse('opencode', {
+      now: () => 100_000,
+      adapterFactory: capabilitiesFactory,
+    });
+    expect(withCapabilities.modelCapabilities).toEqual([
+      { slug: 'gpt-6-astra', serviceTiers: ['priority'] },
+    ]);
+
+    const slugOnly = await buildModelChoicesResponse('opencode2', {
+      now: () => 101_000,
+      adapterFactory: () => fakeAdapter(async () => ['slug-only']),
+    });
+    expect(slugOnly).not.toHaveProperty('modelCapabilities');
+  });
+
+  it('wrapper 选择保留旧 slug 目录但不暴露未经真实 wrapper 证明的档位', async () => {
+    const body = await buildModelChoicesResponse('cjadk-x-codex', {
+      adapterFactory: () => fakeAdapter(undefined, async () => [
+        { slug: 'gateway-model', serviceTiers: ['priority'] },
+      ]),
+    });
+    expect(body.models).toContain('gateway-model');
+    expect(body).not.toHaveProperty('modelCapabilities');
   });
 });

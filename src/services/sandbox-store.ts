@@ -7,29 +7,88 @@
 import { rmwBotEntry } from './config-store.js';
 import { getBot } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
+import {
+  normalizeSandboxMode,
+  normalizeScratchStorage,
+  type SandboxMode,
+} from '../adapters/cli/sandbox-mode.js';
 
-/** Current configured file-sandbox flag for a bot. */
-export function getBotSandbox(larkAppId: string): boolean {
-  try { return getBot(larkAppId).config.sandbox === true; } catch { return false; }
+/** Current configured sandbox mode for a bot. */
+export function getBotSandboxMode(larkAppId: string): SandboxMode {
+  try { return normalizeSandboxMode(getBot(larkAppId).config.sandbox); } catch { return 'off'; }
 }
 
+/** Back-compat boolean view (oncall/scratch both count as sandboxed). */
+export function getBotSandbox(larkAppId: string): boolean {
+  return getBotSandboxMode(larkAppId) !== 'off';
+}
+
+/** Persist the tri-state sandbox selection (+ scratch sub-options) for a bot.
+ *  Atomic bots.json write + in-memory sync, next new session生效. Writing
+ *  'off' omits the key (absent = off, the historical contract). */
+export async function updateBotSandboxMode(
+  larkAppId: string,
+  mode: SandboxMode,
+  scratch?: { storage?: 'tmpfs' | 'disk'; tmpfsSizeMb?: number; denyPaths?: string[] },
+): Promise<{ ok: true; sandbox: SandboxMode } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const storage = normalizeScratchStorage(scratch?.storage);
+  const tmpfsSizeMb = typeof scratch?.tmpfsSizeMb === 'number'
+    && Number.isFinite(scratch.tmpfsSizeMb) && scratch.tmpfsSizeMb > 0
+    ? Math.floor(scratch.tmpfsSizeMb)
+    : undefined;
+  const denyPaths = Array.isArray(scratch?.denyPaths)
+    ? [...new Set(scratch!.denyPaths.filter((p): p is string => typeof p === 'string' && !!p.trim()).map(p => p.trim()))]
+    : undefined;
+
+  const r = await rmwBotEntry<SandboxMode>(larkAppId, (entry) => {
+    if (mode === 'off') {
+      delete entry.sandbox;
+    } else {
+      entry.sandbox = mode;
+    }
+    if (mode === 'scratch') {
+      entry.scratchStorage = storage;
+      if (tmpfsSizeMb) entry.scratchTmpfsSizeMb = tmpfsSizeMb;
+      else delete entry.scratchTmpfsSizeMb;
+      if (denyPaths?.length) entry.scratchDenyPaths = denyPaths;
+      else delete entry.scratchDenyPaths;
+    } else {
+      delete entry.scratchStorage;
+      delete entry.scratchTmpfsSizeMb;
+      delete entry.scratchDenyPaths;
+    }
+    return { write: true, result: mode };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  const cfg = bot.config;
+  if (mode === 'off') delete cfg.sandbox;
+  else cfg.sandbox = mode;
+  if (mode === 'scratch') {
+    cfg.scratchStorage = storage;
+    if (tmpfsSizeMb) cfg.scratchTmpfsSizeMb = tmpfsSizeMb;
+    else delete cfg.scratchTmpfsSizeMb;
+    if (denyPaths?.length) cfg.scratchDenyPaths = denyPaths;
+    else delete cfg.scratchDenyPaths;
+  } else {
+    delete cfg.scratchStorage;
+    delete cfg.scratchTmpfsSizeMb;
+    delete cfg.scratchDenyPaths;
+  }
+  logger.info(`[sandbox:${larkAppId}] sandbox mode → ${mode}`);
+  return { ok: true, sandbox: mode };
+}
+
+/** Back-compat boolean toggle (used by the old dashboard route). */
 export async function updateBotSandbox(
   larkAppId: string,
   enabled: boolean,
 ): Promise<{ ok: true; sandbox: boolean } | { ok: false; reason: string }> {
-  let bot;
-  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-
-  const r = await rmwBotEntry<boolean>(larkAppId, (entry) => {
-    if (enabled) entry.sandbox = true;
-    else delete entry.sandbox;  // omit key when off → preserves "absent = off"
-    return { write: true, result: enabled };
-  });
-  if (!r.ok) return { ok: false, reason: r.reason };
-
-  bot.config.sandbox = enabled;
-  logger.info(`[sandbox:${larkAppId}] sandbox → ${enabled}`);
-  return { ok: true, sandbox: enabled };
+  const r = await updateBotSandboxMode(larkAppId, enabled ? 'oncall' : 'off');
+  return r.ok ? { ok: true, sandbox: r.sandbox !== 'off' } : r;
 }
 
 /** Current configured read-isolation flag for a bot. */

@@ -595,6 +595,43 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(runAutoWorktreeCommitMock).toHaveBeenCalledWith(expect.objectContaining({ prepareTurn }));
   });
 
+  it('resumes a restored auto-worktree on the same explicit path', async () => {
+    const pending: Session = {
+      sessionId: 'pending-explicit-worktree',
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      scope: 'chat',
+      larkAppId: APP,
+      title: 'restore path',
+      status: 'active',
+      createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      queued: true,
+      queuedPrompt: 'OPENING_N',
+      pendingRepoSetup: {
+        mode: 'auto_worktree',
+        prompt: 'OPENING_N',
+        baseDir: '/repos/base',
+        turnId: 'om_original_turn',
+        force: true,
+        worktreePath: '/repos/base-wt-botmux-abc',
+        branch: 'wt/botmux-abc',
+        reuseExisting: true,
+      },
+    };
+    store.set(pending.sessionId, pending);
+
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+
+    expect(runAutoWorktreeCommitMock).toHaveBeenCalledWith(expect.objectContaining({
+      baseDir: '/repos/base',
+      force: true,
+      worktreePath: '/repos/base-wt-botmux-abc',
+      branch: 'wt/botmux-abc',
+      reuseExisting: true,
+    }));
+  });
+
   it('contains detached auto-worktree recovery rejection and leaves the setup retryable', async () => {
     const pending: Session = {
       sessionId: 'pending-auto-worktree',

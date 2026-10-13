@@ -30,6 +30,24 @@ describe('message listener store', () => {
     })).not.toHaveProperty('replyCardTitle');
   });
 
+  it('preserves title resolution only with real keywords and boolean true', () => {
+    expect(sanitizeMessageListenerUpdate({ enabled: true, prompt: '分析文档', contentPolicy: { includeKeywords: ['智能纪要'], resolveDocumentTitles: true } })?.contentPolicy)
+      .toEqual({ includeKeywords: ['智能纪要'], resolveDocumentTitles: true });
+    expect(sanitizeMessageListenerUpdate({ enabled: true, prompt: '分析文档', contentPolicy: { includeKeywords: ['智能纪要'], resolveDocumentTitles: 'true' } })?.contentPolicy)
+      .toEqual({ includeKeywords: ['智能纪要'] });
+  });
+
+  it('keeps keywords when the document-title checkbox patch follows a keyword patch', () => {
+    const keywordPatch = { includeKeywords: ['智能纪要'] };
+    const checkboxPatch = { includeKeywords: [...keywordPatch.includeKeywords], resolveDocumentTitles: true };
+    const update = sanitizeMessageListenerUpdate({
+      enabled: true,
+      prompt: '分析文档',
+      contentPolicy: { ...keywordPatch, ...checkboxPatch },
+    });
+    expect(update?.contentPolicy).toEqual({ includeKeywords: ['智能纪要'], resolveDocumentTitles: true });
+  });
+
   it('rejects enabled include-only listeners without selected senders', () => {
     const update = sanitizeMessageListenerUpdate({
       enabled: true,

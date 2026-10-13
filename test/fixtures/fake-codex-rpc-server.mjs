@@ -18,6 +18,16 @@ import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { appendFileSync, writeFileSync } from 'node:fs';
 
+if (process.env.FAKE_ENV_PROBE_PATH) {
+  const e = process.env;
+  writeFileSync(e.FAKE_ENV_PROBE_PATH, JSON.stringify({
+    hostAbsent: !('UNLISTED_CLOUD_CREDENTIAL' in e),
+    authPresent: e.OPENAI_API_KEY === 'rpc-sentinel',
+    homePinned: e.CODEX_HOME === '/test/rpc/codex',
+    ownerPinned: e.BOTMUX_OWNER_OPEN_ID === 'ou_rpc',
+  }));
+}
+
 const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
 const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
 const port = m ? Number(m[1]) : 0;
@@ -41,6 +51,7 @@ const REQUEST_USER_INPUT = process.env.FAKE_REQUEST_USER_INPUT === '1';
 const SERVER_REQUEST_METHODS = (process.env.FAKE_SERVER_REQUEST_METHODS ?? '')
   .split(',').map(value => value.trim()).filter(Boolean);
 const serverRequestIds = new Set();
+const userInputRequestId = process.env.FAKE_USER_INPUT_STRING_ID === '1' ? 'native-question' : 900;
 let turnCount = 0;
 
 const httpServer = createServer((req, res) => {
@@ -89,7 +100,7 @@ wss.on('connection', (ws) => {
       serverRequestIds.delete(msg.id);
       return;
     }
-    if (REQUEST_USER_INPUT && msg.id === 900 && (msg.result !== undefined || msg.error !== undefined)) {
+    if (REQUEST_USER_INPUT && msg.id === userInputRequestId && (msg.result !== undefined || msg.error !== undefined)) {
       if (!pendingTurnReply) return;
       // Real traex 0.200.19 normalizes ANY reply to requestUserInput (empty
       // answers OR a JSON-RPC error) into {answers:{}} and COMPLETES the turn.
@@ -232,7 +243,7 @@ wss.on('connection', (ws) => {
           pendingThreadId = threadId;
           ws.send(JSON.stringify({
             jsonrpc: '2.0',
-            id: 900,
+            id: userInputRequestId,
             method: 'item/tool/requestUserInput',
             params: {
               threadId: msg.params?.threadId ?? 'thread-fake-1',

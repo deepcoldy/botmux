@@ -14,6 +14,7 @@ import {
   preferChatFilterLabel,
   chatFilterLabelIsUnresolved,
   restartConfirmMessage,
+  resumeErrorMessage,
   historySenderKey,
   sessionLocationText,
   sessionExchangePreview,
@@ -23,6 +24,7 @@ import {
   previewOverlayInitialState,
 } from '../src/dashboard/web/sessions.js';
 import { CliFilterGroup, TopicGroupsView } from '../src/dashboard/web/sessions-page.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { previewMarkdownHtml } from '../src/dashboard/web/preview-markdown.js';
 
 const kanbanCallbacks: SessionsKanbanCallbacks = {
@@ -74,6 +76,18 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
     ...fullState,
   }));
 }
+
+describe('dashboard session resume errors', () => {
+  it.each([
+    ['zh', '该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。', '恢复失败'],
+    ['en', 'This session’s workspace has been reclaimed and the session cannot be resumed. Create a new session in a valid workspace.', 'Resume failed'],
+  ] as const)('explains retirement in %s and preserves other failure details', (locale, message, failure) => {
+    const translate = createDashboardTranslator(locale);
+    expect(resumeErrorMessage('workspace_retired', translate)).toBe(message);
+    expect(resumeErrorMessage('daemon_unavailable', translate)).toBe(`${failure}: daemon_unavailable`);
+    expect(resumeErrorMessage(503, translate)).toBe(`${failure}: 503`);
+  });
+});
 
 describe('dashboard sessions filters', () => {
   it('shows only a current bot reply in the latest exchange preview', () => {

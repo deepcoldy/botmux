@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from '../../core/group-default-models.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { useT } from './react-hooks.js';
-import { DropdownField, ModelPickerField } from './bot-defaults-page.js';
+import { DropdownField, ModelPickerField } from './field-controls.js';
 import { fetchCliOptions, fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption, selectedCliOption } from './bot-defaults.js';
 
 type Props = {

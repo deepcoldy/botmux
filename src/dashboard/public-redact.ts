@@ -159,6 +159,7 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
 }
 
 const PRIVATE_SESSION_FIELDS = new Set([
+  'workspace',
   'gitBranch',
   'riffAccessUrl',
   // Concrete distribution identity is operator configuration, not anonymous

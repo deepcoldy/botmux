@@ -21,9 +21,10 @@
  * /introduce events in flight on the same app), causing rename ENOENT or one
  * writer's partial buffer being renamed into place.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 const DEFAULT_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -45,23 +46,19 @@ function filePath(dataDir: string, larkAppId: string, chatId: string): string {
 }
 
 function readFile(dataDir: string, larkAppId: string, chatId: string): FileShape {
-  const fp = filePath(dataDir, larkAppId, chatId);
-  if (!existsSync(fp)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as FileShape;
-  } catch { /* corrupt — fall through */ }
-  return {};
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次写入覆盖），见 utils/json-file.ts。
+  return readJsonFileSoft<FileShape>(filePath(dataDir, larkAppId, chatId), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'observed-bots-store',
+  });
 }
 
 function writeFileAtomic(dataDir: string, larkAppId: string, chatId: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir, larkAppId, chatId);
-  // Unique tmp name (pid + uuid) so concurrent writers don't clobber each
-  // other's in-flight bytes via a shared `.tmp` filename.
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  // atomicWriteFileSync uses a unique tmp name (pid + random) so concurrent
+  // writers don't clobber each other's in-flight bytes via a shared `.tmp`.
+  atomicWriteFileSync(filePath(dataDir, larkAppId, chatId), JSON.stringify(data, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /**

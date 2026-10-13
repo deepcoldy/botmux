@@ -20,6 +20,7 @@ import {
   hashBotId,
   hashChatId,
   isValidProfileId,
+  mergeListenerContentPolicy,
   previewMessageListener,
   runMessageListenerPreview,
   saveInjectMode,
@@ -88,6 +89,16 @@ describe('team federation helpers', () => {
     expect(teamCliOptions(teams)).toEqual(['claude', 'codex']);
     expect(updateTeamBotCapability(teams, 'cli_a', '  docs  ')[0].bots[0].capability).toBe('docs');
     expect(updateTeamBotCapability(teams, 'cli_a', '   ')[0].bots[0].capability).toBeNull();
+  });
+});
+
+describe('message listener content policy helpers', () => {
+  it('preserves keywords when the title-resolution checkbox is toggled', () => {
+    const withKeywords = mergeListenerContentPolicy(undefined, { includeKeywords: ['智能纪要'] });
+    expect(mergeListenerContentPolicy(withKeywords, {
+      includeKeywords: [...(withKeywords.includeKeywords ?? [])],
+      resolveDocumentTitles: true,
+    })).toEqual({ includeKeywords: ['智能纪要'], resolveDocumentTitles: true });
   });
 });
 

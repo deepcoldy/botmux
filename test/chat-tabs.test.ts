@@ -22,7 +22,7 @@ import {
   sortChatTabs,
 } from '../src/im/lark/chat-tabs.js';
 import { parseTabsCommand } from '../src/im/lark/chat-tabs-command.js';
-import { parseChatTabsCli } from '../src/cli/chat-tabs-command.js';
+import { executeChatTabsCli, parseChatTabsCli } from '../src/cli/chat-tabs-command.js';
 
 describe('chat tabs API', () => {
   beforeEach(() => vi.clearAllMocks());
@@ -42,6 +42,37 @@ describe('chat tabs API', () => {
     });
   });
 
+  it('selects the created URL tab when Feishu returns the complete tab list', async () => {
+    chatTab.listTabs.mockResolvedValue({
+      code: 0,
+      data: { chat_tabs: [{ tab_id: 'msg', tab_type: 'message' }] },
+    });
+    chatTab.create.mockResolvedValue({
+      code: 0,
+      data: {
+        chat_tabs: [
+          { tab_id: 'msg', tab_type: 'message', tab_content: {} },
+          {
+            tab_id: 'tab-url',
+            tab_name: 'Agent Desk',
+            tab_type: 'url',
+            tab_content: { url: 'https://example.com/tasks/task-one?tab=workspace' },
+          },
+        ],
+      },
+    });
+
+    await expect(ensureUrlChatTab(
+      'app',
+      'chat',
+      'https://example.com/tasks/task-one?tab=workspace',
+      'Agent Desk',
+    )).resolves.toMatchObject({
+      created: true,
+      tab: { tab_id: 'tab-url', tab_type: 'url' },
+    });
+  });
+
   it('idempotently reuses an existing URL tab and refreshes its name', async () => {
     const existing = {
       tab_id: 'tab-page', tab_name: '发布页', tab_type: 'url',
@@ -50,7 +81,15 @@ describe('chat tabs API', () => {
     chatTab.listTabs
       .mockResolvedValueOnce({ code: 0, data: { chat_tabs: [existing] } })
       .mockResolvedValueOnce({ code: 0, data: { chat_tabs: [existing] } });
-    chatTab.updateTabs.mockResolvedValue({ code: 0, data: { chat_tabs: [{ ...existing, tab_name: '项目发布页' }] } });
+    chatTab.updateTabs.mockResolvedValue({
+      code: 0,
+      data: {
+        chat_tabs: [
+          { tab_id: 'msg', tab_type: 'message', tab_content: {} },
+          { ...existing, tab_name: '项目发布页' },
+        ],
+      },
+    });
     await expect(ensureUrlChatTab(
       'app', 'chat',
       'https://example.com/project/releases/2026#details',
@@ -151,5 +190,41 @@ describe('parseChatTabsCli', () => {
   it('rejects unsafe protocols and incomplete updates', () => {
     expect(() => parseChatTabsCli(['add', 'javascript:alert(1)'])).toThrow('http/https');
     expect(() => parseChatTabsCli(['update', 'tab-1'])).toThrow('至少需要');
+  });
+});
+
+describe('executeChatTabsCli', () => {
+  it('selects the updated tab by ID when Feishu returns the complete tab list', async () => {
+    const existing = {
+      tab_id: 'tab-page', tab_name: '旧名', tab_type: 'url',
+      tab_content: { url: 'https://example.com/project' },
+    };
+    chatTab.listTabs.mockResolvedValue({
+      code: 0,
+      data: { chat_tabs: [{ tab_id: 'msg', tab_type: 'message' }, existing] },
+    });
+    chatTab.updateTabs.mockResolvedValue({
+      code: 0,
+      data: {
+        chat_tabs: [
+          { tab_id: 'msg', tab_type: 'message', tab_content: {} },
+          { ...existing, tab_name: '新名' },
+        ],
+      },
+    });
+
+    await expect(executeChatTabsCli({
+      action: 'update',
+      tabId: 'tab-page',
+      name: '新名',
+      sessionId: undefined,
+      chatId: undefined,
+      json: true,
+      larkAppId: 'app',
+      resolvedChatId: 'chat',
+    })).resolves.toMatchObject({
+      action: 'updated',
+      tab: { tab_id: 'tab-page', tab_name: '新名' },
+    });
   });
 });

@@ -46,6 +46,34 @@ describe('detectCodexComposerState', () => {
     })).toBe('draft');
   });
 
+  it.each(['›', '»'] as const)('treats the empty %s placeholder (Codex 0.154+ glyph) as an empty composer', (marker) => {
+    const viewport = [
+      '  Tip: When the composer is empty, press Esc.',
+      '',
+      `${marker} Ask Codex to do anything`,
+      '',
+      '  gpt-6-astra ultra · ~/work · Main [default]',
+    ].join('\n');
+
+    expect(detectCodexComposerState({
+      viewport,
+      cursor: { x: 2, y: 2 },
+    })).toBe('empty');
+  });
+
+  it('detects a draft behind the Codex 0.154 U+00BB marker', () => {
+    const viewport = [
+      '» 帮我查一下最新的 botmux 在',
+      '',
+      '  gpt-6-astra ultra · ~/work · Main [default]',
+    ].join('\n');
+
+    expect(detectCodexComposerState({
+      viewport,
+      cursor: { x: 24, y: 0 },
+    })).toBe('draft');
+  });
+
   it('returns unknown when the current viewport does not expose a composer marker', () => {
     expect(detectCodexComposerState({
       viewport: 'Working...\nRunning command',

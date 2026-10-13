@@ -40,7 +40,7 @@ afterEach(() => {
   activeSessions.clear();
   vi.restoreAllMocks();
   config.session.dataDir = previousDataDir;
-  sessionStore.init();
+  sessionStore.init('app-xpi-callbacks');
   rmSync(dataDir, { recursive: true, force: true });
 });
 

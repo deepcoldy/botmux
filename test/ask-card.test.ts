@@ -26,6 +26,11 @@ import {
   handleAskCardAction,
   parseFormSelections,
 } from '../src/im/lark/ask-card.js';
+import {
+  askOptionLayoutForBot,
+  normalizeAskOptionLayout,
+  setAskOptionLayoutLookup,
+} from '../src/im/lark/ask-option-layout.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
 
@@ -889,5 +894,90 @@ describe('createLarkAskCardDispatcher', () => {
       timedOut: true,
     });
     expect(update).toHaveBeenCalledWith('cli_ask', 'om_card', expect.stringContaining('超时'));
+  });
+});
+
+describe('ask option layout（askOptionLayout per-bot 配置）', () => {
+  afterEach(() => {
+    // 还原为「无配置」lookup，避免污染同文件其它用例（未配置即 compact）。
+    setAskOptionLayoutLookup(() => undefined);
+  });
+
+  it('normalizeAskOptionLayout：合法值原样通过，非法值给 warning 并丢弃', () => {
+    expect(normalizeAskOptionLayout(undefined)).toEqual({ warnings: [] });
+    expect(normalizeAskOptionLayout(null)).toEqual({ warnings: [] });
+    expect(normalizeAskOptionLayout('compact')).toEqual({ layout: 'compact', warnings: [] });
+    expect(normalizeAskOptionLayout('vertical')).toEqual({ layout: 'vertical', warnings: [] });
+    for (const bad of ['sideways', 42, true, [], {}]) {
+      const r = normalizeAskOptionLayout(bad);
+      expect(r.layout, JSON.stringify(bad)).toBeUndefined();
+      expect(r.warnings).toHaveLength(1);
+    }
+  });
+
+  it('askOptionLayoutForBot：lookup 未注册 / bot 未知 / 值非法 / 抛错一律回退 compact', () => {
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => undefined);
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'sideways' } }));
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => { throw new Error('boom'); });
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    expect(askOptionLayoutForBot('cli_ask')).toBe('vertical');
+    expect(askOptionLayoutForBot(undefined)).toBe('compact');
+  });
+
+  it('默认 compact：action 行每行最多 4 个按钮，无 column_set', () => {
+    const ask = makePending({
+      questions: [{
+        prompt: 'q', multiSelect: false,
+        options: Array.from({ length: 6 }, (_, i) => ({ key: `k${i}`, label: `L${i}` })),
+      }],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    expect(card.elements.some((el: any) => el.tag === 'column_set')).toBe(false);
+    const optionRows = card.elements.filter((el: any) =>
+      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION));
+    expect(optionRows).toHaveLength(2);
+    expect(optionRows[0].actions).toHaveLength(4);
+    expect(optionRows[1].actions).toHaveLength(2);
+  });
+
+  it('vertical：每个选项一个 column_set 行，单列 weighted、一按钮', () => {
+    setAskOptionLayoutLookup((id) => id === 'cli_ask'
+      ? { config: { askOptionLayout: 'vertical' } }
+      : undefined);
+    const card = JSON.parse(buildAskCard(makePending()));
+    const columnSets = card.elements.filter((el: any) => el.tag === 'column_set');
+    expect(columnSets).toHaveLength(3);
+    for (const row of columnSets) {
+      expect(row.flex_mode).toBe('none');
+      expect(row.horizontal_spacing).toBe('small');
+      expect(row.columns).toHaveLength(1);
+      expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
+      const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
+      expect(buttons).toHaveLength(1);
+      expect(buttons[0].value.action).toBe(ASK_SELECT_ACTION);
+    }
+    // vertical 下不再有装选项按钮的 action 行
+    expect(card.elements.some((el: any) =>
+      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION))).toBe(false);
+  });
+
+  it('vertical 只影响选项按钮：submit 行仍是 action 行，按钮值不变', () => {
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    const ask = makePending({
+      questions: [
+        { prompt: 'q1', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    const submitRow = card.elements.find((el: any) =>
+      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SUBMIT_ACTION));
+    expect(submitRow).toBeDefined();
+    const toggleRows = card.elements.filter((el: any) => el.tag === 'column_set');
+    expect(toggleRows).toHaveLength(2);
+    expect(toggleRows[0].columns[0].elements[0].value.action).toBe(ASK_TOGGLE_ACTION);
   });
 });

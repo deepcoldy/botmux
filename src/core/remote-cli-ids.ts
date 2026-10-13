@@ -12,7 +12,7 @@
  * By construction a remote CLI's id and its backendType share a name, so both
  * helpers can consult the same set.
  */
-const REMOTE_CLI_IDS: ReadonlySet<string> = new Set(['riff', 'mojo']);
+const REMOTE_CLI_IDS: ReadonlySet<string> = new Set(['riff', 'mojo', 'remote-runner']);
 
 /** True for a backend that runs the agent off-box (no local PTY to own). */
 export function isRemoteBackendId(type: string): boolean {

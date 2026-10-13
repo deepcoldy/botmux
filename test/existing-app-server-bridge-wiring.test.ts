@@ -28,15 +28,17 @@ describe('existing Codex App Server bridge wiring', () => {
     expect(spawn).toContain("cfg.existingAppServerEndpoint\n            ? 'split-live'");
   });
 
-  it('uses adopt-style forwarding only for App-side local turns', () => {
+  it('uses adopt-style forwarding for App-side local turns outside zero-prompt mode', () => {
     const emitStart = workerSource.indexOf('function emitReadyCodexTurns');
     const emit = workerSource.slice(emitStart, workerSource.indexOf('\nfunction stopCodexBridge', emitStart));
 
     expect(emit).toContain('const terminalAdoptMode = lastInitConfig?.adoptMode === true;');
     expect(emit).toContain('const sharedAppServerBridge = isExistingAppServerSharedBridge();');
+    // Zero-prompt local turns use ordinary final delivery without an App input
+    // transcript. Explicit adopt sessions retain their existing forwarding.
     expect(emit).toContain(
       'const adoptMode = terminalAdoptMode\n'
-      + '      || (sharedAppServerBridge && turn.isLocal === true);',
+      + '      || (sharedAppServerBridge && turn.isLocal === true && !zeroPromptTerminalSync());',
     );
     expect(emit).toContain('const markers = terminalAdoptMode ? [] : readSendMarkers();');
   });

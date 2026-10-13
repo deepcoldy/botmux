@@ -82,7 +82,7 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('cold-start argv prompts seed working for card-off; Grok holds busy, quiescence seeds idle', () => {
-    // Grok: argv + SessionStart → hold working until assistant_final.
+    // Grok: argv + reliable turn terminal → hold working until assistant_final.
     // Pi/Gemini: argv but first ready IS turn end → seed working then idle.
     // Arming is centralized (not bare preparedInitialPrompt) so Riff is safe.
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
@@ -200,7 +200,7 @@ describe('worker pipe initial screen ordering', () => {
 
     expect(deferIdx).toBeGreaterThan(-1);
     expect(deferIdx).toBeLessThan(drainIdx);
-    expect(adopt).toContain("deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)");
+    expect(adopt).toContain("deferPromptReadyWhileBusy(`${label} adopt-idle`, idleBackend)");
   });
 
   it('gates the first-prompt soft timeout through shouldReleaseFirstPromptTimeout with a hard cap', () => {
@@ -318,9 +318,9 @@ describe('worker pipe initial screen ordering', () => {
     // adapter.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
-    const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
+    const decideIdx = source.indexOf("decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead)", fallbackStart);
     const markReadyIdx = source.indexOf('markPromptReady();', decideIdx);
-    const flushIdx = source.indexOf("if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')", fallbackStart);
+    const flushIdx = source.indexOf("if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush')", fallbackStart);
 
     expect(fallbackStart).toBeGreaterThan(-1);
     expect(decideIdx).toBeGreaterThan(fallbackStart);
@@ -415,7 +415,7 @@ describe('worker pipe initial screen ordering', () => {
     expect(finalizeIdx).toBeGreaterThan(spawnIdx);
     expect(onDataIdx).toBeGreaterThan(finalizeIdx);
     expect(finalize).toContain("codexAppControlProven && codexAppControlStateValue?.status === 'active'");
-    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
+    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);");
     expect(source).not.toContain('CODEX_APP_CONTROL_NONCE_ENV');
     expect(source).not.toContain('codexAppControlNonceForSpawn');
   });
@@ -728,15 +728,36 @@ describe('worker pipe initial screen ordering', () => {
     expect(hook).toContain("status === 'working'");
     expect(hook).toContain('isPromptReady = false;');
 
-    const helperStart = source.indexOf("const drainBridgesThenMarkReady = (");
+    const helperStart = source.indexOf('const drainBridges = ()');
     const helperEnd = source.indexOf('// Set up idle detection.', helperStart);
     const helper = source.slice(helperStart, helperEnd);
     const claudeDrain = helper.indexOf('bridgeDrainAndMaybeEmit();');
     const structuredDrain = helper.indexOf('codexBridgeDrainAndMaybeEmit();');
-    const ready = helper.indexOf('markPromptReady();');
+    const composedDrain = helper.indexOf('drainBridges();', structuredDrain);
+    const ready = helper.indexOf('markReadyFromEvidence(evidenceSource);', composedDrain);
     expect(claudeDrain).toBeGreaterThan(-1);
     expect(structuredDrain).toBeGreaterThan(claudeDrain);
-    expect(ready).toBeGreaterThan(structuredDrain);
+    expect(composedDrain).toBeGreaterThan(structuredDrain);
+    expect(ready).toBeGreaterThan(composedDrain);
+  });
+
+  it('never lets Herdr status be a freshly launched CLI\'s first readiness signal', () => {
+    // Herdr can report idle while a CLI is still booting; Kimi and CodeBuddy
+    // have no startup guard of their own, so the first prompt must wait for a
+    // prompt confirmed by screen/ready-gate evidence. A re-attached CLI was
+    // already running and keeps the immediate status (launchedNewCli=false).
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const hookStart = source.indexOf('observedBackend.onAgentStatus((status) => {');
+    const hookEnd = source.indexOf('backend.onAccessUrl?.', hookStart);
+    const hook = source.slice(hookStart, hookEnd);
+    const guard = hook.indexOf('if (observedBackend.launchedNewCli && promptReadyEdges === promptReadyEdgesAtSpawn) {');
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(hook.indexOf("drainBridgesThenMarkReady('structured');"));
+    expect(source.lastIndexOf('const promptReadyEdgesAtSpawn = promptReadyEdges;', hookStart)).toBeGreaterThan(hookStart - 200);
+
+    const readyStart = source.indexOf('function markPromptReady(): void {');
+    const ready = source.slice(readyStart, source.indexOf('\nfunction ', readyStart + 10));
+    expect(ready.indexOf('promptReadyEdges++;')).toBeGreaterThan(ready.indexOf('isPromptReady = true;'));
   });
 
   it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {
@@ -781,10 +802,13 @@ describe('worker pipe initial screen ordering', () => {
 
   it('wires reasonix cliPid/cliCwd in both immediate and late pid paths', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    // reasonix joins the inline pid/cwd-wiring condition alongside grok/traex at
-    // BOTH sites (synchronous tmux/pty resolve + async zellij late-pid fallback).
-    const matches = source.match(/cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex' \|\| cfg\.cliId === 'reasonix'/g) ?? [];
+    // The pid/cwd-wiring gate is one shared predicate used at BOTH sites
+    // (synchronous tmux/pty resolve + async zellij late-pid fallback); reasonix
+    // is named in it alongside grok/traex/codex.
+    const matches = source.match(/cliAdapterBindsOwnershipPid\(cfg\.cliId, claudeDataDir\)/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+    const predicate = readFileSync(join(process.cwd(), 'src/adapters/cli/ownership-pid.ts'), 'utf8');
+    expect(predicate).toContain("cliId === 'reasonix'");
   });
 
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {

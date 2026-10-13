@@ -21,6 +21,14 @@ describe('config-store', () => {
     expect((await readRawConfig(cfg))[0].allowedUsers).toEqual(['ou_x', 'ou_y']);
   });
 
+  it('rejects network policy combinations before changing durable configuration', async () => {
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+    const before = readFileSync(cfg, 'utf8');
+    await expect(writeRawConfigAtomic(cfg, [{ larkAppId: 'a1', sandboxNetworkPolicy: policy, sandbox: false }])).rejects.toThrow('sandbox_network_policy_requires_local_pty_oncall');
+    await expect(writeRawConfigAtomic(cfg, [{ larkAppId: 'a1', sandboxNetworkPolicy: { ...policy, proxy: 'http://example.org' }, sandbox: true }])).rejects.toThrow('invalid_sandbox_network_policy');
+    expect(readFileSync(cfg, 'utf8')).toBe(before);
+  });
+
   it('findEntryIndex matches by larkAppId', async () => {
     expect(findEntryIndex(await readRawConfig(cfg), 'a1')).toBe(0);
     expect(findEntryIndex(await readRawConfig(cfg), 'nope')).toBe(-1);

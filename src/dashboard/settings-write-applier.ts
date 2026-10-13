@@ -57,6 +57,8 @@ export interface ResolvedDashboardSettingsView {
   autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
+  /** Machine-wide reply-card footer brand signature switch. Default ON. */
+  cardBrandLabel: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -117,6 +119,8 @@ export interface ResolvedDashboardSettingsView {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
@@ -235,6 +239,7 @@ export type ApplySettingsWriteError =
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
+  | 'invalid_cardBrandLabel'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -475,6 +480,12 @@ export async function applySettingsWrite(
     }
     patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
   }
+  if ('cardBrandLabel' in obj) {
+    if (typeof obj.cardBrandLabel !== 'boolean') {
+      return { ok: false, error: 'invalid_cardBrandLabel' };
+    }
+    patch.cardBrandLabel = obj.cardBrandLabel;
+  }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {
       return { ok: false, error: 'invalid_noVisibleOutputHint' };
@@ -680,6 +691,20 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_sessionCleanup' };
     }
     deps.mergeGlobalConfig({ sessionCleanup: next });
+    touched = true;
+  }
+
+  if ('multiTopic' in obj) {
+    const raw = obj.multiTopic;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_multiTopic' };
+    }
+    const multiTopic = raw as Record<string, unknown>;
+    if (typeof multiTopic.enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_enabled' };
+    }
+    const current = deps.readGlobalConfig().multiTopic ?? {};
+    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
     touched = true;
   }
 

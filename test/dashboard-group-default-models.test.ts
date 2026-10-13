@@ -2,7 +2,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, expect, it, vi } from 'vitest';
 import { GroupDefaultModelsRow } from '../src/dashboard/web/group-default-models.js';
-import { ModelPickerField, DropdownField } from '../src/dashboard/web/bot-defaults-page.js';
+import { ModelPickerField, DropdownField } from '../src/dashboard/web/field-controls.js';
 import { setDefaultModelsForGroup, type GroupsActionDeps } from '../src/dashboard/groups-action-helpers.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;

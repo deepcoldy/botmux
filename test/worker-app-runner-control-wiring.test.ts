@@ -40,7 +40,7 @@ describe('worker app-runner control-channel wiring', () => {
     const safeRetryStart = flush.indexOf('const retryQueuedActivation =');
     const retryTransition = flush.indexOf("retryQueuedActivation ? 'retry' : 'cancel'", safeRetryStart);
     const requeue = flush.indexOf('requeueUnsubmittedQueuedActivation(item);', retryTransition);
-    const submittedAck = flush.indexOf("type: 'queued_activation_submitted'", retryTransition);
+    const submittedAck = flush.indexOf('acknowledgeQueuedActivation(item);', requeue);
     expect(safeRetryStart).toBeGreaterThan(writeIdx);
     expect(retryTransition).toBeGreaterThan(safeRetryStart);
     expect(requeue).toBeGreaterThan(retryTransition);
@@ -146,7 +146,7 @@ describe('worker app-runner control-channel wiring', () => {
       workerSource.indexOf('// Riff (and other remote HTTP backends)'),
     );
     expect(firstPromptTimeout).toContain(
-      "if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')",
+      "if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush')",
     );
     expect(firstPromptTimeout).not.toContain('codexAppRuntimeTypeAheadReady()');
   });
@@ -379,7 +379,7 @@ describe('worker app-runner control-channel wiring', () => {
 
   it('enables OSC decoding for dsh and routes final frames to the generic path', () => {
     // The worker only decodes runner OSC frames for cliIds in this set.
-    expect(workerSource).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
+    expect(workerSource).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);");
     // dsh finals go through the generic (non-codex-app) settlement path.
     const markerStart = workerSource.indexOf('if (kind === \'final\' && typeof payload.content === \'string\')');
     expect(markerStart).toBeGreaterThan(-1);

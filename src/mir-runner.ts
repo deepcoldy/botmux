@@ -35,7 +35,9 @@ import {
   type MiramcpAutostartResult,
 } from './mir-local-runtime.js';
 import { normalizeMircliPrompt } from './mir-prompt.js';
+import { resolveMirRunnerTimeoutMs } from './mir-runner-config.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 
 interface Args {
   sessionId: string;
@@ -47,7 +49,6 @@ interface Args {
 
 const output = new RunnerControlWriter();
 const DEFAULT_QUERY_TIMEOUT = '10m';
-const DEFAULT_RUNNER_TIMEOUT_MS = 12 * 60 * 1000;
 const MARKER_PREFIX = '::botmux-mir:';
 // Backend Claude-harness builtin tools that route to the cloud sandbox; mircli's
 // own local tools are the lowercase equivalents. Optionally hard-disallow these
@@ -157,6 +158,8 @@ function runtimeSystemPrompt(): string {
     'Do not say the local MCP bridge is disconnected, that only a cloud sandbox is available, or that the operation is cancelled unless a concrete local tool invocation actually returned that error.',
     'If a local tool invocation fails, report the exact failed operation and error concisely, then stop or ask for the missing input.',
   );
+  const larkPrompt = larkToolPromptFromEnv(args.locale);
+  if (larkPrompt) lines.push(larkPrompt);
   return [
     ...lines,
   ].join('\n');
@@ -243,25 +246,23 @@ class MircliClient {
 
       let stdout = '';
       let stderr = '';
-      const timeoutMs = Number(process.env.MIRCLI_RUNNER_TIMEOUT_MS || DEFAULT_RUNNER_TIMEOUT_MS);
-      const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
-        ? setTimeout(() => {
-          timedOut = true;
-          child.kill('SIGTERM');
-          setTimeout(() => { if (!closed) child.kill('SIGKILL'); }, 5_000).unref();
-        }, timeoutMs)
-        : undefined;
-      timer?.unref();
+      const timeoutMs = resolveMirRunnerTimeoutMs(process.env.MIRCLI_RUNNER_TIMEOUT_MS);
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGTERM');
+        setTimeout(() => { if (!closed) child.kill('SIGKILL'); }, 5_000).unref();
+      }, timeoutMs);
+      timer.unref();
 
       child.stdout.on('data', chunk => { stdout += chunk.toString('utf8'); });
       child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
       child.on('error', err => {
-        if (timer) clearTimeout(timer);
+        clearTimeout(timer);
         reject(new Error(`Failed to start mircli (${bin}): ${errorMessage(err)}. Install mircli (see the mir/mircli internal docs) or set MIRCLI_BIN.`));
       });
       child.on('close', (code, signal) => {
         closed = true;
-        if (timer) clearTimeout(timer);
+        clearTimeout(timer);
         const cleanStdout = stripAnsi(stdout).trim();
         const cleanStderr = stripAnsi(stderr).trim();
         if (code === 0) { resolve(cleanStdout || cleanStderr); return; }

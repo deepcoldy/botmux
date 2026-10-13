@@ -131,6 +131,13 @@ export interface WorkflowFeatureGlobalConfig {
   enabled?: boolean;
 }
 
+export interface MultiTopicGlobalConfig {
+  /** Machine-wide multi-topic orchestration switch. Missing means enabled for
+   *  backwards compatibility. When disabled, botmux-orchestrate is hidden and
+   *  `botmux dispatch` may only append to an existing topic via `--into`. */
+  enabled?: boolean;
+}
+
 export interface WorkerConfig {
   /** Default-on switch for fresh/resumed worker memory admission. */
   memoryAdmissionEnabled?: boolean;
@@ -161,6 +168,27 @@ export interface SessionCleanupGlobalConfig {
   /** 检查频率（分钟）。缺省 60，最小 5（低于则回退到最小值）。 */
   intervalMinutes?: number;
 }
+
+/** Host policy for delegating creation of persistent scheduled work across bots.
+ * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
+ * is a separate emergency revocation switch so stopping new grants does not
+ * silently change the meaning of already committed tasks. */
+export interface ScheduleDelegationGlobalConfig {
+  /** Allow a directly authenticated human turn to request schedule:create. Default off. */
+  createEnabled?: boolean;
+  /** Allow already committed delegated schedules to run. Missing means on. */
+  runEnabled?: boolean;
+  /** Source orchestrator app ids whose managed dispatches request schedule:create by default. */
+  defaultOnDispatchFromBotAppIds?: string[];
+  /** Maximum distinct delegated tasks one target turn may commit. Default 64. */
+  maxTasksPerTurn?: number;
+  /** Personal CLI scopes a delegated schedule may retain for future runs. */
+  runScopes?: Array<'bytedcli'>;
+  /** Let a delegated scheduled turn pause or remove its own task. Default off. */
+  selfManageEnabled?: boolean;
+}
+
+export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
 
 export interface GlobalConfig {
   lang?: Locale;
@@ -202,6 +230,9 @@ export interface GlobalConfig {
    *  feature OFF; set true to enable it host-wide. The
    *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
   workflow?: WorkflowFeatureGlobalConfig;
+  /** Machine-wide multi-topic orchestration switch. Missing / enabled !== false
+   *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
+  multiTopic?: MultiTopicGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
@@ -232,6 +263,8 @@ export interface GlobalConfig {
    *  Stored lenient here; final IANA validity is enforced on write
    *  (settings-write-applier) and re-checked at resolve time. */
   scheduleTimeZone?: string;
+  /** Machine-wide cross-bot schedule delegation policy. */
+  scheduleDelegation?: ScheduleDelegationGlobalConfig;
 }
 
 export interface GlobalSkillConfig {
@@ -367,6 +400,12 @@ export interface DashboardGlobalConfig {
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
+  /** 机器级总开关：是否在回复卡片页脚渲染品牌签名（默认 botmux 链接 / 各 bot 自定义
+   *  brandLabel）。缺省 ON（absent ⇒ 显示）；显式 `false` 时**所有** bot 的页脚品牌
+   *  签名一律不渲染（等价于每 bot brandLabel 被置空），Dashboard 每个 bot 的签名
+   *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
+   *  Live 读取（见 bot-registry.ts `isCardBrandLabelEnabled`），Settings 翻转后无需重启。 */
+  cardBrandLabel?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -376,9 +415,17 @@ export interface DashboardGlobalConfig {
 function readVoice(raw: unknown): VoiceConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
-  const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === undefined;
+  const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === 'minimax' || v.engine === undefined;
   if (!engineOk) return undefined;
-  if (!v.sami && !v.openai && !v.engine && !v.asr) return undefined;
+  if (!v.sami && !v.openai && !v.minimax && !v.engine && !v.asr) return undefined;
+  // 与 bot-registry 的 per-bot 解析对齐：minimax.region 只接受 'cn'/'global'，
+  // 拼错/其它值一律删掉（适配器再兜底 global），避免脏值静默落到海外端点、还被
+  // `voice status` 原样显示。
+  const mm = v.minimax;
+  if (mm && typeof mm === 'object' && !Array.isArray(mm)) {
+    const r = (mm as Record<string, unknown>).region;
+    if (r !== 'cn' && r !== 'global') delete (mm as Record<string, unknown>).region;
+  }
   return v as VoiceConfig;
 }
 
@@ -474,13 +521,6 @@ function readHerdrTraexPlugin(raw: unknown): HerdrTraexPluginConfig | undefined 
   if (typeof r.enabled === 'boolean') out.enabled = r.enabled;
   if (typeof r.source === 'string' && r.source.trim()) out.source = r.source.trim();
   if (typeof r.ref === 'string' && r.ref.trim()) out.ref = r.ref.trim();
-  // Migrate the unmerged review schema in-memory without rewriting config.json.
-  if (!out.source && typeof r.spec === 'string' && r.spec.trim()) {
-    const legacy = r.spec.trim();
-    const hash = legacy.lastIndexOf('#');
-    out.source = hash > 0 ? legacy.slice(0, hash) : legacy;
-    if (!out.ref && hash > 0 && hash < legacy.length - 1) out.ref = legacy.slice(hash + 1);
-  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -513,6 +553,10 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
     && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
   }
+  // Round-trip an explicit boolean either way. Absent stays absent — the live
+  // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored
+  // `false` must be preserved to let an operator suppress footer brands fleet-wide.
+  if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -534,6 +578,30 @@ function readWorker(raw: unknown): WorkerConfig | undefined {
     && value.maxMemoryFullAvg10 > 0
     && value.maxMemoryFullAvg10 <= 100) {
     out.maxMemoryFullAvg10 = value.maxMemoryFullAvg10;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: ScheduleDelegationGlobalConfig = {};
+  if (typeof value.createEnabled === 'boolean') out.createEnabled = value.createEnabled;
+  if (typeof value.runEnabled === 'boolean') out.runEnabled = value.runEnabled;
+  const maxTasksPerTurn = readPositiveInteger(value.maxTasksPerTurn);
+  if (maxTasksPerTurn !== undefined) out.maxTasksPerTurn = Math.min(maxTasksPerTurn, 1024);
+  if (Array.isArray(value.runScopes)) {
+    const runScopes = [...new Set(value.runScopes.filter(
+      (item): item is 'bytedcli' => item === 'bytedcli',
+    ))];
+    if (runScopes.length > 0) out.runScopes = runScopes;
+  }
+  if (typeof value.selfManageEnabled === 'boolean') out.selfManageEnabled = value.selfManageEnabled;
+  if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
+    const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
+      (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
+    ))];
+    if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -699,6 +767,14 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: MultiTopicGlobalConfig = {};
+  if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function globalConfigPath(): string {
   return join(homedir(), '.botmux', 'config.json');
 }
@@ -771,6 +847,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);
   if (workflow) out.workflow = workflow;
+  const multiTopic = readMultiTopic(raw.multiTopic);
+  if (multiTopic) out.multiTopic = multiTopic;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
@@ -787,6 +865,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.scheduleTimeZone === 'string' && raw.scheduleTimeZone.trim()) {
     out.scheduleTimeZone = raw.scheduleTimeZone.trim();
   }
+  const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
+  if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }
@@ -936,6 +1016,18 @@ export function isCrossPrincipalInterruptionEnabled(
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().dashboard?.crossPrincipalInterruption === true;
+}
+
+/** Machine-wide multi-topic orchestration switch. Defaults ON for backwards
+ * compatibility. The env override is also injected into managed CLI sessions
+ * so sandboxed commands agree with the host daemon. */
+export function isMultiTopicOrchestrationEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_MULTI_TOPIC_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().multiTopic?.enabled !== false;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

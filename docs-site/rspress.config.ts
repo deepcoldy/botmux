@@ -32,6 +32,7 @@ const zhSidebar = [
     collapsed: false,
     items: [
       { text: '实时流式卡片', link: '/cards' },
+      { text: '原话题不可用策略', link: '/topic-unavailable-policy' },
       { text: 'Web 终端', link: '/web-terminal' },
       { text: '多机器人协作', link: '/multi-bot' },
       { text: '多话题协作模式', link: '/multi-topic' },
@@ -118,6 +119,7 @@ const enSidebar = [
     collapsed: false,
     items: [
       { text: 'Streaming Cards', link: '/en/cards' },
+      { text: 'Unavailable Topic Policy', link: '/en/topic-unavailable-policy' },
       { text: 'Web Terminal', link: '/en/web-terminal' },
       { text: 'Multi-Bot Collaboration', link: '/en/multi-bot' },
       { text: 'Multi-Topic Orchestration', link: '/en/multi-topic' },
@@ -201,7 +203,7 @@ export default defineConfig({
   // og:title / og:description 由 rspress 按页自动生成，这里只补它不处理的
   head: [
     ['meta', { property: 'og:type', content: 'website' }],
-    ['meta', { property: 'og:url', content: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs' }],
+    ['meta', { property: 'og:url', content: 'https://deepcoldy.github.io/botmux/' }],
     ['meta', { property: 'og:image', content: socialLogoUrl }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:image', content: socialLogoUrl }],

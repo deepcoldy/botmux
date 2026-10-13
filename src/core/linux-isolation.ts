@@ -1,4 +1,7 @@
 import { getPriority } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { chmodSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /**
  * A Linux isolation stamp that survives env -i, exec and nested namespaces.
@@ -79,14 +82,80 @@ function isolationFilter(): Buffer {
  * bwrap must install the filter before exec; failure never runs the CLI bare.
  */
 export function linuxIsolationLaunch(bin: string, args: string[]): { bin: string; args: string[] } {
-  const octal = [...isolationFilter()].map(byte => `\\${byte.toString(8).padStart(3, '0')}`).join('');
+  const octal = isolationFilterOctal();
   return {
     bin: '/bin/sh',
     args: [
       '-c',
-      `exec 4<&0 || exit; printf '${octal}' | { exec "$@" 3<&0 0<&4 4<&-; }`,
+      inlineLauncherScript(octal),
       'botmux-isolation', bin, '--seccomp', '3', ...args,
     ],
+  };
+}
+
+export interface LinuxIsolationArgsFileLaunch {
+  bin: string;
+  args: string[];
+  argsFile: string;
+  cleanup: () => void;
+}
+
+function isolationFilterOctal(): string {
+  return [...isolationFilter()].map(byte => `\\${byte.toString(8).padStart(3, '0')}`).join('');
+}
+
+function inlineLauncherScript(octal = isolationFilterOctal()): string {
+  return `exec 4<&0 || exit; printf '${octal}' | { exec "$@" 3<&0 0<&4 4<&-; }`;
+}
+
+function argsFileLauncherScript(octal = isolationFilterOctal()): string {
+  return `exec 4<&0 || exit; exec 5<"$1" || exit; rm -f -- "$1" || exit; shift; printf '${octal}' | { exec "$@" 3<&0 0<&4 4<&-; }`;
+}
+
+/**
+ * Keep a large bwrap option list out of a persistent terminal backend's argv.
+ * bwrap reads those options as NUL-separated bytes from fd 5; the command stays
+ * on the ordinary argv so its argument boundary is preserved exactly. The
+ * launcher opens the private file before unlinking it, and `cleanup` covers a
+ * backend spawn that fails before the launcher gets to run.
+ */
+export function linuxIsolationLaunchViaArgsFile(
+  bin: string,
+  bwrapOptions: readonly string[],
+  command: readonly string[],
+  directory: string,
+): LinuxIsolationArgsFileLaunch {
+  if (command.length === 0) throw new Error('Linux isolation args-file launch requires a command');
+  if ([...bwrapOptions, ...command].some(arg => arg.includes('\0'))) {
+    throw new Error('Linux isolation arguments must not contain NUL bytes');
+  }
+  const argsFile = join(directory, `bwrap-args-${randomUUID()}`);
+  writeFileSync(argsFile, Buffer.from(`${bwrapOptions.join('\0')}\0`), {
+    flag: 'wx',
+    mode: 0o600,
+  });
+  try {
+    chmodSync(argsFile, 0o600);
+  } catch (error) {
+    try { unlinkSync(argsFile); } catch { /* preserve the chmod error */ }
+    throw error;
+  }
+  return {
+    bin: '/bin/sh',
+    args: [
+      '-c',
+      argsFileLauncherScript(),
+      'botmux-isolation-args-file',
+      argsFile,
+      bin,
+      '--seccomp', '3',
+      '--args', '5',
+      '--', ...command,
+    ],
+    argsFile,
+    cleanup: () => {
+      try { unlinkSync(argsFile); } catch { /* already unlinked by the launcher */ }
+    },
   };
 }
 
@@ -97,10 +166,23 @@ export function linuxIsolationLaunch(bin: string, args: string[]): { bin: string
  * trampoline or an unrelated shell must still hit the bare-shell input guard.
  */
 export function isLinuxIsolationLauncher(commandLine: readonly string[]): boolean {
-  const launch = linuxIsolationLaunch('bwrap', []);
-  return commandLine[0] === launch.bin
-    && launch.args.slice(0, 3).every((arg, index) => commandLine[index + 1] === arg)
-    && !!commandLine[4]
-    && commandLine[5] === '--seccomp'
-    && commandLine[6] === '3';
+  if (commandLine[0] !== '/bin/sh' || commandLine[1] !== '-c') return false;
+  if (commandLine[2] === inlineLauncherScript()) {
+    return commandLine[3] === 'botmux-isolation'
+      && !!commandLine[4]
+      && commandLine[5] === '--seccomp'
+      && commandLine[6] === '3';
+  }
+  if (commandLine[2] === argsFileLauncherScript()) {
+    return commandLine[3] === 'botmux-isolation-args-file'
+      && !!commandLine[4]
+      && !!commandLine[5]
+      && commandLine[6] === '--seccomp'
+      && commandLine[7] === '3'
+      && commandLine[8] === '--args'
+      && commandLine[9] === '5'
+      && commandLine[10] === '--'
+      && !!commandLine[11];
+  }
+  return false;
 }

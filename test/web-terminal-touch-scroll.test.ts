@@ -211,6 +211,22 @@ describe('web terminal touch scrolling', () => {
     expect(workerSource).toContain('if(_ha>0)term.scrollToLine(_hy+_ha)');
   });
 
+  it('replaces Remote Runner full-screen snapshots instead of appending them', () => {
+    const helperStart = workerSource.indexOf('function relayRemoteRunnerWebSnapshot(');
+    const helperEnd = workerSource.indexOf('\n}\n', helperStart) + 2;
+    const helper = workerSource.slice(helperStart, helperEnd);
+    const registration = workerSource.indexOf('backend.onScreenResync?.(');
+    const registrationEnd = workerSource.indexOf('\n  });', registration);
+    const registrationBlock = workerSource.slice(registration, registrationEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helper).toContain('mergeHerdrWebSnapshot(null, snapshot, null, MAX_SCROLLBACK)');
+    expect(helper).toContain('scrollback = renderHerdrWebHistory(frame)');
+    expect(helper).toContain('1989;history;0');
+    expect(registrationBlock).toContain("effectiveBackendType === 'remote-runner'");
+    expect(registrationBlock).toContain('relayRemoteRunnerWebSnapshot(snapshot)');
+  });
+
   it('drives normal-buffer scroll explicitly instead of relying on WebView defaults', () => {
     const touchBlock = scriptBlock('// Single-finger touch scrolling:');
 

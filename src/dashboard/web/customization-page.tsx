@@ -41,6 +41,7 @@ interface Snapshot {
 }
 interface CustomizationSnapshotPayload {
   enabled: boolean;
+  bots?: Array<{ larkAppId: string; name: string; cliId: string; promptInjection: 'default' | 'none'; supported: boolean }>;
   stages?: StageMeta[];
   blocks?: BlockMeta[];
   fragments: Fragment[];
@@ -374,6 +375,11 @@ export function CustomizationPage() {
   const [query, setQuery] = useState('');
   const [showImport, setShowImport] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [savingBots, setSavingBots] = useState(false);
+  const savingBotsRef = useRef(false);
+  const [selectedBots, setSelectedBots] = useState<string[]>([]);
+  const [botQuery, setBotQuery] = useState('');
+  const [botResult, setBotResult] = useState<{ zero: boolean; saved: number; failures: Array<{ name: string; error: string }> } | null>(null);
 
   const flash = useCallback((m: string) => { setToast(m); window.setTimeout(() => setToast(null), 2400); }, []);
   const onError = useCallback((m: string) => flash(`⚠ ${m}`), [flash]);
@@ -399,6 +405,38 @@ export function CustomizationPage() {
       setData(res.snapshot);
       flash(enabled ? '自定义已启用' : '自定义已停用（覆盖保留）');
     } catch (e: any) { onError(e?.message ?? '操作失败'); }
+  };
+
+  const setBotInjection = async (zero: boolean) => {
+    const bots = (data?.bots ?? []).filter(bot => selectedBots.includes(bot.larkAppId));
+    if (savingBotsRef.current || !bots.length || (zero && bots.some(bot => !bot.supported))) return;
+    savingBotsRef.current = true;
+    setSavingBots(true);
+    setBotResult(null);
+    const saved = new Set<string>();
+    const failures: Array<{ larkAppId: string; name: string; error: string }> = [];
+    try {
+      // Each bot owns its daemon endpoint. Keep successful writes when another
+      // daemon is offline, and retain only failed selections for a safe retry.
+      for (const bot of bots) {
+        try {
+          await apiJson(`/api/bots/${encodeURIComponent(bot.larkAppId)}/prompt-injection`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ promptInjection: zero ? 'none' : 'default' }),
+          });
+          saved.add(bot.larkAppId);
+        } catch (e: any) {
+          failures.push({ larkAppId: bot.larkAppId, name: bot.name, error: e?.message ?? '保存失败' });
+        }
+      }
+      setData(previous => previous ? { ...previous, bots: previous.bots?.map(bot => saved.has(bot.larkAppId)
+        ? { ...bot, promptInjection: zero ? 'none' : 'default' } : bot) } : previous);
+      setSelectedBots(failures.map(bot => bot.larkAppId));
+      setBotResult({ zero, saved: saved.size, failures });
+    } finally {
+      savingBotsRef.current = false;
+      setSavingBots(false);
+    }
   };
 
   const stages = data?.stages?.length ? data.stages : FALLBACK_STAGES;
@@ -449,6 +487,10 @@ export function CustomizationPage() {
 
   const activeStage = stages.find(s => s.id === tab);
   const searching = searchResults !== null;
+  const injectionBots = data.bots ?? [];
+  const visibleBots = injectionBots.filter(bot => `${bot.name} ${bot.cliId} ${bot.larkAppId}`.toLowerCase().includes(botQuery.trim().toLowerCase()));
+  const selectableVisibleBots = visibleBots.filter(bot => bot.supported || bot.promptInjection === 'none');
+  const chosenBots = injectionBots.filter(bot => selectedBots.includes(bot.larkAppId));
 
   return (
     <section className="cz-page">
@@ -459,6 +501,55 @@ export function CustomizationPage() {
           <h1>自定义中心</h1>
           <p>调优 botmux 内置的框架 prompt 与内置 skill。所有改动<b>下一个会话即生效，无需重启 daemon</b>；随时可逐项恢复出厂或整体回滚。</p>
         </div>
+      </div>
+
+      <div className="cz-block" data-zero-prompt>
+        <div className="cz-block-label"><b>按 Bot 设置零注入</b></div>
+        <p className="cz-hint">适合由 lead-bot 派活的 sub-bot：只传任务正文与附件，最终回答自动回传。跳过 botmux 的规则、提醒、角色、白板、记忆和技能提示；已有自定义保留。</p>
+        <p className="cz-hint">新会话完整生效，旧历史不会清除。CLI 原生提示、项目 AGENTS.md 和用户自行安装的技能仍由 CLI 管理。按 CLI 的最终回复采集能力判断支持情况，本地 RPC 输入同样适用；暂不支持远端后端和 v3 workflow。</p>
+        {injectionBots.length ? (
+          <div className="cz-bot-picker">
+            <div className="cz-toolbar">
+              <input className="cz-search" type="search" aria-label="搜索 Bot" placeholder="搜索 Bot 名称 / CLI / App ID…"
+                value={botQuery} disabled={savingBots} onChange={e => setBotQuery(e.currentTarget.value)} />
+              <button className="cz-btn cz-btn-ghost" disabled={savingBots || !selectableVisibleBots.length}
+                onClick={() => setSelectedBots(current => [...new Set([...current, ...selectableVisibleBots.map(bot => bot.larkAppId)])])}>全选当前结果</button>
+              <button className="cz-btn cz-btn-ghost" disabled={savingBots || !chosenBots.length} onClick={() => setSelectedBots([])}>清空选择</button>
+            </div>
+            <div className="cz-bot-list" role="group" aria-label="选择要批量设置的 Bot" aria-busy={savingBots}>
+              {visibleBots.map(bot => (
+                <label key={bot.larkAppId} className={`cz-bot-row${selectedBots.includes(bot.larkAppId) ? ' cz-bot-selected' : ''}`}>
+                  <input type="checkbox" aria-label={`选择 ${bot.name}`} checked={selectedBots.includes(bot.larkAppId)}
+                    disabled={savingBots || (!bot.supported && bot.promptInjection !== 'none')}
+                    onChange={e => { const checked = e.currentTarget.checked; setSelectedBots(current => checked
+                      ? [...new Set([...current, bot.larkAppId])] : current.filter(id => id !== bot.larkAppId)); }} />
+                  <span className="cz-bot-name"><b>{bot.name}</b><small>{bot.cliId} · {bot.larkAppId}</small></span>
+                  <span className={`cz-bot-state${bot.promptInjection === 'none' ? ' cz-bot-state-on' : ''}`}>
+                    {bot.promptInjection === 'none' ? '零注入 · 自动回复' : bot.supported ? '原有提示配置' : '暂不支持零注入'}
+                    {!bot.supported && bot.promptInjection === 'none' ? '（仅可恢复）' : ''}
+                  </span>
+                </label>
+              ))}
+              {!visibleBots.length ? <p className="cz-hint">没有匹配的 Bot。</p> : null}
+            </div>
+            <div className="cz-bot-actions">
+              <span className="cz-hint" aria-live="polite">已选 {chosenBots.length} 个 Bot{chosenBots.some(bot => !visibleBots.includes(bot)) ? '（含搜索结果外的选择）' : ''}</span>
+              <button className="cz-btn cz-btn-primary" disabled={savingBots || !chosenBots.length || chosenBots.some(bot => !bot.supported)}
+                onClick={() => void setBotInjection(true)}>开启零注入</button>
+              <button className="cz-btn cz-btn-ghost" disabled={savingBots || !chosenBots.length}
+                onClick={() => void setBotInjection(false)}>恢复原配置</button>
+              {savingBots ? <span className="cz-hint" role="status">正在保存…</span> : null}
+            </div>
+            {botResult ? <div className="cz-bot-result" role={botResult.failures.length ? 'alert' : 'status'}>
+              <div>已{botResult.zero ? '开启零注入' : '恢复原配置'} {botResult.saved} 个 Bot{botResult.saved ? ' · 新会话完整生效' : ''}。</div>
+              {botResult.failures.length ? <>
+                <div>保存失败 {botResult.failures.length} 个，已保留勾选，可重试：</div>
+                <ul>{botResult.failures.map((failure, i) => <li key={i}>{failure.name}：{failure.error}</li>)}</ul>
+              </> : null}
+            </div> : null}
+          </div>
+        ) : <p className="cz-hint">未读取到 Bot 配置。</p>}
+        <p className="cz-hint">lead-bot 使用带稳定 Bot App ID 的派活后，结果由宿主回报到原 lead 会话。CLI 的共享 home 若已有全局 botmux 技能，需先改为按会话注入或使用独立 home。</p>
       </div>
 
       {/* master switch */}
@@ -621,7 +712,25 @@ const PAGE_CSS = `
 .cz-head p{margin:0;color:var(--muted);font-size:13.5px;max-width:72ch;}
 .cz-error{color:var(--danger);padding:20px;}
 .cz-master{margin:18px 0 16px;display:flex;align-items:center;gap:16px;padding:14px 18px;border:1px solid var(--border-soft);border-radius:var(--radius);background:linear-gradient(100deg,var(--accent-soft),transparent 70%);}
-.cz-master-txt{flex:1;}
+.cz-master-txt{flex:1;min-width:0;}
+.cz-bot-picker{margin:16px 0;padding:14px;border:1px solid var(--border-soft);border-radius:var(--radius);background:var(--surface);}
+.cz-bot-list{max-height:290px;overflow:auto;overscroll-behavior:contain;border:1px solid var(--border-soft);border-radius:10px;}
+.cz-bot-row{display:flex;align-items:center;gap:12px;padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border-soft);}
+.cz-bot-row:last-child{border-bottom:none;}
+.cz-bot-row:has(input:disabled){cursor:default;opacity:.6;}
+.cz-bot-selected{background:var(--accent-soft);}
+.cz-bot-row input{flex:none;width:16px;height:16px;accent-color:var(--accent);}
+.cz-bot-name{flex:1;min-width:0;overflow-wrap:anywhere;}
+.cz-bot-name b{display:block;font-size:13px;}
+.cz-bot-name small{display:block;font-size:11px;color:var(--muted);margin-top:3px;}
+.cz-bot-state{font-size:12px;color:var(--muted);text-align:right;}
+.cz-bot-state-on{color:var(--accent-strong);}
+.cz-bot-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px;}
+.cz-bot-actions>.cz-hint:first-child{flex:1 1 170px;}
+.cz-bot-result{margin-top:12px;font-size:12px;overflow-wrap:anywhere;}
+.cz-bot-result[role=alert]{color:var(--danger);}
+.cz-bot-result ul{margin:6px 0 0;padding-left:20px;}
+@media(max-width:520px){.cz-bot-row{flex-wrap:wrap;gap:8px;}.cz-bot-name{flex-basis:calc(100% - 30px);}.cz-bot-state{padding-left:24px;text-align:left;}.cz-bot-picker .cz-search{flex-basis:100%;min-width:0;}}
 .cz-master-txt b{font-size:14.5px;}
 .cz-master-txt span{display:block;color:var(--muted);font-size:12.5px;margin-top:2px;}
 .cz-master-switch{flex:none;padding:0;margin:0;align-items:center;}

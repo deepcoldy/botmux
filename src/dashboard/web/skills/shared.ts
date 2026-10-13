@@ -51,10 +51,6 @@ export function mergeBotAssignmentSelectors(
   return [...direct, ...packs, ...unmanaged];
 }
 
-export function policyReferenceCount(policy?: SkillPolicy | null): number {
-  return priorityNames(policy).length;
-}
-
 export function policyConfigured(policy?: SkillPolicy | null): boolean {
   return (policy?.include?.length ?? 0) > 0;
 }

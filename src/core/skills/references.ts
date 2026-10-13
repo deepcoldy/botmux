@@ -1,4 +1,4 @@
-import type { BotSkillPolicy, SkillPack, SkillSelector } from './types.js';
+import type { BotSkillPolicy, SkillPack } from './types.js';
 
 export interface SkillReferenceBotInput {
   larkAppId: string;

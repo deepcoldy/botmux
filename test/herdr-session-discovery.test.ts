@@ -17,6 +17,8 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// Command assertions use the bare name whether or not this host has herdr on PATH.
+vi.mock('../src/utils/herdr-executable.js', () => ({ herdrExecutable: () => 'herdr' }));
 vi.mock('node:child_process', () => {
   const actual = require('node:child_process') as typeof import('node:child_process');
   return { ...actual, execSync: vi.fn(), execFileSync: vi.fn() };

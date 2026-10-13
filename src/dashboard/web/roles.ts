@@ -34,6 +34,8 @@ export interface RoleData {
   hasRole: boolean;
   injectMode?: RoleInjectMode;
   dispatchCompletionEnabled?: boolean;
+  replyPrivately?: boolean;
+  privateReplyNotice?: string;
   effectiveContent?: string | null;
   effectiveSource?: string;
   hasEffectiveRole?: boolean;
@@ -68,8 +70,16 @@ export interface MessageListenerData {
   contentPolicy?: {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
+    resolveDocumentTitles?: boolean;
   };
   replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
+}
+
+export function mergeListenerContentPolicy(
+  current: MessageListenerData['contentPolicy'],
+  patch: NonNullable<MessageListenerData['contentPolicy']>,
+): NonNullable<MessageListenerData['contentPolicy']> {
+  return { ...(current ?? {}), ...patch };
 }
 
 export interface MessageListenerPreviewItem {
@@ -199,10 +209,6 @@ export function botRoleCount(group: GroupInfo): number {
 
 export function botInChatCount(group: GroupInfo): number {
   return group.memberBots.filter(bot => bot.inChat).length;
-}
-
-export function profileHasEntry(profile: RoleProfileSummary, larkAppId: string): boolean {
-  return (profile.botEntries ?? []).some(entry => entry.larkAppId === larkAppId && entry.hasEntry);
 }
 
 export function entryForBot(entries: RoleProfileEntry[], larkAppId: string | null): RoleProfileEntry | undefined {
@@ -502,4 +508,11 @@ export async function applyRoleProfile(input: {
     error: body.error,
     wouldRefuse: body.wouldRefuse,
   };
+}
+
+export async function saveReplyPrivately(larkAppId: string, chatId: string, settings: { replyPrivately?: boolean; privateReplyNotice?: string }): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings),
+  });
+  return r.ok;
 }

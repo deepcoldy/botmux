@@ -1,8 +1,7 @@
 /**
  * 直接读/改/播种会话行持久层的测试夹具。会话库只有 SQLite 一种引擎：
- * per-bot 落在 `session-stores/<appId>/sessions.db`，legacy 无 appId 落在扁平
- * `sessions.db`。迁移前的 `sessions*.json` 只是**一次性导入源**，播种它请直接
- * 写文件（见各测试里的 seedJson），不要走本模块。
+ * 落在 `session-stores/<appId>/sessions.db`。迁移前的 `sessions-<appId>.json`
+ * 只是**一次性导入源**，播种它请直接写文件（见各测试里的 seedJson），不要走本模块。
  */
 import { mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -32,10 +31,8 @@ export type SeededOccupancyLease = {
   leaseUntil: number;
 };
 
-export function sessionStorePath(dataDir: string, appId?: string): string {
-  return appId
-    ? join(dataDir, 'session-stores', appId, 'sessions.db')
-    : join(dataDir, 'sessions.db');
+export function sessionStorePath(dataDir: string, appId: string): string {
+  return join(dataDir, 'session-stores', appId, 'sessions.db');
 }
 
 function open(path: string, create: boolean): DatabaseSync {
@@ -52,7 +49,7 @@ function open(path: string, create: boolean): DatabaseSync {
  */
 export function seedPersistedSessionRows(
   dataDir: string,
-  appId: string | undefined,
+  appId: string,
   rows: Record<string, any>,
 ): string {
   const path = sessionStorePath(dataDir, appId);
@@ -71,7 +68,7 @@ export function seedPersistedSessionRows(
 }
 
 /** 读某个 store 的全部行（键 → 行对象）。 */
-export function readPersistedSessionRows(dataDir: string, appId?: string): Record<string, any> {
+export function readPersistedSessionRows(dataDir: string, appId: string): Record<string, any> {
   const path = sessionStorePath(dataDir, appId);
   if (!existsSync(path)) throw new Error(`no session store at ${path}`);
   const db = open(path, false);
@@ -86,7 +83,7 @@ export function readPersistedSessionRows(dataDir: string, appId?: string): Recor
 /** 播种 / 覆盖一个 store 的 occupancy 租约（默认 scope='bot'）。 */
 export function seedOccupancyLease(
   dataDir: string,
-  appId: string | undefined,
+  appId: string,
   lease: SeededOccupancyLease,
 ): void {
   const path = sessionStorePath(dataDir, appId);
@@ -105,7 +102,7 @@ export function seedOccupancyLease(
 /** 读某个 store 的 occupancy 行；表不存在或没有行时返回 undefined。 */
 export function readOccupancyLeaseFromDisk(
   dataDir: string,
-  appId?: string,
+  appId: string,
   scope = 'bot',
 ): SeededOccupancyLease | undefined {
   const path = sessionStorePath(dataDir, appId);
@@ -134,7 +131,7 @@ export function readOccupancyLeaseFromDisk(
 /** 模拟「另一个进程」直改持久层里的一行。 */
 export function mutatePersistedSessionRow(
   dataDir: string,
-  appId: string | undefined,
+  appId: string,
   sessionId: string,
   mutate: (row: any) => void,
 ): void {

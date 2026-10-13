@@ -27,10 +27,8 @@
  * HOL-block-drop still applies if a steer-like merge ever appears.
  */
 import {
-  existsSync, statSync, openSync, readSync, closeSync, readdirSync, readFileSync, readlinkSync,
+  existsSync, statSync, openSync, readSync, closeSync, readdirSync, readFileSync,
 } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
 import {
@@ -38,9 +36,9 @@ import {
   resolveGrokCwdBucketDir,
 } from './grok-paths.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import type { ResumableSession } from '../adapters/cli/types.js';
 
-const IS_LINUX = platform() === 'linux';
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const GROK_SESSIONS_ANCHOR = '/.grok/sessions/';
 const TITLE_MAX = 80;
@@ -182,37 +180,14 @@ export function findGrokSessionByPid(
     }
     return best?.hit;
   };
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        if (target.endsWith(' (deleted)')) continue;
-        const hit = matchGrokSessionPath(target);
-        if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
-      }
-      // During `/new` Grok can briefly retain descriptors for both session
-      // directories. Prefer the stream most recently appended instead of
-      // depending on /proc fd enumeration order (which could rotate the
-      // worker bridge backwards to the retired session).
-      return newestHit();
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const hit = matchGrokSessionPath(line.slice(1));
+  // During `/new` Grok can briefly retain descriptors for both session
+  // directories. Prefer the stream most recently appended instead of
+  // depending on fd enumeration order (which could rotate the worker bridge
+  // backwards to the retired session).
+  const targets = listProcessOpenFiles(pid, { skipDeleted: true });
+  if (!targets) return undefined;
+  for (const target of targets) {
+    const hit = matchGrokSessionPath(target);
     if (hit && !hits.some((seen) => seen.sessionId === hit.sessionId)) hits.push(hit);
   }
   return newestHit();

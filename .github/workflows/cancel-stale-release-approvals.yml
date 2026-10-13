@@ -45,6 +45,9 @@ jobs:
       - name: Cancel stale waiting Release runs
         env:
           GH_TOKEN: ${{ github.token }}
+          # 本 job 不需要 checkout；显式提供仓库上下文，避免 gh 尝试从
+          # 当前目录的 .git 推断仓库并报 "not a git repository"。
+          GH_REPO: ${{ github.repository }}
           # schedule 触发时没有 inputs → 回退到默认 24h / 非 dry-run。
           THRESHOLD_HOURS: ${{ github.event.inputs.threshold_hours || '24' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}

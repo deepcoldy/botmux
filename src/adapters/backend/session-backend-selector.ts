@@ -9,6 +9,9 @@ import { isMojoFullyRemote } from './sandbox.js';
 import { mojoRemoteProofFailureReason } from './mojo-types.js';
 import type { EffectiveMojoConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
+import { RemoteRunnerBackend } from './remote-runner-backend.js';
+import type { RemoteRunnerConfig } from './remote-runner-config.js';
+import type { RemoteRunnerBackendState } from './remote-runner-protocol.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { ZellijBackend } from './zellij-backend.js';
@@ -243,6 +246,7 @@ export function backendSandboxCompatibilityError(opts: {
     opts.backendType === 'pty'
     || opts.backendType === 'tmux'
     || opts.backendType === 'riff'
+    || opts.backendType === 'remote-runner'
   ) return undefined;
   if (opts.backendType === 'mojo') {
     // A fully-remote mojo session (cloud on, localDaemon off) executes nothing
@@ -295,7 +299,8 @@ export interface SelectedSessionBackend {
 export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
-  backendConfig?: RiffBackendConfig | EffectiveMojoConfig;
+  backendConfig?: RiffBackendConfig | EffectiveMojoConfig | RemoteRunnerConfig;
+  remoteBackendState?: RemoteRunnerBackendState;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
   herdrOwnershipScope?: string;
@@ -306,6 +311,19 @@ export function selectSessionBackend(opts: {
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
+  if (opts.backendType === 'remote-runner') {
+    return {
+      backend: new RemoteRunnerBackend(
+        (opts.backendConfig ?? {}) as RemoteRunnerConfig,
+        opts.sessionId,
+        opts.remoteBackendState,
+      ),
+      isTmuxMode: false,
+      isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
   if (opts.backendType === 'mojo') {
     // Unlike riff, an absent config is FINE: every mojo field is optional and
     // the bare `mojo` binary on PATH with an ambient login is a valid setup.

@@ -14,8 +14,7 @@
  * scope 会出现"grant 了但 retry 后又因另一层预算继续 blocked"。
  */
 
-import { config } from '../../config.js';
-import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
+import { short, truncate, escapeMd, v3RunDetailUrl } from './v3-card-common.js';
 
 export const V3_REVISIT_GRANT_ACTION = 'v3_revisit_grant';
 
@@ -56,10 +55,6 @@ const DEFAULT_DETAIL_MAX_CHARS = 500;
  *  attemptId 入 nonce —— grant+retry 消费后 blocked 节点进入新 attempt,旧卡失效。 */
 export function v3RevisitGrantCardNonce(runId: string, sourceNodeId: string, attemptId: string): string {
   return `v3revisitgrant:${runId}:${sourceNodeId}:${attemptId}`;
-}
-
-function v3RunDetailUrl(runId: string): string {
-  return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
 }
 
 export function buildV3RevisitGrantCard(input: V3RevisitGrantCardInput): string {
@@ -151,16 +146,3 @@ export function buildV3RevisitGrantCard(input: V3RevisitGrantCardInput): string 
   });
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…（截断，完整见 Web 详情）`;
-}
-
-function short(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, max)}…`;
-}
-
-/** 转义 lark_md 里会被解析的字符,防 detail 注入破坏卡片结构。 */
-function escapeMd(s: string): string {
-  return s.replace(/[\\*_~`\[\]]/g, (c) => `\\${c}`);
-}

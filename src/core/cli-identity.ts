@@ -35,6 +35,8 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { clearLarkToolDelegations } from './lark-tool-delegation.js';
+import { isCliIdentityPath } from '../utils/child-env.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 /** Where a session's identity files live, under its own data dir. */
@@ -86,6 +88,23 @@ export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string)
 }
 
 /**
+ * Machine-readable companion to {@link sessionActiveTurnPath}:
+ * `{"turnId":…,"dispatchAttempt":…}` (one JSON object, 0600).
+ *
+ * The shell file stays a bare line because the `/bin/sh` identity wrapper
+ * sources it per tool call; this one exists for a JSON consumer that must
+ * freeze the (turn, dispatch generation) pair it is reporting on. The dsh-tui
+ * wrapper plugin reads it synchronously inside the `agent/status` callback
+ * (BOTMUX_TURN_IDLE_COMMAND) and carries the pair end-to-end, because a later
+ * read can already name the NEXT dispatch — see src/utils/turn-idle-report.ts.
+ * Its path layout is therefore mirrored in the generated snippet
+ * (src/adapters/dsh-question-bridge.ts): keep the two in sync.
+ */
+export function sessionActiveTurnIdentityPath(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn.json');
+}
+
+/**
  * Publish the turn now executing. Called by the worker at the point it hands a
  * queued input to the CLI, which is later than the daemon's acceptance of that
  * message and possibly much later.
@@ -97,12 +116,23 @@ export function publishActiveTurn(
   sessionDataDir: string,
   sessionId: string,
   turnId: string | undefined,
+  dispatchAttempt?: number,
 ): void {
   const path = sessionActiveTurnPath(sessionDataDir, sessionId);
   try {
     mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
     atomicWriteFileSync(path, `${turnId ?? ''}\n`, { mode: 0o600 });
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
+  try {
+    atomicWriteFileSync(
+      sessionActiveTurnIdentityPath(sessionDataDir, sessionId),
+      `${JSON.stringify({
+        turnId: turnId ?? null,
+        dispatchAttempt: dispatchAttempt ?? null,
+      })}\n`,
+      { mode: 0o600 },
+    );
+  } catch { /* best-effort: the reader stays silent without a frozen identity */ }
 }
 
 /** Session ids reach here from IPC; they are concatenated into a path, so a
@@ -332,13 +362,29 @@ export function clearSessionIdentity(
 ): void {
   try { rmSync(sessionIdentityPath(sessionDataDir, sessionId, tool), { force: true }); }
   catch { /* best-effort: absence is the desired state */ }
+  // Before #1543 identities lived directly under cli-identity/. Upgraded
+  // sessions no longer read or overwrite those files, so remove the exact
+  // legacy path as well instead of leaving a live token behind indefinitely.
+  try {
+    rmSync(
+      join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`),
+      { force: true },
+    );
+  } catch { /* best-effort: absence is the desired state */ }
 }
 
 /** Drop every identity for a session (teardown). */
 export function clearAllSessionIdentities(sessionDataDir: string, sessionId: string): void {
+  clearLarkToolDelegations(sessionDataDir, sessionId);
   for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
     clearSessionIdentity(sessionDataDir, sessionId, tool);
   }
+  try {
+    rmSync(
+      join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.turn`),
+      { force: true },
+    );
+  } catch { /* best-effort: absence is the desired state */ }
 }
 
 /**
@@ -730,7 +776,7 @@ export function findRealToolBinary(
 ): string | null {
   const excluded = new Set(excludeDirs.filter(Boolean));
   for (const dir of (pathValue ?? '').split(delimiter)) {
-    if (!dir || excluded.has(dir)) continue;
+    if (!dir || excluded.has(dir) || isCliIdentityPath(dir)) continue;
     const candidate = join(dir, tool);
     try {
       accessSync(candidate, constants.X_OK);
@@ -747,7 +793,7 @@ export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
 ): void {
-  if (!policy?.enabled || !sessionDataDir) return;
+  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);

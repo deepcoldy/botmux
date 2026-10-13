@@ -163,6 +163,7 @@ export interface CurrentTurnPeerAttestation {
   ds: DaemonSession;
   turnId: string;
   generation: number;
+  dispatchAttempt?: number;
   callerOpenId: string;
   capability: string;
   cliPid?: number;
@@ -174,6 +175,10 @@ export interface CurrentTurnPeerAttestation {
   expectedScheduledTurnId?: string;
   processIdentities: string[];
 }
+
+export type CurrentExecutionPeerAttestation = Omit<CurrentTurnPeerAttestation, 'callerOpenId'> & {
+  callerOpenId?: string;
+};
 
 export interface CurrentTurnPeerAttestationInput {
   sessionId: string;
@@ -190,13 +195,14 @@ export interface CurrentTurnPeerAttestationInput {
  * host-session lineage proof (no rotating capability, no channel env) has a
  * single source of truth.
  */
-export function attestCurrentTurnLoopbackPeer(
+export function attestCurrentExecutionLoopbackPeer(
   input: CurrentTurnPeerAttestationInput,
-): CurrentTurnPeerAttestation | null {
+): CurrentExecutionPeerAttestation | null {
   const procRoot = input.procRoot ?? '/proc';
   const ds = input.findSession(input.sessionId);
   const turnId = ds?.managedTurnOrigin?.turnId;
   const generation = ds?.workerGeneration;
+  const dispatchAttempt = ds?.managedTurnOrigin?.dispatchAttempt;
   const attestation = ds?.localProcessAttestation;
   const cliPid = attestation?.cliPid;
   const cliProcStart = attestation?.cliProcStart;
@@ -219,7 +225,8 @@ export function attestCurrentTurnLoopbackPeer(
     || ((enginePid === undefined) !== (engineProcStart === undefined))
     || (cliPid === undefined && enginePid === undefined)
     || !processIdentities || processIdentities.length === 0
-    || !callerOpenId?.startsWith('ou_') || !capability
+    || !capability
+    || (dispatchAttempt !== undefined && (!Number.isSafeInteger(dispatchAttempt) || dispatchAttempt <= 0))
     || (cliPid !== undefined
       && readProcStart(cliPid, procRoot) !== cliProcStart)
     || (enginePid !== undefined
@@ -252,12 +259,23 @@ export function attestCurrentTurnLoopbackPeer(
   }
   return {
     ds, turnId, generation, callerOpenId, capability,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     workerPid, workerProcStart, cliPid, cliProcStart, enginePid, engineProcStart,
     ...(input.expectedScheduledTurnId
       ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
       : {}),
     processIdentities: [...processIdentities],
   };
+}
+
+/** Human identity remains a separate requirement for actor and authorization
+ * callers. Machine-triggered executions can prove their lineage without it. */
+export function attestCurrentTurnLoopbackPeer(
+  input: CurrentTurnPeerAttestationInput,
+): CurrentTurnPeerAttestation | null {
+  const proof = attestCurrentExecutionLoopbackPeer(input);
+  if (!proof || typeof proof.callerOpenId !== 'string' || !proof.callerOpenId.startsWith('ou_')) return null;
+  return { ...proof, callerOpenId: proof.callerOpenId };
 }
 
 /** Re-run the peer attestation and confirm the live turn is byte-for-byte the
@@ -271,6 +289,7 @@ export function currentTurnPeerAttestationStable(
   return !!again
     && again.ds === frozen.ds && again.turnId === frozen.turnId
     && again.generation === frozen.generation && again.callerOpenId === frozen.callerOpenId
+    && again.dispatchAttempt === frozen.dispatchAttempt
     && again.capability === frozen.capability && again.cliPid === frozen.cliPid
     && again.cliProcStart === frozen.cliProcStart && again.workerPid === frozen.workerPid
     && again.workerProcStart === frozen.workerProcStart
@@ -318,6 +337,15 @@ export async function resolveDaemonCurrentActor(input: {
       schema: CURRENT_ACTOR_SCHEMA,
       status: 'verified',
       actor: { email },
+      // Both values are already in scope here and are the daemon's own state,
+      // not anything the caller supplied: `ds.chatId` was read a few lines
+      // above by the transport check, and `frozen.turnId` is the turn the
+      // attestation just re-verified as byte-identical. Publishing them lets a
+      // consumer record WHICH conversation and WHICH turn a human act came
+      // from — without them, "this actor is verified" is true of every turn and
+      // a consumer has no attested way to bind one act to one effect.
+      chatId: frozen.ds.chatId,
+      turnId: frozen.turnId,
     },
   };
 }

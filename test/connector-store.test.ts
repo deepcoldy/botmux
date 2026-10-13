@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { logger } from '../src/utils/logger.js';
 import {
   deleteConnector,
   getConnector,
@@ -104,5 +105,27 @@ describe('connector-store', () => {
 
   it('mints prefixed connector ids', () => {
     expect(newConnectorId()).toMatch(/^conn_/);
+  });
+});
+
+describe('connector-store: corrupt file is quarantined, not overwritten', () => {
+  it('keeps the corrupt connectors.json as connectors.json.corrupt-* after the next upsert, and the new file stays 0600', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-connectors-corrupt-'));
+      const corrupt = '{"version":1,"connectors":[{"id":"conn_old","name":"precious"';
+      writeFileSync(join(dir, 'connectors.json'), corrupt);
+
+      expect(listConnectors(dir)).toEqual([]);
+      upsertConnector(sample('conn_new'), dir);
+
+      const quarantined = readdirSync(dir).filter(f => f.startsWith('connectors.json.corrupt-'));
+      expect(quarantined).toHaveLength(1);
+      expect(readFileSync(join(dir, quarantined[0]), 'utf-8')).toBe(corrupt);
+      expect(listConnectors(dir).map(c => c.id)).toEqual(['conn_new']);
+      expect(statSync(join(dir, 'connectors.json')).mode & 0o777).toBe(0o600);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

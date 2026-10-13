@@ -1,12 +1,15 @@
 import type { LarkMessage, LarkMention } from '../../types.js';
 import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
+import { getAllBots, effectiveBotDisplayName } from '../../bot-registry.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
+import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
+import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -31,6 +34,7 @@ interface RawEventData {
     chat_id: string;
     chat_type: string;
     create_time: string;
+    update_time?: string;
     mentions?: Array<{
       key: string;       // e.g. "@_user_1"
       name: string;      // display name
@@ -484,10 +488,7 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
           for (const block of rootElements) {
             if (!Array.isArray(block)) continue;
             for (const node of block) {
-              const key = node.image_key ?? node.img_key;
-              if ((node.tag === 'img' || node.tag === 'image') && key) {
-                pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
-              }
+              extractElementImages(node, resources, pushIfNew);
             }
           }
         } else {
@@ -548,16 +549,23 @@ export function parseEventMessage(
     senderType: sender.sender_type,
     msgType: message.message_type,
     ...(message.message_type === 'post' ? { rawPostContent: message.content } : {}),
-    content: extractTextContent(message.message_type, message.content, message.mentions, numberer),
+    content: extractTextContent(message.message_type, message.content, message.mentions ?? [], numberer),
     createTime: message.create_time,
     mentions,
   };
   return { parsed, resources };
 }
 
-export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
+/** `resolveMentions`: render `@_user_N` placeholders with the message's own
+ *  structured `mentions[]` (the REST list/get shapes carry them) exactly as the
+ *  event parser does, instead of dropping them. Opt-in: default output is
+ *  unchanged for every existing caller. */
+export function parseApiMessage(msg: any, numberer?: ImgNumberer, options?: { resolveMentions?: boolean }): LarkMessage {
   const msgType = msg.msg_type ?? 'text';
   const rawContent = msg.body?.content ?? '';
+  const mentions = options?.resolveMentions
+    ? (Array.isArray(msg.mentions) ? msg.mentions as RawEventData['message']['mentions'] : [])
+    : undefined;
   // sender_name is only present when the fetch opted in via with_sender_name=true
   // (all client.ts message read paths do). Covers bot senders too — the one case
   // local rosters can't resolve for third-party bots.
@@ -572,9 +580,111 @@ export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
     ...(senderName ? { senderName } : {}),
     msgType,
     ...(msgType === 'post' ? { rawPostContent: rawContent } : {}),
-    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
+    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), mentions, numberer),
     createTime: msg.create_time ?? '',
   };
+}
+
+/** Structured mention evidence from either Lark shape, for observers that
+ *  must compare representations across live events and history reads. */
+export function structuredMentionRefs(mentions: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  if (!Array.isArray(mentions) || !mentions.length) return undefined;
+  const out = mentions.flatMap((m: any) => {
+    if (!m || typeof m.key !== 'string' || typeof m.name !== 'string' || !m.key || !m.name) return [];
+    const identity = mentionIdentity(m);
+    const openId = mentionOpenId(m); const appId = mentionAppId(m);
+    return [{ key: m.key, name: m.name, ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+      ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) }];
+  });
+  return out.length ? out : undefined;
+}
+
+/** The body as the platform stores it, with `@_user_N` placeholders left in
+ *  place, for message types whose rendered text depends on the mention list.
+ *  Live events and history reads of one platform version share this form
+ *  regardless of whether a `mentions[]` list was attached, so it is the
+ *  canonical identity of the body; undefined for other message types. */
+export function rawPlaceholderText(msgType: string, rawContent: string): string | undefined {
+  try {
+    if (msgType === 'text') {
+      const parsed = JSON.parse(rawContent);
+      const text = typeof parsed?.text === 'string' ? parsed.text : rawContent;
+      return text.trim();
+    }
+    if (msgType === 'post') return postCanonicalBody(JSON.parse(rawContent));
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export const POST_CANONICAL_PREFIX = '{"post":';
+
+/** A post's identity as a typed node sequence: text nodes keep their literal
+ *  text, `at` nodes carry only their target id, other nodes their rendering.
+ *  Node boundaries are preserved, so literal prose can never collide with a
+ *  mention marker, and both observation paths (event with a top-level
+ *  `mentions[]`, history without one) derive the same body from the content. */
+function postCanonicalBody(parsed: any): string {
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs = content.map((paragraph: any[]) => (Array.isArray(paragraph) ? paragraph : [paragraph]).map((node: any) => {
+    if (node?.tag === 'at') return { at: postAtTargetId(node) };
+    if (node?.tag === 'text') return { t: String(node.text ?? '') };
+    return { x: renderPostNode(node) };
+  }));
+  return `${POST_CANONICAL_PREFIX}${JSON.stringify({ title: String(title ?? ''), content: paragraphs })}}`;
+}
+
+function postAtTargetId(node: any): string {
+  return typeof node?.user_id === 'string' && node.user_id ? node.user_id : `name:${String(node?.user_name ?? 'unknown')}`;
+}
+
+/** Target ids of a post's `at` nodes in document order, from its canonical body. */
+export function postCanonicalMentionOrder(canonical: string): string[] | undefined {
+  if (!canonical.startsWith(POST_CANONICAL_PREFIX)) return undefined;
+  try {
+    const parsed = JSON.parse(canonical).post;
+    const order: string[] = [];
+    for (const paragraph of parsed.content ?? []) for (const node of paragraph) if (typeof node?.at === 'string') order.push(node.at);
+    return order;
+  } catch { return undefined; }
+}
+
+/** Mention identities of a post, derived from its inline `at` nodes in
+ *  document order (the one source both observation paths share). A top-level
+ *  `mentions[]` list, when present, only enriches the entry whose id matches
+ *  the node target (display name, typed app/union/user ids); it never defines
+ *  the order or the set. Keys are `@_at:<target id>`. */
+export function postMentionRefs(rawContent: string, topLevel?: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  try {
+    const { content } = resolvePostBody(JSON.parse(rawContent));
+    const enrich = new Map<string, { name: string; openId?: string; appId?: string; userId?: string; unionId?: string }>();
+    for (const m of Array.isArray(topLevel) ? topLevel : []) {
+      if (!m || typeof m !== 'object') continue;
+      const identity = mentionIdentity(m); const openId = mentionOpenId(m); const appId = mentionAppId(m);
+      const entry = { name: String((m as any).name ?? ''), ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+        ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) };
+      for (const id of [openId, appId, identity.userId, identity.unionId]) if (id) enrich.set(id, entry);
+    }
+    const out: Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> = [];
+    const seen = new Set<string>();
+    for (const paragraph of content) {
+      for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+        if (node?.tag !== 'at') continue;
+        const target = postAtTargetId(node);
+        if (seen.has(target)) continue;
+        seen.add(target);
+        const known = enrich.get(target);
+        const name = String(node.user_name ?? known?.name ?? 'unknown');
+        if (known) { out.push({ key: `@_at:${target}`, ...known, name }); continue; }
+        const openId = typeof node.user_id === 'string' && node.user_id ? node.user_id : undefined;
+        out.push({ key: `@_at:${target}`, name, ...(openId ? { openId } : {}) });
+      }
+    }
+    return out.length ? out : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeApiMessageContent(msgType: string, rawContent: string): string {
@@ -583,7 +693,7 @@ function normalizeApiMessageContent(msgType: string, rawContent: string): string
 }
 
 /** Resolve post body from either wrapped {"zh_cn":{title,content}} or unwrapped {title,content} format */
-function resolvePostBody(parsed: any): { title: string; content: any[] } {
+export function resolvePostBody(parsed: any): { title: string; content: any[] } {
   // Unwrapped: has content array directly
   if (Array.isArray(parsed.content)) {
     return { title: parsed.title ?? '', content: parsed.content };
@@ -596,6 +706,32 @@ function resolvePostBody(parsed: any): { title: string; content: any[] } {
     }
   }
   return { title: '', content: [] };
+}
+
+/** Narrow rich-post projection for keyword listeners. It intentionally keeps
+ * only visible title/text/link content so listener matching does not inherit
+ * unrelated mention, file, image, or code-rendering semantics. */
+export function extractPostListenerText(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') return '';
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs: string[] = [];
+  for (const paragraph of content) {
+    const parts: string[] = [];
+    for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+      if (!node || typeof node !== 'object') continue;
+      if (node.tag === 'text' && typeof node.text === 'string') {
+        parts.push(node.text);
+      } else if (node.tag === 'a') {
+        const label = typeof node.text === 'string' ? node.text.trim() : '';
+        const href = typeof node.href === 'string' ? node.href.trim() : '';
+        if (label) parts.push(label);
+        if (href && href !== label) parts.push(label ? ` (${href})` : href);
+      }
+    }
+    const text = parts.join('').trim();
+    if (text) paragraphs.push(text);
+  }
+  return [typeof title === 'string' ? title.trim() : '', ...paragraphs].filter(Boolean).join('\n');
 }
 
 /** 一条 @mention 在两种形状下的松散视图：`parseEventMessage` 产出的 `LarkMention`
@@ -702,15 +838,197 @@ export function stripLeadingMentions(content: string, mentions?: { name: string 
   return s;
 }
 
-function resolveMentions(text: string, mentions?: RawEventData['message']['mentions']): string {
-  if (!mentions || mentions.length === 0) {
-    // No mention info available — strip placeholders
-    return text.replace(/@_user_\d+/g, '').replace(/[^\S\r\n]{2,}/g, ' ').trim();
-  }
+function matchesMentionId(m: any, id: string): boolean {
+  if (!m || !id) return false;
+  const openId = m.openId ?? mentionOpenId(m);
+  if (openId === id) return true;
+  const identity = mentionIdentity(m);
+  if (identity.userId === id || m.userId === id) return true;
+  if (identity.unionId === id || m.unionId === id) return true;
+  if (identity.appId === id || m.appId === id || mentionAppId(m) === id) return true;
+  if (typeof m.id === 'string' && m.id === id) return true;
+  if (m.key === id) return true;
+  return false;
+}
+
+function lookupBotDisplayName(id: string): string | undefined {
+  if (!id) return undefined;
+  try {
+    const list = getAllBots();
+    if (Array.isArray(list)) {
+      const b = list.find(bot => bot.botOpenId === id || bot.config?.larkAppId === id);
+      if (b) return effectiveBotDisplayName(b);
+    }
+  } catch { /* best-effort */ }
+  return undefined;
+}
+
+export function resolveMentions(text: string, mentions?: Array<any>): string {
+  if (!text) return '';
+
+  const mentionList = (mentions ?? []).filter(
+    (m: any) => m && typeof m.name === 'string' && m.name.trim().length > 0,
+  );
+  const consumed = new Set<any>();
+
   let result = text;
-  for (const m of mentions) {
-    result = result.replace(m.key, `@${m.name}`);
+
+  // 1. Replace explicit @_user_N or other structured mention keys present in text
+  for (const m of mentionList) {
+    if (typeof m.key === 'string' && m.key.startsWith('@') && result.includes(m.key)) {
+      result = result.replaceAll(m.key, `@${m.name.trim()}`);
+      consumed.add(m);
+    }
   }
+
+  // 2. Resolve <at ...> tags (Lark card markdown / rich text inline mentions)
+  // Use negative lookahead to prevent swallowed nested tags across malformed inputs
+  const AT_TAG_RE = /<at\b([^>]*?)(?:\/>|>((?:(?!<at\b)[\s\S])*?)<\/at>)/gis;
+
+  if (AT_TAG_RE.test(result)) {
+    AT_TAG_RE.lastIndex = 0;
+
+    interface TagMatch {
+      fullMatch: string;
+      start: number;
+      end: number;
+      id: string;
+      nameAttr: string;
+      innerText: string;
+      resolved?: string;
+    }
+
+    const tagMatches: TagMatch[] = [];
+
+    let match: RegExpExecArray | null;
+    while ((match = AT_TAG_RE.exec(result)) !== null) {
+      const fullMatch = match[0];
+      const start = match.index;
+      const end = start + fullMatch.length;
+      const attrs = match[1] || '';
+      const body = match[2];
+
+      const idMatch = attrs.match(/\b(?:id|user_id)=["']?([^"'\s>]+)["']?/i);
+      const id = idMatch ? idMatch[1] : '';
+
+      const nameMatch = attrs.match(/\bname=["']([^"']+)["']?/i);
+      const nameAttr = nameMatch ? nameMatch[1].trim() : '';
+
+      const innerText = (body ?? '').trim();
+
+      tagMatches.push({ fullMatch, start, end, id, nameAttr, innerText });
+    }
+
+    // Pass 1: Exact matches & explicit naming
+    // Matches by ID against mentionList, @all, local bot registry, or explicit inner text / name attribute.
+    let exactIdMatchCount = 0;
+
+    for (const tag of tagMatches) {
+      if (tag.id.toLowerCase() === 'all') {
+        tag.resolved = '@所有人';
+        continue;
+      }
+
+      if (tag.id) {
+        const exact = mentionList.find(m => matchesMentionId(m, tag.id));
+        if (exact) {
+          consumed.add(exact);
+          tag.resolved = `@${exact.name.trim()}`;
+          exactIdMatchCount++;
+          continue;
+        }
+      }
+
+      if (tag.innerText && !/<at\b/i.test(tag.innerText)) {
+        tag.resolved = `@${tag.innerText}`;
+        continue;
+      }
+
+      if (tag.nameAttr) {
+        tag.resolved = `@${tag.nameAttr}`;
+        continue;
+      }
+
+      if (tag.id) {
+        const botName = lookupBotDisplayName(tag.id);
+        if (botName) {
+          tag.resolved = `@${botName}`;
+          continue;
+        }
+      }
+    }
+
+    // Pass 2: Positional fallback for remaining unresolved tags
+    // ONLY in cross-app forwarding scenarios where NO tag had an exact ID match.
+    // When exactIdMatchCount > 0, the message and mentions share the same ID namespace,
+    // so any unmatched tag ID must not steal an unclaimed mention.
+    if (exactIdMatchCount === 0) {
+      // Propagate resolved names across duplicate tag IDs if any sibling resolved
+      for (const tag of tagMatches) {
+        if (tag.resolved === undefined && tag.id) {
+          const sibling = tagMatches.find(t => t !== tag && t.id === tag.id && t.resolved !== undefined);
+          if (sibling) {
+            tag.resolved = sibling.resolved;
+          }
+        }
+      }
+
+      const remainingTags = tagMatches.filter(t => t.resolved === undefined);
+      const remainingMentions = mentionList.filter(m => !consumed.has(m));
+
+      // In cross-app scenarios, Lark delivers mentions in the same document order as the tags.
+      // If tag count and mention count are aligned (or 1-to-1), assign by position.
+      // If counts diverge (e.g. 2 tags but 1 mention), avoid guessing to prevent false attribution.
+      if (remainingTags.length > 0 && remainingMentions.length > 0) {
+        if (remainingTags.length === remainingMentions.length) {
+          for (let i = 0; i < remainingTags.length; i++) {
+            const tag = remainingTags[i];
+            const m = remainingMentions[i];
+            consumed.add(m);
+            tag.resolved = `@${m.name.trim()}`;
+          }
+        } else if (remainingTags.length === 1 && remainingMentions.length >= 1) {
+          const tag = remainingTags[0];
+          const m = remainingMentions[0];
+          consumed.add(m);
+          tag.resolved = `@${m.name.trim()}`;
+        }
+      }
+    }
+
+    // Pass 3: Apply replacements from right to left
+    for (let i = tagMatches.length - 1; i >= 0; i--) {
+      const item = tagMatches[i];
+      let repl: string;
+      if (item.resolved !== undefined) {
+        repl = item.resolved;
+      } else if (mentions !== undefined) {
+        repl = '';
+      } else {
+        repl = item.fullMatch;
+      }
+
+      let start = item.start;
+      let end = item.end;
+      // If stripping tag between spaces, collapse the redundant double space locally
+      // without touching code block indentation or multi-space formatting elsewhere
+      if (repl === '' && start > 0 && end < result.length && result[start - 1] === ' ' && result[end] === ' ') {
+        end++;
+      }
+      result = result.slice(0, start) + repl + result.slice(end);
+    }
+
+    // Clean up any orphaned </at> tags left behind by malformed markup when resolving mentions
+    if (mentions !== undefined && /<\/at>/i.test(result)) {
+      result = result.replace(/<\/at>/gi, '');
+    }
+  }
+
+  // 3. Strip any unresolvable @_user_\d+ placeholders and normalize spacing around them
+  if (/@_user_\d+/.test(result)) {
+    result = result.replace(/@_user_\d+/g, '').replace(/[^\S\r\n]{2,}/g, ' ');
+  }
+
   return result.trim();
 }
 
@@ -735,7 +1053,14 @@ function renderPostCodeBlock(node: any): string {
 
 function renderPostNode(node: any, numberer?: ImgNumberer): string {
   if (node.tag === 'text') return node.text ?? '';
-  if (node.tag === 'a') return node.text ?? node.href ?? '';
+  if (node.tag === 'a') {
+    // Titled links keep their destination only in href. Preserve it just as
+    // card anchors do, without duplicating links whose label is already a URL.
+    const text = node.text ?? '';
+    return text && node.href && text !== node.href
+      ? `${text}(${node.href})`
+      : (text || node.href || '');
+  }
   if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
   if (node.tag === 'code_block') return renderPostCodeBlock(node);
   if (node.tag === 'img' || node.tag === 'media') {
@@ -764,6 +1089,20 @@ function joinPostNodeText(parts: string[]): string {
  *  dispatched; paths the hook doesn't cover still get this safe placeholder
  *  instead of the raw {"file_key":...} JSON. */
 export const AUDIO_PLACEHOLDER = '[语音]';
+
+/** Authored text only: file names, media placeholders and forwarded content are
+ * resource metadata, not statements by the sender. Ordinary rendering is unchanged. */
+export function extractAuthoredMessageText(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions']): string {
+  if (msgType === 'text') return extractTextContent(msgType, rawContent, mentions ?? []);
+  if (msgType !== 'post') return '';
+  const { title, content } = resolvePostBody(JSON.parse(rawContent));
+  const body = content.map(paragraph => {
+    const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
+    return joinPostNodeText(nodes.filter(node => !['img', 'image', 'file', 'media', 'audio'].includes(node?.tag))
+      .map(node => renderPostNode(node)));
+  }).filter(Boolean).join('\n');
+  return title ? `${title}\n${body}` : body;
+}
 
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
@@ -808,14 +1147,14 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       return AUDIO_PLACEHOLDER;
     }
     if (msgType === 'interactive') {
-      return extractCardContent(rawContent, numberer);
+      return extractCardContent(rawContent, numberer, mentions);
     }
     if (msgType === 'merge_forward') {
       return '[合并转发消息]';
     }
-    return rawContent;
+    return resolveMentions(rawContent, mentions);
   } catch {
-    return rawContent;
+    return resolveMentions(rawContent, mentions);
   }
 }
 
@@ -972,9 +1311,9 @@ function extractRenderedCardContent(rawContent: string): string | undefined {
  * This is similar to post message body.  We also handle the original card JSON
  * (header/config/elements with tag objects) for locally-cached cards.
  */
-export function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
+export function extractCardContent(rawContent: string, numberer?: ImgNumberer, mentions?: RawEventData['message']['mentions']): string {
   const rendered = extractRenderedCardContent(rawContent);
-  if (rendered !== undefined) return rendered;
+  if (rendered !== undefined) return resolveMentions(rendered, mentions);
 
   try {
     const card = JSON.parse(rawContent);
@@ -982,7 +1321,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
     // Pre-resolved merged text injected by resolveMergedCardContent (the
     // A+B union for complex cards). Return it verbatim so the merge flows
     // through both parseEventMessage (live) and parseApiMessage (history).
-    if (typeof card[RESOLVED_TEXT_KEY] === 'string') return card[RESOLVED_TEXT_KEY];
+    if (typeof card[RESOLVED_TEXT_KEY] === 'string') return resolveMentions(card[RESOLVED_TEXT_KEY], mentions);
 
     // Template-based card — no inline content to extract
     if (card.type === 'template') {
@@ -1038,6 +1377,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
           for (const node of paragraph) {
             if (inSignedFooter) continue;
             if (node.tag === 'text') {
+              const visibleText = typeof node.text === 'string'
+                ? stripTrailingGroupContextCardPurposeMarker(node.text)
+                : node.text;
+              if (visibleText !== node.text
+                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                if (visibleText) textNodes.push(visibleText);
+                continue;
+              }
               if (hasCurrentFooterMarker(node.text)) {
                 textNodes.push(node.text.slice(0, node.text.indexOf(REPLY_CARD_FOOTER_MARKER)));
                 inSignedFooter = true;
@@ -1141,7 +1488,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
       }
     }
     const cleaned = visibleParts.join('\n');
-    return cleaned || '[卡片]';
+    return resolveMentions(cleaned || '[卡片]', mentions);
   } catch {
     return '[卡片]';
   }
@@ -1159,6 +1506,40 @@ const RESOLVED_TEXT_KEY = '__botmux_card_text__';
  * surface an honest placeholder instead of a misleading blank or raw fallback.
  */
 export const CARD_EMBEDDED_PLACEHOLDER = '[卡片内嵌组件，需在飞书客户端展开查看]';
+
+/**
+ * True when the text carries **no information beyond "an attachment was sent"**
+ * — i.e. it is nothing but bare placeholders emitted by the renderers above.
+ *
+ * Only the *bare* forms count as zero-information. A placeholder that carries
+ * real text — `[文件 1: 季度汇报.pdf]`, `[图片 2: 报警前30分钟同比]` (see
+ * {@link withImgAlt}), `[卡片: 发布单 #123]`, `[标签: P0]`, `[输入框: 收件人]`,
+ * or a button's own `[确认发布]` — is deliberately NOT stripped: that text is
+ * the whole point, and for an attachment-only message it is the only thing
+ * worth naming the chat after.
+ *
+ * Used as the AI-title gate for session groups: feeding `[图片 1]` to the
+ * titler yields a confident-but-content-free name ("图片内容分析请求") and,
+ * because a successful rename sets `titled` (see `markSessionGroupTitled`),
+ * permanently closes both the birth and the heal gate. Skipping instead leaves
+ * the group on its placeholder name until the user's next real message — ugly
+ * for a moment, but self-healing rather than wrong forever.
+ *
+ * ⚠️ Coupled to the placeholder literals rendered in this file (`renderPostNode`,
+ * `extractTextContent`, `extractCardContent` and {@link CARD_EMBEDDED_PLACEHOLDER}).
+ * Adding a new zero-information placeholder means adding it here too.
+ */
+export function isPlaceholderOnlyText(text: string): boolean {
+  if (!text.trim()) return false;
+  const stripped = text
+    // `[图片]` / `[图片 2]` / `[文件]` / `[文件 3]` / `[语音]` / `[卡片]`
+    .replace(/\[(?:图片|文件|语音|卡片)(?:\s+\d+)?\]/g, '')
+    .replace(/\[卡片 \(模板\)\]/g, '')
+    .replace(/\[合并转发消息\]/g, '')
+    .replaceAll(CARD_EMBEDDED_PLACEHOLDER, '')
+    .trim();
+  return stripped === '';
+}
 
 /** Wrap merged text so extractCardContent returns it verbatim downstream. */
 export function wrapResolvedCardText(text: string): string {
@@ -1282,7 +1663,7 @@ export function mergeCardText(textA: string, textB: string): string {
  */
 export async function resolveMergedCardContent(
   larkAppId: string, messageId: string, numberer?: ImgNumberer,
-): Promise<{ text: string; structuredContent: string; resources: MessageResource[] } | null> {
+): Promise<{ text: string; structuredContent: string; resources: MessageResource[]; updateTime?: number } | null> {
   const [aRes, bRes] = await Promise.all([
     getMessageDetail(larkAppId, messageId, { userCardContent: false }).catch(() => null),
     getMessageDetail(larkAppId, messageId, { userCardContent: true }).catch(() => null),
@@ -1291,6 +1672,8 @@ export async function resolveMergedCardContent(
   const bContent = bRes?.items?.[0]?.body?.content;
   if (!aContent && !bContent) return null;
   const structuredContent = (bContent ?? aContent)!;
+  const structuredMessage = bContent != null ? bRes?.items?.[0] : aRes?.items?.[0];
+  const updateTime = Number(structuredMessage?.update_time);
   // Resources BEFORE text so the shared numberer assigns [图片 N] in attachment
   // order and the text extraction below reuses those numbers (same ordering
   // contract as parseEventMessage / buildForwardedTree). Callers that don't
@@ -1303,7 +1686,8 @@ export async function resolveMergedCardContent(
   // Carry the structured card JSON (B preferred) alongside the merged text so
   // resource extraction (image_key/file_key) keeps working — extractResources
   // walks elements/body, extractCardContent short-circuits on the text key.
-  return { text: merged, structuredContent, resources };
+  return { text: merged, structuredContent, resources,
+    ...(Number.isFinite(updateTime) && updateTime > 0 ? { updateTime } : {}) };
 }
 
 /**
@@ -1314,13 +1698,14 @@ export async function resolveMergedCardContent(
  * by the live daemon path so forwarded cards reach the model fully parsed.
  */
 export async function resolveEventCard(data: RawEventData, larkAppId: string): Promise<void> {
-  let resolved: { text: string; structuredContent: string } | null = null;
+  let resolved: Awaited<ReturnType<typeof resolveMergedCardContent>> = null;
   try {
     resolved = await resolveMergedCardContent(larkAppId, data.message.message_id);
   } catch { /* fall through to local unwrap */ }
   if (resolved) {
     const structured = (() => { try { return JSON.parse(resolved!.structuredContent); } catch { return {}; } })();
     data.message.content = JSON.stringify({ ...structured, [RESOLVED_TEXT_KEY]: resolved.text });
+    if (resolved.updateTime !== undefined) data.message.update_time = String(resolved.updateTime);
     return;
   }
   unwrapUserDsl(data);
@@ -1528,6 +1913,25 @@ function extractElementImages(el: any, resources: MessageResource[], pushIfNew: 
     pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
   }
 
+  // `botmux send --images` keeps ordinary full-width/inline images inside a
+  // Markdown element as `![alt](img_vN_...)`.  Feishu does not always promote
+  // those tokens to native `img` nodes on readback, so native-node-only
+  // extraction made `quoted` render the image while returning resources: [].
+  // Reuse the outbound Markdown parser so code examples and escaped syntax do
+  // not become fake downloadable attachments.
+  if (tag === 'markdown' || tag === 'md' || tag === 'lark_md') {
+    const markdown = typeof el.content === 'string'
+      ? el.content
+      : typeof el.text === 'string'
+        ? el.text
+        : typeof el.text?.content === 'string'
+          ? el.text.content
+          : '';
+    for (const markdownKey of extractFeishuCardMarkdownImageKeys(markdown)) {
+      pushIfNew(resources, { type: 'image', key: markdownKey, name: `${markdownKey}.jpg` });
+    }
+  }
+
   // div.extra can contain an image
   if (el.extra) extractElementImages(el.extra, resources, pushIfNew);
 
@@ -1575,7 +1979,9 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   if (tag === 'markdown' && typeof el.element_id === 'string') {
     const idMatch = REPLY_CARD_HEADING_ELEMENT_ID_RE.exec(el.element_id);
     if (idMatch) {
-      const heading = (typeof elementText === 'string' ? elementText : nestedCardText(el))?.trim();
+      const heading = stripTrailingGroupContextCardPurposeMarker(
+        (typeof elementText === 'string' ? elementText : nestedCardText(el)) ?? '',
+      ).trim();
       if (heading) {
         parts.push(`${'#'.repeat(Number(idMatch[1]))} ${heading}`);
         return;
@@ -1586,7 +1992,12 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // div / markdown / plain_text blocks
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {
     const text = el.text?.content ?? el.content;
-    if (text) parts.push(text);
+    if (text) {
+      const visibleText = typeof text === 'string'
+        ? stripTrailingGroupContextCardPurposeMarker(text)
+        : text;
+      if (visibleText) parts.push(visibleText);
+    }
   }
 
   if (tag === 'table') {

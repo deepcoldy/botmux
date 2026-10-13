@@ -15,11 +15,11 @@
  * `applyDispatchLaunchBinding`, already worked; this test also captures that
  * shape so future refactors can't diverge the two paths again.
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
@@ -54,7 +54,8 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => {
 import {
   __testOnly_sessionAgentConfig as sessionAgentConfig,
 } from '../src/core/worker-pool.js';
-import { createDispatchLaunchSession } from '../src/services/session-store.js';
+import { createDispatchLaunchSession, init as initSessionStore } from '../src/services/session-store.js';
+import { config } from '../src/config.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const TARGET_APP = 'cli_target_app';
@@ -93,7 +94,23 @@ function makeDs(sessionOverrides: any, dsOverrides: Partial<DaemonSession> = {})
 }
 
 describe('P1 — dispatchLaunchSpec.effective.reasoningEffort survives to spawn config', () => {
-  beforeEach(() => vi.clearAllMocks());
+  let storeDir: string;
+  let prevDataDir: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // createDispatchLaunchSession persists through the durable store; bootstrap a
+    // private owned SQLite store in a temp data dir for each case.
+    storeDir = mkdtempSync(join(tmpdir(), 'p1-ipc-store-'));
+    prevDataDir = config.session.dataDir;
+    config.session.dataDir = storeDir;
+    initSessionStore(TARGET_APP);
+  });
+
+  afterEach(() => {
+    config.session.dataDir = prevDataDir;
+    rmSync(storeDir, { recursive: true, force: true });
+  });
 
   it('honors requested high on the direct-IPC path even when the target bot defaults to medium', () => {
     // Reproduces pi's probe: the direct-IPC session (only `dispatchLaunchSpec`,

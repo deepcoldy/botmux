@@ -348,12 +348,21 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
       const body = region(cliSource, start, end);
       expect(body, `${op} target-aware`).toContain('assertSessionTransportOrExit({ chatId: ');
     }
+    const chatMetadataCommands: Array<[string, string, string]> = [
+      ['tabs', 'async function cmdTabs(', 'async function cmdTopNotice('],
+      ['top-notice', 'async function cmdTopNotice(', 'async function cmdHistory('],
+    ];
+    for (const [op, start, end] of chatMetadataCommands) {
+      const body = region(cliSource, start, end);
+      expect(body, `${op} env gate`).toContain(`assertTurnTransportOrExit('${op}')`);
+      expect(body, `${op} target-aware`).toContain(`assertSessionTransportOrExit(session, '${op}')`);
+    }
     // Root-dispatch gate: managed no-transport turn refused for ALL Lark-facing
     // commands, resolved via TAMPER-RESISTANT pid-marker ancestry (not raw env).
     const rootGate = region(cliSource, 'const LARK_FACING_COMMANDS = new Set(', 'switch (command) {');
     expect(rootGate).toContain('managedOriginHasNoTransport()');
     // The command set includes the verbs codex flagged (vc-agent, report).
-    for (const cmd of ['send', 'dispatch', 'create-group', 'grant', 'vc-agent', 'report']) {
+    for (const cmd of ['send', 'dispatch', 'create-group', 'grant', 'vc-agent', 'report', 'tabs', 'top-notice']) {
       expect(rootGate, `LARK_FACING has ${cmd}`).toContain(`'${cmd}'`);
     }
     // managedOriginHasNoTransport resolves via ancestry (env-independent).
@@ -767,9 +776,19 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(allow).toContain("pathname === '/api/trigger'");
     expect(allow).toContain('trigger-result$');
     expect(allow).toContain('insight$');
+    expect(allow).toContain('host-facts$');
     expect(allow).not.toContain('answer');
     // And the gate consults it only under the core-only flag.
     expect(ipcSource).toContain('opts.coreOnlyPublicRoutes === true && routeIsCoreOnlyPublic(method, url.pathname)');
+  });
+
+  it('host-facts fails closed unless the owned session is apiOnly and HTTP-virtual', () => {
+    const handler = region(ipcSource, "ipcRoute('GET', '/api/sessions/:sessionId/host-facts'", "ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede'");
+    expect(handler).toContain('session.larkAppId !== cachedLarkAppId');
+    expect(handler).toContain('getBot(cachedLarkAppId).config.apiOnly === true');
+    expect(handler).toContain('!apiOnly || !isHttpVirtualSession(session.chatId)');
+    expect(handler.match(/jsonRes\(res, 404, \{ ok: false, error: 'session_not_found' \}\)/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(handler).toContain("backingProbe = 'unknown'");
   });
 
   it('P1-2: core-only skips fleet sandbox migration + synthesis ignores ambient BOTS_CONFIG', () => {
@@ -926,6 +945,18 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(serve).toContain('delete e.SESSION_DATA_DIR;');
   });
 
+  it('core-only backend is an explicit tmux/pty opt-in and never changes fleet defaults', () => {
+    const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
+    const serve = region(cliSource, 'async function cmdServe(', 'child.on(');
+    expect(serve).toContain("getOpt('--backend') ?? process.env.BOTMUX_CORE_BACKEND");
+    expect(serve).toContain("backend !== 'tmux' && backend !== 'pty'");
+    expect(serve).toContain('BOTMUX_CORE_BACKEND: backend');
+    expect(registrySource).toContain("const coreBackend = process.env.BOTMUX_CORE_BACKEND;");
+    expect(registrySource).toContain("coreBackend !== 'tmux' && coreBackend !== 'pty'");
+    expect(registrySource).toContain('if (coreBackend) entry.backendType = coreBackend;');
+    expect(readFileSync(resolve('src/config.ts'), 'utf8')).toContain("return 'tmux';");
+  });
+
   it('P1(2nd round): core-only skips host-wide maintenance / auto-restart / restart-report', () => {
     // The synthetic bot is idx=0 but must NOT own fleet maintenance (global
     // botmux update + detached `botmux restart`). Gate the whole block on !coreOnly.
@@ -971,12 +1002,11 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // tmux backend: pane scripts bake a HOST-RESOLVED bin dir literal (codex P1:
     // the pane can't resolve at runtime — BOTMUX_CORE_ONLY/SESSION_DATA_DIR are
     // scrubbed before the script runs). shellWrapperScript(binDir) takes it as an
-    // arg; call sites resolve via resolveBotmuxWrapperBinDir(opts.env). NO hardcoded
-    // $HOME/.botmux/bin and NO runtime-env shell resolution.
+    // arg; call sites (tmux-pipe-backend / zellij / zmx, checked below) resolve via
+    // resolveBotmuxWrapperBinDir(opts.env). NO hardcoded $HOME/.botmux/bin and NO
+    // runtime-env shell resolution.
     const tmuxSrc = readFileSync(resolve('src/adapters/backend/tmux-backend.ts'), 'utf8');
     expect(tmuxSrc).toContain("export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh')");
-    expect(tmuxSrc).toContain('const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);');
-    expect(tmuxSrc).toContain(': shellWrapperScript(wrapperBinDir, shellKind);');
     expect(tmuxSrc).not.toContain('export PATH="$HOME/.botmux/bin:$PATH"');
     expect(tmuxSrc).not.toContain('botmuxWrapperPathExportSh'); // footgun removed
     const fishAwarePersistentBackendCalls: Record<string, RegExp> = {
