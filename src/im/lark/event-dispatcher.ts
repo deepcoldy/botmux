@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
@@ -106,9 +106,6 @@ import {
   durableLarkSessionControlPartition,
 } from '../../services/durable-lark-session-control.js';
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
-
-// 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
-const hallEchoReplied = new Set<string>();
 
 function vcMeetingEventPayloadForLog(data: any): string {
   try {
@@ -4315,28 +4312,10 @@ export function createLarkEventDispatcherRuntime(
           recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
         }
         // 机器人大厅：bot 消息只用于身份登记（上面已学 sender union / mentions
-        // 自学 / cross-ref），绝不当任务路由——大厅打卡会点名 @ 同伴，不吞掉的话
-        // 接收 bot 会把打卡当任务拉起会话在大厅里回话（实测）。只吞 bot 发送方：
+        // 自学），绝不当任务路由——平台 bot 会 @ 新 bot 教它 union，不吞掉的话
+        // 接收 bot 会把这类消息当任务拉起会话在大厅里回话（实测）。只吞 bot 发送方：
         // 人类经隐藏入口进大厅后 @ bot 仍正常应答。
         if (isPlatformHallChat(config.session.dataDir, chatId)) {
-          // 回执互教：打卡者点名了我们且带 #hall-echo（= 它还没学到自己的
-          // union_id）→ @ 回它一次。open_id 直接取事件 sender_id（本 app 视角，
-          // 无需 cross-ref），打卡者从回执的 mentions[] 学到自己。每进程每发送者
-          // 只回一次；回执不带标记，链路必然终止。
-          try {
-            const text: unknown = JSON.parse(message.content ?? '{}')?.text;
-            if (
-              typeof text === 'string' && text.includes('#hall-echo') && senderOpenId &&
-              isBotMentioned(larkAppId, message, undefined) &&
-              !hallEchoReplied.has(`${larkAppId}::${senderOpenId}`)
-            ) {
-              if (primary) return ignoredUnsupportedPrimarySideEffect('platform hall echo replies');
-              hallEchoReplied.add(`${larkAppId}::${senderOpenId}`);
-              void sendMessage(larkAppId, chatId, `<at user_id="${senderOpenId}"></at> 已登记`, 'text')
-                .then(() => logger.info(`[${larkAppId}] hall echo reply sent to ${senderOpenId.substring(0, 12)}`))
-                .catch((e) => logger.warn(`[${larkAppId}] hall echo reply failed: ${(e as Error).message}`));
-            }
-          } catch { /* content 非 JSON → 忽略 */ }
           logger.debug(`[${larkAppId}] hall bot message swallowed after learning (chat=${chatId.substring(0, 12)})`);
           return;
         }
