@@ -874,7 +874,7 @@ export interface Session {
    * 落点）。botmux send 用 `BOTMUX_TURN_ID` 取自己那轮的 target；turn 结束后由
    * deliverFinalOutput / botmux send 成功路径清理对应 entry。
    */
-  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
+  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string; reactionType?: string; reactionIdentity?: 'tenant' | 'user' }>;
   /** Latest quote-target sender. Kept for UI/legacy compatibility; turn-bound
    * `replyTargets[turnId].senderOpenId` is authoritative for --mention-back. */
   quoteTargetSenderOpenId?: string;

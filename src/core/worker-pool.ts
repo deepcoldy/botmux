@@ -8148,6 +8148,8 @@ type DocCommentReplyTarget = {
   replyToName?: string;
   replyId?: string;
   reactionId?: string;
+  reactionType?: string;
+  reactionIdentity?: 'tenant' | 'user';
 };
 
 function persistedDocCommentTarget(
@@ -8172,6 +8174,8 @@ function resolveDocCommentTarget(
     ...memory,
     replyId: memory.replyId ?? persisted.replyId,
     reactionId: memory.reactionId ?? persisted.reactionId,
+    reactionType: memory.reactionType ?? persisted.reactionType,
+    reactionIdentity: memory.reactionIdentity ?? persisted.reactionIdentity,
   };
 }
 
@@ -8197,8 +8201,12 @@ function collectDocCommentReactionTargets(
 ): DocCommentReplyTarget[] {
   const unique = new Map<string, DocCommentReplyTarget>();
   const add = (target: DocCommentReplyTarget): void => {
-    if (!target.replyId || !target.reactionId) return;
-    const key = `${target.fileToken}\0${target.commentId}\0${target.replyId}\0${target.reactionId}`;
+    // Old persisted targets may contain only replyId because update_reaction
+    // succeeded with its documented empty response. Such pending targets still
+    // own the legacy Typing indicator and must be cleaned during close.
+    const reactionType = target.reactionType ?? (target.replyId ? 'Typing' : undefined);
+    if (!target.replyId || !reactionType) return;
+    const key = `${target.fileToken}\0${target.commentId}\0${target.replyId}\0${reactionType}\0${target.reactionIdentity ?? ''}`;
     unique.set(key, target);
   };
   if (ds?.docCommentTurns) {
@@ -8806,11 +8814,12 @@ export async function closeSession(
           { fileToken: target.fileToken, fileType: target.fileType },
           target.commentId,
           target.replyId!,
-          target.reactionId!,
+          target.reactionType ?? 'Typing',
+          { identity: target.reactionIdentity },
         );
       } catch (err: any) {
         logger.debug(
-          `[doc-comment] close cleanup could not remove reaction ${target.reactionId}: ${err?.message ?? err}`,
+          `[doc-comment] close cleanup could not remove reaction ${target.reactionType ?? 'Typing'}: ${err?.message ?? err}`,
         );
       }
     }
@@ -18442,14 +18451,16 @@ function deliverFinalOutput(
         // reaction must never retry and duplicate the document comment.
         consumeDocCommentTurn(ds, msg.turnId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-        if (docTurn.reactionId && docTurn.replyId) {
+        const reactionType = docTurn.reactionType ?? (docTurn.replyId ? 'Typing' : undefined);
+        if (reactionType && docTurn.replyId) {
           try {
             await removeCommentReaction(ds.larkAppId,
               { fileToken: docTurn.fileToken, fileType: docTurn.fileType },
-              docTurn.commentId, docTurn.replyId, docTurn.reactionId);
+              docTurn.commentId, docTurn.replyId, reactionType,
+              { identity: docTurn.reactionIdentity });
           } catch (err: any) {
             logger.debug(
-              `[doc-comment] failed to remove completed reaction ${docTurn.reactionId}: ${err?.message ?? err}`,
+              `[doc-comment] failed to remove completed reaction ${reactionType}: ${err?.message ?? err}`,
             );
           }
         }

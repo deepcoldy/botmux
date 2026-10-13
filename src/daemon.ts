@@ -648,7 +648,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
-import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed } from './im/lark/doc-comment.js';
+import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -27192,6 +27192,8 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
   const claimKey = `${larkAppId}:${sub.fileToken}:${turnId}`;
   const userReplyId = ctx.replyId;
   let reactionId: string | undefined;
+  let reactionType: string | undefined;
+  let reactionIdentity: DocCommentReactionIdentity | undefined;
   let deliveryDs: DaemonSession | undefined;
   let deliverySession: Session | undefined;
   let releaseDeliveryReservation: (() => void) | undefined;
@@ -27239,14 +27241,15 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       }
     }
 
-    if (reactionId && userReplyId) {
+    if (reactionType && userReplyId) {
       try {
         await removeCommentReaction(
           larkAppId,
           { fileToken: sub.fileToken, fileType: sub.fileType },
           commentId,
           userReplyId,
-          reactionId,
+          reactionType,
+          { identity: reactionIdentity },
         );
       } catch (reactionErr) {
         logger.debug(
@@ -27320,9 +27323,14 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
 
       // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
       if (userReplyId) {
-        reactionId = await addCommentReaction(larkAppId,
+        const reaction = await addCommentReactionChecked(larkAppId,
           { fileToken: sub.fileToken, fileType: sub.fileType },
           commentId, userReplyId, 'Typing');
+        if (reaction.ok) {
+          reactionId = reaction.reactionId;
+          reactionType = 'Typing';
+          reactionIdentity = reaction.identity;
+        }
       }
       ensureCurrentRoutingGeneration(generation, 'comment:reaction');
 
@@ -27358,8 +27366,10 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         replyToName: sender?.name,
         replyId: userReplyId,
         reactionId,
+        reactionType,
+        reactionIdentity,
       });
-      const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId };
+      const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId, reactionType, reactionIdentity };
 
       const selfBot = getBot(ds.larkAppId);
 

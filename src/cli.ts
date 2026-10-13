@@ -3924,7 +3924,7 @@ interface SessionData {
   }>;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   /** 文档评论入口 per-turn 回复落点（见 Session.docCommentTargets in types.ts）。 */
-  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
+  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string; reactionType?: string; reactionIdentity?: 'tenant' | 'user' }>;
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   whiteboardId?: string;
@@ -10893,11 +10893,19 @@ async function cmdSend(rest: string[]): Promise<void> {
           })();
       // 清理 "Typing" reaction（bot 已回复完毕）。未知分块会在上方 fail closed，
       // 不会误删指示器并把一份可能不完整的回复伪装成完成。
-      if (exactDocTarget.reactionId && exactDocTarget.replyId) {
+      // Pre-upgrade targets may have only replyId: the old add API projected a
+      // successful empty response to reactionId=undefined. Any pending target
+      // with a replyId predates typed tracking and therefore owns Typing.
+      const reactionType = exactDocTarget.reactionType
+        ?? (exactDocTarget.replyId ? 'Typing' : undefined);
+      if (reactionType && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
           { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
-          exactDocTarget.commentId, exactDocTarget.replyId, exactDocTarget.reactionId,
-          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect });
+          exactDocTarget.commentId, exactDocTarget.replyId, reactionType,
+          {
+            beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+            identity: exactDocTarget.reactionIdentity,
+          });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
