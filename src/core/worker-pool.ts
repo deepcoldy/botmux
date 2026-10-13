@@ -10720,7 +10720,17 @@ export async function forkClosedSession(
     lastMessageAt: Date.now(),
     workingDir: session.workingDir,
   } as DaemonSession;
-  return forkFromSource(source, targetChatId, targetRootMessageId, targetChatType, targetScope, opts);
+  // Workspace recycling may retire (or a resume may reopen) the source while
+  // this copy waits behind the target lock; re-read it right before minting.
+  const revalidate = (): string | undefined => {
+    const latest = sessionStore.getOwnedSession(sessionId);
+    if (!latest) return 'not_found';
+    if (latest.workspaceRetirement) return 'workspace_retired';
+    if (latest.status !== 'closed') return 'not_closed';
+    source.session = latest;
+    return undefined;
+  };
+  return forkFromSource(source, targetChatId, targetRootMessageId, targetChatType, targetScope, opts, revalidate);
 }
 
 async function forkFromSource(
@@ -10730,6 +10740,9 @@ async function forkFromSource(
   targetChatType: 'group' | 'p2p',
   targetScope: 'thread' | 'chat',
   opts?: ForkSessionOptions,
+  /** Re-checks the source under the target-key lock (the caller's checks ran
+   *  before any await). Returns an error code to refuse, undefined to proceed. */
+  revalidateSource?: () => string | undefined,
 ): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
   const sessionId = ds.session.sessionId;
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
@@ -10778,6 +10791,8 @@ async function forkFromSource(
     // so two copies aimed at one empty anchor could both have passed it.
     const lockedOccupant = activeSessionsRegistry?.get(targetKey);
     if (lockedOccupant && lockedOccupant !== ds) return { ok: false, error: 'target_chat_has_session' };
+    const sourceError = revalidateSource?.();
+    if (sourceError) return { ok: false, error: sourceError };
 
     // ── Mint the child session row (new botmux sessionId) ──
     const parentTitle = ds.session.title || '';

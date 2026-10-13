@@ -799,6 +799,19 @@ describe('forkClosedSession（/resume <别处的 id>：从已关闭记录复制�
     expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('排队等目标锁期间源会话被回收：进锁后复查源，拒绝 workspace_retired 且不铸子会话', async () => {
+    const row = closedRow();
+    const retired = { ...row, workspaceRetirement: { operationId: 'op', workspacePath: '/tmp/project' } as any };
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(row).mockReturnValue(retired);
+    vi.mocked(sessionStore.createSession).mockClear();
+    const res = await forkClosedSession(row.sessionId, 'oc_here', 'om_here_root', 'group', 'thread', {
+      forkWorkerImpl: forkWorkerSpy as any,
+    });
+    expect(res).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(sessionStore.createSession).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
   it('只接受已关闭、未回收、可 fork 的记录', async () => {
     expect(await callClosedFork(closedRow({ status: 'active' }))).toEqual({ ok: false, error: 'not_closed' });
     expect(await callClosedFork(closedRow({ workspaceRetirement: { operationId: 'op', workspacePath: '/tmp/p' } as any })))
