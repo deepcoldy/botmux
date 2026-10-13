@@ -2498,9 +2498,54 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
 
 const sessionAuthRequests = new Map<string, {
   sessionId: string;
-  isCurrent: () => boolean;
+  appId: string;
+  callerOpenId: string;
+  authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+  isValid: () => boolean;
+  status: 'pending' | 'ready' | 'failed';
+  expiresAt: number;
   poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+  dispose: () => void;
 }>();
+
+// The daemon owns device-grant completion. Ending an Agent turn must not abandon
+// a link already sent to its verified user. This never dispatches a new turn or
+// injects credentials: those actions still require a fresh current-actor proof.
+function trackSessionAuthorization(
+  requestId: string,
+  entry: Omit<NonNullable<ReturnType<typeof sessionAuthRequests.get>>, 'status' | 'expiresAt' | 'poll' | 'dispose'>,
+): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const request = {
+    ...entry,
+    status: 'pending' as 'pending' | 'ready' | 'failed',
+    expiresAt: Date.now() + entry.authorization.expiresIn * 1_000,
+    poll: async () => {
+      const result = await entry.authorization.poll();
+      request.status = result.status;
+      return result;
+    },
+    dispose: () => { disposed = true; clearTimeout(timer); clearTimeout(expiry); },
+  };
+  const tick = async () => {
+    if (disposed) return;
+    if (!entry.isValid()) {
+      request.dispose();
+      sessionAuthRequests.delete(requestId);
+      return;
+    }
+    try { await request.poll(); }
+    catch { request.status = 'failed'; }
+    if (!disposed && request.status === 'pending') timer = setTimeout(tick, 2_000).unref();
+  };
+  const expiry = setTimeout(() => {
+    request.dispose();
+    sessionAuthRequests.delete(requestId);
+  }, entry.authorization.expiresIn * 1_000).unref();
+  sessionAuthRequests.set(requestId, request);
+  timer = setTimeout(tick, 2_000).unref();
+}
 
 for (const action of ['auth-request', 'auth-status']) {
   ipcRoute('POST', `/api/sessions/:sessionId/${action}`, async (req, res, params) => {
@@ -2569,11 +2614,12 @@ for (const action of ['auth-request', 'auth-status']) {
 
     if (action === 'auth-status') {
       const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
-      if (!request || request.sessionId !== params.sessionId || !request.isCurrent()) {
+      if (!request || request.sessionId !== params.sessionId || request.appId !== ds.larkAppId
+        || request.callerOpenId !== callerOpenId || !request.isValid()) {
         return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
       }
       const result = await request.poll();
-      if (!isCurrent() || !request.isCurrent()) {
+      if (!isCurrent() || !request.isValid()) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
@@ -2602,18 +2648,46 @@ for (const action of ['auth-request', 'auth-status']) {
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
+    // Issuance is turn-bound; an accepted grant belongs to this app/user and
+    // session until its own deadline. A different speaker cannot claim it.
+    const appId = cfg.larkAppId;
+    const requestId = randomBytes(32).toString('hex');
+    const brand = normalizeBrand(cfg.brand);
+    const appSecret = cfg.larkAppSecret;
+    let accepted = false;
+    const isAuthorizationValid = () => {
+      if (!accepted) return isCurrent();
+      const tracked = sessionAuthRequests.get(requestId);
+      if (!tracked || tracked.expiresAt <= Date.now()
+        || findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
+        || ds.larkAppId !== appId || sessionTransportDisabled(ds)) return false;
+      try {
+        const currentConfig = getBot(ds.larkAppId).config;
+        return currentConfig.larkAppSecret === appSecret && normalizeBrand(currentConfig.brand) === brand
+          && (!!boundTool || triggerUserAuthApplies(currentConfig.triggerUserAuth, 'lark-cli'));
+      } catch { return false; }
+    };
+    for (const [requestId, request] of sessionAuthRequests) {
+      if (request.sessionId === params.sessionId && request.appId === cfg.larkAppId
+        && request.callerOpenId === callerOpenId && request.status === 'pending' && request.isValid()
+        && request.expiresAt > Date.now()
+        && scopes.every(scope => request.authorization.scopes.includes(scope))) {
+        return jsonRes(res, 200, { ok: true, requestId, authUrl: request.authorization.authUrl,
+          scopes: request.authorization.scopes, expiresIn: Math.max(1, Math.ceil((request.expiresAt - Date.now()) / 1_000)), autoCallback: true });
+      }
+    }
     let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
     try {
       authorization = await requestUserAuthorization(
-        cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, isCurrent,
+        cfg.larkAppId, appSecret, brand, scopes, callerOpenId, isAuthorizationValid,
       );
     } catch {
       return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
     }
     if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
-    const requestId = randomBytes(32).toString('hex');
-    sessionAuthRequests.set(requestId, { sessionId: params.sessionId, isCurrent, poll: authorization.poll });
-    setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+    accepted = true;
+    trackSessionAuthorization(requestId, { sessionId: params.sessionId, appId: cfg.larkAppId,
+      callerOpenId, authorization, isValid: isAuthorizationValid });
     return jsonRes(res, 200, {
       ok: true, authUrl: authorization.authUrl, requestId,
       scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
@@ -9469,7 +9543,11 @@ export function startIpcServer(opts: {
     workspaceRecycleRuntime.start();
     void (opts.ready ?? Promise.resolve()).then(() => workspaceRecycleRuntime.recoverDeferred())
       .catch(error => logger.warn(`[workspace-recycle] deferred recovery failed: ${String(error)}`));
-    server.once('close', () => workspaceRecycleRuntime.stop());
+    server.once('close', () => {
+      workspaceRecycleRuntime.stop();
+      for (const request of sessionAuthRequests.values()) request.dispose();
+      sessionAuthRequests.clear();
+    });
     return {
     port,
     close: () => new Promise<void>(r => server.close(() => r())),
