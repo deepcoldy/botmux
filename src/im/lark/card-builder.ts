@@ -25,6 +25,7 @@ import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
+import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -147,7 +148,7 @@ function configSelect(placeholder: string, initial: string, options: Array<{ tex
 }
 
 function configSubheader(secKey: string, locale?: Locale): any {
-  return { tag: 'div', text: { tag: 'lark_md', content: `**${t(secKey, undefined, locale)}**` } };
+  return larkMdDiv(`**${t(secKey, undefined, locale)}**`);
 }
 
 /**
@@ -208,12 +209,11 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   for (const g of CONFIG_CARD_BOOLEAN_GROUPS) {
     const btns = g.keys.filter(k => onMap.has(k)).map(k => {
       const on = onMap.get(k) === true;
-      return {
-        tag: 'button',
-        text: { tag: 'plain_text', content: `${on ? '🟢' : '⚪'} ${t('config.label.' + k, undefined, locale)}` },
-        type: on ? 'primary' : 'default',
-        value: { action: 'config_toggle', field: k, ...locVal },
-      };
+      return callbackButton(
+        `${on ? '🟢' : '⚪'} ${t('config.label.' + k, undefined, locale)}`,
+        on ? 'primary' : 'default',
+        { action: 'config_toggle', field: k, ...locVal },
+      );
     });
     elements.push({ tag: 'hr' });
     elements.push(configSubheader(g.sec, locale));
@@ -238,12 +238,11 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
       });
       elements.push({
         tag: 'action',
-        actions: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: t('card.config.quota_edit', undefined, locale) },
-          type: 'default',
-          value: { action: 'config_quota_open', ...locVal },
-        }],
+        actions: [callbackButton(
+          t('card.config.quota_edit', undefined, locale),
+          'default',
+          { action: 'config_quota_open', ...locVal },
+        )],
       });
     }
   }
@@ -253,20 +252,14 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   elements.push({ tag: 'hr' });
   elements.push({
     tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.config.text_btn', undefined, locale) },
-      type: 'default',
-      value: { action: 'config_text_open', ...locVal },
-    }],
+    actions: [callbackButton(t('card.config.text_btn', undefined, locale), 'default', { action: 'config_text_open', ...locVal })],
   });
   elements.push({ tag: 'note', elements: [{ tag: 'lark_md', content: t('card.config.note', undefined, locale) }] });
 
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.config.title', { name: data.botName }, locale) } },
+  return JSON.stringify(wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.config.title', { name: data.botName }, locale)),
     elements,
-  });
+  }));
 }
 
 /**
@@ -277,7 +270,7 @@ export function buildConfigQuotaCard(data: ConfigCardData, locale?: Locale): str
   const locVal: Record<string, string> = locale ? { loc: locale } : {};
   const legacyQuota = data.quota != null && data.quota > MAX_GRANT_QUOTA;
   const elements: any[] = [
-    { tag: 'div', text: { tag: 'lark_md', content: t('card.config.quota_input_note', undefined, locale) } },
+    larkMdDiv(t('card.config.quota_input_note', undefined, locale)),
   ];
   if (legacyQuota) {
     elements.push({
@@ -311,14 +304,10 @@ export function buildConfigQuotaCard(data: ConfigCardData, locale?: Locale): str
       },
     ],
   });
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.config.quota_input_title', { name: data.botName }, locale) },
-    },
+  return JSON.stringify(wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.config.quota_input_title', { name: data.botName }, locale)),
     elements,
-  });
+  }));
 }
 
 /**
@@ -333,7 +322,7 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
   // form 内只放 input+button（与仓库已验证的 TUI 表单同构），label 放 form 外，
   // 否则 form 里混入 div 会整卡渲染失败（空卡）。每字段独立保存。
   const section = (lblKey: string, name: string, value: string | null): any[] => ([
-    { tag: 'div', text: { tag: 'lark_md', content: `**${t(lblKey, undefined, locale)}**` } },
+    larkMdDiv(`**${t(lblKey, undefined, locale)}**`),
     {
       tag: 'form',
       name: `config_form_${name}`,
@@ -351,7 +340,7 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
     },
   ]);
   const elements: any[] = [
-    { tag: 'div', text: { tag: 'lark_md', content: t('card.config.text_note', undefined, locale) } },
+    larkMdDiv(t('card.config.text_note', undefined, locale)),
     { tag: 'hr' },
     ...section('card.config.lbl_brand', 'brandLabel', data.brandLabel),
     { tag: 'hr' },
@@ -363,11 +352,10 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
     { tag: 'hr' },
     ...section('card.config.lbl_role', 'teamRole', data.teamRole),
   ];
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.config.text_title', { name: data.botName }, locale) } },
+  return JSON.stringify(wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.config.text_title', { name: data.botName }, locale)),
     elements,
-  });
+  }));
 }
 
 
@@ -464,12 +452,7 @@ function localCliButton(
       : cliId === 'traex'
         ? 'card.btn.open_local_trae'
         : 'card.btn.open_local_cli';
-  return {
-    tag: 'button',
-    text: { tag: 'plain_text', content: t(labelKey, { cliName }, locale) },
-    type: 'default',
-    value: { action: 'open_local_cli', ...actionBase },
-  };
+  return callbackButton(t(labelKey, { cliName }, locale), 'default', { action: 'open_local_cli', ...actionBase });
 }
 
 /**
@@ -494,23 +477,21 @@ export function buildSessionCard(
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
   const actions: any[] = [];
   if (terminalUrl) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale) },
-      type: 'primary',
-      multi_url: terminalMultiUrl(terminalUrl),
-    });
+    actions.push(urlButton(
+      t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale),
+      'primary',
+      terminalMultiUrl(terminalUrl),
+    ));
   }
   if (!showManageButtons) {
     const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
     if (localBtn) actions.push(localBtn);
     if (terminalUrl) {
-      actions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-        type: 'default',
-        value: { action: 'get_write_link', ...actionBase },
-      });
+      actions.push(callbackButton(
+        t('card.btn.get_write_link', undefined, locale),
+        'default',
+        { action: 'get_write_link', ...actionBase },
+      ));
     }
   }
   // No restart button for ANY remote CLI: the riff worker refuses the IPC
@@ -520,38 +501,19 @@ export function buildSessionCard(
   // review, gate 1); the click handler also guards, this keeps the surface
   // honest.
   if (showManageButtons && !adoptMode && !isRemoteCliId(effectiveCliId)) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.restart_cli', { cliName }, locale) },
-      type: 'default',
-      value: { action: 'restart', ...actionBase },
-    });
+    actions.push(callbackButton(t('card.btn.restart_cli', { cliName }, locale), 'default', { action: 'restart', ...actionBase }));
   }
   if (adoptMode) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
-      type: 'danger',
-      value: { action: 'disconnect', ...actionBase },
-    });
+    actions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
   } else {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-      type: 'danger',
-      value: { action: 'close', ...actionBase },
-    });
+    actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${plainTitle(title)}` },
-      template: 'blue',
-    },
+  const card = wideCard({
+    header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
       { tag: 'action', actions },
     ],
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -596,27 +558,18 @@ export function buildSessionClosedCard(
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
     dirLine;
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.session_closed', undefined, locale) },
-      template: 'grey',
-    },
-    elements: [
-      { tag: 'markdown', content: body },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.btn.resume_session', undefined, locale) },
-            type: 'primary',
-            value: { action: 'resume', ...actionBase },
-          },
-        ],
-      },
+  const card = simpleCard({
+    title: t('card.status.session_closed', undefined, locale),
+    template: 'grey',
+    markdown: body,
+    buttons: [
+      callbackButton(
+        t('card.btn.resume_session', undefined, locale),
+        'primary',
+        { action: 'resume', ...actionBase },
+      ),
     ],
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -630,10 +583,7 @@ export function buildForkPanelCard(
     return JSON.stringify({
       schema: '2.0',
       config: { update_multi: true },
-      header: {
-        template: 'purple',
-        title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
-      },
+      header: cardHeaderTemplateFirst('purple', t('card.fork_panel.title', undefined, locale)),
       body: {
         direction: 'vertical',
         elements: [{ tag: 'markdown', content: t('card.fork_panel.empty', undefined, locale) }],
@@ -651,10 +601,7 @@ export function buildForkPanelCard(
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      template: 'purple',
-      title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
-    },
+    header: cardHeaderTemplateFirst('purple', t('card.fork_panel.title', undefined, locale)),
     body: {
       direction: 'vertical',
       elements: [{
@@ -775,10 +722,7 @@ export function buildSlashListCard(
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('slashlist.heading', { cliName }, locale) },
-    },
+    header: cardHeaderTemplateFirst('blue', t('slashlist.heading', { cliName }, locale)),
     body: { direction: 'vertical', elements },
   });
 }
@@ -830,14 +774,10 @@ export function buildRelayedFrozenCard(
       preview: true,
     });
   }
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.relay_frozen', undefined, locale) },
-      template: 'grey',
-    },
+  const card = wideCard({
+    header: cardHeader(t('card.status.relay_frozen', undefined, locale), 'grey'),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -1070,54 +1010,44 @@ export function buildStreamingCard(
   const hidden = new Set(hiddenButtons);
 
   if (!hidden.has('output')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'toggle_display', ...actionBase },
-    });
+    headerActions.push(callbackButton(
+      t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
+      'default',
+      { action: 'toggle_display', ...actionBase },
+    ));
     if (displayMode !== 'hidden') {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
-        type: 'default' as const,
-        value: { action: 'export_text', ...actionBase },
-      });
+      headerActions.push(callbackButton(
+        t('card.btn.export_text', undefined, locale),
+        'default',
+        { action: 'export_text', ...actionBase },
+      ));
     }
     if (displayMode === 'screenshot') {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
-        type: 'default' as const,
-        value: { action: 'refresh_screenshot', ...actionBase },
-      });
+      headerActions.push(callbackButton(
+        t('card.btn.refresh', undefined, locale),
+        'default',
+        { action: 'refresh_screenshot', ...actionBase },
+      ));
     }
   }
   if (terminalUrl && !hidden.has('terminal')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-      type: 'primary',
-      multi_url: terminalMultiUrl(terminalUrl),
-    });
+    headerActions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)));
   }
   const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
   if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.retry_last_task', undefined, locale) },
-      type: 'primary' as const,
-      value: { action: 'retry_last_task', ...actionBase },
-    });
+    headerActions.push(callbackButton(
+      t('card.btn.retry_last_task', undefined, locale),
+      'primary',
+      { action: 'retry_last_task', ...actionBase },
+    ));
   }
   if (terminalUrl && !hidden.has('writeLink')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-      type: 'default',
-      value: { action: 'get_write_link', ...actionBase },
-    });
+    headerActions.push(callbackButton(
+      t('card.btn.get_write_link', undefined, locale),
+      'default',
+      { action: 'get_write_link', ...actionBase },
+    ));
   }
   // 「🗜️ 压缩」：只要该 CLI 有能接收 /compact 的输入通道就显示——**不再要求有上下文
   // 百分比**。此前条件是 hasContextPct，但只有 codex（native model_context_window）和
@@ -1136,12 +1066,7 @@ export function buildStreamingCard(
   // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
   if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'compact_session', ...actionBase },
-    });
+    headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
   }
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
   // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
@@ -1150,37 +1075,17 @@ export function buildStreamingCard(
   // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
   if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.stop', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'stop_turn', ...actionBase },
-    });
+    headerActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
   }
   if (adoptMode) {
     if (showTakeover) {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.takeover', undefined, locale) },
-        type: 'default' as const,
-        value: { action: 'takeover', ...actionBase },
-      });
+      headerActions.push(callbackButton(t('card.btn.takeover', undefined, locale), 'default', { action: 'takeover', ...actionBase }));
     }
     if (!hidden.has('close')) {
-      headerActions.push({
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
-        type: 'danger' as const,
-        value: { action: 'disconnect', ...actionBase },
-      });
+      headerActions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
     }
   } else if (!hidden.has('close')) {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-      type: 'danger' as const,
-      value: { action: 'close', ...actionBase },
-    });
+    headerActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
   if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
   const effortControl = !adoptMode && usage?.reasoningControl;
@@ -1212,12 +1117,11 @@ export function buildStreamingCard(
   if (writableTerminalUrl) {
     elements.push({
       tag: 'action',
-      actions: [{
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.open_writable_terminal', undefined, locale) },
-        type: 'primary',
-        multi_url: terminalMultiUrl(writableTerminalUrl),
-      }],
+      actions: [urlButton(
+        t('card.btn.open_writable_terminal', undefined, locale),
+        'primary',
+        terminalMultiUrl(writableTerminalUrl),
+      )],
     });
     elements.push({
       tag: 'note',
@@ -1236,12 +1140,7 @@ export function buildStreamingCard(
   // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
   // 以后再加远端 CLI 不会重复漏改。
   if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
-    const mkKey = (label: string, key: string) => ({
-      tag: 'button',
-      text: { tag: 'plain_text', content: label },
-      type: 'default' as const,
-      value: { action: 'term_action', ...actionBase, key },
-    });
+    const mkKey = (label: string, key: string) => (callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }));
     elements.push({
       tag: 'action',
       actions: [
@@ -1277,17 +1176,17 @@ export function buildStreamingCard(
     });
   }
 
-  const card = {
+  const card = wideCard({
     // Lark's ordinary message PATCH endpoint only updates cards whose original
     // and replacement payloads both opt into shared updates. Streaming cards
     // are group-visible mutable UI, so this is part of their wire contract.
-    config: { wide_screen_mode: true, update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
-      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
-    },
+    extraConfig: { update_multi: true },
+    header: cardHeader(
+      `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}`,
+      STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+    ),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -1356,26 +1255,15 @@ export function buildPrivateSnapshotCard(
   const actions: any[] = [];
   if (terminalUrl) {
     actions.push(
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-        type: 'primary',
-        multi_url: terminalMultiUrl(terminalUrl),
-      },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-        type: 'default',
-        value: { action: 'get_write_link', ...actionBase },
-      },
+      urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)),
+      callbackButton(
+        t('card.btn.get_write_link', undefined, locale),
+        'default',
+        { action: 'get_write_link', ...actionBase },
+      ),
     );
   }
-  actions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-    type: 'danger',
-    value: { action: 'close', ...actionBase },
-  });
+  actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   elements.push({ tag: 'action', actions });
   elements.push({
     tag: 'note',
@@ -1385,14 +1273,13 @@ export function buildPrivateSnapshotCard(
     }],
   });
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
-      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
-    },
+  const card = wideCard({
+    header: cardHeader(
+      `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}`,
+      STREAM_STATUS_TEMPLATE_MAP[displayStatus],
+    ),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -1475,12 +1362,8 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
       value: p.path,
     }));
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
-    },
+  const card = wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.repo.title', undefined, locale)),
     elements: [
       // Current working directory + 「直接开启会话」on the same row: the skip
       // button means "use this directory as-is, don't pick a repo", so it pairs
@@ -1500,13 +1383,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             width: 'auto',
             vertical_align: 'center',
             elements: [
-              {
-                tag: 'div',
-                text: {
-                  tag: 'lark_md',
-                  content: `${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`,
-                },
-              },
+              larkMdDiv(`${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`),
             ],
           },
           {
@@ -1514,12 +1391,11 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
             width: 'auto',
             vertical_align: 'center',
             elements: [
-              {
-                tag: 'button',
-                text: { tag: 'plain_text', content: t('card.btn.skip_repo', undefined, locale) },
-                type: 'primary',
-                value: { action: 'skip_repo', root_id: rootMessageId ?? '' },
-              },
+              callbackButton(
+                t('card.btn.skip_repo', undefined, locale),
+                'primary',
+                { action: 'skip_repo', root_id: rootMessageId ?? '' },
+              ),
             ],
           },
         ],
@@ -1560,16 +1436,15 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
           columns: [
             {
               tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-              elements: [{ tag: 'div', text: { tag: 'lark_md', content: t('card.repo.worktree_now_multi', undefined, locale) } }],
+              elements: [larkMdDiv(t('card.repo.worktree_now_multi', undefined, locale))],
             },
             {
               tag: 'column', width: 'auto', vertical_align: 'center',
-              elements: [{
-                tag: 'button',
-                text: { tag: 'plain_text', content: t('card.btn.worktree_to_single', undefined, locale) },
-                type: 'default',
-                value: { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
-              }],
+              elements: [callbackButton(
+                t('card.btn.worktree_to_single', undefined, locale),
+                'default',
+                { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
+              )],
             },
           ],
         }] : []),
@@ -1589,12 +1464,11 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
           },
           ...(worktreeOptions.length > 1 ? [{
             tag: 'column', width: 'auto', vertical_align: 'center',
-            elements: [{
-              tag: 'button',
-              text: { tag: 'plain_text', content: t('card.btn.worktree_to_multi', undefined, locale) },
-              type: 'default',
-              value: { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
-            }],
+            elements: [callbackButton(
+              t('card.btn.worktree_to_multi', undefined, locale),
+              'default',
+              { action: 'worktree_toggle_mode', root_id: rootMessageId ?? '' },
+            )],
           }] : []),
         ],
       }]) : []),
@@ -1671,7 +1545,7 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
         ],
       },
     ],
-  };
+  });
 
   return JSON.stringify(card);
 }
@@ -1797,10 +1671,7 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const card = {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'default' },
-    header: {
-      template: 'orange',
-      title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) },
-    },
+    header: cardHeaderTemplateFirst('orange', t('card.grant.title', undefined, locale)),
     body: {
       direction: 'vertical',
       padding: '12px 12px 20px 12px',
@@ -1914,10 +1785,7 @@ export function buildGrantRequesterNoticeCard(
     if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
     if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
   }
-  const card = {
-    config: { wide_screen_mode: true },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
-  };
+  const card = wideCard({ elements: [larkMdDiv(content)] });
   return JSON.stringify(card);
 }
 
@@ -1927,10 +1795,7 @@ export function buildGrantRequesterNoticeCard(
 export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale, autoReapply = false): string {
   const at = `<at id=${targetOpenId}></at>`;
   const content = t(autoReapply ? 'quota.exhausted_notify_reapply' : 'quota.exhausted_notify', { at, limit }, locale);
-  const card = {
-    config: { wide_screen_mode: true },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
-  };
+  const card = wideCard({ elements: [larkMdDiv(content)] });
   return JSON.stringify(card);
 }
 
@@ -1947,27 +1812,14 @@ export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, loc
  */
 export function buildAdoptBlockedCard(rootId: string, sessionId: string, cliId: CliId | undefined, locale?: Locale): string {
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.adopt_blocked.title', undefined, locale) },
-      template: 'orange',
-    },
-    elements: [
-      { tag: 'markdown', content: t('card.adopt_blocked.body', undefined, locale) },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-            type: 'danger',
-            value: { action: 'close', ...actionBase },
-          },
-        ],
-      },
+  const card = simpleCard({
+    title: t('card.adopt_blocked.title', undefined, locale),
+    template: 'orange',
+    markdown: t('card.adopt_blocked.body', undefined, locale),
+    buttons: [
+      callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }),
     ],
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -2093,26 +1945,14 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
     });
   }
   if (o.terminalUrl) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-      type: 'default',
-      multi_url: terminalMultiUrl(o.terminalUrl),
-    });
+    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
   }
   if (actions.length > 0) elements.push({ tag: 'action', actions });
 
-  return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: {
-      title: {
-        tag: 'plain_text',
-        content: t(titleKey, { cliName: plainTitle(o.cliName) }, locale),
-      },
-      template: 'red',
-    },
+  return JSON.stringify(wideCard({
+    header: cardHeader(t(titleKey, { cliName: plainTitle(o.cliName) }, locale), 'red'),
     elements,
-  });
+  }));
 }
 
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
@@ -2168,7 +2008,7 @@ export function buildGrantResultCard(
   const card = {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'default' },
-    header: { template: kind === 'deny' ? 'grey' : 'green', title: { tag: 'plain_text', content: t('card.grant.title', undefined, locale) } },
+    header: cardHeaderTemplateFirst(kind === 'deny' ? 'grey' : 'green', t('card.grant.title', undefined, locale)),
     body: { elements: [{ tag: 'markdown', content }] },
   };
   return JSON.stringify(card);
@@ -2236,10 +2076,7 @@ export function buildTuiPromptCard(
   }
 
   const elements: any[] = [
-    {
-      tag: 'div',
-      text: { tag: 'lark_md', content: optionLines },
-    },
+    larkMdDiv(optionLines),
     { tag: 'hr' },
     { tag: 'action', actions: buttons },
   ];
@@ -2274,14 +2111,10 @@ export function buildTuiPromptCard(
     });
   }
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: escapeMd(description) },
-      template: 'orange',
-    },
+  const card = wideCard({
+    header: cardHeader(escapeMd(description), 'orange'),
     elements,
-  };
+  });
   return JSON.stringify(card);
 }
 
@@ -2289,19 +2122,11 @@ export function buildTuiPromptCard(
  * Build a "processing" TUI prompt card — shown immediately when user clicks a button.
  */
 export function buildTuiPromptProcessingCard(selectedText: string, locale?: Locale): string {
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.executing', undefined, locale) },
-      template: 'blue',
-    },
-    elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: `${t('card.body.choose_label', undefined, locale)} **${escapeMd(selectedText)}**` },
-      },
-    ],
-  };
+  const card = simpleCard({
+    title: t('card.status.executing', undefined, locale),
+    template: 'blue',
+    div: `${t('card.body.choose_label', undefined, locale)} **${escapeMd(selectedText)}**`,
+  });
   return JSON.stringify(card);
 }
 
@@ -2309,37 +2134,21 @@ export function buildTuiPromptProcessingCard(selectedText: string, locale?: Loca
  * Build a resolved TUI prompt card — shows which option was selected.
  */
 export function buildTuiPromptResolvedCard(selectedText: string, locale?: Locale): string {
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.selected', undefined, locale) },
-      template: 'green',
-    },
-    elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: `**${escapeMd(selectedText)}**` },
-      },
-    ],
-  };
+  const card = simpleCard({
+    title: t('card.status.selected', undefined, locale),
+    template: 'green',
+    div: `**${escapeMd(selectedText)}**`,
+  });
   return JSON.stringify(card);
 }
 
 /** Build a terminal failure state when worker/backend input was not confirmed. */
 export function buildTuiPromptFailedCard(message: string, locale?: Locale): string {
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.status.failed', undefined, locale) },
-      template: 'red',
-    },
-    elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: escapeMd(message) },
-      },
-    ],
-  };
+  const card = simpleCard({
+    title: t('card.status.failed', undefined, locale),
+    template: 'red',
+    div: escapeMd(message),
+  });
   return JSON.stringify(card);
 }
 
@@ -2734,10 +2543,7 @@ function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p
   return {
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.title_p2p' : 'card.relay.title', undefined, locale) },
-      template: 'blue',
-    },
+    header: cardHeader(t(targetChatType === 'p2p' ? 'card.relay.title_p2p' : 'card.relay.title', undefined, locale), 'blue'),
     body: { direction: 'vertical', elements },
   };
 }
@@ -2964,10 +2770,7 @@ function wrapQuoteCard(elements: any[], locale?: Locale): any {
   return {
     schema: '2.0',
     config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: t('card.quote.title', undefined, locale) },
-      template: 'blue',
-    },
+    header: cardHeader(t('card.quote.title', undefined, locale), 'blue'),
     body: { direction: 'vertical', elements },
   };
 }
@@ -3305,10 +3108,7 @@ function wrapAdoptCard(elements: any[], locale?: Locale): any {
   return {
     schema: '2.0',
     config: { update_multi: true, width_mode: 'fill' },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },
-    },
+    header: cardHeaderTemplateFirst('blue', t('card.adopt.title', undefined, locale)),
     body: { direction: 'vertical', elements },
   };
 }
@@ -3341,17 +3141,10 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
     };
   });
 
-  const card = {
-    config: { wide_screen_mode: true },
-    header: {
-      template: 'blue',
-      title: { tag: 'plain_text', content: t('card.codex_app_thread.title', undefined, locale) },
-    },
+  const card = wideCard({
+    header: cardHeaderTemplateFirst('blue', t('card.codex_app_thread.title', undefined, locale)),
     elements: [
-      {
-        tag: 'div',
-        text: { tag: 'lark_md', content: t('card.codex_app_thread.subtitle', undefined, locale) },
-      },
+      larkMdDiv(t('card.codex_app_thread.subtitle', undefined, locale)),
       {
         tag: 'action',
         actions: [
@@ -3364,6 +3157,6 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
         ],
       },
     ],
-  };
+  });
   return JSON.stringify(card);
 }
