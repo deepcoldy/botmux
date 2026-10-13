@@ -70,8 +70,16 @@ export interface MessageListenerData {
   contentPolicy?: {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
+    resolveDocumentTitles?: boolean;
   };
   replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
+}
+
+export function mergeListenerContentPolicy(
+  current: MessageListenerData['contentPolicy'],
+  patch: NonNullable<MessageListenerData['contentPolicy']>,
+): NonNullable<MessageListenerData['contentPolicy']> {
+  return { ...(current ?? {}), ...patch };
 }
 
 export interface MessageListenerPreviewItem {

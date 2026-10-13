@@ -1259,6 +1259,90 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('retries an active canonical route on a replica that does not own that Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const readPrimarySession = vi.fn(async () => ({
+      sessionId: 'session-owned-elsewhere',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-root',
+      scope: 'thread' as const,
+      title: 'Remote owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { readPrimarySession },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-followup',
+      rootId: 'msg-primary-root',
+      threadId: 'omt_primary',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-followup'))
+      .rejects.toThrow(/active canonical Session is owned by another replica/);
+    expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root::${MY_APP_ID}`);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
+    setupBotState({ allowedUsers: [] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const readPrimarySession = vi.fn(async () => ({
+      sessionId: 'session-owned-elsewhere',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-root-bot',
+      scope: 'thread' as const,
+      title: 'Remote bot owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { readPrimarySession },
+    );
+    const data = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-bot-followup',
+      rootId: 'msg-primary-root-bot',
+      threadId: 'omt_primary_bot',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-bot-followup'))
+      .rejects.toThrow(/active canonical Session is owned by another replica/);
+    expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root-bot::${MY_APP_ID}`);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it.each(['never', 'ambient'] as const)(
     'dispatches a %s topic seed immediately when the durable primary wait is disabled',
     async mentionMode => {
@@ -8930,6 +9014,30 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 
+  it('runs a completion continuation only after returning the empty ACK', async () => {
+    const afterAck = vi.fn();
+    handlers.handleCardAction.mockResolvedValue({
+      deferredCard: { type: 'raw', data: { type: 'proposal-accepted' } },
+      afterAck,
+    });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: {
+        action: 'completion_proposal_decide',
+        proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+        nonce: 'n'.repeat(64),
+        decision: 'accept',
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_completion_proposal' },
+    });
+
+    expect(result).toEqual({});
+    expect(afterAck).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(afterAck).toHaveBeenCalledTimes(1);
+  });
+
   it('surfaces deferred patch failure as an empty ACK without returning an invalid card response', async () => {
     mockUpdateMessage.mockRejectedValueOnce(new Error('HTTP 400 invalid card'));
     handlers.handleCardAction.mockResolvedValue({ deferredCard: { type: 'raw', data: { type: 'invalid-negative-followup' } } });
@@ -9333,6 +9441,31 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     release1();
     release2();
     await Promise.all([firstP, secondP]);
+  });
+
+  it('does not collapse accept and dismiss for one completion proposal without event_id', async () => {
+    let release1!: () => void;
+    let release2!: () => void;
+    handlers.handleCardAction
+      .mockReturnValueOnce(new Promise(resolve => { release1 = () => resolve({ type: 'accepted' }); }) as any)
+      .mockReturnValueOnce(new Promise(resolve => { release2 = () => resolve({ type: 'dismissed' }); }) as any);
+    const event = (decision: 'accept' | 'dismiss') => ({
+      action: { value: {
+        action: 'completion_proposal_decide',
+        proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+        nonce: 'n'.repeat(64),
+        decision,
+      } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_completion_proposal' },
+    });
+
+    const accept = capturedHandlers['card.action.trigger'](event('accept'));
+    const dismiss = capturedHandlers['card.action.trigger'](event('dismiss'));
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+    release1();
+    release2();
+    await Promise.all([accept, dismiss]);
   });
 
   // Settings counterpart guard — dash_settings_toggle on different fields.

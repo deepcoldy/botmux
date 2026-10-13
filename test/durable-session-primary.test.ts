@@ -228,6 +228,54 @@ describe('durable primary Session admission', () => {
     await facade.stop();
   });
 
+  it('refuses to replace an active canonical Session with a different session id', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'primary-owner-fence' });
+    await admitDurableLarkSession({ facade, message: message('om_1'), session: session() });
+
+    await expect(admitDurableLarkSession({
+      facade,
+      message: message('om_2'),
+      session: session({ sessionId: 'session-2' }),
+    })).rejects.toThrow(/active canonical Session/);
+
+    expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!)).toMatchObject({
+      session: { sessionId: 'session-1', status: 'active' },
+      admissions: [{ messageId: 'om_1' }],
+      controls: [],
+    });
+    await facade.stop();
+  });
+
+  it('starts a clean canonical history when a closed Session is replaced at the same anchor', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'primary-closed-successor' });
+    await admitDurableLarkSession({
+      facade,
+      message: message('om_old'),
+      session: session({ status: 'closed', closedAt: '2026-10-05T00:02:00.000Z' }),
+    });
+    await commitDurableLarkSessionControl({
+      facade,
+      control: control('card.action.trigger:cli_test:evt_close_old', 'close'),
+      session: session({ status: 'closed', closedAt: '2026-10-05T00:02:00.000Z' }),
+      result: { status: 'closed' },
+    });
+
+    await expect(admitDurableLarkSession({
+      facade,
+      message: message('om_new'),
+      session: session({ sessionId: 'session-2' }),
+    })).resolves.toMatchObject({ kind: 'committed' });
+
+    expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!)).toMatchObject({
+      session: { sessionId: 'session-2', status: 'active' },
+      admissions: [{ messageId: 'om_new' }],
+      controls: [],
+    });
+    await facade.stop();
+  });
+
   it('bounds admission history while retaining the newest 64 turns', async () => {
     const { store, records } = fakeStore();
     const facade = createDurableSessionFacade({ store, ownerId: 'primary-bounded-boot' });

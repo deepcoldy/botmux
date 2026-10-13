@@ -15,12 +15,64 @@ import { bindGroupContextDelivery, confirmGroupContextDelivery, getDeliveredGrou
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import { DEFAULT_BRAND_LABEL } from '../src/im/lark/md-card.js';
 import MarkdownIt from 'markdown-it';
+import { completionProposalCardDispatchUuid, createCompletionProposalStore } from '../src/core/completion-proposal.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' };
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 
 describe('real CLI send into a running reply card', () => {
+  it('preserves the proposal dispatch identity and the original standalone terminal card together', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-proposal-terminal-'));
+    const dataDir = join(root, 'data');
+    const turnId = 'om_proposal_turn_12345678';
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId, turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'codex',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId: 'codex', backendType: 'tmux', workingDir: root,
+        chatId: 'oc_test', rootMessageId: 'om_proposal_root_12345678', scope: 'thread', chatType: 'group',
+        replyTargets: { [turnId]: { updatedAt: new Date().toISOString(), senderOpenId: 'ou_requester_12345678',
+          participants: [{ openId: 'ou_requester_12345678', isBot: false }] } },
+        turnReplyContexts: { [turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_proposal_root_12345678' },
+          replyTargetSenderOpenId: 'ou_requester_12345678', replyTargetSenderIsBot: false,
+        } },
+      } });
+      const proposalFile = join(root, 'proposal.json');
+      writeFileSync(proposalFile, JSON.stringify({
+        title: '继续检查', body: '可以检查下一项。', acceptLabel: '继续', dismissLabel: '跳过',
+      }));
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final',
+        '--completion-proposal-file', proposalFile, '配置：\n\n```diff\n+ ready\n```\n\n后续说明'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: turnId, BOTMUX_LARK_APP_ID: key.larkAppId },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(requests).toHaveLength(1);
+      const sent = requests[0].body;
+      const proposalId = /"proposal_id":"(cp_[a-f0-9]+)"/.exec(sent.content)?.[1];
+      expect(proposalId, String(result.stderr)).toBeDefined();
+      const record = createCompletionProposalStore(dataDir).get(proposalId!);
+      expect(record?.cardMessageId).toBe('om_separate_message');
+      expect(sent.uuid).toBe(completionProposalCardDispatchUuid(record!));
+      const marker = JSON.parse(readFileSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8').trim());
+      // Transport adds callback ownership stamps after the authored snapshot.
+      const sentCard = JSON.parse(sent.content, (key, value) => key === '__bm_cb' ? undefined : value);
+      expect(JSON.parse(marker.terminalCarrierCard)).toEqual(sentCard);
+      expect(marker.terminalCarrier).toBe('standard_reply_card');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 35_000);
+
   it.each<{ cliId: string; configuredCliId: string; frozenCliId?: string; mode?: 'legacy' | 'unified'; layout?: 'result' }>([
     { cliId: 'minimax', configuredCliId: 'minimax' },
     { cliId: 'codex', configuredCliId: 'codex' },

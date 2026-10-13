@@ -25,6 +25,7 @@ import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
+import { FINAL_CARD_PROPOSAL_ELEMENT_ID } from './final-card-sections.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -62,6 +63,7 @@ export function buildTurnTerminalReceiptCard(
 const TURN_TERMINAL_RECEIPT_ELEMENT_ID = 'botmux_turn_terminal_receipt';
 const AUTHORED_MARKDOWN_PROTECTED_ELEMENT_IDS = new Set([
   REPLY_CARD_FOOTER_ELEMENT_ID,
+  FINAL_CARD_PROPOSAL_ELEMENT_ID,
   'botmux_feedback',
   'botmux_oncall_group',
   TURN_TERMINAL_RECEIPT_ELEMENT_ID,

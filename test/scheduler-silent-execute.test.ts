@@ -247,7 +247,11 @@ beforeEach(() => {
   sessionSeq = 0;
   forkWorkerMock.mockClear();
   closeSessionMock.mockClear();
-  sessionStoreCloseMock.mockClear();
+  sessionStoreCloseMock.mockReset();
+  sessionStoreCloseMock.mockImplementation((id: string) => {
+    const session = store.get(id);
+    if (session) session.status = 'closed';
+  });
   sendWorkerInputMock.mockClear();
   sendWorkerInputMock.mockReturnValue(true);
   sendMessageMock.mockClear();
@@ -1056,6 +1060,39 @@ describe('executeScheduledTask — live-session injection', () => {
     };
   }
 
+  it.each(['live', 'cold'] as const)('preserves retained routing and prompts when identity preparation rejects (%s)', async mode => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    const anchor = 'schedule-task:task0001';
+    existing.scope = 'chat';
+    existing.session.rootMessageId = anchor;
+    existing.session.cliId = 'claude-code';
+    existing.lastUserPrompt = 'previous prompt';
+    existing.session.lastCliInput = 'previous input';
+    existing.session.deferredScheduleRun = {
+      taskId: 'task0001', turnId: 'previous-turn', routingAnchor: anchor,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    if (mode === 'cold') existing.worker = null;
+    active.set(sessionKey(anchor, APP), existing);
+    const before = structuredClone(existing.session);
+    const failure = new Error('schedule authority state is revoked; refusing identity');
+    await expect(executeScheduledTask(
+      baseTask({ executionPosition: 'task', silent: true }),
+      active, refreshCliVersion, undefined, {
+        prepareTurnIdentity: async () => { throw failure; },
+      },
+    )).rejects.toBe(failure);
+    expect(active.get(sessionKey(anchor, APP))).toBe(existing);
+    expect(existing.session).toEqual(before);
+    expect(store.get(existing.session.sessionId)).toEqual(before);
+    expect(existing.lastMessageAt).toBe(0);
+    expect(existing.lastUserPrompt).toBe('previous prompt');
+    expect(sessionStoreCloseMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
   it('idle session: injects with the exact scheduled turn armed, no banner', async () => {
     const active = new Map<string, DaemonSession>();
     const existing = liveSession('idle');
@@ -1325,6 +1362,47 @@ describe('executeScheduledTask — live-session injection', () => {
 });
 
 describe('executeScheduledTask — registration rejection', () => {
+  it.each([false, true])('closes an unregistered candidate when identity preparation rejects (silent=%s)', async silent => {
+    const active = new Map<string, DaemonSession>();
+    const failure = new Error('schedule authority state is paused; refusing identity');
+    const task = baseTask({ rootMessageId: ROOT, scope: 'thread', silent });
+    await expect(executeScheduledTask(task, active, refreshCliVersion, undefined, {
+      prepareTurnIdentity: async ds => {
+        expect([...active.values()]).not.toContain(ds);
+        throw failure;
+      },
+    })).rejects.toBe(failure);
+
+    expect(active.size).toBe(0);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-1');
+    expect(store.get('sess-1')?.status).toBe('closed');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+
+    // A later authorized fire must not be blocked by initialStartPending on
+    // the rejected candidate's old active registration.
+    await executeScheduledTask(task, active, refreshCliVersion);
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+    expect([...active.values()][0].session.sessionId).toBe('sess-2');
+  });
+
+  it('preserves a concurrent registration winner when candidate identity preparation rejects', async () => {
+    const active = new Map<string, DaemonSession>();
+    const winner = { session: { sessionId: 'sess-winner', status: 'active' } } as DaemonSession;
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined, {
+        prepareTurnIdentity: async () => {
+          active.set(sessionKey(ROOT, APP), winner);
+          throw new Error('revoked');
+        },
+      },
+    )).rejects.toThrow('revoked');
+    expect(active.get(sessionKey(ROOT, APP))).toBe(winner);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-1');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
   it('throws after closing the rejected candidate instead of reporting a false success', async () => {
     const active = new Map<string, DaemonSession>();
     const winner: DaemonSession = {

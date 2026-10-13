@@ -329,6 +329,8 @@ Configure it per-group in the **Dashboard "Roles → Message Listener"** tab (wi
 | `senderPolicy.includeSenderOpenIds` / `excludeSenderOpenIds` | Exact whitelist / blacklist by `open_id` |
 | `senderPolicy.excludeSelf` | Default `true`; always excludes the bot's own messages (prevents self-triggering) |
 | `messagePolicy.includeMsgTypes` | Message types to listen to; defaults to text + rich text (`post`) |
+| `contentPolicy.includeKeywords` / `matchMode` | Optional keyword filter; `any` (default) needs one match and `all` needs every match. Both use case-insensitive substring matching |
+| `contentPolicy.resolveDocumentTitles` | Defaults to `false`. When a `text` / `post` message misses locally, queries the supported Lark document's **title** as the current bot application before matching again; it never reads the body or falls back to a user identity |
 
 ```json
 {
@@ -342,6 +344,10 @@ Configure it per-group in the **Dashboard "Roles → Message Listener"** tab (wi
   }
 }
 ```
+
+A document link is not a separate Lark message type: it normally appears in `text` content or a `post` rich-text link. Keep `text` / `post` selected in the Dashboard and enable `resolveDocumentTitles` when a bare document URL should match its title. This release accepts only strictly validated HTTPS `docx` / `wiki` links; unsupported links make no metadata request.
+
+Before enabling it, make sure the bot application has published the minimum read scopes: `drive:drive.metadata:readonly` (document title metadata) and `wiki:node:read` (Wiki-node resolution; `wiki:wiki:readonly` also works). If a scope or document access is missing, matching safely falls back to the original message text.
 
 Conventions and limits (V1):
 

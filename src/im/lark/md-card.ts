@@ -34,8 +34,11 @@ import {
   replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
+import { buildCompletionProposalElement } from './completion-proposal-card.js';
+import { composeFinalCardSections } from './final-card-sections.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
+import type { CompletionProposalRecord } from '../../core/completion-proposal.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import {
@@ -1567,6 +1570,7 @@ export function buildMarkdownCard(
 export function buildCanonicalFinalReplyCard(opts: {
   markdown: string;
   feedback?: { policy: FeedbackPolicy };
+  completionProposal?: CompletionProposalRecord;
   recipientOpenId?: string;
   brand?: string;
   locale?: Locale;
@@ -1579,7 +1583,6 @@ export function buildCanonicalFinalReplyCard(opts: {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
     : [];
-  if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
   const footer = buildReplyCardFooter({
     brand: opts.brand,
     recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
@@ -1590,6 +1593,12 @@ export function buildCanonicalFinalReplyCard(opts: {
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
   const card = createReplyCard(elements);
+  composeFinalCardSections(card, {
+    ...(opts.completionProposal
+      ? { completionProposal: buildCompletionProposalElement(opts.completionProposal) }
+      : {}),
+    ...(opts.feedback ? { feedback: buildFeedbackElement(opts.feedback.policy) } : {}),
+  });
   fitBuiltCard(card, 'final_reply');
   return JSON.stringify(card);
 }

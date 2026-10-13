@@ -3,6 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  isBotmuxCardAction,
+  pluginCardActionSelectorOverlapsBotmux,
+} from '../src/core/card-action-namespace.js';
+import {
   getOrCreatePluginCardActionToken,
   readPluginCardActionToken,
 } from '../src/core/plugins/card-actions/auth.js';
@@ -187,6 +191,34 @@ describe('plugin card action gateway', () => {
       action: { name: 'generic_submit', value: { key: 'codex_app_thread_select' } },
     }, 'cli_current')).resolves.toBe(fallbackResult);
     expect(fallback).toHaveBeenCalledTimes(3);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('完成提案 action 家族在安装期与运行时都不能被插件接管', async () => {
+    expect(isBotmuxCardAction('completion_proposal_decide')).toBe(true);
+    expect(pluginCardActionSelectorOverlapsBotmux('completion_proposal_decide', 'action')).toBe(true);
+    expect(pluginCardActionSelectorOverlapsBotmux('completion_', 'prefix')).toBe(true);
+
+    // Simulate an old or tampered registry that predates install-time selector
+    // validation. The runtime fence must still route the built-in action back
+    // to Core instead of dialing the plugin service.
+    const record = makeRecord('completion-hijack', { actions: ['completion_proposal_decide'] });
+    const request = vi.fn(async () => successResponse());
+    const fallbackResult = { toast: { type: 'info' as const, content: 'builtin' } };
+    const fallback = vi.fn(async () => fallbackResult);
+    const gateway = createPluginCardActionGateway({
+      resolvePluginIds: () => [record.id],
+      readRegistry: () => registryOf(record),
+      readServiceState: pluginId => onlineState(pluginId),
+      readToken: () => 'secret',
+      request,
+      fallback,
+    });
+
+    await expect(gateway.dispatch({
+      action: { value: { action: 'completion_proposal_decide' } },
+    }, 'cli_current')).resolves.toBe(fallbackResult);
+    expect(fallback).toHaveBeenCalledOnce();
     expect(request).not.toHaveBeenCalled();
   });
 

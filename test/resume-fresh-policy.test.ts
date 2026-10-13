@@ -156,7 +156,7 @@ describe('resume copy distinction (source lock)', () => {
 
   it('closed-session-card passes the fresh flag into the card builder', () => {
     const source = readFileSync(resolvePath('src/core/closed-session-card.ts'), 'utf8');
-    expect(source).toContain('resumeStartsFresh({ cliId: closedCliId, cliSessionId: ds.session.cliSessionId })');
+    expect(source).toContain('resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId })');
   });
 
   it('card-builder renders the fresh note instead of the generic resume note', () => {

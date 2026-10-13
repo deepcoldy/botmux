@@ -304,7 +304,10 @@ describe('resumeSession', () => {
       const result = await resumeSession(closed.sessionId, map);
 
       expect(result.ok).toBe(true);
-      if (result.ok) expect(result.recoveryPending).toBe(true);
+      if (result.ok) {
+        expect(result.recoveryPending).toBe(true);
+        expect(result.ds.suppressRecoveryCard).toBe(true);
+      }
       expect(sessionStore.getSession(closed.sessionId)?.status).toBe('active');
       expect(map.size).toBe(1);
       expect(forkWorker).toHaveBeenCalledTimes(1);

@@ -15,7 +15,8 @@
  * Run:  npx vitest run --project unit test/turn-cli-identity.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -389,10 +390,11 @@ describe('target daemon consumes signed message authority', () => {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
+    const { trustedCallerForScheduledTask } = await import('../src/core/scheduled-turn-provenance.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
-      'delegatedScheduleCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
+      'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
       'refreshTurnCliIdentity'].map(name => {
       const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
       if (!fn) throw new Error('Missing production handler');
@@ -426,7 +428,11 @@ describe('target daemon consumes signed message authority', () => {
         const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
         return match?.[1] ?? null;
       },
-      scheduleAuthorityStore: undefined,
+      trustedCallerForScheduledTask,
+      scheduleStore: { effectiveScheduleChatIds: (task: any) => task.chatIds ?? [task.chatId] },
+      getDashboardAdminOpenIds: () => [ALICE],
+      canOperate: vi.fn((_appId: string, _chatId: string, openId?: string) => openId === ALICE),
+      scheduleAuthorityStore: undefined as any,
     };
     const handlers = new Function('scope', 'with (scope) { ' + code
       + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity }; }')(scopeValues);
@@ -437,8 +443,161 @@ describe('target daemon consumes signed message authority', () => {
         ? handlers.prepareTurnCliIdentity(ds, turnId)
         : handlers.refreshTurnCliIdentity(ds, turnId),
       resolveTargetAppOpenId,
+      installSchedulerCallback: (scope: Record<string, unknown>) => {
+        let registration: import('typescript').CallExpression | undefined;
+        const find = (node: import('typescript').Node) => {
+          if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+            && node.expression.expression.getText(source) === 'scheduler'
+            && node.expression.name.text === 'setExecuteCallback') registration = node;
+          ts.forEachChild(node, find);
+        };
+        find(source);
+        if (!registration) throw new Error('Missing production scheduler callback');
+        const code = ts.transpileModule(registration.getText(source), {
+          compilerOptions: { target: ts.ScriptTarget.ES2022 },
+        }).outputText;
+        new Function('scope', 'with (scope) { ' + code + ' }')({
+          ...scopeValues, prepareTurnCliIdentity: handlers.prepareTurnCliIdentity, ...scope,
+        });
+      },
     };
   }
+  function directSchedule(h: Awaited<ReturnType<typeof targetHarness>>, patch: Record<string, unknown> = {}) {
+    const task = {
+      id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP, creatorLarkAppId: APP,
+      ownerOpenId: ALICE, ownerUnionId: 'on_alice',
+      parsed: { kind: 'interval', minutes: 30 }, ...patch,
+    };
+    const authority = { kind: 'direct', state: 'active', task };
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => authority };
+    return { task, authority };
+  }
+  const firstScheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  const nextScheduledTurn = 'schedule:a1b2c3d4:23456789-1234-1234-1234-123456789abc';
+
+  it.each(['bytedcli', 'lark-cli'] as const)('publishes creator credentials and executes the %s wrapper on every scheduled turn', async tool => {
+    const h = await targetHarness();
+    directSchedule(h);
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: [tool] }) });
+    const home = join(dir, 'alice-home');
+    mkdirSync(home);
+    larkHomes.set(ALICE, home);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
+    const { publishActiveTurn, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
+    const wrapper = join(dir, `${tool}-wrapper`);
+    writeFileSync(wrapper, renderIdentityWrapper(tool, '/usr/bin/printenv'));
+    for (const turnId of [firstScheduledTurn, nextScheduledTurn]) {
+      await h.run(turnId);
+      publishActiveTurn(dir, SESSION, turnId);
+      const result = spawnSync('/bin/sh', [wrapper, tool === 'bytedcli' ? 'BYTEDCLI_USER_CLOUD_JWT' : 'HOME'], {
+        env: { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, encoding: 'utf8',
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toBe(tool === 'bytedcli' ? 'scheduled-alice' : home);
+    }
+    // Another message may replace the identity while a scheduled turn still
+    // runs. The real wrapper must refuse rather than act as that message's user.
+    bytedcliJwts.set(BOB, { cloudJwt: 'bob-cloud' });
+    await publish(botConfig({ enabled: true, tools: [tool] }), BOB, 'om_bob');
+    const stale = spawnSync('/bin/sh', [wrapper], {
+      env: { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, encoding: 'utf8',
+    });
+    expect(stale.status).toBe(77);
+  });
+
+  it('the production scheduler prepares ordinary tasks before dispatch', async () => {
+    const h = await targetHarness();
+    const { task } = directSchedule(h);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
+    let execute: (task: any, context: any) => Promise<void>;
+    let dispatches = 0;
+    h.installSchedulerCallback({
+      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
+        await run(); return 'executed';
+      },
+      executeScheduledTaskForTargets: async (task: any, _chats: any, run: (task: any) => Promise<void>) => {
+        await run(task); return [];
+      },
+      withBotTurnAdmission: (_app: any, run: () => Promise<void>) => run(),
+      activeSessions: new Map(), refreshCliVersion: vi.fn(),
+      ScheduleTargetExecutionError: class extends Error {},
+      resolveScheduleRunLogErrorDetails: (_precondition: any, error: Error) => ({ error: error.message }),
+      executeScheduledTask: async (_task: any, _active: any, _refresh: any, _prompt: any, runtime: any) => {
+        const turnId = dispatches++ === 0 ? firstScheduledTurn : nextScheduledTurn;
+        await runtime?.prepareTurnIdentity(h.ds, turnId);
+        const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+        expect(env).toContain('scheduled-alice');
+        expect(env).toContain(turnId);
+      },
+      appendScheduleRunLog: vi.fn(),
+    });
+    for (let i = 0; i < 2; i++) await execute!(task, { runId: 'test-run', trigger: 'scheduler', startedAt: new Date().toISOString() });
+    expect(dispatches).toBe(2);
+  });
+
+  it.each([
+    { ownerOpenId: undefined }, { ownerUnionId: undefined },
+    { creatorLarkAppId: 'cli_other' }, { ownerOpenId: BOB },
+  ])('clears previous credentials when the scheduled creator is untrusted: %o', async patch => {
+    const h = await targetHarness();
+    directSchedule(h, patch);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'old-human' });
+    bytedcliJwts.set(BOB, { cloudJwt: 'unauthorized-human' });
+    await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), ALICE, 'om_old');
+    await h.run(firstScheduledTurn);
+    const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(env).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(env).toContain(firstScheduledTurn);
+    expect(env).not.toContain('old-human');
+    expect(env).not.toContain('unauthorized-human');
+  });
+
+  it('publishes a denial when the scheduled creator has not authorized the tool', async () => {
+    const h = await targetHarness();
+    directSchedule(h);
+    await h.run(firstScheduledTurn);
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8'))
+      .toContain("BOTMUX_IDENTITY_MODE='denied'");
+  });
+
+  it('honors open-mode schedule creators without requiring dashboard admin membership', async () => {
+    const h = await targetHarness();
+    directSchedule(h);
+    h.scopeValues.getDashboardAdminOpenIds = () => [];
+    h.scopeValues.canOperate.mockReturnValue(true);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'open-mode-alice' });
+    await h.run(firstScheduledTurn);
+    expect(h.scopeValues.canOperate).toHaveBeenCalledWith(APP, 'oc_chat', ALICE, 'on_alice');
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('open-mode-alice');
+  });
+
+  it('prepares restored completed one-shot turns without allowing paused tasks', async () => {
+    const h = await targetHarness();
+    const { authority } = directSchedule(h, {
+      parsed: { kind: 'once', timestamp: Date.now() }, disabledReason: 'once_completed',
+    });
+    authority.state = 'completed';
+    bytedcliJwts.set(ALICE, { cloudJwt: 'restored-alice' });
+    await h.run(firstScheduledTurn);
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('restored-alice');
+    authority.state = 'paused';
+    await expect(h.run(nextScheduledTurn)).rejects.toThrow('refusing identity');
+  });
+
+  it('rejects missing authority and wrong target chat before publishing credentials', async () => {
+    const h = await targetHarness();
+    await expect(h.run(firstScheduledTurn)).rejects.toThrow('authority record missing');
+    directSchedule(h, { chatId: 'oc_other' });
+    await expect(h.run(firstScheduledTurn)).rejects.toThrow('target does not match');
+  });
+
+  it('keeps disabled trigger-user authentication inert for scheduled turns', async () => {
+    const h = await targetHarness();
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: false }) });
+    await h.run(firstScheduledTurn);
+    expect(existsSync(sessionIdentityPath(dir, SESSION, 'bytedcli'))).toBe(false);
+  });
   it.each(['live', 'restored'])('a proven human turn does not depend on the delegation store (%s)', async mode => {
     const h = await targetHarness();
     writeFileSync(join(dir, 'dispatch-user-delegations.json'), 'corrupt-json');

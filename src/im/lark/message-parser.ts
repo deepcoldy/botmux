@@ -708,6 +708,32 @@ export function resolvePostBody(parsed: any): { title: string; content: any[] } 
   return { title: '', content: [] };
 }
 
+/** Narrow rich-post projection for keyword listeners. It intentionally keeps
+ * only visible title/text/link content so listener matching does not inherit
+ * unrelated mention, file, image, or code-rendering semantics. */
+export function extractPostListenerText(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') return '';
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs: string[] = [];
+  for (const paragraph of content) {
+    const parts: string[] = [];
+    for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+      if (!node || typeof node !== 'object') continue;
+      if (node.tag === 'text' && typeof node.text === 'string') {
+        parts.push(node.text);
+      } else if (node.tag === 'a') {
+        const label = typeof node.text === 'string' ? node.text.trim() : '';
+        const href = typeof node.href === 'string' ? node.href.trim() : '';
+        if (label) parts.push(label);
+        if (href && href !== label) parts.push(label ? ` (${href})` : href);
+      }
+    }
+    const text = parts.join('').trim();
+    if (text) paragraphs.push(text);
+  }
+  return [typeof title === 'string' ? title.trim() : '', ...paragraphs].filter(Boolean).join('\n');
+}
+
 /** 一条 @mention 在两种形状下的松散视图：`parseEventMessage` 产出的 `LarkMention`
  *  （openId/appId 已解析）与飞书事件里的原始 `message.mentions[]`（id/id_type）。 */
 type LooseMention = {

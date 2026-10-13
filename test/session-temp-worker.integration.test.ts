@@ -9,6 +9,17 @@ import type { DaemonToWorker } from '../src/types.js';
 
 const fixtures: { root: string; child: ChildProcess; cliObservation: string }[] = [];
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+function hasCompleteJson(path: string): boolean {
+  if (!existsSync(path)) return false;
+  try {
+    JSON.parse(readFileSync(path, 'utf8'));
+    return true;
+  } catch {
+    // Child processes create the file before their atomic-ish write is visible
+    // to this polling parent; wait for a complete observation, not existence.
+    return false;
+  }
+}
 async function until(check: () => boolean, logs: string[], timeout = 15000): Promise<void> {
   const deadline = Date.now() + timeout;
   while (!check()) {
@@ -65,7 +76,7 @@ setInterval(() => {}, 1000);
       workingDir: dataDir, cliId: 'pi', cliPathOverride: cli, backendType: 'pty', prompt: '',
       envPolicy: { mode }, larkAppId: 'app_temp_test', larkAppSecret: 'fixture-only',
     } satisfies DaemonToWorker);
-    await until(() => existsSync(workerObservation) && existsSync(cliObservation), logs);
+    await until(() => hasCompleteJson(workerObservation) && hasCompleteJson(cliObservation), logs);
     const profile = createHash('sha256').update(resolve(dataDir)).digest('hex').slice(0, 16);
     const expected = join(root, '.cache', 'botmux', 'session-tmp', profile, 'temp-env-probe');
     for (const file of [workerObservation, cliObservation]) {
