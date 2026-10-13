@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -134,6 +134,7 @@ describe('program-status relay launch plan', () => {
     expect(isProgramStatusRelayArgv(launch.args.slice(3))).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/p'])).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/bun', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
+    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '--no-env-file', '--config=/dev/null', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--resume'])).toBe(false);
   });
 
@@ -250,6 +251,27 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     await new Promise(r => setTimeout(r, 200));
     const piped = readFileSync(pipeLog, 'latin1');
     expect(piped.slice(piped.indexOf('A'), piped.indexOf('C') + 1)).toBe('A\nB\r\nC');
+  }, 30_000);
+
+  it.skipIf(!hasTmux)('never resolves stty through the CLI PATH (it runs outside the sandbox)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-osc7501-'));
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    const planted = join(dir, 'PLANTED_STTY_RAN');
+    writeFileSync(join(bin, 'stty'), `#!/bin/sh\n: > '${planted}'\n`, { mode: 0o755 });
+    const done = join(dir, 'done');
+    const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
+    const plan = join(planDir, 'plan.json');
+    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', `: > '${done}'; sleep 0.3`] }));
+    const { command, prefixArgs } = tsRunnerPrefix();
+    // (tmux's own `-e PATH=` does not reach the first pane command on 3.3a.)
+    const created = tmux('new-session', '-d', '-s', 's', '-c', REPO_ROOT, '--',
+      '/usr/bin/env', `PATH=${bin}:${process.env.PATH}`, command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan);
+    expect(created.status, created.stderr).toBe(0);
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(done) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+    expect(existsSync(done)).toBe(true);
+    expect(existsSync(planted)).toBe(false);
   }, 30_000);
 
   it.skipIf(!hasTmux)('with the relay the 7501 answer precedes tmux\'s DA1 answer and the probe never reaches the pane', async () => {

@@ -15,6 +15,7 @@
  * pane terminal (handshake lost, session intact).
  */
 import { spawn as spawnChild, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { consumeProgramStatusRelayPlan, relayChildLaunch } from './core/program-status-relay-launch.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import { PROGRAM_STATUS_PROBE_REPLY, ProgramStatusProbeRelay } from './utils/program-status-probe-relay.js';
@@ -26,6 +27,9 @@ const HELD_FLUSH_MS = 15;
 const SIGNAL_EXIT_GRACE_MS = 5000;
 /** After SIGKILLing the child, the relay kills itself if it still has not exited. */
 const FINAL_KILL_MS = 2000;
+/** Absolute: this process runs outside any sandbox, so it must never resolve
+ *  helpers through the CLI's (possibly agent-writable) PATH. */
+const STTY = ['/bin/stty', '/usr/bin/stty'].find(p => existsSync(p)) ?? '/bin/stty';
 
 const plan = consumeProgramStatusRelayPlan(process.argv.slice(isStandaloneBinary() ? 3 : 2)[0]);
 const stdin = process.stdin;
@@ -47,7 +51,7 @@ function exitWithChildStatus(code: number | null | undefined, signal: number | N
 function runDirect(reason: unknown): void {
   process.stderr.write(`[botmux] program-status relay unavailable (${reason instanceof Error ? reason.message : String(reason)}); running CLI directly\n`);
   // The pane was put into raw mode for the relay; hand the CLI a sane terminal.
-  spawnSync('stty', ['sane'], { stdio: ['inherit', 'ignore', 'ignore'] });
+  spawnSync(STTY, ['sane'], { stdio: ['inherit', 'ignore', 'ignore'] });
   const child = spawnChild(plan.bin, plan.args, { stdio: 'inherit', env: childEnv, cwd: childCwd });
   for (const sig of ['SIGHUP', 'SIGTERM', 'SIGINT', 'SIGQUIT'] as const) {
     process.on(sig, () => { try { child.kill(sig); } catch { /* exited */ } });
@@ -84,7 +88,7 @@ function spawnInner(): pty.IPty | null {
 function makePaneRaw(): void {
   if (!stdin.isTTY) return;
   stdin.setRawMode(true);
-  const stty = spawnSync('stty', ['raw', '-echo'], { stdio: ['inherit', 'ignore', 'pipe'] });
+  const stty = spawnSync(STTY, ['raw', '-echo'], { stdio: ['inherit', 'ignore', 'pipe'] });
   if (stty.status !== 0) {
     process.stderr.write(`[botmux] program-status relay: stty raw failed (${stty.error?.message ?? stty.stderr?.toString().trim()}); output may be double-translated\n`);
   }

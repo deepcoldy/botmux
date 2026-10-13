@@ -68,10 +68,17 @@ export function relayChildLaunch(env: NodeJS.ProcessEnv, fallbackCwd: string): {
  *  cannot resolve. Bun runs the `.ts` natively. */
 function resolveRelayEntry(): { command: string; args: string[] } | null {
   const entry = resolveEntrySpawn('program-status-relay', join(dirname(fileURLToPath(import.meta.url)), '..'));
-  if (isStandaloneBinary() || existsSync(entry.args[0])) return entry;
-  const tsEntry = entry.args[0].replace(/\.js$/, '.ts');
-  if (!process.versions.bun || !existsSync(tsEntry)) return null;
-  return { command: entry.command, args: [tsEntry] };
+  if (isStandaloneBinary()) return entry;
+  let script = entry.args[0];
+  if (!existsSync(script)) {
+    script = script.replace(/\.js$/, '.ts');
+    if (!process.versions.bun || !existsSync(script)) return null;
+  }
+  // A bun interpreter would otherwise autoload `.env*` and bunfig (preload)
+  // from the cwd/home. The shim's `cd /` already covers the cwd (and is all a
+  // compiled binary, which takes no runtime flags, gets); be explicit here.
+  const runtimeFlags = process.versions.bun ? ['--no-env-file', '--config=/dev/null'] : [];
+  return { command: entry.command, args: [...runtimeFlags, script] };
 }
 
 /**
@@ -118,5 +125,6 @@ export function consumeProgramStatusRelayPlan(planPath: string | undefined): Pro
 /** True when a process argv (`/proc/<pid>/cmdline`) is a program-status relay.
  *  Node: `<node> …/program-status-relay.js <plan>`; compiled: `<binary> __program-status-relay <plan>`. */
 export function isProgramStatusRelayArgv(argv: readonly string[]): boolean {
-  return argv.slice(0, 3).some(a => a === RELAY_TOKEN || basename(a) === RELAY_SCRIPT || basename(a) === RELAY_SOURCE);
+  // Interpreter, up to two runtime flags, then the entry.
+  return argv.slice(0, 4).some(a => a === RELAY_TOKEN || basename(a) === RELAY_SCRIPT || basename(a) === RELAY_SOURCE);
 }
