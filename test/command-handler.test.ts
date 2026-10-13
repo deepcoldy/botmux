@@ -9056,3 +9056,92 @@ describe('Codex App /effort command', () => {
     expect(updateCodexAppEffort).not.toHaveBeenCalled();
   });
 });
+
+// ─── 守卫回复的统一出口（replyNoSession / replyTransferInProgress）────────────────
+// handleCommand 里「没有活跃会话」「会话正在搬迁」的拒绝回复原先逐处手写，收口成
+// 单点 helper 后，每个调用点的文案键、回复锚点与调用形态（rootId, text, undefined,
+// larkAppId, turnId）都必须与原先一致。表驱动，一行一个命令。
+describe('command guards — no-session / transfer-in-progress replies', () => {
+  const sessionTexts = (deps: CommandHandlerDeps) =>
+    vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]);
+
+  // [命令, 含参数的消息文本, 期望的文案键]
+  const NO_SESSION: Array<[string, string, string]> = [
+    ['/effort', '/effort high', 'cmd.no_active_session'],
+    ['/cli', '/cli claude-code', 'cmd.no_active_session'],
+    ['/lane', '/lane', 'cmd.no_active_session'],
+    ['/insight', '/insight', 'cmd.no_active_session'],
+    ['/disconnect', '/disconnect', 'cmd.no_active_session'],
+    ['/restart', '/restart', 'cmd.no_active_session'],
+    ['/stop', '/stop', 'cmd.no_active_session'],
+    ['/cd', '/cd /tmp', 'cmd.no_active_session'],
+    ['/rename', '/rename new title', 'cmd.no_active_session'],
+    ['/close', '/close', 'cmd.no_active_session'],
+    ['/retry', '/retry', 'cmd.retry.no_session'],
+    ['/relay', '/relay', 'cmd.relay.no_session'],
+    ['/fork', '/fork do something', 'cmd.fork.no_session'],
+    ['/forklist', '/forklist', 'cmd.fork.no_session'],
+  ];
+
+  it.each(NO_SESSION)('%s 无会话 → 回 %s（锚点 rootId，带 larkAppId 与 turnId）', async (cmd, text, key) => {
+    const deps = makeDeps();
+    await handleCommand(cmd, ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, t(key), undefined, LARK_APP_ID, 'msg_001');
+    // 一次拒绝只回一条
+    expect(sessionTexts(deps).filter(x => x === t(key))).toHaveLength(1);
+  });
+
+  it('没有 appId 与会话时 /card /cot /term 走各自的「无会话」守卫', async () => {
+    for (const cmd of ['/card', '/cot', '/term']) {
+      const deps = makeDeps();
+      await handleCommand(cmd, ROOT_ID, makeLarkMessage(cmd), deps, undefined);
+      expect(sessionTexts(deps), cmd).toContain(t('cmd.no_active_session'));
+    }
+  });
+
+  it.each(['/restart', '/stop', '/cd /tmp'])('%s 在会话搬迁中 → 回 transfer_in_progress，且不执行动作', async (text) => {
+    const { isSessionTransferring } = await import('../src/core/worker-pool.js');
+    const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any });
+    const deps = makeDeps(ds);
+    vi.mocked(isSessionTransferring).mockReturnValue(true);
+    try {
+      await handleCommand(text.split(' ')[0]!, ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+    } finally {
+      vi.mocked(isSessionTransferring).mockReturnValue(false);
+    }
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('cmd.session.transfer_in_progress'), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+  });
+
+  it('/adopt 在会话搬迁中 → transfer_in_progress；无会话时 /adopt 不触发该守卫', async () => {
+    const { isSessionTransferring } = await import('../src/core/worker-pool.js');
+    const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any });
+    const busy = makeDeps(ds);
+    vi.mocked(isSessionTransferring).mockReturnValue(true);
+    try {
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt'), busy, LARK_APP_ID);
+    } finally {
+      vi.mocked(isSessionTransferring).mockReturnValue(false);
+    }
+    expect(busy.sessionReply).toHaveBeenCalledWith(ROOT_ID, t('cmd.session.transfer_in_progress'), undefined, LARK_APP_ID, 'msg_001');
+
+    const none = makeDeps();
+    await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt'), none, LARK_APP_ID);
+    expect(sessionTexts(none)).not.toContain(t('cmd.session.transfer_in_progress'));
+  });
+
+  it('搬迁守卫先于无会话守卫之外的其它检查：/stop 搬迁中不会再走到 CLI 能力判断', async () => {
+    const { isSessionTransferring } = await import('../src/core/worker-pool.js');
+    // codex-app 本会回「不支持 /stop」；搬迁中必须先被搬迁守卫拦下。
+    const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any, session: makeSession({ cliId: 'codex-app' as any }) });
+    const deps = makeDeps(ds);
+    vi.mocked(isSessionTransferring).mockReturnValue(true);
+    try {
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+    } finally {
+      vi.mocked(isSessionTransferring).mockReturnValue(false);
+    }
+    expect(sessionTexts(deps)).toEqual([t('cmd.session.transfer_in_progress')]);
+  });
+});
