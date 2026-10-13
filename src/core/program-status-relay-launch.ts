@@ -29,18 +29,23 @@ const RELAY_SOURCE = 'program-status-relay.ts';
 const PLAN_FILE = 'plan.json';
 const PLAN_DIR_PREFIX = 'botmux-psr-';
 
-/** Interpreter startup options a bot may configure for its CLI. The relay runs
- *  OUTSIDE any sandbox/credential wrapper, so a `--require`/`--import` preload
- *  in them must not execute there: the launch shim parks them under a private
- *  name before exec'ing the relay, and the relay restores them for the CLI. */
+/** The relay runs OUTSIDE any sandbox/credential wrapper, so nothing the bot
+ *  or its working directory configures may execute code in it:
+ *   - interpreter loader options (a `--require`/`--import` preload in
+ *     NODE_OPTIONS/BUN_OPTIONS) are parked under a private name;
+ *   - the relay starts in `/`, because Bun autoloads `.env*` and `bunfig.toml`
+ *     (whose `preload` runs code) from the current directory.
+ *  The relay hands the CLI its original options and working directory back. */
 const LOADER_ENV_KEYS = ['NODE_OPTIONS', 'BUN_OPTIONS'] as const;
 const PARKED_PREFIX = '__BOTMUX_PSR_';
 const PARK_LOADER_ENV_SCRIPT = LOADER_ENV_KEYS
   .map(k => `if [ -n "\${${k}+x}" ]; then ${PARKED_PREFIX}${k}=\$${k}; export ${PARKED_PREFIX}${k}; unset ${k}; fi`)
-  .join('; ') + '; exec "$@"';
+  .join('; ') + `; ${PARKED_PREFIX}CWD=$PWD; export ${PARKED_PREFIX}CWD; cd / || exit 1; exec "$@"`;
 
-/** Child env for the CLI: parked loader options restored, parking names removed. */
-export function restoreRelayLoaderEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/** The CLI's launch context: parked loader options restored, the original
+ *  working directory (and PWD) back, parking names removed. Without a parked
+ *  cwd (relay started directly, e.g. in tests) the relay's own cwd is used. */
+export function relayChildLaunch(env: NodeJS.ProcessEnv, fallbackCwd: string): { env: NodeJS.ProcessEnv; cwd: string } {
   const out: NodeJS.ProcessEnv = { ...env };
   for (const key of LOADER_ENV_KEYS) {
     const parked = PARKED_PREFIX + key;
@@ -49,7 +54,11 @@ export function restoreRelayLoaderEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
       delete out[parked];
     }
   }
-  return out;
+  const parkedCwd = out[`${PARKED_PREFIX}CWD`];
+  delete out[`${PARKED_PREFIX}CWD`];
+  if (!parkedCwd) return { env: out, cwd: fallbackCwd };
+  out.PWD = parkedCwd;
+  return { env: out, cwd: parkedCwd };
 }
 
 /** Resolve the relay entry, or null when it cannot be executed from here. That

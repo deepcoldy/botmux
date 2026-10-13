@@ -15,7 +15,7 @@
  * pane terminal (handshake lost, session intact).
  */
 import { spawn as spawnChild, spawnSync } from 'node:child_process';
-import { consumeProgramStatusRelayPlan, restoreRelayLoaderEnv } from './core/program-status-relay-launch.js';
+import { consumeProgramStatusRelayPlan, relayChildLaunch } from './core/program-status-relay-launch.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import { PROGRAM_STATUS_PROBE_REPLY, ProgramStatusProbeRelay } from './utils/program-status-probe-relay.js';
 import * as pty from './utils/pty.js';
@@ -30,9 +30,10 @@ const FINAL_KILL_MS = 2000;
 const plan = consumeProgramStatusRelayPlan(process.argv.slice(isStandaloneBinary() ? 3 : 2)[0]);
 const stdin = process.stdin;
 const stdout = process.stdout;
-// The launch shim stripped interpreter loader options (NODE_OPTIONS, …) so no
-// bot-configured preload runs in this unconfined process; the CLI gets them back.
-const childEnv = restoreRelayLoaderEnv(process.env);
+// The launch shim parked interpreter loader options and moved us to `/` so no
+// bot- or workdir-configured preload runs in this unconfined process; the CLI
+// gets its options and working directory back.
+const { env: childEnv, cwd: childCwd } = relayChildLaunch(process.env, process.cwd());
 
 function exitWithChildStatus(code: number | null | undefined, signal: number | NodeJS.Signals | null | undefined): void {
   const signo = typeof signal === 'number' ? signal : 0;
@@ -47,7 +48,7 @@ function runDirect(reason: unknown): void {
   process.stderr.write(`[botmux] program-status relay unavailable (${reason instanceof Error ? reason.message : String(reason)}); running CLI directly\n`);
   // The pane was put into raw mode for the relay; hand the CLI a sane terminal.
   spawnSync('stty', ['sane'], { stdio: ['inherit', 'ignore', 'ignore'] });
-  const child = spawnChild(plan.bin, plan.args, { stdio: 'inherit', env: childEnv });
+  const child = spawnChild(plan.bin, plan.args, { stdio: 'inherit', env: childEnv, cwd: childCwd });
   for (const sig of ['SIGHUP', 'SIGTERM', 'SIGINT', 'SIGQUIT'] as const) {
     process.on(sig, () => { try { child.kill(sig); } catch { /* exited */ } });
   }
@@ -65,7 +66,7 @@ function spawnInner(): pty.IPty | null {
       name: process.env.TERM || 'xterm-256color',
       cols: stdout.columns || 80,
       rows: stdout.rows || 24,
-      cwd: process.cwd(),
+      cwd: childCwd,
       env: childEnv as Record<string, string>,
       encoding: null,
     });

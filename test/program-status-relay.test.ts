@@ -20,7 +20,7 @@ import {
 } from '../src/utils/program-status-probe-relay.js';
 import {
   consumeProgramStatusRelayPlan,
-  restoreRelayLoaderEnv,
+  relayChildLaunch,
   isProgramStatusRelayArgv,
   programStatusRelayLaunch,
 } from '../src/core/program-status-relay-launch.js';
@@ -144,18 +144,26 @@ describe('program-status relay launch plan', () => {
     expect(cliIdFromCommArgv('node', ['node', '/opt/botmux/dist/program-status-relay.js', planPath])).toBeUndefined();
   });
 
-  it('starts the relay without bot loader options and hands them back to the CLI', () => {
-    // The relay runs outside any sandbox; a NODE_OPTIONS preload must not run there.
+  it('starts the relay in / without bot loader options and hands both back to the CLI', () => {
+    // The relay runs outside any sandbox: a NODE_OPTIONS preload, or a workdir
+    // .env / bunfig.toml (Bun autoloads both from the cwd), must not reach it.
+    planRoot ||= mkdtempSync(join(tmpdir(), 'relay-plan-test-'));
+    const workdir = mkdtempSync(join(planRoot, 'work-'));
     const launch = compiledLaunch('/usr/bin/claude', []);
-    const probe = `process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([k]) => /NODE_OPTIONS|BUN_OPTIONS/.test(k)))))`;
+    const probe = `process.stdout.write(JSON.stringify({ cwd: process.cwd(), env: Object.fromEntries(Object.entries(process.env).filter(([k]) => /OPTIONS|PSR_CWD/.test(k))) }))`;
     const shimArgs = [...launch.args.slice(0, 3), process.execPath, '-e', probe];
-    const run = (env: NodeJS.ProcessEnv) => JSON.parse(spawnSync(launch.bin, shimArgs, { env, encoding: 'utf8' }).stdout) as Record<string, string>;
-    const base = { PATH: process.env.PATH ?? '' };
+    const run = (env: NodeJS.ProcessEnv) => JSON.parse(spawnSync(launch.bin, shimArgs, { env, cwd: workdir, encoding: 'utf8' }).stdout) as { cwd: string; env: Record<string, string> };
+    const base = { PATH: process.env.PATH ?? '', PWD: workdir };
     const parked = run({ ...base, NODE_OPTIONS: '--require /evil.js', BUN_OPTIONS: '' });
-    expect(parked).toEqual({ __BOTMUX_PSR_NODE_OPTIONS: '--require /evil.js', __BOTMUX_PSR_BUN_OPTIONS: '' });
-    expect(run(base)).toEqual({});
-    expect(restoreRelayLoaderEnv({ ...parked, KEEP: '1' })).toEqual({ NODE_OPTIONS: '--require /evil.js', BUN_OPTIONS: '', KEEP: '1' });
-    expect(restoreRelayLoaderEnv({ KEEP: '1' })).toEqual({ KEEP: '1' });
+    expect(parked.cwd).toBe('/');
+    expect(parked.env).toEqual({
+      __BOTMUX_PSR_NODE_OPTIONS: '--require /evil.js', __BOTMUX_PSR_BUN_OPTIONS: '', __BOTMUX_PSR_CWD: workdir,
+    });
+    expect(run(base).env).toEqual({ __BOTMUX_PSR_CWD: workdir });
+
+    const restored = relayChildLaunch({ ...parked.env, PWD: '/', KEEP: '1' }, '/');
+    expect(restored).toEqual({ cwd: workdir, env: { NODE_OPTIONS: '--require /evil.js', BUN_OPTIONS: '', PWD: workdir, KEEP: '1' } });
+    expect(relayChildLaunch({ KEEP: '1' }, '/here')).toEqual({ cwd: '/here', env: { KEEP: '1' } });
   });
 
   it('rejects a missing or malformed plan', () => {
