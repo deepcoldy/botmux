@@ -20,6 +20,19 @@ import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.j
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import { executeWithLarkGate } from './api-gate.js';
+import {
+  LARK_CODE_APP_SCOPE_MISSING,
+  LARK_CODE_CONTACT_INVALID_PARAM,
+  LARK_CODE_CONTACT_NO_SUCH_USER,
+  LARK_CODE_CONTACT_NOT_VISIBLE,
+  LARK_CODE_CROSS_APP_OPEN_ID,
+  LARK_CODE_EPHEMERAL_NOT_GROUP,
+  LARK_CODE_MESSAGE_UPDATE_EXPIRED,
+  LARK_CODE_MESSAGE_WITHDRAWN,
+  LARK_CODE_USER_SCOPE_MISSING,
+  larkApiError,
+  structuredLarkCode,
+} from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
 
@@ -246,12 +259,11 @@ export class UserTokenMissingError extends Error {
 
 /** Extract Lark error code from AxiosError or SDK error. */
 export function getLarkErrorCode(err: any): number | undefined {
-  const code = err?.response?.data?.code ?? err?.code;
-  return typeof code === 'number' ? code : undefined;
+  return structuredLarkCode(err);
 }
 
-const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
-const LARK_CODE_MESSAGE_UPDATE_EXPIRED = 230031;
+// 具名业务码的单一来源是 lark-errors.ts；此处再导出保持 client.ts 的老出口。
+export { LARK_CODE_EPHEMERAL_NOT_GROUP };
 // Capability cache for the undocumented `/members/bots` endpoint. It prevents
 // repeated hits while the tenant/gateway cannot serve the API, but per-request
 // business errors (bad chat id, permission denial) must not poison other chats.
@@ -409,7 +421,7 @@ export async function sendMessage(
 
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, chatId);
-      throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('send message', res);
     }
 
     const messageId = res.data?.message_id;
@@ -477,7 +489,7 @@ export async function replyMessage(
 
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
-      throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('reply message', res);
     }
 
     const replyId = res.data?.message_id;
@@ -530,7 +542,7 @@ export async function urgentMessage(
     ...larkRequestDeadline(requestOptions),
   });
   if (res?.code !== 0 && res?.code !== undefined) {
-    throw new Error(`Failed to urgent message (${mode}): ${res.msg ?? ''} (code: ${res.code})`);
+    throw larkApiError(`urgent message (${mode})`, res, '');
   }
   logger.info(`Urgent ${mode} sent for message ${messageId} to ${recipients.length} user(s)`);
 }
@@ -578,7 +590,7 @@ export async function forwardMessage(
 
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
-      throw new Error(`Failed to forward message: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('forward message', res);
     }
 
     const forwardedId = res.data?.message_id;
@@ -598,7 +610,7 @@ export async function addReaction(larkAppId: string, messageId: string, emojiTyp
       data: { reaction_type: { emoji_type: emojiType } },
     });
     if (res.code !== 0) {
-      throw new Error(`Failed to add reaction: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('add reaction', res);
     }
     const reactionId = res.data?.reaction_id;
     logger.info(`Added reaction ${emojiType} (${reactionId}) to message ${messageId}`);
@@ -614,7 +626,7 @@ export async function removeReaction(larkAppId: string, messageId: string, react
       path: { message_id: messageId, reaction_id: reactionId },
     });
     if (res.code !== 0) {
-      throw new Error(`Failed to remove reaction: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('remove reaction', res);
     }
     logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
   });
@@ -666,9 +678,9 @@ const USER_PROFILE_CACHE_MAX = 1000;
  *  SDK 基于 Axios，非 2xx 以异常抛出、业务码在 response.data.code——调用方
  *  的 catch 也要走这里（getLarkErrorCode 提取）。 */
 function classifyContactErrorCode(code: number | undefined): DefinitiveProfileMiss | undefined {
-  if (code === 99992361) return 'cross_app';
-  if (code === 41050) return 'not_visible';
-  if (code === 41012 || code === 40001) return 'invalid_id';
+  if (code === LARK_CODE_CROSS_APP_OPEN_ID) return 'cross_app';
+  if (code === LARK_CODE_CONTACT_NOT_VISIBLE) return 'not_visible';
+  if (code === LARK_CODE_CONTACT_NO_SUCH_USER || code === LARK_CODE_CONTACT_INVALID_PARAM) return 'invalid_id';
   return undefined;
 }
 
@@ -817,7 +829,7 @@ export async function sendUserMessage(
         });
 
       if (res.code !== 0) {
-        throw new Error(`Failed to send user message: ${res.msg} (code: ${res.code})`);
+        throw larkApiError('send user message', res);
       }
 
       const messageId = res.data?.message_id;
@@ -833,7 +845,7 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
   const c = getBotClient(larkAppId);
   const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
   if (res.code !== 0) {
-    throw new Error(`Failed to get chat info: ${res.msg} (code: ${res.code})`);
+    throw larkApiError('get chat info', res);
   }
   // user_count excludes bots, only real users; bot_count is the bot member count.
   return {
@@ -873,7 +885,7 @@ export async function listChatUserMembers(larkAppId: string, chatId: string): Pr
     if (pageToken) params.page_token = pageToken;
     const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`, params);
     if (res.code !== 0) {
-      throw new Error(`Failed to list chat members: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('list chat members', res);
     }
     for (const it of (res.data?.items ?? [])) {
       const id = it?.member_id;
@@ -1220,7 +1232,7 @@ export async function listChatPins(larkAppId: string, chatId: string): Promise<L
       throw new Error('Failed to list chat pins: missing code');
     }
     if (res.code !== 0) {
-      throw new Error(`Failed to list chat pins: ${res.msg ?? 'unknown error'} (code: ${res.code})`);
+      throw larkApiError('list chat pins', res, 'unknown error');
     }
 
     for (const item of res.data?.items ?? []) {
@@ -1263,10 +1275,8 @@ export async function unpinMessage(larkAppId: string, messageId: string): Promis
   }
 }
 
-/** Error code Feishu returns from `ephemeral/v1/send` when the target chat is a
- *  topic / thread chat. Ephemeral cards only work in plain `group` chats (see
- *  /tmp design notes: empirically code 18053 `chat can not be thread`). */
-export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
+// LARK_CODE_EPHEMERAL_NOT_GROUP (18053, `chat can not be thread`): ephemeral
+// cards only work in plain `group` chats — defined in lark-errors.ts.
 
 /**
  * Send a "visible-to-one-user" ephemeral card (`ephemeral/v1/send`). The card is
@@ -1293,7 +1303,7 @@ export async function sendEphemeralCard(
       data: { chat_id: chatId, open_id: openId, msg_type: 'interactive', card },
     });
     if (res.code !== 0) {
-      throw new Error(`Failed to send ephemeral card: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('send ephemeral card', res);
     }
     const messageId = res.data?.message_id;
     logger.info(`Sent ephemeral card ${messageId ?? '(no id)'} to ${openId} in chat ${chatId}`);
@@ -1368,7 +1378,7 @@ export async function updateMessage(
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
       if (res.code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) throw new MessageUpdateExpiredError(messageId);
-      throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('update message', res);
     }
     if (returnAcknowledgement) return res.data;
   });
@@ -1406,7 +1416,7 @@ export async function resolveCardKitId(larkAppId: string, messageId: string): Pr
     }
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
-      throw new Error(`Failed to resolve CardKit id: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('resolve CardKit id', res);
     }
     const cardId = res.data?.card_id;
     if (!cardId) throw new Error('CardKit id conversion returned no card_id');
@@ -1444,7 +1454,7 @@ export async function updateCardStreamingSettings(
       },
     });
     if (res.code !== 0) {
-      throw new Error(`Failed to update CardKit streaming settings: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('update CardKit streaming settings', res);
     }
   });
 }
@@ -1468,7 +1478,7 @@ export async function updateCardStreamElementContent(
       data: { content, sequence, uuid },
     });
     if (res.code !== 0) {
-      throw new Error(`Failed to stream CardKit element content: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('stream CardKit element content', res);
     }
   });
 }
@@ -1492,7 +1502,7 @@ export async function patchCardStreamElement(
       data: { partial_element: JSON.stringify(partialElement), sequence, uuid },
     });
     if (res.code !== 0) {
-      throw new Error(`Failed to patch CardKit element: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('patch CardKit element', res);
     }
   });
 }
@@ -1519,7 +1529,7 @@ export async function getMessageDetail(
     with_sender_name: 'true',
   }, options);
   if (res.code !== 0) {
-    throw Object.assign(new Error(`Failed to get message: ${res.msg} (code: ${res.code})`), { code: res.code });
+    throw larkApiError('get message', res);
   }
   return res.data;
 }
@@ -1868,12 +1878,12 @@ export async function resolveTargetAppOpenId(
 
 function isPermanentContactErrorCode(code: number | undefined): boolean {
   return (
-    code === 40001 ||
-    code === 41012 ||
-    code === 41050 ||
-    code === 99991672 ||
-    code === 99991679 ||
-    code === 99992361
+    code === LARK_CODE_CONTACT_INVALID_PARAM ||
+    code === LARK_CODE_CONTACT_NO_SUCH_USER ||
+    code === LARK_CODE_CONTACT_NOT_VISIBLE ||
+    code === LARK_CODE_APP_SCOPE_MISSING ||
+    code === LARK_CODE_USER_SCOPE_MISSING ||
+    code === LARK_CODE_CROSS_APP_OPEN_ID
   );
 }
 
@@ -1976,7 +1986,7 @@ export async function resolveAllowedUsersWithMap(
     for (const oid of openIds) {
       try {
         const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(oid)}`, { user_id_type: 'open_id' });
-        if (res?.code === 99992361) {
+        if (res?.code === LARK_CODE_CROSS_APP_OPEN_ID) {
           logger.warn(`allowedUsers open_id ${oid} belongs to another app for ${larkAppId}; use email or union_id (on_) instead.`);
         } else if (res?.code && res.code !== 0) {
           logger.debug(`verify allowedUsers open_id ${oid} non-zero code: ${res.code} ${res.msg ?? ''}`);
@@ -2014,7 +2024,7 @@ export async function resolveAllowedUsersWithMap(
           // identity verdicts (41050 not-visible / 41012 / 40001 / 99992361)
           // are NOT batch-wide signals: mixed with a transient email batch they
           // would false-alarm on startup.
-          if (res?.code === 99991672 || res?.code === 99991679) hasPermanentBatchError = true;
+          if (res?.code === LARK_CODE_APP_SCOPE_MISSING || res?.code === LARK_CODE_USER_SCOPE_MISSING) hasPermanentBatchError = true;
           entryStatus.set(uid, definitive ? 'definitive' : 'transient');
           logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
         }
@@ -2024,7 +2034,7 @@ export async function resolveAllowedUsersWithMap(
         if (!definitive) errored = true;
         // Same as the non-throw branch above: only app-level missing-scope
         // codes are permanent batch signals; per-entry identity codes stay silent.
-        if (errCode === 99991672 || errCode === 99991679) hasPermanentBatchError = true;
+        if (errCode === LARK_CODE_APP_SCOPE_MISSING || errCode === LARK_CODE_USER_SCOPE_MISSING) hasPermanentBatchError = true;
         entryStatus.set(uid, definitive ? 'definitive' : 'transient');
         logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
       }
@@ -2197,7 +2207,7 @@ export async function resolveUserUnionId(larkAppId: string, openId: string): Pro
     if (res.code === 0 && res.data?.user) {
       return { unionId: res.data.user.union_id ?? undefined, name: res.data.user.name ?? undefined };
     }
-    if (res.code === 99992361) {
+    if (res.code === LARK_CODE_CROSS_APP_OPEN_ID) {
       logger.warn(`resolveUserUnionId [${larkAppId}]: open_id ${openId} 属于其他应用（cross app）。` +
         `请在 allowedUsers 中改用邮箱或 union_id（on_ 前缀）代替 open_id。`);
     } else {
@@ -2297,7 +2307,7 @@ async function listByThread(c: any, threadId: string, pageSize: number): Promise
     });
 
     if (res.code !== 0) {
-      throw new Error(`Failed to list thread messages: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('list thread messages', res);
     }
 
     if (res.data?.items) {
@@ -2337,7 +2347,7 @@ export async function listChatMessages(
     });
 
     if (res.code !== 0) {
-      throw new Error(`Failed to list chat messages: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('list chat messages', res);
     }
 
     if (res.data?.items) {
@@ -2386,7 +2396,7 @@ export async function listChatMessagesUntil(
     });
 
     if (res.code !== 0) {
-      throw new Error(`Failed to list chat messages: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('list chat messages', res);
     }
 
     const items = res.data?.items ?? [];
@@ -2475,7 +2485,7 @@ async function listByChatFilter(c: any, chatId: string, rootMessageId: string, p
     });
 
     if (res.code !== 0) {
-      throw new Error(`Failed to list messages: ${res.msg} (code: ${res.code})`);
+      throw larkApiError('list messages', res);
     }
 
     if (res.data?.items) {

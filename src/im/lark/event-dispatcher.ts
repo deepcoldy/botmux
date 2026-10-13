@@ -106,6 +106,7 @@ import {
   durableLarkSessionControlPartition,
 } from '../../services/durable-lark-session-control.js';
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
+import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
 
 function vcMeetingEventPayloadForLog(data: any): string {
   try {
@@ -510,7 +511,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // application:application:self_manage 都没拿到，导致根本查不到自己的
     // scope 列表。这种"鸡生蛋"情况单独提示：让 admin 开通免审批的
     // self_manage 后下次重启就能自检了。
-    if (infoData.code === 99991672) {
+    if (infoData.code === LARK_CODE_APP_SCOPE_MISSING) {
       // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
       // are missing. Try the Open Platform web-session auto-fix to add every
       // botmux-required scope (including self_manage) in one shot — passing the

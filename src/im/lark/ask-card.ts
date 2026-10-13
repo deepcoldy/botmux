@@ -17,6 +17,7 @@ import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout
 import { replyMessage, sendMessage, updateMessage, uploadFile } from './client.js';
 import { TRANSIENT_LARK_CODES } from './api-gate.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
+import { larkCodeFromMessage, structuredLarkCode } from './lark-errors.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
 import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
 
@@ -134,19 +135,6 @@ export function createLarkAskCardDispatcher(
 }
 
 
-/** Extract a Lark business code from either error shape:
- *  - axios path A: `response.data.code` / top-level `code` (number)
- *  - 2xx-body path B: a plain Error whose message ends in `(code: NNN)` (the
- *    `res.code !== 0` throws in client.ts embed the code only in the string). */
-function extractLarkCode(e: {
-  response?: { data?: { code?: number } }; code?: number; message?: string;
-} | null | undefined, rawMessage: string): number | undefined {
-  const structured = e?.response?.data?.code ?? e?.code;
-  if (typeof structured === 'number') return structured;
-  const m = /\(code:\s*(\d+)\)/.exec(rawMessage);
-  return m ? Number(m[1]) : undefined;
-}
-
 /**
  * Classify a Feishu card-send failure into "worth retrying" vs "give up now"
  * (codex P1-3). PURE + exported so the retry decision is unit-tested directly
@@ -179,7 +167,12 @@ export function classifyAskDispatchError(err: unknown): { retryable: boolean; de
 
   // A whitelisted transient business code is retryable regardless of HTTP
   // status / error shape (codex P1-3) — check it before the status branches.
-  const larkCode = extractLarkCode(e, typeof detail === 'string' ? detail : '');
+  // Structured code first (axios `response.data.code` / top-level `code` /
+  // LarkApiError.code), then the `(code: NNN)` tail of `detail`. NOTE the text
+  // scanned is `detail` (= `response.data.msg || message`, or the bare string
+  // when a string was thrown), NOT api-gate.extractLarkBusinessCode's
+  // `err.message` — a deliberate boundary difference kept from the original.
+  const larkCode = structuredLarkCode(e) ?? larkCodeFromMessage(typeof detail === 'string' ? detail : '');
   if (larkCode !== undefined && TRANSIENT_LARK_CODES.has(larkCode)) {
     return { retryable: true, detail: `lark code ${larkCode} (transient): ${detail}` };
   }
