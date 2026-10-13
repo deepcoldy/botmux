@@ -1522,6 +1522,15 @@ export function updateTask(
   if (finalExecutionPosition === 'task' && explicitRootMessageId) {
     return { ok: false, error: 'task_root_not_user_settable' };
   }
+  // Validate against the root that will actually remain after this patch, not
+  // the pre-edit root. Entering task position drops any foreign topic root;
+  // moving an already materialized task to another chat drops its old root;
+  // an in-place edit of the same task keeps the root it already owns.
+  const rootAfterPatch = finalExecutionPosition === 'task'
+    ? task.executionPosition === 'task' && !primaryChatChanged
+      ? task.rootMessageId?.trim() || undefined
+      : undefined
+    : nextRootMessageId?.trim() || undefined;
   const nextPosition = finalExecutionPosition;
   const nextFollowActive = updates.followActive ?? task.followActive;
   if (updates.followActive === true && nextPosition !== 'topic') {
@@ -1549,13 +1558,14 @@ export function updateTask(
     updates.topicTitle !== undefined
     || updates.silent !== undefined
     || executionPosition !== undefined
+    || targetUpdate
   ) {
     try {
       const normalizedTopicTitle = normalizeTopicTitle(
         updates.topicTitle !== undefined ? updates.topicTitle : task.topicTitle,
         {
           executionPosition: finalExecutionPosition,
-          rootMessageId: nextRootMessageId?.trim() || undefined,
+          rootMessageId: rootAfterPatch,
           silent: updates.silent !== undefined ? updates.silent : task.silent,
           ownerOpenId: task.ownerOpenId,
         },

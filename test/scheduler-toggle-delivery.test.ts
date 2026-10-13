@@ -260,6 +260,77 @@ describe('scheduler.updateTask', () => {
     expect(store.get(id)).toMatchObject({ silent: true, rootMessageId: 'om_materialized' });
   });
 
+  it('rejects moving a silent dynamic-title topic task into rootless task position', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const id = seed('origin', {
+      chatId: 'oc_original',
+      scope: 'thread',
+      executionPosition: 'topic',
+      rootMessageId: 'om_original_topic',
+      silent: true,
+      topicTitle: '{{date}} 巡检 {{owner}}',
+      ownerOpenId: 'ou_owner123',
+    });
+
+    expect(updateTask(id, { executionPosition: 'task' })).toEqual({
+      ok: false,
+      error: 'topic_title_template_silent_unsupported',
+    });
+    expect(store.get(id)).toMatchObject({
+      chatId: 'oc_original',
+      executionPosition: 'topic',
+      rootMessageId: 'om_original_topic',
+      silent: true,
+    });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('rejects moving a materialized silent dynamic-title task to another chat', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const id = seed('origin', {
+      chatId: 'oc_original',
+      scope: 'thread',
+      executionPosition: 'task',
+      rootMessageId: 'om_materialized',
+      silent: true,
+      topicTitle: '{{date}} 巡检 {{owner}}',
+      ownerOpenId: 'ou_owner123',
+    });
+
+    expect(updateTask(id, { chatId: 'oc_new' })).toEqual({
+      ok: false,
+      error: 'topic_title_template_silent_unsupported',
+    });
+    expect(store.get(id)).toMatchObject({
+      chatId: 'oc_original',
+      rootMessageId: 'om_materialized',
+      silent: true,
+    });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('rejects moving an ownerless dynamic-title topic task into rootless task position', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const id = seed('origin', {
+      chatId: 'oc_original',
+      scope: 'thread',
+      executionPosition: 'topic',
+      rootMessageId: 'om_original_topic',
+      topicTitle: '{{owner}} 巡检',
+      ownerOpenId: undefined,
+    });
+
+    expect(updateTask(id, { executionPosition: 'task' })).toEqual({
+      ok: false,
+      error: 'topic_title_owner_unavailable',
+    });
+    expect(store.get(id)).toMatchObject({
+      executionPosition: 'topic',
+      rootMessageId: 'om_original_topic',
+    });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('normalizes a multi-chat update and publishes the complete target patch', async () => {
     const { updateTask } = await import('../src/core/scheduler.js');
     const id = seed('origin', { scope: 'chat' });
