@@ -25,10 +25,11 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { accessSync, constants as fsConstants, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { isStandaloneBinary } from './self-spawn.js';
+import { locateExecutable } from '../utils/executable.js';
 
 /** A botmux core process name managed by the old pm2 ecosystem. */
 function isBotmuxPm2Name(name: unknown): boolean {
@@ -66,16 +67,9 @@ function resolvePm2Bin(pkgRoot: string): string | null {
   // and once the home is gone nothing can address that God any more. MEASURED on
   // a dev box with pm2 on PATH: orphaned `botmux-pm2-probe-<pid>` Gods
   // accumulated across `botmux start/restart` runs. A filesystem lookup spawns
-  // nothing.
-  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
-    if (!dir) continue;
-    const candidate = join(dir, 'pm2');
-    try {
-      accessSync(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch { /* not here */ }
-  }
-  return null;
+  // nothing (and, like every other PATH lookup here, skips a directory that
+  // merely shares the name).
+  return locateExecutable('pm2');
 }
 
 /** A pm2-era botmux daemon process, recovered from PM2_HOME/pids/. */

@@ -352,7 +352,11 @@ describe('reapLegacyPm2', () => {
     const pkgRoot = tmp();          // no bundled pm2
     const shimRoot = tmp();
     const logFile = fakePm2(shimRoot, { jlist: JSON.stringify([{ name: 'botmux-0' }]) });
-    process.env.PATH = `${join(shimRoot, 'node_modules', 'pm2', 'bin')}:${process.env.PATH ?? ''}`;
+    // An EARLIER PATH entry holding a traversable DIRECTORY named pm2 must be
+    // skipped, not returned: X_OK alone accepts it and every pm2 call then EACCESes.
+    const decoy = tmp();
+    mkdirSync(join(decoy, 'pm2'), { mode: 0o755 });
+    process.env.PATH = `${decoy}:${join(shimRoot, 'node_modules', 'pm2', 'bin')}:${process.env.PATH ?? ''}`;
     liveGodPidfile(join(configDir, 'pm2'));
 
     const r = reapLegacyPm2(configDir, pkgRoot);
