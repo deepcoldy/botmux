@@ -171,6 +171,7 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
     try {
       normalizeTopicTitle(input.topicTitle, {
         executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
         silent: input.silent,
         ownerOpenId: input.ownerOpenId,
       });
@@ -211,6 +212,7 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       executionPosition: input.executionPosition,
       topicTitle: normalizeTopicTitle(input.topicTitle, {
         executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
         silent: input.silent,
         ownerOpenId: input.ownerOpenId,
       }),

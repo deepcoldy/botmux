@@ -71,6 +71,7 @@ export function assertScheduleTopicTitleTemplateValid(
   template: string,
   options: {
     executionPosition?: ScheduleExecutionPosition;
+    rootMessageId?: string;
     silent?: boolean;
     ownerOpenId?: string;
     timeZone?: string;
@@ -78,7 +79,7 @@ export function assertScheduleTopicTitleTemplateValid(
 ): void {
   if (!hasScheduleTopicTitleRuntimeTemplate(template)) return;
   const createsOwnTopic = options.executionPosition === 'new-topic'
-    || options.executionPosition === 'task';
+    || (options.executionPosition === 'task' && !options.rootMessageId?.trim());
   if (!createsOwnTopic) return;
   if (options.silent === true) {
     throw new Error('topic_title_template_silent_unsupported');

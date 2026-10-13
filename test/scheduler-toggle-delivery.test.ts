@@ -247,6 +247,19 @@ describe('scheduler.updateTask', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
+  it('allows silent edits after a dedicated dynamic-title task already has its root', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const id = seed('origin', {
+      scope: 'thread',
+      executionPosition: 'task',
+      rootMessageId: 'om_materialized',
+      topicTitle: '{{owner}} 巡检',
+      ownerOpenId: 'ou_owner123',
+    });
+    expect(updateTask(id, { silent: true })).toEqual({ ok: true });
+    expect(store.get(id)).toMatchObject({ silent: true, rootMessageId: 'om_materialized' });
+  });
+
   it('normalizes a multi-chat update and publishes the complete target patch', async () => {
     const { updateTask } = await import('../src/core/scheduler.js');
     const id = seed('origin', { scope: 'chat' });

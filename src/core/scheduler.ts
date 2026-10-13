@@ -1004,6 +1004,7 @@ export function addTask(params: {
   }
   const topicTitle = normalizeTopicTitle(params.topicTitle, {
     executionPosition,
+    rootMessageId: executionPosition === 'task' ? undefined : params.rootMessageId,
     silent: params.silent,
     ownerOpenId: params.ownerOpenId,
   });
@@ -1098,6 +1099,7 @@ export function commitDelegatedTask(input: {
     executionPosition: position,
     topicTitle: normalizeTopicTitle(params.topicTitle, {
       executionPosition: position,
+      rootMessageId: position === 'topic' ? params.rootMessageId : undefined,
       silent: params.silent,
       ownerOpenId: params.ownerOpenId,
     }),
@@ -1141,6 +1143,7 @@ export function normalizeTopicTitle(
   value: string | undefined,
   options?: {
     executionPosition?: ScheduleExecutionPosition;
+    rootMessageId?: string;
     silent?: boolean;
     ownerOpenId?: string;
   },
@@ -1368,6 +1371,7 @@ export function toggleDelivery(id: string): {
   try {
     normalizeTopicTitle(task.topicTitle, {
       executionPosition,
+      rootMessageId: executionPosition === 'task' ? undefined : task.rootMessageId,
       silent: task.silent,
       ownerOpenId: task.ownerOpenId,
     });
@@ -1551,6 +1555,7 @@ export function updateTask(
         updates.topicTitle !== undefined ? updates.topicTitle : task.topicTitle,
         {
           executionPosition: finalExecutionPosition,
+          rootMessageId: nextRootMessageId?.trim() || undefined,
           silent: updates.silent !== undefined ? updates.silent : task.silent,
           ownerOpenId: task.ownerOpenId,
         },
