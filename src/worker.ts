@@ -253,7 +253,7 @@ import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUE
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
+import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -7752,11 +7752,13 @@ function codexBridgeStartTimer(): void {
         const attachOk = codexAttachGated
           ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
           : traexAttachGated
-            ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
+            ? (() => { const sid = traexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
             : true;
         if (path && attachOk) {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
-            const discoveredSessionId = codexSessionIdFromRolloutPath(path);
+            const discoveredSessionId = structuredBridgeIsTraex()
+              ? traexSessionIdFromRolloutPath(path)
+              : codexSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
           }
           codexBridgePendingSessionId = undefined;
@@ -8398,8 +8400,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // Already attached — first-attach-wins for most CLIs. Exceptions: TRAE
     // and Grok can rotate their native session in the same process.
     if (structuredBridgeIsTraex()) {
-      const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
-      if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
+      const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+      const sameSession = currentSid?.toLowerCase() === cliSessionId.toLowerCase();
+      const next = resolveFileBridgePath('traex', { sessionId: cliSessionId });
+      if (sameSession && (!next || next === codexBridgeRolloutPath)) return;
       // Ownership gate: the reported id came from the GLOBAL history.jsonl, so a
       // sibling pane's identical text (e.g. a bare adopt-mode reply with no
       // unique <session_id>) could surface a foreign id. Only rotate the bridge
@@ -8409,7 +8413,6 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         log(`Keeping current TRAE bridge ${currentSid ?? '?'} — refusing history-only re-attach to ${cliSessionId}`);
         return;
       }
-      const next = resolveFileBridgePath('traex', { sessionId: cliSessionId });
       // Close any terminal already committed to the retired rollout before
       // switching. A durable turn is a worker HOL barrier, so a legitimate
       // session rotation cannot overtake an unfinished durable delivery.
@@ -8420,11 +8423,13 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         log(`TRAE pre-rotation bridge drain failed: ${err.message}`);
       }
       if (next && next !== codexBridgeRolloutPath) {
-        log(`TRAE session rotated ${currentSid ?? '?'} → ${cliSessionId}; re-attaching bridge to ${next}`);
+        const reason = sameSession ? `rollout segment moved for ${cliSessionId}`
+          : `session rotated ${currentSid ?? '?'} → ${cliSessionId}`;
+        log(`TRAE ${reason}; re-attaching bridge to ${next}`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = undefined;
         codexBridgeAttach(next, 'fresh-empty');
-      } else if (!next) {
+      } else if (!next && !sameSession) {
         log(`TRAE session rotated ${currentSid ?? '?'} → ${cliSessionId}; waiting for rollout`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = cliSessionId;
@@ -8630,7 +8635,7 @@ function maybeFollowTraexSessionRotationViaPid(): void {
     ?? backend.getChildPid?.()
     ?? codexAdoptPendingPid;
   if (!pid) return;
-  const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
   const observed = findTraexRolloutByPid(pid, currentSid);
   if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;

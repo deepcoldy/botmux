@@ -4,6 +4,12 @@ import { describe, expect, it } from 'vitest';
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
 describe('TRAE worker structured-bridge wiring', () => {
+  it('uses the TRAE-specific parser and rebinds a moved segment for the same session', () => {
+    expect(workerSource).toContain('traexSessionIdFromRolloutPath(path!)');
+    expect(workerSource).toContain('traexSessionIdFromRolloutPath(codexBridgeRolloutPath)');
+    expect(workerSource).toContain('rollout segment moved for ${cliSessionId}');
+  });
+
   it('gives the RPC app-server the non-secret Lark route required by botmux ask', () => {
     const start = workerSource.indexOf('async function engageCodexRpc');
     const end = workerSource.indexOf('engine = new CodexRpcEngine', start);

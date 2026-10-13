@@ -53,7 +53,6 @@ import {
   extractLastCodexTurn,
   type CodexBridgeEvent,
   type CodexDrainResult,
-  codexSessionIdFromRolloutPath,
   codexCotEntriesFromResponseItem,
   codexTaskFailureCode,
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
@@ -108,6 +107,7 @@ const TRAEX_LSOF_TIMEOUT_MS = 1_000;
 const TRAEX_YEAR_DIR_RE = /^\d{4}$/;
 const TRAEX_MONTH_DIR_RE = /^(?:0[1-9]|1[0-2])$/;
 const TRAEX_DAY_DIR_RE = /^(?:0[1-9]|[12]\d|3[01])$/;
+const TRAEX_ROLLOUT_SESSION_RE = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i;
 
 interface TraexRolloutLookupMiss {
   nextFilesystemScanAtMs: number;
@@ -118,6 +118,17 @@ interface TraexRolloutLookupMiss {
  *  on every call, so a newly indexed rollout attaches immediately; only the
  *  compatibility filesystem scan is delayed after repeated misses. */
 const traexRolloutLookupMisses = new Map<string, TraexRolloutLookupMiss>();
+
+/** Extract the stable TRAE thread id from a rollout filename.
+ *
+ * Older releases used `rollout-<ts>-<thread-id>.jsonl`. TraeX 0.209.1 also
+ * writes resumed history segments as
+ * `rollout-<ts>-<thread-id>_<first-turn-id>.jsonl`. The suffix after `_` is a
+ * turn id, not a new resumable session id. The generic Codex parser selects
+ * the final UUID and therefore cannot be used for TRAE segmented rollouts. */
+export function traexSessionIdFromRolloutPath(path: string): string | undefined {
+  return TRAEX_ROLLOUT_SESSION_RE.exec(path)?.[1];
+}
 
 type DatabaseSyncLike = {
   prepare(sql: string): StatementSyncLike;
@@ -732,7 +743,7 @@ export function drainTraexRollout(
   const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
   const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
   const newOffset = start + Buffer.byteLength(completeText, 'utf8');
-  const sourceSessionId = codexSessionIdFromRolloutPath(path);
+  const sourceSessionId = traexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
   const seenUserTurns = new Set<string>();
@@ -1229,7 +1240,7 @@ function matchTraexRolloutPath(target: string): { path: string; cliSessionId: st
     // share the same rollout-*.jsonl filename shape.
     if (!target.includes('/cli/sessions/')) return undefined;
   }
-  const sid = codexSessionIdFromRolloutPath(target);
+  const sid = traexSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };
 }
@@ -1444,9 +1455,7 @@ function readTraexDirectory(path: string): Dirent[] {
 function isCanonicalTraexRolloutPath(
   path: string,
   sessionsRoot: string,
-  suffix: string,
 ): boolean {
-  if (!path.endsWith(suffix)) return false;
   const rel = relative(sessionsRoot, path);
   if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) return false;
   const parts = rel.split(sep);
@@ -1460,13 +1469,14 @@ function isCanonicalTraexRolloutPath(
 function findIndexedTraexRollout(
   cliSessionId: string,
   sessionsRoot: string,
-  suffix: string,
 ): string | undefined {
   const rows = withTraeDb((db) => db.prepare(
     'SELECT rollout_path AS rolloutPath FROM threads WHERE id = ? LIMIT 1',
   ).all(cliSessionId) as { rolloutPath?: string }[]) ?? [];
   const path = rows[0]?.rolloutPath;
-  if (typeof path !== 'string' || !isCanonicalTraexRolloutPath(path, sessionsRoot, suffix)) {
+  if (typeof path !== 'string'
+    || !isCanonicalTraexRolloutPath(path, sessionsRoot)
+    || traexSessionIdFromRolloutPath(path)?.toLowerCase() !== cliSessionId.toLowerCase()) {
     return undefined;
   }
   try {
@@ -1476,7 +1486,7 @@ function findIndexedTraexRollout(
   }
 }
 
-function findTraexRolloutInDateTree(sessionsRoot: string, suffix: string): string | undefined {
+function findTraexRolloutInDateTree(sessionsRoot: string, cliSessionId: string): string | undefined {
   const years = readTraexDirectory(sessionsRoot)
     .filter((entry) => entry.isDirectory() && TRAEX_YEAR_DIR_RE.test(entry.name))
     .sort((a, b) => b.name.localeCompare(a.name));
@@ -1493,9 +1503,12 @@ function findTraexRolloutInDateTree(sessionsRoot: string, suffix: string): strin
       for (const day of days) {
         const dayPath = join(monthPath, day.name);
         const rollout = readTraexDirectory(dayPath)
-          .find((entry) => entry.isFile()
-            && entry.name.startsWith('rollout-')
-            && entry.name.endsWith(suffix));
+          .filter((entry) => entry.isFile() && entry.name.startsWith('rollout-'))
+          // ISO timestamps are embedded in the filename, so descending name
+          // order selects the newest resume segment within one day.
+          .sort((a, b) => b.name.localeCompare(a.name))
+          .find((entry) => traexSessionIdFromRolloutPath(entry.name)?.toLowerCase()
+            === cliSessionId.toLowerCase());
         if (rollout) return join(dayPath, rollout.name);
       }
     }
@@ -1524,7 +1537,9 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
  *
  * TRAE's `threads` table is the authoritative session→path index. Older TRAE
  * versions may not expose `rollout_path`, so lookup degrades to the documented
- * `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` tree. The fallback never
+ * `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` tree. Newer releases may
+ * append `_<first-turn-id>` after the stable sid for a resumed segment. The
+ * fallback never
  * descends into rollout sidecars (`*.artifacts`, `tool-results`,
  * `rollout-blobs`), whose contents cannot be top-level sessions and may span
  * gigabytes. Repeated fallback misses are backed off, while the cheap indexed
@@ -1532,10 +1547,9 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
 export function findTraexRolloutBySessionId(cliSessionId: string): string | undefined {
   if (!cliSessionId) return undefined;
   const sessionsRoot = traeSessionsRoot();
-  const suffix = `-${cliSessionId}.jsonl`;
   const missKey = `${sessionsRoot}\0${cliSessionId.toLowerCase()}`;
 
-  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot, suffix);
+  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot);
   if (indexed) {
     traexRolloutLookupMisses.delete(missKey);
     return indexed;
@@ -1546,7 +1560,7 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
   const miss = traexRolloutLookupMisses.get(missKey);
   if (miss && nowMs < miss.nextFilesystemScanAtMs) return undefined;
 
-  const scanned = findTraexRolloutInDateTree(sessionsRoot, suffix);
+  const scanned = findTraexRolloutInDateTree(sessionsRoot, cliSessionId);
   if (scanned) {
     traexRolloutLookupMisses.delete(missKey);
     return scanned;

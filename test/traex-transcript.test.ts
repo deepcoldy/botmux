@@ -19,6 +19,7 @@ import {
   traexHistoryMatchDelta,
   traexHistorySize,
   traexHistorySidIsOwned,
+  traexSessionIdFromRolloutPath,
 } from '../src/services/traex-transcript.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 
@@ -244,6 +245,15 @@ afterEach(() => {
 });
 
 describe('findTraexRolloutBySessionId', () => {
+  it('extracts the stable session id from legacy and resumed-segment filenames', () => {
+    const resumeTurnId = '00000000-0000-7000-8000-000000000099';
+    expect(traexSessionIdFromRolloutPath(`rollout-2026-06-04T12-00-00-${SID}.jsonl`)).toBe(SID);
+    expect(traexSessionIdFromRolloutPath(
+      `rollout-2026-06-04T12-00-00-${SID}_${resumeTurnId}.jsonl`,
+    )).toBe(SID);
+    expect(traexSessionIdFromRolloutPath('rollout-not-a-session.jsonl')).toBeUndefined();
+  });
+
   it('does not resolve rollout-shaped files inside TRAE sidecar directories', () => {
     const previousTraeHome = process.env.TRAE_HOME;
     const traeHome = join(dir, 'trae-home');
@@ -290,6 +300,37 @@ describe('findTraexRolloutBySessionId', () => {
     }
   });
 
+  it('prefers the indexed resume segment over a stale legacy rollout for the same session', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const legacyDayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '03');
+    const resumedDayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04');
+    const legacyRollout = join(legacyDayDir, `rollout-2026-06-03T12-00-00-${SID}.jsonl`);
+    const resumeTurnId = '00000000-0000-7000-8000-000000000099';
+    const resumedRollout = join(
+      resumedDayDir,
+      `rollout-2026-06-04T12-00-00-${SID}_${resumeTurnId}.jsonl`,
+    );
+    const dbPath = join(traeHome, 'cli', 'state_5.sqlite');
+    mkdirSync(legacyDayDir, { recursive: true });
+    mkdirSync(resumedDayDir, { recursive: true });
+    writeFileSync(legacyRollout, line(user('stale legacy rollout')));
+    writeFileSync(resumedRollout, line(user('active resumed rollout')));
+    const db = openDatabaseSyncNow(dbPath);
+    expect(db).not.toBeNull();
+    db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)');
+    db!.prepare('INSERT INTO threads (id, rollout_path) VALUES (?, ?)').run(SID, resumedRollout);
+    db!.close();
+    process.env.TRAE_HOME = traeHome;
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBe(resumedRollout);
+    } finally {
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
   it('falls back to the canonical date tree when an older threads schema has no rollout_path', () => {
     const previousTraeHome = process.env.TRAE_HOME;
     const traeHome = join(dir, 'trae-home');
@@ -306,6 +347,34 @@ describe('findTraexRolloutBySessionId', () => {
 
     try {
       expect(findTraexRolloutBySessionId(SID)).toBe(rollout);
+    } finally {
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
+  it('finds the newest resumed segment when the threads schema has no rollout_path', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const dayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04');
+    const resumeTurnId = '00000000-0000-7000-8000-000000000099';
+    const legacyRollout = join(dayDir, `rollout-2026-06-04T11-00-00-${SID}.jsonl`);
+    const resumedRollout = join(
+      dayDir,
+      `rollout-2026-06-04T12-00-00-${SID}_${resumeTurnId}.jsonl`,
+    );
+    const dbPath = join(traeHome, 'cli', 'state_5.sqlite');
+    mkdirSync(dayDir, { recursive: true });
+    writeFileSync(legacyRollout, line(user('stale legacy rollout')));
+    writeFileSync(resumedRollout, line(user('active resumed rollout')));
+    const db = openDatabaseSyncNow(dbPath);
+    expect(db).not.toBeNull();
+    db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY)');
+    db!.close();
+    process.env.TRAE_HOME = traeHome;
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBe(resumedRollout);
     } finally {
       if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
       else process.env.TRAE_HOME = previousTraeHome;
