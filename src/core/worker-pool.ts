@@ -2,7 +2,8 @@ import { trackStartingCardPublication } from './starting-card-publication.js';
 import { privateReplyEnabled } from './private-reply.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
-import { getMessageDetail as getTopicMessageDetail, uploadImage } from '../im/lark/client.js';
+import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
+import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
@@ -50,7 +51,7 @@ import {
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { appendTurnTerminalReceiptToCard, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
+import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -99,7 +100,6 @@ import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import {
-  buildMarkdownCard,
   buildCanonicalFinalReplyCard,
   buildContextualReplyCard,
   type CardUsageSnapshot,
@@ -135,7 +135,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
@@ -676,9 +676,9 @@ import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../ser
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
-import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
+import { readBotsInfoJson } from '../services/bots-info-cache.js';
 import {
   claimQuotaFallbackEvent,
   resolveQuotaFallbackTarget,
@@ -687,7 +687,6 @@ import type {
   CliTurnPayload,
   CodexAppDeliverySink,
   CodexAppDispatchLedgerEntry,
-  CodexAppGenerationCommit,
   CodexAppTurnInput,
   FrozenSessionReplyTarget,
   DaemonToWorker,
@@ -1359,13 +1358,19 @@ async function patchTurnTerminalCarrier(
   const detail = await getTopicMessageDetail(ds.larkAppId, messageId, { userCardContent: true });
   const cardJson = messageCardContent(detail, ds.chatId);
   if (!cardJson) return false;
-  const patched = appendTurnTerminalReceiptToCard(
-    cardJson,
-    kind,
-    localeForBot(ds.larkAppId),
+  const footer = buildTurnTerminalFooterPatch(cardJson, kind, localeForBot(ds.larkAppId));
+  if (!footer) return false;
+  const cardId = await resolveCardKitId(ds.larkAppId, messageId);
+  // Ordinary send cards have no CardKit stream writes. Use one stable operation
+  // across retries; a card with a conflicting sequence falls back to the strip
+  // rather than rewriting its (potentially normalized) answer body.
+  const uuid = `trf_${createHash('sha256')
+    .update(`${ds.larkAppId}\0${messageId}\0${kind}`)
+    .digest('hex').slice(0, 47)}`;
+  await patchCardStreamElement(
+    ds.larkAppId, cardId, REPLY_CARD_FOOTER_ELEMENT_ID,
+    footer, 1, uuid, messageId,
   );
-  if (!patched) return false;
-  await updateMessage(ds.larkAppId, messageId, patched);
   return true;
 }
 
@@ -2749,12 +2754,10 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
   const crossRef = readPeerCrossRef(dataDir, larkAppId);
 
-  let botEntries: BotMentionEntry[] = [];
-  const botInfoPath = join(dataDir, 'bots-info.json');
-  if (existsSync(botInfoPath)) {
-    const parsed = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
-    if (Array.isArray(parsed)) botEntries = parsed as BotMentionEntry[];
-  }
+  // Runs on every turn's final output; the cached read only re-parses when
+  // a sibling daemon actually rewrote bots-info.json.
+  const parsed = readBotsInfoJson(dataDir);
+  const botEntries: BotMentionEntry[] = Array.isArray(parsed) ? parsed as BotMentionEntry[] : [];
 
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
@@ -8152,6 +8155,8 @@ type DocCommentReplyTarget = {
   replyToName?: string;
   replyId?: string;
   reactionId?: string;
+  reactionType?: string;
+  reactionIdentity?: 'tenant' | 'user';
 };
 
 function persistedDocCommentTarget(
@@ -8176,6 +8181,8 @@ function resolveDocCommentTarget(
     ...memory,
     replyId: memory.replyId ?? persisted.replyId,
     reactionId: memory.reactionId ?? persisted.reactionId,
+    reactionType: memory.reactionType ?? persisted.reactionType,
+    reactionIdentity: memory.reactionIdentity ?? persisted.reactionIdentity,
   };
 }
 
@@ -8201,8 +8208,12 @@ function collectDocCommentReactionTargets(
 ): DocCommentReplyTarget[] {
   const unique = new Map<string, DocCommentReplyTarget>();
   const add = (target: DocCommentReplyTarget): void => {
-    if (!target.replyId || !target.reactionId) return;
-    const key = `${target.fileToken}\0${target.commentId}\0${target.replyId}\0${target.reactionId}`;
+    // Old persisted targets may contain only replyId because update_reaction
+    // succeeded with its documented empty response. Such pending targets still
+    // own the legacy Typing indicator and must be cleaned during close.
+    const reactionType = target.reactionType ?? (target.replyId ? 'Typing' : undefined);
+    if (!target.replyId || !reactionType) return;
+    const key = `${target.fileToken}\0${target.commentId}\0${target.replyId}\0${reactionType}\0${target.reactionIdentity ?? ''}`;
     unique.set(key, target);
   };
   if (ds?.docCommentTurns) {
@@ -8810,11 +8821,12 @@ export async function closeSession(
           { fileToken: target.fileToken, fileType: target.fileType },
           target.commentId,
           target.replyId!,
-          target.reactionId!,
+          target.reactionType ?? 'Typing',
+          { identity: target.reactionIdentity },
         );
       } catch (err: any) {
         logger.debug(
-          `[doc-comment] close cleanup could not remove reaction ${target.reactionId}: ${err?.message ?? err}`,
+          `[doc-comment] close cleanup could not remove reaction ${target.reactionType ?? 'Typing'}: ${err?.message ?? err}`,
         );
       }
     }
@@ -10389,13 +10401,11 @@ export async function transferSession(
   const oldAnchor = sessionAnchorId(ds);
   const oldRuntimeKey = activeSessionKey(ds);
   const oldChatId = ds.chatId;
-  const oldStreamCardId = ds.streamCardId;
   const sourcePinnedStreamingTargets = captureLifecycleStreamingCardCleanupTargets(
     ds.larkAppId,
     ds.chatId,
     ds,
   );
-  const oldCurrentImageKey = ds.currentImageKey;
 
   // Scratch/store cleanup above awaited. A fresh source turn may have been
   // admitted during that window; recheck the durable dispatch ledger in the
@@ -10533,7 +10543,7 @@ export async function transferSession(
       });
   }
 
-  // forkWorker with resume=true — TmuxBackend.spawn detects the surviving
+  // forkWorker with resume=true — the tmux backend detects the surviving
   // `bmx-<sessionId>` session and re-attaches instead of creating a new one.
   if (
     ds.session.status === 'active'
@@ -11280,33 +11290,6 @@ function clearQueuedActivationJournal(session: Session): void {
   session.queuedCodexAppText = undefined;
   session.queuedCodexAppMessageContext = undefined;
   session.pendingRepoSetup = undefined;
-}
-
-/** A worker disappeared before the exact activation ACK. Re-park non-Codex
- * work from the retained exact input; ACK loss may duplicate, but N can never
- * be silently replaced by a later inbound turn in the same daemon lifetime. */
-function reparkUnsubmittedQueuedActivation(ds: DaemonSession, reason: string): boolean {
-  if (!ds.session.queuedActivationPending
-    || !ds.session.queuedActivationToken
-    || ds.session.cliId === 'codex-app') return false;
-  ds.session.queued = true;
-  ds.session.queuedActivationPending = undefined;
-  ds.session.queuedActivationToken = undefined;
-  ds.initialStartPending = false;
-  ds.initialStartClaimToken = undefined;
-  ds.pendingPrompt ??= ds.session.queuedPrompt;
-  try {
-    sessionStore.updateSession(ds.session);
-  } catch (err) {
-    // Memory remains explicitly parked while the old durable marker still
-    // provides restart recovery on disk.
-    logger.error(
-      `[${tag(ds)}] Failed to persist queued activation re-park after ${reason}: `
-      + `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  logger.warn(`[${tag(ds)}] Re-parked unacknowledged queued activation after ${reason}`);
-  return true;
 }
 
 type AcceptedWorkerForkDispatch = {
@@ -14892,7 +14875,21 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
           break;
         }
-        restartCoordinator.resolve(ds.session.sessionId, msg.attemptId, msg.status);
+        const restartSettled = restartCoordinator.resolve(
+          ds.session.sessionId,
+          msg.attemptId,
+          msg.status,
+        );
+        // requestSessionRestart() fences the live generation by clearing
+        // workerReady before asking the worker to respawn its CLI in place. An
+        // in-worker respawn does not emit the process-level `ready` message
+        // again, so the matching successful receipt is the authoritative edge
+        // that must release that fence. Without this assignment the terminal
+        // can be prompt-ready/idle while relay and fork remain permanently
+        // blocked as `worker_busy`.
+        if (restartSettled && msg.status === 'succeeded') {
+          ds.workerReady = true;
+        }
         break;
       }
 
@@ -14955,6 +14952,13 @@ function setupWorkerHandlers(
         }
         ds.activeModel = model;
         ds.activeReasoningEffort = reasoningEffort;
+        if (ds.session.dispatchLaunchSpec && model) {
+          ds.session.dispatchLaunchSpec.effectiveRuntime = {
+            model, ...(reasoningEffort ? { reasoningEffort } : {}),
+            workerGeneration, observedAt: new Date().toISOString(),
+          };
+          sessionStore.updateSession(ds.session);
+        }
         scheduleActiveRuntimePatch(ds);
         break;
       }
@@ -15565,89 +15569,6 @@ function setupWorkerHandlers(
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
         scheduleCardPatch(ds, cardJson, msg.turnId);
-        break;
-      }
-
-      case 'tui_prompt': {
-        // AI detected an interactive TUI prompt — post card to thread
-        if (!ownsLifecycleMutation()) {
-          logger.info(`[${t}] Ignored TUI prompt from stale worker generation`);
-          break;
-        }
-        // Dedup across both posted and in-flight/cardless prompt state.
-        if (hasTuiPromptAuthority(ds)) {
-          logger.debug(`[${t}] TUI prompt card already posted, skipping duplicate`);
-          break;
-        }
-        logger.info(`[${t}] TUI prompt detected: ${msg.description}${msg.multiSelect ? ' (multi-select)' : ''}`);
-        emitSessionLifecycleHook(ds, 'session.requires_attention', {
-          reason: 'tui_prompt',
-          description: msg.description,
-          optionsCount: msg.options.length,
-          optionsPreview: msg.options.slice(0, 5).map(option => ({
-            text: option.text,
-            label: option.label,
-            type: option.type,
-            selected: option.selected,
-          })),
-          multiSelect: msg.multiSelect,
-        });
-        // Card-only turn label. The dashboard's title is the canonical
-        // session.title; publishing this prompt description as `patch.title`
-        // would temporarily overwrite a user-issued /rename until refresh.
-        ds.currentTurnTitle = msg.description;
-        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-          logger.info(`[${t}] Managed/silent turn — TUI prompt kept in lifecycle audit only`);
-          break;
-        }
-        // Document-native sessions have no Lark chat/thread destination. Keep
-        // the lifecycle audit/title above, but never send a card to their
-        // internal `doc:<token>` routing anchor.
-        if (isDocNativeSession(ds)) {
-          logger.info(`[${t}] Doc-native session — suppressing TUI prompt card`);
-          break;
-        }
-        // The array identity acts as this prompt's in-memory ownership token.
-        // Clearing/replacing the prompt changes it, so a late card POST cannot
-        // reclaim authority after prompt_ready, worker exit, or replacement.
-        // Cardless silent/document prompts deliberately never occupy this slot.
-        const promptOptions = msg.options;
-        ds.tuiPromptOptions = promptOptions;
-        ds.tuiPromptMultiSelect = msg.multiSelect;
-        ds.tuiToggledIndices = [];
-        ds.tuiPromptProcessing = false;
-        try {
-          const cardJson = buildTuiPromptCard(
-            sessionAnchorId(ds),
-            ds.session.sessionId,
-            msg.description,
-            msg.options,
-            msg.multiSelect,
-            undefined,
-            loc,
-          );
-          const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
-          const stillOwnsLifecycle = ownsLifecycleMutation();
-          if (!stillOwnsLifecycle || ds.tuiPromptOptions !== promptOptions) {
-            const terminalCard = stillOwnsLifecycle
-              ? buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, loc), loc)
-              : buildTuiPromptFailedCard(tr('worker.tui_submit_failed', {
-                cliName: sessionCliDisplayName(ds, botCfg),
-              }, loc), loc);
-            updateMessage(handlerLarkAppId, cardMsgId, terminalCard).catch(err =>
-              logger.debug(`[${t}] Failed to resolve late TUI prompt card: ${err}`),
-            );
-            break;
-          }
-          ds.tuiPromptCardId = cardMsgId;
-          publishAttentionPatch(ds);
-        } catch (err) {
-          logger.warn(`[${t}] Failed to post TUI prompt card: ${err}`);
-          if (ownsLifecycleMutation() && ds.tuiPromptOptions === promptOptions) {
-            clearTuiPromptAuthority(ds);
-            publishAttentionPatch(ds);
-          }
-        }
         break;
       }
 
@@ -16283,6 +16204,9 @@ function setupWorkerHandlers(
           break;
         }
         const prior = ds.session.remoteBackendState;
+        const rebuildGenerationAdvanced = startupState.onRemoteBackendStartupExit !== undefined
+          && prior !== undefined
+          && state.generation > prior.generation;
         if (prior && state.provider !== prior.provider) {
           logger.error(`[${t}] Ignored remote backend state from a different provider`);
           break;
@@ -16308,7 +16232,13 @@ function setupWorkerHandlers(
           // RemoteRunnerBackend publishes its normalized ready state before
           // firing onReady. For an explicit rebuild this is the durable proof
           // that the provider crossed its second (backend) startup boundary.
-          startupState.onRemoteBackendStartupExit = undefined;
+          // onBackendState immediately replays the CONSTRUCTOR'S initial state
+          // when the callback is registered. That same-generation replay is not
+          // provider readiness and must not disarm rollback: otherwise a child
+          // exit during resume leaves the Session ghost-active with no backend.
+          if (rebuildGenerationAdvanced) {
+            startupState.onRemoteBackendStartupExit = undefined;
+          }
         } catch (err) {
           ds.session.remoteBackendState = prior;
           ds.session.remoteRunnerUsage = priorUsage;
@@ -16904,7 +16834,7 @@ function setupWorkerHandlers(
         }
         // Daemon-owned auto terminal state for ordinary Lark turns in the
         // legacy/send UI. The presentation follows the last visible carrier:
-        //   1. standard BotMux reply card -> read back + PATCH in place;
+        //   1. standard BotMux reply card -> PATCH only its footer element;
         //   2. no visible body -> PATCH the existing streaming card only;
         //   3. file/voice/custom card -> append the compact terminal strip.
         // This never depends on the model remembering a final send. A bare
@@ -18558,14 +18488,16 @@ function deliverFinalOutput(
         // reaction must never retry and duplicate the document comment.
         consumeDocCommentTurn(ds, msg.turnId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-        if (docTurn.reactionId && docTurn.replyId) {
+        const reactionType = docTurn.reactionType ?? (docTurn.replyId ? 'Typing' : undefined);
+        if (reactionType && docTurn.replyId) {
           try {
             await removeCommentReaction(ds.larkAppId,
               { fileToken: docTurn.fileToken, fileType: docTurn.fileType },
-              docTurn.commentId, docTurn.replyId, docTurn.reactionId);
+              docTurn.commentId, docTurn.replyId, reactionType,
+              { identity: docTurn.reactionIdentity });
           } catch (err: any) {
             logger.debug(
-              `[doc-comment] failed to remove completed reaction ${docTurn.reactionId}: ${err?.message ?? err}`,
+              `[doc-comment] failed to remove completed reaction ${reactionType}: ${err?.message ?? err}`,
             );
           }
         }
@@ -19176,7 +19108,6 @@ export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_bindPreparedGroupContextWorker = bindPreparedGroupContextWorker;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
-export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
@@ -19202,7 +19133,6 @@ function commitGroupContextDispatch(ds: DaemonSession, payload: CliTurnPayload, 
     logger.warn(`[${tag(ds)}] group-context dispatch commit skipped: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
-export const __testOnly_commitGroupContextDispatch = commitGroupContextDispatch;
 
 /** Prompt assembly can precede reservation. Bind only at this real execution
  * boundary so a replacement never inherits another worker's pending outputs. */

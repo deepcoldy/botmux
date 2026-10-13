@@ -3,7 +3,6 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { globalConfigPath } from '../src/global-config.js';
-import { config } from '../src/config.js';
 import {
   isCardBrandLabelEnabled,
   registerBot,
@@ -47,29 +46,29 @@ describe('cardBrandLabel — global footer-brand switch', () => {
     } as any);
   }
 
-  describe('config.cardBrandLabelEnabled getter (default ON)', () => {
+  describe('isCardBrandLabelEnabled() global switch (default ON)', () => {
     it('is ON with no config file', () => {
-      expect(config.cardBrandLabelEnabled).toBe(true);
+      expect(isCardBrandLabelEnabled()).toBe(true);
     });
 
     it('is ON when the dashboard block/key is absent', () => {
       writeDashboard({ codexRpcInput: true });
-      expect(config.cardBrandLabelEnabled).toBe(true);
+      expect(isCardBrandLabelEnabled()).toBe(true);
     });
 
     it('is ON when explicitly true', () => {
       writeDashboard({ cardBrandLabel: true });
-      expect(config.cardBrandLabelEnabled).toBe(true);
+      expect(isCardBrandLabelEnabled()).toBe(true);
     });
 
     it('is OFF only when explicitly persisted false', () => {
       writeDashboard({ cardBrandLabel: false });
-      expect(config.cardBrandLabelEnabled).toBe(false);
+      expect(isCardBrandLabelEnabled()).toBe(false);
     });
 
     it('ignores a non-boolean value and stays ON', () => {
       writeDashboard({ cardBrandLabel: 'off' });
-      expect(config.cardBrandLabelEnabled).toBe(true);
+      expect(isCardBrandLabelEnabled()).toBe(true);
     });
   });
 

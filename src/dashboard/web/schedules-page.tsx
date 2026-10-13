@@ -92,6 +92,7 @@ const SCHEDULE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ul
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
 const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
 const MAX_SCHEDULE_TARGET_CHATS = 5;
+const SCHEDULE_TOPIC_TITLE_RUNTIME_TEMPLATE = /\{\{owner\}\}|\{\{date(?::[+-]\d+d)?\}\}/;
 const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f /srv/my-service/ready.flag; then
   printf '1\n'
 else
@@ -1786,6 +1787,7 @@ export function ScheduleFormModal(props: {
   const [touched, setTouched] = useState(false);
   const [scheduleTouched, setScheduleTouched] = useState(false);
   const localDelivery = editing?.deliver === 'local';
+  const hasDynamicTopicTitle = SCHEDULE_TOPIC_TITLE_RUNTIME_TEMPLATE.test(topicTitle);
 
   useEffect(() => {
     if (!open || !larkAppId) return;
@@ -2754,8 +2756,12 @@ export function ScheduleFormModal(props: {
             <small className="schedule-form-help">{tr('schedules.form.silentHelp')}</small>
           </span>
         </label>
-        {executionPosition === 'new-topic' && silent ? (
-          <p className="schedule-form-help">{tr('schedules.form.silentNewTopicConflict')}</p>
+        {(executionPosition === 'new-topic' || executionPosition === 'task') && silent ? (
+          <p className="schedule-form-help">
+            {tr(hasDynamicTopicTitle
+              ? 'schedules.form.silentDynamicTitleConflict'
+              : 'schedules.form.silentNewTopicConflict')}
+          </p>
         ) : null}
         <fieldset className="schedule-calendar-fields">
           <legend className="schedule-form-label">{tr('schedules.form.calendar')}</legend>

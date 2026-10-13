@@ -75,8 +75,6 @@ export const messages: Record<string, string> = {
   'card.status.waiting_screenshot': '_(Waiting for first screenshot…)_',
   'card.status.screenshot_unavailable': '_(No screenshot is available. Refresh after the session resumes.)_',
   'card.status.truncated_prefix': '… (truncated)',
-  'card.pending.detoured_title': 'Sent',
-  'card.pending.detoured_body': 'The final reply was sent to another target.',
 
   // ─── Card body text ──────────────────────────────────────────────────────
   'card.body.cli_terminated': '{cliName} process has exited.',
@@ -123,8 +121,6 @@ export const messages: Record<string, string> = {
   'card.repo.worktree_rolled_back': 'Worktree creation failed on {repo}: {error}. Rolled back {count} worktree(s) already created in this batch.',
   'card.repo.toast_worktree_creating': 'Creating worktree — will post in the thread when done…',
 
-  // Platform team hall check-in (bot-only group, visible to bots only)
-  'platform.hall_announce': '🤖 Team check-in: this bot is online (registers its union_id, no reply needed)',
 
   // In-group authorization card
   'card.grant.title': '🔑 Access Request',
@@ -215,11 +211,7 @@ export const messages: Record<string, string> = {
 
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 Choose a CLI session to adopt',
-  'card.adopt.placeholder_select': 'Pick a CLI session',
   'card.adopt.uptime_unknown': 'unknown',
-  'card.adopt.section_live': '**Take over a running session** (observe a live tmux / herdr / zellij process)',
-  'card.adopt.section_resume': '**Resume a past session** (import from disk via --resume; no live process needed)',
-  'card.adopt.placeholder_resume': 'Pick a past session to resume',
   // V2 picker (search + card list + pagination), replacing the two dropdowns.
   'card.adopt.search_placeholder': '🔍 Search sessions (title / project / path)',
   'card.adopt.empty': 'No sessions available to adopt.\n(Running: local CLIs live in tmux / zellij / herdr; History: sessions of this bot’s CLI resumable from disk.)',
@@ -282,7 +274,6 @@ export const messages: Record<string, string> = {
   'card.relay.title': '📋 Pick a session to relay into this chat',
   'card.relay.title_p2p': '📋 Pick a session to relay into this DM',
   'card.relay.empty': 'No relayable sessions.\n(Only your **active** sessions on this bot are listed — including DMs (shown as "direct message"); closed sessions do not appear.)',
-  'card.relay.btn_pull': 'Pull into this chat',
   'card.relay.btn_confirm': 'Confirm relay into this chat',
   'card.relay.btn_confirm_p2p': 'Confirm relay into this DM',
   'card.relay.btn_confirm_running': 'Session is running — cannot relay yet',
@@ -292,12 +283,10 @@ export const messages: Record<string, string> = {
   'card.relay.selected_tag': 'selected',
   'card.relay.hint_pick_first': 'Tap any session above to select it, then press Confirm to relay.',
   'card.relay.search_placeholder': '🔍 Search sessions (title / chat / path; try "dm" for direct messages)',
-  'card.relay.btn_search': 'Search',
   'card.relay.btn_prev_page': '← Prev',
   'card.relay.btn_next_page': 'Next →',
   'card.relay.page_indicator': 'Page {current} / {total}',
   'card.relay.empty_filtered': 'No sessions match "{query}". Try a different keyword.',
-  'card.relay.placeholder_select': 'Pick a session to relay',
   'card.relay.type_group': 'group chat',
   'card.relay.type_topic': 'topic chat',
   'card.relay.type_p2p': 'direct message',
@@ -308,7 +297,6 @@ export const messages: Record<string, string> = {
   'card.relay.toast_not_found': 'Session not found or already closed.',
   'card.relay.toast_not_owner': 'Only the session owner can relay it.',
   'card.relay.toast_not_invoker': 'This menu was summoned by someone else. Run /relay yourself to get your own.',
-  'card.relay.toast_worker_busy': '⚠️ The session is mid-turn. Wait for it to go idle, then relay.',
   'card.relay.toast_not_started_yet': '⚠️ The session has not picked a repo yet, so the CLI never started. Pick a repo in the source chat first.',
   'card.relay.toast_same_chat': 'That session is already at the target location (same topic/chat) — nothing to relay.',
   'card.relay.toast_failed': 'Relay failed: {error}',
@@ -321,7 +309,6 @@ export const messages: Record<string, string> = {
   'card.relay.fail_timeout': '⚠️ Relay timed out before completing. The session is still where it was — nothing was lost; its Lark history and AI memory remain in the source. Wait a moment, then click "Confirm relay" again to retry.',
   'card.relay.fail_worker_busy': '⚠️ Relay did not complete: the session is mid-turn. It is still where it was and was not lost — wait for it to go idle, then click "Confirm relay" again.',
   'card.relay.fail_generic': '⚠️ Relay did not complete ({error}). The session is still where it was — nothing was lost; its Lark history and AI memory remain in the source. Please click "Confirm relay" again to retry.',
-  'card.relay.toast_target_has_session': 'This chat already has an active session for the bot. Please /close it first, then relay.',
   'cmd.relay.target_has_session_msg': '⚠️ This bot already has an active session "{title}" in this chat. Please /close it first, then relay a new one in.',
   'card.relay.toast_success': '✅ Relayed into this chat',
 
@@ -436,13 +423,9 @@ export const messages: Record<string, string> = {
   'cmd.close.worktree_check_ahead_ok': '✅ Unpushed commits: none',
   'cmd.close.worktree_check_ahead_warn': '⚠️ Unpushed commits: {n}',
   'cmd.close.worktree_effect_safe': 'This worktree is clean; removing it will not lose any code.',
-  'cmd.close.worktree_confirm_risky': '⚠️ About to close sessions and remove this worktree:\n- Other active sessions sharing it: {count}\n- Uncommitted changes: {dirty}\n- Unpushed commits: {ahead}\nTo continue, send `/close wt --yes`.',
-  'cmd.close.worktree_confirm_shared': '⚠️ {count} active session(s) are also using this worktree. To close them all and remove the worktree, send `/close wt --yes`.',
   'cmd.close.worktree_sibling_close_failed': '⚠️ The current session was closed, but {count} other session(s) using `{path}` could not be closed. The worktree was not removed; retry from a remaining session after its owner daemon recovers.',
   'cmd.close.worktree_remove_failed': '⚠️ Session closed, but failed to remove worktree `{path}`: {error}',
-  'cmd.cd.riff_unsupported': '⚠️ Riff sessions cannot switch working directory or role in place. Use /close to close the current remote session, then create one from the new directory.',
   'cmd.cd.remote_unsupported': '⚠️ Remote-backend sessions (Riff / Mojo) cannot switch working directory or role in place. Use /close to close the current remote session, then create one from the new directory.',
-  'cmd.takeover.riff_unsupported': '⚠️ Riff sessions cannot adopt or import another session in place. Use /close to safely close the current remote session, then create or import a session.',
   'cmd.takeover.remote_unsupported': '⚠️ Remote-backend sessions (Riff / Mojo) cannot adopt or import another session in place. Use /close to safely close the current remote session, then create or import a session.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
   'cmd.cd.switched': 'Working directory switched to {path}. It will resume there on your next message.',
@@ -562,7 +545,6 @@ export const messages: Record<string, string> = {
   'cmd.watch.started': '✅ Now watching comments on doc {title}… ({mode}).\nComments feed into this session and AI replies go back into the original comment thread.',
   'cmd.watch.started_moved': '✅ Now watching comments on doc {title}… ({mode}).\n⚠️ This doc was bound to another session and is now rebound to this one.',
   'cmd.watch.started_lazy': '✅ Registered a comment watch for doc {title}… ({mode}).\nNo session is bound yet. Botmux will create a doc-native session and start the CLI when the first matching comment arrives.',
-  'cmd.watch.deferred_start': 'No CLI is currently running. Botmux will start the session automatically when the first matching doc comment arrives.',
   'cmd.watch.prewarming': 'Starting and warming the AI session now: it will read the document, build meeting context, and then wait for comments.',
   'cmd.watch.project_optional_session': 'No project is bound to this session. To use local code in answers, send `/cd <project directory>`; otherwise Botmux will answer from the document only.',
   'cmd.watch.project_optional_lazy': 'No project is bound to this watch. It will answer from the document only; rerun with `--dir <project directory>` if local code is needed.',
@@ -594,7 +576,6 @@ export const messages: Record<string, string> = {
   'daemon.doc_mention_notify_body': 'User {requester} mentioned the bot in doc {token} and triggered a reply.',
   'daemon.doc_dropped_notify_title': '⚠️ Doc comment event not handled',
   'daemon.doc_dropped_notify_body': "Bot could not read or handle {requester}'s comment event in doc {token}; no reply was produced. A failure marker will be left on that comment so they know to resend.",
-  'daemon.doc_comment_reply_prefix': '↪ Reply to {author}: ',
   'cmd.adopt.already_adopted': 'This topic is already adopting {label} ({pane}).\nClick "Disconnect" on the card first, then run /adopt again (the original CLI is untouched).',
   'cmd.adopt.no_sessions': 'No adoptable CLI session found.',
   'cmd.adopt.pane_not_found': 'tmux pane not found: {pane}',
@@ -707,7 +688,6 @@ export const messages: Record<string, string> = {
   'card.config.sec.card': '🎴 Card behavior',
   'card.config.sec.autostart': '🚀 Auto-start',
   'card.config.sec.security': '🔒 Security & grants',
-  'card.config.quota_label': 'Msg quota',
   'card.config.quota_off': 'Default: grant card 3 / Oncall unmetered',
   'card.config.quota_value': 'Current: {quota} messages per person on grant cards (Oncall unmetered)',
   'card.config.quota_edit': 'Set message quota',
@@ -747,7 +727,6 @@ export const messages: Record<string, string> = {
   'card.config.lbl_startup': 'Startup commands (auto-sent after launch, before the first message; comma/newline separated, args allowed, e.g. /effort ultracode)',
   'card.config.lbl_role': 'Default role (team, cross-chat)',
   'card.config.save': '💾 Save',
-  'card.config.back': '⬅ Back to config',
   'card.config.text_saved': '✓ Saved',
   'card.config.text_sent': '✏️ Text-fields card sent to your DM ↓',
   'card.config.text_send_fail': '⚠️ Send failed (you may not have a 1:1 with this bot yet)',
@@ -788,7 +767,6 @@ export const messages: Record<string, string> = {
   'cmd.relay.not_owner': '⚠️ Only the original session owner can /relay --create this session to a new group.',
   'cmd.relay.adopt_not_relayable': '⚠️ This session was attached via /adopt to an external tmux. The CLI runs on your machine and botmux does not control its tmux lifecycle, so it cannot be relayed.',
   'cmd.relay.not_started_yet': '⚠️ The session has not picked a repo and the CLI has never started — nothing to relay yet. Pick a repo in this session first.',
-  'cmd.relay.worker_busy': '⚠️ The session is mid-turn (working). Wait for the current turn to finish (idle), then try /relay again.',
   'cmd.relay.resolve_failed': '⚠️ Could not resolve the @-mentioned bots; /relay cancelled. Please retry shortly.',
   'cmd.relay.m1_announce': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\n@ the corresponding bot to continue.',
   'cmd.relay.m1_announce_dm': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\nJust send a message to continue.',
@@ -855,7 +833,6 @@ export const messages: Record<string, string> = {
   'schedule.position_top_level': 'Execution position: group top level (session shape follows the regular-group mode)',
   'schedule.position_topic': 'Execution position: inside the current topic',
   'schedule.silent_note': 'Silent mode: fires post no "started" banner; the model only sends (botmux send) when the alert condition is met, otherwise stays fully silent',
-  'schedule.silent_new_topic_conflict': 'A silent fresh topic is deferred: no alert closes the hidden session, and the first botmux send creates and binds the topic.',
   'schedule.parse_failed': 'Cannot parse schedule. Use a natural-language form:\n\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report\n/schedule hourly check service health\n/schedule every 30 minutes ping the service\n/schedule 1st of each month 9:00 generate monthly report\n\nManagement:\n/schedule list — list all tasks\n/schedule remove <id> — delete a task\n/schedule enable <id> — enable a task\n/schedule disable <id> — disable a task\n/schedule run <id> — run once now',
 
   // ─── /help ───────────────────────────────────────────────────────────────
@@ -937,7 +914,6 @@ export const messages: Record<string, string> = {
   'help.config_set': '/botconfig set <field> <value>  - Change model/cli/lang/toggles; /botconfig help for all fields',
   'help.skills': '/skills ...    - View/manage this bot\'s skill policy (attach/detach require owner)',
   'help.reply_mode': '/reply-mode [status|chat|chat-topic|topic|new-topic] - Show/change regular-group or DM reply/session mode',
-  'help.substitute': '/substitute [status|on|off] - Show/change substitute mode for this group',
   'help.heading_group': '🆕 One-shot session group:',
   'help.group': '/group <name>  (alias /g)  - Auto-create a group and invite you (the whole group = one CLI session)',
   'help.project': '/project enable|status|disable - Enable, inspect, or leave project-group mode in this ordinary group (owner only)',
@@ -1060,6 +1036,12 @@ export const messages: Record<string, string> = {
   // or it would conflict with http_response_mode again.
   'ai.followup.reminder_no_transport': 'This turn is a program-driven request/response: your entire reply is returned verbatim to the caller, not shown in any chat. Just follow the <botmux_http_response_mode> instructions in this turn\'s content; do not call botmux send, do not post to Feishu/Lark.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
+  // Cursor moves a shell command that outlives its wait limit into a background
+  // task; when it completes Cursor injects a synthetic user prompt ("Briefly
+  // inform the user about the task result…") and starts a new turn. That is not
+  // a Lark message and botmux cannot intercept it (#1504) — prompt-level only.
+  'ai.cursor.background_task_note': 'Cursor turns a shell command that outlives its wait limit into a background task; when it completes, Cursor injects a synthetic prompt like "Briefly inform the user about the task result and perform any follow-up actions" and starts a new turn — that is NOT a new message from the Lark user. When you receive it: if the result is already covered by an earlier reply or carries nothing new for the user, do not `botmux send` again — make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`; only send one progress message when the result is genuinely new information (e.g. the final verdict of a build/test). Prefer waiting for commands synchronously (raise the wait limit as needed) instead of letting them fall into the background.',
+  'ai.cursor.background_task_note_transcript': 'Cursor turns a shell command that outlives its wait limit into a background task; when it completes, Cursor injects a synthetic prompt like "Briefly inform the user about the task result and perform any follow-up actions" and starts a new turn — that is NOT a new message from the Lark user. When you receive it: if the result is already covered by an earlier reply or carries nothing new for the user, make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`; only answer briefly when the result is genuinely new information (e.g. the final verdict of a build/test). Prefer waiting for commands synchronously (raise the wait limit as needed) instead of letting them fall into the background.',
   'ai.bridge.attachments_label': '[Attachments]',
   'ai.bridge.mentions_label': '[@Mentions]',
 
@@ -1164,10 +1146,8 @@ export const messages: Record<string, string> = {
   'card.action.takeover_retired': '⚠️ The old "Take Over" button is retired. In bridge mode, botmux bridges the original CLI so replies still come back to Lark — no takeover needed. Full takeover (`/adopt --takeover`) is on the roadmap.',
   'card.action.terminal_not_ready': '⚠️ Terminal is not ready yet, please try again shortly.',
   'card.action.terminal_unsupported': '⚠️ This session backend does not provide a Web Terminal. For ZMX, run `botmux list` or `zmx attach` locally.',
-  'card.action.local_terminal_opened': '💻 Requested opening local {cliName}.',
   'card.action.local_terminal_unsupported': '⚠️ This {cliName} session cannot be opened locally yet. Use a terminal access method supported by this backend.',
   'card.action.local_cli_missing': '⚠️ Could not find the local {cliName} executable ({executable}). Install it or configure PATH / cliPathOverride.',
-  'card.action.local_terminal_failed': '⚠️ Failed to open local CLI: {reason}',
   'card.action.local_terminal_no_permission': '🔒 You do not have operate permission, so you cannot open the local CLI.',
   'card.action.local_cli_opened': 'Opening local {cliName}.',
   'card.action.local_cli_disabled': '⚠️ Native CLI opening is off by default. Enable it explicitly in settings first.',
@@ -1206,7 +1186,6 @@ export const messages: Record<string, string> = {
   'card.action.close_residual_local': 'The session was closed locally and the remote session was cancelled, but a credentialed local subprocess may still be running ({taskId}). Inspect the host process manually.',
   'card.action.no_output': '(no output yet)',
   'card.action.tui_select_title': 'Select options',
-  'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
   'card.action.tui_ipc_failed': '⚠️ The TUI action was not sent; the worker may be unavailable. Please try again.',
   'card.action.continue_using_current_repo': 'Keeping current repo: {cwd}',
@@ -1273,52 +1252,7 @@ export const messages: Record<string, string> = {
   'card.action.continue_turn_success': '▶️ Asked the CLI to inspect the current state and resume from where it stopped. Waiting for execution.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
-  'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',
-  'setup.lark_permissions_required': 'Permissions to grant:',
-  'setup.lark_perm_im_message': '  - im:message (send/receive messages)',
-  'setup.lark_perm_group_at_msg': '  - im:message.group_at_msg (group messages)',
-  'setup.lark_perm_resource': '  - im:resource (file download)',
-  'setup.lark_perm_chat': '  - im:chat (group info)',
-  'setup.lark_perm_user_base': '  - contact:user.base:readonly (user info)',
-  'setup.lark_enable_events': 'Enable Event Subscription (WebSocket mode):',
-  'setup.prompt_cli_choice': 'CLI adapter [1]: ',
-  'setup.prompt_working_dir': 'Default working directory [~]: ',
-  'setup.prompt_allowed_users': 'Allowed users (emails / mobiles / open_ids, comma-separated; empty = no restriction): ',
-  'setup.prompt_lang': 'UI language [zh/en, default en]: ',
-  'setup.section_lark_app_config': '── Lark app config ──',
-  'setup.section_reconfigure': '── Reconfigure ──',
-  'setup.section_add_new_bot': '── Add new bot ──',
-  'setup.config_written': '✅ Config written: {path}',
-  'setup.next_step': 'Next:',
-  'setup.next_step_short': 'Next: botmux restart',
-  'setup.next_start_daemon': '  1. botmux start              start the daemon (required before Lark long-poll connects)',
-  'setup.next_autostart': '  2. botmux autostart enable   enable on-boot autostart (recommended: {platformName}; no sudo)',
-  'setup.platform_mac': 'macOS launchd',
-  'setup.platform_linux': 'Linux user systemd',
-  'setup.platform_windows': 'Windows Task Scheduler',
-  'setup.platform_other': 'current platform not supported',
-  'setup.wizard_title': '🤖 botmux setup wizard',
-  'setup.config_dir': 'Config dir: {path}',
-  'setup.data_dir': 'Data dir: {path}',
-  'setup.bots_already_configured': '{count} bot(s) already configured:',
-  'setup.prompt_action_existing_bots': 'Action: 1) Add new bot  2) Reconfigure  (1/2) [1]: ',
-  'setup.old_config_backed_up': 'Old config backed up: {path}',
-  'setup.added_bot': '✅ Added bot {appId}; {count} total',
-  'setup.config_file': '   Config file: {path}',
-  'setup.using_single_bot_config': 'Currently using single-bot config: {path}',
-  'setup.prompt_action_env_exists': 'Action: 1) Add new bot  2) Overwrite current config  (1/2): ',
-  'setup.old_env_backed_up': '   Old .env backed up: {path}',
-  'setup.env_missing_keys': '⚠️  Current .env is missing LARK_APP_ID or LARK_APP_SECRET — please complete the basics first',
-  'setup.current_bot': 'Current bot: {appId} ({cliId})',
-  'setup.migrated_to_multibot': '✅ Migrated to multi-bot config',
 
-  'start.no_config': '❌ No config file found',
-  'start.run_setup': '   First run: botmux setup',
-  'start.daemon_started': '✅ Daemon started{suffix}',
-  'start.daemon_started_suffix': ' ({count} bots, each in its own process)',
-  'start.logs_hint': '   Logs: botmux logs',
-  'start.status_hint': '   Status: botmux status',
-  'start.autostart_synced': '   autostart unit synced to current launch path',
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': 'Proactive start (joined chat)',
@@ -1517,7 +1451,6 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.pause.disabled.alreadyPaused': 'Schedule is already paused',
   'card.dashboard.schedules.resume.disabled.alreadyEnabled': 'Schedule is already enabled',
   'card.dashboard.schedules.delivery.disabled.local': 'Local-only delivery cannot be changed from the card',
-  'card.dashboard.schedules.delivery.disabled.silent': 'A silent fresh topic is deferred until the first botmux send',
   'card.dashboard.schedules.delivery.disabled.topicRootRequired': 'This task has no retained topic root; set a topic root message ID in Dashboard first',
   'card.dashboard.schedules.delivery.disabled.alreadyOrigin': 'Already running inside the topic',
   'card.dashboard.schedules.delivery.disabled.alreadyTopLevel': 'Already running at group top level',
@@ -1684,12 +1617,12 @@ export const messages: Record<string, string> = {
   // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
   'common.operator': 'By: {by}',
   'common.empty_paren': '(empty)',
-  'common.truncated_short': '…(truncated)',
 
   // Ask card
   'card.ask.field.deadline': 'Deadline',
   'card.ask.field.answerable': 'Can answer',
   'card.ask.question_n': 'Question {n}',
+  'card.ask.prompt_truncated': '(The question is too long and was truncated in this card; see the attached file in this thread for the full text.)',
   'card.ask.submit': 'Submit',
   'card.ask.submit_confirm_empty': 'Confirm empty submit',
   'card.ask.empty_warning': "⚠️ You haven't selected any option. Multi-select allows choosing none; if you really mean an empty answer, click \"Confirm empty submit\" again, otherwise select first and submit.",
@@ -1711,7 +1644,6 @@ export const messages: Record<string, string> = {
   'card.ask.supplement': 'Note: {comment}',
   'card.ask.timed_out': 'Timed out, no answer',
   'card.ask.invalidated': 'No longer valid',
-  'card.ask.no_approver': 'No eligible responders',
   'card.ask.answerable_designated_member': 'designated member only',
   'card.ask.answerable_talk_members': 'anyone who can talk to me in this chat',
 
@@ -1723,7 +1655,6 @@ export const messages: Record<string, string> = {
   'toast.action_in_progress': 'Action in progress — please wait',
   'toast.action_received_bg': 'Action received — processing in the background',
   'toast.card_update_busy_retry': 'The card is updating — please tap again in a moment',
-  'toast.not_in_approver_list': 'You’re not on the approver list — no action taken',
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[User quoted a message — run `botmux quoted {id}` to view it]',
@@ -1744,7 +1675,6 @@ export const messages: Record<string, string> = {
   'card.usage.ctx': 'ctx',
   'card.usage.quota_5h': '5h',
   'card.usage.quota_7d': '7d',
-  'card.usage.tokens': 'Tokens',
   'card.usage.turn': 'This turn',
   'card.usage.total': 'Total',
 

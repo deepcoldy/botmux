@@ -3,7 +3,6 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readManagedOriginCapability } from './managed-origin-capability.js';
 import {
-  readLinuxBootIdentity,
   readProcessStartIdentity,
 } from '../utils/process-identity.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';

@@ -158,7 +158,6 @@ import {
 import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
-  selectionKeyForBot,
   isTtadkWrapper,
   ttadkAcceptsModel,
   TTADK_DEFAULT_MODEL,
@@ -169,6 +168,7 @@ import {
   isKnownSelectionKey,
   buildModelChoicesResponse,
 } from './services/model-catalog.js';
+import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
@@ -185,7 +185,7 @@ import { parseCloseResidual, type ParsedCloseResidual } from './core/close-resid
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import type { WorkspaceMetadata } from './core/workspace-metadata.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
-import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
+import { isLocalDevInstall, botmuxVersionAt, diskVersionAt, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
 import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
@@ -296,7 +296,6 @@ import {
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
-import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -337,7 +336,7 @@ import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
-import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
+import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
@@ -5629,8 +5628,8 @@ const server = createServer(async (req, res) => {
             wrapperCli: o.wrapperCli,
             cliLaunchMode: o.cliLaunchMode,
           }, { shellFallback: false });
-          // 静态模型候选（shell-free）：模型下拉的初始选项；live 增量由
-          // /api/cli-options/models 按需探测。staticModelChoices 自身 fail-soft，
+          // 静态模型候选（shell-free）：live 不可用时的兜底；live 成功时由
+          // /api/cli-options/models 返回 runtime 权威目录。staticModelChoices 自身 fail-soft，
           // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
           let modelChoices: string[] = [];
           try {
@@ -5665,7 +5664,8 @@ const server = createServer(async (req, res) => {
 
     // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），
     // 不做全量扫描——20+ CLI 各自 shell out 会让表单打开即卡。静态候选已随
-    // /api/cli-options 的 modelChoices 字段下发，本端点只补 live 增量并合并去重。
+    // /api/cli-options 的 modelChoices 字段下发；本端点 live 成功时只返回 live，
+    // 探测失败或为空时才回退静态候选。
     if (req.method === 'GET' && url.pathname === '/api/cli-options/models') {
       const key = (url.searchParams.get('key') ?? '').trim();
       if (!isKnownSelectionKey(key)) {
@@ -5680,26 +5680,14 @@ const server = createServer(async (req, res) => {
       } catch {
         botConfig = undefined;
       }
-      const cliId = resolveCliSelection(key).cliId;
-      const runtimeApplies = botConfig
-        && selectionKeyForBot(botConfig.cliId, botConfig.wrapperCli, botConfig.cliLaunchMode) === key;
-      const cliPath = runtimeApplies
-        ? botConfig?.cliRuntime?.executable
-          ?? (botConfig?.cliRuntime ? undefined : botConfig?.cliPathOverride)
-        : undefined;
+      const probeContext = modelCatalogProbeContext(key, botConfig, process.env);
       const body = await buildModelChoicesResponse(key, {
-        runtimeContext: botConfig && runtimeApplies
-          ? `${botConfig.larkAppId}:${cliId}:${cliPath ?? 'default'}`
-          : undefined,
-        probeEnv: botConfig && runtimeApplies
-          ? {
-              ...buildSessionChildEnv(process.env, botConfig.envPolicy),
-              ...botInjectedEnv(botConfig.env, botConfig.envPolicy),
-            }
-          : undefined,
+        runtimeContext: probeContext.runtimeContext,
+        probeEnv: probeContext.probeEnv,
+        runtimeExecutable: probeContext.runtimeExecutable,
         adapterFactory: requestedCliId => createCliAdapterSync(
           requestedCliId,
-          requestedCliId === cliId ? cliPath : undefined,
+          requestedCliId === probeContext.cliId ? probeContext.runtimeExecutable : undefined,
         ),
       });
       return jsonRes(res, 200, body);
@@ -7096,7 +7084,7 @@ const server = createServer(async (req, res) => {
     // ─── Per-bot defaults (Bot Defaults tab) ─────────────────────────────────
     // GET  /api/bots                         — fan out to each daemon, return
     //                                          [{larkAppId, botName, defaultOncall, ...}]
-    // PUT  /api/bots/:appId/default-oncall   — proxy to that bot's daemon
+    // 各配置项的写入走 PUT /api/bots/:appId/<field>，逐项代理到该 bot 的 daemon
 
     if (req.method === 'GET' && url.pathname === '/api/bots') {
       const agentFields = configuredBotAgentFields();
@@ -7154,22 +7142,6 @@ const server = createServer(async (req, res) => {
       const out = [...onlineOut, ...recoveryRows]
         .sort((a, b) => Number(a.botIndex ?? Number.MAX_SAFE_INTEGER) - Number(b.botIndex ?? Number.MAX_SAFE_INTEGER));
       return jsonRes(res, 200, { bots: out });
-    }
-
-    let mBotDef: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotDef = url.pathname.match(/^\/api\/bots\/([^/]+)\/default-oncall$/))) {
-      const appId = decodeURIComponent(mBotDef[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-default-oncall`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
     }
 
     let mBotQuotaFallback: RegExpMatchArray | null;
@@ -7762,23 +7734,6 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-summary-range`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // Backward-compatible alias from the short-lived keyword-trigger dashboard.
-    let mBotSummaryTrigger: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotSummaryTrigger = url.pathname.match(/^\/api\/bots\/([^/]+)\/summary-trigger$/))) {
-      const appId = decodeURIComponent(mBotSummaryTrigger[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-summary-trigger`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -8843,16 +8798,12 @@ function startPlatformTunnelIfBound(): void {
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     });
     logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);
-    // 大厅打卡自愈重试：team-sync 应用时会立即尝试一次；这里的低频周期兜住
-    // "当时 daemon 离线 / bot 还没进大厅 / 发送失败"的漏拍。无平台绑定不启动。
-    const hallTimer = setInterval(() => { void maybeAnnounceHallPresence(); }, 5 * 60 * 1000);
-    hallTimer.unref();
   } catch (e) {
     logger.warn(`[platform-tunnel] 启动失败: ${(e as Error).message}`);
   }
 }
 
-/** 平台 team-sync 落盘（roster + 团队群镜像），随后触发一轮大厅打卡检查。 */
+/** 平台 team-sync 落盘（roster + 团队群镜像）。 */
 function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
   const applied = applyPlatformTeamSync(config.session.dataDir, payload);
   if (!applied) {
@@ -8860,101 +8811,6 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
     return;
   }
   logger.info(`[platform-tunnel] team-sync 已应用 rev=${applied.rev} teams=${applied.teams.length}`);
-  void maybeAnnounceHallPresence();
-}
-
-// 大厅打卡节流：按「发送 bot ×大厅」记最小间隔与尝试上限——按 bot 记会让多团队
-// bot 在第一个大厅烧光预算后，新加入的大厅永远轮空（实测踩过）。只有真正发出
-// 消息才消耗次数；状态落盘，重启不重发（否则每次重启都往大厅刷一轮）。
-const HALL_ANNOUNCE_MIN_INTERVAL_MS = 10 * 60 * 1000;
-const HALL_ANNOUNCE_MAX_TRIES = 6;
-const hallAnnounceStatePath = () => join(config.session.dataDir, 'hall-announce-state.json');
-function readHallAnnounceState(): Record<string, { lastAt: number; tries: number }> {
-  try { return JSON.parse(readFileSync(hallAnnounceStatePath(), 'utf-8')); } catch { return {}; }
-}
-/** 记录一次打卡尝试。consumeTry=false 只刷新 lastAt（发送失败：保住 10 分钟退避
- *  但不烧预算——否则 daemon 掉线期间就把 6 次上限烧光、恢复后永久跳过，Codex review）。 */
-function bumpHallAnnounceState(key: string, consumeTry: boolean): void {
-  const all = readHallAnnounceState();
-  const cur = all[key];
-  all[key] = { lastAt: Date.now(), tries: (cur?.tries ?? 0) + (consumeTry ? 1 : 0) };
-  try { atomicWriteFileSync(hallAnnounceStatePath(), JSON.stringify(all, null, 2) + '\n'); } catch { /* 尽力而为 */ }
-}
-/** 发送方 daemon 的 mention cross-ref（name → 本 app 视角 open_id）。 */
-function readBotCrossRef(appId: string): Record<string, string> {
-  try { return JSON.parse(readFileSync(join(config.session.dataDir, `bot-openids-${appId}.json`), 'utf-8')); } catch { return {}; }
-}
-
-/**
- * 大厅打卡编排（union_id 自学）。实测大厅（bot-only 群）只有「直接点名 @」会
- * 投递事件——普通消息、自 @、@all 全部静默，自家回声在大多数应用上永远等不来。
- * 机制（与 event-dispatcher 的 hall 分支对偶）：
- * - 有未入册成员的大厅里，每个本机 bot 点名 @ 自己 cross-ref 能解析到的未入册
- *   成员（含别的机器的——mention 跨机器投递，对方跑新版即可学）；被点到的直接
- *   从 mentions[] 学到自己的 union_id。已入册 bot 也参与——纯教学。
- * - 自己未入册时消息带 #hall-echo，被点到的 bot 回 @ 一次（open_id 取事件
- *   sender_id，无需 cross-ref）→ 打卡者从回执学到自己。任一方向可解析即收敛。
- * 消息只在有意义时才发：解析不到任何目标时不发不计次（唯一例外：未入册 bot 的
- * 首次尝试发一条裸打卡，给有 receive-all scope 的应用留回声机会）。状态落盘，
- * 重启不重发——解析不到目标反复裸发刷屏这个坑踩过了（自动review 实测）。
- */
-async function maybeAnnounceHallPresence(): Promise<void> {
-  try {
-    const dataDir = config.session.dataDir;
-    const teams = listPlatformTeams(dataDir);
-    if (teams.length === 0) return;
-    const localBotIds = new Set(readPlatformBotsInfo().map(b => b.appId));
-    const now = Date.now();
-    const state = readHallAnnounceState();
-    for (const team of teams) {
-      const hallChatId = team.groupChatIds[0];
-      if (!hallChatId) continue;
-      // 未入册成员（全大厅，含别的机器）：本机的以本地 store 为准（比 roster 新鲜），
-      // 远端的以 roster 的 unionId 为准。
-      const isLearned = (b: { appId: string; unionId?: string }) =>
-        localBotIds.has(b.appId) ? !!getBotUnionId(dataDir, b.appId) : !!b.unionId;
-      const unlearned = team.bots.filter(b => !isLearned(b));
-      if (unlearned.length === 0) continue;
-      const unlearnedNames = new Set(unlearned.map(b => b.name).filter(Boolean) as string[]);
-      for (const bot of team.bots) {
-        if (!localBotIds.has(bot.appId)) continue;            // 只编排本机 bot
-        const selfLearned = isLearned(bot);
-        const throttleKey = `${bot.appId}::${hallChatId}`;
-        const st = state[throttleKey];
-        if (st && (now - st.lastAt < HALL_ANNOUNCE_MIN_INTERVAL_MS || st.tries >= HALL_ANNOUNCE_MAX_TRIES)) continue;
-        // 点名目标 = 自己 cross-ref 能解析到的未入册成员（发不出 @ 的目标点了也白点）。
-        const crossRef = readBotCrossRef(bot.appId);
-        const targets = [...unlearnedNames].filter(n => n !== bot.name && typeof crossRef[n] === 'string').slice(0, 4);
-        // 没有可教的目标：已入册 → 无事可做；未入册 → 仅首次发裸打卡碰回声运气，
-        // 之后静默等别人教（不发不计次，cross-ref 或 roster 变化后自然恢复）。
-        if (targets.length === 0 && (selfLearned || (st?.tries ?? 0) > 0)) continue;
-        // 成功发出才消耗预算；失败只刷新 lastAt 保住退避间隔（见 bumpHallAnnounceState）。
-        let sent = false;
-        try {
-          const r = await proxyToDaemon(bot.appId, '/api/platform/hall-announce', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ chatId: hallChatId, mentionNames: targets }),
-          });
-          const j = await r.json().catch(() => ({} as { ok?: boolean; error?: string; mentioned?: string[]; unresolved?: string[]; skipped?: string }));
-          if (!r.ok || !(j as { ok?: boolean }).ok) {
-            logger.warn(`[platform-tunnel] 大厅打卡失败 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}: ${(j as { error?: string }).error ?? r.status}`);
-          } else {
-            sent = !(j as { skipped?: string }).skipped;
-            const mentioned = (j as { mentioned?: string[] }).mentioned ?? [];
-            const unresolved = (j as { unresolved?: string[] }).unresolved ?? [];
-            if (sent) logger.info(`[platform-tunnel] 大厅打卡已发 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}${mentioned.length ? ` 点名=[${mentioned.join(',')}]` : ''}${unresolved.length ? ` 未解析=[${unresolved.join(',')}]` : ''}`);
-          }
-        } catch (e) {
-          logger.warn(`[platform-tunnel] 大厅打卡请求异常 bot=${bot.appId}: ${(e as Error).message}`);
-        }
-        bumpHallAnnounceState(throttleKey, sent);
-        state[throttleKey] = { lastAt: now, tries: (st?.tries ?? 0) + (sent ? 1 : 0) };
-      }
-    }
-  } catch (e) {
-    logger.warn(`[platform-tunnel] 大厅打卡检查异常: ${(e as Error).message}`);
-  }
 }
 
 // Graceful shutdown

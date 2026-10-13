@@ -31,8 +31,10 @@
  * the pending set is tiny (type-ahead depth, single digits), so this is
  * cheaper and simpler than an append-only log with compaction.
  */
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 export interface BridgeTurnJournalEntry {
   turnId: string;
@@ -67,23 +69,20 @@ interface BridgeTurnJournalFile {
 }
 
 export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
-  let raw: string;
-  try {
-    raw = readFileSync(path, 'utf8');
-  } catch {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(raw) as BridgeTurnJournalFile;
-    if (parsed?.version !== 1 || !Array.isArray(parsed.pending)) return [];
-    return parsed.pending.filter(entry =>
-      typeof entry?.turnId === 'string'
-      && typeof entry?.markTimeMs === 'number'
-      && typeof entry?.jsonlPath === 'string'
-      && typeof entry?.offsetAtMark === 'number');
-  } catch {
-    return [];
-  }
+  // 缺失 / 损坏 / 形状不符 → []。损坏的文件被隔离为 .corrupt-*（而不是被下一次
+  // writeBridgeTurnJournal 覆盖），见 utils/json-file.ts。
+  const parsed = readJsonFileSoft<BridgeTurnJournalFile | null>(path, {
+    fallback: () => null,
+    validate: (v): v is BridgeTurnJournalFile =>
+      isJsonObject(v) && v.version === 1 && Array.isArray(v.pending),
+    label: 'bridge-turn-journal',
+  });
+  if (!parsed) return [];
+  return parsed.pending.filter(entry =>
+    typeof entry?.turnId === 'string'
+    && typeof entry?.markTimeMs === 'number'
+    && typeof entry?.jsonlPath === 'string'
+    && typeof entry?.offsetAtMark === 'number');
 }
 
 export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[]): void {
@@ -92,9 +91,7 @@ export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalE
     : pending;
   const payload: BridgeTurnJournalFile = { version: 1, pending: bounded };
   mkdirSync(dirname(path), { recursive: true });
-  const tmpPath = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
-  renameSync(tmpPath, path);
+  atomicWriteFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600, followTargetSymlink: false });
 }
 
 export function appendBridgeTurnJournalEntry(path: string, entry: BridgeTurnJournalEntry): void {

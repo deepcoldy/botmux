@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
@@ -26,7 +26,15 @@ function listSkillDirs(root: string): string[] {
   if (!existsSync(root)) return [];
   try {
     return readdirSync(root, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => {
+        if (entry.isDirectory()) return true;
+        if (!entry.isSymbolicLink()) return false;
+        try {
+          return statSync(join(root, entry.name)).isDirectory();
+        } catch {
+          return false;
+        }
+      })
       .map((entry) => join(root, entry.name));
   } catch {
     return [];

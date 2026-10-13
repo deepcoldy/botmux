@@ -136,6 +136,31 @@ describe('scheduler.addTask — task position (dedicated per-task topic)', () =>
     expect(() => scheduler.addTask({ ...TASK_PARAMS, followActive: true }))
       .toThrow('follow_active_requires_topic');
   });
+
+  it('rejects dynamic templates that would make every persisted task fire fail', async () => {
+    const { scheduler } = await freshImport();
+    expect(() => scheduler.addTask({
+      ...TASK_PARAMS,
+      silent: true,
+      topicTitle: '{{date}} 巡检',
+    })).toThrow('topic_title_template_silent_unsupported');
+    expect(() => scheduler.addTask({
+      ...TASK_PARAMS,
+      topicTitle: '{{owner}} 巡检',
+    })).toThrow('topic_title_owner_unavailable');
+    expect(() => scheduler.addTask({
+      ...TASK_PARAMS,
+      ownerOpenId: 'ou_owner123',
+      topicTitle: `${'x'.repeat(140)}${'{{owner}}'.repeat(6)}`,
+    })).toThrow('topic_title_rendered_too_long');
+  });
+
+  it('accepts a 200-code-point template when its normal date expansion fits the delivery budget', async () => {
+    const { store, scheduler } = await freshImport();
+    const topicTitle = `${'x'.repeat(192)}{{date}}`;
+    const task = scheduler.addTask({ ...TASK_PARAMS, topicTitle });
+    expect(store.getTask(task.id, TEST_APP)?.topicTitle).toBe(topicTitle);
+  });
 });
 
 describe('scheduler.resolveTaskExecutionPosition — task position', () => {

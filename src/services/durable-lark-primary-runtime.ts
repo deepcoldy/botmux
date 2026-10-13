@@ -57,6 +57,7 @@ export interface DurableLarkPrimaryRuntimeOptions {
   shutdownMs?: number;
   control?: {
     ownedPartitionKeys(): readonly string[];
+    partitionKeyPrefix?: string;
     resolve: DurableSessionControlDispatchOptions['resolve'];
     workerId?: string;
     intervalMs?: number;
@@ -150,6 +151,9 @@ export function startDurableLarkPrimaryRuntime(
     ? startDurableSessionControlConsumer({
         store: options.store,
         ownedPartitionKeys: options.control.ownedPartitionKeys,
+        ...(options.control.partitionKeyPrefix
+          ? { partitionKeyPrefix: options.control.partitionKeyPrefix }
+          : {}),
         dispatch: createDurableSessionControlDispatch({
           store: options.store,
           sessionOwnerId: session.ownerId,

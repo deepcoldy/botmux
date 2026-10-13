@@ -109,7 +109,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkCliInput, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
 import { config } from '../src/config.js';
 import { buildExternalEventApplicationContext, buildExternalEventDataContext, buildExternalEventVisibleText, buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
@@ -174,6 +174,29 @@ describe('buildNewTopicPrompt', () => {
     expect(routing).toContain('已了解/已补充/已记录');
     expect(routing).toContain('只处理 `&lt;user_message&gt;` 中的真实用户请求');
     expect(routing).not.toContain('&amp;lt;');
+  });
+
+  it('puts the Cursor background-task note inside <botmux_routing> for cursor only (#1504)', () => {
+    const cursor = buildNewTopicPrompt('hello', SESSION_ID, 'cursor');
+    const routing = cursor.slice(cursor.indexOf('<botmux_routing>'), cursor.indexOf('</botmux_routing>'));
+    expect(routing).toContain('后台任务');
+    expect(routing).toContain('Briefly inform the user about the task result');
+    expect(routing).toContain('不是飞书用户的新消息');
+
+    const codex = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    expect(codex).not.toContain('Briefly inform the user about the task result');
+    expect(codex).not.toContain('后台任务');
+  });
+
+  it('omits the Cursor background-task note in zero-injection mode (promptInjection none)', () => {
+    // Zero-injection sends only the user's text — no <botmux_routing> at all,
+    // so the cursor-only routing line must not leak through either variant.
+    const zero = buildNewTopicPrompt('hello', SESSION_ID, 'cursor', undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, { promptInjection: 'none' });
+    expect(zero).not.toContain('<botmux_routing>');
+    expect(zero).not.toContain('Briefly inform the user about the task result');
+    expect(zero).not.toContain('后台任务');
+    expect(zero).toContain('hello');
   });
 
   it('gives Hermes the standard botmux-send routing hints like other structured-bridge CLIs', () => {
@@ -604,9 +627,9 @@ describe('buildFollowUpContent', () => {
   });
 });
 
-// ─── buildReforkPrompt — wraps re-fork branch (resume / daemon-restart) ─────
+// ─── buildReforkCliInput — wraps re-fork branch (resume / daemon-restart) ───
 
-describe('buildReforkPrompt', () => {
+describe('buildReforkCliInput', () => {
   const SESSION_ID = 'refork-session-id';
 
   function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
@@ -636,7 +659,7 @@ describe('buildReforkPrompt', () => {
 
   it('wraps non-adopt re-fork prompt in <user_message> + <botmux_reminder>', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, '继续聊', { cliId: 'codex' });
+    const out = buildReforkCliInput(ds, '继续聊', { cliId: 'codex' }).content;
     expect(out).toContain('<user_message>');
     expect(out).toContain('继续聊');
     expect(out).toContain('</user_message>');
@@ -647,21 +670,21 @@ describe('buildReforkPrompt', () => {
 
   it('embeds <session_id> for CLIs without injectsSessionContext (codex)', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, 'hello', { cliId: 'codex' });
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'codex' }).content;
     expect(out).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
   it('omits <session_id> for claude-code (injectsSessionContext=true); reminder stays unless transcript is opted in', () => {
     const ds = makeDs();
     // 缺省 send：保留 reminder（模型仍要自己 botmux send）。
-    const out = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'claude-code' }).content;
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('<user_message>');
     expect(out).toContain('<botmux_reminder>');
     // 显式 transcript 才切换：最终回复由 daemon 从转写转发，不再注入 reminder。
     mockBotConfig.replyDelivery = 'transcript';
     try {
-      const transcriptOut = buildReforkPrompt(ds, 'hello', { cliId: 'claude-code' });
+      const transcriptOut = buildReforkCliInput(ds, 'hello', { cliId: 'claude-code' }).content;
       expect(transcriptOut).not.toContain('<session_id>');
       expect(transcriptOut).toContain('<user_message>');
       expect(transcriptOut).not.toContain('<botmux_reminder>');
@@ -672,14 +695,14 @@ describe('buildReforkPrompt', () => {
 
   it('omits <session_id> for pi (injectsSessionContext=true)', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, 'hello', { cliId: 'pi' });
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'pi' }).content;
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('<user_message>');
   });
 
   it('omits botmux_reminder for Mira re-fork prompts', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, 'hello', { cliId: 'mira' });
+    const out = buildReforkCliInput(ds, 'hello', { cliId: 'mira' }).content;
     expect(out).toContain('<user_message>');
     expect(out).not.toContain('<session_id>');
     expect(out).not.toContain('<botmux_reminder>');
@@ -688,7 +711,7 @@ describe('buildReforkPrompt', () => {
   it('places the whiteboard hint after <botmux_reminder> and before <user_message> on re-fork', () => {
     const ds = makeDs();
     (ds.session as any).whiteboardId = 'wb_refork';
-    const out = buildReforkPrompt(ds, '继续', { cliId: 'codex' });
+    const out = buildReforkCliInput(ds, '继续', { cliId: 'codex' }).content;
     expect(out).toContain('<whiteboard id="wb_refork">');
     expect(out.indexOf('<botmux_reminder>')).toBeLessThan(out.indexOf('<whiteboard '));
     expect(out.indexOf('<whiteboard ')).toBeLessThan(out.indexOf('<user_message>'));
@@ -696,11 +719,11 @@ describe('buildReforkPrompt', () => {
 
   it('forwards attachments and mentions to the wrapper', () => {
     const ds = makeDs();
-    const out = buildReforkPrompt(ds, '看图', {
+    const out = buildReforkCliInput(ds, '看图', {
       cliId: 'codex',
       attachments: [{ type: 'image', path: '/tmp/x.jpg', name: 'x.jpg' }],
       mentions: [{ key: '@_user_1', name: 'Alice', openId: 'ou_alice' }],
-    });
+    }).content;
     expect(out).toContain('path="/tmp/x.jpg"');
     expect(out).toContain('name="Alice"');
     expect(out).toContain('open_id="ou_alice"');
@@ -710,10 +733,10 @@ describe('buildReforkPrompt', () => {
     const ds = makeDs({
       adoptedFrom: { tmuxTarget: 'foo:0.0', originalCliPid: 1, cwd: '/tmp' },
     });
-    const out = buildReforkPrompt(ds, 'hello', {
+    const out = buildReforkCliInput(ds, 'hello', {
       cliId: 'claude-code',
       selfMention: { name: 'Claude', openId: 'ou_bot' },
-    });
+    }).content;
     expect(out).not.toContain('<user_message>');
     expect(out).not.toContain('<botmux_reminder>');
     expect(out).not.toContain('<session_id>');
@@ -1161,7 +1184,7 @@ describe('replyDelivery=transcript envelope', () => {
     expect(solo).not.toContain('- @Bot');
   });
 
-  it('buildReforkPrompt 读 ds.soloSession：transcript + solo 去壳，非 solo 保留壳', () => {
+  it('buildReforkCliInput 读 ds.soloSession：transcript + solo 去壳，非 solo 保留壳', () => {
     mockBotConfig.replyDelivery = 'transcript';
     const makeDs = (soloSession?: boolean): DaemonSession => ({
       session: {
@@ -1173,12 +1196,12 @@ describe('replyDelivery=transcript envelope', () => {
       spawnedAt: 0, cliVersion: '1.0.0', lastMessageAt: 0, hasHistory: true,
       soloSession,
     } as DaemonSession);
-    const bare = buildReforkPrompt(makeDs(true), '@Bot 继续', { cliId: 'claude-code', selfMention, sender });
+    const bare = buildReforkCliInput(makeDs(true), '@Bot 继续', { cliId: 'claude-code', selfMention, sender }).content;
     expect(bare).not.toContain('<botmux_reminder>');
     expect(bare).not.toContain('<user_message>');
     expect(bare).not.toContain('<sender ');
     expect(bare.startsWith('继续')).toBe(true);
-    const shelled = buildReforkPrompt(makeDs(false), '@Bot 继续', { cliId: 'claude-code', selfMention, sender });
+    const shelled = buildReforkCliInput(makeDs(false), '@Bot 继续', { cliId: 'claude-code', selfMention, sender }).content;
     expect(shelled).not.toContain('<botmux_reminder>');
     expect(shelled).toContain('<user_message>\n@Bot 继续\n</user_message>');
     expect(shelled).toContain('<sender ');
@@ -1289,7 +1312,7 @@ describe('per-bot zero prompt injection', () => {
       expect(opening.content).toBe(expected);
       expect(buildFollowUpCliInput(task, 'sid', opts).content).toBe(expected);
       const ds = { larkAppId: 'app_test', session: { sessionId: 'sid', chatId: 'oc_group', backendType: 'pty', promptInjection: 'none' } } as DaemonSession;
-      expect(buildReforkPrompt(ds, task, opts)).toBe(expected);
+      expect(buildReforkCliInput(ds, task, opts).content).toBe(expected);
       expect(buildNewTopicPrompt(task, 'sid', cliId, undefined, undefined, undefined,
         undefined, ['第二条'], undefined, 'zh', undefined, opts)).toBe(task + '\n\n第二条');
       delete mockBotConfig.promptInjection;

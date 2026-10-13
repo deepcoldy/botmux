@@ -32,20 +32,20 @@ import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
+import { writeAndFlush } from './cli/stdout-flush.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { createRequire } from 'node:module';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
-import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
+import { closeResidualClause, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
   advanceAncestorSessionTurn,
   findAncestorSessionMarkerContext as findLiveAncestorSessionContext,
@@ -140,6 +140,17 @@ import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { isCodexReasoningEffort, type CodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { resolveDispatchLaunchSpec } from './core/dispatch-launch-spec.js';
+import {
+  canonicalizeDispatchLaunchKickoff,
+  createDispatchLaunchId,
+  dispatchLaunchInspection,
+  type DispatchLaunchPrepareRequestV1,
+} from './core/dispatch-launch-contract.js';
+import { createDispatchLaunchOperationStore } from './core/dispatch-launch-operation-store.js';
+import { createDispatchLaunchSourceCoordinator } from './core/dispatch-launch-source.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   computeSessionPickerLayout,
@@ -159,11 +170,8 @@ import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
-import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import {
   FLEET_DAEMON_EXIT_WAIT_MS,
-  FLEET_SUCCESSOR_SETTLE_MS,
-  PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
 import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from './cli/durable-session-send.js';
@@ -222,7 +230,6 @@ import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallR
 import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
 import {
-  fetchLatestVersion,
   fetchDistTagVersion,
   isNewerVersion,
   parseUpdateTarget,
@@ -237,7 +244,7 @@ import {
   localDevUpdateSteps,
   describeSpawnFailure,
 } from './utils/local-dev-update.js';
-import { cliAuthBind, loadDashboardSecret, signCliAuth } from './dashboard/auth.js';
+import { loadDashboardSecret } from './dashboard/auth.js';
 import {
   postWorkflowDaemonMutation,
   type WorkflowDaemonMutation,
@@ -299,7 +306,6 @@ import {
   loadBotMentionIdentityMap,
   orderedFooterRecipients,
   stripCodeSpans,
-  type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
@@ -334,7 +340,6 @@ import {
   consumeRestartIntentTo,
   removeRestartIntentAttemptTo,
   type RestartIntent,
-  writeManualIntentIfAbsentTo,
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
 import { loadAllSessionsSnapshot, type SessionsSnapshot } from './services/session-store.js';
@@ -386,7 +391,6 @@ import {
   probePersistentBackendTargets,
   persistentBackendTargetKey,
   resolvePersistentBackendTarget,
-  type PersistentBackendType,
 } from './core/persistent-backend.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
@@ -409,7 +413,6 @@ logger.setSilent(true);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const require = createRequire(import.meta.url);
 
 // Package root is one level up from dist/
 const PKG_ROOT = dirname(__dirname);
@@ -2834,13 +2837,6 @@ function cleanupStaleDaemonDescriptors(): void {
   }
 }
 
-/** Block the current thread for `ms`. Safe here: the restart CLI is a one-shot
- *  process, so stalling its event loop during the shutdown poll is harmless. */
-function sleepSyncMs(ms: number): void {
-  if (ms <= 0) return;
-  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* SAB unavailable → no-op */ }
-}
-
 /**
  * One-time migration cleanup for hosts upgrading from a pm2-based botmux. The
  * fleet now runs under the built-in supervisor, not pm2, but an upgrading host
@@ -3940,7 +3936,7 @@ interface SessionData {
   }>;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   /** 文档评论入口 per-turn 回复落点（见 Session.docCommentTargets in types.ts）。 */
-  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
+  docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string; reactionType?: string; reactionIdentity?: 'tenant' | 'user' }>;
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   whiteboardId?: string;
@@ -3954,6 +3950,9 @@ interface SessionData {
   cliSessionId?: string;
   /** Frozen file-sandbox decision from the persisted session (tri-state). */
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
+  dispatchLaunchSpec?: import('./types.js').Session['dispatchLaunchSpec'];
+  model?: string;
+  reasoningEffort?: string;
   backendType?: BackendType;
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
@@ -5271,6 +5270,20 @@ function cmdManagedZmxAttach(args: string[]): void {
 async function cmdList(): Promise<void> {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
+  if (process.argv.includes('--json')) {
+    console.log(JSON.stringify({
+      sessions: active.map(session => ({
+        ...session,
+        ...(session.dispatchLaunchSpec ? {
+          requestedLaunch: session.dispatchLaunchSpec.requested,
+          ...(session.dispatchLaunchSpec.effectiveRuntime ? {
+            effectiveRuntime: session.dispatchLaunchSpec.effectiveRuntime,
+          } : {}),
+        } : {}),
+      })),
+    }));
+    return;
+  }
   // One immutable control-plane snapshot per invocation. In particular, ZMX's
   // full-list probe walks every per-session daemon, so running it once per row
   // would make a large session list quadratic and amplify socket timeouts.
@@ -6082,9 +6095,7 @@ async function cmdRoleSwitch(argv: string[]): Promise<void> {
   if (res.ok && body?.ok) {
     console.log(body.mode === 'respawn-resume'
       ? `✓ 已切换到 ${body.dir}（进程即将在新目录重启并续回上下文）`
-      : body.mode === 'inject'  // 兼容旧 daemon 的注入模式
-        ? `✓ 已切换到 ${body.dir}（会话空闲时生效，进程不重启）`
-        : `✓ 已切换到 ${body.dir}（下条消息在新目录冷启动）`);
+      : `✓ 已切换到 ${body.dir}（下条消息在新目录冷启动）`);
     return;
   }
   console.error(`✗ 切换被拒绝: ${body?.error ?? `HTTP ${res.status}`}`);
@@ -6763,6 +6774,7 @@ const SEND_HELP_BODY = [
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
   '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈与页脚签名',
+  '       --completion-proposal-file <path>  仅限标准 final；附一个 requester-only 的二选一可选后续动作',
   '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
   '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
@@ -6916,7 +6928,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
-       --new-topic [--topic-title ...] 每次创建新话题和独立会话
+       --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题按任务时区支持 {{date:-1d}} / {{owner}}
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
   schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
   schedule remove <id>                 删除任务
@@ -8614,6 +8626,15 @@ import {
   type ReplyLayout,
 } from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
+import { buildCompletionProposalElement } from './im/lark/completion-proposal-card.js';
+import { composeFinalCardSections } from './im/lark/final-card-sections.js';
+import {
+  completionProposalCardDispatchUuid,
+  createCompletionProposalStore,
+  normalizeCompletionProposalInput,
+  type CompletionProposalRecord,
+  type CompletionProposalVisibleInput,
+} from './core/completion-proposal.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
@@ -8670,6 +8691,10 @@ async function relaySend(
   relayDir: string,
   replyLayout?: ReplyLayout,
 ): Promise<void> {
+  if (flagPresentButValueMissing(rest, '--completion-proposal-file')) {
+    console.error('relay: --completion-proposal-file 需要路径参数');
+    process.exit(2);
+  }
   const unsupportedRouting = ['--chat-id', '--into', '--top-level']
     .filter(flag => rest.some(token => token === flag || token.startsWith(`${flag}=`)));
   if (unsupportedRouting.length > 0) {
@@ -8699,6 +8724,7 @@ async function relaySend(
     console.error('relay: --plugin-card-action 只能与 --card-file/--card-json 一起使用');
     process.exit(2);
   }
+  const completionProposalFile = argValue(rest, '--completion-proposal-file');
   let cardContent = '';
   if (cardJsonArg !== undefined && cardFile !== undefined) {
     console.error('relay: --card-json 与 --card-file 不能同时使用');
@@ -8762,6 +8788,26 @@ async function relaySend(
     cardOutfile = join(relayDir, cardBase);
     writeFileSync(cardOutfile, cardContent);
   }
+  let completionProposalBase: string | undefined;
+  let completionProposalOutfile: string | undefined;
+  if (completionProposalFile !== undefined) {
+    if (!existsSync(completionProposalFile)) {
+      console.error(`relay: 文件不存在: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (!statSync(completionProposalFile).isFile()) {
+      console.error(`relay: 不是普通文件: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    const proposalBytes = readFileSync(completionProposalFile);
+    if (proposalBytes.byteLength > 8192) {
+      console.error('relay: --completion-proposal-file 不能超过 8 KiB');
+      process.exit(2);
+    }
+    completionProposalBase = `${id}.completion-proposal.json`;
+    completionProposalOutfile = join(relayDir, completionProposalBase);
+    writeFileSync(completionProposalOutfile, proposalBytes);
+  }
 
   // Copy attachments into the outbox; carry only basenames.
   const copyOutboxAttachment = (p: string, out: string[]): void => {
@@ -8811,6 +8857,7 @@ async function relaySend(
     contentFile: contentBase,
     preparedContentFile: preparedContentBase,
     cardFile: cardBase,
+    completionProposalFile: completionProposalBase,
     attachments,
     videos,
     videoCovers,
@@ -8828,15 +8875,37 @@ async function relaySend(
         try { unlinkSync(cfile); } catch { /* */ }
         if (preparedContentOutfile) { try { unlinkSync(preparedContentOutfile); } catch { /* */ } }
         if (cardOutfile) { try { unlinkSync(cardOutfile); } catch { /* */ } }
-        if (res.stdout) process.stdout.write(res.stdout);
-        if (res.stderr) process.stderr.write(res.stderr);
-        process.exit(res.code ?? 0);
+        if (completionProposalOutfile) { try { unlinkSync(completionProposalOutfile); } catch { /* */ } }
+        await mirrorRelayResponseAndExit(res, 0);
       } catch { /* partial write — retry next tick */ }
     }
     await new Promise(r => setTimeout(r, 150));
   }
   console.error('relay: 等待 daemon 投递超时（120s）');
   process.exit(1);
+}
+
+/**
+ * Mirror a host relay response (`<id>.res.json`) onto this process's stdio and
+ * exit with its code.  The host child normally returns a short JSON, but either
+ * stream can carry an upstream error body of any size; because the relay exits
+ * explicitly, both writes must complete first or a large response is silently
+ * truncated at the sandbox boundary.
+ */
+async function mirrorRelayResponseAndExit(
+  res: { code?: number; stdout?: string; stderr?: string },
+  defaultCode: number,
+): Promise<never> {
+  try {
+    await Promise.all([
+      res.stdout ? writeAndFlush(process.stdout, res.stdout) : Promise.resolve(),
+      res.stderr ? writeAndFlush(process.stderr, res.stderr) : Promise.resolve(),
+    ]);
+  } catch (writeError) {
+    console.error(`relay: 无法完整输出 host 响应：${writeError instanceof Error ? writeError.message : String(writeError)}`);
+    process.exit(1);
+  }
+  process.exit(res.code ?? defaultCode);
 }
 
 /**
@@ -8918,9 +8987,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
         const res = JSON.parse(readFileSync(resPath, 'utf8')) as { code?: number; stdout?: string; stderr?: string };
         try { unlinkSync(resPath); } catch { /* */ }
         try { unlinkSync(contentPath); } catch { /* */ }
-        if (res.stdout) process.stdout.write(res.stdout);
-        if (res.stderr) process.stderr.write(res.stderr);
-        process.exit(res.code ?? 1);
+        await mirrorRelayResponseAndExit(res, 1);
       } catch { /* atomic response should be complete; retry defensively */ }
     }
     await new Promise(resolve => setTimeout(resolve, 150));
@@ -9656,8 +9723,13 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --plugin-card-action 需要 plugin id');
     process.exit(2);
   }
+  if (flagPresentButValueMissing(rest, '--completion-proposal-file', true)) {
+    console.error('botmux send: --completion-proposal-file 需要路径参数');
+    process.exit(2);
+  }
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
+  const completionProposalFile = argValue(rest, '--completion-proposal-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
   const pluginCardActionId = argValue(rest, '--plugin-card-action');
   if (pluginCardActionId !== undefined && !isValidPluginId(pluginCardActionId)) {
@@ -10911,11 +10983,19 @@ async function cmdSend(rest: string[]): Promise<void> {
           })();
       // 清理 "Typing" reaction（bot 已回复完毕）。未知分块会在上方 fail closed，
       // 不会误删指示器并把一份可能不完整的回复伪装成完成。
-      if (exactDocTarget.reactionId && exactDocTarget.replyId) {
+      // Pre-upgrade targets may have only replyId: the old add API projected a
+      // successful empty response to reactionId=undefined. Any pending target
+      // with a replyId predates typed tracking and therefore owns Typing.
+      const reactionType = exactDocTarget.reactionType
+        ?? (exactDocTarget.replyId ? 'Typing' : undefined);
+      if (reactionType && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
           { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
-          exactDocTarget.commentId, exactDocTarget.replyId, exactDocTarget.reactionId,
-          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect });
+          exactDocTarget.commentId, exactDocTarget.replyId, reactionType,
+          {
+            beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+            identity: exactDocTarget.reactionIdentity,
+          });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
@@ -10984,6 +11064,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // bug #750 fixed). pickTurnReplyTarget already enforces
     // quoteTargetId===currentTurnId for its own hit.
     ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
+  const proposalRequesterIsExactHuman = !!currentTurnId
+    && !!replyTargetSenderOpenId
+    && collectTurnWindowParticipants(s, currentTurnId).participants
+      .some(participant => participant.openId === replyTargetSenderOpenId && participant.isBot === false);
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
@@ -11141,6 +11225,58 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
     process.exit(2);
   }
+  let completionProposalVisible: CompletionProposalVisibleInput | undefined;
+  let completionProposalOmittedReason: string | undefined;
+  if (completionProposalFile !== undefined) {
+    if (!existsSync(completionProposalFile)) {
+      console.error(`文件不存在: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (!statSync(completionProposalFile).isFile()) {
+      console.error(`不是普通文件: ${completionProposalFile}`);
+      process.exit(1);
+    }
+    if (effectiveResponseKind !== 'final') {
+      console.error('botmux send: --completion-proposal-file 只能与 --response-kind final 同时使用');
+      process.exit(2);
+    }
+    if (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin || isSlashSend) {
+      console.error('botmux send: Completion Proposal 仅支持当前会话内的标准 final 卡');
+      process.exit(2);
+    }
+    const proposalJson = readFileSync(completionProposalFile, 'utf8');
+    if (Buffer.byteLength(proposalJson, 'utf8') > 8192) {
+      console.error('botmux send: --completion-proposal-file 不能超过 8 KiB');
+      process.exit(2);
+    }
+    let raw: unknown;
+    try { raw = JSON.parse(proposalJson); }
+    catch {
+      console.error('botmux send: --completion-proposal-file 必须包含有效 JSON');
+      process.exit(2);
+    }
+    try { completionProposalVisible = normalizeCompletionProposalInput(raw); }
+    catch (error) {
+      console.error(`botmux send: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+    if (!currentTurnId) completionProposalOmittedReason = 'missing_origin_turn';
+    else if (!replyTargetSenderOpenId?.startsWith('ou_') || !proposalRequesterIsExactHuman) {
+      completionProposalOmittedReason = 'missing_exact_human_requester';
+    }
+    else if (!isSuspendableBackendType(s.backendType)) completionProposalOmittedReason = 'backend_not_restart_safe';
+    if (completionProposalOmittedReason) {
+      content = [
+        content.trimEnd(),
+        '',
+        `> **${completionProposalVisible.title}**`,
+        `> ${completionProposalVisible.body}`,
+        '> 如需继续，请直接在当前话题回复。',
+      ].join('\n');
+      completionProposalVisible = undefined;
+      console.error(`botmux send: Completion Proposal 已降级为静态提示 (${completionProposalOmittedReason})`);
+    }
+  }
 
   // Ambiguity gate for --mention-back. --mention-back means "@ back the one
   // counterpart who triggered this turn"; that is only unambiguous when this
@@ -11184,6 +11320,29 @@ async function cmdSend(rest: string[]): Promise<void> {
   const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
     ? frozenTurnReplyTarget
     : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+
+  let completionProposalRecord: CompletionProposalRecord | undefined;
+  let completionProposalStore: ReturnType<typeof createCompletionProposalStore> | undefined;
+  if (completionProposalVisible && currentTurnId && replyTargetSenderOpenId) {
+    try {
+      completionProposalStore = createCompletionProposalStore(dataDir);
+      completionProposalRecord = completionProposalStore.prepare({
+        visible: completionProposalVisible,
+        larkAppId: s.larkAppId,
+        sessionId: sid,
+        chatId: targetChatId,
+        chatType: s.chatType === 'p2p' ? 'p2p' : 'group',
+        scope: sendTarget.mode === 'thread' ? 'thread' : 'chat',
+        anchor: sendTarget.mode === 'thread' ? sendTarget.rootMessageId : targetChatId,
+        originTurnId: currentTurnId,
+        ...(originDispatchAttempt !== undefined ? { originDispatchAttempt } : {}),
+        requesterOpenId: replyTargetSenderOpenId,
+      });
+    } catch (error) {
+      console.error(`botmux send: Completion Proposal 初始化失败: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(2);
+    }
+  }
   const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
     ? readDeferredTopicBinding(dataDir, s.sessionId)
     : undefined;
@@ -11373,6 +11532,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     await revalidateIsolatedOrigin();
     return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
+  // 有意保留：#602 引入时所有调用点已改走 dispatchAfterOriginGate + beforeEffect 栅栏，
+  // 此包装自出生即无调用方；但 test/cli-send-hook-context.test.ts 对其源码文本做了断言，
+  // 删除需同步改测试。
+  void dispatch;
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
@@ -12043,10 +12206,16 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
 
       const canonicalCard = createReplyCard([...elements], layoutHeader);
+      if (effectiveResponseKind === 'final') {
+        composeFinalCardSections(canonicalCard, {
+          ...(completionProposalRecord
+            ? { completionProposal: buildCompletionProposalElement(completionProposalRecord) }
+            : {}),
+          ...(feedbackPolicy ? { feedback: buildFeedbackElement(feedbackPolicy) } : {}),
+        });
+      }
       if (feedbackPolicy && effectiveResponseKind === 'final') {
-        const feedbackElement = buildFeedbackElement(feedbackPolicy);
-        const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
-        canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
+
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
       }
       // Fit charts to Feishu's 30KB request limit on the fully assembled card;
@@ -12091,7 +12260,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
             : { kind: 'progress', text }, {
             beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
-            send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, uuid ?? providerUuid),
+            send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
               effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
               async (lookup) => {
@@ -12125,8 +12294,26 @@ async function cmdSend(rest: string[]): Promise<void> {
       } else {
         const standaloneCard = responseKind === undefined ? replyCardJson
           : markGroupContextCardPurpose(replyCardJson, responseKind === 'progress' ? 'runtime' : 'message');
-        messageId = await dispatchPrimary(standaloneCard, 'interactive');
+        messageId = await dispatchPrimary(
+          standaloneCard,
+          'interactive',
+          false,
+          completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : undefined,
+        );
       }
+
+    if (completionProposalRecord && completionProposalStore) {
+      try {
+        completionProposalRecord = completionProposalStore.bindMessage(
+          completionProposalRecord.proposalId,
+          completionProposalRecord.nonce,
+          messageId,
+        );
+      } catch (error) {
+        completionProposalOmittedReason = 'bind_failed';
+        console.error(`botmux send: Completion Proposal 绑定失败，按钮将保持不可执行: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     }
 
     // The cheap preflight above catches ordinary retries. A concurrent retry
@@ -12417,6 +12604,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
+      ...(completionProposalRecord && !completionProposalOmittedReason
+        ? { proposalId: completionProposalRecord.proposalId, proposalStatus: completionProposalRecord.status }
+        : completionProposalFile !== undefined
+          ? { proposalStatus: 'omitted', proposalReason: completionProposalOmittedReason ?? 'unavailable' }
+          : {}),
       ...(failedAttachments.length > 0
         ? { failedAttachments: failedAttachments.map(f => f.path) }
         : {}),
@@ -12945,6 +13137,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 说明:
   新开话题: 发一条顶层「子项目」种子消息，在它线程里把 bot @ 进来各起独立会话。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
+  --model / --reasoning-effort: 为唯一 --bot-app 的新话题冻结启动规格；与 --into 冲突。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
   返回 JSON：seedMessageId / threadRootId 仍为 om_...；新增 threadId 为 omt_... 或 null。
@@ -12965,6 +13158,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --no-delegate schedule:create
                         本次派发不附带来源 Bot 配置的默认 schedule 创建权限
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
+  --model <catalog-id>  目标 Codex 实时目录中的模型；仅新话题、单 Worker
+  --reasoning-effort <level>  low|medium|high|xhigh|max|ultra（按模型校验）
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
@@ -12994,6 +13189,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const briefFile = dispatchArgs.briefFile;
   const overrideChatId = dispatchArgs.chatId;
   const repo = dispatchArgs.repo;
+  const requestedModel = dispatchArgs.model?.trim();
+  const requestedEffortRaw = dispatchArgs.reasoningEffort?.trim().toLowerCase();
+  const hasLaunchOverride = dispatchArgs.model !== undefined || dispatchArgs.reasoningEffort !== undefined;
   const intoRoot = dispatchArgs.into;
   const standby = dispatchArgs.standby;
   const steer = dispatchArgs.steer;
@@ -13025,6 +13223,30 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('--standby 与 --steer 不能同用（待命模式没有简报可调整当前 turn）。');
     process.exit(1);
   }
+  if (hasLaunchOverride && intoRoot) {
+    console.error('--model/--reasoning-effort 只允许新话题，不能与 --into 同用。');
+    process.exit(1);
+  }
+  if (hasLaunchOverride && botAppSpecs.length !== 1) {
+    console.error('--model/--reasoning-effort 需要且只允许一个 --bot-app 目标。');
+    process.exit(1);
+  }
+  if (hasLaunchOverride && botSpecs.length > 1) {
+    console.error('--model/--reasoning-effort 只允许一个 Worker 目标。');
+    process.exit(1);
+  }
+  if (hasLaunchOverride && repo && botSpecs.length !== 1) {
+    console.error('--repo 与 launch spec 同用时仍需一个 --bot open_id 走既有 operate 授权入口。');
+    process.exit(1);
+  }
+  if (dispatchArgs.model !== undefined && !requestedModel) {
+    console.error('--model 需要非空 catalog id。');
+    process.exit(1);
+  }
+  if (dispatchArgs.reasoningEffort !== undefined && !isCodexReasoningEffort(requestedEffortRaw)) {
+    console.error('--reasoning-effort 只接受 low|medium|high|xhigh|max|ultra。');
+    process.exit(1);
+  }
   if (dispatchArgs.delegates?.some(value => value !== 'schedule:create')) {
     console.error('--delegate 当前只支持 schedule:create。');
     process.exit(1);
@@ -13041,7 +13263,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('--delegate schedule:create 仅支持带 --bot-app 的非 standby 受管派发。');
     process.exit(1);
   }
-  if (botAppSpecs.length > 0 && repo) {
+  if (botAppSpecs.length > 0 && repo && !hasLaunchOverride) {
     console.error('--bot-app 仅自动建立 talk-only chatGrant，不能授权 /repo 管理命令；请使用驻守 Bot 的默认工作目录，或另走显式 operate 信任链路。');
     process.exit(1);
   }
@@ -13134,6 +13356,21 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (!parsedBotApps.some(item => item.appId === targetAppId)) parsedBotApps.push({ appId: targetAppId, role });
   }
 
+  let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
+  let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
+  if (hasLaunchOverride) {
+    const target = botConfigs.find(cfg => cfg.larkAppId === parsedBotApps[0]!.appId)!;
+    const adapter = createCliAdapterSync(target.cliId, target.cliRuntime?.executable ?? target.cliPathOverride);
+    const resolved = await resolveDispatchLaunchSpec({
+      requested: { model: dispatchArgs.model, reasoningEffort: dispatchArgs.reasoningEffort },
+      target,
+      detectModels: () => adapter.detectModels?.() ?? Promise.resolve(null),
+    });
+    if (!resolved.ok) { console.error(resolved.error); process.exit(1); }
+    requestedLaunch = resolved.requested;
+    effectiveRuntime = resolved.effective;
+  }
+
   try {
     await assertProjectDispatchPolicy({
       sessionId: sid,
@@ -13178,6 +13415,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const bots = [...legacyBots, ...appBots]
     .filter((bot, index, all) => all.findIndex(candidate => candidate.openId === bot.openId) === index);
+  if (hasLaunchOverride && bots.length !== 1) {
+    console.error('--model/--reasoning-effort 的 --bot 与 --bot-app 必须解析到同一个 Worker。');
+    process.exit(1);
+  }
   const { readRoleDispatchCompletionEnabled } = await import('./core/role-resolver.js');
   const sameTopicSendEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
   const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
@@ -13197,6 +13438,89 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   } catch (err: any) {
     console.error(`dispatch 构建失败: ${err.message}`);
     process.exit(1);
+  }
+  if (requestedLaunch && effectiveRuntime && !repo) {
+    const target = parsedBotApps[0]!;
+    const targetDaemon = findDaemon(target.appId);
+    if (!targetDaemon) {
+      console.error(`目标 Bot daemon 不在线: ${target.appId}`);
+      process.exit(1);
+    }
+    const origin = findAncestorSessionContext();
+    const sourceTurnId = origin?.turnId;
+    if (!sourceTurnId) {
+      console.error('launch spec 需要当前受管 turn 身份；请从本轮 Bot 会话内调用。');
+      process.exit(1);
+    }
+    const dispatchId = createDispatchLaunchId();
+    const request: DispatchLaunchPrepareRequestV1 = {
+      schemaVersion: 1,
+      protocol: 'v1',
+      dispatchId,
+      source: { larkAppId: appId, sessionId: sid, turnId: sourceTurnId },
+      targetLarkAppId: target.appId,
+      chatId: targetChatId,
+      kickoff: canonicalizeDispatchLaunchKickoff({
+        title: title.trim(), brief,
+        ...(target.role ? { role: target.role } : {}),
+        sourceDisplay: appId, targetLarkAppId: target.appId,
+      }),
+      requestedOverride: requestedLaunch,
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    };
+    const coordinator = createDispatchLaunchSourceCoordinator({
+      sourceLarkAppId: appId,
+      store: createDispatchLaunchOperationStore({ dataDir: resolveDataDir(), ownerLarkAppId: appId }),
+      targetDaemon,
+      now: () => new Date(),
+    });
+    // validateRequestAuthority throws plain Error (not DispatchLaunchFailure)
+    // when the target daemon does not advertise IPC v1 or is behind a stale
+    // findDaemon lookup. Convert to a human-readable exit instead of letting
+    // the stack trace bubble out of the CLI.
+    let prepared: Awaited<ReturnType<typeof coordinator.prepare>>;
+    try {
+      prepared = await coordinator.prepare(request);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`DISPATCH_LAUNCH_UNAVAILABLE: ${message}`);
+      process.exit(1);
+    }
+    if (!prepared.ok) {
+      console.error(`${prepared.errorCode}: ${prepared.message}`);
+      process.exit(1);
+    }
+    let started: Awaited<ReturnType<typeof coordinator.start>>;
+    try {
+      started = await coordinator.start(dispatchId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`DISPATCH_LAUNCH_UNAVAILABLE: ${message}`);
+      process.exit(1);
+    }
+    if (!started.ok) {
+      console.error(`${started.errorCode}: ${started.message}`);
+      process.exit(1);
+    }
+    const operation = started.operation;
+    // Direct-IPC dispatch requires !repo; --standby was rejected above when it
+    // arrived without --repo. So `standby` is provably false in this branch —
+    // do not compute `!standby` / `standby ? ...` here.
+    console.log(JSON.stringify({
+      success: operation.state === 'awaiting_proof',
+      taskSent: true,
+      mode: 'dispatch',
+      sourceSessionId: sid,
+      targetAppIds: [target.appId],
+      threadRootId: 'rootMessageId' in operation ? operation.rootMessageId : null,
+      seedMessageId: 'rootMessageId' in operation ? operation.rootMessageId : null,
+      threadId: null,
+      chatId: targetChatId,
+      repo: repo ?? null,
+      ...dispatchLaunchInspection(operation),
+    }));
+    if (operation.state !== 'awaiting_proof') process.exitCode = 1;
+    return;
   }
   const intoBriefJson = intoRoot
     ? JSON.stringify({ zh_cn: { title: '', content: built.threadContent } })
@@ -13302,6 +13626,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         bots: built.mentionedOpenIds,
         purpose: brief,
         owners: bots.map(bot => bot.name ?? bot.openId),
+        ...(requestedLaunch && effectiveRuntime ? {
+          requestedLaunch,
+          effectiveRuntime,
+        } : {}),
       },
     });
     const registrationBody: any = await registration.json().catch(() => ({}));
@@ -13403,6 +13731,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       bots: built.mentionedOpenIds,
       collaborationReady: parsedBotApps.length > 0,
       projectSynced,
+      ...(requestedLaunch && effectiveRuntime ? {
+        requestedLaunch,
+        effectiveRuntime,
+      } : {}),
       ...(acceptance ? {
         accepted,
         acceptedBotAppIds: acceptance.acceptedBotAppIds,
@@ -14602,6 +14934,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // result.kind==='answered' 时用 toLegacySelected 取回旧的 string（单问单选）
   const selected = toLegacySelected(result);
 
+  let stdoutPayload: string | undefined;
   if (useJson) {
     const out: AskJsonOutput = {
       // `selected` 是「单问单选」的向后兼容值（= toLegacySelected 的形状判据：
@@ -14614,7 +14947,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       comment: result.kind === 'answered' ? result.comment : null,
       timedOut: result.kind === 'timedOut',
     };
-    process.stdout.write(JSON.stringify(out) + '\n');
+    stdoutPayload = JSON.stringify(out) + '\n';
   } else if (result.kind === 'answered') {
     // 非 JSON 模式：单选输出 key，多选输出逗号分隔的 keys。
     //
@@ -14631,12 +14964,23 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     // N 项→逗号分隔，全程 exit 0。文字作答时 answers[0] 为空数组同样落空行（上面已在
     // stderr 提示改读 --json 的 comment）。
     const value = multiSelect ? (result.answers[0]?.join(',') ?? '') : (selected ?? '');
-    process.stdout.write(value + '\n');
+    stdoutPayload = value + '\n';
   }
 
-  // Flush the actual result before acknowledging delivery. If this process
-  // disappears first, the daemon can still recover its unconsumed receipt.
-  await new Promise<void>(resolve => process.stdout.write('', () => resolve()));
+  // Flush the actual result before acknowledging delivery (and before the
+  // explicit process.exit below): `ask --json` carries the user's free-form
+  // comment, whose size is unbounded, and an exit right after write() can drop
+  // the tail of a large pipe write.  If the write fails, exit without the ack
+  // so the daemon can still recover its unconsumed receipt.
+  if (stdoutPayload !== undefined) {
+    try {
+      await writeAndFlush(process.stdout, stdoutPayload);
+    } catch (writeError) {
+      process.removeListener('SIGINT', protectAskWait);
+      console.error(`botmux ask: stdout 输出失败：${writeError instanceof Error ? writeError.message : String(writeError)}`);
+      process.exit(1);
+    }
+  }
   try { await postAsk({ ...body, acknowledge: true }); }
   catch { /* durable receipt + same-session recovery handles ambiguous delivery */ }
   process.removeListener('SIGINT', protectAskWait);
@@ -14968,7 +15312,10 @@ async function cmdHook(cliId: string): Promise<void> {
   const env = process.env as Record<string, string | undefined>;
   const result = await runHook(payload, env, postAsk, cliId);
   if (result.stdout) {
-    console.log(result.stdout);
+    // The directive can embed the user's free-form answer (unbounded size);
+    // wait for the pipe write to complete before the explicit exit truncates it.
+    // A failed write still exits 0: hook mode must never block the CLI.
+    try { await writeAndFlush(process.stdout, result.stdout + '\n'); } catch { /* passthrough */ }
   }
   process.exit(0);
 }

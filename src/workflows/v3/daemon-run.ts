@@ -65,7 +65,6 @@ import {
   canResolveGateWait,
   normalizeGateWaitInput,
   readWait,
-  resolveWait,
   resolveWaitOnce,
   selectedResolution,
   v3GateWaitId,

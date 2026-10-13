@@ -41,12 +41,9 @@ import {
   openSync,
   readSync,
   readdirSync,
-  readlinkSync,
   statSync,
   type Dirent,
 } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { platform } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import {
   splitCodexEventsByCutoff,
@@ -67,6 +64,7 @@ import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
@@ -98,12 +96,10 @@ export interface TraexRuntimeSnapshot {
   reasoningEffort?: string;
 }
 
-const IS_LINUX = platform() === 'linux';
 const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 const TRAEX_ROLLOUT_LOOKUP_INITIAL_BACKOFF_MS = 2_000;
 const TRAEX_ROLLOUT_LOOKUP_MAX_BACKOFF_MS = 8_000;
 const TRAEX_ROLLOUT_LOOKUP_MISS_CACHE_MAX = 256;
-const TRAEX_LSOF_TIMEOUT_MS = 1_000;
 const TRAEX_YEAR_DIR_RE = /^\d{4}$/;
 const TRAEX_MONTH_DIR_RE = /^(?:0[1-9]|1[0-2])$/;
 const TRAEX_DAY_DIR_RE = /^(?:0[1-9]|[12]\d|3[01])$/;
@@ -1360,42 +1356,6 @@ function selectTraexRollout(
   return newest;
 }
 
-/** Enumerate the file paths a pid holds open (Linux /proc, else lsof). Shared
- *  by findTraexRolloutByPid (single) and findTraexRolloutSetByPid (ownership
- *  set) so both derive from one source. Returns undefined when enumeration is
- *  unavailable — callers treat that as "cannot prove ownership". */
-function traexProcessOpenTargets(pid: number): string[] | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (!existsSync(fdDir)) return undefined;
-    let entries: string[];
-    try { entries = readdirSync(fdDir); } catch { return undefined; }
-    const targets: string[] = [];
-    for (const fd of entries) {
-      try { targets.push(readlinkSync(join(fdDir, fd))); } catch { continue; }
-    }
-    return targets;
-  }
-  let out: string;
-  try {
-    out = execFileSync('lsof', ['-p', String(pid), '-Fn'], {
-      encoding: 'utf-8',
-      timeout: TRAEX_LSOF_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-      maxBuffer: 4 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-  } catch {
-    return undefined;
-  }
-  const targets: string[] = [];
-  for (const line of out.split('\n')) {
-    if (line.startsWith('n/')) targets.push(line.slice(1));
-  }
-  return targets;
-}
-
 /** Find the visible top-level rollout an externally-running TRAE process owns.
  *  TRAE can keep the parent rollout and internal guardian/subagent rollouts open
  *  in the same process. Internal rollouts are never adoptable. When a current
@@ -1405,7 +1365,7 @@ export function findTraexRolloutByPid(
   pid: number,
   preferredSessionId?: string,
 ): { path: string; cliSessionId: string } | undefined {
-  const targets = traexProcessOpenTargets(pid);
+  const targets = listProcessOpenFiles(pid);
   if (!targets) return undefined;
   const selected = selectTraexRollout(traexRolloutRefs(targets), preferredSessionId);
   return selected ? { path: selected.path, cliSessionId: selected.cliSessionId } : undefined;
@@ -1419,7 +1379,7 @@ export function findTraexRolloutByPid(
  *  as "cannot prove ownership" — fail closed, do not bind). Mirrors
  *  findCodexRolloutSetByPid. */
 export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
-  const targets = traexProcessOpenTargets(pid);
+  const targets = listProcessOpenFiles(pid);
   if (!targets) return undefined;
   const set = new Set<string>();
   for (const ref of selectableTraexRollouts(traexRolloutRefs(targets))) {

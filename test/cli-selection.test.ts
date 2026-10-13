@@ -7,6 +7,7 @@ import {
   CLI_SELECTION_ALIASES,
   resolveCliSelection,
   lookupCliSelection,
+  lookupCliSelectionForBotShape,
   selectionKeyForBot,
   stripSettingsArgs,
   stripWrapperUnsafeArgs,
@@ -245,6 +246,28 @@ describe('selectionKeyForBot', () => {
     expect(selectionKeyForBot('codex')).toBe('codex');
     expect(selectionKeyForBot('claude-code', '')).toBe('claude-code');
     expect(selectionKeyForBot('claude-code', 'ccr')).toBe('claude-code');
+  });
+});
+
+describe('lookupCliSelectionForBotShape', () => {
+  it('round-trips every registered native, wrapper and launch-mode tuple exactly', () => {
+    for (const option of CLI_SELECT_OPTIONS) {
+      expect(lookupCliSelectionForBotShape(
+        option.cliId,
+        option.wrapperCli,
+        option.cliLaunchMode,
+      )?.key).toBe(option.key);
+    }
+  });
+
+  it('does not treat missing fields as wildcards or unknown wrappers as native', () => {
+    expect(lookupCliSelectionForBotShape('codex', 'ccr claude')).toBeUndefined();
+    expect(lookupCliSelectionForBotShape('codex', 'aiden x codex', undefined)?.key)
+      .toBe('aiden-x-codex');
+    expect(lookupCliSelectionForBotShape('codex', undefined, undefined)?.key).toBe('codex');
+    expect(lookupCliSelectionForBotShape('traex', undefined, 'forge-traex')?.key)
+      .toBe('forge-x-traex');
+    expect(lookupCliSelectionForBotShape('traex', undefined, undefined)?.key).toBe('traex');
   });
 });
 

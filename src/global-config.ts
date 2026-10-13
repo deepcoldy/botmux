@@ -404,7 +404,7 @@ export interface DashboardGlobalConfig {
    *  brandLabel）。缺省 ON（absent ⇒ 显示）；显式 `false` 时**所有** bot 的页脚品牌
    *  签名一律不渲染（等价于每 bot brandLabel 被置空），Dashboard 每个 bot 的签名
    *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
-   *  Live 读取（见 config.ts `cardBrandLabelEnabled`），Settings 翻转后无需重启。 */
+   *  Live 读取（见 bot-registry.ts `isCardBrandLabelEnabled`），Settings 翻转后无需重启。 */
   cardBrandLabel?: boolean;
 }
 
@@ -521,13 +521,6 @@ function readHerdrTraexPlugin(raw: unknown): HerdrTraexPluginConfig | undefined 
   if (typeof r.enabled === 'boolean') out.enabled = r.enabled;
   if (typeof r.source === 'string' && r.source.trim()) out.source = r.source.trim();
   if (typeof r.ref === 'string' && r.ref.trim()) out.ref = r.ref.trim();
-  // Migrate the unmerged review schema in-memory without rewriting config.json.
-  if (!out.source && typeof r.spec === 'string' && r.spec.trim()) {
-    const legacy = r.spec.trim();
-    const hash = legacy.lastIndexOf('#');
-    out.source = hash > 0 ? legacy.slice(0, hash) : legacy;
-    if (!out.ref && hash > 0 && hash < legacy.length - 1) out.ref = legacy.slice(hash + 1);
-  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -561,7 +554,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
   }
   // Round-trip an explicit boolean either way. Absent stays absent — the live
-  // getter (config.ts `cardBrandLabelEnabled`) treats absent as ON, so a stored
+  // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored
   // `false` must be preserved to let an operator suppress footer brands fleet-wide.
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
   return Object.keys(out).length > 0 ? out : undefined;

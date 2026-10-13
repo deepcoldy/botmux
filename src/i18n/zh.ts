@@ -78,8 +78,6 @@ export const messages: Record<string, string> = {
   'card.status.waiting_screenshot': '_(等待第一张截图…)_',
   'card.status.screenshot_unavailable': '_(当前没有可用截图，请在会话恢复后刷新。)_',
   'card.status.truncated_prefix': '… (已截断)',
-  'card.pending.detoured_title': '已发送',
-  'card.pending.detoured_body': '最终回复已发送到其他目标。',
 
   // ─── Card body text ──────────────────────────────────────────────────────
   'card.body.cli_terminated': '{cliName} 进程已终止。',
@@ -125,9 +123,6 @@ export const messages: Record<string, string> = {
   'card.repo.toast_worktree_mode_switched_back': '已切回单仓库选择器，本 bot 后续会话默认生效（可再点切到多仓库）。',
   'card.repo.worktree_rolled_back': '{repo} 创建 worktree 失败：{error}。已回滚本批次此前创建的 {count} 个 worktree。',
   'card.repo.toast_worktree_creating': '正在创建 worktree，完成后会在话题里通知…',
-
-  // 平台团队大厅打卡（bot-only 群，仅 bot 可见）
-  'platform.hall_announce': '🤖 团队登记打卡：本 bot 上线（登记身份 union_id 用，无需回复）',
 
   // 群内授权卡片
   'card.grant.title': '🔑 使用授权',
@@ -218,11 +213,7 @@ export const messages: Record<string, string> = {
 
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 选择要接入的 CLI 会话',
-  'card.adopt.placeholder_select': '选择 CLI 会话',
   'card.adopt.uptime_unknown': '未知',
-  'card.adopt.section_live': '**接管运行中的会话**（观察 tmux / herdr / zellij 里的活进程）',
-  'card.adopt.section_resume': '**恢复历史会话**（从磁盘 resume 导入，无需进程在跑）',
-  'card.adopt.placeholder_resume': '选择要 resume 的历史会话',
   // V2 picker (search + card list + pagination), replacing the two dropdowns.
   'card.adopt.search_placeholder': '🔍 搜索会话（标题/项目/路径）',
   'card.adopt.empty': '当前没有可接入的会话。\n（运行中：tmux / zellij / herdr 里正在跑的本机 CLI；历史：本 bot 同类 CLI 从磁盘可 resume 的会话。）',
@@ -283,7 +274,6 @@ export const messages: Record<string, string> = {
   'card.relay.title': '📋 选择要接力到本群的会话',
   'card.relay.title_p2p': '📋 选择要接力到本单聊的会话',
   'card.relay.empty': '当前没有可接力的会话。\n（只列同一机器人下你自己的**活跃**会话——含私聊（位置显示为「单聊」）；已关闭的会话不会出现。）',
-  'card.relay.btn_pull': '接力到本群',
   'card.relay.btn_confirm': '确认接力到本群',
   'card.relay.btn_confirm_p2p': '确认接力到本单聊',
   'card.relay.btn_confirm_running': '会话运行中，暂不可迁移',
@@ -293,12 +283,10 @@ export const messages: Record<string, string> = {
   'card.relay.selected_tag': '已选中',
   'card.relay.hint_pick_first': '点击上方任意会话以选中，然后再点确认按钮触发接力。',
   'card.relay.search_placeholder': '🔍 搜索会话（标题/群名/路径；搜「单聊」找私聊）',
-  'card.relay.btn_search': '搜索',
   'card.relay.btn_prev_page': '← 上一页',
   'card.relay.btn_next_page': '下一页 →',
   'card.relay.page_indicator': '第 {current} / {total} 页',
   'card.relay.empty_filtered': '没有匹配「{query}」的会话，请换个关键词。',
-  'card.relay.placeholder_select': '选择要接力的会话',
   'card.relay.type_group': '普通群',
   'card.relay.type_topic': '话题群',
   'card.relay.type_p2p': '单聊',
@@ -309,7 +297,6 @@ export const messages: Record<string, string> = {
   'card.relay.toast_not_found': '会话已不存在或已关闭。',
   'card.relay.toast_not_owner': '只有会话发起人能接力它。',
   'card.relay.toast_not_invoker': '这张菜单是别人召唤的，请自己发 /relay 召唤一张。',
-  'card.relay.toast_worker_busy': '⚠️ 会话当前正在处理中，请等它空闲后再接力。',
   'card.relay.toast_not_started_yet': '⚠️ 会话还没选仓库、CLI 没起来，无法接力。请先回原会话把仓库选了。',
   'card.relay.toast_same_chat': '该会话已在目标位置（同一话题/群），无需接力。',
   'card.relay.toast_failed': '接力失败：{error}',
@@ -320,7 +307,6 @@ export const messages: Record<string, string> = {
   'card.relay.fail_timeout': '⚠️ 接力超时未完成。会话仍在原处、未丢失——飞书消息历史和 AI 记忆都还在源会话里。请稍等片刻，再点一次「确认接力」重试。',
   'card.relay.fail_worker_busy': '⚠️ 接力未完成：会话正在处理中（mid-turn）。会话仍在原处、未丢失，请等它空闲后再点一次「确认接力」重试。',
   'card.relay.fail_generic': '⚠️ 接力未完成（{error}）。会话仍在原处、未丢失——飞书消息历史和 AI 记忆都还在源会话里。请稍后再点一次「确认接力」重试。',
-  'card.relay.toast_target_has_session': '本群已有该机器人的活跃会话，请先 /close 它再接力',
   'cmd.relay.target_has_session_msg': '⚠️ 本群已有该机器人的活跃会话「{title}」。请先用 /close 关掉那个会话，再接力新的过来。',
   'card.relay.toast_success': '✅ 已接力到本群',
 
@@ -435,13 +421,9 @@ export const messages: Record<string, string> = {
   'cmd.close.worktree_check_ahead_ok': '✅ 未 push 提交：无',
   'cmd.close.worktree_check_ahead_warn': '⚠️ 未 push 提交：{n} 个',
   'cmd.close.worktree_effect_safe': '此 worktree 干净，删除不会丢失代码。',
-  'cmd.close.worktree_confirm_risky': '⚠️ 准备关闭并删除这个 worktree：\n- 其它同 worktree 活跃会话：{count} 个\n- 未提交改动：{dirty}\n- 未 push 提交：{ahead} 个\n确认要继续，请发送 `/close wt --yes`。',
-  'cmd.close.worktree_confirm_shared': '⚠️ 还有 {count} 个活跃会话也在这个 worktree 下。确认要一起关闭并删除 worktree，请发送 `/close wt --yes`。',
   'cmd.close.worktree_sibling_close_failed': '⚠️ 当前会话已关闭，但使用 `{path}` 的其他 {count} 个会话未能关闭。worktree 未删除；请等所属 daemon 恢复后，从剩余会话重试。',
   'cmd.close.worktree_remove_failed': '⚠️ 会话已关闭，但移除 worktree `{path}` 失败：{error}',
-  'cmd.cd.riff_unsupported': '⚠️ Riff 会话不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
   'cmd.cd.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持中途切换工作目录或角色。请先用 /close 关闭当前远程会话，再从新目录创建会话。',
-  'cmd.takeover.riff_unsupported': '⚠️ Riff 会话不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
   'cmd.takeover.remote_unsupported': '⚠️ 远程后端会话（Riff / Mojo）不支持原地接管或导入其他会话。请先用 /close 安全关闭当前远程会话，再新建或导入会话。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',
@@ -560,7 +542,6 @@ export const messages: Record<string, string> = {
   'cmd.watch.started': '✅ 已开始监听文档 {title}… 的评论（{mode}）。\n评论会喂进本会话，AI 回复会发回原评论讨论串。',
   'cmd.watch.started_moved': '✅ 已开始监听文档 {title}… 的评论（{mode}）。\n⚠️ 该文档原先绑定另一条会话，现已改绑到本会话。',
   'cmd.watch.started_lazy': '✅ 已登记监听文档 {title}… 的评论（{mode}）。\n当前没有绑定会话；首条符合条件的评论到来时自动创建文档会话并启动 CLI。',
-  'cmd.watch.deferred_start': '当前没有运行中的 CLI；首条符合条件的文档评论到来时，botmux 会自动启动会话。',
   'cmd.watch.prewarming': '正在启动并预热 AI 会话：AI 会先读取文档、建立会议上下文，然后进入评论待命状态。',
   'cmd.watch.project_optional_session': '当前会话未绑定项目。是否需要结合本地代码回答？需要时发送 `/cd <项目目录>`；不操作则默认仅根据文档内容回答。',
   'cmd.watch.project_optional_lazy': '当前监听未绑定项目。默认仅根据文档内容回答；需要结合本地代码时，请重新执行并添加 `--dir <项目目录>`。',
@@ -592,7 +573,6 @@ export const messages: Record<string, string> = {
   'daemon.doc_mention_notify_body': '用户 {requester} 在文档 {token} 中 @了机器人，已触发回复。',
   'daemon.doc_dropped_notify_title': '⚠️ 文档评论事件未处理',
   'daemon.doc_dropped_notify_body': '用户 {requester} 在文档 {token} 中的评论事件，bot 未能读取或处理；未产生回复。将在该评论上留下失败标记，提示对方重发。',
-  'daemon.doc_comment_reply_prefix': '↪ 回复 {author}：',
   'cmd.adopt.already_adopted': '本话题已接入 {label} ({pane})。\n请先点击卡片上的「断开」按钮，再 /adopt 切换 CLI 会话（原 CLI 不受影响）。',
   'cmd.adopt.no_sessions': '未发现可接入的 CLI 会话',
   'cmd.adopt.pane_not_found': '未找到 tmux pane {pane}',
@@ -705,7 +685,6 @@ export const messages: Record<string, string> = {
   'card.config.sec.card': '🎴 卡片行为',
   'card.config.sec.autostart': '🚀 主动开工',
   'card.config.sec.security': '🔒 安全 / 授权',
-  'card.config.quota_label': '消息额度',
   'card.config.quota_off': '默认：授权卡 3 条 / Oncall 不限额',
   'card.config.quota_value': '当前：授权卡每人 {quota} 条（Oncall 不限额）',
   'card.config.quota_edit': '设置消息额度',
@@ -745,7 +724,6 @@ export const messages: Record<string, string> = {
   'card.config.lbl_startup': '启动命令（开会话后、首条消息前自动发，逗号/换行分隔，可带参数，如 /effort ultracode）',
   'card.config.lbl_role': '默认角色（team，跨群）',
   'card.config.save': '💾 保存',
-  'card.config.back': '⬅ 返回配置',
   'card.config.text_saved': '✓ 已保存',
   'card.config.text_sent': '✏️ 文本设置卡已发到你私聊 ↓',
   'card.config.text_send_fail': '⚠️ 发送失败（你可能没和本 bot 开过私聊）',
@@ -786,7 +764,6 @@ export const messages: Record<string, string> = {
   'cmd.relay.not_owner': '⚠️ 只有会话发起人能用 /relay --create 把会话搬到新群。',
   'cmd.relay.adopt_not_relayable': '⚠️ 该会话是 /adopt 接入的外部 tmux 进程，CLI 在你电脑里跑，botmux 控不了 tmux 生命周期，无法接力。',
   'cmd.relay.not_started_yet': '⚠️ 会话还没选仓库、CLI 没起来，无法接力。请先在本会话里选仓库把 CLI 起起来。',
-  'cmd.relay.worker_busy': '⚠️ 会话正在处理中（mid-turn），无法接力。请等当前回合结束（idle）后再发 /relay。',
   'cmd.relay.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/relay 取消。请稍后重试。',
   'cmd.relay.m1_announce': '📋 已从「{sourceChat}」接力会话过来。\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。\n@ 对应机器人继续对话即可。',
   'cmd.relay.m1_announce_dm': '📋 已从「{sourceChat}」接力会话过来。\n⚠️ 飞书消息历史留在源会话，AI 记忆已接续。\n直接发消息继续对话即可。',
@@ -853,7 +830,6 @@ export const messages: Record<string, string> = {
   'schedule.position_top_level': '执行位置：群消息顶层（后续会话形态跟随普通群会话模式）',
   'schedule.position_topic': '执行位置：当前话题下',
   'schedule.silent_note': '静默模式: 触发时不发「执行中」提示，模型判断满足条件才 botmux send 报警，否则完全静默',
-  'schedule.silent_new_topic_conflict': '静默新话题会延迟创建：无通知时自动关闭隐藏会话，首次 botmux send 才创建并绑定话题。',
   'schedule.parse_failed': '无法解析定时任务，请使用自然语言格式：\n\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报\n/schedule 每小时 检查服务健康状态\n/schedule 每30分钟 ping一下服务\n/schedule 每月1号9:00 生成月报\n\n管理命令：\n/schedule list — 查看所有任务\n/schedule remove <id> — 删除任务\n/schedule enable <id> — 启用任务\n/schedule disable <id> — 禁用任务\n/schedule run <id> — 立即执行一次',
 
   // ─── /help ───────────────────────────────────────────────────────────────
@@ -935,7 +911,6 @@ export const messages: Record<string, string> = {
   'help.config_set': '/botconfig set <字段> <值>  - 改 model/cli/lang/开关等；/botconfig help 看全部字段',
   'help.skills': '/skills ...    - 查看/管理本 bot 的技能策略（attach/detach 需 owner）',
   'help.reply_mode': '/reply-mode [status|chat|chat-topic|topic|new-topic] - 查看/切换普通群或私聊的回复/会话模式',
-  'help.substitute': '/substitute [status|on|off] - 查看/切换当前群替身模式开关',
   'help.heading_group': '🆕 一键新建会话群：',
   'help.group': '/group <群名>  (别名 /g)  - 自动建群、邀请你进群（整群=一个 CLI 会话）',
   'help.project': '/project enable|status|disable - 在当前普通群启用、查看或退出项目群模式（owner 专用）',
@@ -1056,6 +1031,11 @@ export const messages: Record<string, string> = {
   // 这条 reminder 绝不能再带 send/@/BOTMUX_NOTHING_TO_SEND，否则又和 http_response_mode 打架。
   'ai.followup.reminder_no_transport': '本轮是程序发起的请求-应答：完整回复会原样回传给调用方，不显示在任何聊天里。按本轮内容里的 <botmux_http_response_mode> 指示作答即可；不要调用 botmux send，不要发飞书。',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
+  // Cursor 会把超过等待时限的 shell 命令转成后台任务，任务完成后由 Cursor 自动注入一条
+  // 合成 user 提示（"Briefly inform the user about the task result…"）再开一轮——它不是
+  // 飞书消息，botmux 拦不到（#1504）。只能在提示层告诉模型别把它当成新消息去 send。
+  'ai.cursor.background_task_note': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，不要再 botmux send，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才发一条 progress。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
+  'ai.cursor.background_task_note_transcript': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才简短作答。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',
 
@@ -1165,10 +1145,8 @@ export const messages: Record<string, string> = {
   'card.action.takeover_retired': '⚠️ 旧版"接管"按钮已停用。bridge 模式下原 CLI 由 botmux 桥接，无需接管即可在飞书中收到回答。如需 /resume 完整接管能力，请等待 /adopt --takeover 命令上线。',
   'card.action.terminal_not_ready': '⚠️ 终端尚未就绪，请稍后再试。',
   'card.action.terminal_unsupported': '⚠️ 当前会话后端不提供 Web 终端；ZMX 会话请在本机运行 `botmux list` 或 `zmx attach`。',
-  'card.action.local_terminal_opened': '💻 已请求打开本机 {cliName}',
   'card.action.local_terminal_unsupported': '⚠️ 当前 {cliName} 会话暂不支持本机直开，请使用该后端支持的终端接入方式。',
   'card.action.local_cli_missing': '⚠️ 本机未找到 {cliName} 可执行文件（{executable}），请先安装或配置 PATH / cliPathOverride。',
-  'card.action.local_terminal_failed': '⚠️ 打开本机 CLI 失败：{reason}',
   'card.action.local_terminal_no_permission': '🔒 没有操作权限，无法打开本机 CLI',
   'card.action.local_cli_opened': '正在打开本机 {cliName}',
   'card.action.local_cli_disabled': '⚠️ 本机 CLI 直开默认关闭，请先在设置中显式启用。',
@@ -1207,7 +1185,6 @@ export const messages: Record<string, string> = {
   'card.action.close_residual_local': '会话已在本地关闭、远端会话已取消，但本机可能残留带凭证子进程未确认终止（{taskId}）。请人工核查该主机进程。',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
-  'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
   'card.action.tui_ipc_failed': '⚠️ TUI 操作未发送（worker 可能不可用），请重试。',
   'card.action.continue_using_current_repo': '继续使用当前仓库：{cwd}',
@@ -1276,52 +1253,7 @@ export const messages: Record<string, string> = {
   'card.action.continue_turn_success': '▶️ 已请 CLI 读取现场后从上次的进度继续，请等待执行。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
-  'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',
-  'setup.lark_permissions_required': '需要的权限:',
-  'setup.lark_perm_im_message': '  - im:message (发送/接收消息)',
-  'setup.lark_perm_group_at_msg': '  - im:message.group_at_msg (群消息)',
-  'setup.lark_perm_resource': '  - im:resource (文件下载)',
-  'setup.lark_perm_chat': '  - im:chat (群信息)',
-  'setup.lark_perm_user_base': '  - contact:user.base:readonly (用户信息)',
-  'setup.lark_enable_events': '启用事件订阅 (WebSocket 模式):',
-  'setup.prompt_cli_choice': 'CLI 适配器 [1]: ',
-  'setup.prompt_working_dir': '默认工作目录 [~]: ',
-  'setup.prompt_allowed_users': '允许的用户 (邮箱/手机号/open_id，逗号分隔，留空=不限制): ',
-  'setup.prompt_lang': 'UI 语言 / UI language [zh/en, 默认 zh]: ',
-  'setup.section_lark_app_config': '── 飞书应用配置 ──',
-  'setup.section_reconfigure': '── 重新配置 ──',
-  'setup.section_add_new_bot': '── 添加新机器人 ──',
-  'setup.config_written': '✅ 配置已写入: {path}',
-  'setup.next_step': '下一步:',
-  'setup.next_step_short': '下一步: botmux restart',
-  'setup.next_start_daemon': '  1. botmux start              启动 daemon（飞书后台配长连接前必须先启动）',
-  'setup.next_autostart': '  2. botmux autostart enable   注册开机自启（推荐：{platformName}，无需 sudo）',
-  'setup.platform_mac': 'mac launchd',
-  'setup.platform_linux': 'linux user systemd',
-  'setup.platform_windows': 'Windows Task Scheduler',
-  'setup.platform_other': '当前平台暂不支持',
-  'setup.wizard_title': '🤖 botmux 配置向导',
-  'setup.config_dir': '配置目录: {path}',
-  'setup.data_dir': '数据目录: {path}',
-  'setup.bots_already_configured': '已配置 {count} 个机器人：',
-  'setup.prompt_action_existing_bots': '操作: 1) 添加新机器人  2) 重新配置  (1/2) [1]: ',
-  'setup.old_config_backed_up': '旧配置已备份: {path}',
-  'setup.added_bot': '✅ 已添加机器人 {appId}，共 {count} 个',
-  'setup.config_file': '   配置文件: {path}',
-  'setup.using_single_bot_config': '当前使用单机器人配置: {path}',
-  'setup.prompt_action_env_exists': '操作: 1) 添加新机器人  2) 覆盖当前配置  (1/2): ',
-  'setup.old_env_backed_up': '   旧 .env 已备份: {path}',
-  'setup.env_missing_keys': '⚠️  当前 .env 缺少 LARK_APP_ID 或 LARK_APP_SECRET，请先完成基础配置',
-  'setup.current_bot': '当前机器人: {appId} ({cliId})',
-  'setup.migrated_to_multibot': '✅ 已迁移到多机器人配置',
 
-  'start.no_config': '❌ 未找到配置文件',
-  'start.run_setup': '   请先运行: botmux setup',
-  'start.daemon_started': '✅ daemon 已启动{suffix}',
-  'start.daemon_started_suffix': ' ({count} 个机器人, 每个独立进程)',
-  'start.logs_hint': '   日志: botmux logs',
-  'start.status_hint': '   状态: botmux status',
-  'start.autostart_synced': '   autostart unit 已同步到当前启动路径',
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
   'daemon.auto_start_join_title': '主动开工（入群）',
@@ -1520,7 +1452,6 @@ export const messages: Record<string, string> = {
   'card.dashboard.schedules.pause.disabled.alreadyPaused': '任务已暂停',
   'card.dashboard.schedules.resume.disabled.alreadyEnabled': '任务已启用',
   'card.dashboard.schedules.delivery.disabled.local': '本地投递模式不支持在卡片中切换',
-  'card.dashboard.schedules.delivery.disabled.silent': '静默新话题将在首次 botmux send 时延迟创建',
   'card.dashboard.schedules.delivery.disabled.topicRootRequired': '该任务没有可用的话题根消息，需先在 Dashboard 中填写目标话题根消息 ID',
   'card.dashboard.schedules.delivery.disabled.alreadyOrigin': '已在话题下执行',
   'card.dashboard.schedules.delivery.disabled.alreadyTopLevel': '已在群消息顶层执行',
@@ -1684,12 +1615,12 @@ export const messages: Record<string, string> = {
   // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
   'common.operator': '操作人：{by}',
   'common.empty_paren': '（空）',
-  'common.truncated_short': '…（已截断）',
 
   // Ask card
   'card.ask.field.deadline': '截止',
   'card.ask.field.answerable': '可答复',
   'card.ask.question_n': '问题 {n}',
+  'card.ask.prompt_truncated': '（问题正文过长，卡片内已截断；完整内容见本话题中的附件文件）',
   'card.ask.submit': '提交',
   'card.ask.submit_confirm_empty': '确认空提交',
   'card.ask.empty_warning': '⚠️ 你还没有勾选任何选项。多选允许「一个都不选」，如确实要以空作答，请再次点击「确认空提交」；否则先勾选再提交。',
@@ -1714,7 +1645,6 @@ export const messages: Record<string, string> = {
   'card.ask.supplement': '补充：{comment}',
   'card.ask.timed_out': '超时未答',
   'card.ask.invalidated': '已失效',
-  'card.ask.no_approver': '无可用答复人',
   'card.ask.answerable_designated_member': '指定成员（仅本人可操作）',
   'card.ask.answerable_talk_members': '本群可对话成员',
 
@@ -1726,7 +1656,6 @@ export const messages: Record<string, string> = {
   'toast.action_in_progress': '操作正在处理中，请稍候',
   'toast.action_received_bg': '操作已收到，后台处理中',
   'toast.card_update_busy_retry': '卡片正在更新，请稍后再点一次',
-  'toast.not_in_approver_list': '你不在该审批人名单里，无法操作',
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[用户引用了消息 用 botmux quoted {id} 查看]',
@@ -1747,7 +1676,6 @@ export const messages: Record<string, string> = {
   'card.usage.ctx': 'ctx',
   'card.usage.quota_5h': '5h',
   'card.usage.quota_7d': '7d',
-  'card.usage.tokens': 'Token',
   'card.usage.turn': '本轮',
   'card.usage.total': '累计',
 

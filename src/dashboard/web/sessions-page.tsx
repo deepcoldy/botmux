@@ -16,7 +16,6 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
   type CSSProperties,
-  type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
@@ -35,7 +34,6 @@ import { FeedGroupPicker } from './feed-group-picker.js';
 import { BotMultiSelect } from './bot-multi-select.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
-  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   readStoredBoardOrder,
   readStoredCreateKeepOpen,

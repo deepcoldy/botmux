@@ -1,16 +1,11 @@
-import * as pty from '../../utils/pty.js';
 import { execSync, execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
-import { randomBytes } from 'node:crypto';
-import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
+import type { SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
 import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
-import { inheritBotEnv } from '../../core/env-policy.js';
-import { strictPaneCommand } from './strict-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
-import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -148,40 +143,20 @@ export function isExecTimeoutError(err: unknown): boolean {
 }
 
 /**
- * TmuxBackend — session backend using tmux for process persistence.
+ * TmuxBackend — static tmux session helpers (naming, probes, kill, diagnostics).
  *
- * Architecture: pty-under-tmux.
- *   - A node-pty process runs `tmux new-session` or `tmux attach-session`
- *   - All output flows through the pty (onData/onExit work unchanged)
- *   - kill() only detaches (kills the pty viewer), tmux session survives
- *   - destroySession() kills the tmux session (for explicit /close)
+ * This class used to be a pty-under-tmux `SessionBackend` instance (node-pty
+ * running `tmux new-session` / `attach-session`). That implementation was
+ * superseded by {@link TmuxPipeBackend} (tmux-pipe-backend.ts), which is the only
+ * tmux backend `selectSessionBackend` constructs; the unreachable instance
+ * surface (constructor, spawn / write / sendText / pasteText / attachToExisting
+ * / getAttachInfo …) was removed. What remains is the static helper surface
+ * shared by the daemon, worker, persistent-backend bookkeeping and
+ * TmuxPipeBackend itself.
  *
  * Naming: tmux sessions are named `bmx-<sessionId.slice(0,8)>`.
  */
-export class TmuxBackend implements SessionBackend {
-  private process: pty.IPty | null = null;
-  private readonly sessionName: string;
-  private readonly ownsSession: boolean;
-  private reattaching = false;
-  /** Tmux pane target when in adopt mode (e.g. "0:2.0") — set by attachToExisting.
-   *  When non-null, ALL pane-scoped tmux commands (send-keys / paste-buffer /
-   *  copy-mode / list-panes) must address this pane explicitly; using
-   *  `this.sessionName` would either resolve nothing (the name is synthetic
-   *  in adopt mode) or fall through to whichever pane tmux happens to have
-   *  active, which is exactly the bug we're avoiding. */
-  private adoptedPaneTarget: string | null = null;
-
-  constructor(sessionName: string, opts?: { ownsSession?: boolean }) {
-    this.sessionName = sessionName;
-    this.ownsSession = opts?.ownsSession ?? true;
-  }
-
-  /** Target string to use for pane-scoped tmux commands. In adopt mode this
-   *  is the real pane address ("0:2.0"); otherwise the bmx-* session name. */
-  private get cmdTarget(): string {
-    return this.adoptedPaneTarget ?? this.sessionName;
-  }
-
+export class TmuxBackend {
   // ─── Static helpers ───────────────────────────────────────────────────────
 
   /**
@@ -396,128 +371,12 @@ export class TmuxBackend implements SessionBackend {
     }
   }
 
-  // ─── SessionBackend implementation ────────────────────────────────────────
-
-  spawn(bin: string, args: string[], opts: SpawnOpts): void {
-    // Self-heal a server polluted by a pre-upgrade botmux before we touch it
-    // (once per daemon process; no-op on a server this build booted clean).
-    TmuxBackend.scrubServerGlobalEnvOnce();
-    this.reattaching = TmuxBackend.hasSession(this.sessionName);
-    if (opts.strictEnv && this.reattaching && !opts.strictEnvReattach) throw new Error('Refusing unverified strict tmux reattach');
-    const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
-    if (this.reattaching && instanceIdentity) TmuxBackend.assertInstanceIdentity(this.sessionName, instanceIdentity);
-    logger.debug(
-      `[tmux:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
-      `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
-    );
-    // Strip TMUX/TMUX_PANE from caller env before handing to pty.spawn — if
-    // the daemon was started inside a tmux session, leaving TMUX set would
-    // make this `tmux attach-session`/`new-session` target that parent
-    // session's socket. After the user's terminal tmux dies, every call
-    // here would print `error connecting to <stale-socket>` to the PTY and
-    // flood the daemon log via the leaked-stderr path.
-    const childEnv = tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
-
-    if (this.reattaching) {
-      // Re-attach to surviving tmux session (CLI is still running)
-      this.process = pty.spawn('tmux', ['attach-session', '-t', this.sessionName], {
-        name: 'xterm-256color',
-        cols: opts.cols,
-        rows: opts.rows,
-        cwd: opts.cwd,
-        env: childEnv,
-      });
-    } else {
-      // Run the CLI inside a fresh user shell so PATH / NVM_BIN / PNPM_HOME /
-      // mise / fnm / asdf shims set up in the user's rcfiles are loaded the
-      // way `coco` (or any other CLI) would see them if the user opened a
-      // terminal and ran it themselves.
-      //
-      // Shape:
-      //   tmux new-session -- /usr/bin/env DISABLE_AUTO_UPDATE=true
-      //     <shell> <shellFlags> -c <SCRIPT> [POSIX: _] <cwd> KEY=VAL... bin args...
-      //
-      //   - The env(1) prefix makes DISABLE_AUTO_UPDATE visible while the
-      //     shell loads its rcfile, then SCRIPT unsets it before execing the
-      //     CLI. This prevents oh-my-zsh's update prompt without changing the
-      //     final CLI environment or running an unattended update.
-      //   - <shell> + <shellFlags> come from resolveUserShell() and are
-      //     shell-kind-specific (bash needs `-i`; zsh needs `-l -i`;
-      //     fish needs `-i`; POSIX sh uses no flags).
-      //   - SCRIPT is shell-kind-aware:
-      //       * POSIX: `cd -- "$1" && shift && unset <managed> && exec /usr/bin/env "$@"`.
-      //       * fish: `cd -- $argv[1]; set -e argv[1]; set -e <managed>; exec /usr/bin/env $argv`.
-      //     Both return to the session's intended cwd even if the rcfile changed
-      //     directory mid-load, clear inherited tmux server-global botmux keys,
-      //     and inject this pane's KEY=VAL values only after rcfile startup.
-      //   - POSIX shells require `_` as the $0 placeholder before cwd; fish sees
-      //     argv directly and must omit that sentinel. In both contracts, spaces /
-      //     quotes / `$` / newlines in cwd, env values, or args never need shell
-      //     escaping because they travel as argv elements.
-      //   - tmux's own `-e KEY=VAL` is deliberately NOT used: it sets the
-      //     session env (visible to the shell), which means the user's rcfile
-      //     could `unset` or `export` over it before the CLI sees it. env(1)
-      //     injection happens after rcfile load and is authoritative.
-      const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
-      const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
-      // Debug knob — when on, the wrapper does NOT `exec` the CLI; it runs the
-      // CLI as a child and then drops into an interactive `$shell -i` so the
-      // user can poke at PATH / NVM / pnpm in the web terminal after exiting
-      // the CLI with Ctrl-C. Worker will still think the CLI is alive (it
-      // can't see the child-vs-exec distinction), so don't send messages
-      // through the bot while in this mode — type into the web terminal directly.
-      const debugKeepShell = !opts.strictEnv && process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
-      // Host-resolve the wrapper bin dir from opts.env (BOTMUX_CORE_ONLY /
-      // SESSION_DATA_DIR are scrubbed inside the pane before the script runs, so it
-      // MUST be baked in host-side — codex P1). opts.env is the authoritative
-      // per-session env the daemon assembled, not the scrubbed pane env.
-      const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
-      const shellKind = shellKindForPath(shellSpec.shell);
-      const script = debugKeepShell
-        ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind)
-        : shellWrapperScript(wrapperBinDir, shellKind);
-      if (debugKeepShell) {
-        logger.info(
-          `[tmux:${this.sessionName}] BOTMUX_DEBUG_KEEP_SHELL=1 — CLI exit will drop ` +
-          `to interactive ${shellSpec.shell} in the web terminal`,
-        );
-      }
-
-      const tmuxArgs = [
-        'new-session',
-        '-s', this.sessionName,
-        '-x', String(opts.cols),
-        '-y', String(opts.rows),
-        ...(instanceIdentity ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
-        '--',
-        ...(opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, script, [
-          opts.cwd,
-          ...envAssignments,
-          bin, ...args,
-        ])),
-      ];
-      this.process = pty.spawn('tmux', tmuxArgs, {
-        name: 'xterm-256color',
-        cols: opts.cols,
-        rows: opts.rows,
-        cwd: opts.cwd,
-        env: childEnv,
-      });
-    }
-
-    // Configure tmux session options.
-    // Runs for BOTH new sessions and reattach — reattach needs this to
-    // backfill options added after the session was originally created.
-    // Setting an already-applied option is idempotent.
-    setTimeout(() => {
-      configureTmuxSessionOptions(this.sessionName);
-    }, 500);
-  }
-
-  /** Whether the last spawn() re-attached to an existing tmux session. */
-  get isReattach(): boolean {
-    return this.reattaching;
-  }
+  // ─── Type-level instance fields ───────────────────────────────────────────
+  //
+  // TmuxBackend is never instantiated. These three optional fields exist only
+  // so worker.ts's `(backend as TmuxBackend | PtyBackend | ZellijBackend | …)`
+  // assignments keep type-checking (a property write on a union requires the
+  // property on every member). Drop them together with those casts.
 
   /** Claude Code session JSONL path — set by worker for claude-code sessions so
    *  the claude-code adapter can verify paste+Enter submissions via file growth. */
@@ -528,246 +387,6 @@ export class TmuxBackend implements SessionBackend {
   /** Working directory the CLI was spawned in — cross-checked against the pid
    *  file's cwd field so a recycled PID can't mislead the resolver. */
   cliCwd?: string;
-
-  write(data: string): boolean {
-    if (!this.process) return false;
-    this.process.write(data);
-    return true;
-  }
-
-  /**
-   * Send text literally to the tmux pane via `tmux send-keys -l`.
-   * Uses execFileSync (no shell) so arbitrary text is safe — no escaping needed.
-   * For multiline text, use pasteText() instead (send-keys -l sends \n as Enter).
-   */
-  sendText(text: string): void {
-    this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-l', '--', text], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /** Send special keys (Enter, Escape, C-c, etc.) to the tmux pane. */
-  sendSpecialKeys(...keys: string[]): void {
-    this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, ...keys], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  sendLines(lines: string[], softNewlineKey: string): void {
-    if (lines.length === 0) return;
-    this.exitCopyModeIfNeeded();
-    const args: string[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (i > 0) args.push(';');
-      args.push('send-keys', '-t', this.cmdTarget, '-l', '--', lines[i]);
-      if (i < lines.length - 1) {
-        args.push(';');
-        args.push('send-keys', '-t', this.cmdTarget, softNewlineKey);
-      }
-    }
-    execFileSync('tmux', args, {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /**
-   * Enter copy-mode on the pane (`-e` makes it auto-exit when scrolled back to
-   * the bottom). Lets us use tmux's own scrollback even when the running app
-   * is in the alternate screen buffer (Claude Code, vim, etc.).
-   */
-  enterCopyMode(): void {
-    execFileSync('tmux', ['copy-mode', '-e', '-t', this.cmdTarget], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /** Send a copy-mode X-command (e.g. 'halfpage-up', 'halfpage-down', 'cancel'). */
-  sendCopyModeCommand(xCommand: string): void {
-    execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-X', xCommand], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
-  }
-
-  /**
-   * Paste text into the tmux pane via load-buffer + paste-buffer.
-   * The -p flag asks tmux to insert bracketed-paste markers
-   * (\e[200~ … \e[201~) when the application has requested bracketed paste,
-   * so TUI apps (CoCo/Ink, etc.) can detect paste boundaries reliably.
-   * Safe for multiline content (unlike sendText where \n becomes Enter).
-   */
-  pasteText(text: string): void {
-    this.exitCopyModeIfNeeded();
-    const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
-    let loaded = false;
-    try {
-      execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {
-        input: text,
-        stdio: ['pipe', 'ignore', 'ignore'],
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
-      loaded = true;
-      execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', this.cmdTarget, '-d', '-p'], {
-        stdio: 'ignore',
-        timeout: 5000,
-        env: tmuxEnv(),
-      });
-      loaded = false;
-    } finally {
-      if (loaded) {
-        try {
-          execFileSync('tmux', ['delete-buffer', '-b', bufferName], {
-            stdio: 'ignore',
-            timeout: 1000,
-            env: tmuxEnv(),
-          });
-        } catch { /* best-effort cleanup after a failed paste */ }
-      }
-    }
-  }
-
-  private exitCopyModeIfNeeded(): void {
-    try {
-      const inMode = execFileSync('tmux', ['display-message', '-p', '-t', this.cmdTarget, '#{pane_in_mode}'], {
-        encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 1000,
-        env: tmuxEnv(),
-      }).trim();
-
-      if (inMode === '1') {
-        execFileSync('tmux', ['send-keys', '-t', this.cmdTarget, '-X', 'cancel'], {
-          stdio: 'ignore',
-          timeout: 1000,
-          env: tmuxEnv(),
-        });
-      }
-    } catch {
-      // Pane may be gone or tmux may be restarting; keep the original write path best-effort.
-    }
-  }
-
-  resize(cols: number, rows: number): void {
-    this.process?.resize(cols, rows);
-  }
-
-  /** Must be called AFTER spawn(). Callbacks registered before spawn are silently lost. */
-  onData(cb: (data: string) => void): void {
-    this.process?.onData(cb);
-  }
-
-  /** Must be called AFTER spawn(). Callbacks registered before spawn are silently lost. */
-  onExit(cb: (code: number | null, signal: string | null) => void): void {
-    this.process?.onExit(({ exitCode, signal }) => {
-      cb(exitCode, signal !== undefined ? String(signal) : null);
-    });
-  }
-
-  getChildPid(): number | null {
-    try {
-      // display-message resolves the *exact* target pane (single line out),
-      // unlike list-panes which returns every pane in the target's window
-      // when cmdTarget is a pane address — taking the first line of that
-      // would silently bind to whichever pane tmux happens to list first.
-      const output = execSync(
-        `tmux display-message -p -t ${shellescape(this.cmdTarget)} '#{pane_pid}'`,
-        // Explicit stdio: execSync's default leaks the child's stderr to the
-        // parent's stderr fd. When tmux server is unavailable (transient
-        // restart, killed by user, /tmp wiped), this command writes "error
-        // connecting to /tmp/tmux-UID/default" to stderr, which the daemon's
-        // worker.stderr handler then logs as a worker error every poll cycle.
-        // tmuxEnv() also strips $TMUX so we don't target a dead parent server.
-        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 3000, env: tmuxEnv() },
-      ).trim();
-      const pid = parseInt(output, 10);
-      return pid > 0 ? pid : null;
-    } catch {
-      return null;
-    }
-  }
-
-  /** Detach only — kills the pty viewer but leaves tmux session alive. */
-  kill(): void {
-    // Unzoom adopted pane before detaching (restore user's original layout)
-    if (this.adoptedPaneTarget) {
-      try {
-        // Only unzoom if the pane is currently zoomed
-        const zoomed = execSync(
-          `tmux display -t ${shellescape(this.adoptedPaneTarget)} -p '#{window_zoomed_flag}'`,
-          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: tmuxEnv() },
-        ).trim();
-        if (zoomed === '1') {
-          execSync(`tmux resize-pane -Z -t ${shellescape(this.adoptedPaneTarget)}`, { stdio: 'ignore', env: tmuxEnv() });
-        }
-      } catch { /* pane may be gone — benign */ }
-      this.adoptedPaneTarget = null;
-    }
-    if (this.process) {
-      try { this.process.kill(); } catch { /* already dead */ }
-      this.process = null;
-    }
-  }
-
-  /** Kill the tmux session permanently. Called on explicit /close. */
-  destroySession(): void {
-    this.kill();
-    if (this.ownsSession) {
-      TmuxBackend.killSession(this.sessionName);
-    }
-  }
-
-  /**
-   * Attach to an existing user tmux pane (not a bmx-* session).
-   * Used by adopt mode — Botmux observes an already-running CLI.
-   *
-   * Zooms the target pane so only it is visible (hides other panes in the window).
-   * The zoom is undone when the backend is killed (detach/disconnect).
-   */
-  attachToExisting(tmuxTarget: string, opts: SpawnOpts): void {
-    this.reattaching = true;
-    this.adoptedPaneTarget = tmuxTarget;
-
-    // Zoom the target pane BEFORE attaching — this makes the pane fill the entire
-    // window, so the PTY output (and web terminal) only shows this one pane.
-    // If the pane is already the only one in the window, zoom is a no-op.
-    //
-    // We intentionally attach to the source session directly rather than
-    // creating a grouped viewer session: in tmux -CC + iTerm2 control mode
-    // the extra session disrupts the integration's window/pane bookkeeping
-    // and tearing it down on disconnect breaks the user's original layout
-    // (iTerm splits one source window's panes into separate native windows).
-    // The downside is the web terminal will follow whichever window the
-    // user's primary -CC client is currently focused on; that stickiness
-    // can be revisited later via `tmux pipe-pane` (out-of-band capture)
-    // without polluting the -CC client.
-    try {
-      execSync(`tmux resize-pane -Z -t ${shellescape(tmuxTarget)}`, { stdio: 'ignore', env: tmuxEnv() });
-    } catch { /* benign */ }
-
-    this.process = pty.spawn('tmux', ['attach-session', '-t', tmuxTarget], {
-      name: 'xterm-256color',
-      cols: opts.cols,
-      rows: opts.rows,
-      cwd: opts.cwd,
-      env: tmuxEnv(opts.env),
-    });
-  }
-
-  getAttachInfo() {
-    return { type: 'tmux' as const, sessionName: this.sessionName };
-  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

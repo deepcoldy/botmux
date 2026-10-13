@@ -254,7 +254,6 @@ export class MockLlmServer {
 
   private async handleOpenAiChat(body: any, res: ServerResponse): Promise<void> {
     const messages = Array.isArray(body?.messages) ? body.messages : [];
-    const lastMsg = messages[messages.length - 1];
     const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
 
     const lastNonSystemMsg = [...messages].reverse().find((m: any) => m?.role !== 'system');

@@ -11,9 +11,11 @@
  * writer process (the current deployment model). If multiple dashboard processes
  * ever write concurrently, a single-use code would need a file lock here.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
@@ -31,21 +33,17 @@ type FileShape = Record<string, TeamInvite>; // keyed by code
 function filePath(dataDir: string): string { return join(dataDir, 'team-invites.json'); }
 
 function readFile(dataDir: string): FileShape {
-  const fp = filePath(dataDir);
-  if (!existsSync(fp)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as FileShape;
-  } catch { /* corrupt */ }
-  return {};
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次写入覆盖），见 utils/json-file.ts。
+  return readJsonFileSoft<FileShape>(filePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'invite-store',
+  });
 }
 
 function writeFileAtomic(dataDir: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /** Drop expired or used-and-old entries. */

@@ -21,8 +21,9 @@
  * 升级注意：升级前的 ledger 记录没有 costCny，状态丢失重建时一律计 0——
  * 预算统计从升级后开始累加，不回溯历史花费。
  */
-import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { defaultLedgerDir } from './usage-ledger.js';
 
@@ -208,12 +209,10 @@ function loadState(dir: string, larkAppId: string, month: string): BudgetState {
 function persistState(dir: string, larkAppId: string, state: BudgetState): void {
   mkdirSync(dir, { recursive: true });
   const target = statePath(dir, larkAppId);
-  // temp+rename keeps a crash from truncating state; the pid suffix keeps
-  // concurrent daemons from stomping each other's tmp file (same scheme as
-  // the ledger's state-<appId>.json).
-  const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state));
-  renameSync(tmp, target);
+  // atomicWriteFileSync: temp+rename keeps a crash from truncating state, and
+  // its unique tmp name keeps concurrent daemons from stomping each other's
+  // (same scheme as the ledger's state-<appId>.json).
+  atomicWriteFileSync(target, JSON.stringify(state), { followTargetSymlink: false });
   try {
     stateCache.set(target, { mtimeMs: statSync(target).mtimeMs, state });
   } catch { /* mtime refresh is best-effort */ }

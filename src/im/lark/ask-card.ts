@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { parseLinkDestination } from 'markdown-it/lib/helpers/index.mjs';
 import type {
   AskCardDispatcher,
@@ -10,7 +14,9 @@ import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
-import { replyMessage, sendMessage, updateMessage } from './client.js';
+import { replyMessage, sendMessage, updateMessage, uploadFile } from './client.js';
+import { TRANSIENT_LARK_CODES } from './api-gate.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
 import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
 
@@ -24,6 +30,11 @@ export const ASK_SUBMIT_ACTION = 'ask_submit';
 export const ASK_TOGGLE_ACTION = 'ask_toggle';
 
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
+
+/** Worst-case placeholder for ask dispatchUuid (ask- + 40 hex = 44 chars,
+ * ask-persist-store.ts dispatchUuidForKey). Used when an ask lacks a real
+ * dispatchUuid so the byte budget still reflects the wire payload. */
+const ASK_DISPATCH_UUID_WORST_CASE = 'ask-'.padEnd(44, '0');
 
 export interface AskCardActionData {
   context?: { open_message_id?: string };
@@ -39,6 +50,7 @@ export interface AskCardDispatcherDeps {
   sendMessage?: typeof sendMessage;
   replyMessage?: typeof replyMessage;
   updateMessage?: typeof updateMessage;
+  uploadFile?: typeof uploadFile;
 }
 
 /** 点击处理的可注入依赖。目前只有「未授权 → 弹授权卡」这一路（供单测替换）。 */
@@ -53,6 +65,8 @@ export function createLarkAskCardDispatcher(
   const send = deps.sendMessage ?? sendMessage;
   const reply = deps.replyMessage ?? replyMessage;
   const update = deps.updateMessage ?? updateMessage;
+  // 惰性取用：只有超预算的卡才需要上传附件。
+  const upload: typeof uploadFile = (...args) => (deps.uploadFile ?? uploadFile)(...args);
 
   return {
     async send(ask) {
@@ -63,7 +77,7 @@ export function createLarkAskCardDispatcher(
           throw new AskDispatchError(detail, retryable);
         }
       }
-      const cardJson = buildAskCard(ask);
+      const { json: cardJson, promptTruncated } = renderAskCard(ask);
       // botmux 把 chat-scope session 的 routing anchor 也叫 rootMessageId,
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
       // 飞书 /messages/{id}/reply 只接受 om_ — 用 oc_ 会 400 invalid message_id.
@@ -75,6 +89,22 @@ export function createLarkAskCardDispatcher(
       // returns the ORIGINAL message_id instead of posting a second card.
       const uuid = ask.dispatchUuid;
       try {
+        // 问题正文超出整卡 30KB 预算时卡片内只展示截断版，全文先作为附件发出，
+        // 让审批人始终能看到完整信息（对齐 turn reply card 的 sendOverflow）。
+        // 附件先于卡片发送：瞬时失败整体按同一分类重试，附件 uuid 由 dispatchUuid
+        // 派生，重试/重启重发都会被飞书去重；确定性失败（如缺上传权限）不阻断
+        // 卡片——宁可只看到截断版，也不能让审批卡整张发不出、被误报「未获确认」。
+        if (promptTruncated) {
+          try {
+            await sendPromptAttachment(ask, upload, (content, fileUuid) => canReplyToRoot
+              ? reply(ask.larkAppId, ask.rootMessageId!, content, 'file', true, fileUuid)
+              : send(ask.larkAppId, ask.chatId, content, 'file', fileUuid));
+          } catch (err) {
+            if (classifyAskDispatchError(err).retryable) throw err;
+            logger.warn(`[ask:${ask.askId}] failed to send full-question attachment; sending truncated card only: ${
+              err instanceof Error ? err.message : String(err)}`);
+          }
+        }
         const messageId = canReplyToRoot
           ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
           : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
@@ -103,28 +133,6 @@ export function createLarkAskCardDispatcher(
   };
 }
 
-/**
- * Feishu business error codes that mean "the request is transient — retry
- * later", per the official IM v1 send/reply error table + frequency-control
- * guide (codex P1-3). These must be retryable EVEN when the HTTP status is a
- * 4xx (some legacy freq-control surfaces as HTTP 400) or a 2xx-body business
- * error — otherwise a same-uuid partial-success convergence (the second request
- * arriving while the first is still "being sent") is wrongly given up on.
- *
- *   230049  the message is being sent — official "please retry"
- *   230020  message API per-chat rate limit
- *   99991400 generic OpenAPI frequency control (modern = HTTP 429, legacy = 400)
- *
- * NOT included: 11232 / 11233 are the old V4 message API; the current im.v1
- * create/reply path never returns them, so mixing them in would only widen the
- * whitelist without cause.
- *
- * Rate-limit codes (99991400 / HTTP 429) ideally honour `x-ogw-ratelimit-reset`
- * as the retry delay — the broker's short fixed backoff can't outlast a long
- * official reset window. Plumbing that through AskDispatchError.retryAfterMs is
- * a follow-up (see PR notes); 230049/230020 converge within the short backoff.
- */
-const TRANSIENT_LARK_CODES = new Set([230049, 230020, 99991400]);
 
 /** Extract a Lark business code from either error shape:
  *  - axios path A: `response.data.code` / top-level `code` (number)
@@ -354,6 +362,95 @@ function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArme
  * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
+  return renderAskCard(ask, result, opts).json;
+}
+
+/**
+ * 按飞书卡片请求体 30KB 上限（与 turn reply card 同一把尺子）渲染 ask 卡：
+ * 问题正文默认完整渲染；整卡超预算时把过长的正文统一截到能放下的最大长度并附
+ * 「完整内容见附件」，由发送方把全文作为文件发出。纯函数、只依赖 ask 本身，
+ * 首发 / 勾选重绘 / settle PATCH 得到一致的截断结果。
+ */
+export function renderAskCard(
+  ask: PendingAsk,
+  result?: AskResult,
+  opts?: { confirmEmptyArmed?: boolean },
+): { json: string; promptTruncated: boolean } {
+  const measureUuid = ask.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE;
+  const full = renderAskCardWithCap(ask, result, opts, Infinity);
+  if (turnReplyCardRequestBytes(full, ask.chatId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
+    return { json: full, promptTruncated: false };
+  }
+  const longest = Math.max(0, ...ask.questions.map((_, i) => questionPrompt(ask, i).length));
+  // 二分出能放进预算的最大单题字符上限（只影响超过该上限的题）。
+  let lo = 0;
+  let hi = longest;
+  let best = renderAskCardWithCap(ask, result, opts, 0);
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const json = renderAskCardWithCap(ask, result, opts, mid);
+    if (turnReplyCardRequestBytes(json, ask.chatId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
+      best = json;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  // 若正文截到 0 仍超限（如超长选项标签），超限与正文无关，原样返回最小形态。
+  return { json: best, promptTruncated: true };
+}
+
+/** 未 settle 的文本作答批次会把选项标签并进问题正文展示；settle 后只展示原问题。 */
+function questionPrompt(ask: PendingAsk, index: number, settled = false): string {
+  const q = ask.questions[index]!;
+  const textReplyRequired = ask.questions.some(item => item.inputMode === 'text');
+  return !settled && textReplyRequired && q.options.length
+    ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt;
+}
+
+function capPrompt(prompt: string, cap: number, locale?: Locale): string {
+  if (prompt.length <= cap) return prompt;
+  let head = prompt.slice(0, cap);
+  // 不切断 UTF-16 代理对，避免产生孤立代理导致整卡 JSON 非法。
+  if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
+  return `${head}…\n\n${t('card.ask.prompt_truncated', undefined, locale)}`;
+}
+
+/** 完整问题正文（附件内容）。 */
+export function askPromptAttachmentText(ask: PendingAsk): string {
+  const locale = localeForBot(ask.larkAppId);
+  return ask.questions.map((q, i) => {
+    const lines = [`## ${t('card.ask.question_n', { n: i + 1 }, locale)}`, '', q.prompt];
+    if (q.options.length) lines.push('', ...q.options.map(o => `- ${o.label}`));
+    return lines.join('\n');
+  }).join('\n\n') + '\n';
+}
+
+async function sendPromptAttachment(
+  ask: PendingAsk,
+  upload: typeof uploadFile,
+  deliver: (content: string, uuid: string | undefined) => Promise<string>,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-ask-'));
+  try {
+    const path = join(dir, `ask-${ask.askId.replace(/[^\w-]/g, '_').slice(0, 40)}-question.md`);
+    writeFileSync(path, askPromptAttachmentText(ask), { mode: 0o600 });
+    const fileKey = await upload(ask.larkAppId, path);
+    const uuid = ask.dispatchUuid
+      ? `askf_${createHash('sha256').update(ask.dispatchUuid).digest('hex').slice(0, 32)}`
+      : undefined;
+    await deliver(JSON.stringify({ file_key: fileKey }), uuid);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function renderAskCardWithCap(
+  ask: PendingAsk,
+  result: AskResult | undefined,
+  opts: { confirmEmptyArmed?: boolean } | undefined,
+  promptCap: number,
+): string {
   const locale = localeForBot(ask.larkAppId);
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
@@ -376,12 +473,11 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     // 只留下「已选择」，审批人就无法回看自己批准了什么。
     elements.push({ tag: 'hr' });
     for (let i = 0; i < ask.questions.length; i++) {
-      const q = ask.questions[i]!;
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(capPrompt(questionPrompt(ask, i, true), promptCap, locale))}`,
         },
       });
     }
@@ -400,16 +496,17 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
 
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
+      const prompt = capPrompt(questionPrompt(ask, i), promptCap, locale);
 
-      const prompt = textReplyRequired && q.options.length
-        ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt;
-
-      // 问题标题
+      // 问题标题。问题正文完整渲染：审批按钮的效力取决于完整信息，展示层截断
+      // 会让批准人在信息不全的情况下做决定。空 prompt 已在 ask-api 归一化时以
+      // bad_question_shape 拒绝。整卡超飞书 30KB 请求体上限时由 renderAskCard 的
+      // 字节预算截断并改由附件承载全文（promptCap 默认 Infinity，即不截断）。
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
         },
       });
 
@@ -714,11 +811,6 @@ function appendActionRows(
       actions: actions.slice(i, i + MAX_BUTTONS_PER_ACTION_ROW),
     });
   }
-}
-
-function truncate(s: string, maxChars: number, locale?: Locale): string {
-  if (s.length <= maxChars) return s || t('common.empty_paren', undefined, locale);
-  return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
 }
 
 /** Keep labelled web links usable without enabling arbitrary question markup. */

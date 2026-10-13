@@ -68,6 +68,18 @@ describe('startInitialPassthroughSession ownership', () => {
   });
 });
 
+describe('startInitialPassthroughSession substitute marking', () => {
+  it('carries quoteOnly / substitute onto the reply target like every other inbound path', () => {
+    // Regression: `substitute` was destructured but never read, so a
+    // substitute-triggered cold-start passthrough lost its chat-scope
+    // quote-reply / footer substitute addressing.
+    const region = fnRegion('startInitialPassthroughSession', 14000);
+    const call = region.slice(region.indexOf('beginReplyTargetTurn(ds, replyRootId, messageId'));
+    expect(call.slice(0, 400)).toMatch(/quoteOnly: substituteReplyMode === 'quote', substitute,/);
+    expect(region).toMatch(/const substituteReplyMode = substitute\s*\?/);
+  });
+});
+
 describe('startInitialPassthroughSession call sites', () => {
   it('thread-reply injection keeps the foreign-bot guard on owner fields', () => {
     // thread 执行段（executeThreadSlash）里的字段名已与新话题入口对齐：isForeignBotSender / senderOpenId。
@@ -116,8 +128,8 @@ describe('registration loser command handoff', () => {
     const region = src.slice(start, end);
     // prepared 重投与级联推迟重入（replay 快照）都不再重新解析。replay 不是 prepared，配额与下载仍重过。
     expect(region).toContain('if (!prepared && !replay) await resolveNonsupportMessage(data, larkAppId);');
-    // runtime 级联的正文重入（cascadeBodyReentry）同样跳过这两处一次性副作用。
-    expect(region).toContain('if (!prepared && !ctx.cascadeBodyReentry) learnFromMentions(larkAppId, parsed.mentions);');
-    expect(region).toMatch(/if \(!prepared && !ctx\.cascadeBodyReentry\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
+    // runtime 级联正文重入（cascadeBodyReentry）与 Completion Proposal 合成续跑同样跳过这两处一次性副作用。
+    expect(region).toContain('if (!prepared && !ctx.cascadeBodyReentry && !ctx.completionProposalContinuation) learnFromMentions(larkAppId, parsed.mentions);');
+    expect(region).toMatch(/if \(!prepared && !ctx\.cascadeBodyReentry && !ctx\.completionProposalContinuation\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
   });
 });

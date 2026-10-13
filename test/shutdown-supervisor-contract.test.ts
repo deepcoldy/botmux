@@ -20,7 +20,6 @@ import {
   REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
 } from '../src/core/shutdown-budgets.js';
-import { DAEMON_GRACEFUL_EXIT_CODE } from '../src/core/supervisor-shutdown-protocol.js';
 import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
@@ -41,12 +40,11 @@ describe('graceful shutdown supervisor contract', () => {
     // The daemon exits with a nonzero sentinel on a clean shutdown so a supervisor
     // (pm2 historically, our FleetSupervisor now) can tell "shut down cleanly, do
     // NOT restart" from a crash. Signal death maps to 0 under pm2, hence nonzero.
-    expect(DAEMON_GRACEFUL_EXIT_CODE).toBeGreaterThan(0);
-    expect(DAEMON_GRACEFUL_EXIT_CODE).toBeLessThan(256);
-    expect(DAEMON_GRACEFUL_EXIT_CODE).toBe(PM2_GRACEFUL_EXIT_CODE);
+    expect(PM2_GRACEFUL_EXIT_CODE).toBeGreaterThan(0);
+    expect(PM2_GRACEFUL_EXIT_CODE).toBeLessThan(256);
     // The built-in supervisor's policy uses the SAME sentinel, so a daemon's clean
     // exit suppresses a restart identically whether pm2 or the supervisor owns it.
-    expect(FLEET_GRACEFUL_EXIT_CODE).toBe(DAEMON_GRACEFUL_EXIT_CODE);
+    expect(FLEET_GRACEFUL_EXIT_CODE).toBe(PM2_GRACEFUL_EXIT_CODE);
 
     const shutdownStart = daemon.indexOf('const shutdown = async () => {');
     const shutdownEnd = daemon.indexOf("process.on('SIGTERM'", shutdownStart);

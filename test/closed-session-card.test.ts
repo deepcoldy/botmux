@@ -95,6 +95,29 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     expect(content).not.toContain('/opt/current-codex');
   });
 
+  it('rebuilds the Resume button from a persisted closed Session after rollback', () => {
+    const ds = makeSession();
+    ds.session.status = 'closed';
+    ds.session.closedAt = '2026-10-10T00:00:00.000Z';
+    ds.session.larkAppId = 'app_test';
+
+    const card = JSON.parse(buildClosedSessionCard(ds.session, 'zh')) as {
+      elements: Array<{
+        tag: string;
+        actions?: Array<{ value?: Record<string, unknown> }>;
+      }>;
+    };
+    const resume = card.elements
+      .find(element => element.tag === 'action')
+      ?.actions?.[0]?.value;
+
+    expect(resume).toMatchObject({
+      action: 'resume',
+      session_id: 'botmux-session',
+      root_id: 'om_root',
+    });
+  });
+
   it('keeps legacy product copy while using the session-frozen executable', () => {
     const ds = makeSession();
     ds.session.cliPathOverride = '/opt/legacy/vendor-codex';

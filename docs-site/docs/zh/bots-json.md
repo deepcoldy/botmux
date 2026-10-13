@@ -336,6 +336,8 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
 | `senderPolicy.includeSenderOpenIds` / `excludeSenderOpenIds` | 按 `open_id` 精确白名单 / 黑名单 |
 | `senderPolicy.excludeSelf` | 默认 `true`，始终排除当前 Bot 自己发的消息（防自触发） |
 | `messagePolicy.includeMsgTypes` | 监听的消息类型，默认文本 + 富文本（`post`） |
+| `contentPolicy.includeKeywords` / `matchMode` | 可选关键词过滤；`any`（默认）任一命中，`all` 要求全部命中，均为不区分大小写的子串匹配 |
+| `contentPolicy.resolveDocumentTitles` | 默认 `false`。仅在 `text` / `post` 本地文本未命中关键词时，以当前 Bot 的应用身份查询受支持飞书文档的**标题**后再匹配；不读取正文，不回退用户身份，Bot 无文档权限时仍按原消息文本判断 |
 
 ```json
 {
@@ -349,6 +351,10 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同�
   }
 }
 ```
+
+文档链接不是独立的飞书消息类型：它通常存在于 `text` 正文或 `post` 富文本链接中。因此 Dashboard 的消息类型仍选择 `text` / `post`，需要按纯链接所指文档标题匹配时，再开启 `resolveDocumentTitles`。目前仅支持经域名与路径校验的 HTTPS `docx` / `wiki` 链接；不支持的链接不会产生网络请求。
+
+开启前，确认 Bot 应用已获得并发布最小读取权限：`drive:drive.metadata:readonly`（读取文档元数据标题）以及 `wiki:node:read`（解析 Wiki 节点；也可使用 `wiki:wiki:readonly`）。权限不足或应用未被授予目标文档访问权时，监听会安全降级为仅按原消息文本判断。
 
 约定与边界（V1）:
 

@@ -1,8 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 export type WebhookLifecycleStatus = 'creating' | 'active' | 'resolved';
 
@@ -55,24 +57,18 @@ function normalizeStore(raw: unknown): WebhookLifecycleStoreFile {
 }
 
 function readStore(dataDir: string = config.session.dataDir): WebhookLifecycleStoreFile {
-  const fp = storePath(dataDir);
-  if (!existsSync(fp)) return emptyStore();
-  try {
-    return normalizeStore(JSON.parse(readFileSync(fp, 'utf-8')));
-  } catch {
-    return emptyStore();
-  }
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次 writeStore 覆盖），见 utils/json-file.ts。
+  return normalizeStore(readJsonFileSoft<Record<string, any>>(storePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'webhook-lifecycle-store',
+  }));
 }
 
 function writeStore(dataDir: string, store: WebhookLifecycleStoreFile): void {
   const fp = storePath(dataDir);
   mkdirSync(dirname(fp), { recursive: true });
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(normalizeStore(store), null, 2) + '\n', {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
-  renameSync(tmp, fp);
+  atomicWriteFileSync(fp, JSON.stringify(normalizeStore(store), null, 2) + '\n', { mode: 0o600, followTargetSymlink: false });
 }
 
 function keyOf(connectorId: string, dedupKey: string): string {

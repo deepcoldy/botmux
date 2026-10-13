@@ -1933,9 +1933,9 @@ describe('getAllBots', () => {
 });
 
 
-// ─── isChatOncallBoundForAnyBot ───────────────────────────────────────────
+// ─── findOncallChatForAnyBot ──────────────────────────────────────────────
 
-describe('isChatOncallBoundForAnyBot', () => {
+describe('findOncallChatForAnyBot', () => {
   let mod: Awaited<ReturnType<typeof freshImport>>;
   let fsMock: { existsSync: ReturnType<typeof vi.fn>; readFileSync: ReturnType<typeof vi.fn>; statSync: ReturnType<typeof vi.fn> };
 
@@ -1966,9 +1966,8 @@ describe('isChatOncallBoundForAnyBot', () => {
     mod.registerBot(configs[0]);
 
     expect(mod.findOncallChat('app_a', 'oc_oncall')).toBeUndefined();
-    expect(mod.isChatOncallBoundForAnyBot('oc_oncall')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_oncall')).toEqual({ chatId: 'oc_oncall', workingDir: '/repo' });
-    expect(mod.isChatOncallBoundForAnyBot('oc_other')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_other')).toBeUndefined();
   });
 
   it('refreshes the sibling oncall cache when bots.json mtime changes', () => {
@@ -1985,14 +1984,13 @@ describe('isChatOncallBoundForAnyBot', () => {
 
     // First lookup builds a negative cache from the original file content.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([{ larkAppId: 'app_a', larkAppSecret: 'sa' }]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(false);
+    expect(mod.findOncallChatForAnyBot('oc_new')).toBeUndefined();
 
     // A later mtime causes the cache to refresh and pick up sibling bindings.
     fsMock.readFileSync.mockReturnValueOnce(JSON.stringify([
       { larkAppId: 'app_a', larkAppSecret: 'sa' },
       { larkAppId: 'app_b', larkAppSecret: 'sb', oncallChats: [{ chatId: 'oc_new', workingDir: '/repo' }] },
     ]));
-    expect(mod.isChatOncallBoundForAnyBot('oc_new')).toBe(true);
     expect(mod.findOncallChatForAnyBot('oc_new')?.workingDir).toBe('/repo');
   });
 });

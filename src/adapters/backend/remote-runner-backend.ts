@@ -14,7 +14,6 @@ import type {
 import {
   MAX_REMOTE_RUNNER_LINE_BYTES,
   REMOTE_RUNNER_BASE_CAPABILITIES,
-  REMOTE_RUNNER_PROTOCOL_VERSION,
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,

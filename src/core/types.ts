@@ -813,7 +813,7 @@ export interface DaemonSession {
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
    *  命中后把正文发表为文档评论而非飞书卡片，并删除该项。仅内存（轮是瞬时的）。 */
-  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string }>;
+  docCommentTurns?: Map<string, { fileToken: string; fileType: string; commentId: string; replyToOpenId?: string; replyToName?: string; replyId?: string; reactionId?: string; reactionType?: string; reactionIdentity?: 'tenant' | 'user' }>;
   /** Last scoped dedupe key emitted via the bridge final_output pipeline.
    *  Format is `${sessionId}:${lastUuid || turnId}` so different sessions can
    *  never suppress each other's final_output payloads. */

@@ -43,22 +43,18 @@ import {
   lstatSync,
   openSync,
   opendirSync,
-  readdirSync,
-  readlinkSync,
   readSync,
   statSync,
   type Dirent,
 } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { platform } from 'node:os';
 import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { CodexThreadSettings } from './codex-service-tier.js';
-// cot-subject 只用语言内建，等价于内联，不违反本模块 dependency-free 口径。
+// cot-subject 与 process-open-files 只用语言/Node 内建，等价于内联，不违反本模块 dependency-free 口径。
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject } from './cot-subject.js';
 
-const IS_LINUX = platform() === 'linux';
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
 const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
 
@@ -74,48 +70,6 @@ export function codexSessionIdFromRolloutPath(path: string): string | undefined 
 
 type CodexRolloutRef = { path: string; cliSessionId: string };
 
-/** Enumerate the filesystem paths a process currently has open, normalised to
- *  a plain string[] regardless of platform. Returns undefined only when the
- *  enumeration itself is unavailable (unreadable /proc, lsof failed); an empty
- *  array means "readable, but no matching fds". Both `findCodexRolloutByPid`
- *  and `findCodexRolloutSetByPid` derive from THIS single source so their
- *  Linux `/proc` and macOS/BSD `lsof` normalisation can never drift apart.
- *
- *  Linux: `/proc/<pid>/fd/*` fast path.
- *  macOS / BSD: `lsof -p <pid> -Fn` 兜底（同 session-discovery 里的 readCwd）。 */
-function codexProcessOpenTargets(pid: number): string[] | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      const targets: string[] = [];
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        targets.push(target);
-      }
-      return targets;
-    }
-    // /proc 不可读时落到下面的 lsof 兜底（极少见，但兜一下）
-  }
-  // BSD ps 的 lsof：每个 fd 输出一行 `f<n>` 加一行 `n<path>`，socket / pipe
-  // 之类的内部条目以 `n->0x...` 或 `n<garbage>` 开头，所以只接受 `n/` 开头。
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  return out.split('\n').flatMap(line =>
-    line.startsWith('n/') ? [line.slice(1)] : [],
-  );
-}
-
 /** Find the rollout file an externally-running Codex process has open. A
  *  single open rollout is authoritative for that pid. Multiple open rollouts
  *  are ambiguous: current Codex versions can keep parent and sibling-agent
@@ -124,7 +78,7 @@ function codexProcessOpenTargets(pid: number): string[] | undefined {
  *
  *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
 export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
-  const targets = codexProcessOpenTargets(pid);
+  const targets = listProcessOpenFiles(pid);
   if (!targets) return undefined;
   return findSingleCodexRollout(targets);
 }
@@ -143,7 +97,7 @@ export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined 
  *  undefined only when the fd enumeration itself is unavailable — callers must
  *  treat undefined as "cannot prove ownership" (fail closed: do not re-attach). */
 export function findCodexRolloutSetByPid(pid: number): Set<string> | undefined {
-  const targets = codexProcessOpenTargets(pid);
+  const targets = listProcessOpenFiles(pid);
   if (!targets) return undefined;
   const set = new Set<string>();
   for (const target of targets) {

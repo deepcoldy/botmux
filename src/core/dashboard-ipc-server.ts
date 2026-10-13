@@ -10,13 +10,13 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
 import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
 import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
+import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
 import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
@@ -126,7 +126,6 @@ function readIsolationEnforceable(larkAppId: string): boolean {
 }
 import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
-import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
 import { addAllowedChatGroup, removeAllowedChatGroup } from '../services/grant-store.js';
@@ -257,9 +256,10 @@ import { normalizeTriggerCommand } from '../services/command-trigger-normalize.j
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   normalizeMessageListenerPreviewLimit,
-  previewMessageListenerMatches,
+  evaluateMessageListenerWithDocumentTitles,
   buildListenerBotAppIdToOpenId,
   collectListenerBotAppIds,
+  resolveListenerSenderIdentity,
   renderMessageListenerInstruction,
   resolveEffectiveMessageListener,
   type MessageListenerPreviewMatch,
@@ -893,7 +893,19 @@ function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
   return false;
 }
 
-function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
+export function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
+  // Dispatch-launch daemon traffic carries its own full-envelope HMAC bound to
+  // the target app, bound port, boot instance, method, path and exact body.
+  // Let those handlers authenticate it instead of requiring the unrelated
+  // dashboard trusted-host envelope first.
+  const dispatchMatch = pathname.match(new RegExp(
+    `^${DISPATCH_LAUNCH_IPC_ROUTE_PREFIX}/(dl_[0-9a-f]{32})(?:/(prepare|start|cancel))?$`,
+  ));
+  if (dispatchMatch) {
+    const action = dispatchMatch[2];
+    if ((method === 'GET' && action === undefined)
+        || (method === 'POST' && action !== undefined)) return true;
+  }
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one
@@ -1830,9 +1842,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req,
     return jsonRes(res, 429, { ok: false, error: 'too_many_native_runtime_requests' });
   }
   if (preauthLimited) nativeSubagentRuntimePreauthInFlight += 1;
-  let body: Record<string, unknown>;
   try {
-    body = await readBoundedJsonBody<Record<string, unknown>>(
+    // 只为「有界地读完并校验是合法 JSON」：鉴权看 header（capability 签名），请求体内容不参与决策（客户端恒发 '{}'）。
+    await readBoundedJsonBody<Record<string, unknown>>(
       req,
       NATIVE_SUBAGENT_RUNTIME_BODY_MAX_BYTES,
       NATIVE_SUBAGENT_RUNTIME_BODY_TIMEOUT_MS,
@@ -4222,13 +4234,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, pa
   jsonRes(res, status, r);
 });
 
-// ─── Sandbox landing (owner reviews the clone's diff then applies it back) ───
-function workingDirForSession(sessionId: string): string | undefined {
-  const ds = findActiveBySessionId(sessionId);
-  if (ds) return ds.session.workingDir;
-  return sessionStore.listSessions().find(s => s.sessionId === sessionId)?.workingDir;
-}
-
 /**
  * Reactivate a closed session — counterpart to `/close`. Used by both the
  * "▶️ 恢复会话" card button (via card-handler) and the `botmux resume <id>`
@@ -5805,49 +5810,6 @@ ipcRoute('POST', '/api/groups/:chatId/leave', async (_req, res, p) => {
   jsonRes(res, 200, r);
 });
 
-// 平台团队大厅打卡：dashboard 在 team-sync 后编排本机 bot 往大厅（bot-only 群）
-// 发登记消息。实测大厅只有「直接点名 @」会投递（普通消息/自 @/@all 全部静默），
-// 所以打卡消息点名 @ 本机其他未入册 bot（mentionNames，open_id 由本 app 的
-// cross-ref 解析——open_id 是 per-app 的，只有发送方自己能解析），被点到的 bot
-// 从 mentions 学到自己的 union_id。回声路径保留（有 receive-all scope 的应用仍可
-// 从自家消息学）。已入册且无人可教时幂等跳过。
-ipcRoute('POST', '/api/platform/hall-announce', async (req, res) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
-  let body: { chatId?: unknown; mentionNames?: unknown };
-  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const chatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
-  if (!/^oc_[0-9a-f]+$/i.test(chatId)) return jsonRes(res, 400, { ok: false, error: 'bad_chat_id' });
-  const mentionNames = Array.isArray(body.mentionNames)
-    ? body.mentionNames.filter((x): x is string => typeof x === 'string' && !!x.trim())
-    : [];
-  // 解析点名目标：name → 本 app 视角的 open_id（cross-ref，来自历史 @ 事件）。解析不到的跳过。
-  const resolved: Array<{ name: string; openId: string }> = [];
-  if (mentionNames.length) {
-    try {
-      const map: Record<string, string> = JSON.parse(
-        readFileSync(join(config.session.dataDir, `bot-openids-${cachedLarkAppId}.json`), 'utf-8'),
-      );
-      for (const name of mentionNames) {
-        const openId = map[name];
-        if (typeof openId === 'string' && openId.startsWith('ou_')) resolved.push({ name, openId });
-      }
-    } catch { /* 无 cross-ref → 全部解析失败，退化为普通打卡 */ }
-  }
-  if (getBotUnionId(config.session.dataDir, cachedLarkAppId) && resolved.length === 0) {
-    return jsonRes(res, 200, { ok: true, skipped: 'already_learned' });
-  }
-  try {
-    const atPrefix = resolved.map((r) => `<at user_id="${r.openId}">${r.name}</at> `).join('');
-    // 自己还没入册 → 带 #hall-echo 请求回执：被点到的 bot 会 @ 回我们一次，
-    // 我们从回执的 mentions[] 学到自己的 union_id（见 event-dispatcher hall 分支）。
-    const echoTag = getBotUnionId(config.session.dataDir, cachedLarkAppId) ? '' : ' #hall-echo';
-    await sendMessage(cachedLarkAppId, chatId, atPrefix + t('platform.hall_announce', undefined, localeForBot(cachedLarkAppId)) + echoTag, 'text');
-    jsonRes(res, 200, { ok: true, mentioned: resolved.map((r) => r.name), unresolved: mentionNames.filter((n) => !resolved.some((r) => r.name === n)) });
-  } catch (e) {
-    jsonRes(res, 502, { ok: false, error: `send_failed: ${(e as Error).message}` });
-  }
-});
-
 // ─── Oncall bindings (dashboard) ───────────────────────────────────────────
 // PUT  /api/oncall/:chatId  body: {workingDir} — bind or update workingDir
 // DELETE /api/oncall/:chatId — unbind
@@ -6098,19 +6060,27 @@ async function collectMessageListenerPreviewMatches(
   });
   const candidateBotAppIds = collectListenerBotAppIds(messages, dashboardHistoryMessageSender);
   const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
-  const matches = previewMessageListenerMatches({
-    bot: previewBot,
-    chatId,
-    messages,
-    limit,
-    senderForMessage: dashboardHistoryMessageSender,
-    appIdToOpenId,
+  const matches: MessageListenerPreviewMatch[] = [];
+  for (const message of messages) {
+    const messageId = String(message?.message_id ?? '');
+    if (!messageId) continue;
+    const sender = dashboardHistoryMessageSender(message);
+    const resolved = resolveListenerSenderIdentity(sender, appIdToOpenId);
+    const match = await evaluateMessageListenerWithDocumentTitles({
+      bot: previewBot, chatId, message,
+      senderOpenId: resolved.senderOpenId,
+      senderName: sender.senderName,
+      senderTypeRaw: sender.senderTypeRaw,
+      senderIdentityUnverified: resolved.identityUnverified,
     // Mirror realtime/poll routing: a message that explicitly @mentions this bot
     // hands off to normal @-routing, NOT the listener — so preview/run-preview
     // must apply the same gate (else preview over-counts and run-preview would
     // spawn a session for a message live routing never sends to the listener).
-    explicitlyMentionedThisBot: (message) => messageMentionsBot(message, larkAppId, bot.botOpenId),
-  });
+      explicitlyMentionedThisBot: messageMentionsBot(message, larkAppId, bot.botOpenId),
+    });
+    if (match) matches.push({ ...match, messageId, createTime: message?.create_time ? String(message.create_time) : undefined });
+  }
+  matches.splice(0, Math.max(0, matches.length - limit));
   // The listener matcher extracts card text from the SIMPLIFIED history view,
   // which drops button jump URLs. The live delivery path (handleNewTopic) fixes
   // this by re-extracting after resolveNonsupportMessage merges the card's two
@@ -6679,7 +6649,7 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
 
 // ─── Per-bot defaultOncall (dashboard) ─────────────────────────────────────
 // GET  /api/bot-default-oncall → returns this daemon's current config
-// PUT  /api/bot-default-oncall  body: { enabled, workingDir }
+// （写入已迁到 PUT /api/bot-working-dir-mode，此处不再有 PUT）
 //
 // Forward-only policy: enabling does not backfill or distinguish "old vs new"
 // chats. Any group the bot is in — present or future — auto-binds on its
@@ -7246,20 +7216,6 @@ ipcRoute('PUT', '/api/bot-summary-range', async (req, res) => {
   try { raw = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const r = await updateDashboardSummaryRange(cachedLarkAppId, raw);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-  jsonRes(res, 200, { ok: true, summaryRange: r.summaryRange });
-});
-
-// Backward-compatible dashboard endpoint from the short-lived keyword-trigger UI.
-ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let raw: unknown;
-  try { raw = await readJsonBody(req); }
-  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
-    ? { limit: (raw as Record<string, unknown>).limit, sinceHours: (raw as Record<string, unknown>).sinceHours }
-    : raw;
-  const r = await updateDashboardSummaryRange(cachedLarkAppId, body);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, summaryRange: r.summaryRange });
 });
@@ -9101,31 +9057,6 @@ ipcRoute('POST', '/api/bot-config/reload', async (_req, res) => {
   } catch (err: any) {
     jsonRes(res, 500, { ok: false, error: ipcErrorText(err) });
   }
-});
-
-ipcRoute('PUT', '/api/bot-default-oncall', async (req, res) => {
-  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { enabled?: unknown; workingDir?: unknown };
-  try { body = await readJsonBody<{ enabled?: boolean; workingDir?: string }>(req); }
-  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-
-  const enabled = body.enabled === true;
-  const workingDir = typeof body.workingDir === 'string' ? body.workingDir.trim() : '';
-
-  // Validate workingDir when enabling. Allow blank workingDir only when
-  // disabling — the on-disk record keeps the last value so the UI can
-  // round-trip after a disable.
-  let resolvedPath = '';
-  if (enabled) {
-    if (!workingDir) return jsonRes(res, 400, { ok: false, error: 'workingDir_required' });
-    const v = validateWorkingDir(workingDir);
-    if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error });
-    resolvedPath = v.resolvedPath;
-  }
-
-  const r = await oncallStore.updateBotDefaultOncall(cachedLarkAppId, { enabled, workingDir });
-  if (!r.ok) return jsonRes(res, 400, r);
-  jsonRes(res, 200, { ok: true, defaultOncall: r.defaultOncall, resolvedPath: resolvedPath || undefined });
 });
 
 // Per-bot「默认工作目录模式」三选一（dashboard 单选；两个底层字段互斥）：

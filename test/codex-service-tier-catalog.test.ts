@@ -1,4 +1,7 @@
 import { execFile } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   checkCodexServiceTierSupport,
@@ -63,6 +66,24 @@ describe('codex service tier catalog', () => {
       callback(new Error('offline'));
     }) as typeof execFile);
     expect(await loadCodexServiceTierCatalog({ cliBin: '/codex', env: { PATH: '/b' } })).toBeNull();
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('invalidates the nested catalog cache when the executable is replaced in place', async () => {
+    const cliBin = join(mkdtempSync(join(tmpdir(), 'botmux-codex-catalog-')), 'codex');
+    writeFileSync(cliBin, 'v1');
+    succeed(JSON.stringify({
+      models: [{ slug: 'gpt-first', visibility: 'list', service_tiers: [] }],
+    }));
+    await expect(loadCodexServiceTierCatalog({ cliBin, env: { PATH: '/a' } }))
+      .resolves.toEqual([{ slug: 'gpt-first', serviceTiers: [] }]);
+
+    writeFileSync(cliBin, 'version-two-is-a-different-size');
+    succeed(JSON.stringify({
+      models: [{ slug: 'gpt-second', visibility: 'list', service_tiers: [] }],
+    }));
+    await expect(loadCodexServiceTierCatalog({ cliBin, env: { PATH: '/a' } }))
+      .resolves.toEqual([{ slug: 'gpt-second', serviceTiers: [] }]);
     expect(execFileMock).toHaveBeenCalledTimes(2);
   });
 

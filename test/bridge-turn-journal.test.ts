@@ -19,8 +19,8 @@
  *                            4. no output / user line never landed → turn
  *                               never starts; pruneExpired retires it
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -36,6 +36,7 @@ import {
 } from '../src/services/bridge-turn-journal.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
+import { logger } from '../src/utils/logger.js';
 import { splitTranscriptEventsByCutoff, type TranscriptEvent } from '../src/services/claude-transcript.js';
 
 function user(uuid: string, content: string, timestampMs: number): TranscriptEvent {
@@ -70,6 +71,25 @@ describe('bridge turn journal file ops', () => {
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('quarantines a corrupt journal as *.corrupt-* instead of overwriting it on the next append', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      mkdirSync(join(dir, 'turn-marks'), { recursive: true });
+      const corrupt = '{"version":1,"pending":[{"turnId":"t_lost","markTimeMs":1';
+      writeFileSync(path, corrupt);
+
+      expect(readBridgeTurnJournal(path)).toEqual([]);
+      appendBridgeTurnJournalEntry(path, entry({ turnId: 't_new', markTimeMs: 5 }));
+
+      expect(readBridgeTurnJournal(path).map(e => e.turnId)).toEqual(['t_new']);
+      const quarantined = readdirSync(join(dir, 'turn-marks')).filter(f => f.startsWith('session.json.corrupt-'));
+      expect(quarantined).toHaveLength(1);
+      expect(readFileSync(join(dir, 'turn-marks', quarantined[0]), 'utf8')).toBe(corrupt);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('appends, reads back, removes per turn, and clears', () => {

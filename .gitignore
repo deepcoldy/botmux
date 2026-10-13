@@ -55,4 +55,9 @@ src/desktop/assets/*.png
 
 # OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
 .omo/
+# no-mistakes 评测代理产物（coverage/profile、stdout/stderr、manifest），本地留存
+.no-mistakes/
 test-bots.json
+
+# tmux 客户端调试日志（曾被误提交）
+tmux-client-*.log

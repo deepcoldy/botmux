@@ -10,7 +10,6 @@ import { getGroupContextSettings } from './group-context-settings-store.js';
 import { getGroupContextHead, getGroupContextMessage, listGroupContextMessages, upsertGroupContextMessage, pruneGroupContext, type GroupContextMessageRecord } from './group-context-store.js';
 import { readPreparedGroupContext, writePreparedGroupContext, getDeliveredGroupContextSeqs, recordNativeGroupContextDelivery, type GroupContextDeliveryBinding } from './group-context-delivery-store.js';
 import { createGroupContextPreparer, type GroupContextTurnRequest } from './group-context.js';
-import type { PreparedGroupContext } from './group-context-delivery-store.js';
 import type { GroupContextRenderMessage } from './group-context-render.js';
 import type { LarkAttachment } from '../types.js';
 import { logger } from '../utils/logger.js';

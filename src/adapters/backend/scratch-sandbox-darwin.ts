@@ -45,7 +45,7 @@ import {
   symlinkSync,
   readlinkSync,
 } from 'node:fs';
-import { join, dirname, basename, isAbsolute, resolve, relative, sep } from 'node:path';
+import { join, dirname, isAbsolute, resolve, relative, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { botmuxShimExecLine } from './sandbox.js';
 import {

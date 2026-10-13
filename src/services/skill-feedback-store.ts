@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
-import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackEventType, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
+import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
 
 /** True when a node:sqlite error is the recoverable write-lock contention that
  *  a burst of concurrent cold-start opens against a shared dataDir produces. */

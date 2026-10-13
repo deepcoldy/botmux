@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
@@ -19,7 +19,7 @@ import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../c
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -73,7 +73,7 @@ import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMat
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
 import { isP2pForceTopicRoot, recordP2pForceTopicRoot } from '../../services/p2p-force-topic-store.js';
-import { evaluateMessageListener, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
+import { evaluateMessageListenerWithDocumentTitles, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
 import {
   parseVcMeetingPushEvent,
   VC_BOT_MEETING_ACTIVITY_EVENT,
@@ -84,8 +84,10 @@ import {
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
 import type { Session, VcMeetingImTurnOrigin } from '../../types.js';
+import { sessionKey } from '../../core/types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
+import { readBotsInfoJson } from '../../services/bots-info-cache.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
 import type { DurableInboxStore } from '../../services/durable-coordination.js';
@@ -99,15 +101,11 @@ import type {
   DurableLarkCanonicalHandlerResult,
   DurableLarkPostAdmissionOutput,
 } from '../../services/durable-lark-canonical-dispatch.js';
-import type { DurableInboxPrimaryDispatchContext } from '../../services/durable-inbox-primary-consumer.js';
 import {
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
 } from '../../services/durable-lark-session-control.js';
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
-
-// 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
-const hallEchoReplied = new Set<string>();
 
 function vcMeetingEventPayloadForLog(data: any): string {
   try {
@@ -1137,6 +1135,8 @@ function cardActionKey(larkAppId: string, data: any): string {
     // duplicate in-flight click on the previous button.
     feedbackResult: value?.result,
     feedbackReason: value?.reason_key,
+    proposalId: value?.proposal_id,
+    proposalDecision: value?.decision,
     rootId: value?.root_id,
     sessionId: value?.session_id,
     // Detail actions can share action labels across rows; include row ids so
@@ -1224,24 +1224,25 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   const work = handlers.handleCardAction(data, larkAppId)
     .then(shapeCardActionResult)
     .then(result => {
-      if (typeof result?.afterAck === 'function') {
-        // Run a fresh serialized publisher after ACK, never a captured card
-        // snapshot which could overwrite another tool/answer update.
-        setTimeout(() => {
-          void Promise.resolve().then(result.afterAck)
-            .catch(err => logger.warn(`Failed to publish card action after ACK: ${err}`));
-        }, 0);
-        return result.toast ? { toast: result.toast } : {};
-      }
-      if (!result?.deferredCard) return result;
+      if (!result?.deferredCard && typeof result?.afterAck !== 'function') return result;
       // ACK the callback before patching. If we await message.patch here, Lark
       // applies the callback completion after the API patch and can restore the
       // pre-click card, making the expanded follow-up flash and disappear.
-      setTimeout(() => {
-        void patchTimedOutCardActionResult(larkAppId, data, result)
-          .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
-      }, 0);
-      return result.toast ? { toast: result.toast } : {};
+      if (result.deferredCard) {
+        setTimeout(() => {
+          void patchTimedOutCardActionResult(larkAppId, data, result)
+            .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
+        }, 0);
+      }
+      if (typeof result.afterAck === 'function') {
+        setTimeout(() => {
+          void Promise.resolve(result.afterAck())
+            .catch(err => logger.warn(`Failed to run deferred card continuation: ${err}`));
+        }, 0);
+      }
+      if (result.deferredCard) return result.toast ? { toast: result.toast } : {};
+      const { afterAck: _afterAck, ...response } = result;
+      return response;
     })
     .catch(err => {
       logger.error(`Error handling card action: ${err}`);
@@ -1439,10 +1440,8 @@ export function resolveSiblingBotNameByUnionId(
 
   // appId → current botName from the shared, rename-fresh bots-info.json.
   try {
-    const infoPath = join(dataDir, 'bots-info.json');
-    if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId?: string; botName?: string | null }> =
-        JSON.parse(readFileSync(infoPath, 'utf-8'));
+    const entries = readBotsInfoJson(dataDir) as Array<{ larkAppId?: string; botName?: string | null }> | undefined;
+    if (entries) {
       const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
       if (typeof name === 'string' && name.trim()) return name.trim();
     }
@@ -1497,9 +1496,8 @@ export function updateBotOpenIdCrossRef(
   // Read known bot names from bots-info.json
   const knownBotNames = new Set<string>();
   try {
-    const infoPath = join(dataDir, 'bots-info.json');
-    if (existsSync(infoPath)) {
-      const entries: Array<{ botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+    const entries = readBotsInfoJson(dataDir) as Array<{ botName: string | null }> | undefined;
+    if (entries) {
       for (const e of entries) {
         if (e.botName) knownBotNames.add(e.botName.toLowerCase());
       }
@@ -1688,7 +1686,7 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
     // mentionOpenId() tolerates both the WS event object shape ({ open_id }) and
     // the REST bare-string shape. Bot mentions may also arrive as app_id
     // (id_type='app_id' / { app_id }) with no open_id; isBotMentioned handles
-    // that shape via mentionMatchesBot(), so the redirect/yield check must too.
+    // that shape via messageMentionsBot(), so the redirect/yield check must too.
     const oid = mentionOpenId(m);
     if (oid) {
       if (oid === botOpenId) continue; // that's me
@@ -1784,18 +1782,6 @@ function isSubstituteAllowedChat(cfg: { chats?: string[]; excludedChats?: string
   if (isSubstituteExcludedChat(cfg, chatId)) return false;
   if (!cfg?.chats?.length) return true;
   return cfg.chats.includes(chatId);
-}
-
-function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
-  const openId = mentionOpenId(m);
-  if (botOpenId && openId === botOpenId) return true;
-
-  // Some Lark event payloads identify bot mentions by app_id:
-  //   { id_type: "app_id", id: "cli_xxx" }
-  // Treat that as an explicit mention of this daemon, but do not let app_id
-  // flow through mentionOpenId(), which is persisted and used as an open_id.
-  const appId = mentionAppId(m);
-  return Boolean(larkAppId && appId === larkAppId);
 }
 
 // ─── Permission gates ────────────────────────────────────────────────────
@@ -2581,6 +2567,11 @@ export interface RoutingContext {
   commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
+  /** Daemon-minted turn created after a requester accepted a Completion
+   * Proposal. It has no native inbound Lark message, so consumers must not
+   * emit message reactions, quote its synthetic turn id, or run unrelated
+   * inbound-message hooks. */
+  completionProposalContinuation?: true;
   /** Earlier topic seed coalesced into this root-linked clarification. */
   forwardSeedData?: any;
   /** runtime 级联的正文项以同一条消息重入 handleThreadReply 时置位：跳过已在首次入站跑过的
@@ -2912,7 +2903,7 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
       const data = larkReceiveEventFromHistoryMessage(message, chatId);
       const rawSender = historyMessageSender(message);
       const resolved = resolveListenerSenderIdentity(rawSender, appIdToOpenId);
-      const match = evaluateMessageListener({
+      const match = await evaluateMessageListenerWithDocumentTitles({
         bot,
         chatId,
         message: data.message,
@@ -4032,7 +4023,12 @@ export interface LarkEventDispatcherRuntimeOptions {
     data: unknown;
   }) => Promise<unknown>;
   /** ACK 前的同步权限/生命周期预检；consumer 仍会在副作用前再次验证。 */
-  authorizePrimaryControl?: (data: unknown) => boolean;
+  authorizePrimaryControl?: (data: unknown) => boolean | Promise<boolean>;
+  /**
+   * Primary consumer 在执行本地会话副作用前回读权威 Session。若权威 active
+   * Session 属于另一副本，本副本必须抛错并让 Inbox 重试，不能冷启替换它。
+   */
+  readPrimarySession?: (sessionKey: string) => Promise<Session | undefined>;
 }
 
 interface PrimaryProcessContext {
@@ -4165,6 +4161,22 @@ export function createLarkEventDispatcherRuntime(
       throw new Error(`durable canonical Session is unavailable for ${primary.message.eventId}`);
     }
     return { kind: 'admitted', session };
+  };
+
+  const assertPrimaryRouteOwner = async (
+    ctx: RoutingContext,
+    primary: PrimaryProcessContext | undefined,
+  ): Promise<void> => {
+    if (!primary || !runtimeOptions.readPrimarySession) return;
+    const anchor = ctx.runtimeRoutingAnchor ?? ctx.anchor;
+    const canonicalKey = sessionKey(anchor, larkAppId);
+    const canonical = await runtimeOptions.readPrimarySession(canonicalKey);
+    if (!canonical || canonical.status !== 'active') return;
+    const local = handlers.resolveDurableSession?.(ctx);
+    if (local?.sessionId === canonical.sessionId) return;
+    throw new Error(
+      `durable primary active canonical Session is owned by another replica: ${canonicalKey}`,
+    );
   };
 
   const ignoredUnsupportedPrimarySideEffect = (
@@ -4300,33 +4312,15 @@ export function createLarkEventDispatcherRuntime(
           recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
         }
         // 机器人大厅：bot 消息只用于身份登记（上面已学 sender union / mentions
-        // 自学 / cross-ref），绝不当任务路由——大厅打卡会点名 @ 同伴，不吞掉的话
-        // 接收 bot 会把打卡当任务拉起会话在大厅里回话（实测）。只吞 bot 发送方：
+        // 自学），绝不当任务路由——平台 bot 会 @ 新 bot 教它 union，不吞掉的话
+        // 接收 bot 会把这类消息当任务拉起会话在大厅里回话（实测）。只吞 bot 发送方：
         // 人类经隐藏入口进大厅后 @ bot 仍正常应答。
         if (isPlatformHallChat(config.session.dataDir, chatId)) {
-          // 回执互教：打卡者点名了我们且带 #hall-echo（= 它还没学到自己的
-          // union_id）→ @ 回它一次。open_id 直接取事件 sender_id（本 app 视角，
-          // 无需 cross-ref），打卡者从回执的 mentions[] 学到自己。每进程每发送者
-          // 只回一次；回执不带标记，链路必然终止。
-          try {
-            const text: unknown = JSON.parse(message.content ?? '{}')?.text;
-            if (
-              typeof text === 'string' && text.includes('#hall-echo') && senderOpenId &&
-              isBotMentioned(larkAppId, message, undefined) &&
-              !hallEchoReplied.has(`${larkAppId}::${senderOpenId}`)
-            ) {
-              if (primary) return ignoredUnsupportedPrimarySideEffect('platform hall echo replies');
-              hallEchoReplied.add(`${larkAppId}::${senderOpenId}`);
-              void sendMessage(larkAppId, chatId, `<at user_id="${senderOpenId}"></at> 已登记`, 'text')
-                .then(() => logger.info(`[${larkAppId}] hall echo reply sent to ${senderOpenId.substring(0, 12)}`))
-                .catch((e) => logger.warn(`[${larkAppId}] hall echo reply failed: ${(e as Error).message}`));
-            }
-          } catch { /* content 非 JSON → 忽略 */ }
           logger.debug(`[${larkAppId}] hall bot message swallowed after learning (chat=${chatId.substring(0, 12)})`);
           return;
         }
         const botMessageListener = chatType === 'group'
-          ? evaluateMessageListener({
+          ? await evaluateMessageListenerWithDocumentTitles({
               bot: getBot(larkAppId),
               chatId,
               message,
@@ -4448,6 +4442,7 @@ export function createLarkEventDispatcherRuntime(
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
               const seedPayload = { data, ctx: seedCtx, ownsSession: false };
               if (primary) {
+                await assertPrimaryRouteOwner(seedCtx, primary);
                 await dispatchHumanMessage(seedPayload);
                 return primaryResult(seedCtx, primary);
               }
@@ -4553,6 +4548,7 @@ export function createLarkEventDispatcherRuntime(
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
         // back-to-back into this thread must be handled in order, not raced.
         if (primary) {
+          await assertPrimaryRouteOwner(routedCtx, primary);
           await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
           return primaryResult(routedCtx, primary);
         }
@@ -4665,7 +4661,7 @@ export function createLarkEventDispatcherRuntime(
       }
       const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, senderOpenId);
       const messageListener = chatType === 'group'
-        ? evaluateMessageListener({
+        ? await evaluateMessageListenerWithDocumentTitles({
             bot: getBot(larkAppId),
             chatId,
             message,
@@ -5192,6 +5188,7 @@ export function createLarkEventDispatcherRuntime(
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
+      await assertPrimaryRouteOwner(ctx, primary);
       // Record explicit DM /t intent before this message releases the raw
       // per-chat routing lane and before handleNewTopic begins its async session
       // registration. A back-to-back root-linked reply can therefore select the
@@ -5517,16 +5514,32 @@ export function createLarkEventDispatcherRuntime(
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_ended', VC_BOT_MEETING_ENDED_EVENT),
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
-    'card.action.trigger': (data: any) => {
+    'card.action.trigger': async (data: any) => {
       const actionType = cardActionType(data);
       if (
         runtimeOptions.enqueuePrimary
         && actionType
         && PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS.has(actionType)
       ) {
+        let authorizedControl = false;
         if (
           runtimeOptions.enqueuePrimaryControl
-          && runtimeOptions.authorizePrimaryControl?.(data) === true
+          && (actionType === 'close' || actionType === 'resume')
+          && data?.action?.value?.visibility !== 'private'
+          && getBot(larkAppId).config.privateCard !== true
+        ) {
+          try {
+            authorizedControl = await runtimeOptions.authorizePrimaryControl?.(data) === true;
+          } catch (error) {
+            logger.warn(
+              `[card-action] durable primary authorization failed closed: app=${larkAppId} `
+              + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        if (
+          runtimeOptions.enqueuePrimaryControl
+          && authorizedControl
           && (actionType === 'close' || actionType === 'resume')
           && data?.action?.value?.visibility !== 'private'
           && getBot(larkAppId).config.privateCard !== true

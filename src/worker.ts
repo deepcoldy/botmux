@@ -18,7 +18,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -74,10 +74,10 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -277,7 +277,7 @@ import {
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
-import { findAntigravityConversationId, findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { drainAntigravityTranscript, type AntigravityTranscriptState } from './services/antigravity-transcript.js';
 import { decideAntigravityTickerAction } from './services/antigravity-bridge-decision.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
@@ -353,6 +353,7 @@ import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.j
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
@@ -420,7 +421,7 @@ import {
 } from './adapters/backend/scratch-sandbox-darwin.js';
 import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
 import { resolveSandboxMode } from './adapters/cli/sandbox-mode.js';
-import { registerScratchView, scratchViewPath, scratchLinuxMappings, type ScratchPathMapping } from './services/scratch-host-view.js';
+import { registerScratchView, scratchViewPath, scratchLinuxMappings } from './services/scratch-host-view.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -476,7 +477,6 @@ import {
 import {
   cancelSubmitFailureChainForTerminal,
   createSubmitFailureChainController,
-  submitFailureChainKeyOf,
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
 import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
@@ -496,8 +496,7 @@ import {
 } from './adapters/hook-installer.js';
 import { hookCommandFor, nativeSubagentRuntimeHookCommand } from './adapters/hook-command.js';
 import { traexNativeSubagentHookConfig } from './adapters/cli/traex.js';
-import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
-import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
@@ -623,7 +622,6 @@ import {
   type CodexAppControlState,
   type CodexAppControlIdentity,
   type CodexAppPosixOwnerLease,
-  type CodexAppSignedControlMarker,
 } from './utils/codex-app-control.js';
 
 // Never inherit a session-level CLI home from the daemon's launch environment.
@@ -2183,10 +2181,6 @@ let lastAbortedCloseRequestId: string | null = null;
 /** Graceful daemon-shutdown detach stays alive until lineage commit. */
 let shutdownDetachRequestId: string | null = null;
 let shutdownDetachPhase: 'preparing' | 'prepared' | null = null;
-/** pty-under-zellij backend (BACKEND_TYPE=zellij). Behaves like the non-tmux
- *  pty path for the worker (renderer screenshots, relay web terminal) but owns
- *  a persistent zellij session that survives daemon restart. */
-let isZellijMode = false;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
@@ -2423,12 +2417,11 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', mimocode: 'MiMoCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo', minimax: 'MiniMax Code', 'remote-runner': 'Remote Runner' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
     : undefined)
-    ?? CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '']
+    ?? lookupCliDisplayName(lastInitConfig?.cliId ?? '')
     ?? 'CLI';
 }
 
@@ -3187,6 +3180,12 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         stampMojoTurnMark(msg.turnId, undefined); // a passthrough IS a mojo turn
         writeCliPidMarker();
         publishSandboxRelayCapability();
+        // A mid-session `/effort <level>` opens a Yes/No "Change effort level?"
+        // confirm dialog; arm the guard so onPtyData can auto-accept it. Armed
+        // before the bytes land (not after the submission is acknowledged) so
+        // a dialog that renders during the acceptance wait is not missed. Bare
+        // `/effort` opens a level picker (unknown target) and is left alone.
+        if (isEffortLevelCommand(msg.content)) armEffortConfirm();
       });
       sent = true;
       if (fence && !adoptWriteFenceIsCurrent(fence)) {
@@ -3200,6 +3199,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       recoveryFailureReason = err instanceof SubmissionWriteError
         ? err.recoveryFailureReason
         : undefined;
+      disarmEffortConfirm();
       // Do not send a bundled follow-up or another queued command against a
       // backend whose literal command write failed.
       log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
@@ -4111,7 +4111,6 @@ let codexAppPosixOwnerLease: CodexAppPosixOwnerLease | undefined;
 let codexAppPosixOwnerLeaseSessionId: string | undefined;
 let codexAppPosixOwnerLeasePromise: Promise<void> | undefined;
 let codexAppControlActiveSocket: Socket | undefined;
-let codexAppControlActiveIdentity: CodexAppControlIdentity | undefined;
 let codexAppFreshCandidateGeneration: string | undefined;
 let codexAppUnprovenPromptDeferred = false;
 let codexAppRejectedControlLogged = false;
@@ -4211,7 +4210,6 @@ function stopCodexAppControlChannel(
   }
   codexAppControlConnections.clear();
   codexAppControlActiveSocket = undefined;
-  codexAppControlActiveIdentity = undefined;
   const server = codexAppControlServer;
   codexAppControlServer = undefined;
   try { server?.close(); } catch { /* worker exit/restart */ }
@@ -4322,7 +4320,6 @@ function activateCodexAppControlConnection(
       );
     });
   }
-  codexAppControlActiveIdentity = identity;
   codexAppControlReplayWindow.retainOnly(identity.generation);
   connection.authenticated = true;
   connection.identity = identity;
@@ -4580,7 +4577,6 @@ function acceptCodexAppControlSocket(
     const wasActive = codexAppControlActiveSocket === socket;
     if (wasActive) {
       codexAppControlActiveSocket = undefined;
-      codexAppControlActiveIdentity = undefined;
       codexAppControlProven = false;
       codexAppSignedStateObserved = false;
       codexAppInputReady = false;
@@ -5181,7 +5177,6 @@ let bridgeStalePidStateSessionId: string | undefined;
  *  turn references the path anymore. */
 const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
-let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue(
   notifyTerminalTurnStarted,
   (taskId, anchor) => {
@@ -6069,13 +6064,11 @@ function bridgeAbsorbBaseline(): void {
     if (tryRestoreInterruptedBridgeTurns()) return;
     const cursor = baselineJsonlCursor(bridgeJsonlPath);
     bridgeOffset = cursor.newOffset;
-    bridgePendingTail = cursor.pendingTail;
     bridgeBaselineDone = true;
     return;
   }
   const result = drainTranscript(bridgeJsonlPath, 0);
   bridgeOffset = result.newOffset;
-  bridgePendingTail = result.pendingTail;
   bridgeQueue.absorb(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
   bridgeBaselineDone = true;
@@ -6143,7 +6136,6 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   const fromOffset = Math.min(...restorable.map(entry => entry.offsetAtMark));
   const drained = drainTranscript(bridgeJsonlPath, fromOffset);
   bridgeOffset = drained.newOffset;
-  bridgePendingTail = drained.pendingTail;
   const cutoffMs = Math.min(...restorable.map(entry => entry.markTimeMs)) - 5_000;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
@@ -6208,7 +6200,6 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // trying to deliver.
   bridgeJsonlPath = matched;
   bridgeJsonlDir = dirname(matched);
-  bridgePendingTail = '';
   // Split-live: drain `matched` from offset 0, partition by cutoffMs.
   // History (pre-mark) is absorbed into the seen set so the iTerm-side
   // turns the user accumulated before this Lark message DON'T re-emit
@@ -6217,7 +6208,6 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // performRotationSwitch already does for fd-rotation rotations.
   const drained = drainTranscript(matched, 0);
   bridgeOffset = drained.newOffset;
-  bridgePendingTail = drained.pendingTail;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, matched);
@@ -6485,13 +6475,11 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   }
   bridgeJsonlPath = newPath;
   bridgeJsonlDir = dirname(newPath);
-  bridgePendingTail = '';
 
   // Drain the new path from 0 ourselves (do NOT call bridgeAbsorbBaseline
   // — that would emit the preamble we want to suppress on rotation).
   const result = drainTranscript(newPath, 0);
   bridgeOffset = result.newOffset;
-  bridgePendingTail = result.pendingTail;
   const { history, live } = splitTranscriptEventsByCutoff(result.events, cutoffMs);
   bridgeQueue.absorb(history);
   if (live.length > 0) bridgeQueue.ingest(live, newPath);
@@ -6669,7 +6657,6 @@ function maybeFollowSessionRotationViaPid(): PidFollowResult {
   bridgeJsonlPath = resolved.path;
   bridgeJsonlDir = dirname(resolved.path);
   bridgeOffset = 0;
-  bridgePendingTail = '';
   bridgeBaselineDone = true;
   // Same as the fingerprint and fd-rotation switches: the bridge is now on
   // another Claude conversation, so re-declare which one before any of its
@@ -6785,7 +6772,6 @@ function bridgeIngest(): void {
   }
   const result = drainTranscript(bridgeJsonlPath, bridgeOffset);
   bridgeOffset = result.newOffset;
-  bridgePendingTail = result.pendingTail;
   if (result.events.length > 0) {
     lastStructuredBridgeActivityAtMs = Date.now();
     // First drained event = the CLI session now holds user-visible history.
@@ -6999,7 +6985,6 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     // baseline=done with offset=0 up front: the very first events drained
     // from the file are eligible for attribution against pending Lark turns.
     bridgeOffset = 0;
-    bridgePendingTail = '';
     bridgeBaselineDone = true;
     log(`Bridge fresh-empty mode: ${bridgeJsonlPath} (waiting for file to appear; no baseline absorb)`);
   } else if (existsSyncSafe(bridgeJsonlPath)) {
@@ -7098,7 +7083,6 @@ function bridgeMarkPendingTurn(
       jsonlFileExists: existsSyncSafe(bridgeJsonlPath),
     })) {
       bridgeOffset = 0;
-      bridgePendingTail = '';
       bridgeBaselineDone = true;
       log(`Bridge baseline self-healed: guessed transcript ${bridgeJsonlPath} absent; fresh-empty readiness armed for fingerprint recovery`);
     } else {
@@ -9996,7 +9980,6 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   crashDiagnosticTmuxParked = true;
   isTmuxMode = true;
   isPipeMode = false;
-  isZellijMode = false;
   // The CLI is gone; stop the screen-update + analyzer loops so a stale
   // `status='working'` tick can't un-freeze the daemon's frozen crash card.
   // The web terminal is served by per-client tmux-attach PTYs, not these loops,
@@ -15643,7 +15626,6 @@ async function spawnCli(
   if (cfg.adoptMode && cfg.adoptSource === 'herdr' && cfg.adoptHerdrSessionName && (cfg.adoptHerdrPaneId || cfg.adoptHerdrTarget)) {
     isTmuxMode = false;
     isPipeMode = true;
-    isZellijMode = false;
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
     const target = cfg.adoptHerdrTarget ?? cfg.adoptHerdrPaneId!;
@@ -15712,7 +15694,6 @@ async function spawnCli(
     // PTY-per-WS — we don't attach to anything).
     isTmuxMode = true;
     isPipeMode = true;
-    isZellijMode = !!cfg.adoptZellijPaneId;
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
     const observeBe: ObserveBackend = cfg.adoptZellijPaneId
@@ -16367,7 +16348,6 @@ async function spawnCli(
   let selectedBackend = selectBackend();
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
-  isZellijMode = selectedBackend.isZellijMode;
   backend = selectedBackend.backend;
   // BOT_HOME CLI-data redirect: sandboxed bots whose adapter supports it, plus
   // Codex bots explicitly requesting isolated auth, keep their CLI data
@@ -16774,7 +16754,6 @@ async function spawnCli(
         selectedBackend = selectBackend();
         isTmuxMode = selectedBackend.isTmuxMode;
         isPipeMode = selectedBackend.isPipeMode;
-        isZellijMode = selectedBackend.isZellijMode;
         backend = selectedBackend.backend;
         cliLifetimeNonce++;
         persistentSessionName = selectedBackend.persistentSessionName;
@@ -16943,7 +16922,6 @@ async function spawnCli(
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
       isPipeMode = selectedBackend.isPipeMode;
-      isZellijMode = selectedBackend.isZellijMode;
       backend = selectedBackend.backend;
       cliLifetimeNonce++;
       persistentSessionName = selectedBackend.persistentSessionName;
@@ -16995,7 +16973,6 @@ async function spawnCli(
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
       isPipeMode = selectedBackend.isPipeMode;
-      isZellijMode = selectedBackend.isZellijMode;
       backend = selectedBackend.backend;
       cliLifetimeNonce++;
       persistentSessionName = selectedBackend.persistentSessionName;
@@ -17585,7 +17562,7 @@ async function spawnCli(
 
   // Reattach vs fresh was predicted above (see willReattachPersistent) so the
   // resume pre-flight could short-circuit on it; reuse it here so the log line
-  // tells the truth. When a bmx-* tmux session is still alive, TmuxBackend.spawn
+  // tells the truth. When a bmx-* tmux session is still alive, the tmux backend
   // ignores the bin/args and just `tmux attach-session`s — logging
   // `Spawning: <new bin>` in that case is misleading and has cost real
   // debugging time. (CliId-mismatch reattach is now blocked upstream in
@@ -18564,7 +18541,6 @@ async function spawnCli(
   // same outbox relay / seccomp marker / credential masks. Host-side readers of
   // CLI-written files must go through the scratch path mappings (Linux merged
   // root, macOS clone trees).
-  let scratchMergedHost: string | undefined;
   let scratchMappings: import('./services/scratch-host-view.js').ScratchPathMapping[] | undefined;
   /** The clone HOME the worker points its own transcript readers at (both
    *  platforms; on Linux equals scratchMergedHost + real $HOME). */
@@ -18652,7 +18628,6 @@ async function spawnCli(
           if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
           sandboxCleanup = att.cleanup;
           sandboxRelayOutbox = att.outbox;
-          scratchMergedHost = att.mergedHostPath;
           scratchMappings = scratchLinuxMappings(att.mergedHostPath);
           scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
           sandboxStopWatcher = startOutboxWatcher(
@@ -18726,7 +18701,6 @@ async function spawnCli(
       if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
-      scratchMergedHost = sbx.mergedHostPath;
       scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
       scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
       sandboxStopWatcher = startOutboxWatcher(
@@ -23677,7 +23651,6 @@ process.on('message', async (raw: unknown) => {
       // Adopt IPC handlers can overlap. Delay their turn baseline until the
       // submission mutex is held so a queued message cannot steal attribution
       // from the write/verification already in flight.
-      let turnSeq = usageLimitTracker.currentTurn();
       // Adopt handlers are async and serialized below, so their renderer/usage
       // turn begins inside writeAdoptMessage. Non-adopt keeps the immediate
       // baseline while the message waits for normal flush scheduling.

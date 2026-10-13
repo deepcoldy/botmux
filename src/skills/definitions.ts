@@ -52,6 +52,7 @@ botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --top
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
+非静默 \`--new-topic\` / \`task\` 的 \`--topic-title\` 支持触发时模板：\`{{date}}\` 是定时任务时区的自然日，\`{{date:-1d}}\` / \`{{date:+2d}}\` 按自然日偏移，\`{{owner}}\` 是任务创建人的真实飞书 mention。模板仅在每次触发时渲染，保存的任务配置保持不变；silent 延迟建根仅支持静态标题，动态模板会在创建或更新时被拒绝。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
 执行位置是任务级可选项：**群内默认在群顶层执行，即使从话题内创建也不继承原话题**；要按用户要求在当前话题跟进、轮询或提醒，必须显式传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
 可选 \`--model <id>\` / \`--reasoning-effort <low|medium|high|xhigh|max|ultra>\`：**只给这一个任务**换模型/思考强度，不动 Bot 配置（同一个 Bot 下高频哨兵用便宜模型、每日深度任务用最强模型）。仅 Codex / Claude Code / Grok / TraeX 支持。注意模型是 CLI **进程启动参数**：只有新建会话的那次触发能应用，所以 \`--new-topic\` 每次生效，\`--topic\`/\`--top-level\` 只在首次创建会话那次生效、之后复用会话时沿用旧模型。模型不支持所选强度、或 Bot 换了 CLI 时，触发会丢掉该项照常执行并记 warn，不会跳过执行。
@@ -597,6 +598,44 @@ botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
 
 多行内容也可用 \`--content-file -\` 从 stdin 读取。核心命令只负责 transport、会话归属、顺序与幂等；阶段、公开工作摘要、工具事件和 UI 语义应由机器人自己的 Skill 决定。不要把模型私有原始 CoT 写进卡片，只展示可公开、可验证的工作摘要。
 
+### 完成卡附一个受约束的可选后续
+
+当任务已经结束、但存在一个值得让原请求者决定是否继续的独立后续时，可以把一份 Completion Proposal 附在**同一张标准 final 卡**上。它适合“是否创建修复 MR”“是否把已验证结论沉淀为规范”这类非阻塞二选一；它不是通用 callback，也不能替代需要当场等待答案的 \`botmux ask\`。
+
+先做无副作用的能力探测：
+
+\`\`\`bash
+botmux capabilities --json
+\`\`\`
+
+只有 \`.capabilities.completion_proposal_v1 == true\` 时才传文件。文件必须是 UTF-8 JSON，且只允许 4 个会展示给用户的字符串字段：
+
+\`\`\`json
+{
+  "title": "是否创建修复 MR？",
+  "body": "会整理本次已验证的修复，创建独立分支和 MR；不会自动合并。",
+  "acceptLabel": "创建 MR",
+  "dismissLabel": "暂不创建"
+}
+\`\`\`
+
+\`\`\`bash
+botmux send --response-kind final \\
+  --completion-proposal-file /absolute/task-tmp/completion-proposal.json \\
+  --mention-back <<'EOF'
+修复已完成并通过测试。
+EOF
+\`\`\`
+
+硬边界：
+
+- 只支持当前会话、标准正文 final 卡；不能和自定义卡、语音、跨群、顶层发送等特殊 sink 混用。
+- Core 固定 24 小时有效期，并把提案绑定到本次任务的精确 requester；其他人点击会被拒绝，重复点击按 first-decision-wins 幂等处理。
+- 四个字段是全部授权快照。不要写 prompt、命令、绝对路径、凭证、隐藏 payload 或 URL；点击接受只授权继续处理卡片上可见的内容，Agent 仍会在新 turn 里重跑 Skill、目标、权限和审批检查。
+- 接受会在 ACK 后启动一个新的普通 turn；跳过不会启动 Agent。满意度反馈是任务质量评价，Proposal 是有副作用的后续授权，两者独立并可同时出现在 final 卡。
+- 如果精确 requester、origin turn 或可跨重启恢复的 backend 不可证明，Core 会把内容降级成静态提示，不留下一个以后点不动的按钮。旧 Core 无该 capability 时，调用方应省略参数，并在正文里给静态提示。
+- 自定义 \`--card-file/--card-json\` 永远不能伪造这个回调；需要自定义业务交互时仍应走专门受审计的 Core 能力。
+
 ### @mention 其他机器人协作
 
 \`\`\`bash
@@ -708,6 +747,8 @@ sandbox dispatch 暂不支持
 | \`--video-covers <path>\` | 视频封面图片，可重复，按顺序对应 \`--videos\` |
 | \`--card-file <path>\` | 直接发送 interactive card JSON 文件（纯展示 + open_url，交互控件被拒） |
 | \`--card-json <json>\` | 直接发送 interactive card JSON 字符串（纯展示 + open_url，交互控件被拒） |
+| \`--response-kind final\` | 声明当前标准回复是最终答案，允许 Core 挂反馈与受约束完成后续 |
+| \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
 | \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |

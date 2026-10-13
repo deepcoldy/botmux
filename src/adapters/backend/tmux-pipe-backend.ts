@@ -378,8 +378,8 @@ export class TmuxPipeBackend implements SessionBackend {
   cliCwd?: string;
 
   /** Whether this backend re-attached to an existing bmx-* tmux session
-   *  (rather than creating a new detached one). Mirrors TmuxBackend.isReattach
-   *  so the worker can branch on reattach behaviour without a private-cast. */
+   *  (rather than creating a new detached one), so the worker can branch on
+   *  reattach behaviour without a private-cast. */
   get isReattach(): boolean {
     return this._isReattach;
   }
@@ -1092,6 +1092,9 @@ export class TmuxPipeBackend implements SessionBackend {
     // the next spawn before the stream's queued close runs (Bun and Node).
     const stream = this.readStream;
     this.readStream = null;
+    // 有意保留：fifoFd 已无生产读者（#1394 起 fd 的关闭完全交给 ReadStream），但
+    // test/fixtures/tmux-pipe-exit-fixture.ts 通过类型断言读取它；此处显式读一次以满足 noUnusedLocals。
+    void this.fifoFd;
     this.fifoFd = null;
     stream?.destroy();
     if (this.fifoWakeFd !== null) {

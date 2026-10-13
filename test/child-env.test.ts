@@ -25,7 +25,6 @@ import {
   stripDashboardH5Env,
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
-import { pm2CallerEnv } from '../src/cli/pm2-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
 import { COMPANION_BOT_APP_ID_ENV, COMPANION_SECRET_FILE_ENV } from '../src/config.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
@@ -700,21 +699,13 @@ describe('session CLI home scrub call sites', () => {
     expect(worker).toContain('zellijEnv(redactChildEnv(process.env))');
   });
 
-  it('pm2 boundaries and daemon boot scrub invoker-terminal fingerprints and turn markers', () => {
+  it('external-member boundary and daemon boot scrub invoker-terminal fingerprints and turn markers', () => {
     // Same persistence vector as the scrubs above, fourth and fifth key
     // families: agent-shell fingerprints (NO_COLOR/CODEX_CI/PAGER — colorless
-    // fleet TUIs) and turn-scoped session identity. The plugin pm2 client
-    // boundary (core/plugins/pm2.ts, which shares the God's PM2_HOME and routes
-    // through scrubPm2CallerEnv) must bake clean env; daemon boot additionally
-    // heals a fleet already poisoned by an earlier restart or a stale dump.pm2.
-    const pm2EnvSrc = read('cli/pm2-env.ts');
-    const fn = pm2EnvSrc.slice(pm2EnvSrc.indexOf('export function scrubPm2CallerEnv('));
-    const fnBody = fn.slice(0, fn.indexOf('\n}'));
-    expect(fnBody).toContain('scrubInvokerTerminalEnv(');
-    expect(fnBody).toContain('scrubSessionTurnMarkerEnv(');
-    // TERM is re-pinned (not left absent) inside the shared scrub so pm2
-    // CLIENT output on a real TTY keeps supports-color detection.
-    expect(fnBody).toContain("env.TERM = 'xterm-256color'");
+    // fleet TUIs) and turn-scoped session identity. The external-member
+    // boundary (core/plugins/supervisor-client.ts → scrubExternalMemberEnv) must
+    // bake clean env; daemon boot additionally heals a fleet already poisoned by
+    // an earlier restart or a stale dump.pm2.
     const pluginSupervisor = read('core/plugins/supervisor-client.ts');
     expect(pluginSupervisor).toContain('scrubExternalMemberEnv(');
     expect(read('index-plugin-supervisor.ts')).toContain('scrubExternalMemberEnv(process.env)');
@@ -789,81 +780,13 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
   });
 });
 
-/**
- * pm2 invocation boundary — the plugin pm2 client (core/plugins/pm2.ts →
- * cli/pm2-env.ts). (Core fleet supervision no longer uses pm2 after the
- * pm2→supervisor migration; plugin services remain pm2-managed and share the
- * God's PM2_HOME.)
- *
- * pm2 copies the CALLER's environment into every managed app and into
- * dump.pm2, which `pm2 resurrect` replays after a reboot — so whatever survives
- * this scrub is handed to the whole fleet AND written to disk under
- * ~/.botmux/pm2, readable via `pm2 describe`/`jlist` for as long as that dump
- * lives. `botmux restart` is routinely issued from the dashboard process
- * (update/restart button), which legitimately holds the Feishu H5 login family.
- */
-describe('pm2CallerEnv()', () => {
-  it('never carries the Dashboard H5 login family into pm2 metadata/dump', () => {
-    const future = `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`;
-    const base: NodeJS.ProcessEnv = {
-      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'h5-secret'])),
-      [future]: 'h5-secret',
-      PATH: '/usr/bin',
-    };
-
-    const env = pm2CallerEnv(base, '/tmp/pm2-home');
-
-    for (const key of [...DASHBOARD_H5_ENV_KEYS, future]) {
-      expect(key in env, key).toBe(false);
-    }
-    expect(Object.values(env)).not.toContain('h5-secret');
-    expect(env.PATH).toBe('/usr/bin');
-    expect(env.PM2_HOME).toBe('/tmp/pm2-home');
-  });
-
-  it('keeps stripping session CLI homes, Claude markers and workflow identity', () => {
-    const base: NodeJS.ProcessEnv = {
-      CLAUDE_CONFIG_DIR: '/home/bot-a/.botmux/claude',
-      CODEX_HOME: '/home/bot-a/.botmux/codex',
-      CLAUDECODE: '1',
-      CLAUDE_CODE_CHILD_SESSION: '1',
-      BOTMUX_WORKFLOW: '1',
-      BOTMUX_WORKFLOW_RUN_ID: 'run_1',
-      BOTMUX_DASHBOARD_PORT: '7891',
-    };
-
-    const env = pm2CallerEnv(base, '/tmp/pm2-home');
-
-    for (const key of [...SESSION_CLI_HOME_ENV_KEYS, ...CLAUDE_SESSION_MARKER_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS]) {
-      expect(key in env, key).toBe(false);
-    }
-    // Non-secret operator settings still ride through — they are the point of
-    // the baked env block.
-    expect(env.BOTMUX_DASHBOARD_PORT).toBe('7891');
-  });
-
-  it('does not mutate the caller env', () => {
-    const base: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET: 'h5-secret' };
-    pm2CallerEnv(base, '/tmp/pm2-home');
-    expect(base.BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET).toBe('h5-secret');
-  });
-});
-
 describe('scrubExternalMemberEnv (external fleet members)', () => {
-  // Parity with the pm2 path is the whole contract: this replaces the plugin pm2
-  // boundary, and a migration must not quietly reduce protection. Asserting the
-  // RESULT against that boundary's real composition (rather than re-listing keys
-  // here) means the two cannot drift.
-  //
-  // The reference MUST be the whole old boundary, not scrubPm2CallerEnv alone:
-  // pm2Env() ran stripPm2GracefulExitMarker FIRST and then scrubbed. Comparing
-  // against the scrub in isolation is what let the graceful-exit sentinel leak
-  // into external members unnoticed — the fixture carries it now so this spec
-  // fails if that strip is ever dropped again.
-  it('strips exactly what the whole pm2 plugin boundary stripped', async () => {
-    const { scrubPm2CallerEnv } = await import('../src/cli/pm2-env.js');
-    const { stripPm2GracefulExitMarker } = await import('../src/pm2-graceful-exit.js');
-    const poisoned = (): NodeJS.ProcessEnv => ({
+  // The fixture carries every key family the old pm2 plugin boundary stripped
+  // (pm2Env(): stripPm2GracefulExitMarker(...) then scrubPm2CallerEnv(...)), so
+  // this spec fails if any of those strips is ever dropped — including the
+  // graceful-exit sentinel, which once leaked into external members unnoticed.
+  it('strips every key family the old pm2 plugin boundary stripped', () => {
+    const env: NodeJS.ProcessEnv = {
       CODEX_HOME: '/bot/a/codex',
       CLAUDE_CONFIG_DIR: '/bot/a/claude',
       CLAUDECODE: '1',
@@ -881,13 +804,32 @@ describe('scrubExternalMemberEnv (external fleet members)', () => {
       PATH: '/usr/bin',
       HOME: '/root',
       UNRELATED: 'keep',
+    };
+    scrubExternalMemberEnv(env);
+    expect(env).toEqual({
+      PATH: '/usr/bin',
+      HOME: '/root',
+      UNRELATED: 'keep',
+      TERM: 'xterm-256color',
     });
-    const viaExternal = poisoned();
-    // pm2Env(): stripPm2GracefulExitMarker(...) then scrubPm2CallerEnv(...).
-    const viaPm2 = stripPm2GracefulExitMarker(poisoned());
-    scrubExternalMemberEnv(viaExternal);
-    scrubPm2CallerEnv(viaPm2);
-    expect(viaExternal).toEqual(viaPm2);
+  });
+
+  it('never carries the Dashboard H5 login family (incl. future prefixed knobs) into external members', () => {
+    const future = `${DASHBOARD_H5_ENV_PREFIX}FUTURE_KNOB`;
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(DASHBOARD_H5_ENV_KEYS.map((key) => [key, 'h5-secret'])),
+      [future]: 'h5-secret',
+      PATH: '/usr/bin',
+      BOTMUX_DASHBOARD_PORT: '7891',
+    };
+    scrubExternalMemberEnv(env);
+    for (const key of [...DASHBOARD_H5_ENV_KEYS, future]) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(Object.values(env)).not.toContain('h5-secret');
+    // Non-secret operator settings still ride through.
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.BOTMUX_DASHBOARD_PORT).toBe('7891');
   });
 
   it('strips the graceful-exit sentinel (drift guard on the key name)', () => {

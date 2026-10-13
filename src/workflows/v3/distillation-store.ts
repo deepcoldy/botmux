@@ -57,7 +57,6 @@ const PREPARED_FILE = 'prepared.json';
 const PROPOSAL_FILE = 'proposal.json';
 const STATE_FILE = 'state.json';
 
-const STORE_SCHEMA_VERSION = 1 as const;
 const PREPARED_SCHEMA_VERSION = 1 as const;
 const PROPOSAL_SCHEMA_VERSION = 1 as const;
 const STATE_SCHEMA_VERSION = 1 as const;

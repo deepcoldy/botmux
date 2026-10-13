@@ -4,7 +4,6 @@
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection } from '../../core/prompt-injection.js';
-import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { basename as pathBasename, dirname, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
@@ -90,6 +89,11 @@ import {
   type V3DistillationCardHandlerDeps,
 } from './v3-distillation-card-handler.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
+import {
+  handleCompletionProposalAction,
+  isCompletionProposalAction,
+  type CompletionProposalCardHandlerDeps,
+} from './completion-proposal-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
@@ -100,11 +104,11 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
-import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
+import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
@@ -131,7 +135,7 @@ import {
 } from '../../services/local-cli-opener.js';
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
-import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -152,6 +156,8 @@ export interface CardHandlerDeps {
   v3RunSaveDeps?: V3RunSaveCardHandlerDeps;
   /** v3 参数蒸馏提案的接受/拒绝动作。 */
   v3DistillationDeps?: V3DistillationCardHandlerDeps;
+  /** 标准完成卡里的 requester-only 非阻塞后续提案。 */
+  completionProposalDeps?: CompletionProposalCardHandlerDeps;
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
@@ -1556,6 +1562,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleOncallGroupAction(data, larkAppId);
   }
 
+  if (isCompletionProposalAction(value?.action) && larkAppId) {
+    if (!deps.completionProposalDeps) {
+      return { toast: { type: 'error', content: '该后续动作当前不可用，请直接在话题中继续。' } };
+    }
+    return handleCompletionProposalAction(data, larkAppId, deps.completionProposalDeps);
+  }
+
   if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
     const { handleSkillFeedbackCardAction } = await import('./skill-feedback-card.js');
     const { getSkillFeedbackStore } = await import('../../services/skill-feedback-store.js');
@@ -2736,7 +2749,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (value?.action) {
     const { action: actionType, root_id: rootId } = value;
-    const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = larkAppId
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
@@ -2982,7 +2994,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           },
         };
       }
-      const effectiveCliId = sessionCliId(ds);
       const cliName = sessionCliDisplayName(ds);
       logger.info(`[${tag(ds)}] Correlated restart via card button`);
       requestSessionRestart(ds, {
@@ -4149,7 +4160,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // image to the originally-POSTed initial frame while waiting for the
       // fresh screenshot PATCH (~1s).
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
-        const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
         const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
@@ -4320,7 +4330,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] term_action: ${key}`);
       }
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
-        const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
         const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);

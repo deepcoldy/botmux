@@ -10,7 +10,6 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
 // Plain ESM import, deliberately: `--compile` traces it into the binary, while tsc /

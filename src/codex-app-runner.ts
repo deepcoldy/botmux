@@ -355,7 +355,7 @@ class AppServerClient {
     return this.child.exitCode !== null || this.child.signalCode !== null;
   }
 
-  constructor(private readonly codexBin: string, private readonly cwd: string) {
+  constructor(codexBin: string, cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
       cwd,
       env: process.env,

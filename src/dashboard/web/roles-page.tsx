@@ -40,6 +40,7 @@ import {
   loadGroups,
   loadMessageListenerRunPreviewStatus,
   loadMessageListener,
+  mergeListenerContentPolicy,
   loadProfileEntries,
   loadProfileEntry,
   loadProfiles,
@@ -153,6 +154,7 @@ export function cloneListener(listener: MessageListenerData | null | undefined):
       contentPolicy: {
         ...(listener.contentPolicy.includeKeywords ? { includeKeywords: [...listener.contentPolicy.includeKeywords] } : {}),
         ...(listener.contentPolicy.matchMode ? { matchMode: listener.contentPolicy.matchMode } : {}),
+        ...(listener.contentPolicy.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
       },
     } : {}),
   };
@@ -634,10 +636,7 @@ function RolesPage(props: { tab: RolesTab }) {
   function updateListenerContentPolicy(patch: NonNullable<MessageListenerData['contentPolicy']>): void {
     setEditingListener(prev => ({
       ...prev,
-      contentPolicy: {
-        ...(prev.contentPolicy ?? {}),
-        ...patch,
-      },
+      contentPolicy: mergeListenerContentPolicy(prev.contentPolicy, patch),
     }));
   }
 
@@ -760,6 +759,7 @@ function RolesPage(props: { tab: RolesTab }) {
       return {
         includeKeywords,
         ...(raw.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+        ...(raw.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
       };
     })();
     return {
@@ -1852,6 +1852,23 @@ export function MessageListenerEditor(props: {
               <option value="any">{tr('roles.listenerMatchModeAny')}</option>
               <option value="all">{tr('roles.listenerMatchModeAll')}</option>
             </select>
+          </label>
+          <label className="roles-listener-field" style={{ minWidth: 220 }}>
+            <span className="roles-field-label">{tr('roles.listenerResolveDocumentTitles')}</span>
+            <input
+              type="checkbox"
+              checked={listener.contentPolicy?.resolveDocumentTitles === true}
+              disabled={policyKeywords.length === 0}
+              // Preserve the currently rendered keyword list in this patch.
+              // The keyword textarea and this checkbox are separate React
+              // events; carrying only the boolean here could race a pending
+              // keyword update and replace contentPolicy with an object that
+              // has no includeKeywords, which then clears the textarea.
+              onChange={ev => props.onContentPolicyPatch({
+                includeKeywords: [...policyKeywords],
+                resolveDocumentTitles: ev.currentTarget.checked,
+              })}
+            />
           </label>
         </div>
         <small className="roles-listener-scope-help">{tr('roles.listenerContentPolicyHelp')}</small>

@@ -1865,11 +1865,27 @@ async function triggerSessionTurnAdmitted(
     } else {
       newDs.initialStartPending = true;
     }
-    deps.activeSessions.set(key, newDs);
+    // Same registration gate as every other creation path: besides the live
+    // occupant checked above, a quarantined session (restore could not prove
+    // its persistent backend gone) reserves this route so a second runtime is
+    // never started beside a possibly still-running CLI.
+    if (!setActiveSessionIfActive(deps.activeSessions, key, newDs)) {
+      try { sessionStore.closeSession(session.sessionId); }
+      catch { /* keep the refusal */ }
+      return { kind: 'refused' as const };
+    }
     return { kind: 'created' as const, ds: newDs };
   });
 
   if (claim.kind === 'existing') return deliverToExisting(claim.ds);
+  if (claim.kind === 'refused') {
+    return {
+      ok: false,
+      triggerId,
+      errorCode: 'trigger_failed',
+      error: 'session route is reserved by a quarantined session',
+    };
+  }
   const newDs = claim.ds;
   const session = newDs.session;
 

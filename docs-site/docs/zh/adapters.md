@@ -130,7 +130,7 @@ BotMux 把“协议能力”和“发行版身份”分开：`cliId: "codex"` �
 1. `src/adapters/cli/` 下新建文件，实现 `CliAdapter` 接口
 2. `src/adapters/cli/types.ts` 的 `CliId` 联合类型加新 ID
 3. `src/adapters/cli/registry.ts` 加 import / switch case / export
-4. `src/worker.ts` 的 `CLI_DISPLAY_NAMES`、`card-builder.ts` 的 `cliDisplayNames` 加显示名
+4. `src/adapters/cli/display-names.ts` 的 `CLI_DISPLAY_NAMES` 加显示名（卡片、worker、setup / dashboard 共用）
 5. `src/cli.ts` setup 交互菜单加选项
 6. 更新 README
 

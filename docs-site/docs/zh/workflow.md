@@ -1,15 +1,10 @@
 # Workflow（实验性）
 
-botmux 有两套 workflow 引擎，共享 `botmux workflow` 命令前缀，但定位不同：
+一句话模糊目标 → 自动拷问澄清、编排 DAG、并发执行；跑通的流程可以存成 **Saved Workflow** 反复复用。run 存放在 `~/.botmux/v3-runs`，运行情况在 **Dashboard 的 v3 视图**看（每张飞书卡片都带「Web 详情」链接直达）。
 
-| 引擎 | 是什么 | 入口 | run 存放 |
-|------|--------|------|----------|
-| **v3 即兴 workflow**（LLM-driven，推荐） | 一句话模糊目标 → 自动拷问澄清、编排 DAG、并发执行 | 飞书 `/workflow <目标>` | `~/.botmux/v3-runs` |
-| **v0.2 模板 workflow**（schema-driven） | 手写 / 生成可复用的 `workflow.json`，反复跑 | `/template run <id>` | `~/.botmux/workflow-runs` |
+> ⚠️ Workflow **默认关闭**。在 Dashboard 设置页打开「工作流功能」开关，或设置环境变量 `BOTMUX_WORKFLOW_ENABLED=true` 后才可用。关闭时即兴编排与 Saved Workflow 的运行/保存都会被拒绝，但进行中的 run 仍可用 `botmux workflow cancel / retry / grant` 管理。
 
-> ⚠️ 两套引擎的 run **不互通**：`botmux workflow ls / tail / show / resume / cancel` 只看 v0.2 模板 run；v3 即兴 workflow 的运行情况在 **Dashboard 的 v3 视图**看（每张飞书卡片都带「Web 详情」链接直达）。
-
-## 即兴 workflow（v3，推荐）
+## 即兴 workflow
 
 ### 怎么用
 
@@ -35,7 +30,7 @@ botmux 有两套 workflow 引擎，共享 `botmux workflow` 命令前缀，但�
 
 ### workflow 能表达什么（节点能力）
 
-architect 自动编排时（或你在 v0.2 模板里声明）能用上这些结构，所以你在 Gate-2 看到的流程可能不是简单的直线：
+architect 自动编排时能用上这些结构，所以你在 Gate-2 看到的流程可能不是简单的直线：
 
 - **顺序依赖 + 并发**：无依赖的节点并行跑。
 - **条件分支**：某节点产出结构化结果后，下游边按结果激活——只走命中的分支，没走的分支零成本跳过；多个上游可按「全部 / 任一 / 法定票数」汇合。
@@ -51,6 +46,7 @@ architect 自动编排时（或你在 v0.2 模板里声明）能用上这些结�
 | `botmux workflow start <runId>` | approve-dag 后交 daemon 开跑（带飞书审批卡） |
 | `botmux workflow retry <runId> [--node <id>]` | 重跑受阻（blocked）节点 |
 | `botmux workflow grant <runId> [--loop <id>]` | 给轮数耗尽的循环追加一轮 |
+| `botmux workflow cancel <runId> [--reason <text>]` | 取消进行中的 run |
 
 改主意：需求要改 → `botmux workflow revise-spec <runId>`（退回重新澄清，原 DAG 作废）；流程要改 → `botmux workflow revise-dag <runId>`（只重编流程）。
 
@@ -75,34 +71,27 @@ architect 自动编排时（或你在 v0.2 模板里声明）能用上这些结�
 | `botmux workflow approve-dag <runId>` | Gate-2 通过 → `dag_approved` |
 | `botmux workflow start <runId>` | 交 daemon 驱动开跑 |
 
-## 可复用模板（v0.2）
+## 保存与复用（Saved Workflow）
 
-反复要跑的固定流程，做成模板存起来复用：
+即兴 workflow 跑通后，可以把它存成 Saved Workflow，之后带不同参数反复跑：
 
-- 用 `botmux-workflow-create` skill 把你的描述翻译成 `~/.botmux/workflows/<id>.workflow.json`（**绝对路径的全局位置**，不是当前目录的 `./workflows/`——CLI agent 与 daemon 的 cwd 不一定一致）。
-- `botmux workflow validate <path>` 校验定义文件。
-- 跑模板：飞书 `/template run <id> key=value`（daemon 真实执行），或 CLI `botmux workflow run <id> --param key=value`（**离线 stub，不起真实 worker，仅端到端冒烟测试**）。
+| 入口 | 作用 |
+|------|------|
+| 飞书 `/workflow save last [名称]` / CLI `botmux workflow save [last\|runId] [名称]` | 把最近一次（或指定 runId）的 run 存为 Saved Workflow |
+| 飞书 `/workflow run <名称> [key=value ...]` / CLI `botmux workflow run <名称\|workflowId> [--param key=value ...]` | 运行 Saved Workflow |
+| 飞书 `/workflow list` / CLI `botmux workflow list [--json]` | 列出已保存的 workflow |
+| 飞书 `/workflow show <名称>` / CLI `botmux workflow show <名称\|workflowId>` | 查看定义 |
 
-入参（params）：CLI 用 `--param key=value` 传标量，用 `--param-json key=<json>` 传 object / array（如 `--param-json tags='["urgent","cn"]'`）；IM `/template run` 暂不支持 object / array 入参。params 适合传**业务变量**（chat id、模式开关、阈值），不要把整段任务指令通过 params 传——节点任务定义应写死在 `workflow.json` 里。
+入参（params）：CLI 用 `--param key=value` 传标量，用 `--param-json key=<json>` 传 object / array（如 `--param-json tags='["urgent","cn"]'`）。params 适合传**业务变量**（chat id、模式开关、阈值），不要把整段任务指令通过 params 传——节点的任务定义应固化在 workflow 里。
 
-### 模板 run 的运维 & 调试命令
+## 旧版 v2 模板（已下线）
 
-以下命令管的是 **v0.2 模板 run**（读写 `~/.botmux/workflow-runs`，可用 `BOTMUX_WORKFLOW_RUNS_DIR` 覆盖），**不需要 daemon 在线**，**看不到 v3 即兴 workflow 的 run**：
+v2 模板 runtime 已下线：`/template run`、`botmux workflow ls / tail / resume / validate` 等命令都会直接报错。仍有旧 `~/.botmux/workflows/*.workflow.json` 定义或历史 run 的，用离线工具处理：
 
 | 命令 | 说明 |
 |------|------|
-| `botmux workflow ls [--all] [--status ...] [--wide] [--json]` | 列出模板 run；默认仅未结束的 |
-| `botmux workflow tail <runId> [--from N] [--follow] [--json]` | 打印事件简表；`--follow` 持续跟随 |
-| `botmux workflow show <runId>` | replay 事件，打印 Snapshot 摘要 JSON |
-| `botmux workflow resume <runId>` | 从磁盘 runDir 冷恢复（CLI 不 spawn 新 worker） |
-| `botmux workflow cancel <runId> [--reason <text>]` | 写入 cancelRequested 并驱动 cancel recovery |
-
-```bash
-botmux workflow ls                         # 看哪些模板 run 在跑
-botmux workflow tail wf-abc-123 --follow   # 跟一个 run 的事件流
-botmux workflow resume wf-abc-123          # run 卡住/重启过 → 冷恢复
-botmux workflow cancel wf-abc-123 --reason '依赖外部超时'
-```
+| `botmux template migrate-v3 [workflowId\|path ...] [--all]` | 默认 dry-run；加 `--commit` 把可转换的 v2 定义固化为 v3 Saved Workflow |
+| `botmux template archive-runs [--commit] [--verify <archiveId\|path>]` | 扫描、归档或校验已终态的 v2 历史 run；不会执行 v2 workflow，也不直接删除历史数据 |
 
 ## 开发 / 自测：`botmux v3 run`
 

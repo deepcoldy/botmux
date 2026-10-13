@@ -57,9 +57,9 @@ bash src/desktop/install-local.sh
 7. 使用本机 ad-hoc 签名并移除 quarantine。
 8. 默认打开 App。
 
-脚本只安装 App，不会安装、升级、link 或修改用户机器上的全局 `botmux` CLI。App 自带版本匹配的 Node、botmux 和 PM2，不依赖用户的 PATH、fnm、nvm 或 Homebrew Node。
+脚本只安装 App，不会安装、升级、link 或修改用户机器上的全局 `botmux` CLI。App 自带版本匹配的 Node 和 botmux，不依赖用户的 PATH、fnm、nvm 或 Homebrew Node。
 
-App 与命令行继续共用 `~/.botmux` 中的机器人配置、会话、日志和专用 PM2_HOME。启动时若检测到全局 CLI 留下的 botmux fleet，会先优雅停止旧 core 进程，再使用内置 runtime 重建；不会删除用户配置，也不会操作默认 `~/.pm2` 中的无关应用。
+App 与命令行继续共用 `~/.botmux` 中的机器人配置、会话、日志和 fleet 状态（`~/.botmux/fleet-state.json`）。启动时若检测到全局 CLI 留下的 botmux fleet，会先优雅停止旧 core 进程，再使用内置 runtime 重建；不会删除用户配置。
 
 常用参数：
 

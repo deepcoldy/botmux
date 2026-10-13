@@ -97,6 +97,12 @@ export interface ClaimInboxInput {
   lane?: string;
   /** 只 claim 当前 worker 可执行的分区；空数组表示没有可 claim 的 owner。 */
   partitionKeys?: string[];
+  /**
+   * Claim any partition whose key starts with this value. Mutually exclusive
+   * with `partitionKeys`. Owner-routed consumers use exact keys first, then a
+   * bounded application prefix as a failover discovery path.
+   */
+  partitionKeyPrefix?: string;
   leaseDurationMs: number;
 }
 

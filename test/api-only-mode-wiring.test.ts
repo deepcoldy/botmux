@@ -872,7 +872,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
   });
 
-  it('stamps the turn sender type onto the trusted caller at both IM entry points', () => {
+  it('stamps proven sender type at IM entries and source testimony at dispatch launch', () => {
     // A bot's turn carries a perfectly valid union_id (its own), so a consumer
     // cannot tell "a person asked" from "a bot triggered itself" unless the host
     // says which it was. Both inbound paths must therefore pass it — a missed
@@ -885,9 +885,9 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    // handleNewTopic, principal-lane live suggestion, and handleThreadReply.
-    expect(trustedCallerArgs.length).toBe(3);
-    for (const args of trustedCallerArgs) {
+    // Three IM entry paths plus the authenticated dispatch launch caller.
+    expect(trustedCallerArgs.length).toBe(4);
+    for (const args of trustedCallerArgs.slice(0, 3)) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
       expect(senderTypeArg).not.toBe('');
@@ -898,6 +898,16 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       // which is the exact case a bare `sender_type` check already missed.
       expect(senderTypeArg).toContain('isForeignBot');
     }
+    // Dispatch launch is not an IM event on the target app: its same-host HMAC
+    // authenticated and policy-allowlisted source daemon attests the human
+    // caller union_id, while the immediate trigger is known to be that bot.
+    const dispatchArgs = trustedCallerArgs[3]!;
+    expect(dispatchArgs.slice(0, 3).join(', ')).toContain('operation.callerUnionId');
+    expect(dispatchArgs[3]).toBe('true');
+    expect(daemonSource).toContain('trustedCaller: dispatchTrustedCaller');
+    // The source testimony must never be reused as evaluateBotTalk's bot union.
+    expect(daemonSource).toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId)');
+    expect(daemonSource).not.toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId, callerUnionId)');
   });
 
   it('P1-2: entrypoint strips BOTS_CONFIG so no worker fork inherits it', () => {
@@ -992,12 +1002,11 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // tmux backend: pane scripts bake a HOST-RESOLVED bin dir literal (codex P1:
     // the pane can't resolve at runtime — BOTMUX_CORE_ONLY/SESSION_DATA_DIR are
     // scrubbed before the script runs). shellWrapperScript(binDir) takes it as an
-    // arg; call sites resolve via resolveBotmuxWrapperBinDir(opts.env). NO hardcoded
-    // $HOME/.botmux/bin and NO runtime-env shell resolution.
+    // arg; call sites (tmux-pipe-backend / zellij / zmx, checked below) resolve via
+    // resolveBotmuxWrapperBinDir(opts.env). NO hardcoded $HOME/.botmux/bin and NO
+    // runtime-env shell resolution.
     const tmuxSrc = readFileSync(resolve('src/adapters/backend/tmux-backend.ts'), 'utf8');
     expect(tmuxSrc).toContain("export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh')");
-    expect(tmuxSrc).toContain('const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);');
-    expect(tmuxSrc).toContain(': shellWrapperScript(wrapperBinDir, shellKind);');
     expect(tmuxSrc).not.toContain('export PATH="$HOME/.botmux/bin:$PATH"');
     expect(tmuxSrc).not.toContain('botmuxWrapperPathExportSh'); // footgun removed
     const fishAwarePersistentBackendCalls: Record<string, RegExp> = {

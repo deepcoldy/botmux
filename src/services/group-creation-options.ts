@@ -99,9 +99,7 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
 
   let m: RegExpExecArray | null;
   while ((m = scanner.exec(raw)) !== null) {
-    const lead = m[1] ?? '';
     const name = m[2];
-    const flagStart = m.index + lead.length;
     const nameEnd = scanner.lastIndex;
     const next = raw.charAt(nameEnd);
 

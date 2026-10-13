@@ -50,13 +50,12 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { homedir, platform } from 'node:os';
+import { existsSync, statSync, openSync, readSync, closeSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
-const IS_LINUX = platform() === 'linux';
 
 const CHAT_ID_RE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 
@@ -87,34 +86,10 @@ export function cursorChatIdFromStoreDbPath(path: string): string | undefined {
  *  Linux: `/proc/<pid>/fd/*` fast path. macOS / BSD: `lsof -p <pid> -Fn`
  *  fallback (same shape as codex-transcript.findCodexRolloutByPid). */
 export function findCursorChatIdByPid(pid: number): string | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const chatId = cursorChatIdFromStoreDbPath(target);
-        if (chatId) return chatId;
-      }
-      return undefined;
-    }
-    // /proc unreadable — fall through to lsof.
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const chatId = cursorChatIdFromStoreDbPath(line.slice(1));
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  for (const target of targets) {
+    const chatId = cursorChatIdFromStoreDbPath(target);
     if (chatId) return chatId;
   }
   return undefined;

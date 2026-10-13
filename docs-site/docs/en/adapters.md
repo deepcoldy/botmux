@@ -130,7 +130,7 @@ For the **specific wrapper scripts** of each gateway, use the docs published by 
 1. Create a new file under `src/adapters/cli/` implementing the `CliAdapter` interface
 2. Add the new ID to the `CliId` union type in `src/adapters/cli/types.ts`
 3. Add the import / switch case / export in `src/adapters/cli/registry.ts`
-4. Add the display name to `CLI_DISPLAY_NAMES` in `src/worker.ts` and `cliDisplayNames` in `card-builder.ts`
+4. Add the display name to `CLI_DISPLAY_NAMES` in `src/adapters/cli/display-names.ts` (shared by cards, the worker and the setup / dashboard pickers)
 5. Add an option to the setup interactive menu in `src/cli.ts`
 6. Update the README
 

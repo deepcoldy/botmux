@@ -1,4 +1,5 @@
 import type { CliId } from '../adapters/cli/types.js';
+import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import {
   normalizeCliRuntimeConfig,
   type CliRuntimeConfig,
@@ -57,46 +58,6 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
 
-/**
- * CLI 展示名. 与 worker.ts 的 CLI_DISPLAY_NAMES / card-builder.ts 的
- * cliDisplayNames 保持一致——这三处是已知的展示名复制点 (见 CLAUDE.md
- * "添加新 CLI 适配器" 清单), 新增 CLI 时一并更新.
- */
-const CLI_DISPLAY_LABELS: Record<CliId, string> = {
-  'claude-code': 'Claude',
-  'aiden': 'Aiden',
-  'coco': 'CoCo',
-  'codex': 'Codex',
-  'cursor': 'Cursor',
-  'gemini': 'Gemini',
-  'genius': 'Genius',
-  'opencode': 'OpenCode',
-  'opencode2': 'OpenCode 2',
-  'mimocode': 'MiMoCode',
-  'antigravity': 'Antigravity',
-  'mtr': 'MTR',
-  'hermes': 'Hermes',
-  'codex-app': 'Codex App',
-  'mira': 'Mira',
-  'seed': 'Seed',
-  'traex': 'TRAE',
-  'pi': 'Pi',
-  'copilot': 'Copilot',
-  'oh-my-pi': 'Oh My Pi',
-  'ebsd': 'ebsd',
-  'relay': 'Relay',
-  'mir': 'Mir CLI',
-  'kimi': 'Kimi',
-  'grok': 'Grok Build',
-  'kiro-cli': 'Kiro',
-  'riff': 'Riff',
-  'reasonix': 'Reasonix',
-  'dsh': 'DeepSeek Harness',
-  'dsh-tui': 'DeepSeek Harness TUI',
-  'mojo': 'Mojo',
-  'minimax': 'MiniMax Code',
-  'remote-runner': 'Remote Runner',
-};
 
 /**
  * 有序 CLI 选项 (id + 展示名), 顺序与 setup 交互菜单 (CLI_ID_CHOICES 序号)
@@ -104,7 +65,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
  * 列表. 单一事实源: CLI_ID_CHOICES 的值序.
  */
 export const CLI_OPTIONS: ReadonlyArray<{ id: CliId; label: string }> =
-  Object.values(CLI_ID_CHOICES).map(id => ({ id, label: CLI_DISPLAY_LABELS[id] ?? id }));
+  Object.values(CLI_ID_CHOICES).map(id => ({ id, label: CLI_DISPLAY_NAMES[id] ?? id }));
 
 /**
  * 把 setup 里"CLI 适配器"那一格的原始输入解析成合法的 CliId.

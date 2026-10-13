@@ -3540,6 +3540,44 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
+  it('cleans a pre-upgrade persisted Typing target that has no reaction metadata', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.chatId = 'doc:doc-token';
+    ds.session.scope = 'chat';
+    ds.session.chatId = 'doc:doc-token';
+    ds.session.docCommentTargets = {
+      'turn-1': {
+        fileToken: 'doc-token',
+        fileType: 'docx',
+        commentId: 'comment-1',
+        turnId: 'turn-1',
+        replyId: 'reply-1',
+      },
+    };
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(removeCommentReactionMock).toHaveBeenCalledWith(
+      ds.larkAppId,
+      { fileToken: 'doc-token', fileType: 'docx' },
+      'comment-1',
+      'reply-1',
+      'Typing',
+      { identity: undefined },
+    );
+  });
+
   it('consumes doc-comment turn state after posting even when reaction cleanup fails', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -4104,10 +4142,6 @@ describe('Worker turn_terminal routing', () => {
       type: 'screen_update', content: 'silent progress', status: 'working', turnId: 'schedule-turn',
     } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
     (ds.worker as any).emit('message', {
-      type: 'tui_prompt', description: 'silent approval',
-      options: [{ text: 'allow', selected: false }], turnId: 'schedule-turn',
-    } satisfies Extract<WorkerToDaemon, { type: 'tui_prompt' }>);
-    (ds.worker as any).emit('message', {
       type: 'user_notify', message: 'silent warning', turnId: 'schedule-turn',
     } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
     (ds.worker as any).emit('message', {
@@ -4329,7 +4363,7 @@ describe('Worker turn_terminal routing', () => {
     expect(ds.suppressedFinalOutputTurns.get('delivery-stable-key')).toBe(2);
   });
 
-  it('suppresses non-final streaming, TUI, and diagnostic UI for a listener_thread receiver', async () => {
+  it('suppresses non-final streaming and diagnostic UI for a listener_thread receiver', async () => {
     const ds = makeDs();
     ds.scope = 'chat';
     ds.session.scope = 'chat';
@@ -4366,13 +4400,6 @@ describe('Worker turn_terminal routing', () => {
       turnId: 'delivery-stable-key',
       dispatchAttempt: 1,
     } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    (ds.worker as any).emit('message', {
-      type: 'tui_prompt',
-      description: 'permission needed',
-      options: [{ text: 'allow', selected: false }],
-      turnId: 'delivery-stable-key',
-      dispatchAttempt: 1,
-    } satisfies Extract<WorkerToDaemon, { type: 'tui_prompt' }>);
     (ds.worker as any).emit('message', {
       type: 'user_notify', message: 'submit failed', turnId: 'delivery-stable-key', dispatchAttempt: 1,
     } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);

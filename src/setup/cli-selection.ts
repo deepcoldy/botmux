@@ -269,6 +269,25 @@ export function selectionKeyForBot(cliId: string, wrapperCli?: string, cliLaunch
 }
 
 /**
+ * Strictly reverse-map a persisted launch shape to a registered option.
+ * Unlike {@link selectionKeyForBot}, this never falls back to the bare cliId:
+ * an unknown wrapper or launch mode is a distinct, untrusted shape.
+ */
+export function lookupCliSelectionForBotShape(
+  cliId: string,
+  wrapperCli?: string | null,
+  cliLaunchMode?: CliLaunchMode | null,
+): CliSelectOption | undefined {
+  const normalizedWrapper = wrapperCli?.trim() || undefined;
+  const normalizedLaunchMode = cliLaunchMode ?? undefined;
+  return CLI_SELECT_OPTIONS.find(option =>
+    option.cliId === cliId
+    && option.wrapperCli === normalizedWrapper
+    && option.cliLaunchMode === normalizedLaunchMode,
+  );
+}
+
+/**
  * 把选择键解析成可落盘的 bot 配置片段（纯映射，无副作用）。非法 key 抛错。
  */
 export function resolveCliSelection(key: string): ResolvedCliSelection {

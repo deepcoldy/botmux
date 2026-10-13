@@ -144,10 +144,6 @@ const CONSUMERS: Record<string, Rule> = {
       + 'closeSession itself. No user surface at schedule time.',
     count: 2,
   },
-  'core/session-manager.ts::suspendActiveSessionsForBot::closeSession': {
-    category: 'background',
-    why: 'Bot-wide suspend sweep; a refusal keeps the row active and logged.',
-  },
   'core/trigger-session.ts::reconcileIdempotencyLeasesOnBoot::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Boot reconcile: wrapper logs refusal and residual with the remote id.',
@@ -176,6 +172,11 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Document-comment admission rollback has no direct user surface; the '
       + 'background wrapper logs refused cleanup and any remote residual.',
+  },
+  'daemon.ts::cancelSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Authenticated dispatch-launch cancel has no direct UI surface; the '
+      + 'background wrapper logs any refusal or residual remote session.',
   },
   'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::runIdempotencyFailClose': {
     category: 'background',

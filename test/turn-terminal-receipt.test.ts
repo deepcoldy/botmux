@@ -12,9 +12,14 @@ const botConfig: Record<string, unknown> = {
 
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),
+  resolveCardKitId: vi.fn(async () => 'card_answer'),
+  patchCardStreamElement: vi.fn(async () => {}),
   getMessageDetail: vi.fn(async () => ({
     items: [{ chat_id: 'oc_chat', msg_type: 'interactive', body: {
-      content: JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+      content: JSON.stringify({ schema: '2.0', body: { elements: [
+        { tag: 'markdown', content: '- item**Next heading**' },
+        { tag: 'markdown', element_id: 'botmux_reply_footer', content: 'brand' },
+      ] } }),
     } }],
   })),
   addReaction: vi.fn(async () => 'reaction_id'),
@@ -34,9 +39,10 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   buildTurnFailedCard: vi.fn(() => JSON.stringify({ failure: true })),
   buildTurnTerminalReceiptCard: vi.fn((kind: string) => JSON.stringify({ kind })),
-  appendTurnTerminalReceiptToCard: vi.fn((card: string, kind: string) => JSON.stringify({
-    ...JSON.parse(card), terminal: kind,
-  })),
+  buildTurnTerminalFooterPatch: vi.fn((card: string, kind: string) => {
+    const footer = JSON.parse(card).body?.elements?.find((e: any) => e.element_id === 'botmux_reply_footer');
+    return footer ? { content: `${footer.content} terminal:${kind}` } : undefined;
+  }),
   getCliDisplayName: vi.fn(() => 'TraeX'),
 }));
 
@@ -90,7 +96,7 @@ import {
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
-import { getMessageDetail, updateMessage } from '../src/im/lark/client.js';
+import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamElement } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 
@@ -191,8 +197,10 @@ describe('independent turn terminal receipt', () => {
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
   });
 
-  it('patches the last standard reply card instead of appending a strip', async () => {
+  it.each(['traex', 'codex'] as const)('patches only the last standard reply footer (%s)', async cliId => {
     const ds = makeDs();
+    botConfig.cliId = cliId;
+    ds.session.cliId = cliId;
     bindLarkTurn(ds, 'om_turn_card');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
@@ -205,11 +213,13 @@ describe('independent turn terminal receipt', () => {
     } satisfies WorkerToDaemon);
     (ds.worker as any).emit('message', terminalMsg('om_turn_card'));
 
-    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith(
-      'app_test',
-      'om_answer_card',
-      expect.stringContaining('"terminal":"completed"'),
+    await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalledWith(
+      'app_test', 'card_answer', 'botmux_reply_footer',
+      { content: 'brand terminal:completed' }, 1,
+      expect.stringMatching(/^trf_[0-9a-f]{47}$/), 'om_answer_card',
     ));
+    // A message read is a normalized representation, not a lossless update payload.
+    expect(updateMessage).not.toHaveBeenCalled();
     expect(getMessageDetail).toHaveBeenCalledWith(
       'app_test',
       'om_answer_card',
@@ -234,11 +244,13 @@ describe('independent turn terminal receipt', () => {
       outputDisposition: 'nothing_to_send',
     }));
 
-    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith(
-      'app_test',
-      'om_answer_card',
-      expect.stringContaining('"terminal":"completed"'),
+    await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalledWith(
+      'app_test', 'card_answer', 'botmux_reply_footer',
+      { content: 'brand terminal:completed' }, 1,
+      expect.stringMatching(/^trf_[0-9a-f]{47}$/), 'om_answer_card',
     ));
+    // A message read is a normalized representation, not a lossless update payload.
+    expect(updateMessage).not.toHaveBeenCalled();
     expect(ds.silentIdleTurnId).toBeUndefined();
     expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
     expect(sessionReplyMock).not.toHaveBeenCalled();
@@ -282,6 +294,56 @@ describe('independent turn terminal receipt', () => {
 
     await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
     expect(updateMessage).not.toHaveBeenCalledWith('app_test', 'om_other_chat_card', expect.anything());
+  });
+
+  it('falls back without rewriting the answer when the footer is missing', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_no_footer');
+    vi.mocked(getMessageDetail).mockResolvedValueOnce({
+      items: [{ chat_id: 'oc_chat', msg_type: 'interactive', body: {
+        content: JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+      } }],
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_no_footer',
+      messageId: 'om_answer', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_no_footer'));
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(resolveCardKitId).not.toHaveBeenCalled();
+    expect(patchCardStreamElement).not.toHaveBeenCalled();
+    expect(updateMessage).not.toHaveBeenCalled();
+  });
+
+  it('retries one stable footer operation then falls back without replacing the body', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_patch_failure');
+    vi.mocked(patchCardStreamElement)
+      .mockRejectedValueOnce(new Error('CardKit unavailable'))
+      .mockRejectedValueOnce(new Error('CardKit unavailable'))
+      .mockRejectedValueOnce(new Error('CardKit unavailable'));
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_patch_failure',
+      messageId: 'om_answer', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_patch_failure'));
+    // Use the production backoff (0/1/5s) with real timers, like the transport
+    // retry case below: fake timers do not drive Bun's async continuations the
+    // same way as vitest's, so advancing them never fires the retries.
+    await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalledTimes(3), {
+      timeout: 8_000,
+      interval: 50,
+    });
+    const calls = vi.mocked(patchCardStreamElement).mock.calls;
+    expect(calls[1]).toEqual(calls[0]);
+    expect(calls[2]).toEqual(calls[0]);
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1), {
+      timeout: 2_000,
+      interval: 20,
+    });
+    expect(updateMessage).not.toHaveBeenCalled();
   });
 
   it('uses only the streaming card when the turn produced no visible body', async () => {

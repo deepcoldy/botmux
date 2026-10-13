@@ -21,7 +21,6 @@ import {
   testMessage,
   expectedReplyMarker,
   sendMessage,
-  sendThreadReply,
   navigateToMessenger,
   openChat,
   waitForStreamingCard,

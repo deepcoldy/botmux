@@ -137,18 +137,6 @@ describe('global dashboard config', () => {
     });
   });
 
-  it('reads the review-only legacy spec as source/ref for compatibility', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({
-      dashboard: { herdrTraexPlugin: { enabled: true, spec: ' owner/repo#tag ' } },
-    }));
-
-    expect(readGlobalConfig().dashboard?.herdrTraexPlugin).toEqual({
-      enabled: true,
-      source: 'owner/repo',
-      ref: 'tag',
-    });
-  });
-
   it('reads repoPickerMode as a top-level global enum', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       repoPickerMode: 'repos',

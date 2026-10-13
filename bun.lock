@@ -7,7 +7,6 @@
       "dependencies": {
         "@larksuiteoapi/node-sdk": "^1.64.0",
         "@modelcontextprotocol/sdk": "^1.29.0",
-        "@xterm/addon-unicode11": "^0.9.0",
         "@xterm/headless": "^6.0.0",
         "croner": "^10.0.1",
         "dotenv": "^17.3.1",
@@ -18,7 +17,6 @@
         "qrcode-terminal": "^0.12.0",
         "react": "^19.2.7",
         "react-dom": "^19.2.7",
-        "smol-toml": "^1.9.0",
         "ws": "^8.19.0",
         "yaml": "^2.9.0",
         "zod": "^3.23.0",
@@ -35,6 +33,7 @@
         "@types/react-dom": "^19.2.3",
         "@types/react-test-renderer": "19.1.0",
         "@types/ws": "^8.18.1",
+        "@xterm/addon-unicode11": "^0.9.0",
         "electron": "^37.0.0",
         "electron-builder": "^26.0.0",
         "esbuild": "^0.28.0",
@@ -1159,8 +1158,6 @@
     "read-binary-file-arch": ["read-binary-file-arch@1.0.6", "https://registry.npmjs.org/read-binary-file-arch/-/read-binary-file-arch-1.0.6.tgz", { "dependencies": { "debug": "^4.3.4" }, "bin": { "read-binary-file-arch": "cli.js" } }, "sha512-BNg9EN3DD3GsDXX7Aa8O4p92sryjkmzYYgmgTAc6CA4uGLEDzFfxOxugu21akOxpcXHiEgsYkC6nPsQvLLLmEg=="],
 
     "readable-stream": ["readable-stream@2.3.8", "https://registry.npmjs.org/readable-stream/-/readable-stream-2.3.8.tgz", { "dependencies": { "core-util-is": "~1.0.0", "inherits": "~2.0.3", "isarray": "~1.0.0", "process-nextick-args": "~2.0.0", "safe-buffer": "~5.1.1", "string_decoder": "~1.1.1", "util-deprecate": "~1.0.1" } }, "sha512-8p0AUk4XODgIewSi0l8Epjs+EVnWiK7NoDIEGU0HhE7+ZyY8D1IMY7odu5lRrFXGg71L15KG8QrPmum45RTtdA=="],
-
-    "smol-toml": ["smol-toml@1.9.0", "", {}, "sha512-hpd+HLON7HdZXqYchMM/+LaTTbdK0AU3NngIJ4KVyWbY9bfQqdL9cD+4yf6dUoU2Ap4VsU0JkQi6FxAI1B2mXQ=="],
 
     "require-directory": ["require-directory@2.1.1", "https://registry.npmjs.org/require-directory/-/require-directory-2.1.1.tgz", {}, "sha512-fGxEI7+wsG9xrvdjsrlmL22OMTTiHRwAMroiEeMgq8gzoLC/PQr7RsRDSTLUg/bZAZtF+TVIkHc6/4RIKrui+Q=="],
 

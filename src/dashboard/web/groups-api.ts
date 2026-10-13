@@ -235,13 +235,6 @@ export async function setGroupPinStreamingCard(
   return { ok: r.ok && body?.ok !== false, status: r.status, body };
 }
 
-export async function fetchGroupCollaborationMode(chatId: string): Promise<GroupCollaborationModeResponse> {
-  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`);
-  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
-  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
-  return body;
-}
-
 export async function saveGroupCollaborationMode(
   chatId: string,
   input:

@@ -66,12 +66,12 @@
  * matching turn — identical to Codex/Grok. Non-steered turns stay strictly
  * interleaved (user → assistant_final → user → assistant_final).
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
-import { execSync } from 'node:child_process';
-import { homedir, platform } from 'node:os';
+import { existsSync, statSync, openSync, readSync, closeSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { codexTaskFailureCode, safeFailureSummary, type CodexCotEntry } from './codex-transcript.js';
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import {
   PI_TURN_BOUNDARY_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_STOP_REASON_ERROR,
@@ -79,7 +79,6 @@ import {
 
 const PI_SESSIONS_ROOT = join(homedir(), '.pi', 'agent', 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const IS_LINUX = platform() === 'linux';
 
 export interface PiBridgeEvent {
   uuid: string;
@@ -262,33 +261,9 @@ export function findPiTranscriptBySessionId(cliSessionId: string, cwd?: string):
 }
 
 export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId: string } | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const hit = matchPiTranscriptPath(target);
-        if (hit) return hit;
-      }
-      return undefined;
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const target = line.slice(1);
+  const targets = listProcessOpenFiles(pid);
+  if (!targets) return undefined;
+  for (const target of targets) {
     const hit = matchPiTranscriptPath(target);
     if (hit) return hit;
   }

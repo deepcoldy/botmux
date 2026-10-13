@@ -48,6 +48,9 @@ const mockQueuedTailAdmission = vi.fn();
 const activeKeyLocks = vi.hoisted(() => ({
   byMap: new WeakMap<Map<string, any>, Map<string, Promise<void>>>(),
 }));
+/** Routing keys the registration gate treats as reserved by a quarantined
+ *  session (the real gate consults findQuarantinedRoutingConflict). */
+const routeQuarantine = vi.hoisted(() => ({ keys: new Set<string>() }));
 vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
@@ -90,6 +93,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
     }
   }),
   setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => {
+    if (routeQuarantine.keys.has(key)) return false;
     if (map.has(key) && map.get(key) !== ds) return false;
     map.set(key, ds);
     return true;
@@ -172,6 +176,7 @@ function existingDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
 describe('triggerSessionTurn rootMessageId target', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    routeQuarantine.keys.clear();
     mockGetChatMode.mockReset().mockResolvedValue('topic');
     mockBotAutoWorktreeEnabled.mockReturnValue(false);
     mockGetBot.mockReturnValue({
@@ -572,6 +577,20 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(res).toMatchObject({ ok: false, errorCode: 'target_required' });
     expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
+  it('refuses to start a second runtime on a route reserved by a quarantined session', async () => {
+    // Regression: #597 replaced the setActiveSessionIfActive registration with a
+    // bare Map.set, silently dropping the quarantine routing check every other
+    // creation path still applies.
+    routeQuarantine.keys.add(sessionKey(ROOT, APP));
+    const activeSessions = new Map<string, DaemonSession>();
+    const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: false, errorCode: 'trigger_failed' });
+    expect(activeSessions.has(sessionKey(ROOT, APP))).toBe(false);
+    expect(mockCloseSession).toHaveBeenCalledWith('sess_new');
     expect(mockForkWorker).not.toHaveBeenCalled();
   });
 

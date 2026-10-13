@@ -1,5 +1,5 @@
 import { spawn, fork, type ChildProcess, type StdioOptions } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 
 /**
  * Spawn one of botmux's own entry modules (daemon / core-only / worker /

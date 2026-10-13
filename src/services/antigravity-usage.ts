@@ -173,7 +173,6 @@ export function readAntigravityTokenUsage(
     let turns = 0;
     let latestModel = '';
     let lastStepInput = 0;
-    let lastStepOutput = 0;
     let lastStepCache = 0;
 
     for (const row of rows) {
@@ -191,7 +190,6 @@ export function readAntigravityTokenUsage(
       if (parsed.outputTokens > 0) turns++;
 
       lastStepInput = parsed.inputTokens;
-      lastStepOutput = parsed.outputTokens;
       lastStepCache = parsed.cacheReadTokens;
     }
 

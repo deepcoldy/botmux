@@ -5,11 +5,13 @@ import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
  * https://open.feishu.cn/document/server-docs/im-v1/message-card/patch.md */
 export const TURN_REPLY_CARD_MAX_BYTES = 30_000;
 
-export function turnReplyCardRequestBytes(cardJson: string, chatId: string): number {
+export function turnReplyCardRequestBytes(cardJson: string, chatId: string, uuid?: string): number {
   const common = {
     msg_type: 'interactive', content: stampBotmuxCallbackMarkers(cardJson),
-    // TurnReplyCardStore uses brc_ followed by a 32-character digest.
-    uuid: 'brc_'.padEnd(36, '0'),
+    // Default: TurnReplyCardStore uses brc_ followed by a 32-character digest.
+    // Callers with a different uuid length (e.g. ask cards: ask- + 40 hex = 44)
+    // must pass the real value so the budget reflects the wire payload.
+    uuid: uuid ?? 'brc_'.padEnd(36, '0'),
   };
   // Either initial delivery envelope is larger than a subsequent PATCH.
   return Math.max(

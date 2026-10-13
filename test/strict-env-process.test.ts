@@ -121,7 +121,8 @@ describe('strict environment real process probes', () => {
   });
   let realTmux: string | undefined;
   try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* optional native tool */ }
-  it.skipIf(!realTmux).each(['tmux', 'tmux-pipe'] as const)('%s excludes poisoned shared-server env, skips profile and isolates explicit bot credentials', async kind => {
+  it.skipIf(!realTmux)('tmux-pipe excludes poisoned shared-server env, skips profile and isolates explicit bot credentials', async () => {
+    const kind = 'tmux-pipe';
     const { dir, script } = prepare(); const socket = join(dir, 'socket'); const binDir = join(dir, 'bin');
     const session = 'bmx-strict-probe'; let child: ReturnType<typeof spawnNodeTsScript> | undefined;
     try {

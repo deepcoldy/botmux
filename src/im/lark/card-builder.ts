@@ -2,6 +2,7 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
+import { CLI_DISPLAY_NAMES } from '../../adapters/cli/display-names.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
@@ -58,8 +59,6 @@ export function buildTurnTerminalReceiptCard(
   });
 }
 
-const TURN_TERMINAL_RECEIPT_ELEMENT_ID = 'botmux_turn_terminal_receipt';
-
 function findCardElementById(value: unknown, elementId: string): any | undefined {
   if (Array.isArray(value)) {
     for (const child of value) {
@@ -103,55 +102,23 @@ function appendTurnTerminalReceiptToFooter(content: string, label: string): stri
   return `${base} · <font color='grey'>${label}</font>`;
 }
 
-/** Merge the daemon-owned terminal state into an existing standard BotMux
- * reply card. Prefer the canonical footer so the card keeps one bottom divider
- * and one compact metadata/status line. Cards without a footer receive only a
- * small trailing line, without another divider. The source card is read back
- * from Lark immediately before this patch, so late feedback/control mutations
- * are preserved. Undefined means the message is no longer a patchable Card 2.0
- * payload and the caller must use the independent-strip fallback instead. */
-export function appendTurnTerminalReceiptToCard(
+/** Build a footer-only CardKit update. Message reads may normalize Markdown;
+ * never submit their body as the source of a full-card update. */
+export function buildTurnTerminalFooterPatch(
   cardJson: string,
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
-): string | undefined {
+): { content: string } | undefined {
   let card: any;
-  try {
-    card = JSON.parse(cardJson);
-  } catch {
-    return undefined;
-  }
-  if (!card || card.schema !== '2.0' || !card.body || !Array.isArray(card.body.elements)) {
-    return undefined;
-  }
-  const label = t(`worker.turn_terminal_receipt.${kind}`, undefined, locale);
-  const terminalElement = {
-    tag: 'markdown',
-    element_id: TURN_TERMINAL_RECEIPT_ELEMENT_ID,
-    text_size: 'notation_small_v2',
-    content: `<font color='grey'>${label}</font>`,
-  };
-
-  // Migrate cards patched by the first implementation: remove its standalone
-  // terminal line and the immediately preceding divider before folding the
-  // same state into the canonical footer.
-  const existing = card.body.elements.findIndex(
-    (element: any) => element?.element_id === TURN_TERMINAL_RECEIPT_ELEMENT_ID,
-  );
-  if (existing >= 0) {
-    card.body.elements.splice(existing, 1);
-    if (existing > 0 && card.body.elements[existing - 1]?.tag === 'hr') {
-      card.body.elements.splice(existing - 1, 1);
-    }
-  }
-
+  try { card = JSON.parse(cardJson); } catch { return undefined; }
+  if (card?.schema !== '2.0' || !Array.isArray(card.body?.elements)) return undefined;
   const footer = findCardElementById(card.body.elements, REPLY_CARD_FOOTER_ELEMENT_ID);
-  if (footer && typeof footer.content === 'string' && footer.content.trim()) {
-    footer.content = appendTurnTerminalReceiptToFooter(footer.content, label);
-  } else {
-    card.body.elements.push(terminalElement);
+  if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
+    return undefined;
   }
-  return JSON.stringify(card);
+  return { content: appendTurnTerminalReceiptToFooter(
+    footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
+  ) };
 }
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
@@ -403,44 +370,9 @@ export function buildConfigTextCard(data: ConfigCardData, locale?: Locale): stri
   });
 }
 
-const cliDisplayNames: Record<CliId, string> = {
-  'claude-code': 'Claude',
-  'seed': 'Seed',
-  'relay': 'Relay',
-  'aiden': 'Aiden',
-  'coco': 'CoCo',
-  'codex': 'Codex',
-  'codex-app': 'Codex App',
-  'cursor': 'Cursor',
-  'gemini': 'Gemini',
-  'genius': 'Genius',
-  'opencode': 'OpenCode',
-  'opencode2': 'OpenCode 2',
-  'mimocode': 'MiMoCode',
-  'antigravity': 'Antigravity',
-  'mtr': 'MTR',
-  'hermes': 'Hermes',
-  'mira': 'Mira',
-  'mir': 'Mir CLI',
-  'traex': 'TRAE',
-  'pi': 'Pi',
-  'copilot': 'Copilot',
-  'oh-my-pi': 'Oh My Pi',
-  'ebsd': 'ebsd',
-  'kimi': 'Kimi',
-  'grok': 'Grok Build',
-  'kiro-cli': 'Kiro',
-  'riff': 'Riff',
-  'reasonix': 'Reasonix',
-  'dsh': 'DeepSeek Harness',
-  'dsh-tui': 'DeepSeek Harness TUI',
-  'mojo': 'Mojo',
-  'minimax': 'MiniMax Code',
-  'remote-runner': 'Remote Runner',
-};
 
 export function getCliDisplayName(cliId: CliId): string {
-  return cliDisplayNames[cliId] ?? cliId;
+  return CLI_DISPLAY_NAMES[cliId] ?? cliId;
 }
 
 /** Escape Lark markdown special characters in user-controlled strings.
@@ -848,24 +780,6 @@ export function buildSlashListCard(
       title: { tag: 'plain_text', content: t('slashlist.heading', { cliName }, locale) },
     },
     body: { direction: 'vertical', elements },
-  });
-}
-
-
-export function buildDetouredPendingResponseCard(locale?: Locale): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      template: 'grey',
-      title: { tag: 'plain_text', content: t('card.pending.detoured_title', undefined, locale) },
-    },
-    body: {
-      direction: 'vertical',
-      elements: [
-        { tag: 'markdown', content: t('card.pending.detoured_body', undefined, locale) },
-      ],
-    },
   });
 }
 
@@ -1973,37 +1887,6 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
         },
       ],
     },
-  };
-  return JSON.stringify(card);
-}
-
-/** 授权成功后给被授权人的通知卡（独立消息）。支持一次通知多个被授权人；带额度时追加"（额度 N 条）"。
- *
- *  **bot grantee 有名字就用纯文本名字、拿不到名字才 `<at>` 兜底；真人 grantee 一律 `<at>` 点名**：
- *  卡片里的 `<at id=botOpenId>` 会被对方 bot 的 daemon 当成一次「被 @」消息，凭新授权/同伴 peer
- *  关系在本群拉起一个空会话（实测：手动 /grant 后没有 prompt → 空会话「等待输入」）。所以能拿到
- *  bot 名字时优先用纯文本（不产生 mention、不唤醒对方）；只有名字缺失时才退回 `<at>`——此时飞书
- *  能据 open_id 展示对方身份（远比裸 open_id 可读），代价是可能偶尔触发一次空会话（产品上可接受，
- *  且名字缺失是少数边角情况）。真人被 `<at>` 不会自动开会话。传 string/string[]（无 isBot 信息）
- *  时按真人处理（@ 全部），保持旧调用方/单测兼容。 */
-export function buildGrantNotifyCard(
-  kind: 'chat' | 'global',
-  target: string | string[] | Array<{ openId: string; name?: string; isBot?: boolean }>,
-  locale?: Locale,
-  quota?: number,
-  expiresAt?: number,
-): string {
-  const entries = (Array.isArray(target) ? target : [target]).map(tt =>
-    typeof tt === 'string' ? { openId: tt, name: undefined as string | undefined, isBot: false } : tt);
-  const at = renderGrantAtMentions(entries);
-  let content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
-  if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
-  if (expiresAt !== undefined) {
-    content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
-  }
-  const card = {
-    config: { wide_screen_mode: true },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
   };
   return JSON.stringify(card);
 }
@@ -3244,7 +3127,6 @@ export function buildAdoptSelectCard(
   const elements: any[] = [];
 
   const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
-  const sessionUnknown = t('card.adopt.session_unknown', undefined, locale);
 
   // Truncation hint: resume discovery caps at resumeLimit; if it came back
   // full, the user is probably not seeing everything → tell them to search.

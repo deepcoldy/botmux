@@ -975,7 +975,6 @@ function readCodexTokenAggregateCached(
     };
   };
 
-  let scanned: JsonlCursor;
   let completeBytes: number;
   let previewAgg: TokenUsageAggregate;
   let pendingTailIsInitialResidualLine: boolean;
@@ -988,7 +987,7 @@ function readCodexTokenAggregateCached(
       usageFileCache.delete(key);
       return null;
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else if (!oversized) {
     baseOffset = 0;
     const win = scanFromWindow(baseOffset, true);
@@ -997,7 +996,7 @@ function readCodexTokenAggregateCached(
       usageFileCache.delete(key);
       return null;
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else {
     // Oversized cold/bounded read. Fast path: scan the last tail window. Widen
     // ONCE to the back-scan budget and re-scan that whole window when the fast
@@ -1036,7 +1035,7 @@ function readCodexTokenAggregateCached(
         win = widened;
       }
     }
-    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+    ({ state, seenMessageIds, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   }
 
   const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;
