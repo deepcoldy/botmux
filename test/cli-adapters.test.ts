@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -56,6 +56,7 @@ import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
+import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
@@ -3438,6 +3439,38 @@ describe('idleToBusyPattern', () => {
     }
     // Preserve the legacy viewport guard without using it as a new-turn edge.
     expect(adapter.busyPattern!.test('Working…')).toBe(true);
+  });
+
+  it('oh-my-pi recognizes the real omp 18.10.1 default band footer, not its idle footer', () => {
+    const adapter = createOhMyPiAdapter('/bin/omp');
+    const fx = JSON.parse(readFileSync(new URL('./fixtures/omp-band-footer-v18.10.1.json', import.meta.url), 'utf8'));
+    for (const frame of [fx.workingFrame, fx.workingFrameWithStatusRow]) {
+      const stripped = stripAnsiScreenText(frame);
+      expect(adapter.idleToBusyPattern!.test(stripped)).toBe(true);
+      expect(adapter.busyPattern!.test(stripped)).toBe(true);
+    }
+    // Interrupted/finished turn: status glyph instead of a braille spinner.
+    expect(adapter.idleToBusyPattern!.test(stripAnsiScreenText(fx.idleFrame))).toBe(false);
+    // Plain-text equivalents of what the band footer renders.
+    expect(adapter.idleToBusyPattern!.test(' \ue0b6 ⠦ 1s \ue0b1 4o 1M \ue0b1 repo \ue0b0─0.9%────1M─')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test(' ⠦ 1m30s  model   repo ─12%────')).toBe(true);
+    for (const text of [
+      // A spinner + elapsed line quoted in a reply, with no footer gauge.
+      '⠦ 1s waiting for the build',
+      'Quoted footer: ⠦ 1s  model   repo ─0.9%───',
+      // Footer split across lines must not combine.
+      '\ue0b6 ⠦ 1s \ue0b1 model\n─0.9%───',
+      // Idle band footer redrawn right after the previous row (no newline).
+      '  Working…\ue0b6 \u{f0d57} \ue0b1 4o 1M \ue0b0─0.9%───',
+      // Percentages not followed by the footer rule.
+      '⠦ 1s finished 100% of the tests.',
+    ]) {
+      expect(adapter.idleToBusyPattern!.test(text)).toBe(false);
+    }
+  });
+
+  it('oh-my-pi opts into OSC 7501 program status', () => {
+    expect(createOhMyPiAdapter('/bin/omp').supportsProgramStatus).toBe(true);
   });
 
   it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {

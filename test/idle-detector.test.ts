@@ -7,6 +7,7 @@
  * Run:  pnpm vitest run test/idle-detector.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -127,6 +128,39 @@ describe('IdleDetector: onBusy()', () => {
       expect(cb).toHaveBeenCalledTimes(2);
     } finally {
       detector.dispose();
+    }
+  });
+
+  it('recovers OMP local input from the real omp 18.10.1 band footer', () => {
+    const fx = JSON.parse(readFileSync(new URL('./fixtures/omp-band-footer-v18.10.1.json', import.meta.url), 'utf8'));
+    // Whole synchronized frames, and the same frames split at every escape
+    // sequence (omp moves the cursor with CSI H, so no newline precedes the
+    // footer once ANSI is stripped).
+    const splits: Array<(s: string) => string[]> = [(s) => [s], (s) => s.split(/(?=\x1b)/)];
+    for (const split of splits) {
+      for (const working of [fx.workingFrame, fx.workingFrameWithStatusRow]) {
+        const detector = new IdleDetector(createOhMyPiAdapter('/bin/omp'));
+        const cb = vi.fn();
+        detector.onBusy(cb);
+        try {
+          detector.fireIdle();
+          for (const chunk of split(fx.idleFrame)) detector.feed(chunk);
+          expect(cb).not.toHaveBeenCalled();
+          for (const chunk of split(working)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(1);
+          // Further spinner ticks in the same cycle do not re-fire.
+          for (const chunk of split(fx.workingFrame)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(1);
+          // After the turn ends, the next active footer revives busy again.
+          detector.fireIdle();
+          for (const chunk of split(fx.idleFrame)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(1);
+          for (const chunk of split(working)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(2);
+        } finally {
+          detector.dispose();
+        }
+      }
     }
   });
 
