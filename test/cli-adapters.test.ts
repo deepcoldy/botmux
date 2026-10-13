@@ -3342,6 +3342,31 @@ describe('busyPattern', () => {
     // Accepted recall-first residual: tightening this would reject observed PTY
     // footer redraws that append separators/content in the same logical line.
     expect(busy!.test('◈ note: the footer reads (36m 20s • esc to interrupt) now')).toBe(true);
+
+    // TraeX 0.209.1 live tmux captures: the working row carries trailing
+    // shell-status segments after the footer, and the capacity queue renders
+    // as a glyph row (the line-start queue arms miss both).
+    expect(busy!.test('✦ Working… (3s • esc to interrupt) · 1 shell running… · /ps to manage')).toBe(true);
+    expect(busy!.test('❖ Running command… (12s • esc to interrupt) · 1 shell running… · /ps to manage')).toBe(true);
+    expect(busy!.test('◆ Queued for capacity (1s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('◇ Queued for capacity (3m 27s • esc to interrupt)')).toBe(true);
+    // ...and the completed 0.209.1 screen must stay idle: the assistant reply
+    // and tool-history rows reuse the ◆ glyph, plus the "Worked for" summary.
+    const idleScreen0209 = [
+      '▍ Run the shell command `sleep 12` and then reply with just OK.',
+      '◆ Ran sleep 12',
+      '  └ (no output)',
+      '◆ OK',
+      '  Worked for 17s • 12:03 PM',
+      '──────────────────────────────────────────────────────── Run sleep 12 command ─',
+      '❯ Improve documentation in @filename',
+      '────────────────────────────────────────────────────────────────────────────────',
+      '  GPT-5.5 (MAX) xhigh · Context 99% left · /tmp/x · master      ☢ Full Access (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(busy!.test(idleScreen0209)).toBe(false);
+    expect(busy!.test('◆ OK')).toBe(false);
+    expect(busy!.test('◆ The job finished (took 12s) — press esc to interrupt next time')).toBe(false);
+    expect(busy!.test('  Worked for 17s • 12:03 PM')).toBe(false);
   });
 
   it('traex staticBusyPattern latches only on line-anchored queue evidence', () => {

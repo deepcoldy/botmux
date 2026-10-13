@@ -115,8 +115,12 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  * footer while retaining the visible composer and context bar. Raw PTY and
  * 100ms screen captures verified seven rotating glyphs and ordinary activity
  * labels as well as PreToolUse/PostToolUse/UserPromptSubmit hook-runner rows.
+ * TraeX 0.209.1 (tmux capture) renders the capacity queue in the same shape:
+ * "◆ Queued for capacity (1s • esc to interrupt)" followed by an indented
+ * "└ Too many requests right now. …" child row — neither is caught by the
+ * line-start-anchored queue arms, so the activity-row arm must cover it.
  *
- * Three branches:
+ * Four branches:
  *  1. Spinner-anchored labels: "<braille frame><space><label>". The frame
  *     never appears in transcript prose, so assistant output like
  *     "Working… on the fix" cannot revive a completed card. Covers the
@@ -184,9 +188,12 @@ const TRAEX_QUEUE_STATIC_ARMS = [
   "Too many requests right now\\. You're in the queue",
 ];
 
-/** TraeX activity footer captured from a live 0.201.6 TUI. Keep it line- and
- *  glyph-anchored: no-alt-screen history can contain the same words. */
-const TRAEX_ACTIVITY_PATTERN = String.raw`(?:^|[\n\r])[ \t]*[⋄✧◇✦❖◈◆][ \t]*[^()\r\n]{0,240}\([^()\r\n]*\d+(?:h|m|s)(?:[ \t]+\d+(?:m|s))?[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b[^()\r\n]*\)(?![ \t]*["'\x60])`;
+/** Rotating activity glyphs observed on live TraeX activity rows. */
+const TRAEX_ACTIVITY_GLYPHS = '⋄✧◇✦❖◈◆';
+
+/** TraeX activity footer captured from live 0.201.6 / 0.209.1 TUIs. Keep it
+ *  line- and glyph-anchored: no-alt-screen history can contain the same words. */
+const TRAEX_ACTIVITY_PATTERN = String.raw`(?:^|[\n\r])[ \t]*[${TRAEX_ACTIVITY_GLYPHS}][ \t]*[^()\r\n]{0,240}\([^()\r\n]*\d+(?:h|m|s)(?:[ \t]+\d+(?:m|s))?[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b[^()\r\n]*\)(?![ \t]*["'\x60])`;
 
 const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
   [

@@ -299,6 +299,34 @@ describe('IdleDetector: TraeX capacity-queue busy pattern', () => {
     detector.dispose();
   });
 
+  it('flips busy on TraeX 0.209.1 working and glyph-queue rows after a false idle', () => {
+    // Live 0.209.1 tmux captures: trailing shell-status segments follow the
+    // footer, and the capacity queue renders as a glyph activity row.
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K✦ Working… (3s • esc to interrupt) · 1 shell running… · /ps to manage');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    detector.fireIdle();
+    detector.feed("\x1b[2K◆ Queued for capacity (1s • esc to interrupt)\n  └ Too many requests right now. You're in the queue at position 432.");
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('does not promote a completed TraeX 0.209.1 reply or turn summary', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('◆ Ran sleep 12\n  └ (no output)\n◆ OK\n  Worked for 17s • 12:03 PM\n❯ Improve documentation in @filename');
+    expect(cb).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
   it('does not promote transcript prose, commands, or diff history quoting activity text', () => {
     const detector = new IdleDetector(traexAdapter);
     const cb = vi.fn();
