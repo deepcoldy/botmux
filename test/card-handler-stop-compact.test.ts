@@ -146,8 +146,7 @@ import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -402,16 +401,15 @@ describe('compact_session card action', () => {
   });
 });
 
-// ─── isSensitive source lock ──────────────────────────────────────────────
+// ─── sensitive-action table lock ───────────────────────────────────────────
 
-describe('stop_turn / compact_session permission gate (source lock)', () => {
-  it('both actions are registered in the isSensitive canOperate gate', () => {
+describe('stop_turn / compact_session permission gate (table lock)', () => {
+  it('both actions are registered in the canOperate gate table', () => {
     // 防止后续重构把两个新 action 误移出权限闸（与 term_action/close 同档）。
-    const source = readFileSync(resolve('src/im/lark/card-handler.ts'), 'utf8');
-    const line = source.split('\n').find(l => l.includes('const isSensitive ='));
-    expect(line).toBeTruthy();
-    expect(line!).toContain('stop_turn');
-    expect(line!).toContain('compact_session');
+    // 清单原先是 card-handler.ts 里 `const isSensitive = …` 的手写数组、靠 grep 源码行锁住；
+    // 现在登记在 SENSITIVE_CARD_ACTIONS，直接断言表本身（行为侧的拒绝用例在上面各 describe 里）。
+    expect(sensitiveCardActionMeta('stop_turn')).toBeDefined();
+    expect(sensitiveCardActionMeta('compact_session')).toBeDefined();
   });
 });
 

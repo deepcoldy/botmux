@@ -158,8 +158,7 @@ import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session, FailedTurnRecord } from '../src/types.js';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -437,14 +436,13 @@ describe('retry_turn — refusal branches', () => {
 });
 
 describe('retry_turn — permission gate', () => {
-  it('is registered as a sensitive action in the source gate', () => {
-    // Source-lock: the isSensitive allowlist is a plain string array with no
-    // type-level enforcement, so an action dropped from it silently becomes
-    // clickable by anyone in the chat. Pin membership here.
-    const src = readFileSync(resolve(__dirname, '../src/im/lark/card-handler.ts'), 'utf8');
-    const line = src.split('\n').find(l => l.includes('const isSensitive'));
-    expect(line).toBeTruthy();
-    expect(line).toContain("'retry_turn'");
+  it('is registered as a sensitive action in the permission gate table', () => {
+    // The sensitive-action allowlist has no type-level enforcement, so an action
+    // dropped from it silently becomes clickable by anyone in the chat. Pin
+    // membership here. (This used to grep the `const isSensitive` source line; the
+    // list now lives in SENSITIVE_CARD_ACTIONS, so assert on the table itself —
+    // the behavioural deny test right below covers the gate wiring.)
+    expect(sensitiveCardActionMeta('retry_turn')).toBeDefined();
   });
 
   it('does not resubmit when canOperate denies the operator', async () => {
