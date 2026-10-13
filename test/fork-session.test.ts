@@ -781,6 +781,24 @@ describe('forkClosedSession（/resume <别处的 id>：从已关闭记录复制�
     expect(row).toEqual(before);
   });
 
+  it('两个复制请求并发打到同一个空锚点：先注册者胜出，后到者不会把它替换/关掉', async () => {
+    const row = closedRow();
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(row);
+    const registry = new Map<string, DaemonSession>();
+    setActiveSessionsRegistry(registry);
+    const go = () => forkClosedSession(row.sessionId, 'oc_here', 'om_here_root', 'group', 'thread', {
+      forkWorkerImpl: forkWorkerSpy as any,
+    });
+    const [a, b] = await Promise.all([go(), go()]);
+    const oks = [a, b].filter(r => r.ok);
+    expect(oks).toHaveLength(1);
+    expect([a, b].find(r => !r.ok)).toEqual({ ok: false, error: 'target_chat_has_session' });
+    const winner = registry.get(sessionKey('om_here_root', 'cli_app_test'));
+    expect(winner?.session.sessionId).toBe((oks[0] as { childSessionId: string }).childSessionId);
+    expect(winner?.session.status).toBe('active');
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('只接受已关闭、未回收、可 fork 的记录', async () => {
     expect(await callClosedFork(closedRow({ status: 'active' }))).toEqual({ ok: false, error: 'not_closed' });
     expect(await callClosedFork(closedRow({ workspaceRetirement: { operationId: 'op', workspacePath: '/tmp/p' } as any })))

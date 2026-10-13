@@ -68,10 +68,16 @@ const CONSUMERS: Record<string, Rule> = {
   },
   'core/worker-pool.ts::forkFromSource::closeSession': {
     category: 'impossible_by_invariant',
+    why: 'Evicts disposable command scratches (worker:null, never ran a CLI) at the '
+      + 'fork target anchor. No turn ever ran in them, so no remote session exists.',
+    count: 1,
+  },
+  'core/worker-pool.ts::mintAndSpawnChild::closeSession': {
+    category: 'impossible_by_invariant',
     why: 'Rolls back a just-created fork CHILD whose worker never started (slot lost '
       + 'before registration, or spawn threw). No turn ran, so no remote session '
       + 'was ever created for it.',
-    count: 3,
+    count: 2,
   },
   // ── user surfaces: must render refusal AND residual ──────────────────────
   'core/dismiss-command.ts::dismissSessionGroup::closeSession': {

@@ -4326,7 +4326,7 @@ export async function handleCommand(
             },
           );
           if (forked.ok) {
-            touchSessionGroup(resumeChatId, forked.childSessionId);
+            if (rootId === resumeChatId) touchSessionGroup(resumeChatId, forked.childSessionId);
             await sessionReply(rootId, t('cmd.resume.forked', { title: session.title || session.sessionId.substring(0, 8) }, loc));
           } else if (forked.error === 'fork_unsupported_backend') {
             const cliName = getCliDisplayName((session.cliId ?? getBot(session.larkAppId ?? larkAppId!).config.cliId ?? 'claude-code') as CliId);
@@ -4345,7 +4345,9 @@ export async function handleCommand(
           break;
         }
         const result = await resumeSession(session.sessionId, activeSessions);
-        if (result.ok) touchSessionGroup(result.ds.chatId, session.sessionId);
+        // Only a chat-scope session is the group's resident; a resumed subtopic must not
+        // displace it (top-level /dismiss requires a chat-scope resident).
+        if (result.ok && result.ds.scope === 'chat') touchSessionGroup(result.ds.chatId, session.sessionId);
         await sessionReply(rootId, resumeResultMessage(result, loc));
         break;
       }
