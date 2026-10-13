@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isStandaloneBinary, resolveEntrySpawn } from './self-spawn.js';
@@ -6,42 +7,76 @@ import { isStandaloneBinary, resolveEntrySpawn } from './self-spawn.js';
 /**
  * Launch plan for `program-status-relay` (see src/program-status-relay.ts).
  *
- * The wrapped command travels base64-encoded in ONE argv slot rather than as
- * `-- <bin> <args…>`: discovery (`cliIdFromCommArgv`) scans the argv of
- * interpreter-named processes (`node`, `bun`) for a CLI basename, and a bun-run
- * relay keeps comm `bun` (process.title does not rename it there). A plain
- * `claude` token in the relay's argv would make /adopt and the pid resolvers
- * mistake the relay for Claude itself.
+ * The wrapped command travels in a private plan FILE; the relay's argv carries
+ * only its path. Two reasons:
+ *   - tmux rejects a `new-session` command around 16 KB ("command too long"),
+ *     and the CLI argv already spends most of that budget on a first prompt
+ *     (TMUX_INITIAL_PROMPT_ARG_BUDGET). Re-encoding it inline would push
+ *     prompts that fit today over the limit; a path keeps the relay's
+ *     overhead constant.
+ *   - discovery (`cliIdFromCommArgv`) scans the argv of interpreter-named
+ *     processes (`node`, `bun`) for a CLI basename, and a bun-run relay keeps
+ *     comm `bun` (process.title does not rename it there). A plain `claude`
+ *     token in the relay's argv would make /adopt and the pid resolvers
+ *     mistake the relay for Claude itself.
+ * The relay deletes the file as soon as it has read it.
  */
 export interface ProgramStatusRelayPlan { bin: string; args: string[] }
 
 const RELAY_TOKEN = '__program-status-relay';
 const RELAY_SCRIPT = 'program-status-relay.js';
 const RELAY_SOURCE = 'program-status-relay.ts';
+const PLAN_FILE = 'plan.json';
+const PLAN_DIR_PREFIX = 'botmux-psr-';
 
-/**
- * Wrap `bin args` in the relay, or return null when the relay entry cannot be
- * executed from here. That is the case when the worker runs from source:
- * resolveEntrySpawn points at `src/program-status-relay.js`, which does not
- * exist, and under Node a `.ts` would also need a loader the pane (different
- * cwd, possibly a strict env) cannot resolve. Bun runs the `.ts` natively.
- * Callers then launch the CLI directly — the pre-relay behaviour.
- */
-export function programStatusRelayLaunch(bin: string, args: string[]): { bin: string; args: string[] } | null {
+/** Resolve the relay entry, or null when it cannot be executed from here. That
+ *  is the case when the worker runs from source: resolveEntrySpawn points at
+ *  `src/program-status-relay.js`, which does not exist, and under Node a `.ts`
+ *  would also need a loader the pane (different cwd, possibly a strict env)
+ *  cannot resolve. Bun runs the `.ts` natively. */
+function resolveRelayEntry(): { command: string; args: string[] } | null {
   const entry = resolveEntrySpawn('program-status-relay', join(dirname(fileURLToPath(import.meta.url)), '..'));
-  let entryArgs = entry.args;
-  if (!isStandaloneBinary() && !existsSync(entryArgs[0])) {
-    const tsEntry = entryArgs[0].replace(/\.js$/, '.ts');
-    if (!process.versions.bun || !existsSync(tsEntry)) return null;
-    entryArgs = [tsEntry];
-  }
-  const plan: ProgramStatusRelayPlan = { bin, args };
-  return { bin: entry.command, args: [...entryArgs, Buffer.from(JSON.stringify(plan)).toString('base64')] };
+  if (isStandaloneBinary() || existsSync(entry.args[0])) return entry;
+  const tsEntry = entry.args[0].replace(/\.js$/, '.ts');
+  if (!process.versions.bun || !existsSync(tsEntry)) return null;
+  return { command: entry.command, args: [tsEntry] };
 }
 
-export function decodeProgramStatusRelayPlan(encoded: string | undefined): ProgramStatusRelayPlan {
-  if (!encoded) throw new Error('program-status-relay: missing launch plan');
-  const plan = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')) as Partial<ProgramStatusRelayPlan>;
+/**
+ * Wrap `bin args` in the relay, or return null (callers then launch the CLI
+ * directly — the pre-relay behaviour). `cleanup` removes the plan file for a
+ * launch that never reached the relay (spawn failure, reattach instead of a
+ * fresh pane); it is a no-op once the relay has consumed it.
+ */
+export function programStatusRelayLaunch(
+  bin: string,
+  args: string[],
+  planRoot: string = tmpdir(),
+): { bin: string; args: string[]; cleanup: () => void } | null {
+  const entry = resolveRelayEntry();
+  if (!entry) return null;
+  const dir = mkdtempSync(join(planRoot, PLAN_DIR_PREFIX));
+  const planPath = join(dir, PLAN_FILE);
+  const plan: ProgramStatusRelayPlan = { bin, args };
+  writeFileSync(planPath, JSON.stringify(plan), { mode: 0o600 });
+  return {
+    bin: entry.command,
+    args: [...entry.args, planPath],
+    cleanup: () => { rmSync(dir, { recursive: true, force: true }); },
+  };
+}
+
+/** Read and delete the plan file written by {@link programStatusRelayLaunch}. */
+export function consumeProgramStatusRelayPlan(planPath: string | undefined): ProgramStatusRelayPlan {
+  if (!planPath) throw new Error('program-status-relay: missing launch plan');
+  let raw: string;
+  try {
+    raw = readFileSync(planPath, 'utf8');
+  } finally {
+    const dir = dirname(planPath);
+    if (basename(planPath) === PLAN_FILE && basename(dir).startsWith(PLAN_DIR_PREFIX)) rmSync(dir, { recursive: true, force: true });
+  }
+  const plan = JSON.parse(raw) as Partial<ProgramStatusRelayPlan>;
   if (typeof plan.bin !== 'string' || !plan.bin || !Array.isArray(plan.args) || !plan.args.every(a => typeof a === 'string')) {
     throw new Error('program-status-relay: malformed launch plan');
   }

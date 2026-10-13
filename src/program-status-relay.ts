@@ -15,7 +15,7 @@
  * pane terminal (handshake lost, session intact).
  */
 import { spawn as spawnChild } from 'node:child_process';
-import { decodeProgramStatusRelayPlan } from './core/program-status-relay-launch.js';
+import { consumeProgramStatusRelayPlan } from './core/program-status-relay-launch.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import { PROGRAM_STATUS_PROBE_REPLY, ProgramStatusProbeRelay } from './utils/program-status-probe-relay.js';
 import * as pty from './utils/pty.js';
@@ -25,7 +25,7 @@ const HELD_FLUSH_MS = 15;
 /** Upper bound on waiting for the CLI after forwarding a terminating signal. */
 const SIGNAL_EXIT_GRACE_MS = 5000;
 
-const plan = decodeProgramStatusRelayPlan(process.argv.slice(isStandaloneBinary() ? 3 : 2)[0]);
+const plan = consumeProgramStatusRelayPlan(process.argv.slice(isStandaloneBinary() ? 3 : 2)[0]);
 const stdin = process.stdin;
 const stdout = process.stdout;
 

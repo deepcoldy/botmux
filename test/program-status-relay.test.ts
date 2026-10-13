@@ -9,9 +9,9 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   PROGRAM_STATUS_PROBE_REPLY,
@@ -19,7 +19,7 @@ import {
   type ProbeRelayAction,
 } from '../src/utils/program-status-probe-relay.js';
 import {
-  decodeProgramStatusRelayPlan,
+  consumeProgramStatusRelayPlan,
   isProgramStatusRelayArgv,
   programStatusRelayLaunch,
 } from '../src/core/program-status-relay-launch.js';
@@ -88,16 +88,37 @@ describe('ProgramStatusProbeRelay', () => {
 
 describe('program-status relay launch plan', () => {
   const realArgv1 = process.argv[1];
+  let planRoot = '';
+  afterEach(() => { if (planRoot) rmSync(planRoot, { recursive: true, force: true }); planRoot = ''; });
   // Compiled form: isStandaloneBinary() keys off argv[1] under /$bunfs/.
   const compiledLaunch = (bin: string, args: string[]) => {
+    planRoot ||= mkdtempSync(join(tmpdir(), 'relay-plan-test-'));
     process.argv[1] = '/$bunfs/root/cli.js';
-    try { return programStatusRelayLaunch(bin, args)!; } finally { process.argv[1] = realArgv1; }
+    try { return programStatusRelayLaunch(bin, args, planRoot)!; } finally { process.argv[1] = realArgv1; }
   };
 
-  it('round-trips the wrapped command', () => {
+  it('round-trips the wrapped command through a private plan file that is consumed once read', () => {
     const launch = compiledLaunch('/usr/bin/claude', ['--resume', 'x y', '']);
-    expect(launch.args.slice(0, -1)).toEqual(['__program-status-relay']);
-    expect(decodeProgramStatusRelayPlan(launch.args.at(-1))).toEqual({ bin: '/usr/bin/claude', args: ['--resume', 'x y', ''] });
+    expect(launch.args[0]).toBe('__program-status-relay');
+    const planPath = launch.args[1];
+    expect(statSync(planPath).mode & 0o777).toBe(0o600);
+    expect(consumeProgramStatusRelayPlan(planPath)).toEqual({ bin: '/usr/bin/claude', args: ['--resume', 'x y', ''] });
+    expect(existsSync(dirname(planPath))).toBe(false);
+    launch.cleanup(); // no-op after consumption
+  });
+
+  it('cleanup removes an unconsumed plan (spawn failed / pane reattached)', () => {
+    const launch = compiledLaunch('/usr/bin/claude', []);
+    launch.cleanup();
+    expect(existsSync(dirname(launch.args[1]))).toBe(false);
+  });
+
+  it('adds a constant-size argv regardless of the wrapped command (tmux caps new-session at ~16 KB)', () => {
+    const small = compiledLaunch('/usr/bin/claude', ['hi']);
+    const large = compiledLaunch('/usr/bin/claude', ['x'.repeat(12_000)]);
+    const len = (a: string[]) => a.join(' ').length;
+    expect(len(large.args)).toBe(len(small.args));
+    expect(len(large.args)).toBeLessThan(200);
   });
 
   it.skipIf(!!process.versions.bun)('declines (CLI launched directly) when the entry only exists as Node-unrunnable source', () => {
@@ -108,21 +129,26 @@ describe('program-status relay launch plan', () => {
   it('is recognisable from its argv, in the compiled, dist and source forms', () => {
     const launch = compiledLaunch('/usr/bin/claude', []);
     expect(isProgramStatusRelayArgv([launch.bin, ...launch.args])).toBe(true);
-    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', 'e30='])).toBe(true);
-    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '/src/botmux/src/program-status-relay.ts', 'e30='])).toBe(true);
+    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/p'])).toBe(true);
+    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--resume'])).toBe(false);
   });
 
   it('keeps the CLI name out of argv so discovery never mistakes the relay for the CLI', () => {
     // A bun-run relay keeps comm "bun", and discovery scans launcher argv for CLI basenames.
-    const plan = compiledLaunch('/root/.local/bin/claude', ['--model', 'opus']).args.at(-1)!;
-    expect(cliIdFromCommArgv('bun', ['bun', '/opt/botmux/dist/program-status-relay.js', plan])).toBeUndefined();
-    expect(cliIdFromCommArgv('node', ['node', '/opt/botmux/dist/program-status-relay.js', plan])).toBeUndefined();
+    const planPath = compiledLaunch('/root/.local/bin/claude', ['--model', 'opus']).args.at(-1)!;
+    expect(cliIdFromCommArgv('bun', ['bun', '/opt/botmux/dist/program-status-relay.js', planPath])).toBeUndefined();
+    expect(cliIdFromCommArgv('node', ['node', '/opt/botmux/dist/program-status-relay.js', planPath])).toBeUndefined();
   });
 
-  it('rejects a malformed plan', () => {
-    expect(() => decodeProgramStatusRelayPlan(undefined)).toThrow(/missing/);
-    expect(() => decodeProgramStatusRelayPlan(Buffer.from('{"bin":1}').toString('base64'))).toThrow(/malformed/);
+  it('rejects a missing or malformed plan', () => {
+    planRoot = mkdtempSync(join(tmpdir(), 'relay-plan-test-'));
+    expect(() => consumeProgramStatusRelayPlan(undefined)).toThrow(/missing/);
+    const bad = join(planRoot, 'plan.json');
+    writeFileSync(bad, '{"bin":1}');
+    expect(() => consumeProgramStatusRelayPlan(bad)).toThrow(/malformed/);
+    // Only a botmux-psr-* directory is ever removed.
+    expect(existsSync(planRoot)).toBe(true);
   });
 });
 
@@ -184,10 +210,13 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     const fake = join(dir, 'fake.cjs');
     writeFileSync(fake, FAKE_CLI);
     const result = join(dir, 'relay.json');
-    const plan = Buffer.from(JSON.stringify({ bin: '/bin/sh', args: ['-c', 'sleep 0.3; exec "$0" "$1" "$2"', process.execPath, fake, result] })).toString('base64');
+    const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
+    const plan = join(planDir, 'plan.json');
+    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', 'sleep 0.3; exec "$0" "$1" "$2"', process.execPath, fake, result] }));
     const { command, prefixArgs } = tsRunnerPrefix();
     const { order, piped } = await runInPane([command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan], result);
     expect(order).toEqual(['7501', 'da1']);
+    expect(existsSync(planDir)).toBe(false);
     // The worker must not see the probe (it would send a second, late reply).
     expect(piped).not.toContain('\x1b]7501;?');
   }, 30_000);

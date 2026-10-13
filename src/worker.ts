@@ -19171,6 +19171,7 @@ async function spawnCli(
   // launch env and proves the old key, while an actual fresh start consumes
   // the candidate and proves the new key. The worker trusts cryptographic
   // proof, not a backend's prediction flag.
+  let programStatusRelayPlanCleanup: (() => void) | undefined;
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
@@ -19191,6 +19192,7 @@ async function spawnCli(
       if (relayed) {
         spawnBin = relayed.bin;
         spawnArgs = relayed.args;
+        programStatusRelayPlanCleanup = relayed.cleanup;
         log('[program-status] launching CLI behind in-pane OSC 7501 relay');
       } else {
         log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
@@ -19243,12 +19245,15 @@ async function spawnCli(
     if (!willReattachPersistent) writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
   } catch (err) {
     cleanupCodexAppControlBootstrap();
+    programStatusRelayPlanCleanup?.();
     throw err;
   } finally {
     delete childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV];
   }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // A late same-named pane was reused, so the relay never ran to consume its plan.
+  if (actuallyReattachedPersistent) programStatusRelayPlanCleanup?.();
   if (actuallyReattachedPersistent) lastSpawnArgvDurableInitialPrompt = false;
   // ── Generational-race commit/teardown for the read-isolation provenance proof ──
   // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
