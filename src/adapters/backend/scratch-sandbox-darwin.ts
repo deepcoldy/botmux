@@ -63,6 +63,14 @@ export type ScratchStorage = 'disk'; // macOS: always APFS-COW-backed; the Linux
 const CLONE_TIMEOUT_CORE_MS = 5 * 60_000;
 const CLONE_TIMEOUT_BESTEFFORT_MS = 20_000;
 
+/** Whether a broad denied root contains a trusted per-session carve. */
+export function macScratchDenyHostsWritableCarve(
+  root: string,
+  writableCarvePaths: readonly string[],
+): boolean {
+  return writableCarvePaths.some(carve => carve !== root && carve.startsWith(`${root}${sep}`));
+}
+
 /** CLI state dirs cloned REQUIRED (fail-closed): sessions/auth/config of the
  *  supported CLIs must be writable COW for scratch to function. */
 const CORE_CLONE_HOME_DIRS = new Set([
@@ -196,6 +204,8 @@ export function buildMacScratchProfile(input: {
   /** Final WRITE-only denies (subtrees degraded from clone to symlink must be
    *  read-native but never writable, so writes can't silently reach the host). */
   fileWriteDenyPaths?: readonly string[];
+  /** Final trusted write carves below a sealed shared root. */
+  writableCarvePaths?: readonly string[];
   /** REAL host cache areas granted write (Foundation/cfprefsd ignore HOME). */
   hostWritable?: readonly string[];
   mcpSocket?: string;
@@ -245,6 +255,13 @@ export function buildMacScratchProfile(input: {
     if (typeof raw !== 'string' || !raw || !isAbsolute(raw)) continue;
     lines.push(`(deny file-write* (subpath "${escSb(raw)}"))`);
   }
+  // Stage 6: trusted per-session carves below a shared deny root. These must
+  // come after final write seals such as ~/.cache symlink degradation.
+  for (const raw of input.writableCarvePaths ?? []) {
+    if (typeof raw !== 'string' || !raw || !isAbsolute(raw)) continue;
+    lines.push(`(allow file-read* (subpath "${escSb(raw)}"))`);
+    lines.push(`(allow file-write* (subpath "${escSb(raw)}"))`);
+  }
   if (!input.net) lines.push('(deny network*)');
   return lines;
 }
@@ -258,6 +275,8 @@ export interface PrepareMacScratchOpts {
   cliArgs: string[];
   /** Credential/secret REAL host paths (read+write denied in the child). */
   denyPaths?: readonly string[];
+  /** Current session paths re-opened below a shared denied parent. */
+  writableCarvePaths?: readonly string[];
   mcpGatewaySocketPath?: string;
   net?: boolean;
 }
@@ -286,6 +305,10 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
 
   const homeReal = canonical(opts.home);
   const cwdReal = canonical(opts.chdir);
+  const writableCarvePaths = (opts.writableCarvePaths ?? [])
+    .filter((p): p is string => typeof p === 'string' && !!p && isAbsolute(p))
+    .map(p => canonical(p))
+    .filter(p => existsSync(p));
   if (!sameVolume(homeReal, homeCloneRoot)) {
     console.error(`[scratch-darwin] HOME ${homeReal} not on the same volume as ${homeCloneRoot}; cross-volume scratch refused.`);
     rmSync(sessionRoot, { recursive: true, force: true });
@@ -347,6 +370,10 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   for (const p of opts.denyPaths ?? []) {
     if (typeof p !== 'string' || !p) continue;
     let cur = canonical(p);
+    // Keep a white-in-black root precise. Promoting session-tmp to its
+    // top-level ~/.cache ancestor would unnecessarily deny reads to every
+    // unrelated cache and would obscure the exact sibling-session boundary.
+    if (macScratchDenyHostsWritableCarve(cur, writableCarvePaths)) continue;
     while (dirname(cur) !== homeReal && cur !== dirname(cur) && cur.startsWith(homeReal)) cur = dirname(cur);
     if (dirname(cur) === homeReal) authorityRoots.add(cur);
   }
@@ -530,11 +557,17 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   const claudeMcpCache = join(homeReal, 'Library', 'Caches', 'claude-cli-nodejs');
   // File-level caller-supplied denies outside the authority roots / session
   // tree (the sessionRoot is NOT denied on macOS: clones/outbox live under it).
-  const callerFileDenies = (opts.denyPaths ?? [])
+  const callerDenies = (opts.denyPaths ?? [])
     .filter((p): p is string => typeof p === 'string' && !!p && isAbsolute(p))
     .map(p => canonical(p))
     .filter(p => !p.startsWith(sessionRoot + sep) && p !== sessionRoot)
     .filter(p => ![...authorityRoots].some(root => p === root || p.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)));
+  // A broad deny that contains a trusted carve belongs in stage 2, before the
+  // deeper stage-6 re-open. Leaving it in the final file-deny stage would mask
+  // this session's own lark-cli HOME together with its siblings.
+  const callerRootDenies = callerDenies.filter(root =>
+    macScratchDenyHostsWritableCarve(root, writableCarvePaths));
+  const callerFileDenies = callerDenies.filter(p => !callerRootDenies.includes(p));
 
   // macOS lark-cli keystores. These are NOT under ~/.botmux and the shared
   // enumerator only resolves Linux store paths, so the mac module must seal
@@ -545,12 +578,14 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   const profilePath = join(sessionRoot, 'scratch.sb');
   const lines = buildMacScratchProfile({
     net: opts.net !== false,
-    authorityRootDenies: [...authorityRoots].sort((a, b) => b.length - a.length),
+    authorityRootDenies: [...new Set([...authorityRoots, ...callerRootDenies])]
+      .sort((a, b) => b.length - a.length),
     writable: [homeCloneRoot, workCloneRoot, tmp, outbox, shimBin],
     hostWritable,
     fileDenyPaths: [...new Set([...callerFileDenies, ...macLarkDenies])],
     fileWriteDenyPaths: [...degradedWriteDeny, claudeMcpCache]
       .filter(p => !authorityRoots.has(p)),
+    writableCarvePaths,
     mcpSocket: sandboxMcpSocket,
   });
   writeFileSync(profilePath, lines.join('\n') + '\n', { mode: 0o600 });

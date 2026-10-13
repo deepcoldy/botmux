@@ -3796,7 +3796,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     }
   }
 
-  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
+  function toggleTool(tool: 'lark-cli' | 'bytedcli' | 'larkdev', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
     void save({ enabled: true, tools: next, fallback });
   }
@@ -3818,7 +3818,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         <>
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
-            {(['lark-cli', 'bytedcli'] as const).map(tool => (
+            {(['lark-cli', 'bytedcli', 'larkdev'] as const).map(tool => (
               <label key={tool} className="bd-inline-check">
                 <input
                   type="checkbox"
@@ -3834,6 +3834,9 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
+          ) : null}
+          {tools.includes('larkdev') ? (
+            <p className="bd-section-note">{tr('botDefaults.triggerUserAuthLarkdevNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (
             <p className="bd-section-note" data-trigger-user-auth-authorized="">

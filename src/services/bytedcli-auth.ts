@@ -35,9 +35,16 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import {
+  BYTECLOUD_USER_SITES,
+  type ByteCloudUserSite,
+} from '../utils/bytecloud-sites.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
-import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
+import {
+  scrubCredentialLikeEnv,
+  scrubSessionTurnMarkerEnv,
+} from '../utils/child-env.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
@@ -122,10 +129,15 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const env = { ...process.env };
   scrubSessionTurnMarkerEnv(env);
+  // bytedcli subcommands accept ByteCloud JWTs/AK/SKs as well as many
+  // domain-specific tokens, cookies and passwords. Leaving any ambient
+  // credential in place could silently act as the daemon/operator instead of
+  // this sender even though HOME itself is isolated.
+  scrubCredentialLikeEnv(env);
   for (const key of [
     'BYTEDCLI_PROFILE', 'BYTEDCLI_CODEBASE_APP_ID', 'BYTEDCLI_CODEBASE_APP_SECRET',
+    'BYTEDCLI_CLOUD_SITE', 'BYTEDCLI_AUTH_SITE',
     'AIME_WORKSPACE_PATH', 'AIME_CURRENT_USER',
-    'BYTECLOUD_AUTH_ACCESS_KEY_ID', 'BYTECLOUD_AUTH_SECRET_ACCESS_KEY',
   ]) delete env[key];
   Object.assign(env, { HOME: home, BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1' });
   return await new Promise<BytedcliResult>(resolve => {
@@ -322,6 +334,55 @@ export interface BytedcliJwts {
   /** Git pushes authenticate with this one, so commit attribution follows it. */
   codeJwt?: string;
 }
+
+const allSiteMinting = new Map<
+  string,
+  Promise<Partial<Record<ByteCloudUserSite, string>> | null>
+>();
+
+/**
+ * Mint the current sender's ByteCloud JWT for every control plane their login
+ * can reach. Missing regional access is represented by an absent entry, never
+ * by falling through to a machine login inside a governed CLI.
+ */
+export async function mintByteCloudUserJwts(
+  openId: string,
+): Promise<Partial<Record<ByteCloudUserSite, string>> | null> {
+  const existing = allSiteMinting.get(openId);
+  if (existing) return existing;
+  const work = mintAllSiteUserJwts(openId);
+  allSiteMinting.set(openId, work);
+  try { return await work; } finally { allSiteMinting.delete(openId); }
+}
+
+async function mintAllSiteUserJwts(
+  openId: string,
+): Promise<Partial<Record<ByteCloudUserSite, string>> | null> {
+  // Reuse the existing CN mint path so pending-login completion, provider
+  // verification and in-flight de-duplication stay identical to bytedcli.
+  const primary = await mintBytedcliJwts(openId);
+  if (!primary) return null;
+  const result: Partial<Record<ByteCloudUserSite, string>> = {
+    cn: primary.cloudJwt,
+  };
+  // Keep one process at a time inside the same durable HOME. ByteCloud Auth
+  // may rotate and persist login state while minting; concurrent regional
+  // processes must not race those writes.
+  for (const site of BYTECLOUD_USER_SITES) {
+    if (site === 'cn') continue;
+    const minted = await runAsUser(openId, [
+      '--site', site,
+      'auth', 'get-bytecloud-jwt-token',
+    ]);
+    const jwt = minted.stdout.trim();
+    if (minted.ok && jwt) result[site] = jwt;
+    else logger.debug(`[bytedcli-auth] no personal ByteCloud JWT available for governed CLI site ${site}`);
+  }
+  return result;
+}
+
+/** Backward-compatible name for callers that only use the tokens with larkdev. */
+export const mintLarkdevByteCloudJwts = mintByteCloudUserJwts;
 
 /**
  * Mint this person's JWTs for the current turn.

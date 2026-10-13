@@ -36,6 +36,10 @@ import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } fr
 import { delimiter, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
+import {
+  BYTECLOUD_USER_JWT_ENV_BY_SITE,
+  type ByteCloudUserSite,
+} from '../utils/bytecloud-sites.js';
 import { isCliIdentityPath } from '../utils/child-env.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
@@ -161,9 +165,20 @@ export const IDENTITY_ENV_KEYS: Record<TriggerUserAuthTool, readonly string[]> =
   // APP_SECRET appears only in bot mode; in user mode it is absent from the
   // file, and `export` on an unset name puts nothing in the child's env.
   'lark-cli': ['LARKSUITE_CLI_APP_ID', 'LARKSUITE_CLI_APP_SECRET', 'LARKSUITE_CLI_USER_ACCESS_TOKEN'],
-  // ByteCloud JWT and the Codebase JWT derived from it. The latter is what git
-  // pushes authenticate with, so attribution of a commit follows from it.
-  bytedcli: ['BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT'],
+  // Site-specific ByteCloud SDK inputs. bytedcli also accepts the legacy
+  // `BYTEDCLI_USER_CLOUD_JWT`, but that variable carries only one region: when
+  // a command selects another site bytedcli skips the mismatched JWT and may
+  // fall back to the operator's on-disk login. Publish every site explicitly.
+  bytedcli: [
+    ...Object.values(BYTECLOUD_USER_JWT_ENV_BY_SITE),
+    'BYTECLOUD_AUTH_AS',
+  ],
+  // larkdev's ByteCloud SDK selects a site-specific JWT before consulting its
+  // on-disk auth directory. BOE aliases CN, so no separate BOE value exists.
+  larkdev: [
+    ...Object.values(BYTECLOUD_USER_JWT_ENV_BY_SITE),
+    'BYTECLOUD_AUTH_AS',
+  ],
 };
 
 /** Common to every variant: the turn these credentials were published FOR.
@@ -197,9 +212,14 @@ export interface LarkCliHomeIdentity extends TurnBound {
 
 export interface BytedCliIdentity extends TurnBound {
   tool: 'bytedcli';
-  cloudJwt: string;
-  /** Optional: only present once a Codebase JWT has been minted for this person. */
-  codeJwt?: string;
+  /** Site keys use bytedcli spelling; BOE intentionally reuses `cn`. */
+  cloudJwts: Partial<Record<ByteCloudUserSite, string>>;
+}
+
+export interface LarkdevIdentity extends TurnBound {
+  tool: 'larkdev';
+  /** Site keys use bytedcli spelling; BOE intentionally reuses `cn`. */
+  cloudJwts: Partial<Record<ByteCloudUserSite, string>>;
 }
 
 /**
@@ -234,7 +254,7 @@ export interface DeniedIdentity extends TurnBound {
   message: string;
 }
 
-export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | BotIdentity | DeniedIdentity;
+export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | LarkdevIdentity | BotIdentity | DeniedIdentity;
 
 /** Exit code for a command refused for want of authorization. Distinct from the
  *  tool's own failures so callers can tell "not allowed" from "did not work".
@@ -291,8 +311,16 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       ['LARKSUITE_CLI_USER_ACCESS_TOKEN', identity.userAccessToken],
     );
   } else {
-    pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
-    if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    pairs.push([
+      MODE_VAR,
+      identity.tool === 'bytedcli' ? 'bytedcli-user' : 'larkdev-user',
+    ], ['BYTECLOUD_AUTH_AS', 'user']);
+    for (const [site, key] of Object.entries(BYTECLOUD_USER_JWT_ENV_BY_SITE) as Array<
+      [ByteCloudUserSite, typeof BYTECLOUD_USER_JWT_ENV_BY_SITE[ByteCloudUserSite]]
+    >) {
+      const jwt = identity.cloudJwts[site];
+      if (jwt) pairs.push([key, jwt]);
+    }
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
@@ -388,11 +416,95 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
 }
 
 /**
+ * Identity-bearing variables that a governed wrapper must clear before it
+ * sources the current turn file. The parent agent can carry per-bot env added
+ * after daemon boot scrubbing, and both lark-cli and ByteCloud prefer env over
+ * their isolated on-disk state. An absent key in this turn must therefore mean
+ * absent, not "reuse whatever the parent happened to export".
+ */
+const WRAPPER_IDENTITY_OVERRIDE_ENV_KEYS = [
+  ...new Set(Object.values(IDENTITY_ENV_KEYS).flat()),
+  // Pre-fix bytedcli values carry only one region. Scrub them so a stale
+  // parent/session cannot override the site-specific identity below or become
+  // an accidental fallback source.
+  'BYTEDCLI_USER_CLOUD_JWT',
+  'BYTEDCLI_USER_CODE_JWT',
+  'BYTEDCLI_USER_CB_OAUTH_AT',
+  'BYTEDCLI_PROFILE',
+  'BYTEDCLI_CODEBASE_APP_ID',
+  'BYTEDCLI_CODEBASE_APP_SECRET',
+  'BYTEDCLI_CLOUD_SITE',
+  'BYTEDCLI_AUTH_SITE',
+  'BYTEDCLI_AI_AUTH_APP_KEY',
+  'BYTEDCLI_AI_AUTH_SUBJECT',
+  'BYTEDCLI_BYTECLOUD_AUTH_FALLBACK',
+  'BYTEDCLI_OCEANUS_AUTH',
+  'BYTEDCLI_USE_ZTI_JWT',
+  'LARKSUITE_CLI_CONFIG_DIR',
+  'LARKSUITE_CLI_DATA_DIR',
+  'LARKSUITE_CLI_TENANT_ACCESS_TOKEN',
+  'LARKSUITE_CLI_TENANT_ACCESS_TOKEN_SOURCE',
+  'LARKSUITE_CLI_TOKEN_ONLY__',
+  'LARKSUITE_CLI_PROFILE',
+  'LARKSUITE_CLI_DEFAULT_AS',
+  'FEISHU_USER_ACCESS_TOKEN',
+  'LARKDEV_AUTH_DIR',
+  // The ByteCloud SDK treats this marker as an environment-managed ByteClaw
+  // identity even when LARKDEV_AUTH_DIR is empty. It must not bypass the
+  // current sender's injected JWTs (or supply a missing regional JWT).
+  'AIPAAS_BYTECLAW',
+  'BYTECLOUD_CLI_API_JWT_TOKEN',
+  'BYTECLOUD_CLI_JWT_TOKEN',
+  'AIME_USER_CLOUD_JWT',
+  'AIME_USER_CODE_JWT',
+  'AIME_WORKSPACE_PATH',
+  'AIME_CURRENT_USER',
+  'BYTECLOUD_AUTH_ACCESS_KEY_ID',
+  'BYTECLOUD_AUTH_SECRET_ACCESS_KEY',
+  'BYTECLOUD_ACCESS_KEY_ID',
+  'BYTECLOUD_SECRET_ACCESS_KEY',
+] as const;
+
+/**
+ * Shell fragment that removes ambient credentials by family rather than by a
+ * hard-coded list. The installed bytedcli is a toolbox: besides ByteCloud it
+ * accepts domain-specific tokens, cookies, passwords and AK/SK pairs. A new
+ * site or subcommand credential must fail closed until Botmux deliberately
+ * publishes a current-turn value for it.
+ *
+ * Use POSIX `command -p` so an agent-controlled PATH cannot replace `env` or
+ * `sed` with a helper that observes the turn JWT or skips the scrub.
+ */
+const DYNAMIC_BYTECLOUD_IDENTITY_SCRUB = [
+  '__botmux_identity_env="$(command -p env)" || {',
+  `  printf '%s\\n' 'botmux: ByteCloud 身份环境清理工具缺失，命令未执行。' >&2`,
+  `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
+  '}',
+  '__botmux_identity_keys="$(printf \'%s\\n\' "$__botmux_identity_env" | command -p sed -n \\',
+  "  -e 's/^\\([A-Z0-9_]*TOKEN[A-Z0-9_]*\\)=.*/\\1/p' \\",
+  "  -e 's/^\\([A-Z0-9_]*JWT[A-Z0-9_]*\\)=.*/\\1/p' \\",
+  "  -e 's/^\\([A-Z0-9_]*COOKIE[A-Z0-9_]*\\)=.*/\\1/p' \\",
+  "  -e 's/^\\([A-Z0-9_]*PASSWORD[A-Z0-9_]*\\)=.*/\\1/p' \\",
+  "  -e 's/^\\([A-Z0-9_]*SECRET[A-Z0-9_]*\\)=.*/\\1/p' \\",
+  "  -e 's/^\\([A-Z0-9_]*ACCESS_KEY[A-Z0-9_]*\\)=.*/\\1/p' \\",
+  "  -e 's/^\\([A-Z0-9_]*AUTHORIZATION[A-Z0-9_]*\\)=.*/\\1/p')\" || {",
+  `  printf '%s\\n' 'botmux: ByteCloud 身份环境清理失败，命令未执行。' >&2`,
+  `  exit ${IDENTITY_DENIED_EXIT_CODE}`,
+  '}',
+  'for __botmux_identity_key in $__botmux_identity_keys; do',
+  '  unset "$__botmux_identity_key"',
+  'done',
+  'unset __botmux_identity_env __botmux_identity_key __botmux_identity_keys',
+] as const;
+
+/**
  * The wrapper script for one tool.
  *
  * Design constraints, each learned the hard way elsewhere in this codebase:
  *
- *  - `exec` so signals and the exit code pass straight through.
+ *  - Direct branches use `exec`; branches with an invocation-scoped HOME run
+ *    the child under a tiny supervisor that forwards signals, preserves its
+ *    exit code, and removes the temporary directory afterward.
  *  - Absolute path to the real binary: the wrapper shadows the tool's own name
  *    on `PATH`, so resolving by name again would re-enter this script forever.
  *  - `BOTMUX_SESSION_ID` / `SESSION_DATA_DIR` come from the session env the
@@ -423,10 +535,24 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  */
 export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath: string): string {
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
+  const dynamicByteCloudScrub = tool === 'lark-cli' ? [] : DYNAMIC_BYTECLOUD_IDENTITY_SCRUB;
+  const legacyUserMode = tool === 'bytedcli'
+    ? [
+        `    printf '%s\\n' 'botmux: bytedcli 身份文件仍是旧格式，命令未执行。请重新发起当前操作。' >&2`,
+        `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
+        '    ;;',
+      ]
+    : [
+        `    export ${exportKeys}`,
+        '    ;;',
+      ];
+  const userHomeExecEnv = tool === 'lark-cli'
+    ? ['      LARKSUITE_CLI_LOG_DIR="$__botmux_home/.local/state/lark-cli/logs" \\']
+    : [];
   return [
     '#!/bin/sh',
     '# botmux trigger-user identity wrapper — generated, do not edit.',
-    '# Sources the identity the daemon published for the CURRENT turn, then execs',
+    '# Sources the identity the daemon published for the CURRENT turn, then runs',
     '# the real tool. Re-read on every invocation, which is what lets the acting',
     '# identity change without restarting the session.',
     '#',
@@ -434,6 +560,11 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '# would hand it the machine account\'s login, not the bot\'s.',
     `${MODE_VAR}=`,
     `${DENY_MSG_VAR}=`,
+    // Do this before sourcing the turn file. In particular, a missing regional
+    // larkdev token must fail in the empty LARKDEV_AUTH_DIR below, not fall back
+    // to a machine JWT/AK inherited from the parent process.
+    `unset ${WRAPPER_IDENTITY_OVERRIDE_ENV_KEYS.join(' ')}`,
+    ...dynamicByteCloudScrub,
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/${tool}.env"`,
     '  if [ -f "$__botmux_cred" ]; then',
@@ -465,8 +596,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
-    `    export ${exportKeys}`,
-    '    ;;',
+    ...legacyUserMode,
     '  user-home)',
     // Device-code identity. HOME is scoped to THIS exec only: assign it inline
     // to the lark-cli process rather than `export`-ing, so a sibling command or
@@ -477,8 +607,147 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `      printf '%s\\n' 'botmux: ${tool} 的按人身份目录缺失，命令未执行。请重新发送 /login 完成授权后重试。' >&2`,
     `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    fi',
-    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR}`,
-    `    HOME="$${HOME_VAR}" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    `    __botmux_home="$${HOME_VAR}"`,
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
+    `    HOME="$__botmux_home" \\`,
+    '      XDG_CONFIG_HOME="$__botmux_home/.config" \\',
+    '      XDG_DATA_HOME="$__botmux_home/.local/share" \\',
+    '      XDG_STATE_HOME="$__botmux_home/.local/state" \\',
+    '      XDG_CACHE_HOME="$__botmux_home/.cache" \\',
+    ...userHomeExecEnv,
+    `      exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    '    ;;',
+    '  bytedcli-user)',
+    // BYTECLOUD_AUTH_AS=user is a default, not a policy boundary: bytedcli's
+    // global --as option writes a higher-priority runtime override. Likewise a
+    // request-scoped JWT is consulted before the selected auth identity. Refuse
+    // both override channels so this wrapper can only act as the published turn.
+    '    for __botmux_arg in "$@"; do',
+    '      case "$__botmux_arg" in',
+    '        --as|--as=*|--bytecloud-user-jwt-file|--bytecloud-user-jwt-file=*)',
+    `          printf '%s\\n' 'botmux: bytedcli 身份由当前消息发起人固定，不能通过命令参数覆盖；命令未执行。' >&2`,
+    `          exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '          ;;',
+    '      esac',
+    '    done',
+    '    unset __botmux_arg',
+    // A single BYTEDCLI_USER_CLOUD_JWT is valid but bound to one region; when a
+    // command selects another site bytedcli deliberately skips it. The SDK's
+    // site-specific variables avoid that ambiguity. Run in a fresh HOME so an
+    // unavailable site/token fails closed instead of consulting ~/.local/share/
+    // bytedcli and silently acting as the machine's persistent login.
+    '    __botmux_bytedcli_base="${TMPDIR:-/tmp}/botmux-bytedcli-home"',
+    '    umask 077',
+    '    command -p mkdir -p "$__botmux_bytedcli_base" || {',
+    `      printf '%s\\n' 'botmux: bytedcli 隔离认证目录创建失败，命令未执行。' >&2`,
+    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    }',
+    '    __botmux_bytedcli_home="$(command -p mktemp -d "$__botmux_bytedcli_base/invocation.XXXXXX")" || {',
+    `      printf '%s\\n' 'botmux: bytedcli 隔离认证目录创建失败，命令未执行。' >&2`,
+    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    }',
+    `    export ${exportKeys}`,
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
+    '    __botmux_bytedcli_child=',
+    '    __botmux_bytedcli_forwarded=',
+    '    __botmux_bytedcli_cleanup() { command -p rm -rf -- "$__botmux_bytedcli_home"; }',
+    '    __botmux_bytedcli_forward() {',
+    '      __botmux_bytedcli_forwarded="$1"',
+    '      if [ -n "$__botmux_bytedcli_child" ]; then',
+    '        command -p kill -s "$1" "$__botmux_bytedcli_child" 2>/dev/null || :',
+    '      fi',
+    '    }',
+    "    trap '__botmux_bytedcli_forward HUP' HUP",
+    "    trap '__botmux_bytedcli_forward INT' INT",
+    "    trap '__botmux_bytedcli_forward TERM' TERM",
+    '    trap __botmux_bytedcli_cleanup EXIT',
+    '    exec 9<&0',
+    '    (',
+    // Non-interactive shells may make asynchronous children ignore INT/QUIT
+    // and attach stdin to /dev/null. Reset signal dispositions before exec and
+    // preserve fd 0 explicitly so governed CLIs keep normal PTY behavior.
+    '      trap - HUP INT TERM',
+    '      HOME="$__botmux_bytedcli_home" \\',
+    '        XDG_CONFIG_HOME="$__botmux_bytedcli_home/.config" \\',
+    '        XDG_DATA_HOME="$__botmux_bytedcli_home/.local/share" \\',
+    '        XDG_STATE_HOME="$__botmux_bytedcli_home/.local/state" \\',
+    '        XDG_CACHE_HOME="$__botmux_bytedcli_home/.cache" \\',
+    `        BYTECLOUD_AUTH_AS=user BYTEDCLI_NO_AUTO_UPGRADE=1 exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    '    ) <&9 9<&- &',
+    '    __botmux_bytedcli_child=$!',
+    '    exec 9<&-',
+    // A signal can land after the async child exists but before `$!` is stored.
+    // The trap records it even when no PID is available; replay it now so that
+    // narrow launch window cannot turn cancellation into an indefinite wait.
+    '    if [ -n "$__botmux_bytedcli_forwarded" ]; then',
+    '      command -p kill -s "$__botmux_bytedcli_forwarded" "$__botmux_bytedcli_child" 2>/dev/null || :',
+    '    fi',
+    '    while :; do',
+    '      wait "$__botmux_bytedcli_child"',
+    '      __botmux_bytedcli_status=$?',
+    // A caught signal may interrupt wait before the forwarded signal has made
+    // the child exit. Keep its HOME intact and wait again until it is reaped.
+    '      if [ -n "$__botmux_bytedcli_forwarded" ] \\',
+    '         && command -p kill -0 "$__botmux_bytedcli_child" 2>/dev/null; then',
+    '        continue',
+    '      fi',
+    '      break',
+    '    done',
+    '    trap - EXIT HUP INT TERM',
+    '    __botmux_bytedcli_cleanup',
+    '    exit "$__botmux_bytedcli_status"',
+    '    ;;',
+    '  larkdev-user)',
+    // A fresh auth directory per invocation makes every non-injected site fail
+    // closed instead of consulting ~/.larkdev/auth or state left by another
+    // turn. Injected SDK JWTs are not persisted as login credentials.
+    '    __botmux_larkdev_base="${TMPDIR:-/tmp}/botmux-larkdev-auth"',
+    '    umask 077',
+    '    command -p mkdir -p "$__botmux_larkdev_base" || {',
+    `      printf '%s\\n' 'botmux: larkdev 隔离认证目录创建失败，命令未执行。' >&2`,
+    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    }',
+    '    __botmux_larkdev_auth="$(command -p mktemp -d "$__botmux_larkdev_base/invocation.XXXXXX")" || {',
+    `      printf '%s\\n' 'botmux: larkdev 隔离认证目录创建失败，命令未执行。' >&2`,
+    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    }',
+    `    export ${exportKeys}`,
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
+    '    __botmux_larkdev_child=',
+    '    __botmux_larkdev_forwarded=',
+    '    __botmux_larkdev_cleanup() { command -p rm -rf -- "$__botmux_larkdev_auth"; }',
+    '    __botmux_larkdev_forward() {',
+    '      __botmux_larkdev_forwarded="$1"',
+    '      if [ -n "$__botmux_larkdev_child" ]; then',
+    '        command -p kill -s "$1" "$__botmux_larkdev_child" 2>/dev/null || :',
+    '      fi',
+    '    }',
+    "    trap '__botmux_larkdev_forward HUP' HUP",
+    "    trap '__botmux_larkdev_forward INT' INT",
+    "    trap '__botmux_larkdev_forward TERM' TERM",
+    '    trap __botmux_larkdev_cleanup EXIT',
+    '    exec 9<&0',
+    '    (',
+    '      trap - HUP INT TERM',
+    `      LARKDEV_AUTH_DIR="$__botmux_larkdev_auth" BYTECLOUD_AUTH_AS=user exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    '    ) <&9 9<&- &',
+    '    __botmux_larkdev_child=$!',
+    '    exec 9<&-',
+    '    if [ -n "$__botmux_larkdev_forwarded" ]; then',
+    '      command -p kill -s "$__botmux_larkdev_forwarded" "$__botmux_larkdev_child" 2>/dev/null || :',
+    '    fi',
+    '    while :; do',
+    '      wait "$__botmux_larkdev_child"',
+    '      __botmux_larkdev_status=$?',
+    '      if [ -n "$__botmux_larkdev_forwarded" ] \\',
+    '         && command -p kill -0 "$__botmux_larkdev_child" 2>/dev/null; then',
+    '        continue',
+    '      fi',
+    '      break',
+    '    done',
+    '    trap - EXIT HUP INT TERM',
+    '    __botmux_larkdev_cleanup',
+    '    exit "$__botmux_larkdev_status"',
     '    ;;',
     '  turn-mismatch)',
     `    printf '%s\\n' 'botmux: 这条命令属于上一轮对话，而凭证已经切换到新消息的发起人；为避免用错人的权限，命令未执行。' >&2`,
@@ -658,16 +927,22 @@ export function installIdentityWrapper(
 export function renderGitAskpassScript(bytedcliPath: string, exchangeUrl?: string): string {
   const fallback = exchangeUrl
     ? [
-        // Second source: exchange the ByteCloud JWT the wrapper already exported
-        // for a Codebase JWT over HTTP. Without it a bytedcli that is missing or
-        // mid-upgrade turns every push into an unexplained auth failure.
-        '  if [ -z "$__botmux_token" ] && [ -n "$BYTEDCLI_USER_CLOUD_JWT" ]; then',
+        // Second source: ask the SAME wrapped bytedcli for the current turn's
+        // ByteCloud JWT, then exchange it. A child wrapper cannot export a value
+        // back into this parent askpass process, so reading BYTEDCLI_USER_* here
+        // never worked and could only pick up an unrelated ambient value.
+        '  if [ -z "$__botmux_token" ]; then',
+        `    __botmux_cloud="$(GIT_CONFIG_COUNT=0 GIT_SSH_COMMAND=false ${shellSingleQuote(bytedcliPath)} \\`,
+        '      auth get-bytecloud-jwt-token 2>/dev/null | tr -d \'\\r\\n\')"',
+        '  fi',
+        '  if [ -z "$__botmux_token" ] && [ -n "$__botmux_cloud" ]; then',
         `    __botmux_token="$(curl -fsS --max-time 10 -X POST ${shellSingleQuote(exchangeUrl)} \\`,
         '      -H "Content-Type: application/json" -H "domain: tenant;v1" \\',
-        '      -H "x-jwt-token: $BYTEDCLI_USER_CLOUD_JWT" \\',
-        '      --data-binary "$(printf \'{"jwt_token":"%s"}\' "$BYTEDCLI_USER_CLOUD_JWT")" 2>/dev/null \\',
+        '      -H "x-jwt-token: $__botmux_cloud" \\',
+        '      --data-binary "$(printf \'{"jwt_token":"%s"}\' "$__botmux_cloud")" 2>/dev/null \\',
         '      | sed -n \'s/.*"code_base_token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\')"',
         '  fi',
+        '  unset __botmux_cloud',
       ]
     : [];
   return [

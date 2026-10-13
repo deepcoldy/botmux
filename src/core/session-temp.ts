@@ -28,7 +28,12 @@ export function sessionTempDir(dataDir: string, sessionId: string): string {
     .update(resolve(dataDir))
     .digest('hex')
     .slice(0, 16);
-  return join(homedir(), '.cache', 'botmux', 'session-tmp', profile, sessionTempSegment(sessionId));
+  return join(sessionTempRootDir(), profile, sessionTempSegment(sessionId));
+}
+
+/** Shared parent containing every bot/session scratch tree for this OS user. */
+export function sessionTempRootDir(): string {
+  return join(homedir(), '.cache', 'botmux', 'session-tmp');
 }
 
 /** Create and validate the session scratch directory before exposing it. */

@@ -3,6 +3,7 @@ import {
   scratchHostView,
   remapIntoMerged,
   prepareScratchSandbox,
+  compileScratchWritableCarveArgs,
 } from '../src/adapters/backend/scratch-sandbox.js';
 import {
   scratchMergedRootFor,
@@ -148,6 +149,59 @@ describe('scratchViewPath canonicalises symlink-aliased input (mac /tmp → /pri
 });
 
 describe('prepareScratchSandbox tmux argument transport', () => {
+  it('compiles a trusted session as a later-wins writable carve below the shared root', () => {
+    const shared = '/home/u/.cache/botmux/session-tmp';
+    const own = `${shared}/profile/session-own`;
+    const sibling = `${shared}/profile/session-sibling`;
+    const args = compileScratchWritableCarveArgs([shared], [own]);
+    expect(args).toEqual([
+      '--bind', own, own,
+    ]);
+    expect(args).not.toContain(sibling);
+    expect(compileScratchWritableCarveArgs([shared], ['/home/u/unrelated'])).toEqual([]);
+  });
+
+  it('compiles a shared deny root before the current session writable rebind', () => {
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
+    const root = mkdtempSync(join(tmpdir(), 'scratch-sbx-carve-'));
+    const dataDir = join(root, 'data');
+    const workingDir = join(root, 'work');
+    const shared = join(root, 'home', '.cache', 'botmux', 'session-tmp');
+    const own = join(shared, 'profile', 'session-own');
+    const sibling = join(shared, 'profile', 'session-sibling');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(workingDir, { recursive: true });
+    mkdirSync(own, { recursive: true });
+    mkdirSync(sibling, { recursive: true });
+    let plan: ReturnType<typeof prepareScratchSandbox> = null;
+    try {
+      plan = prepareScratchSandbox({
+        sessionId: 'scratch-session-carve',
+        dataDir,
+        storage: 'disk',
+        chdir: workingDir,
+        home: join(root, 'home'),
+        cliBin: '/bin/true',
+        cliArgs: [],
+        denyPaths: [shared],
+        writableCarvePaths: [own],
+      });
+      if (!plan) return;
+      const mask = plan.args.indexOf(shared);
+      const carve = plan.args.indexOf(own);
+      const reseal = plan.args.lastIndexOf(shared);
+      expect(plan.args[mask - 1]).toBe('--tmpfs');
+      expect(plan.args[carve - 1]).toBe('--bind');
+      expect(carve).toBeGreaterThan(mask);
+      expect(plan.args[reseal - 1]).toBe('--remount-ro');
+      expect(reseal).toBeGreaterThan(carve);
+      expect(plan.args).not.toContain(sibling);
+    } finally {
+      plan?.cleanup();
+      rmSandboxScratch(root);
+    }
+  });
+
   it('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {
     if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
     const root = mkdtempSync(join(tmpdir(), 'scratch-sbx-tmux-args-'));

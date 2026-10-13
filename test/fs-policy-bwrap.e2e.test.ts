@@ -52,7 +52,13 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
   // Build the bwrap argv the SAME way the worker does (deny masks: mode-000
   // empty sources, missing mountpoints pre-created). Returns the created-mask
   // list too so cleanup tests can assert rmdir-if-empty.
-  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string } = {}) {
+  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: {
+    larkCliLinuxStore?: string;
+    larkTransportEnabled?: boolean;
+    botHome?: string;
+    mandatoryDenyPaths?: string[];
+    extraWritePaths?: string[];
+  } = {}) {
     const emptiesDir = join(S, 'sbx/empties');
     const emptyDir = join(S, 'sbx/empty');
     mkdirSync(emptiesDir, { recursive: true });
@@ -68,6 +74,8 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       userPaths: { readOnly: [join(S, 'ref'), ...(userPaths.readOnly ?? [])], readWrite: userPaths.readWrite, deny: userPaths.deny },
       larkCliLinuxStore: opts.larkCliLinuxStore,
       larkTransportEnabled: opts.larkTransportEnabled,
+      mandatoryDenyPaths: opts.mandatoryDenyPaths,
+      extraWritePaths: opts.extraWritePaths,
       net: true, writeRegexes: [],
     });
     policy.rules = policy.rules.filter(r => r.access === 'deny' || existsSync(r.path));
@@ -256,6 +264,33 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(run(args, `echo x > ${JSON.stringify(join(denied, 'evil'))} && echo WROTE`).out).not.toContain('WROTE');
     expect(existsSync(join(denied, 'evil'))).toBe(false);
     rmSync(denied, { recursive: true, force: true });
+  });
+
+  it('session-tmp mandatory seal hides sibling credentials while preserving this session snapshot', () => {
+    const shared = join(S, 'session-tmp');
+    const own = join(shared, 'profile/session-own');
+    const sibling = join(shared, 'profile/session-sibling');
+    mkdirSync(join(own, 'lark-cli-home'), { recursive: true });
+    mkdirSync(join(sibling, 'lark-cli-home'), { recursive: true });
+    writeFileSync(join(own, 'lark-cli-home/token.enc'), 'OWN_TOKEN');
+    writeFileSync(join(sibling, 'lark-cli-home/token.enc'), 'SIBLING_TOKEN');
+
+    const { args } = build({}, {
+      mandatoryDenyPaths: [shared],
+      extraWritePaths: [own],
+    });
+    expect(run(args, `cat ${JSON.stringify(join(own, 'lark-cli-home/token.enc'))}`).out)
+      .toContain('OWN_TOKEN');
+    expect(run(args, `echo refreshed > ${JSON.stringify(join(own, 'lark-cli-home/refreshed'))}`).status)
+      .toBe(0);
+    expect(readFileSync(join(own, 'lark-cli-home/refreshed'), 'utf8')).toContain('refreshed');
+
+    const siblingRead = run(args, `cat ${JSON.stringify(join(sibling, 'lark-cli-home/token.enc'))}`);
+    expect(siblingRead.status).not.toBe(0);
+    expect(siblingRead.out).not.toContain('SIBLING_TOKEN');
+    expect(run(args, `echo tampered > ${JSON.stringify(join(sibling, 'lark-cli-home/tampered'))}`).status)
+      .not.toBe(0);
+    expect(existsSync(join(sibling, 'lark-cli-home/tampered'))).toBe(false);
   });
 
   it('OMP state stays writable while only the current transcript directory is carved through the sessions mask', () => {

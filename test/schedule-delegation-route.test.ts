@@ -4,6 +4,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
+import { DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS } from '../src/core/schedule-delegated-runtime.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
 import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
@@ -67,6 +68,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     resolveUnionIdFromOpenId: async () => 'on_user',
     computeInputHash,
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+    DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS,
     TRIGGER_USER_AUTH_TOOLS,
     scheduleAuthorityStore: {},
     createHash,

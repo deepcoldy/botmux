@@ -187,6 +187,18 @@ describe('session application identity route', () => {
     const ready = await post('auth-status', { requestId: request.requestId });
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
   });
+  it('returns a sanitized 502 when the bound-app authorization start fails (not a 500)', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender' } as any);
+    vi.spyOn(tokens, 'requestUserAuthorization').mockRejectedValue(new Error('device_authorization_failed'));
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['sheets:spreadsheet:read'] }),
+    });
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'authorization_request_failed' });
+  });
   it('requires the current user’s grant and never uses the machine account', async () => {
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
     expect(await (await request('user')).json()).toMatchObject({ ok: false, error: expect.stringContaining('cli_bound') });

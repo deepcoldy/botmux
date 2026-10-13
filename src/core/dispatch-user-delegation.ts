@@ -17,7 +17,7 @@ const authorityV1Schema = z.object({
   appId: identity('cli_'),
   openId: identity('ou_'),
   unionId: identity('on_'),
-  tools: z.array(z.enum(['lark-cli', 'bytedcli'])).min(1).max(2),
+  tools: z.array(z.enum(['lark-cli', 'bytedcli', 'larkdev'])).min(1).max(3),
 }).strict();
 const scheduleCreateCapabilitySchema = z.object({
   action: z.literal('schedule:create'),
@@ -33,7 +33,7 @@ const authorityV2Schema = z.object({
   appId: identity('cli_'),
   openId: identity('ou_'),
   unionId: identity('on_'),
-  tools: z.array(z.enum(['lark-cli', 'bytedcli'])).max(2),
+  tools: z.array(z.enum(['lark-cli', 'bytedcli', 'larkdev'])).max(3),
   capabilities: z.array(scheduleCreateCapabilitySchema).min(1).max(64),
 }).strict();
 const payloadBase = {

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { enumerateScratchSecretPaths } from '../src/adapters/backend/scratch-credentials.js';
@@ -32,6 +32,12 @@ function layout() {
   writeFileSync(join(data(), 'vc-meeting-daemon-auth', '57'), 't');
   mkdirSync(join(data(), 'bytedcli-home', 'ou_p'), { recursive: true });
   writeFileSync(join(data(), 'bytedcli-home', 'ou_p', 'login.json'), '{}');
+  mkdirSync(join(data(), 'lark-cli-home', 'ou_p'), { recursive: true });
+  writeFileSync(join(data(), 'lark-cli-home', 'ou_p', 'token.enc'), 'personal');
+  mkdirSync(join(home(), '.larkdev', 'auth'), { recursive: true });
+  writeFileSync(join(home(), '.larkdev', 'auth', 'refresh.json'), 'bytecloud');
+  mkdirSync(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1'), { recursive: true });
+  mkdirSync(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-OTHER'), { recursive: true });
   // trigger-user identity (#1543 layout): <sid>.bin/ wrapper dir containing
   // .data/<tool>.env + turn; another person's session sits in a sibling .bin dir.
   mkdirSync(join(data(), 'cli-identity', 'sess-1.bin', '.data'), { recursive: true });
@@ -59,10 +65,13 @@ describe('enumerateScratchSecretPaths', () => {
       botmuxHomes: [home()],
       dataDirs: [data()],
       botsConfigPath: join(home(), 'bots.json'),
+      homeDir: home(),
       sessionId: 'sess-1',
+      sessionScratchDir: join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1'),
     });
     const got = new Set(secret.denyPaths);
     const carve = new Set(secret.readOnlyCarvePaths);
+    const writableCarve = new Set(secret.writableCarvePaths);
     expect(got.has(join(home(), 'bots.json'))).toBe(true);
     expect(got.has(`${join(home(), 'bots.json')}.bak-2`)).toBe(true);
     expect(got.has(join(home(), '.dashboard-secret'))).toBe(true);
@@ -77,6 +86,11 @@ describe('enumerateScratchSecretPaths', () => {
     // per-person secret dirs enclosed wholesale
     expect(got.has(join(data(), 'vc-meeting-daemon-auth'))).toBe(true);
     expect(got.has(join(data(), 'bytedcli-home'))).toBe(true);
+    expect(got.has(join(data(), 'lark-cli-home'))).toBe(true);
+    expect(got.has(join(home(), '.larkdev', 'auth'))).toBe(true);
+    expect(got.has(join(home(), '.cache', 'botmux', 'session-tmp'))).toBe(true);
+    expect(writableCarve.has(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1'))).toBe(true);
+    expect(writableCarve.has(join(home(), '.cache', 'botmux', 'session-tmp', 'profile', 'sess-OTHER'))).toBe(false);
     // cli-identity/ whole dir sealed, own session's <sid>.bin/ dir carved ro
     expect(got.has(join(data(), 'cli-identity'))).toBe(true);
     expect(carve.has(join(data(), 'cli-identity', 'sess-1.bin'))).toBe(true);
@@ -89,6 +103,31 @@ describe('enumerateScratchSecretPaths', () => {
     expect(got.has(join(home(), 'bin', 'botmux'))).toBe(false);
     expect(got.has(join(data(), 'schedules'))).toBe(false);
     delete process.env.LARKSUITE_CLI_DATA_DIR;
+  });
+
+  it.skipIf(process.platform === 'win32')('canonicalizes a symlinked HOME before carving the current session scratch', () => {
+    const realHome = join(root, 'real-home');
+    const linkedHome = join(root, 'linked-home');
+    mkdirSync(realHome, { recursive: true });
+    symlinkSync(realHome, linkedHome, 'dir');
+    const ownLexical = join(linkedHome, '.cache', 'botmux', 'session-tmp', 'profile', 'sess-1');
+    const siblingLexical = join(linkedHome, '.cache', 'botmux', 'session-tmp', 'profile', 'sess-OTHER');
+    mkdirSync(ownLexical, { recursive: true });
+    mkdirSync(siblingLexical, { recursive: true });
+
+    const secret = enumerateScratchSecretPaths({
+      botmuxHomes: [],
+      dataDirs: [],
+      homeDir: realpathSync(linkedHome),
+      sessionScratchDir: ownLexical,
+    });
+    const sharedCanonical = realpathSync(join(linkedHome, '.cache', 'botmux', 'session-tmp'));
+    const ownCanonical = realpathSync(ownLexical);
+    const siblingCanonical = realpathSync(siblingLexical);
+
+    expect(secret.denyPaths).toContain(sharedCanonical);
+    expect(secret.writableCarvePaths).toContain(ownCanonical);
+    expect(secret.writableCarvePaths).not.toContain(siblingCanonical);
   });
 
   it('adds external BOTS_CONFIG sidecar siblings outside the botmux home', () => {

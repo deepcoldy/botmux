@@ -259,7 +259,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.credentials.on_bytedcli_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：ByteCloud 鉴权失败处理流程', gateLabel: '仅当 bytedcli 在 triggerUserAuth.tools 内时注入',
+    label: '凭证：ByteCloud 鉴权失败处理流程', gateLabel: '仅当 bytedcli 或 larkdev 在 triggerUserAuth.tools 内时注入',
   },
   {
     key: 'ai.credentials.on_auth_link', block: 'credentials', stage: 'new', kind: 'editable',

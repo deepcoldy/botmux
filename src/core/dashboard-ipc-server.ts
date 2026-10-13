@@ -370,6 +370,13 @@ import {
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import {
+  beginLarkCliLogin,
+  completeLarkCliLogin,
+  larkCliHomeForTurn,
+  larkCliLoginScopes,
+  materializeLarkCliHomeForSession,
+} from '../services/lark-cli-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -2496,10 +2503,19 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', credentialType: 'user_access_token', credential: token });
 });
 
+type SessionAuthPollResult =
+  | { status: 'pending' }
+  // Personal-app trigger-user path: the acting identity is a HOME directory.
+  | { status: 'ready'; mode: 'user-home'; home: string }
+  // Standard session-bound lark tool (#1606): the acting identity is a
+  // Bot-application-issued user_access_token.
+  | { status: 'ready'; mode: 'app-token'; token: string }
+  | { status: 'failed'; error: string };
+
 const sessionAuthRequests = new Map<string, {
   sessionId: string;
   isCurrent: () => boolean;
-  poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+  poll: () => Promise<SessionAuthPollResult>;
 }>();
 
 for (const action of ['auth-request', 'auth-status']) {
@@ -2580,9 +2596,14 @@ for (const action of ['auth-request', 'auth-status']) {
       if (result.status === 'failed') {
         return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
       }
-      if (!boundTool && !refreshSessionIdentity(config.session.dataDir, params.sessionId, {
-        tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
-      })) {
+      // Personal-app trigger-user path publishes a per-turn HOME. The bound
+      // lark-tool path (#1606) owns NO trigger-user identity file — its token
+      // is served live by the narrow lark-tool-identity route — so it must not
+      // be written here (that would resurrect the removed Bot-app-token file).
+      if (result.mode === 'user-home'
+        && !refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+          tool: 'lark-cli', mode: 'user-home', home: result.home, turnId,
+        })) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
       return jsonRes(res, 200, { ok: true, status: 'ready' });
@@ -2602,21 +2623,97 @@ for (const action of ['auth-request', 'auth-status']) {
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
       return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     }
-    let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+    const requestId = randomBytes(32).toString('hex');
+    if (boundTool) {
+      // Standard session-bound lark tool (#1606): authorize against the Bot's
+      // own application and serve the resulting user_access_token live. This
+      // session's worker removed lark-cli from trigger-user tools, so it never
+      // uses the personal-app path below.
+      let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+      try {
+        authorization = await requestUserAuthorization(
+          cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, isCurrent,
+        );
+      } catch {
+        return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+      }
+      if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      sessionAuthRequests.set(requestId, {
+        sessionId: params.sessionId,
+        isCurrent,
+        poll: async () => {
+          const r = await authorization.poll();
+          if (r.status !== 'ready') return r;
+          return { status: 'ready', mode: 'app-token', token: r.token };
+        },
+      });
+      setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+      return jsonRes(res, 200, {
+        ok: true,
+        authUrl: authorization.authUrl,
+        requestId,
+        scopes: authorization.scopes,
+        expiresIn: authorization.expiresIn,
+        autoCallback: true,
+      });
+    }
+
+    // Trigger-user personal-app path: the sender selects/creates their own
+    // application first (stage app-setup), then authorizes the user against it;
+    // the acting identity published per turn is a HOME directory.
+    let authorization: Awaited<ReturnType<typeof beginLarkCliLogin>>;
     try {
-      authorization = await requestUserAuthorization(
-        cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, isCurrent,
-      );
+      const brand = normalizeBrand(cfg.brand);
+      authorization = await (brand === 'lark'
+        ? beginLarkCliLogin(callerOpenId, scopes, brand)
+        : beginLarkCliLogin(callerOpenId, scopes));
     } catch {
       return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
     }
     if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
-    const requestId = randomBytes(32).toString('hex');
-    sessionAuthRequests.set(requestId, { sessionId: params.sessionId, isCurrent, poll: authorization.poll });
-    setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+    if (!authorization) {
+      return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+    }
+    if (authorization.stage === 'app-setup') {
+      // Scope top-ups only make sense after the sender has a personal app. Hand
+      // the first-step URL back explicitly; never fall through to the Bot app.
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'personal_lark_app_required',
+        authUrl: authorization.authUrl,
+      });
+    }
+    const expiresIn = 9 * 60;
+    sessionAuthRequests.set(requestId, {
+      sessionId: params.sessionId,
+      isCurrent,
+      poll: async () => {
+        const completed = await completeLarkCliLogin(callerOpenId);
+        if (completed.state === 'pending') return { status: 'pending' };
+        if (completed.state === 'failed') {
+          return { status: 'failed', error: completed.detail ?? 'authorization_failed' };
+        }
+        const sandbox = ds.session.sandbox;
+        const home = sandbox === true || sandbox === 'oncall' || sandbox === 'scratch'
+          ? await materializeLarkCliHomeForSession(
+              callerOpenId,
+              config.session.dataDir,
+              params.sessionId,
+            )
+          : larkCliHomeForTurn(callerOpenId);
+        return home
+          ? { status: 'ready', mode: 'user-home', home }
+          : { status: 'failed', error: 'authorization_identity_unavailable' };
+      },
+    });
+    setTimeout(() => sessionAuthRequests.delete(requestId), expiresIn * 1_000).unref();
     return jsonRes(res, 200, {
-      ok: true, authUrl: authorization.authUrl, requestId,
-      scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
+      ok: true,
+      authUrl: authorization.authUrl,
+      requestId,
+      scopes: authorization.scopes ?? larkCliLoginScopes(scopes),
+      expiresIn,
+      autoCallback: true,
     });
   });
 }

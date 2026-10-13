@@ -1,6 +1,17 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
-import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+
+/**
+ * Persistent delegation currently grants only the legacy bytedcli run scope.
+ * Keep its isolation prerequisite pinned to the two tools that existed when
+ * those grants were issued; adding opt-in larkdev support must not revoke every
+ * stored schedule merely because the global supported-tool enum grew.
+ */
+export const DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS = [
+  'lark-cli',
+  'bytedcli',
+] as const satisfies readonly TriggerUserAuthTool[];
 
 export interface DelegatedScheduleRuntimeDependencies {
   runEnabled: boolean;
@@ -49,7 +60,9 @@ export async function authorizeDelegatedScheduleRun(
   if (authority.kind !== 'delegated') throw new Error('schedule authority is not delegated');
   if (authority.state !== 'active') throw new Error(`schedule authority state is ${authority.state}`);
   if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
-  if (!TRIGGER_USER_AUTH_TOOLS.every(tool => deps.triggerUserAuthTools.includes(tool))) {
+  if (!DELEGATED_SCHEDULE_REQUIRED_IDENTITY_TOOLS.every(
+    tool => deps.triggerUserAuthTools.includes(tool),
+  )) {
     throw new Error('delegated schedule requires triggerUserAuth isolation for every identity tool');
   }
   if (authority.runScopes.some(scope => !deps.hostRunScopes.includes(scope)

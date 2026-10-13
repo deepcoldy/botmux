@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { findRealToolBinary, renderIdentityWrapper } from '../src/core/cli-identity.js';
-import { scrubSessionTurnMarkerEnv } from '../src/utils/child-env.js';
+import { scrubCredentialLikeEnv, scrubSessionTurnMarkerEnv } from '../src/utils/child-env.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -21,7 +21,7 @@ describe('bytedcli provider process boundary', () => {
     mkdirSync(tools);
     const real = join(tools, 'bytedcli');
     writeFileSync(real, `#!/bin/sh
-if [ -n "$BOTMUX_IDENTITY_BIN$BOTMUX_SESSION_ID$BYTEDCLI_USER_CLOUD_JWT$AIME_USER_CLOUD_JWT$BYTEDCLI_PROFILE$BYTECLOUD_AUTH_ACCESS_KEY_ID$AIME_WORKSPACE_PATH$AIME_CURRENT_USER" ]; then
+if [ -n "$BOTMUX_IDENTITY_BIN$BOTMUX_SESSION_ID$BYTEDCLI_USER_CLOUD_JWT$AIME_USER_CLOUD_JWT$BYTEDCLI_PROFILE$BYTECLOUD_AUTH_ACCESS_KEY_ID$BYTECLOUD_AUTH_ACCESS_KEY_ID_I18N_TT$BYTECLOUD_CLI_API_JWT_TOKEN$BYTECLOUD_CLI_API_JWT_TOKEN_CN$BYTECLOUD_CLI_JWT_TOKEN$AIPAAS_BYTECLAW$AIME_WORKSPACE_PATH$AIME_CURRENT_USER$BYTEDCLI_SERVICE_ACCOUNT_JWT_US_TTP$BYTEDCLI_SERVICE_ACCOUNT_US_TTP_ACCESS_KEY_ID$BYTEDCLI_AI_AUTH_APP_KEY$BYTEDCLI_AI_AUTH_SUBJECT$BYTEDCLI_BYTECLOUD_AUTH_FALLBACK$BYTEDCLI_USE_ZTI_JWT$BYTEDCLI_MEEGO_ACCESS_TOKEN$BYTEDCLI_BYTEIO_WEB_COOKIE$SAFE_COOKIE" ]; then
   exit 77
 fi
 [ "$BYTECLOUD_AUTH_AS" = user ] || exit 78
@@ -49,6 +49,20 @@ esac
     vi.stubEnv('AIME_WORKSPACE_PATH', root);
     vi.stubEnv('AIME_CURRENT_USER', 'unrelated-user');
     vi.stubEnv('BYTECLOUD_AUTH_ACCESS_KEY_ID', 'unrelated-app');
+    vi.stubEnv('BYTECLOUD_AUTH_ACCESS_KEY_ID_I18N_TT', 'unrelated-regional-app');
+    vi.stubEnv('BYTECLOUD_CLI_API_JWT_TOKEN', 'unrelated-global-jwt');
+    vi.stubEnv('BYTECLOUD_CLI_API_JWT_TOKEN_CN', 'unrelated-cn-jwt');
+    vi.stubEnv('BYTECLOUD_CLI_JWT_TOKEN', 'unrelated-legacy-jwt');
+    vi.stubEnv('AIPAAS_BYTECLAW', '1');
+    vi.stubEnv('BYTEDCLI_SERVICE_ACCOUNT_JWT_US_TTP', 'unrelated-app-jwt');
+    vi.stubEnv('BYTEDCLI_SERVICE_ACCOUNT_US_TTP_ACCESS_KEY_ID', 'unrelated-app-ak');
+    vi.stubEnv('BYTEDCLI_AI_AUTH_APP_KEY', 'unrelated-ai-app');
+    vi.stubEnv('BYTEDCLI_AI_AUTH_SUBJECT', 'unrelated-subject');
+    vi.stubEnv('BYTEDCLI_BYTECLOUD_AUTH_FALLBACK', '1');
+    vi.stubEnv('BYTEDCLI_USE_ZTI_JWT', '1');
+    vi.stubEnv('BYTEDCLI_MEEGO_ACCESS_TOKEN', 'unrelated-meego-user');
+    vi.stubEnv('BYTEDCLI_BYTEIO_WEB_COOKIE', 'unrelated-byteio-user');
+    vi.stubEnv('SAFE_COOKIE', 'unrelated-safe-user');
     expect(findRealToolBinary('bytedcli', process.env.PATH)).toBe(real);
     vi.resetModules();
     const provider = await import('../src/services/bytedcli-auth.js');
@@ -69,9 +83,34 @@ esac
       GIT_ASKPASS: '/custom/cli-identity/old.bin/botmux-git-askpass',
       GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: 'old-helper',
       SESSION_DATA_DIR: '/custom', HTTPS_PROXY: 'https://proxy.example.test',
+      BYTECLOUD_CLI_API_JWT_TOKEN_US_TTP: 'stale-user',
+      BYTECLOUD_AUTH_SECRET_ACCESS_KEY_EU_TTP: 'stale-app',
+      BYTECLOUD_AUTH_AS: 'app',
+      AIPAAS_BYTECLAW: '1',
+      BYTEDCLI_SERVICE_ACCOUNT_JWT_FUTURE_EDGE: 'stale-app-jwt',
+      BYTEDCLI_SERVICE_ACCOUNT_FUTURE_EDGE_SECRET_ACCESS_KEY: 'stale-app-sk',
+      BYTEDCLI_AI_AUTH_APP_KEY: 'stale-ai-app',
+      BYTEDCLI_AI_AUTH_SUBJECT: 'stale-subject',
+      BYTEDCLI_BYTECLOUD_AUTH_FALLBACK: '1',
+      BYTEDCLI_USE_ZTI_JWT: '1',
     };
     scrubSessionTurnMarkerEnv(env);
     expect(env).toEqual({ PATH: '/usr/bin', SESSION_DATA_DIR: '/custom', HTTPS_PROXY: 'https://proxy.example.test' });
+  });
+
+  it('scrubs domain credentials accepted by bytedcli subcommands', () => {
+    const env: NodeJS.ProcessEnv = {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'https://proxy.example.test',
+      BYTEDCLI_MEEGO_ACCESS_TOKEN: 'meego-user',
+      BYTEDCLI_BYTEIO_WEB_COOKIE: 'byteio-user',
+      BYTEDCLI_OCEANUS_AUTH: 'oceanus-user',
+      SAFE_COOKIE: 'safe-user',
+      VOLCENGINE_ACCESS_KEY: 'volc-user',
+      LIBRA_APP_SECRET: 'libra-app',
+    };
+    scrubCredentialLikeEnv(env);
+    expect(env).toEqual({ PATH: '/usr/bin', HTTPS_PROXY: 'https://proxy.example.test' });
   });
 
   it('preserves ordinary shell customization and git configuration', () => {

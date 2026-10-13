@@ -22,8 +22,8 @@
  *
  * Paths that don't exist are skipped (the mask compiler existence-filters).
  */
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
+import { join, dirname, basename, resolve, sep } from 'node:path';
 import { homedir as osHomedir } from 'node:os';
 import { resolveLarkCliLinuxStoreDir } from '../cli/fs-policy.js';
 
@@ -44,6 +44,9 @@ export interface ScratchSecretInput {
    *  <sid>.<tool>.env/.bin/.turn files are returned as read-only carve paths
    *  (the governed CLI + `botmux send` need them). */
   sessionId?: string;
+  /** Current session's private cache tree. It is the only writable carve under
+   *  the otherwise sealed shared session-tmp parent. */
+  sessionScratchDir?: string;
 }
 
 export interface ScratchSecrets {
@@ -51,6 +54,8 @@ export interface ScratchSecrets {
   denyPaths: string[];
   /** Paths re-opened READ-ONLY inside an otherwise denied dir. */
   readOnlyCarvePaths: string[];
+  /** Paths re-opened READ+WRITE inside an otherwise denied shared dir. */
+  writableCarvePaths: string[];
 }
 
 // Trigger-user CLI identity lives in ONE per-session directory
@@ -73,13 +78,35 @@ function isDir(p: string): boolean {
   try { return lstatSync(p).isDirectory(); } catch { return false; }
 }
 
+/** Resolve symlink aliases when the path exists, while retaining a stable
+ * lexical fallback for optional paths that have not been created yet. */
+function canonical(p: string): string {
+  try { return realpathSync(p); } catch { return resolve(p); }
+}
+
 export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchSecrets {
   const out = new Set<string>();
   const readOnlyCarve = new Set<string>();
+  const writableCarve = new Set<string>();
   const homeDir = input.homeDir || osHomedir();
   const addFile = (p: string | undefined): void => {
     if (p && isFileOrLink(p)) out.add(p);
   };
+
+  // Session-local lark-cli HOME snapshots live below one shared cache parent.
+  // Scratch otherwise exposes the real filesystem for reads, so seal the whole
+  // parent and re-open only this session's own scratch tree. This is independent
+  // of triggerUserAuth: a non-participating session must not read a sibling's
+  // snapshot created by a participating bot.
+  const sessionTempRoot = canonical(resolve(homeDir, '.cache', 'botmux', 'session-tmp'));
+  if (isDir(sessionTempRoot)) out.add(sessionTempRoot);
+  if (input.sessionScratchDir) {
+    const ownScratchInput = resolve(input.sessionScratchDir);
+    const ownScratch = canonical(ownScratchInput);
+    if (ownScratch.startsWith(`${sessionTempRoot}${sep}`) && isDir(ownScratchInput)) {
+      writableCarve.add(ownScratch);
+    }
+  }
 
   for (const home of input.botmuxHomes) {
     let entries: string[];
@@ -137,10 +164,15 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
       }
     } catch { /* */ }
 
-    // Per-person secret subdirectories (whole dirs): VC daemon auth tokens
-    // and each person's bytedcli login HOME. The CLI never needs these inside
-    // a scratch turn (they are daemon-side / per-owner).
-    for (const secretDir of ['vc-meeting-daemon-auth', 'bytedcli-home']) {
+    // Per-person secret subdirectories (whole dirs): VC daemon auth tokens,
+    // bytedcli logins, and lark-cli personal apps/logins. The CLI receives only
+    // its own per-turn wrapper identity and must not enumerate another sender's
+    // HOME.
+    for (const secretDir of [
+      'vc-meeting-daemon-auth',
+      'bytedcli-home',
+      'lark-cli-home',
+    ]) {
       const p = join(dataDir, secretDir);
       if (isDir(p)) out.add(p);
     }
@@ -175,7 +207,23 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     if (existsSync(p)) out.add(p);
   }
 
-  return { denyPaths: [...out], readOnlyCarvePaths: [...readOnlyCarve] };
+  // larkdev's ByteCloud SDK keeps refresh/login state here. A governed wrapper
+  // always overrides LARKDEV_AUTH_DIR with an empty per-invocation directory,
+  // but scratch exposes the host tree for reads; mask both the default and an
+  // operator-configured auth root so the agent cannot bypass the wrapper by
+  // reading or invoking against the machine login directly.
+  for (const p of new Set<string>([
+    join(homeDir, '.larkdev', 'auth'),
+    ...(process.env.LARKDEV_AUTH_DIR?.startsWith('/') ? [process.env.LARKDEV_AUTH_DIR] : []),
+  ])) {
+    if (existsSync(p)) out.add(p);
+  }
+
+  return {
+    denyPaths: [...out],
+    readOnlyCarvePaths: [...readOnlyCarve],
+    writableCarvePaths: [...writableCarve],
+  };
 }
 
 /** Back-compat flat list (deny + ro-carve are all "secret-adjacent"); used by

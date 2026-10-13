@@ -599,6 +599,64 @@ export function isCliIdentityPath(value: string | undefined): boolean {
   return !!value && /(?:^|[\\/])cli-identity[\\/][^\\/]+\.bin(?:[\\/]|$)/.test(value);
 }
 
+/**
+ * ByteCloud credential environment variables understood by bytedcli and the
+ * shared ByteCloud Auth SDK (used by larkdev).
+ *
+ * The SDK deliberately gives these variables precedence over its on-disk
+ * login.  Consequently a private HOME / LARKDEV_AUTH_DIR is not an isolation
+ * boundary while one of them is inherited from the daemon, an enclosing agent
+ * session, or a previous botmux turn.  Keep the predicate in one place so the
+ * provider subprocesses and the session wrappers cannot drift.
+ */
+export function isByteCloudCredentialEnvKey(key: string): boolean {
+  return key === 'AIPAAS_BYTECLAW'
+    || key === 'AIME_USER_CLOUD_JWT'
+    || key === 'AIME_USER_CODE_JWT'
+    || key === 'BYTECLOUD_CLI_JWT_TOKEN'
+    || key === 'BYTECLOUD_AUTH_AS'
+    // bytedcli can override BYTECLOUD_AUTH_AS=user with `--as app` and then
+    // consume these application credentials.  They are identity-bearing just
+    // like the SDK AK/SK variables below, not harmless CLI configuration.
+    || key === 'BYTEDCLI_AI_AUTH_APP_KEY'
+    || key === 'BYTEDCLI_AI_AUTH_SUBJECT'
+    || key === 'BYTEDCLI_BYTECLOUD_AUTH_FALLBACK'
+    || key === 'BYTEDCLI_USE_ZTI_JWT'
+    || /^BYTEDCLI_SERVICE_ACCOUNT_[A-Z0-9_]+$/.test(key)
+    || /^BYTECLOUD_CLI_API_JWT_TOKEN(?:_[A-Z0-9_]+)?$/.test(key)
+    || /^BYTECLOUD_AUTH_ACCESS_KEY_ID(?:_[A-Z0-9_]+)?$/.test(key)
+    || /^BYTECLOUD_AUTH_SECRET_ACCESS_KEY(?:_[A-Z0-9_]+)?$/.test(key)
+    // Older SDK call sites use the same AK/SK names without the AUTH segment.
+    || /^BYTECLOUD_ACCESS_KEY_ID(?:_[A-Z0-9_]+)?$/.test(key)
+    || /^BYTECLOUD_SECRET_ACCESS_KEY(?:_[A-Z0-9_]+)?$/.test(key);
+}
+
+/**
+ * Credentials accepted directly by governed CLIs outside the shared
+ * ByteCloud SDK. bytedcli is a toolbox whose subcommands also accept domain
+ * tokens, cookies, passwords and AK/SK pairs; inheriting any one of them would
+ * let a turn act as the daemon operator even when its ByteCloud JWT is isolated.
+ */
+export function isCredentialLikeEnvKey(key: string): boolean {
+  return isByteCloudCredentialEnvKey(key)
+    || /(?:TOKEN|JWT|COOKIE|PASSWORD|SECRET|ACCESS_KEY|AUTHORIZATION)/.test(key)
+    || key === 'BYTEDCLI_OCEANUS_AUTH';
+}
+
+/** Delete ambient credentials before starting a governed CLI provider. */
+export function scrubCredentialLikeEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of Object.keys(env)) {
+    if (isCredentialLikeEnvKey(key)) delete env[key];
+  }
+}
+
+/** Delete every inherited ByteCloud user/app identity from `env` in place. */
+export function scrubByteCloudCredentialEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of Object.keys(env)) {
+    if (isByteCloudCredentialEnvKey(key)) delete env[key];
+  }
+}
+
 export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
   delete env.BOTMUX_LARK_TOOL_BINDING;
   const bin = env.BOTMUX_IDENTITY_BIN?.replace(/[\\/]+$/, '');
@@ -623,9 +681,9 @@ export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
   }
   for (const key of [
     'BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT', 'BYTEDCLI_USER_CB_OAUTH_AT',
-    'AIME_USER_CLOUD_JWT', 'AIME_USER_CODE_JWT',
     'LARKSUITE_CLI_USER_ACCESS_TOKEN',
   ]) delete env[key];
+  scrubByteCloudCredentialEnv(env);
 }
 
 /** Proxy env vars that must reach the CLI child process so it can dial the

@@ -119,6 +119,20 @@ function canonical(p: string): string {
   try { return realpathSync(p); } catch { return resolve(p); }
 }
 
+/** Compile the later-wins RW binds for trusted paths below a sealed root. */
+export function compileScratchWritableCarveArgs(
+  denies: readonly string[],
+  writableCarves: readonly string[],
+): string[] {
+  const args: string[] = [];
+  for (const p of writableCarves) {
+    if (denies.some(d => d === p || isWithin(d, p))) {
+      args.push('--bind', p, p);
+    }
+  }
+  return args;
+}
+
 function hasCmd(cmd: string): boolean {
   return spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
 }
@@ -332,7 +346,7 @@ export interface PrepareScratchOpts {
    *  files under the otherwise-sealed cli-identity/ dir). Bound READ-ONLY. */
   readOnlyCarvePaths?: readonly string[];
   /** Host paths that must be READ+WRITABLE inside even under a denied dir
-   *  (the outbox is handled internally; reserved for future carve-outs). */
+   *  (the outbox is handled internally). */
   writableCarvePaths?: readonly string[];
   /** Env keys the WORKER may repoint at the host-side merged tree for its own
    *  transcript reads (CODEX_HOME / TRAE_HOME). The container child must keep
@@ -509,7 +523,15 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   // Real-host passthrough carve-outs layered AFTER deny masks (later mount
   // wins). The outbox MUST stay host-real: the daemon watcher reads it without
   // any merged-tree awareness.
-  const carveTargets = new Set<string>([outbox]);
+  const writableCarves = new Set<string>();
+  for (const raw of opts.writableCarvePaths ?? []) {
+    if (typeof raw !== 'string' || !raw) continue;
+    try {
+      const p = canonical(raw);
+      if (isAbsolute(p) && existsSync(p)) writableCarves.add(p);
+    } catch { /* missing/invalid carve */ }
+  }
+  const carveTargets = new Set<string>([outbox, ...writableCarves]);
 
   // ── bwrap argv ───────────────────────────────────────────────────────────
   const args: string[] = [];
@@ -640,6 +662,11 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       args.push('--ro-bind', f, f);
     }
   }
+
+  // Writable carve-outs use host-real binds after the broad empty/tmpfs mask.
+  // Only emit a carve that is actually below a denied root; a standalone bind
+  // would unnecessarily bypass scratch COW semantics.
+  args.push(...compileScratchWritableCarveArgs(denies, [...writableCarves]));
 
   // fnm/nvm/volta bin farms under /run get masked by the fresh /run tmpfs.
   args.push(...reexposeRunBinArgs([opts.cliBin, process.execPath]));
