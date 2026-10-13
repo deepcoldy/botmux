@@ -4,6 +4,7 @@ import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
 import { cliIdForComm, findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
 function makeScheduler() {
@@ -59,6 +60,8 @@ function runWorkerWiring(late: boolean, options: {
   // codex descendant must be discovered), 'codex' a direct native install (no
   // descendant scan may run).
   comm?: string;
+  /** argv of the pane pid (100); defaults to a plain launcher. */
+  paneCmdline?: string[];
   cliRuntime?: { source: string; executable: string };
 } = {}) {
   const scheduler = makeScheduler();
@@ -88,6 +91,8 @@ function runWorkerWiring(late: boolean, options: {
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
+    readCmdline: (pid: number) => (pid === 100 ? (options.paneCmdline ?? ['launcher']) : []),
+    isProgramStatusRelayArgv,
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
   };
@@ -111,6 +116,23 @@ describe('worker wrapper PID wiring', () => {
     expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'claude-code');
     expect(result.backend.cliPid).toBe(200);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  const RELAY_ARGV = ['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', 'e30='];
+  it.each([false, true])('resolves Claude behind the OSC 7501 relay without a wrapperCli (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', paneCmdline: RELAY_ARGV });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'claude-code');
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('resolves Claude behind the relay even under sandbox (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true,
+      paneCmdline: ['/opt/botmux', '__program-status-relay', 'e30='],
+    });
+    expect(result.backend.cliPid).toBe(200);
   });
 
   it.each([false, true])('attests the native Codex child behind the standard npm launcher (late PID=%s)', late => {

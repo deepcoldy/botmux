@@ -333,6 +333,7 @@ import {
   findLaunchedCliPid,
   scheduleWrapperRealCliPid,
   readComm,
+  readCmdline,
   cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
@@ -443,6 +444,7 @@ import {
   type IdleEvidenceSource,
 } from './utils/idle-detector.js';
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
+import { isProgramStatusRelayArgv, programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { inspectPostTerminalComposer, resolvePtyInputPolicy } from './utils/pty-input-policy.js';
 import {
@@ -12436,7 +12438,13 @@ function onPtyData(data: string, isLiveStream = true): void {
         spawnArgvTurnStartEvidenceSeen = true;
         spawnArgvTurnStartBusyScanTail = '';
       }
+      const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
       idleDetector?.observeProgramStatus(part.event);
+      if (!wasAuthoritative && idleDetector?.programStatusActive()) {
+        // The probe log above only proves a probe was seen and answered; an
+        // accepted status report is the evidence the CLI took the handshake.
+        log(`[program-status] status received (state=${part.event.state}); authority engaged`);
+      }
     } else if (part.type === 'data') {
       handlePtyDataChunk(part.text);
     }
@@ -19169,6 +19177,25 @@ async function spawnCli(
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
     }
+    if (
+      !cfg.adoptMode && !willReattachPersistent && effectiveBackendType === 'tmux'
+      && cliAdapter.id === 'claude-code' && cliAdapter.supportsProgramStatus
+      && process.env.BOTMUX_PROGRAM_STATUS_RELAY !== '0'
+    ) {
+      // tmux answers the CLI's DA1 sentinel itself, before the worker can see
+      // the OSC 7501 probe via pipe-pane, so Claude Code would disable program
+      // status. An in-pane relay answers the probe ahead of the DA1 query
+      // (src/program-status-relay.ts). The pane pid becomes the relay; the
+      // real CLI pid is resolved below (startWrapperRealPidResolve).
+      const relayed = programStatusRelayLaunch(spawnBin, spawnArgs);
+      if (relayed) {
+        spawnBin = relayed.bin;
+        spawnArgs = relayed.args;
+        log('[program-status] launching CLI behind in-pane OSC 7501 relay');
+      } else {
+        log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
+      }
+    }
     if (!cfg.adoptMode && !willReattachPersistent && !isRemoteBackendType(effectiveBackendType)) {
       // Wrap the command executed INSIDE the pane, not `tmux new-session`.
       // The shared tmux server keeps its own cgroup while the owned CLI and all
@@ -19410,15 +19437,21 @@ async function spawnCli(
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
   const startWrapperRealPidResolve = (launcherPid: number): void => {
+    // The OSC 7501 relay is the same launcher shape (pane pid = relay, CLI is a
+    // descendant). Detected from the live cmdline rather than this spawn's
+    // decision so a daemon-restart reattach to a relayed pane is covered too.
+    const viaRelay = isProgramStatusRelayArgv(readCmdline(launcherPid));
+    const viaWrapper = !!cfg.wrapperCli?.trim() && !sandboxRequested;
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
+    if ((!viaWrapper && !viaRelay) || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
+    const launcherLabel = viaWrapper ? `wrapperCli "${cfg.wrapperCli}"` : 'program-status relay';
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
-        log(`wrapperCli "${cfg.wrapperCli}": resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${targetCliId}); rewiring session discovery + bridge`);
+        log(`${launcherLabel}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${targetCliId}); rewiring session discovery + bridge`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
         // module-level bridgeCliPid and re-points to the real CLI's jsonl.
