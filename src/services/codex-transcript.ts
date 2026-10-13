@@ -46,13 +46,15 @@ import {
   readdirSync,
   readlinkSync,
   readSync,
+  realpathSync,
   statSync,
   type Dirent,
 } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
-import { join } from 'node:path';
-import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
+import { codexHome, codexHistoryPath } from './codex-paths.js';
+import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { CodexThreadSettings } from './codex-service-tier.js';
 // cot-subject 只用语言内建，等价于内联，不违反本模块 dependency-free 口径。
@@ -66,9 +68,10 @@ const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
  *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
  *  the UUID alone — the `<ts>` segment between "rollout-" and the sid
  *  contains its own dashes that would otherwise let a greedy match swallow
- *  parts of the sid. Returns undefined for paths that don't match. */
+ *  parts of the sid. An optional `_UUID` identifies a file generation, not a
+ *  different session. Returns undefined for paths that don't match. */
 export function codexSessionIdFromRolloutPath(path: string): string | undefined {
-  const m = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
+  const m = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i.exec(basename(path));
   return m ? m[1] : undefined;
 }
 
@@ -697,17 +700,51 @@ function runtimeFromCodexEntry(obj: any): { model?: string; reasoningEffort?: st
   };
 }
 
-/** Locate the rollout file for a given Codex sessionId. Codex names files
- *  `rollout-<ts>-<sid>.jsonl`, so a suffix match is unambiguous. The
- *  directory tree is small (year/month/day) — a one-shot recursive scan
- *  is cheap enough that we don't bother caching. */
+/** Inspect the first session_meta line within a bounded header read. */
+function rolloutHeaderSessionId(path: string, noFollow = false): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | (noFollow ? constants.O_NOFOLLOW : 0));
+    if (!fstatSync(fd).isFile()) return undefined;
+    const bytes = Buffer.alloc(64 * 1024);
+    const count = readSync(fd, bytes, 0, bytes.length, 0);
+    const end = bytes.subarray(0, count).indexOf(0x0a);
+    if (end < 0) return undefined;
+    const row = JSON.parse(bytes.subarray(0, end).toString('utf8'));
+    return row?.type === 'session_meta' && typeof row.payload?.id === 'string'
+      ? row.payload.id : undefined;
+  } catch { return undefined; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function indexedCodexRollout(home: string, sessionsRoot: string, sid: string): string | undefined {
+  const dbPath = join(home, 'state_5.sqlite');
+  if (!existsSync(dbPath)) return undefined;
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (!db) return undefined;
+  try {
+    const row = db.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(sid) as { rollout_path?: unknown } | undefined;
+    const path = row?.rollout_path;
+    if (typeof path !== 'string' || !isAbsolute(path)
+      || codexSessionIdFromRolloutPath(path)?.toLowerCase() !== sid.toLowerCase()) return undefined;
+    const rel = relative(realpathSync(sessionsRoot), realpathSync(path));
+    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+    if (!statSync(path).isFile() || rolloutHeaderSessionId(path)?.toLowerCase() !== sid.toLowerCase()) return undefined;
+    return path;
+  } catch { return undefined; }
+  finally { db.close(); }
+}
+
+/** Prefer Codex's exact thread index: resumed sessions can have several
+ * generations named rollout-<ts>-<sid>[_<generation>].jsonl. Without an index,
+ * choose the latest generation by filename creation order, never by mtime
+ * (copying/touching an old rollout must not make it active again). */
 export function findCodexRolloutBySessionId(
   cliSessionId: string,
   opts?: { codexHome?: string; noFollow?: boolean },
 ): string | undefined {
-  const sessionsRoot = opts?.codexHome
-    ? join(opts.codexHome, 'sessions')
-    : codexSessionsRoot();
+  const home = opts?.codexHome ?? codexHome();
+  const sessionsRoot = join(home, 'sessions');
   if (!cliSessionId) return undefined;
   try {
     // BOT_HOME is untrusted and requires no-follow roots. A normal CODEX_HOME
@@ -718,7 +755,11 @@ export function findCodexRolloutBySessionId(
   } catch {
     return undefined;
   }
-  const suffix = `-${cliSessionId}.jsonl`;
+  // SQLite opens sidecars itself; no-follow BOT_HOME lookups deliberately use
+  // the bounded scan instead of trusting database/sidecar symlink traversal.
+  const indexed = opts?.noFollow ? undefined : indexedCodexRollout(home, sessionsRoot, cliSessionId);
+  if (indexed) return indexed;
+  let newest: string | undefined;
   const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
   let visitedEntries = 0;
   while (stack.length > 0) {
@@ -756,10 +797,13 @@ export function findCodexRolloutBySessionId(
           if (!opts?.noFollow || depth < UNTRUSTED_SESSION_SCAN_MAX_DEPTH) {
             stack.push({ dir: full, depth: depth + 1 });
           }
-        } else if (isFile && entry.name.endsWith(suffix)) {
+        } else if (isFile && codexSessionIdFromRolloutPath(entry.name)?.toLowerCase() === cliSessionId.toLowerCase()) {
           try {
             const fileStat = opts?.noFollow ? lstatSync(full) : statSync(full);
-            if (fileStat.isFile()) return full;
+            if (!fileStat.isFile()) continue;
+            const headerSid = rolloutHeaderSessionId(full, opts?.noFollow);
+            if (headerSid && headerSid.toLowerCase() !== cliSessionId.toLowerCase()) continue;
+            if (!newest || entry.name > basename(newest)) newest = full;
           } catch {
             continue;
           }
@@ -769,7 +813,7 @@ export function findCodexRolloutBySessionId(
       try { directory.closeSync(); } catch { /* already closed */ }
     }
   }
-  return undefined;
+  return newest;
 }
 
 function codexHistoryCliSessionId(parsed: unknown): string | undefined {
