@@ -441,6 +441,21 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(ds.hasHistory).toBe(false);
   });
 
+  it('renders dynamic date and owner placeholders before creating the text root', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      topicTitle: '{{date:-1d}} 工作总结（00:00-24:00） {{owner}}',
+      ownerOpenId: 'ou_owner123',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    const title = sendMessageMock.mock.calls[0][2] as string;
+    expect(title).toMatch(/^\d{4}-\d{2}-\d{2} 工作总结（00:00-24:00） /);
+    expect(title).toContain('<at user_id="ou_owner123"></at>');
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
   it('uses the standard task-start notice when no custom title is configured', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ executionPosition: 'new-topic', chatType: 'group' }), active, refreshCliVersion);
@@ -482,6 +497,27 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(active.size).toBe(2);
     expect(new Set([...active.values()].map(ds => ds.session.sessionId)).size).toBe(2);
     expect(new Set([...active.values()].map(ds => ds.session.deferredScheduleRun?.routingAnchor)).size).toBe(2);
+  });
+
+  it('fails closed when a silent fresh-topic task uses a runtime title template', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      silent: true,
+      topicTitle: '{{date:-1d}} 日报 {{owner}}',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion)).rejects.toThrow('topic_title_template_silent_unsupported');
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it('does not render a hidden topic title after switching to top-level', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'top-level',
+      topicTitle: '{{owner}}',
+      ownerOpenId: undefined,
+    }), active, refreshCliVersion)).resolves.toBeUndefined();
   });
 
   it('thread task without a real root safely degrades to silent chat scope', async () => {
@@ -531,8 +567,6 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
 
     await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
 
-    // No Lark root ever created, no second virtual session: both fires share one
-    // stable slot (contrast: new-topic mints a per-run anchor/session each time).
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(active.size).toBe(1);
     expect(active.has(sessionKey(taskAnchor, APP))).toBe(true);
@@ -541,8 +575,6 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     const secondTurn = (forkWorkerMock.mock.calls[1][2] as { turnId: string }).turnId;
     expect(secondTurn).not.toBe(firstTurn);
     const ds = active.get(sessionKey(taskAnchor, APP))!;
-    // The deferred marker now belongs to the NEW turn — a first `botmux send`
-    // during turn 1 must not steal materialization ownership (turn equality).
     expect(ds.session.deferredScheduleRun?.turnId).toBe(secondTurn);
     expect(ds.session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
     expect(ds.silentScheduledTurns?.has(secondTurn)).toBe(true);
