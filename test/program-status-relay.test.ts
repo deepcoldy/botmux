@@ -132,12 +132,18 @@ describe('program-status relay launch plan', () => {
     const launch = compiledLaunch('/usr/bin/claude', []);
     // What the pane runs once the loader-env shim has exec'd.
     expect(isProgramStatusRelayArgv(launch.args.slice(3))).toBe(true);
-    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/p'])).toBe(true);
-    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
-    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '--no-env-file', '--config=/dev/null', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
+    const plan = '/tmp/botmux-psr-AbC123/plan.json';
+    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', plan])).toBe(true);
+    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '--no-env-file', '--config=/dev/null', '/src/botmux/src/program-status-relay.ts', plan])).toBe(true);
     // macOS `ps` fallback whitespace-splits a checkout path containing spaces.
-    expect(isProgramStatusRelayArgv('/opt/homebrew/bin/bun --no-env-file --config=/dev/null /Users/a/My Projects/botmux/src/program-status-relay.ts /tmp/p'.split(' '))).toBe(true);
+    expect(isProgramStatusRelayArgv(`/opt/homebrew/bin/bun --no-env-file --config=/dev/null /Users/a/My Projects/botmux/src/program-status-relay.ts ${plan}`.split(' '))).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--resume'])).toBe(false);
+  });
+
+  it('does not mistake an ordinary CLI argument naming the relay file for a relay', () => {
+    expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--system-prompt-file', '/tmp/program-status-relay.ts'])).toBe(false);
+    expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--system-prompt-file', '/tmp/program-status-relay.ts', '--verbose'])).toBe(false);
+    expect(isProgramStatusRelayArgv(['/usr/bin/claude', 'program-status-relay.js', 'plan.json'])).toBe(false);
   });
 
   it('keeps the CLI name out of argv so discovery never mistakes the relay for the CLI', () => {

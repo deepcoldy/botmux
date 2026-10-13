@@ -122,11 +122,20 @@ export function consumeProgramStatusRelayPlan(planPath: string | undefined): Pro
   return { bin: plan.bin, args: plan.args };
 }
 
+/** A relay argv ENDS with its entry (hidden subcommand or script) followed by
+ *  the plan path this module minted. Matching that tail — rather than any
+ *  token — keeps an ordinary CLI argument that merely names a file
+ *  `program-status-relay.ts` from passing; matching on the joined string keeps
+ *  working when macOS readCmdline() falls back to `ps` and whitespace-splits a
+ *  path containing spaces. */
+const RELAY_ARGV_TAIL = new RegExp(
+  `(?:^|[ /])(?:${RELAY_TOKEN}|${RELAY_SCRIPT.replace('.', '\\.')}|${RELAY_SOURCE.replace('.', '\\.')})`
+  + ` \\S*/${PLAN_DIR_PREFIX}[^/ ]+/${PLAN_FILE.replace('.', '\\.')}$`,
+);
+
 /** True when a process argv (`/proc/<pid>/cmdline`) is a program-status relay.
- *  Node: `<node> …/program-status-relay.js <plan>`; compiled: `<binary> __program-status-relay <plan>`. */
+ *  Node: `<node> …/program-status-relay.js <plan>`; Bun adds runtime flags
+ *  before the script; compiled: `<binary> __program-status-relay <plan>`. */
 export function isProgramStatusRelayArgv(argv: readonly string[]): boolean {
-  // Whole argv, not a fixed prefix: on macOS readCmdline() falls back to `ps`
-  // and whitespace-splits it, so an entry path containing spaces spreads over
-  // several tokens (its last fragment still ends in the entry's basename).
-  return argv.some(a => a === RELAY_TOKEN || basename(a) === RELAY_SCRIPT || basename(a) === RELAY_SOURCE);
+  return RELAY_ARGV_TAIL.test(argv.join(' '));
 }

@@ -19477,7 +19477,7 @@ async function spawnCli(
     // daemon-restart reattach to an already-relayed pane is recognised from
     // its cmdline.
     const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
-      || isProgramStatusRelayArgv(readCmdline(panePid));
+      || (effectiveBackendType === 'tmux' && isProgramStatusRelayArgv(readCmdline(panePid)));
     if (!viaRelay) { resolveBehindWrapper(panePid, panePid); return; }
     if (!claudeDataDir && cfg.cliId !== 'codex') return;
     scheduleWrapperRealCliPid(panePid, {

@@ -67,6 +67,7 @@ function runWorkerWiring(late: boolean, options: {
   execAfterReads?: number;
   /** Direct children of the relay (pid 100). Defaults to the single child 150. */
   relayChildren?: number[];
+  backendType?: string;
   /** This spawn wrapped the CLI in the OSC 7501 relay / backend reused an existing pane. */
   relayLaunched?: boolean;
   reattached?: boolean;
@@ -111,6 +112,7 @@ function runWorkerWiring(late: boolean, options: {
     getChildPids: (pid: number) => (pid === 100 ? (options.relayChildren ?? [150]) : []),
     isProgramStatusRelayArgv,
     programStatusRelayLaunched: options.relayLaunched ?? false,
+    effectiveBackendType: options.backendType ?? 'tmux',
     actuallyReattachedPersistent: options.reattached ?? false,
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
     setTimeout: scheduler.schedule, log: vi.fn(),
@@ -161,6 +163,22 @@ describe('worker wrapper PID wiring', () => {
       paneCmdline: ['/bin/sh', '-c', 'exec "$@"'], paneCmdlineAfterExec: RELAY_ARGV, execAfterReads: 3,
     });
     expect(result.backend.cliPid).toBe(150);
+  });
+
+  it.each([false, true])('never treats a non-tmux CLI as relayed, even if its argv looks like one (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', backendType: 'pty', paneCmdline: RELAY_ARGV,
+    });
+    expect(result.backend.cliPid).toBe(100);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(150);
+  });
+
+  it.each([false, true])('does not treat a Claude arg naming the relay file as a relay (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      paneCmdline: ['/root/.local/bin/claude', '--system-prompt-file', '/tmp/program-status-relay.ts'],
+    });
+    expect(result.backend.cliPid).toBe(100);
   });
 
   it.each([false, true])('does not bind an ambiguous child set (late PID=%s)', late => {
