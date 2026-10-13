@@ -20,6 +20,7 @@ import {
 } from '../src/utils/program-status-probe-relay.js';
 import {
   consumeProgramStatusRelayPlan,
+  restoreRelayLoaderEnv,
   isProgramStatusRelayArgv,
   programStatusRelayLaunch,
 } from '../src/core/program-status-relay-launch.js';
@@ -99,8 +100,9 @@ describe('program-status relay launch plan', () => {
 
   it('round-trips the wrapped command through a private plan file that is consumed once read', () => {
     const launch = compiledLaunch('/usr/bin/claude', ['--resume', 'x y', '']);
-    expect(launch.args[0]).toBe('__program-status-relay');
-    const planPath = launch.args[1];
+    const relayArgv = launch.args.slice(3);
+    expect(relayArgv.slice(1, 2)).toEqual(['__program-status-relay']);
+    const planPath = relayArgv[2];
     expect(statSync(planPath).mode & 0o777).toBe(0o600);
     expect(consumeProgramStatusRelayPlan(planPath)).toEqual({ bin: '/usr/bin/claude', args: ['--resume', 'x y', ''] });
     expect(existsSync(dirname(planPath))).toBe(false);
@@ -110,7 +112,7 @@ describe('program-status relay launch plan', () => {
   it('cleanup removes an unconsumed plan (spawn failed / pane reattached)', () => {
     const launch = compiledLaunch('/usr/bin/claude', []);
     launch.cleanup();
-    expect(existsSync(dirname(launch.args[1]))).toBe(false);
+    expect(existsSync(dirname(launch.args.at(-1)!))).toBe(false);
   });
 
   it('adds a constant-size argv regardless of the wrapped command (tmux caps new-session at ~16 KB)', () => {
@@ -118,7 +120,7 @@ describe('program-status relay launch plan', () => {
     const large = compiledLaunch('/usr/bin/claude', ['x'.repeat(12_000)]);
     const len = (a: string[]) => a.join(' ').length;
     expect(len(large.args)).toBe(len(small.args));
-    expect(len(large.args)).toBeLessThan(200);
+    expect(len(large.args)).toBeLessThan(600);
   });
 
   it.skipIf(!!process.versions.bun)('declines (CLI launched directly) when the entry only exists as Node-unrunnable source', () => {
@@ -128,7 +130,8 @@ describe('program-status relay launch plan', () => {
 
   it('is recognisable from its argv, in the compiled, dist and source forms', () => {
     const launch = compiledLaunch('/usr/bin/claude', []);
-    expect(isProgramStatusRelayArgv([launch.bin, ...launch.args])).toBe(true);
+    // What the pane runs once the loader-env shim has exec'd.
+    expect(isProgramStatusRelayArgv(launch.args.slice(3))).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/p'])).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/bun', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--resume'])).toBe(false);
@@ -139,6 +142,20 @@ describe('program-status relay launch plan', () => {
     const planPath = compiledLaunch('/root/.local/bin/claude', ['--model', 'opus']).args.at(-1)!;
     expect(cliIdFromCommArgv('bun', ['bun', '/opt/botmux/dist/program-status-relay.js', planPath])).toBeUndefined();
     expect(cliIdFromCommArgv('node', ['node', '/opt/botmux/dist/program-status-relay.js', planPath])).toBeUndefined();
+  });
+
+  it('starts the relay without bot loader options and hands them back to the CLI', () => {
+    // The relay runs outside any sandbox; a NODE_OPTIONS preload must not run there.
+    const launch = compiledLaunch('/usr/bin/claude', []);
+    const probe = `process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([k]) => /NODE_OPTIONS|BUN_OPTIONS/.test(k)))))`;
+    const shimArgs = [...launch.args.slice(0, 3), process.execPath, '-e', probe];
+    const run = (env: NodeJS.ProcessEnv) => JSON.parse(spawnSync(launch.bin, shimArgs, { env, encoding: 'utf8' }).stdout) as Record<string, string>;
+    const base = { PATH: process.env.PATH ?? '' };
+    const parked = run({ ...base, NODE_OPTIONS: '--require /evil.js', BUN_OPTIONS: '' });
+    expect(parked).toEqual({ __BOTMUX_PSR_NODE_OPTIONS: '--require /evil.js', __BOTMUX_PSR_BUN_OPTIONS: '' });
+    expect(run(base)).toEqual({});
+    expect(restoreRelayLoaderEnv({ ...parked, KEEP: '1' })).toEqual({ NODE_OPTIONS: '--require /evil.js', BUN_OPTIONS: '', KEEP: '1' });
+    expect(restoreRelayLoaderEnv({ KEEP: '1' })).toEqual({ KEEP: '1' });
   });
 
   it('rejects a missing or malformed plan', () => {

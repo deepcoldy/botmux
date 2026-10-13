@@ -29,6 +29,29 @@ const RELAY_SOURCE = 'program-status-relay.ts';
 const PLAN_FILE = 'plan.json';
 const PLAN_DIR_PREFIX = 'botmux-psr-';
 
+/** Interpreter startup options a bot may configure for its CLI. The relay runs
+ *  OUTSIDE any sandbox/credential wrapper, so a `--require`/`--import` preload
+ *  in them must not execute there: the launch shim parks them under a private
+ *  name before exec'ing the relay, and the relay restores them for the CLI. */
+const LOADER_ENV_KEYS = ['NODE_OPTIONS', 'BUN_OPTIONS'] as const;
+const PARKED_PREFIX = '__BOTMUX_PSR_';
+const PARK_LOADER_ENV_SCRIPT = LOADER_ENV_KEYS
+  .map(k => `if [ -n "\${${k}+x}" ]; then ${PARKED_PREFIX}${k}=\$${k}; export ${PARKED_PREFIX}${k}; unset ${k}; fi`)
+  .join('; ') + '; exec "$@"';
+
+/** Child env for the CLI: parked loader options restored, parking names removed. */
+export function restoreRelayLoaderEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const key of LOADER_ENV_KEYS) {
+    const parked = PARKED_PREFIX + key;
+    if (parked in out) {
+      out[key] = out[parked];
+      delete out[parked];
+    }
+  }
+  return out;
+}
+
 /** Resolve the relay entry, or null when it cannot be executed from here. That
  *  is the case when the worker runs from source: resolveEntrySpawn points at
  *  `src/program-status-relay.js`, which does not exist, and under Node a `.ts`
@@ -60,8 +83,8 @@ export function programStatusRelayLaunch(
   const plan: ProgramStatusRelayPlan = { bin, args };
   writeFileSync(planPath, JSON.stringify(plan), { mode: 0o600 });
   return {
-    bin: entry.command,
-    args: [...entry.args, planPath],
+    bin: '/bin/sh',
+    args: ['-c', PARK_LOADER_ENV_SCRIPT, 'botmux-program-status-relay', entry.command, ...entry.args, planPath],
     cleanup: () => { rmSync(dir, { recursive: true, force: true }); },
   };
 }

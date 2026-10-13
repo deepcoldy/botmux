@@ -334,6 +334,7 @@ import {
   scheduleWrapperRealCliPid,
   readComm,
   readCmdline,
+  getChildPids,
   cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
@@ -19443,30 +19444,53 @@ async function spawnCli(
   // wrapperCli is ignored, so there is no launcher indirection). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
-  const startWrapperRealPidResolve = (launcherPid: number): void => {
-    // The OSC 7501 relay is the same launcher shape (pane pid = relay, CLI is a
-    // descendant). A fresh relayed launch is known from this spawn's decision —
-    // the pane may still be the launch shell that has not exec'd the relay yet,
-    // so its cmdline cannot be trusted at this instant. A daemon-restart
-    // reattach to an already-relayed pane is recognised from its cmdline.
-    const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
-      || isProgramStatusRelayArgv(readCmdline(launcherPid));
-    const viaWrapper = !!cfg.wrapperCli?.trim() && !sandboxRequested;
+  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): void => {
+    log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
+    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+    // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
+    // module-level bridgeCliPid and re-points to the real CLI's jsonl.
+    bridgeCliPid = realPid;
+    publishLocalProcessAttestation(realPid);
+  };
+  // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
+  // reports while this spawn is current (equal to launcherPid unless a relay
+  // sits between the pane and the launcher).
+  const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
-    if ((!viaWrapper && !viaRelay) || (!claudeDataDir && cfg.cliId !== 'codex')) return;
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
-    const launcherLabel = viaWrapper ? `wrapperCli "${cfg.wrapperCli}"` : 'program-status relay';
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
+      getChildPid: () => (backend?.getChildPid?.() === panePid ? launcherPid : null),
+      applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  const startWrapperRealPidResolve = (panePid: number): void => {
+    // The OSC 7501 relay sits between the pane and what used to be the pane
+    // process: its single direct child is exactly the pid the pane reported
+    // before the relay existed (CLI, sandbox wrapper or wrapperCli launcher),
+    // whatever that process's comm. Unwrap that one level, then resolve as
+    // before. A fresh relayed launch is known from this spawn's decision — the
+    // pane may still be the launch shell that has not exec'd the relay yet. A
+    // daemon-restart reattach to an already-relayed pane is recognised from
+    // its cmdline.
+    const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
+      || isProgramStatusRelayArgv(readCmdline(panePid));
+    if (!viaRelay) { resolveBehindWrapper(panePid, panePid); return; }
+    if (!claudeDataDir && cfg.cliId !== 'codex') return;
+    scheduleWrapperRealCliPid(panePid, {
+      findRealPid: (lp) => {
+        if (!isProgramStatusRelayArgv(readCmdline(lp))) return null;
+        const children = getChildPids(lp);
+        return children.length === 1 ? children[0] : null;
+      },
+      getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
-      applyRealPid: (realPid) => {
-        log(`${launcherLabel}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${targetCliId}); rewiring session discovery + bridge`);
-        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
-        // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
-        // module-level bridgeCliPid and re-points to the real CLI's jsonl.
-        bridgeCliPid = realPid;
-        publishLocalProcessAttestation(realPid);
+      applyRealPid: (childPid) => {
+        applyResolvedCliPid(childPid, 'program-status relay', panePid);
+        resolveBehindWrapper(childPid, panePid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });

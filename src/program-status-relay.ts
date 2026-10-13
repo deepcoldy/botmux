@@ -15,7 +15,7 @@
  * pane terminal (handshake lost, session intact).
  */
 import { spawn as spawnChild, spawnSync } from 'node:child_process';
-import { consumeProgramStatusRelayPlan } from './core/program-status-relay-launch.js';
+import { consumeProgramStatusRelayPlan, restoreRelayLoaderEnv } from './core/program-status-relay-launch.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import { PROGRAM_STATUS_PROBE_REPLY, ProgramStatusProbeRelay } from './utils/program-status-probe-relay.js';
 import * as pty from './utils/pty.js';
@@ -24,10 +24,15 @@ import * as pty from './utils/pty.js';
 const HELD_FLUSH_MS = 15;
 /** Upper bound on waiting for the CLI after forwarding a terminating signal. */
 const SIGNAL_EXIT_GRACE_MS = 5000;
+/** After SIGKILLing the child, the relay kills itself if it still has not exited. */
+const FINAL_KILL_MS = 2000;
 
 const plan = consumeProgramStatusRelayPlan(process.argv.slice(isStandaloneBinary() ? 3 : 2)[0]);
 const stdin = process.stdin;
 const stdout = process.stdout;
+// The launch shim stripped interpreter loader options (NODE_OPTIONS, …) so no
+// bot-configured preload runs in this unconfined process; the CLI gets them back.
+const childEnv = restoreRelayLoaderEnv(process.env);
 
 function exitWithChildStatus(code: number | null | undefined, signal: number | NodeJS.Signals | null | undefined): void {
   const signo = typeof signal === 'number' ? signal : 0;
@@ -40,7 +45,9 @@ function exitWithChildStatus(code: number | null | undefined, signal: number | N
 
 function runDirect(reason: unknown): void {
   process.stderr.write(`[botmux] program-status relay unavailable (${reason instanceof Error ? reason.message : String(reason)}); running CLI directly\n`);
-  const child = spawnChild(plan.bin, plan.args, { stdio: 'inherit' });
+  // The pane was put into raw mode for the relay; hand the CLI a sane terminal.
+  spawnSync('stty', ['sane'], { stdio: ['inherit', 'ignore', 'ignore'] });
+  const child = spawnChild(plan.bin, plan.args, { stdio: 'inherit', env: childEnv });
   for (const sig of ['SIGHUP', 'SIGTERM', 'SIGINT', 'SIGQUIT'] as const) {
     process.on(sig, () => { try { child.kill(sig); } catch { /* exited */ } });
   }
@@ -59,7 +66,7 @@ function spawnInner(): pty.IPty | null {
       cols: stdout.columns || 80,
       rows: stdout.rows || 24,
       cwd: process.cwd(),
-      env: process.env as Record<string, string>,
+      env: childEnv as Record<string, string>,
       encoding: null,
     });
   } catch (err) {
@@ -68,6 +75,21 @@ function spawnInner(): pty.IPty | null {
   }
 }
 
+/** Make the pane a byte-transparent transport before the inner PTY exists (so
+ *  the transient `stty` is never mistaken for the relay's CLI child). libuv's
+ *  raw mode deliberately keeps OPOST|ONLCR, so bytes the inner PTY already
+ *  processed would be rewritten again on the way out (`\r\n` → `\r\r\n`, and
+ *  an app's bare-LF cursor moves turned into CRLF): full `stty raw` it is. */
+function makePaneRaw(): void {
+  if (!stdin.isTTY) return;
+  stdin.setRawMode(true);
+  const stty = spawnSync('stty', ['raw', '-echo'], { stdio: ['inherit', 'ignore', 'pipe'] });
+  if (stty.status !== 0) {
+    process.stderr.write(`[botmux] program-status relay: stty raw failed (${stty.error?.message ?? stty.stderr?.toString().trim()}); output may be double-translated\n`);
+  }
+}
+
+makePaneRaw();
 const inner = spawnInner();
 if (inner) relayThrough(inner);
 
@@ -107,17 +129,6 @@ function relayThrough(term: pty.IPty): void {
     exitWithChildStatus(exitCode, signal);
   });
 
-  if (stdin.isTTY) {
-    stdin.setRawMode(true);
-    // libuv's raw mode deliberately keeps OPOST|ONLCR, so bytes the inner PTY
-    // already processed would be rewritten again on the way out (`\r\n` →
-    // `\r\r\n`, and an app's bare-LF cursor moves turned into CRLF). The pane
-    // must be a byte-transparent transport: full `stty raw` on it.
-    const stty = spawnSync('stty', ['raw', '-echo'], { stdio: ['inherit', 'ignore', 'pipe'] });
-    if (stty.status !== 0) {
-      process.stderr.write(`[botmux] program-status relay: stty raw failed (${stty.error?.message ?? stty.stderr?.toString().trim()}); output may be double-translated\n`);
-    }
-  }
   stdin.on('data', (data: Buffer) => term.write(data));
   stdin.on('error', () => { /* pane gone; SIGHUP handles teardown */ });
   stdout.on('error', () => { /* pane gone; SIGHUP handles teardown */ });
@@ -128,10 +139,18 @@ function relayThrough(term: pty.IPty): void {
     }
   });
 
+  let escalation: ReturnType<typeof setTimeout> | null = null;
   for (const sig of ['SIGHUP', 'SIGTERM', 'SIGINT', 'SIGQUIT'] as const) {
     process.on(sig, () => {
       try { term.kill(sig); } catch { /* already exited */ }
-      setTimeout(() => process.exit(128 + (signalNumber(sig) ?? 1)), SIGNAL_EXIT_GRACE_MS).unref();
+      if (escalation) return;
+      // Never process.exit() while the child lives: node-pty's native waitpid
+      // thread would be joined during teardown and can block indefinitely.
+      // Kill the child instead; onExit then exits the relay normally.
+      escalation = setTimeout(() => {
+        try { term.kill('SIGKILL'); } catch { /* already exited */ }
+        setTimeout(() => process.kill(process.pid, 'SIGKILL'), FINAL_KILL_MS).unref();
+      }, SIGNAL_EXIT_GRACE_MS);
     });
   }
 }
