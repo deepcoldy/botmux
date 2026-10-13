@@ -6916,7 +6916,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
-       --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题支持 {{date:-1d}} / {{owner}}
+       --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题按任务时区支持 {{date:-1d}} / {{owner}}
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
   schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
   schedule remove <id>                 删除任务

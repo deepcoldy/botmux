@@ -78,7 +78,7 @@ export function scheduleTimeZone(): string {
 // 一个「指定日+月」的 cron，取 nextRun。这样一次性与同表达式 cron 在 DST 边界上**天然一致**。
 
 /** 目标时区 `tz` 在 UTC 瞬时 `utcMs` 处的当地日期 (year, month, day)。 */
-function zonedDateParts(tz: string, utcMs: number): { year: number; month: number; day: number } {
+export function zonedDateParts(tz: string, utcMs: number): { year: number; month: number; day: number } {
   const dtf = new Intl.DateTimeFormat('en-US', {
     timeZone: tz,
     year: 'numeric', month: '2-digit', day: '2-digit',

@@ -4099,7 +4099,7 @@ export async function executeScheduledTask(
   if (silent && createsOwnTopic && hasDynamicTopicTitle) {
     throw new Error('topic_title_template_silent_unsupported');
   }
-  const topicTitle = rawTopicTitle && createsOwnTopic && !silent
+  const topicTitle = rawTopicTitle && createsOwnTopic && !silent && hasDynamicTopicTitle
     ? renderScheduleTopicTitle(rawTopicTitle, {
         firedAt: new Date(),
         ownerOpenId: task.ownerOpenId,
@@ -4150,6 +4150,8 @@ export async function executeScheduledTask(
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
+      // A custom title is the actual text root; without one the localized
+      // task-start notice remains the backwards-compatible seed.
       const topicSeed = topicTitle
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
@@ -4207,6 +4209,8 @@ export async function executeScheduledTask(
               logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
             });
           }
+          // Dedicated tasks use the same rendered fire-time title contract as
+          // new-topic runs, but persist this first root for later continuations.
           const topicSeed = topicTitle
             || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
           const seed = await sendMessage(larkAppId, task.chatId, topicSeed);

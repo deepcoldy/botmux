@@ -182,6 +182,22 @@ describe('scheduler.toggleDelivery', () => {
     expect(store.get(id)!.silent).toBe(true);
   });
 
+  it('refuses to toggle a silent task with a hidden dynamic title into new-topic', async () => {
+    const { toggleDelivery } = await import('../src/core/scheduler.js');
+    const id = seed('origin', {
+      scope: 'chat',
+      executionPosition: 'top-level',
+      silent: true,
+      topicTitle: '{{date}} 巡检',
+    });
+    expect(toggleDelivery(id)).toEqual({
+      ok: false,
+      error: 'topic_title_template_silent_unsupported',
+    });
+    expect(store.get(id)).toMatchObject({ executionPosition: 'top-level' });
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('returns not_found for an unknown id without publishing', async () => {
     const { toggleDelivery } = await import('../src/core/scheduler.js');
     const r = toggleDelivery('missing');
@@ -202,6 +218,33 @@ describe('scheduler.updateTask', () => {
       type: 'schedule.updated',
       body: { id, patch: { silent: false } },
     });
+  });
+
+  it('rejects edits that turn a stored dynamic title into an always-failing task', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const dynamic = seed('origin', {
+      scope: 'chat',
+      executionPosition: 'new-topic',
+      topicTitle: '{{date}} 巡检',
+      ownerOpenId: 'ou_owner123',
+    });
+    expect(updateTask(dynamic, { silent: true })).toEqual({
+      ok: false,
+      error: 'topic_title_template_silent_unsupported',
+    });
+    expect(store.get(dynamic)?.silent).toBeUndefined();
+
+    const ownerless = seed('origin', {
+      scope: 'chat',
+      executionPosition: 'top-level',
+      topicTitle: '{{owner}} 巡检',
+    });
+    expect(updateTask(ownerless, { executionPosition: 'new-topic' })).toEqual({
+      ok: false,
+      error: 'topic_title_owner_unavailable',
+    });
+    expect(store.get(ownerless)).toMatchObject({ executionPosition: 'top-level' });
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it('normalizes a multi-chat update and publishes the complete target patch', async () => {

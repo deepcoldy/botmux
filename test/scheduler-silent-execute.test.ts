@@ -567,6 +567,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
 
     await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
 
+    // No Lark root ever created, no second virtual session: both fires share one
+    // stable slot (contrast: new-topic mints a per-run anchor/session each time).
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(active.size).toBe(1);
     expect(active.has(sessionKey(taskAnchor, APP))).toBe(true);
@@ -575,6 +577,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     const secondTurn = (forkWorkerMock.mock.calls[1][2] as { turnId: string }).turnId;
     expect(secondTurn).not.toBe(firstTurn);
     const ds = active.get(sessionKey(taskAnchor, APP))!;
+    // The deferred marker now belongs to the NEW turn — a first `botmux send`
+    // during turn 1 must not steal materialization ownership (turn equality).
     expect(ds.session.deferredScheduleRun?.turnId).toBe(secondTurn);
     expect(ds.session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
     expect(ds.silentScheduledTurns?.has(secondTurn)).toBe(true);
@@ -633,6 +637,38 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(ds.session.rootMessageId).toBe('om_banner_123');
     expect(ds.session.deferredScheduleRun).toBeUndefined();
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders dynamic date and owner placeholders for the dedicated task root', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      topicTitle: '{{date:-1d}} 数据库巡检 {{owner}}',
+      ownerOpenId: 'ou_owner123',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    const title = sendMessageMock.mock.calls[0][2] as string;
+    expect(title).toMatch(/^\d{4}-\d{2}-\d{2} 数据库巡检 /);
+    expect(title).toContain('<at user_id="ou_owner123"></at>');
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith(
+      'task0001',
+      { rootMessageId: 'om_banner_123' },
+      APP,
+    );
+  });
+
+  it('fails closed before creating a hidden task session for a dynamic title', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      silent: true,
+      topicTitle: '{{date}} 数据库巡检',
+    }), active, refreshCliVersion)).rejects.toThrow('topic_title_template_silent_unsupported');
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(0);
   });
 
   it('non-silent first fire without a custom title seeds the standard task-start notice', async () => {

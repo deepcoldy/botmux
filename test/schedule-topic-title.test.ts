@@ -11,10 +11,22 @@ describe('renderScheduleTopicTitle', () => {
     expect(renderScheduleTopicTitle('每日发布巡检', { firedAt })).toBe('每日发布巡检');
   });
 
-  it('renders local fire date and bounded calendar-day offsets', () => {
+  it('renders the schedule-timezone fire date and bounded calendar-day offsets', () => {
     expect(renderScheduleTopicTitle('{{date}} 日报', { firedAt })).toBe('2026-01-01 日报');
     expect(renderScheduleTopicTitle('{{date:-1d}} 日报', { firedAt })).toBe('2025-12-31 日报');
     expect(renderScheduleTopicTitle('{{date:+2d}} 日报', { firedAt })).toBe('2026-01-03 日报');
+  });
+
+  it('uses the configured schedule timezone instead of the daemon host calendar', () => {
+    const utcInstant = new Date('2026-01-01T16:30:00.000Z');
+    expect(renderScheduleTopicTitle('{{date}} {{date:-1d}}', {
+      firedAt: utcInstant,
+      timeZone: 'Asia/Shanghai',
+    })).toBe('2026-01-02 2026-01-01');
+    expect(renderScheduleTopicTitle('{{date}} {{date:-1d}}', {
+      firedAt: utcInstant,
+      timeZone: 'America/New_York',
+    })).toBe('2026-01-01 2025-12-31');
   });
 
   it('renders the task owner as a native text-message mention', () => {
@@ -47,9 +59,13 @@ describe('renderScheduleTopicTitle', () => {
     expect(hasScheduleTopicTitleRuntimeTemplate('{{date:1d}} {{service}}')).toBe(false);
   });
 
-  it('checks the rendered title length after owner expansion', () => {
+  it('allows normal placeholder growth but caps pathological repeated expansion', () => {
+    const rawAtLimit = `${'x'.repeat(192)}{{date}}`;
+    expect(Array.from(rawAtLimit)).toHaveLength(200);
+    expect(Array.from(renderScheduleTopicTitle(rawAtLimit, { firedAt }))).toHaveLength(202);
+
     expect(() => renderScheduleTopicTitle(
-      `${'x'.repeat(180)}{{owner}}`,
+      `${'x'.repeat(150)}${'{{owner}}'.repeat(6)}`,
       { firedAt, ownerOpenId: 'ou_owner1234567890' },
     )).toThrow('topic_title_rendered_too_long');
   });
