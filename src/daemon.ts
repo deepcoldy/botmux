@@ -7247,6 +7247,12 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     }
     const needsDelegation = targetAppIds.length > 0
       && (tools.length > 0 || scheduleCreateRequested);
+    // Host IPC authentication proves the local command, not a human turn.
+    // In particular a revoked worker may retain a policy-only origin. Never
+    // report a protected dispatch as sent after dropping its user authority.
+    if (needsDelegation && !turnId) {
+      return jsonRes(res, 403, { ok: false, error: 'dispatch_turn_unproven' });
+    }
     const directScheduleSource = !!active && active.turnId === turnId
       && active.caller.senderType === 'user' && !active.caller.source
       && !!active.caller.requestUserOpenId
