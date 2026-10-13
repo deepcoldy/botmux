@@ -125,6 +125,8 @@ export function consumeProgramStatusRelayPlan(planPath: string | undefined): Pro
 /** True when a process argv (`/proc/<pid>/cmdline`) is a program-status relay.
  *  Node: `<node> …/program-status-relay.js <plan>`; compiled: `<binary> __program-status-relay <plan>`. */
 export function isProgramStatusRelayArgv(argv: readonly string[]): boolean {
-  // Interpreter, up to two runtime flags, then the entry.
-  return argv.slice(0, 4).some(a => a === RELAY_TOKEN || basename(a) === RELAY_SCRIPT || basename(a) === RELAY_SOURCE);
+  // Whole argv, not a fixed prefix: on macOS readCmdline() falls back to `ps`
+  // and whitespace-splits it, so an entry path containing spaces spreads over
+  // several tokens (its last fragment still ends in the entry's basename).
+  return argv.some(a => a === RELAY_TOKEN || basename(a) === RELAY_SCRIPT || basename(a) === RELAY_SOURCE);
 }

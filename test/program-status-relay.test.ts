@@ -135,6 +135,8 @@ describe('program-status relay launch plan', () => {
     expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/p'])).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/bun', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/bun', '--no-env-file', '--config=/dev/null', '/src/botmux/src/program-status-relay.ts', '/tmp/p'])).toBe(true);
+    // macOS `ps` fallback whitespace-splits a checkout path containing spaces.
+    expect(isProgramStatusRelayArgv('/opt/homebrew/bin/bun --no-env-file --config=/dev/null /Users/a/My Projects/botmux/src/program-status-relay.ts /tmp/p'.split(' '))).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--resume'])).toBe(false);
   });
 
