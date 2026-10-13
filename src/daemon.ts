@@ -7194,6 +7194,17 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
   }
 });
 
+/** Resolve schedule control from the exact live turn, not the busy/idle hint.
+ * The caller must still pass the route's managed-origin proof. Only an actual
+ * IM message can recover its caller from reply metadata: synthetic continuation
+ * turns may copy that metadata but do not represent a new human request. */
+function scheduleCallerForTurn(ds: DaemonSession, turnId: string): TrustedCaller | undefined {
+  const active = ds.activeInteractiveTurn;
+  if (active?.turnId === turnId) return active.caller;
+  if (!turnId.startsWith('om_')) return undefined;
+  return dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
+}
+
 // Managed schedule creation. The caller supplies task input only; creator
 // identity, grant scope and the commit authority are derived from this exact
 // live turn and the host-signed dispatch record.
@@ -7265,13 +7276,14 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let credentialOpenId: string | undefined;
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
-  const active = ds.activeInteractiveTurn;
-  const direct = active?.turnId === turnId && active.caller.senderType === 'user'
-    && !active.caller.source && active.caller.requestLarkAppId === ds.larkAppId;
+  const caller = scheduleCallerForTurn(ds, turnId);
+  const direct = caller?.senderType === 'user'
+    && !caller.source && caller.requestLarkAppId === ds.larkAppId;
+  const capability = ds.managedTurnOrigin.capability;
   try {
     if (direct) {
-      controlOpenId = active.caller.requestUserOpenId;
-      controlUnionId = active.caller.requestUserUnionId
+      controlOpenId = caller.requestUserOpenId;
+      controlUnionId = caller.requestUserUnionId
         ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
       grantId = `direct:${sessionId}:${turnId}`;
     } else {
@@ -7332,7 +7344,8 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         && !(await listChatMemberOpenIds(ds.larkAppId, task.chatId)).includes(controlOpenId))) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_operator_denied' });
     }
-    if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation) {
+    if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation
+      || ds.managedTurnOrigin.capability !== capability) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_delegation_turn_changed' });
     }
     const baseParams = {
@@ -7418,13 +7431,12 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     claimedDispatchAttempt: body?.originDispatchAttempt,
   });
   const turnId = ds?.managedTurnOrigin?.turnId;
-  const active = ds?.activeInteractiveTurn;
+  const caller = ds && turnId ? scheduleCallerForTurn(ds, turnId) : undefined;
   const hostAdmin = trustedHost && !ds && body?.larkAppId === selfDaemonLarkAppId;
-  const currentHumanAdmin = !!ds && !!turnId && active?.turnId === turnId
-    && active.caller.senderType === 'user' && !active.caller.source
-    && active.caller.requestLarkAppId === ds.larkAppId
-    && !!active.caller.requestUserOpenId
-    && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
+  const currentHumanAdmin = !!ds && caller?.senderType === 'user' && !caller.source
+    && caller.requestLarkAppId === ds.larkAppId
+    && !!caller.requestUserOpenId
+    && getDashboardAdminOpenIds(ds.larkAppId).includes(caller.requestUserOpenId);
   const action = body.action;
   const scheduledTaskId = turnId ? parseScheduledTurnId(turnId) : null;
   const requestedId = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';

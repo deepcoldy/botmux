@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
-import { scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
+import { dispatchCallerFromReply, scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
+import { pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
 import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
@@ -16,7 +17,10 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
   && node.expression.expression.getText(source) === 'ipcRoute'
   && node.expression.arguments[1]?.getText(source) === 'SCHEDULE_DELEGATED_ADD_ROUTE') as ts.ExpressionStatement;
 const handler = (route.expression as ts.CallExpression).arguments[2];
-const code = ts.transpileModule(`const handler = ${handler.getText(source)}`, {
+const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'scheduleCallerForTurn');
+const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
 
@@ -24,7 +28,8 @@ function harness(overrides: Record<string, unknown> = {}) {
   const turnId = 'om_kickoff';
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
-    session: { sessionId: 'target-session', scope: 'thread', rootMessageId: 'om_root' },
+    session: { sessionId: 'target-session', scope: 'thread', rootMessageId: 'om_root',
+      replyTargets: { [turnId]: { rootMessageId: 'om_root' } } },
     workerGeneration: 7,
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
@@ -50,7 +55,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true,
       tools: ['lark-cli', 'bytedcli'] } } }),
-    pickTurnReplyTarget: () => ({ rootMessageId: 'om_root' }),
+    pickTurnReplyTarget, dispatchCallerFromReply,
     dispatchUserForTurn: async () => ({
       domain: 'botmux.dispatch-user.v2', deliveryId: 'delivery-1', messageId: turnId,
       sourceSessionId: 'source-session', sourceAppId: 'cli_source', sourceTurnId: 'om_human',
@@ -70,7 +75,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     TRIGGER_USER_AUTH_TOOLS,
     scheduleAuthorityStore: {},
     createHash,
-    scheduler: { commitDelegatedTask, addTask: vi.fn() },
+    scheduler: { commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
   };
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
   return { ds, body, scope, commitDelegatedTask, run: () => run({}, {}) };
@@ -169,4 +174,155 @@ describe('delegated schedule add route', () => {
     }));
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
+});
+
+function directHumanHarness() {
+  const h = harness();
+  h.scope.readGlobalConfig = () => ({});
+  h.ds.activeInteractiveTurn = undefined;
+  h.ds.session.replyTargets.om_kickoff = {
+    rootMessageId: 'om_root', senderOpenId: 'ou_user_target',
+    participants: [{ openId: 'ou_user_target', isBot: false }],
+  };
+  h.body.task.executionPosition = 'new-topic';
+  delete h.body.task.rootMessageId;
+  return h;
+}
+
+describe('direct schedule creation after the active-turn hint is cleared', () => {
+  it.each(['thread', 'chat'] as const)('uses the exact human sender in %s scope with delegation disabled', async scope => {
+    const h = directHumanHarness();
+    h.ds.scope = h.ds.session.scope = scope;
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    expect(h.ds.activeInteractiveTurn).toBeUndefined();
+  });
+
+  it('keeps the authenticated active caller authoritative', async () => {
+    const h = directHumanHarness();
+    h.ds.activeInteractiveTurn = { turnId: 'om_kickoff', caller: {
+      senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_user_target',
+      requestUserUnionId: 'on_active_user',
+    } };
+    h.ds.session.replyTargets = {};
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerUnionId: 'on_active_user' } } });
+  });
+
+  it.each([
+    { senderType: 'bot', requestLarkAppId: 'cli_target' },
+    { senderType: 'user', requestLarkAppId: 'cli_other' },
+    { senderType: 'user', requestLarkAppId: 'cli_target', source: 'schedule_creator' },
+  ])('does not override a non-direct active caller: %o', async caller => {
+    const h = directHumanHarness();
+    h.ds.activeInteractiveTurn = { turnId: 'om_kickoff', caller };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_disabled' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each([true, undefined])('does not treat isBot=%s as a human', async isBot => {
+    const h = directHumanHarness();
+    h.ds.session.replyTargets.om_kickoff.participants[0].isBot = isBot;
+    expect((await h.run()).status).toBe(403);
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('does not borrow another turn, session owner, or client-supplied creator', async () => {
+    const h = directHumanHarness();
+    const reply = h.ds.session.replyTargets.om_kickoff;
+    h.ds.session.replyTargets = { om_old: reply };
+    h.ds.session.currentReplyTarget = { ...reply, turnId: 'om_old' };
+    h.ds.session.ownerOpenId = 'ou_user_target';
+    h.ds.session.ownerUnionId = 'on_user';
+    h.ds.activeInteractiveTurn = { turnId: 'om_old', caller: {
+      senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_user_target',
+    } };
+    Object.assign(h.body.task, { ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user' });
+    expect((await h.run()).status).toBe(403);
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['schedule:a1b2c3d4:run', 'bmx-continuation-test'])('rejects copied reply metadata for synthetic turn %s', async turnId => {
+    const h = directHumanHarness();
+    h.ds.session.replyTargets[turnId] = h.ds.session.replyTargets.om_kickoff;
+    h.ds.managedTurnOrigin.turnId = h.body.originTurnId = turnId;
+    expect((await h.run()).status).toBe(403);
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['revoked', 'stale-capability'] as const)('requires a live exact origin: %s', async mode => {
+    const h = directHumanHarness();
+    if (mode === 'revoked') h.ds.managedTurnOrigin = undefined;
+    if (mode === 'stale-capability') h.body.originCapability = 'd'.repeat(64);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_origin_unproven' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['not-admin', 'not-member', 'no-union'] as const)('preserves the operator check: %s', async mode => {
+    const h = directHumanHarness();
+    if (mode === 'not-admin') h.scope.getDashboardAdminOpenIds = () => [];
+    if (mode === 'not-member') h.scope.listChatMemberOpenIds = async () => [];
+    if (mode === 'no-union') h.scope.resolveUnionIdFromOpenId = async () => null;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['turn', 'worker', 'capability'] as const)('refuses commit if %s changes during identity lookup', async mode => {
+    const h = directHumanHarness();
+    h.scope.resolveUnionIdFromOpenId = async () => {
+      if (mode === 'turn') h.ds.managedTurnOrigin.turnId = 'om_next';
+      if (mode === 'worker') h.ds.workerGeneration++;
+      if (mode === 'capability') h.ds.managedTurnOrigin.capability = 'd'.repeat(64);
+      return 'on_user';
+    };
+    expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_delegation_turn_changed' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+});
+
+// Exercise the production IPC cases as well as the production route. External
+// side effects are stubbed; no live worker or daemon is started by this test.
+it('creates after same-turn revoke/republication without reviving the busy hint', async () => {
+  const source = ts.createSourceFile('worker-pool.ts', readFileSync('src/core/worker-pool.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+  const cases: string[] = [];
+  function visit(node: ts.Node): void {
+    if (ts.isCaseClause(node) && ts.isStringLiteral(node.expression)
+      && ['managed_turn_origin', 'managed_turn_origin_revoked'].includes(node.expression.text)) {
+      cases.push(node.getText(source));
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  expect(cases).toHaveLength(2);
+  const ipcCode = ts.transpileModule(`switch (msg.type) { ${cases.join('\n')} }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  }).outputText;
+  const h = directHumanHarness();
+  const worker = {};
+  h.ds.worker = worker;
+  h.ds.activeInteractiveTurn = { turnId: 'om_kickoff', caller: {
+    senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_user_target',
+  } };
+  const scope = { ds: h.ds, worker, t: 'test', botCfg: {}, randomBytes,
+    logger: { warn: vi.fn(), error: vi.fn() },
+    currentGatewayCallerOpenId: (ds: any, turnId: string) => pickTurnReplyTarget(ds.session, turnId)?.senderOpenId,
+    currentTurnProcessIdentities: () => undefined,
+    noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(),
+  };
+  const dispatch = new Function('scope', 'msg', `with (scope) { ${ipcCode} }`);
+  dispatch(scope, { type: 'managed_turn_origin_revoked', sessionId: 'target-session',
+    turnId: 'om_kickoff', capability: 'c'.repeat(64) });
+  expect(h.ds.activeInteractiveTurn).toBeUndefined();
+  expect((await h.run()).status).toBe(403);
+  dispatch(scope, { type: 'managed_turn_origin', sessionId: 'target-session',
+    turnId: 'om_kickoff', capability: 'd'.repeat(64) });
+  h.body.originCapability = 'd'.repeat(64);
+  expect(h.ds.managedTurnOrigin.callerOpenId).toBe('ou_user_target');
+  expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+    ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user', executionPosition: 'new-topic',
+  } } });
+  expect(h.ds.activeInteractiveTurn).toBeUndefined();
+  expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
 });

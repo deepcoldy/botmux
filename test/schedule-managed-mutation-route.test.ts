@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
+import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
+import { pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
@@ -10,7 +12,10 @@ const route = source.statements.find(node => ts.isExpressionStatement(node)
   && node.expression.expression.getText(source) === 'ipcRoute'
   && node.expression.arguments[1]?.getText(source) === 'SCHEDULE_MANAGED_MUTATE_ROUTE') as ts.ExpressionStatement;
 const handler = (route.expression as ts.CallExpression).arguments[2];
-const code = ts.transpileModule(`const handler = ${handler.getText(source)}`, {
+const callerHelper = source.statements.find(node => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'scheduleCallerForTurn');
+const code = ts.transpileModule(`${callerHelper?.getText(source) ?? ''}
+const handler = ${handler.getText(source)}`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
 
@@ -33,6 +38,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     readJsonBody: async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
       originTurnId: turnId, action, id, prompt: 'changed' }),
     findActiveBySessionId: () => ds, authorizeSessionScopedIpc,
+    pickTurnReplyTarget, dispatchCallerFromReply,
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
     parseScheduledTurnId,
@@ -96,4 +102,36 @@ describe('managed schedule mutation route', () => {
     expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_task_disabled' } });
     expect(h.scheduler.runTaskNow).not.toHaveBeenCalled();
   });
+});
+
+describe('direct schedule mutation after the active-turn hint is cleared', () => {
+  it.each(['pause', 'resume', 'remove', 'update', 'run'])('allows %s for the current human administrator', async action => {
+    const h = harness(action);
+    h.ds.activeInteractiveTurn = undefined;
+    h.ds.session.replyTargets = { om_human: { senderOpenId: 'ou_admin',
+      participants: [{ openId: 'ou_admin', isBot: false }] } };
+    h.record.kind = 'direct';
+    h.record.task.enabled = true;
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    const method = { pause: 'disableTask', resume: 'enableTask', remove: 'removeTask',
+      update: 'updateTask', run: 'runTaskNow' }[action]!;
+    expect(h.scheduler[method as keyof typeof h.scheduler]).toHaveBeenCalledOnce();
+  });
+
+  it.each(['bot', 'unknown', 'other-turn', 'non-admin', 'revoked', 'continuation'] as const)(
+    'does not authorize mutation from %s metadata', async mode => {
+      const turnId = mode === 'continuation' ? 'bmx-continuation-test' : 'om_human';
+      const h = harness('pause', turnId);
+      h.ds.activeInteractiveTurn = undefined;
+      const sender = mode === 'non-admin' ? 'ou_other' : 'ou_admin';
+      h.ds.session.ownerOpenId = 'ou_admin';
+      h.ds.session.replyTargets = { [mode === 'other-turn' ? 'om_old' : turnId]: {
+        senderOpenId: sender, participants: [{ openId: sender,
+          isBot: mode === 'bot' ? true : mode === 'unknown' ? undefined : false }],
+      } };
+      if (mode === 'revoked') h.ds.managedTurnOrigin = undefined;
+      expect((await h.run()).status).toBe(403);
+      expect(h.scheduler.disableTask).not.toHaveBeenCalled();
+    },
+  );
 });
