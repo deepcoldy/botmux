@@ -25,6 +25,13 @@ describe('Kimi managed K3 reasoning efforts', () => {
 });
 
 describe('Codex model-aware reasoning efforts', () => {
+  it('locks every GPT-6 model to the runtime-verified effort set', () => {
+    expect(codexReasoningEffortsForModel('gpt-6.1-sol')).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    expect(codexReasoningEffortsForModel('gpt-6-astra')).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    expect(codexReasoningEffortsForModel('gpt-6-sol')).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    expect(codexReasoningEffortsForModel('gpt-6-luna')).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
   it('exposes six levels only for sol and terra', () => {
     expect(codexReasoningEffortsForModel('gpt-5.6-sol')).toContain('ultra');
     expect(codexReasoningEffortsForModel('gpt-5.6-terra')).toContain('ultra');

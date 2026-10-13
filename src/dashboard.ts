@@ -158,7 +158,6 @@ import {
 import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
-  selectionKeyForBot,
   isTtadkWrapper,
   ttadkAcceptsModel,
   TTADK_DEFAULT_MODEL,
@@ -169,6 +168,7 @@ import {
   isKnownSelectionKey,
   buildModelChoicesResponse,
 } from './services/model-catalog.js';
+import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
@@ -296,7 +296,6 @@ import {
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
-import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -5629,8 +5628,8 @@ const server = createServer(async (req, res) => {
             wrapperCli: o.wrapperCli,
             cliLaunchMode: o.cliLaunchMode,
           }, { shellFallback: false });
-          // 静态模型候选（shell-free）：模型下拉的初始选项；live 增量由
-          // /api/cli-options/models 按需探测。staticModelChoices 自身 fail-soft，
+          // 静态模型候选（shell-free）：live 不可用时的兜底；live 成功时由
+          // /api/cli-options/models 返回 runtime 权威目录。staticModelChoices 自身 fail-soft，
           // 这里再包一层 try/catch 兜底，保证选项列表永不因模型目录异常而整包失败。
           let modelChoices: string[] = [];
           try {
@@ -5665,7 +5664,8 @@ const server = createServer(async (req, res) => {
 
     // On-demand 模型探测：只探测当前选中的单个 CLI（用户在模型下拉旁点「刷新」时），
     // 不做全量扫描——20+ CLI 各自 shell out 会让表单打开即卡。静态候选已随
-    // /api/cli-options 的 modelChoices 字段下发，本端点只补 live 增量并合并去重。
+    // /api/cli-options 的 modelChoices 字段下发；本端点 live 成功时只返回 live，
+    // 探测失败或为空时才回退静态候选。
     if (req.method === 'GET' && url.pathname === '/api/cli-options/models') {
       const key = (url.searchParams.get('key') ?? '').trim();
       if (!isKnownSelectionKey(key)) {
@@ -5680,26 +5680,14 @@ const server = createServer(async (req, res) => {
       } catch {
         botConfig = undefined;
       }
-      const cliId = resolveCliSelection(key).cliId;
-      const runtimeApplies = botConfig
-        && selectionKeyForBot(botConfig.cliId, botConfig.wrapperCli, botConfig.cliLaunchMode) === key;
-      const cliPath = runtimeApplies
-        ? botConfig?.cliRuntime?.executable
-          ?? (botConfig?.cliRuntime ? undefined : botConfig?.cliPathOverride)
-        : undefined;
+      const probeContext = modelCatalogProbeContext(key, botConfig, process.env);
       const body = await buildModelChoicesResponse(key, {
-        runtimeContext: botConfig && runtimeApplies
-          ? `${botConfig.larkAppId}:${cliId}:${cliPath ?? 'default'}`
-          : undefined,
-        probeEnv: botConfig && runtimeApplies
-          ? {
-              ...buildSessionChildEnv(process.env, botConfig.envPolicy),
-              ...botInjectedEnv(botConfig.env, botConfig.envPolicy),
-            }
-          : undefined,
+        runtimeContext: probeContext.runtimeContext,
+        probeEnv: probeContext.probeEnv,
+        runtimeExecutable: probeContext.runtimeExecutable,
         adapterFactory: requestedCliId => createCliAdapterSync(
           requestedCliId,
-          requestedCliId === cliId ? cliPath : undefined,
+          requestedCliId === probeContext.cliId ? probeContext.runtimeExecutable : undefined,
         ),
       });
       return jsonRes(res, 200, body);

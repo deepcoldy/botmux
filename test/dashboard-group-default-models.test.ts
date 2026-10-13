@@ -24,6 +24,7 @@ const props = {chatId:'oc_demo',appId:'app-a',botName:'Assistant',cliId:'codex',
 it('uses Agent CLI model candidates, saves effort, and never writes the CLI', async () => {
   const writes=mockRequests();let renderer!: TestRenderer.ReactTestRenderer;
   await act(async()=>{renderer=TestRenderer.create(React.createElement(GroupDefaultModelsRow,{...props,models:{'claude-code':'sonnet'}}));});
+  expect(globalThis.fetch).toHaveBeenCalledWith('/api/cli-options/models?key=codex&bot=app-a');
   expect(renderer.root.findByType(ModelPickerField).props.options).toContain('custom-live');
   expect(renderer.root.findAllByType(ModelPickerField)).toHaveLength(1);
   await act(async()=>renderer.root.findByType(ModelPickerField).props.onChange('gpt-5.6-sol'));

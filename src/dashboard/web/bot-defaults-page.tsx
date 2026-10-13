@@ -76,7 +76,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
@@ -2674,8 +2674,12 @@ export function BotAgentSection(props: {
   // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = selectedCliId === 'dsh';
   const reasoningEffortOptions = useMemo(
-    () => reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model),
-    [cliKey, isCodexSelection, model],
+    () => {
+      const live = isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
+      return live?.filter(isCodexReasoningEffort)
+        ?? reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model);
+    },
+    [cliKey, detectedModels, isCodexSelection, model],
   );
   const nativeReasoningEffortOptions = useMemo(
     () => nativeModelMode === 'custom'

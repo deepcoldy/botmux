@@ -37,6 +37,18 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
   // resolveCommand. resolvedBin is the node runner, not codex itself.
   const rawCodexBin = pathOverride ?? 'codex';
   let cachedCodexBin: string | undefined;
+  const detectModelCapabilities = async (
+    options?: { env?: NodeJS.ProcessEnv },
+  ): Promise<readonly DebugModelCapabilities[] | null> => {
+    try {
+      // Shares `cachedCodexBin` with the launch call sites, so discovery and
+      // the app-server always use the same resolved binary.
+      const codexBin = (cachedCodexBin ??= resolveCommandReal(rawCodexBin));
+      return await loadCodexServiceTierCatalog({ cliBin: codexBin, env: options?.env });
+    } catch {
+      return null;
+    }
+  };
   return {
     id: 'codex-app',
     // Whole ~/.codex kept REAL (see codex.ts): under the deny-by-default file
@@ -87,23 +99,13 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     },
 
     // 与 codex CLI 同一模型目录（app-server 后端就是 codex binary）：静态列表是
-    // `codex debug models` visibility=list 的快照，live 探测补充目录增量。
+    // `codex debug models` visibility=list 的快照；live 成功时只使用 live 目录。
     modelChoices: CLI_MODEL_CHOICES['codex-app'],
     // resolvedBin 是 runner；能力探测使用其实际启动的 Codex binary。
-    async detectModelCapabilities(options?: { env?: NodeJS.ProcessEnv }): Promise<readonly DebugModelCapabilities[] | null> {
-      try {
-        // Shares `cachedCodexBin` with the two call sites above, so it must use the
-        // same resolver or whichever runs first would decide the cached value and
-        // silently change what the other two get. It also execs the binary itself.
-        const codexBin = (cachedCodexBin ??= resolveCommandReal(rawCodexBin));
-        return await loadCodexServiceTierCatalog({ cliBin: codexBin, env: options?.env });
-      } catch {
-        return null;
-      }
-    },
+    detectModelCapabilities,
 
     async detectModels(): Promise<readonly string[] | null> {
-      const catalog = await this.detectModelCapabilities?.();
+      const catalog = await detectModelCapabilities();
       return catalog?.map(model => model.slug) ?? null;
     },
 

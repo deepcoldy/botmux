@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { realpathSync, statSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { parseDebugModelCapabilitiesJson, type DebugModelCapabilities } from '../adapters/cli/model-catalog-json.js';
 import type { CodexServiceTier } from './codex-service-tier.js';
@@ -24,13 +25,25 @@ const CACHE_IRRELEVANT_ENV = new Set([
   'SESSION_DATA_DIR',
 ]);
 
+function executableIdentity(cliBin: string): string {
+  try {
+    const canonicalPath = realpathSync(cliBin);
+    const stat = statSync(canonicalPath);
+    return `${canonicalPath}:${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    // Preserve fail-soft behavior for mocked or temporarily unavailable paths;
+    // execFile below remains the authority on whether the probe can run.
+    return cliBin;
+  }
+}
+
 function cacheKey(cliBin: string, env: NodeJS.ProcessEnv): string {
   const stableEnv = Object.keys(env)
     .filter(key => !CACHE_IRRELEVANT_ENV.has(key))
     .sort()
     .map(key => `${key}=${env[key] ?? ''}`)
     .join('\n');
-  return `${cliBin}\0${stableEnv}`;
+  return `${executableIdentity(cliBin)}\0${stableEnv}`;
 }
 
 export function clearCodexServiceTierCatalogCache(): void {

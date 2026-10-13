@@ -469,7 +469,7 @@ describe('document-comment routing integration', () => {
   it('revalidates comment delivery after every key await and before send/fork', () => {
     const region = asyncFnRegion('handleDocComment', 'pollWatchedDocComments');
     expect(region).toContain('resolveBoundDocSession(sub, larkAppId)');
-    expect(region).toMatch(/await addCommentReaction[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:reaction'\)/);
+    expect(region).toMatch(/await addCommentReactionChecked[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:reaction'\)/);
     expect(region).toMatch(/await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:sender'\)/);
     expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:live-note'\)[\s\S]*sendWorkerInput/);
     expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:refork-note'\)[\s\S]*forkWorker/);
@@ -482,7 +482,7 @@ describe('document-comment routing integration', () => {
     expect(region).toContain('targetMatchesThisTurn(persistedTarget)');
     expect(region).toContain('delete deliverySession.docCommentTargets?.[turnId]');
     expect(region).toContain('sessionStore.getOwnedSession(deliverySession.sessionId) === deliverySession');
-    expect(region).toMatch(/if \(reactionId && userReplyId\)[\s\S]*await removeCommentReaction/);
+    expect(region).toMatch(/if \(reactionType && userReplyId\)[\s\S]*await removeCommentReaction/);
     expect(region).toMatch(/\(ds\.session\.docCommentTargets \?\?= \{\}\)\[turnId\] = docTarget/);
     expect(region).toContain('}, cleanupFailedDelivery)');
   });

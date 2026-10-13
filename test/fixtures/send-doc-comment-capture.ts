@@ -19,6 +19,8 @@ import { existsSync, writeFileSync } from 'node:fs';
       } else {
         data = { code: 0, data: { reply_id: 'reply_bot' } };
       }
+    } else if (method === 'POST' && url.pathname.endsWith('/comments/reaction')) {
+      data = { code: 0, data: {} };
     } else if (method === 'POST' && (
       url.pathname === '/open-apis/im/v1/messages'
       || url.pathname === '/open-apis/im/v1/messages/om_chat_turn/reply'

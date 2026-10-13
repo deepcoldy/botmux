@@ -72,6 +72,12 @@ describe('codex detectModels（mock child_process）', () => {
       .toEqual([{ file: CODEX_BIN, args: ['debug', 'models'] }]);
   });
 
+  it('detectModels 解构调用时不依赖 adapter this 绑定', async () => {
+    execFileStdout = REAL_SHAPE([modelEntry('gpt-6-sol')]);
+    const { detectModels } = createCodexAdapter(CODEX_BIN);
+    await expect(detectModels!()).resolves.toEqual(['gpt-6-sol']);
+  });
+
   it('detectModelCapabilities 返回同一目录的 serviceTiers', async () => {
     execFileStdout = REAL_SHAPE([
       { ...modelEntry('gpt-6-astra'), service_tiers: [{ id: 'priority' }, { id: 'ultrafast' }] },
@@ -144,6 +150,12 @@ describe('codex-app detectModels（mock child_process）', () => {
     expect(execFileCalls.map(({ file, args }) => ({ file, args }))).toEqual([
       { file: CODEX_BIN, args: ['debug', 'models'] },
     ]);
+  });
+
+  it('detectModels 解构调用时不依赖 adapter this 绑定', async () => {
+    execFileStdout = REAL_SHAPE([modelEntry('gpt-6-luna')]);
+    const { detectModels } = createCodexAppAdapter(CODEX_BIN);
+    await expect(detectModels!()).resolves.toEqual(['gpt-6-luna']);
   });
 });
 

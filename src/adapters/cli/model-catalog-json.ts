@@ -1,3 +1,5 @@
+import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
+
 /**
  * 共享的 `xxx debug models` JSON 目录解析。
  *
@@ -17,6 +19,9 @@
 export interface DebugModelCapabilities {
   slug: string;
   serviceTiers: string[];
+  reasoningEfforts?: string[];
+  /** Parsed for future default-selection UX; deliberately not sent to Dashboard clients yet. */
+  defaultReasoningEffort?: string;
 }
 
 export function parseDebugModelCapabilitiesJson(stdout: string): DebugModelCapabilities[] {
@@ -32,7 +37,13 @@ export function parseDebugModelCapabilitiesJson(stdout: string): DebugModelCapab
   const capabilities: DebugModelCapabilities[] = [];
   for (const entry of models) {
     if (typeof entry !== 'object' || entry === null) continue;
-    const record = entry as { slug?: unknown; visibility?: unknown; service_tiers?: unknown };
+    const record = entry as {
+      slug?: unknown;
+      visibility?: unknown;
+      service_tiers?: unknown;
+      supported_reasoning_levels?: unknown;
+      default_reasoning_level?: unknown;
+    };
     const slug = record.slug;
     const visibility = record.visibility;
     if (typeof slug !== 'string' || slug.length === 0) continue;
@@ -44,10 +55,27 @@ export function parseDebugModelCapabilitiesJson(stdout: string): DebugModelCapab
           : undefined))
         .filter((id): id is string => typeof id === 'string' && id.length > 0)
       : [];
-    capabilities.push({ slug, serviceTiers });
+    const reasoningEfforts = Array.isArray(record.supported_reasoning_levels)
+      ? record.supported_reasoning_levels
+        .map(level => (typeof level === 'object' && level !== null
+          ? (level as { effort?: unknown }).effort
+          : undefined))
+        .filter(isCodexReasoningEffort)
+      : [];
+    capabilities.push({
+      slug,
+      serviceTiers,
+      ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
+      ...(isCodexReasoningEffort(record.default_reasoning_level)
+        ? { defaultReasoningEffort: record.default_reasoning_level }
+        : {}),
+    });
   }
   return capabilities;
 }
+
+/** Backward-compatible rich catalogue name used by callers interested in reasoning metadata. */
+export const parseDebugModelCatalogJson = parseDebugModelCapabilitiesJson;
 
 export function parseDebugModelsJson(stdout: string): string[] {
   return parseDebugModelCapabilitiesJson(stdout).map(model => model.slug);

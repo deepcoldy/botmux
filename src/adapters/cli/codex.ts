@@ -238,6 +238,18 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   // is a spawn-time concern.
   const rawBin = pathOverride ?? 'codex';
   let cachedBin: string | undefined;
+  const detectModelCapabilities = async (
+    options?: { env?: NodeJS.ProcessEnv },
+  ): Promise<readonly DebugModelCapabilities[] | null> => {
+    try {
+      return await loadCodexServiceTierCatalog({
+        cliBin: (cachedBin ??= resolveCommand(rawBin)),
+        env: options?.env,
+      });
+    } catch {
+      return null;
+    }
+  };
   return {
     id: 'codex',
     mcpGateway: {
@@ -631,19 +643,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // mis-fire risk is negligible.
     get skillsDir(): string { return join(codexHome(), 'skills'); },
     // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
-    // live 探测（detectModels）会补充目录增量，live 不可用时以此兜底。
+    // live 探测成功时只使用 live 目录；live 不可用时以此快照兜底。
     modelChoices: CLI_MODEL_CHOICES['codex'],
     // 与保存/启动校验共用真实 binary + env 的能力目录、超时和缓存。
-    async detectModelCapabilities(options?: { env?: NodeJS.ProcessEnv }): Promise<readonly DebugModelCapabilities[] | null> {
-      try {
-        return await loadCodexServiceTierCatalog({ cliBin: this.resolvedBin, env: options?.env });
-      } catch {
-        return null;
-      }
-    },
+    detectModelCapabilities,
 
     async detectModels(): Promise<readonly string[] | null> {
-      const catalog = await this.detectModelCapabilities?.();
+      const catalog = await detectModelCapabilities();
       return catalog?.map(model => model.slug) ?? null;
     },
   };

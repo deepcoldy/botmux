@@ -281,23 +281,16 @@ export function modelSuggestionsForOption(opt: CliOption | undefined, cliState: 
 }
 
 /**
- * 合并模型候选：detected（后端已合并静态+live 去重）优先；detected 缺失时回退 static。
- * 两份列表再做一次去重保序，防御后端合并遗漏。纯函数，供单测。
+ * live 探测非空时以 runtime 目录为准；缺失或空时回退 static。纯函数，供单测。
  */
 export function mergeModelCandidates(
   staticChoices: readonly string[],
   detected: readonly string[] | null | undefined,
 ): string[] {
-  const primary = detected ?? staticChoices;
-  const extra = detected ? staticChoices : [];
+  const primary = detected && detected.length > 0 ? detected : staticChoices;
   const seen = new Set<string>();
   const out: string[] = [];
   for (const item of primary) {
-    if (typeof item !== 'string' || seen.has(item)) continue;
-    seen.add(item);
-    out.push(item);
-  }
-  for (const item of extra) {
     if (typeof item !== 'string' || seen.has(item)) continue;
     seen.add(item);
     out.push(item);
@@ -306,16 +299,22 @@ export function mergeModelCandidates(
 }
 
 /**
- * 按需探测某个 CLI 当前可用的模型列表（静态精选 + live 探测合并去重）。
+ * 按需探测某个 CLI 当前可用的模型列表（live 成功时权威，失败时回退静态）。
  * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
  */
 export async function fetchDetectedModels(
   key: string,
-  botId?: string,
-): Promise<{ models: string[]; source: 'live' | 'static'; modelCapabilities?: ModelCapabilities[] } | null> {
+  appId?: string,
+): Promise<{
+  models: string[];
+  source: 'live' | 'static';
+  modelCapabilities?: ModelCapabilities[];
+  reasoningEffortsByModel?: Record<string, string[]>;
+} | null> {
   try {
-    const botQuery = botId ? `&bot=${encodeURIComponent(botId)}` : '';
-    const r = await fetch(`/api/cli-options/models?key=${encodeURIComponent(key)}${botQuery}`);
+    const query = new URLSearchParams({ key });
+    if (appId) query.set('bot', appId);
+    const r = await fetch(`/api/cli-options/models?${query.toString()}`);
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !body || !Array.isArray(body.models)) return null;
     const models = body.models.filter((m: unknown): m is string => typeof m === 'string');
@@ -329,7 +328,19 @@ export async function fetchDetectedModels(
           return [{ slug, serviceTiers: tiers }];
         })
       : undefined;
-    return { models, source, ...(modelCapabilities ? { modelCapabilities } : {}) };
+    const reasoningEffortsByModel = body.reasoningEffortsByModel
+      && typeof body.reasoningEffortsByModel === 'object'
+      ? Object.fromEntries(Object.entries(body.reasoningEffortsByModel)
+        .filter(([, levels]) => Array.isArray(levels))
+        .map(([model, levels]) => [model, (levels as unknown[])
+          .filter((level): level is string => typeof level === 'string')]))
+      : undefined;
+    return {
+      models,
+      source,
+      ...(modelCapabilities ? { modelCapabilities } : {}),
+      ...(reasoningEffortsByModel ? { reasoningEffortsByModel } : {}),
+    };
   } catch {
     return null;
   }

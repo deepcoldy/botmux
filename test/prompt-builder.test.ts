@@ -176,6 +176,29 @@ describe('buildNewTopicPrompt', () => {
     expect(routing).not.toContain('&amp;lt;');
   });
 
+  it('puts the Cursor background-task note inside <botmux_routing> for cursor only (#1504)', () => {
+    const cursor = buildNewTopicPrompt('hello', SESSION_ID, 'cursor');
+    const routing = cursor.slice(cursor.indexOf('<botmux_routing>'), cursor.indexOf('</botmux_routing>'));
+    expect(routing).toContain('后台任务');
+    expect(routing).toContain('Briefly inform the user about the task result');
+    expect(routing).toContain('不是飞书用户的新消息');
+
+    const codex = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    expect(codex).not.toContain('Briefly inform the user about the task result');
+    expect(codex).not.toContain('后台任务');
+  });
+
+  it('omits the Cursor background-task note in zero-injection mode (promptInjection none)', () => {
+    // Zero-injection sends only the user's text — no <botmux_routing> at all,
+    // so the cursor-only routing line must not leak through either variant.
+    const zero = buildNewTopicPrompt('hello', SESSION_ID, 'cursor', undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, { promptInjection: 'none' });
+    expect(zero).not.toContain('<botmux_routing>');
+    expect(zero).not.toContain('Briefly inform the user about the task result');
+    expect(zero).not.toContain('后台任务');
+    expect(zero).toContain('hello');
+  });
+
   it('gives Hermes the standard botmux-send routing hints like other structured-bridge CLIs', () => {
     // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
     // as a redundant belt-and-braces on top of the real dedup fix

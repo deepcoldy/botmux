@@ -288,6 +288,10 @@ interface DriveCallOpts {
   beforeProviderEffect?: () => void | Promise<void>;
   providerRequestStarted?: () => void | Promise<void>;
   providerRequestNotDelivered?: () => void | Promise<void>;
+  /** Called after a successful preferTenant write identifies which principal
+   * actually committed it. Transient reactions need the same principal for
+   * their matching delete because update_reaction returns no reaction_id. */
+  providerIdentityUsed?: (identity: DocCommentReactionIdentity) => void;
   /**
    * The document this call acts on, when known. Used ONLY to look up which
    * person owns the subscription (see `userOpenId`); it is not sent upstream.
@@ -318,6 +322,8 @@ export interface DocProviderEffectOptions {
   /** Called only after an HTTP/business response proves the write was rejected. */
   providerRequestNotDelivered?: () => void | Promise<void>;
 }
+
+export type DocCommentReactionIdentity = 'tenant' | 'user';
 
 const DOC_SUBSCRIPTION_PERMISSION_CODE = 1069603;
 
@@ -560,7 +566,10 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   if (opts.preferTenant) {
     try {
       const res = await callTenant();
-      if (res?.code === 0) return res;
+      if (res?.code === 0) {
+        opts.providerIdentityUsed?.('tenant');
+        return res;
+      }
       logger.debug(`[doc-comment] tenant call code=${res?.code} (${opts.path})；回退 user 身份`);
     } catch (err) {
       if (opts.providerRequestStarted && !providerResponseProvesRejection(err)) {
@@ -568,7 +577,9 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
       }
       logger.debug(`[doc-comment] tenant call threw (${opts.path})；回退 user 身份：${err instanceof Error ? err.message : err}`);
     }
-    return callUser();
+    const res = await callUser();
+    if (res?.code === undefined || res.code === 0) opts.providerIdentityUsed?.('user');
+    return res;
   }
 
   // 默认：优先 user（有 token），401/403 回退 tenant。
@@ -1101,7 +1112,8 @@ export function chunkCommentText(text: string, max = DOC_COMMENT_MAX_CHARS): str
  * `options.tenantOnly` 关掉这个回退 —— 用于**不会被清理的终态标记**，那种场景下
  * 以授权用户名义永久落一个 reaction 比不落更糟（见 DriveCallOpts.tenantOnly）。
  *
- * @returns 新创建的 reaction_id（删除时要用）；失败返回 undefined（不阻塞主流程）。
+ * @returns 旧版兼容返回值。官方接口响应不承诺 reaction_id，因此新调用方应使用
+ * {@link addCommentReactionChecked} 持久化 reactionType + identity。
  */
 export async function addCommentReaction(
   larkAppId: string,
@@ -1132,8 +1144,9 @@ export async function addCommentReactionChecked(
   replyId: string,
   reactionType: string,
   options: DocProviderEffectOptions & { tenantOnly?: boolean } = {},
-): Promise<{ ok: boolean; reactionId?: string }> {
+): Promise<{ ok: boolean; reactionId?: string; identity?: DocCommentReactionIdentity }> {
   try {
+    let identity: DocCommentReactionIdentity | undefined;
     const res = await driveApiCall(larkAppId, {
       method: 'POST',
       path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
@@ -1143,14 +1156,16 @@ export async function addCommentReactionChecked(
       // tenantOnly 与 preferTenant 互斥：前者禁用 user 回退，后者允许。
       ...(options.tenantOnly ? { tenantOnly: true } : { preferTenant: true }),
       beforeProviderEffect: options.beforeProviderEffect,
+      providerIdentityUsed: used => { identity = used; },
     });
+    if (options.tenantOnly && (res?.code === undefined || res.code === 0)) identity = 'tenant';
     const reactionId: string | undefined = res?.data?.reaction_id;
     if (reactionId) {
       logger.info(`[doc-comment] added reaction=${reactionId} type=${reactionType} on reply=${replyId.slice(0, 12)}`);
     }
     // 走到这里说明 driveApiCall 没抛（tenantOnly 路径 code!=0 会抛；其余路径
     // 返回体自带 code）。id 可能为空 —— 官方 schema 不承诺，不能据此判失败。
-    return { ok: res?.code === undefined || res.code === 0, reactionId };
+    return { ok: res?.code === undefined || res.code === 0, reactionId, identity };
   } catch (err) {
     logger.warn(`[doc-comment] addCommentReaction failed for reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
     return { ok: false };
@@ -1160,34 +1175,42 @@ export async function addCommentReactionChecked(
 /**
  * 删除评论回复的 reaction（bot 回复发出后清理 "Typing" 指示器）。
  *
- * 端点：`DELETE drive/v2/files/{token}/comments/reaction`，参数全走 query string。
+ * 官方 update_reaction 是同一个 `POST` 端点，靠 `action: "delete"` +
+ * `reply_id` + `reaction_type` 取消；成功响应体是空对象，不存在可供删除的
+ * reaction_id。添加时若回退到了 user 身份，删除也必须沿用 user 身份，否则
+ * tenant 的成功 no-op 会把用户身份创建的表情留在评论里。
+ *
  * best-effort：失败只告警不抛（bot 已经成功回复了，reaction 留着也不影响）。
  */
 export async function removeCommentReaction(
   larkAppId: string,
   file: ResolvedDocFile,
-  commentId: string,
+  _commentId: string,
   replyId: string,
-  reactionId: string,
-  options: DocProviderEffectOptions = {},
+  reactionType: string,
+  options: DocProviderEffectOptions & { identity?: DocCommentReactionIdentity } = {},
 ): Promise<void> {
-  if (!reactionId) return;
-  try {
-    await driveApiCall(larkAppId, {
-      method: 'DELETE',
-      path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
-      fileTokenForIdentity: file.fileToken,
-      params: {
-        file_type: file.fileType,
-        comment_id: commentId,
-        reply_id: replyId,
-        reaction_id: reactionId,
-      },
-      preferTenant: true,
-      beforeProviderEffect: options.beforeProviderEffect,
-    });
-    logger.info(`[doc-comment] removed reaction=${reactionId.slice(0, 12)} on reply=${replyId.slice(0, 12)}`);
-  } catch (err) {
-    logger.warn(`[doc-comment] removeCommentReaction failed for reaction=${reactionId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  if (!reactionType) return;
+  const identities: DocCommentReactionIdentity[] = options.identity
+    ? [options.identity]
+    // Persisted targets created before identity tracking may belong to either
+    // principal. Delete for both; the operation is idempotent for a missing
+    // reaction and prevents an old user-fallback Typing marker from leaking.
+    : ['tenant', 'user'];
+  for (const identity of identities) {
+    try {
+      await driveApiCall(larkAppId, {
+        method: 'POST',
+        path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
+        fileTokenForIdentity: file.fileToken,
+        params: { file_type: file.fileType },
+        data: { action: 'delete', reply_id: replyId, reaction_type: reactionType },
+        ...(identity === 'tenant' ? { tenantOnly: true } : { userOnly: true }),
+        beforeProviderEffect: options.beforeProviderEffect,
+      });
+      logger.info(`[doc-comment] removed reaction=${reactionType} identity=${identity} on reply=${replyId.slice(0, 12)}`);
+    } catch (err) {
+      logger.warn(`[doc-comment] removeCommentReaction failed for reaction=${reactionType} identity=${identity}: ${err instanceof Error ? err.message : err}`);
+    }
   }
 }
