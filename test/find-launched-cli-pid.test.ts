@@ -139,6 +139,16 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
   });
 
+  it('keeps scope PID discovery alive while a slow launch shell is still starting', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150, scopePayloadAfterProbe: 40, bridgePid: 100,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
   it.each([false, true])('attests the Codex child without a Claude data dir (late PID=%s)', late => {
     const result = runWorkerWiring(late);
     expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');

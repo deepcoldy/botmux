@@ -19428,6 +19428,10 @@ async function spawnCli(
     // Ordinary launches without scope support need no additional retry loop.
     if (!scopePayloadLauncherActive && sessionScopePayloadPid(launcherPid) === launcherPid) return;
     scheduleWrapperRealCliPid(launcherPid, {
+      // A slow launch rcfile can outlive the normal wrapper-discovery budget.
+      // Keep ownership discovery until the payload appears; the existing
+      // backend/child-PID fence stops it on close or replacement.
+      maxAttempts: Number.POSITIVE_INFINITY,
       findRealPid: sessionScopePayloadPid,
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
