@@ -336,6 +336,7 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
   buildStreamingCardJson,
+  isDisposableCommandScratch,
 } from './core/worker-pool.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
@@ -26920,6 +26921,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       text: cmdContent,
       context: 'thread',
       phase: deriveSessionPhase(existingDs),
+      sessionIsCommandScratch: !!existingDs && isDisposableCommandScratch(existingDs),
       passthrough: resolvePassthroughCommands(larkAppId, passthroughCliId),
       coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
       senderIsBot: isBotSenderType || isForeignBotSender,

@@ -83,6 +83,7 @@ const forkWorkerSpy = vi.fn();
 import {
   forkSession,
   forkClosedSession,
+  withActiveSessionKeyLock,
   isForkCapableSession,
   forkWorker,
   setActiveSessionsRegistry,
@@ -821,5 +822,52 @@ describe('forkClosedSession（/resume <别处的 id>：从已关闭记录复制�
     vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
     expect(await forkClosedSession('missing', 'oc_here', 'om_here_root', 'group', 'thread')).toEqual({ ok: false, error: 'not_found' });
     expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('forkSession：等目标锁期间源会话变化', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+      botName: 'TestBot',
+    } as any);
+  });
+
+  const forkWhileTargetLocked = async (mutate: (src: DaemonSession, registry: Map<string, DaemonSession>) => void) => {
+    const registry = new Map<string, DaemonSession>();
+    setActiveSessionsRegistry(registry);
+    const src = makeSourceDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+    vi.mocked(sessionStore.createSession).mockClear();
+    let release: (() => void) | undefined;
+    const held = withActiveSessionKeyLock(registry, sessionKey('oc_child', 'cli_app_test'), () => new Promise<void>(r => { release = r; }));
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    // Source guards pass now; the fork then queues behind the held target lock.
+    const pending = callFork(src);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    mutate(src, registry);
+    release!();
+    await held;
+    return pending;
+  };
+
+  it('源会话开始新一轮：拒绝 worker_busy，不铸子会话', async () => {
+    const res = await forkWhileTargetLocked(src => {
+      src.worker = { killed: false } as any;
+      src.lastScreenStatus = 'working' as any;
+    });
+    expect(res).toEqual({ ok: false, error: 'worker_busy' });
+    expect(sessionStore.createSession).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('源会话被关闭：拒绝 session_not_active，不铸子会话', async () => {
+    const res = await forkWhileTargetLocked((src, registry) => {
+      src.session.status = 'closed';
+      registry.clear();
+    });
+    expect(res).toEqual({ ok: false, error: 'session_not_active' });
+    expect(sessionStore.createSession).not.toHaveBeenCalled();
   });
 });

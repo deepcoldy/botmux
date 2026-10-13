@@ -35,6 +35,16 @@ describe('/resume 路由', () => {
     }
   });
 
+  it('现有会话只是命令空壳（如关闭后发过 /help）时照样认领；真 dormant 会话仍转发', () => {
+    expect(classifySlash(base({ phase: 'dormant', sessionIsCommandScratch: true })))
+      .toMatchObject({ kind: 'daemon', cmd: '/resume', sessionPolicy: 'sessionless' });
+    expect(classifySlash(base({ phase: 'dormant', sessionIsCommandScratch: false })))
+      .toEqual({ kind: 'forward', reason: 'unknown_slash', cmd: '/resume' });
+    // 空壳旗标只影响 /resume，其它命令的判定不变。
+    expect(classifySlash(base({ phase: 'dormant', sessionIsCommandScratch: true, text: '/foo' })))
+      .toEqual({ kind: 'forward', reason: 'unknown_slash', cmd: '/foo' });
+  });
+
   it('不进全局 daemon 集合（不遮蔽自定义透传，也进不了 canTalk 名单）', () => {
     expect(DAEMON_COMMANDS.has('/resume')).toBe(false);
     expect(commandSpec('/resume')).toMatchObject({ claimWithoutSessionOnly: true, sessionPolicy: 'sessionless' });

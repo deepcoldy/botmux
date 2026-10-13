@@ -94,6 +94,9 @@ export interface SlashRouteInput {
   cascadeCapable?: boolean;
   /** 消息带附件时不切级联（附件跟正文走一条路），整条按今天转发。 */
   hasAttachments?: boolean;
+  /** 现有会话只是命令预建的空壳（worker:null、从未跑过 CLI，见 isDisposableCommandScratch）。
+   *  只影响「仅无会话时认领」的命令（`/resume`）：空壳不算会话。缺省 = 不是空壳。 */
+  sessionIsCommandScratch?: boolean;
 }
 
 /** runtime 级联的一项：透传命令行，或最后的正文。 */
@@ -182,9 +185,10 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
 
   const spec = commandSpec(cmd);
   const cliCommand = spec?.cliId !== undefined && spec.cliId === input.cliId;
-  // 「仅无会话时认领」的命令（`/resume`）：无会话 → 先于透传闸认领（没有 CLI 可透传）；
+  // 「仅无会话时认领」的命令（`/resume`）：无会话（或只有命令空壳，如关闭后发过 /help）
+  // → 先于透传闸认领（没有 CLI 可透传）；
   // 有会话 → 落到下面的透传闸 / 未知命令转发，与改造前逐字一致（它不在 DAEMON_COMMANDS 里）。
-  if (spec?.claimWithoutSessionOnly && (input.phase === 'none' || input.phase === 'closed')) {
+  if (spec?.claimWithoutSessionOnly && (input.phase === 'none' || input.phase === 'closed' || input.sessionIsCommandScratch)) {
     return { kind: 'daemon', cmd, content, sessionPolicy: 'sessionless' };
   }
 

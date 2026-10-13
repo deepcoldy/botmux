@@ -10683,7 +10683,16 @@ export async function forkSession(
   if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
     return { ok: false, error: 'worker_busy' };
   }
-  return forkFromSource(ds, targetChatId, targetRootMessageId, targetChatType, targetScope, opts);
+  // The source may start a turn, close, or be replaced while this fork waits
+  // behind the target-key lock; repeat the live-source guards right before minting.
+  const revalidate = (): string | undefined => {
+    if (findActiveBySessionId(sessionId) !== ds || ds.session.status !== 'active') return 'session_not_active';
+    if (isSessionLifecycleInFlight(ds)) return 'worker_busy';
+    const latestStatus = ds.lastScreenStatus;
+    if (ds.worker && !ds.worker.killed && latestStatus !== 'idle' && latestStatus !== 'limited') return 'worker_busy';
+    return undefined;
+  };
+  return forkFromSource(ds, targetChatId, targetRootMessageId, targetChatType, targetScope, opts, revalidate);
 }
 
 /**
@@ -10793,6 +10802,9 @@ async function forkFromSource(
     if (lockedOccupant && lockedOccupant !== ds) return { ok: false, error: 'target_chat_has_session' };
     const sourceError = revalidateSource?.();
     if (sourceError) return { ok: false, error: sourceError };
+    // Fork from the native id as of NOW (post-revalidation), not as of the pre-lock guard.
+    const lockedCliSessionId = ds.session.cliSessionId;
+    if (!lockedCliSessionId) return { ok: false, error: 'not_started_yet' };
 
     // ── Mint the child session row (new botmux sessionId) ──
     const parentTitle = ds.session.title || '';
@@ -10817,7 +10829,7 @@ async function forkFromSource(
     childSession.quoteTargetSenderOpenId = opts?.senderOpenId;
     childSession.quoteTargetSenderIsBot = opts?.senderIsBot;
     childSession.pendingForkSession = true;
-    childSession.cliSessionId = srcCliSessionId;
+    childSession.cliSessionId = lockedCliSessionId;
     childSession.cliId = ds.session.cliId;
     childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
     childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
