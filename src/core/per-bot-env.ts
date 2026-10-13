@@ -201,17 +201,29 @@ export function parsePerBotEnvText(text: string): PerBotEnvTextParse {
     if ('error' in logical) return { ok: false, reason: 'invalid_env_line', line: logical.line };
     const { words, line } = logical;
     if (words.length === 0) continue;
+    // dotenv-style `KEY = value` / `KEY =value` (spaces around `=`): one
+    // assignment, exactly one value word — never silently skipped.
+    if (words.length >= 2 && words.length <= 3 && !words[0].quoted && ENV_KEY_RE.test(words[0].text)
+        && !words[1].nameQuoted && words[1].text.startsWith('=')) {
+      const rest = words[1].text.slice(1);
+      if (rest && words.length === 3) return { ok: false, reason: 'invalid_env_line', line };
+      env[words[0].text] = rest || (words[2]?.text ?? '');
+      continue;
+    }
     let i = 0;
     let launcher = false;
+    let afterEnv = false;
     while (i < words.length && LAUNCHER_PREFIX_WORDS.has(words[i].text) && !words[i].quoted) {
       if (words[i].text !== 'export') launcher = true;
+      if (words[i].text === 'env') afterEnv = true;
       i++;
     }
     const assignments: Array<[string, string]> = [];
     for (; i < words.length; i++) {
       const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(words[i].text);
-      // The name and `=` must be unquoted shell syntax, like `A=` — not `"A=1"`.
-      if (!m || words[i].nameQuoted) break;
+      // Shell assignments need an unquoted `NAME=` (`"A=1"` is a command word);
+      // `env`'s own arguments are parsed after unquoting, so there it counts.
+      if (!m || (words[i].nameQuoted && !afterEnv)) break;
       assignments.push([m[1], words[i].text.slice(m[0].length)]);
     }
     if (assignments.length === 0) { ignoredLines.push(line); continue; }

@@ -88,6 +88,15 @@ describe('parsePerBotEnvText', () => {
     expect(parsePerBotEnvText('"A=1"')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('keeps dotenv `KEY = value` compatibility instead of silently skipping it', () => {
+    expect(parsePerBotEnvText('TOKEN = secret\nA =1\nMODEL=x')).toMatchObject({ ok: true, env: { TOKEN: 'secret', A: '1', MODEL: 'x' }, ignoredLines: [] });
+    expect(parsePerBotEnvText('TOKEN = a b')).toEqual({ ok: false, reason: 'invalid_env_line', line: 1 });
+  });
+
+  it('accepts quoted NAME=value arguments of an env launcher', () => {
+    expect(parsePerBotEnvText('env A=1 "TOKEN=secret" claude')).toMatchObject({ ok: true, env: { A: '1', TOKEN: 'secret' } });
+  });
+
   it('treats a comment after an empty assignment as a comment', () => {
     expect(parsePerBotEnvText('TOKEN= # comment\nHASH=a#b')).toMatchObject({ ok: true, env: { TOKEN: '', HASH: 'a#b' } });
   });
