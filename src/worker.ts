@@ -19436,7 +19436,7 @@ async function spawnCli(
         // The pane PID remains a valid marker ancestor, but it cannot identify
         // the payload's open transcript files or Claude's PID-keyed metadata.
         const observed = backend as SessionBackend & { cliPid?: number };
-        if (!observed.cliPid || observed.cliPid === launcherPid) {
+        if (!observed.cliPid || observed.cliPid === launcherPid || observed.cliPid === payloadPid) {
           observed.cliPid = payloadPid;
           publishLocalProcessAttestation(payloadPid);
         }

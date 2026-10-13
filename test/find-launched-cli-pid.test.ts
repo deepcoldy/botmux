@@ -19,7 +19,7 @@ function makeScheduler() {
 // worker.ts (which starts process IPC). Only OS probes and timers are replaced;
 // the gate, late-PID branch, resolver and attestation wiring remain real code.
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const wiringStart = workerSource.indexOf('const startWrapperRealPidResolve =');
+const wiringStart = workerSource.indexOf('const startScopePayloadPidResolve =');
 const wiringEnd = workerSource.indexOf('// Bridge fallback: claude-code only.', wiringStart);
 if (wiringStart < 0 || wiringEnd < wiringStart) throw new Error('Worker launcher wiring not found');
 const workerWiring = transpileModule(workerSource.slice(wiringStart, wiringEnd), {
@@ -55,6 +55,9 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
 function runWorkerWiring(late: boolean, options: {
   cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean;
   launchedCliPid?: number | null;
+  scopePayloadPid?: number;
+  scopePayloadAfterProbe?: number;
+  bridgePid?: number;
   // comm of the pane/getChildPid process: 'node' models the npm launcher (a
   // codex descendant must be discovered), 'codex' a direct native install (no
   // descendant scan may run).
@@ -63,6 +66,7 @@ function runWorkerWiring(late: boolean, options: {
 } = {}) {
   const scheduler = makeScheduler();
   const backend = { cliPid: 100, getChildPid: () => 100 };
+  let scopeProbes = 0;
   const findLaunchedCliPidMock = vi.fn(function (this: unknown, ..._args: unknown[]) {
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
   });
@@ -80,12 +84,18 @@ function runWorkerWiring(late: boolean, options: {
       ...(options.cliRuntime ? { cliRuntime: options.cliRuntime } : {}),
     },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
-    credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: options.bridgePid,
+    scopePayloadLauncherActive: options.scopePayloadPid !== undefined,
+    sessionScopePayloadPid: vi.fn((pid: number) => {
+      scopeProbes++;
+      return pid === 100 && scopeProbes >= (options.scopePayloadAfterProbe ?? 1)
+        ? options.scopePayloadPid ?? pid : pid;
+    }),
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
-    process: { env: {} }, cliPidMarker: undefined,
+    process: { env: {}, platform: 'linux' }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid,
     publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
@@ -98,6 +108,37 @@ function runWorkerWiring(late: boolean, options: {
 }
 
 describe('worker wrapper PID wiring', () => {
+  it.each([false, true])('binds and attests a scope payload rather than its pane parent (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150, bridgePid: 100,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('follows a scope child that appears after initial PID wiring (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
+      scopePayloadPid: 150, scopePayloadAfterProbe: 2, bridgePid: 100,
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(150);
+  });
+
+  it.each([false, true])('preserves a deeper wrapper PID when scope resolution finishes later (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', claudeDataDir: '/claude',
+      scopePayloadPid: 150, scopePayloadAfterProbe: 3, bridgePid: 100,
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
   it.each([false, true])('attests the Codex child without a Claude data dir (late PID=%s)', late => {
     const result = runWorkerWiring(late);
     expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');
