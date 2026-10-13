@@ -1170,6 +1170,14 @@ describe('HerdrBackend message writing', () => {
     be.kill();
   });
 
+  it('explicit bracketed paste uses one raw frame with literal newlines', () => {
+    const be = spawnBackend('5-5');
+    expect(be.sendBracketedPaste('first\n中文 second')).toBe(true);
+    expect(herdrCall('pane', 'send-text', '5-5', '\x1b[200~first\n中文 second\x1b[201~')).toBeDefined();
+    expect(herdrCall('pane', 'send-keys', '5-5', 'Enter')).toBeUndefined();
+    be.kill();
+  });
+
   it('sendSpecialKeys() invokes `pane send-keys` with each key', () => {
     const be = spawnBackend('5-5');
     be.sendSpecialKeys('Enter', 'C-c');
