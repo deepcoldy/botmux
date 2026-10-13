@@ -50,6 +50,18 @@ bun run test:e2e-browser
 Each invocation writes its replayable report below the gitignored
 `midscene_run/runs/<run-id>/` directory.
 
+## 调试飞书卡片回调
+
+设置 `BOTMUX_CARD_ACTION_DIAGNOSTICS=1` 启动或重启待验证的 daemon，点击卡片后查找
+`[card-action-diagnostics]` 日志。`dispatcher` 记录归一化之前的字段结构，`handler`
+记录进入业务处理时的结构；两者均包含外层是否有 `event`、action 字段名、value 类型，
+以及解析后的 `action`、`result`、`expected_feedback_id`。完整事件载荷、token、用户与
+消息标识、表单正文不会输出。该开关默认关闭，排查结束后取消设置并重启。
+
+归一化必须先于动作分类和去重。回归测试应通过真实反馈存储验证 revision 和同卡更新，
+同时验证下拉/表单字段、身份校验及重复点击行为。卡片定义里的 `behaviors[].value`
+不能代替实际回调载荷；未拿到线上原始结构时，PR 应明确标注尚未完成线上实测。
+
 ## Architecture
 
 ```

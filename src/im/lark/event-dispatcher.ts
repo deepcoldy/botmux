@@ -4,6 +4,8 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { normalizeCardActionData } from './card-action-data.js';
+import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { startLarkConnection } from './transport/connection.js';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -5518,6 +5520,9 @@ export function createLarkEventDispatcherRuntime(
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
     'card.action.trigger': (data: any) => {
+      const normalized = normalizeCardActionData(data);
+      logCardActionDiagnostics('dispatcher', data, normalized);
+      data = normalized;
       const actionType = cardActionType(data);
       if (
         runtimeOptions.enqueuePrimary

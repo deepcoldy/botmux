@@ -1419,9 +1419,11 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
-  it.each(['close', 'resume', 'restart'])(
-    'rejects unfenced %s card actions before local side effects',
-    async action => {
+  it.each(['close', 'resume', 'restart'].flatMap(action =>
+    ['object', 'string', 'behaviors', 'envelope'].map(shape => [action, shape]),
+  ))(
+    'rejects unfenced %s card actions in %s payloads before local side effects',
+    async (action, shape) => {
       setupBotState({ allowedUsers: [USER_OPEN_ID] });
       const handlers = makeHandlers();
       const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
@@ -1435,11 +1437,14 @@ describe('Lark event dispatcher — durable primary processor', () => {
       );
       runtime.connect();
 
-      const result = await capturedHandlers['card.action.trigger']({
-        action: { value: { action, session_id: 'session-primary' } },
+      const value = { action, session_id: 'session-primary' };
+      const event = {
+        action: shape === 'behaviors' ? { behaviors: [{ type: 'callback', value }] }
+          : { value: shape === 'object' ? value : JSON.stringify(value) },
         operator: { open_id: USER_OPEN_ID },
         context: { open_message_id: 'om_primary_lifecycle' },
-      });
+      };
+      const result = await capturedHandlers['card.action.trigger'](shape === 'envelope' ? { event } : event);
 
       expect(result).toEqual({
         toast: {
@@ -8876,6 +8881,39 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     setupBotState();
     handlers = makeHandlers();
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it.each(['string', 'behaviors', 'envelope'])('normalizes %s callback payloads before dedupe and dispatch', async shape => {
+    let release!: () => void;
+    handlers.handleCardAction.mockReturnValueOnce(new Promise(resolve => {
+      release = () => resolve({ toast: { type: 'success', content: 'accepted' } });
+    }) as any);
+    handlers.handleCardAction.mockResolvedValueOnce({ toast: { type: 'success', content: 'accepted' } });
+    const click = (result: string) => {
+      const value = { action: 'feedback_submit', result };
+      const event = {
+        operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_payload' },
+        action: shape === 'behaviors'
+          ? { behaviors: [{ type: 'callback', value }] }
+          : { value: JSON.stringify(value) },
+      };
+      return shape === 'envelope' ? { schema: '2.0', event } : event;
+    };
+    const first = capturedHandlers['card.action.trigger'](click('conclusive_usable'));
+    try {
+      const duplicate = await capturedHandlers['card.action.trigger'](click('conclusive_usable'));
+      expect(duplicate.toast.type).toBe('info');
+      const different = await capturedHandlers['card.action.trigger'](click('effective_progress'));
+      expect(different.toast.type).toBe('success');
+      expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
+      expect(handlers.handleCardAction).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        action: expect.objectContaining({ value: { action: 'feedback_submit', result: 'conclusive_usable' } }),
+        operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om_payload' },
+      }), MY_APP_ID);
+    } finally {
+      release();
+      await first;
+    }
   });
 
   it('uses empty ACK plus message.patch for a fast deferred complex-card update', async () => {

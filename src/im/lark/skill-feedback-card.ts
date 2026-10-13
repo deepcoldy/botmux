@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { CardActionData } from './card-handler.js';
+import { normalizeCardActionData } from './card-action-data.js';
 import { resolveCardOperatorUnionId } from './card-handler.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { SkillFeedbackStore } from '../../services/skill-feedback-store.js';
@@ -80,10 +80,11 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
 
 function callbackKey(input: Record<string, unknown>): string { return createHash('sha256').update(JSON.stringify(input)).digest('hex'); }
 
-export async function handleSkillFeedbackCardAction(data: CardActionData, larkAppId: string, deps: {
+export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: string, deps: {
   store: SkillFeedbackStore;
   loadBaseCard?: (platformMessageId: string) => Promise<Record<string, unknown> | undefined>;
 }): Promise<any> {
+  const data = normalizeCardActionData(input);
   const platformMessageId = data.context?.open_message_id;
   const verifiedOperator = await resolveCardOperatorUnionId(data, larkAppId);
   const operatorOpenId = verifiedOperator.openId?.startsWith('ou_') ? verifiedOperator.openId : undefined;
