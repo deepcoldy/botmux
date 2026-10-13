@@ -14,6 +14,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available when the existing bot-level XPI switch enables principal lanes) |
 | `/lane close` | Safely close your isolated principal lane: refuses while work is running/queued or files are uncommitted, pushes unpublished commits before cleanup, and never auto-merges or deletes the branch |
 | `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |
+| `/queue <text>` | Codex App live sessions: submit a separate turn after the active task, or start immediately when idle. Multiline plain text supported; rich text and attachments are not supported yet. Requires command permission (canTalkDaemonCommands may grant access). Missing/unready sessions and other CLIs are explicitly rejected |
 | `/stop` | Interrupt the current turn while keeping the session; same as the streaming card's Stop button |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |

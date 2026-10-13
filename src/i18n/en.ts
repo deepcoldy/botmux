@@ -318,6 +318,11 @@ export const messages: Record<string, string> = {
   'card.tui.input_placeholder': 'Type a custom reply…',
 
   // ─── Command responses ───────────────────────────────────────────────────
+  'cmd.queue.usage': 'Usage: /queue <text message> (multiline plain text supported; rich text and attachments are not supported yet)',
+  'cmd.queue.unsupported': '/queue currently supports Codex App sessions only.',
+  'cmd.queue.not_ready': 'Session is not ready. Start the session before retrying /queue.',
+  'cmd.queue.accepted': 'Accepted: runs as a separate turn after the active task, or starts immediately when idle.',
+  'cmd.queue.failed': 'Message was not queued. Please retry later.',
   'cmd.no_active_session': 'No active session in this topic.',
   'cmd.close.tag_updated': '🏷️ This chat is now in “{name}”.',
   'cmd.close.tag_failed': '⚠️ The session is closed, but its tag update did not complete. The chat and history are kept; check tag authorization or adjust the groups manually.',
@@ -843,6 +848,7 @@ export const messages: Record<string, string> = {
   'help.close': '/close      - Close current session, kill {cliName}',
   'help.cleanup_wt': '/cleanup-wt <ID> - Retry a failed worktree cleanup job',
   'help.lane': '/lane status|close - Inspect or safely close your isolated lane (protects uncommitted and unpushed work)',
+  'help.queue': '/queue <text> - Run after the active task (Codex App)',
   'help.stop': '/stop       - Interrupt the current turn, keep the session',
   'help.restart': '/restart    - Restart {cliName} (keep session)',
   'help.topic': '[title] /t [/repo <repo> | /repo wt <repo> [branch]] [/model <model>] [/effort <level>] [<first task>]  (alias /topic) - Start a topic in a regular group, declaring title, repo, model, reasoning effort and the first task in one message. Newlines are the same as spaces; the title goes BEFORE /t (Lark shows the raw message in its topic list and the bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. Bare /t opens setup (repo picker when needed, otherwise waits for the next task or /repo); a bare /repo inside the header (no argument) starts right away in the default working dir, same as the picker card start-directly button. /repo wt <repo> [branch] creates a fresh worktree on that repo before starting: the branch may be omitted (auto-named from the title/task); when given it is only taken from the next word on the same line as the repo that looks like a branch name, so start a latin first task on a new line. Note that /repo inside the header takes a single token, while a standalone mid-session /repo still takes the rest of the line',

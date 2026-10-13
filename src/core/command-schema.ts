@@ -31,6 +31,8 @@ export type CommandSessionPolicy =
 export type CommandSpecialHandler = 'sessions' | 'vc-auth' | 'card' | 'cot' | 'term';
 
 export interface CommandSpec {
+  /** Payload commands accept literal angle brackets and slash-prefixed body lines. */
+  readonly literalBody?: true;
   /** 主名，含前导 `/`，小写。 */
   readonly name: string;
   /** 别名（fallthrough case），含前导 `/`。 */
@@ -62,6 +64,8 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
+  { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
+    notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },
   { name: '/help', sessionPolicy: 'default', help: ['help.help'] },
   { name: '/insight', sessionPolicy: 'default', help: ['help.insight'] },
   { name: '/detach', aliases: ['/disconnect'], sessionPolicy: 'default', help: ['help.detach'] },

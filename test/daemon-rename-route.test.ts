@@ -624,6 +624,90 @@ describe('/rename production routing — must not pre-create a session (review P
     rmSync(crossRefPath(), { force: true });
   });
 
+  it.each([false, true])('/queue missing session creates nothing (reply=%s)', async reply => {
+    const root = 'om_queue_missing';
+    const id = reply ? 'om_queue_missing_reply' : root;
+    const data = makeEventData(id, '/queue later', reply ? root : undefined);
+    if (reply) await handleThreadReply(data, makeCtx(root, id));
+    else await handleNewTopic(data, makeCtx(root, id));
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText()).toContain('没有活跃的会话');
+  });
+
+  it('/queue freezes serial inputs and preserves FIFO IDs, caller, body and reply placement', async () => {
+    const root = 'om_queue_root';
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: [OWNER], codexAppCleanInput: true });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'queue');
+    ds.session.cliId = 'codex-app';
+    ds.session.cliSessionId = 'native-queue-thread';
+    ds.workingDir = '/tmp';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    // Bot config remains Claude: the existing session's frozen CLI wins.
+    for (const [id, text] of [['om_queue_1', 'first <tag>\n/compact is literal text'], ['om_queue_2', 'next']]) {
+      await handleThreadReply(makeEventData(id, `/queue ${text}`, root), makeCtx(root, id));
+    }
+    expect(repliedText()).toContain('已接纳');
+    const turns = send.mock.calls.map(([m]) => m).filter(m => m.type === 'message');
+    expect(turns).toHaveLength(2);
+    expect(turns.map(m => m.turnId)).toEqual(['om_queue_1', 'om_queue_2']);
+    expect(turns.map(m => m.codexAppInput.text)).toEqual(['first <tag>\n/compact is literal text', 'next']);
+    for (const turn of turns) {
+      expect(turn.codexAppSteerable).toBeUndefined();
+      expect(turn.trustedCaller).toMatchObject({ requestUserOpenId: OWNER, senderType: 'user' });
+      expect(turn.content).not.toContain('/queue');
+    }
+    expect(ds.session.codexAppDispatchLedger?.map(e => e.turnId)).toEqual(['om_queue_1', 'om_queue_2']);
+    for (const entry of ds.session.codexAppDispatchLedger ?? []) {
+      expect(entry.codexAppSteerable).toBeUndefined();
+      expect(entry.replyTarget).toEqual({ mode: 'thread', rootMessageId: root });
+    }
+    expect(repliedText()).toContain('已接纳');
+  });
+
+  it.each(['other-cli', 'no-worker', 'killed', 'pending-repo', 'empty', 'post', 'sender-denied'])(
+    '/queue refuses %s without injecting model input', async mode => {
+      const root = 'om_queue_refused';
+      const ds = seedThreadSession(root, 'queue refused');
+      ds.session.cliId = mode === 'other-cli' ? 'claude-code' : 'codex-app';
+      ds.workingDir = '/tmp';
+      const send = vi.fn();
+      ds.worker = mode === 'no-worker' ? null : { killed: mode === 'killed', send } as any;
+      ds.pendingRepo = mode === 'pending-repo';
+      const data = makeEventData('om_queue_refusal', mode === 'empty' ? '/queue' : '/queue later', root);
+      if (mode === 'post') {
+        data.message.message_type = 'post';
+        data.message.content = JSON.stringify({ zh_cn: { title: '', content: [[{ tag: 'text', text: '/queue later' }, { tag: 'img', image_key: 'img_fake' }]] } });
+      }
+      if (mode === 'sender-denied') data.sender.sender_id.open_id = 'ou_unknown';
+      await handleThreadReply(data, makeCtx(root, 'om_queue_refusal'));
+      expect(send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+      expect(ds.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+      expect(repliedText()).not.toContain('已接纳');
+    },
+  );
+
+  it('/queue refuses a replaced worker after sender lookup without injecting into the replacement', async () => {
+    const root = 'om_queue_replaced';
+    const ds = seedThreadSession(root, 'queue replaced');
+    ds.session.cliId = 'codex-app';
+    ds.workingDir = '/tmp';
+    const original = vi.fn();
+    const replacement = vi.fn();
+    ds.worker = { killed: false, send: original } as any;
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      ds.worker = { killed: false, send: replacement } as any;
+      return { openId: OWNER, type: 'user' };
+    });
+    await handleThreadReply(makeEventData('om_queue_replaced_reply', '/queue later', root),
+      makeCtx(root, 'om_queue_replaced_reply'));
+    expect([...original.mock.calls, ...replacement.mock.calls].filter(([m]) => m.type === 'message')).toHaveLength(0);
+    expect(repliedText()).toContain('未能入队');
+  });
+
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
     await handleNewTopic(makeEventData('om_new_1', '/rename Foo'), makeCtx('om_new_1', 'om_new_1'));
 

@@ -232,6 +232,7 @@ type SessionPhase =
 
 | 变化 | 今天 | 之后 | 理由 | PR |
 |---|---|---|---|---|
+| `/queue <消息>` | 未注册，作为普通模型输入，可引导当前轮 | existingOnly、多行 daemon 命令；Codex App 活会话冻结为 serial FIFO，新轮次执行；其它 CLI / 无活 worker 明确拒绝 | 不改变普通消息引导；不创建会话；仍走命令授权；附件暂不支持 | 独立 queue PR |
 | Codex App 会话内 `/effort <档位>` | 无 raw 透传面，作为普通模型输入 | schema 按 `cliId: codex-app` 登记为只用于已有会话的 daemon 命令，通过原生设置接口更新；其它 CLI 仍透传 | 调整后续轮次推理强度；更新当前轮需显式启用实验特性 `step_model_switching`（默认关闭）；不创建模型轮次，CLI 专属命令不进入全局 daemon 集合 | #1817 |
 | 头部 `/repo wt <目标> [分支]` | 拒（`repo_worktree_unsupported`） | 可用 | 直接动因 | PR-1 |
 | `/repo wt` 用法串与帮助行不一致（zh/en） | 两条互相矛盾 | 由 schema 生成一条 | 自相矛盾的东西修好必然改掉一条 | PR-2 |

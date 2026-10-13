@@ -584,6 +584,7 @@ export interface CommandHandlerDeps {
   getActiveCount: () => number;
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined;
+  submitQueuedMessage?: (ds: DaemonSession, message: LarkMessage, text: string, replyTarget?: FrozenSessionReplyTarget) => Promise<boolean>;
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
@@ -1748,6 +1749,31 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/queue': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const text = message.content.replace(/^\/queue\b/i, '').trim();
+        if (!text || message.msgType !== 'text' || message.attachments?.length) {
+          await sessionReply(rootId, t('cmd.queue.usage', undefined, loc));
+          break;
+        }
+        const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (cliId !== 'codex-app' || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+          await sessionReply(rootId, t('cmd.queue.unsupported', undefined, loc));
+          break;
+        }
+        if (!ds.worker || ds.worker.killed || ds.pendingRepo || ds.initialStartPending
+          || ds.session.queuedActivationPending || isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.queue.not_ready', undefined, loc));
+          break;
+        }
+        const accepted = await deps.submitQueuedMessage?.(ds, message, text, deps.invocationReplyTarget);
+        await sessionReply(rootId, t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc));
+        break;
+      }
+
       case '/effort': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -5955,6 +5981,7 @@ export async function handleCommand(
           t('help.cleanup_wt', undefined, loc),
           t('help.lane', undefined, loc),
           t('help.stop', { cliName }, loc),
+          t('help.queue', undefined, loc),
           t('help.restart', { cliName }, loc),
           t('help.topic', undefined, loc),
           t('help.cd', { cliName }, loc),

@@ -5759,6 +5759,57 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
 
 export const __testOnly_prewarmDocCommentSession = prewarmDocCommentSession;
 
+/** /queue uses the same accepted ledger and native FIFO as ordinary input,
+ * without the positive authorization that permits steering an active turn. */
+async function submitQueuedMessage(
+  ds: DaemonSession, message: LarkMessage, text: string,
+  replyTarget?: import('./types.js').FrozenSessionReplyTarget,
+): Promise<boolean> {
+  const worker = ds.worker;
+  const generation = ds.session.workerGeneration;
+  const nativeThread = ds.session.cliSessionId;
+  const isCurrent = () => activeSessions.get(activeSessionKey(ds)) === ds
+    && ds.worker === worker && !!worker && !worker.killed
+    && ds.session.workerGeneration === generation
+    && ds.session.cliSessionId === nativeThread;
+  if (!isCurrent()) return false;
+  const senderIsBot = senderIsBotTriState(message.senderType,
+    isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId));
+  const sender = await resolveSender(ds.larkAppId, message.senderId, message.senderType);
+  if (!isCurrent()) return false;
+  const bot = getBot(ds.larkAppId);
+  const input = buildFollowUpCliInput(text, ds.session.sessionId, {
+    cliId: 'codex-app', sender, codexAppText: text,
+    mentions: message.mentions,
+    larkAppId: ds.larkAppId, chatId: ds.session.chatId,
+    selfMention: { name: bot.botName, openId: bot.botOpenId },
+    sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds), turnId: message.messageId,
+  });
+  ds.session.quoteTargetId = message.messageId;
+  ds.session.quoteTargetSenderOpenId = message.senderId;
+  ds.session.quoteTargetSenderIsBot = senderIsBot === true;
+  const root = replyTarget?.mode === 'thread' || replyTarget?.mode === 'quote'
+    ? replyTarget.rootMessageId : undefined;
+  beginReplyTargetTurn(ds, root, message.messageId, new Date().toISOString(), {
+    quoteOnly: replyTarget?.mode === 'quote',
+    senderOpenId: message.senderId,
+    participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
+    inThread: !!message.threadId,
+  });
+  // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
+  // and carried across runner recovery; user-written text cannot enable it.
+  if (!sendWorkerInput(ds, input, message.messageId, {
+    trustedCaller: trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot),
+  })) return false;
+  ds.session.lastCallerOpenId = message.senderId;
+  beginNewTurn(ds, text, message.messageId);
+  rememberLastCliInput(ds, text, input);
+  markSessionActivity(ds, Date.now(), { human: senderIsBot === false });
+  sessionStore.updateSession(ds.session);
+  return true;
+}
+
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
@@ -5767,6 +5818,7 @@ const commandDeps: CommandHandlerDeps = {
   lastRepoScan,
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
+  submitQueuedMessage,
 };
 
 /** Bind every reply produced by one slash-command invocation to the routing

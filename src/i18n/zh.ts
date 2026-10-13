@@ -317,6 +317,11 @@ export const messages: Record<string, string> = {
   'card.tui.input_placeholder': '输入自定义回复…',
 
   // ─── Command responses ───────────────────────────────────────────────────
+  'cmd.queue.usage': '用法：/queue <文字消息>（支持多行纯文本，暂不支持富文本和附件）',
+  'cmd.queue.unsupported': '/queue 暂只支持 Codex App 会话。',
+  'cmd.queue.not_ready': '会话尚未就绪，请启动会话后重试 /queue。',
+  'cmd.queue.accepted': '已接纳：将在当前任务结束后作为独立一轮执行；空闲时直接开始。',
+  'cmd.queue.failed': '消息未能入队，请稍后重试。',
   'cmd.no_active_session': '当前话题没有活跃的会话。',
   'cmd.close.tag_updated': '🏷️ 当前群已移入「{name}」。',
   'cmd.close.tag_failed': '⚠️ 会话已关闭，但标签切换未完成；群聊与历史保留，请检查标签授权或手动调整分组。',
@@ -841,6 +846,7 @@ export const messages: Record<string, string> = {
   'help.close': '/close      - 关闭当前会话，终止 {cliName} 进程',
   'help.cleanup_wt': '/cleanup-wt <ID> - 重试失败的 worktree 清理任务',
   'help.lane': '/lane status|close - 查看或安全关闭本人的独立 lane（关闭前会保护未提交和未推送成果）',
+  'help.queue': '/queue <消息> - 等当前任务结束后执行（Codex App）',
   'help.stop': '/stop       - 中断当前 turn，保留会话',
   'help.restart': '/restart    - 重启 {cliName} 进程（保留 session）',
   'help.topic': '[标题] /t [/repo 仓库 | /repo wt 仓库 [分支]] [/model 模型] [/effort 档位] [首轮任务]  (别名 /topic) - 普通群内新开话题，一条消息交代完标题/仓库/模型/推理强度/首轮任务。换行等价于空格；标题写在 /t 之前（飞书话题列表显示的是原消息，bot 改不了）；带空格的路径用双引号；指令任一项写错则整条不生效并回一句用法错误。裸 /t 进入话题设置（需选仓则弹卡，否则等待下一条任务或 /repo）；头部里裸写 /repo（不带参数）= 直接在默认目录开会话，与选仓卡的「直接开始」一致。/repo wt 仓库 [分支] 在该仓库上新建 worktree 再开会话：分支可省略（按标题/正文自动命名），写了则只认与仓库同一行、长得像分支名的下一个词，所以英文开头的正文请换行再写。注意头部里的 /repo 只吃一个 token，会话中途单发的 /repo 仍吃整行',
