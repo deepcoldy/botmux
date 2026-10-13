@@ -182,6 +182,11 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
 
   const spec = commandSpec(cmd);
   const cliCommand = spec?.cliId !== undefined && spec.cliId === input.cliId;
+  // 「仅无会话时认领」的命令（`/resume`）：无会话 → 先于透传闸认领（没有 CLI 可透传）；
+  // 有会话 → 落到下面的透传闸 / 未知命令转发，与改造前逐字一致（它不在 DAEMON_COMMANDS 里）。
+  if (spec?.claimWithoutSessionOnly && (input.phase === 'none' || input.phase === 'closed')) {
+    return { kind: 'daemon', cmd, content, sessionPolicy: 'sessionless' };
+  }
 
   // ④ 透传闸（先于 DAEMON_COMMANDS；两集合恒不相交，顺序因此不可观测）。
   if (!cliCommand && input.passthrough.has(cmd)) {

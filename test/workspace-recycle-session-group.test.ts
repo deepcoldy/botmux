@@ -31,7 +31,7 @@ import { __testOnly_activeSessions as active, __testOnly_handleNewTopic as handl
 import { type DaemonSession, activeSessionKey } from '../src/core/types.js';
 
 const APP = 'app-recycle-group';
-const CHAT = 'oc-recycle-group';
+const CHAT = 'oc_recycle_group';
 let controller: WorkspaceRecycleRuntime | undefined;
 afterEach(() => {
   controller?.stop(); active.clear(); pool.setActiveSessionsRegistry(new Map());
@@ -39,13 +39,13 @@ afterEach(() => {
   rmSync(mocks.dataDir, { recursive: true, force: true });
 });
 
-it('finish(succeeded) keeps the real durable row retired through session-group automatic resume, without fresh fallback', async () => {
+it('finish(succeeded) keeps the retired row closed: a new group message starts fresh, /resume is refused', async () => {
   const workspace = join(mocks.dataDir, 'workspace'); mkdirSync(workspace, { recursive: true });
   const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'claude-code', allowedUsers: ['ou_fixture'] });
   bot.resolvedAllowedUsers = ['ou_fixture'];
   store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
   const session = store.createSession(CHAT, 'om_original', 'recycle group fixture', 'group', 'chat');
-  Object.assign(session, { larkAppId: APP, workingDir: workspace, backendType: 'pty' }); store.updateSession(session);
+  Object.assign(session, { larkAppId: APP, workingDir: workspace, backendType: 'pty', cliId: 'claude-code' }); store.updateSession(session);
   const ds = { session, larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat', workingDir: workspace,
     worker: null, workerPort: null, workerToken: null, lastMessageAt: 1, lastScreenStatus: 'idle' } as DaemonSession;
   active.set(activeSessionKey(ds), ds);
@@ -63,15 +63,26 @@ it('finish(succeeded) keeps the real durable row retired through session-group a
   expect((await recycler.finish('retire-group', { eventId: 'end-group', outcome: 'succeeded' })).status).toBe('closed');
   // Reload both stores to prove that rejection does not depend on runtime memory.
   store.init(APP); initSessionGroups(APP);
-  mocks.reply.mockClear(); mocks.send.mockClear();
-  await handleNewTopic({
+  const ingress = (messageId: string, text: string) => handleNewTopic({
     sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
-    message: { message_id: 'om_continue', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: 'continue' }), create_time: String(Date.now()) },
-  }, { chatId: CHAT, messageId: 'om_continue', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
-  expect(store.loadAllSessionsStrict(mocks.dataDir)).toMatchObject([{ sessionId: session.sessionId, status: 'closed',
-    workspaceRetirement: { operationId: 'retire-group', workspacePath: workspace } }]);
+    message: { message_id: messageId, chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId, chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  const retired = () => store.loadAllSessionsStrict(mocks.dataDir).find(s => s.sessionId === session.sessionId);
+
+  // /resume (no session in the chat → claimed by botmux) targets the retired row and is refused.
+  mocks.reply.mockClear(); mocks.send.mockClear();
+  await ingress('om_resume', '/resume');
+  await vi.waitFor(() => expect([...mocks.reply.mock.calls, ...mocks.send.mock.calls].flat().join(' '))
+    .toMatch(/工作区已回收|workspace has been reclaimed/));
+  expect(retired()).toMatchObject({ status: 'closed', workspaceRetirement: { operationId: 'retire-group', workspacePath: workspace } });
   expect(active.size).toBe(0);
   expect(mocks.fork).not.toHaveBeenCalled();
-  expect(getSessionGroup(CHAT)?.lastSessionId).toBe(session.sessionId);
-  expect([...mocks.reply.mock.calls, ...mocks.send.mock.calls].flat().join(' ')).toMatch(/工作区已回收|workspace has been reclaimed/);
+
+  // An ordinary message no longer auto-resumes the closed row: it opens a fresh session.
+  await ingress('om_continue', 'continue');
+  expect(retired()).toMatchObject({ status: 'closed', workspaceRetirement: { operationId: 'retire-group', workspacePath: workspace } });
+  const fresh = getSessionGroup(CHAT)?.lastSessionId;
+  expect(fresh).toBeTruthy();
+  expect(fresh).not.toBe(session.sessionId);
+  expect(store.getOwnedSession(fresh!)?.status).toBe('active');
 });

@@ -127,7 +127,7 @@ import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
-import { isSessionGroup } from '../services/session-groups-store.js';
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { tagClosedSessionGroup } from '../services/feed-group-tagger.js';
 import { dismissSessionGroup } from './dismiss-command.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
@@ -1723,6 +1723,44 @@ function formatInsightCard(report: SafeInsightReport, loc: Locale): string {
     if (s.evidence.length) lines.push(`   · ${s.evidence.join('；')}`);
   }
   return lines.join('\n');
+}
+
+/** 「恢复会话」结果 → 回复文案；`/adopt <id>` 与 `/resume` 共用，失败口径与卡片按钮一致。 */
+function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, loc: Locale): string {
+  if (result.ok) {
+    const cliName = sessionCliDisplayName(result.ds);
+    const resultLoc = localeForBot(result.ds.larkAppId);
+    if (result.recoveryPending) return t('card.action.resume_started_remote', { cliName }, resultLoc);
+    return resumeStartsFresh(result.ds.session)
+      ? t('card.action.resume_success_fresh', { cliName }, resultLoc)
+      : t('card.action.resume_success', { cliName }, resultLoc);
+  }
+  switch (result.error) {
+    case 'not_closed': return t('card.action.resume_not_closed', undefined, loc);
+    case 'anchor_occupied': {
+      const detail = result.activeSessionId
+        ? t('card.action.resume_anchor_holder', { short: result.activeSessionId.substring(0, 8) }, loc)
+        : '';
+      return t('card.action.resume_anchor_occupied', { detail }, loc);
+    }
+    case 'adopt_unsupported': return t('card.action.resume_adopt_unsupported', undefined, loc);
+    case 'deferred_unmaterialized': return t('card.action.resume_deferred_unmaterialized', undefined, loc);
+    case 'resume_cancelled': return t('card.action.resume_cancelled', undefined, loc);
+    case 'workspace_retired': return t('card.action.resume_workspace_retired', undefined, loc);
+    case 'resume_start_failed': return t('card.action.resume_start_failed', undefined, loc);
+    case 'resume_reconciliation_required': return t('card.action.resume_reconciliation_required', undefined, loc);
+    default: return t('cmd.adopt.resume_not_found', undefined, loc);
+  }
+}
+
+/** `/resume` 不带参数时的目标：本锚点（话题根 / 群）下最近关闭的真会话。
+ *  命令预建的 worker:null 空壳（`/help` 之类）关闭后也是 closed 行，但从未跑过 CLI，跳过。 */
+function latestClosedSessionAt(anchor: string): import('../types.js').Session | undefined {
+  return sessionStore.listSessions()
+    .filter(s => s.status === 'closed'
+      && storedSessionAnchorId(s) === anchor
+      && !!(s.cliLaunchSnapshot || s.cliId || s.lastCliInput))
+    .sort((a, b) => Date.parse(b.closedAt ?? b.createdAt) - Date.parse(a.closedAt ?? a.createdAt))[0];
 }
 
 export async function handleCommand(
@@ -4251,6 +4289,67 @@ export async function handleCommand(
         break;
       }
 
+      case '/resume': {
+        // 路由只在本话题/本群没有会话时把 /resume 交到这里；有会话时它透传给 CLI 自带的 /resume。
+        const target = message.content.replace(/^\/resume\s*/i, '').trim();
+        const session = target
+          ? sessionStore.getOwnedSession(target)
+            ?? sessionStore.listSessions().find(s => s.cliSessionId === target)
+          : latestClosedSessionAt(rootId);
+        if (!session) {
+          await sessionReply(rootId, t(target ? 'cmd.adopt.resume_not_found' : 'cmd.resume.none', undefined, loc));
+          break;
+        }
+        if (storedSessionAnchorId(session) !== rootId) {
+          // 别处的会话：像 /fork 一样复制到这里（继承完整上下文），原会话不动、仍可在原处恢复。
+          if (session.status !== 'closed') {
+            await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
+            break;
+          }
+          const resumeChatId = message.chatId ?? session.chatId;
+          const senderIsBot = message.senderType === 'app' || message.senderType === 'bot'
+            || (!!larkAppId && isKnownPeerBot(config.session.dataDir, larkAppId, message.senderId));
+          const { forkClosedSession } = await import('./worker-pool.js');
+          const forked = await forkClosedSession(
+            session.sessionId,
+            resumeChatId,
+            rootId,
+            message.chatType ?? 'group',
+            rootId === resumeChatId ? 'chat' : 'thread',
+            {
+              childTitle: session.title,
+              larkThreadId: rootId === resumeChatId ? undefined : message.threadId,
+              turnId: message.messageId,
+              senderOpenId: message.senderId,
+              senderIsBot,
+              childOwnerOpenId: senderIsBot ? undefined : message.senderId,
+            },
+          );
+          if (forked.ok) {
+            touchSessionGroup(resumeChatId, forked.childSessionId);
+            await sessionReply(rootId, t('cmd.resume.forked', { title: session.title || session.sessionId.substring(0, 8) }, loc));
+          } else if (forked.error === 'fork_unsupported_backend') {
+            const cliName = getCliDisplayName((session.cliId ?? getBot(session.larkAppId ?? larkAppId!).config.cliId ?? 'claude-code') as CliId);
+            await sessionReply(rootId, t('cmd.resume.fork_unsupported', { cli: cliName, id: session.sessionId }, loc));
+          } else if (forked.error === 'workspace_retired') {
+            await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, loc));
+          } else if (forked.error === 'adopt_not_forkable') {
+            await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
+          } else if (forked.error === 'not_started_yet') {
+            await sessionReply(rootId, t('cmd.fork.not_started_yet', undefined, loc));
+          } else if (forked.error === 'target_chat_has_session') {
+            await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail: '' }, loc));
+          } else {
+            await sessionReply(rootId, t('cmd.fork.failed', { error: forked.error }, loc));
+          }
+          break;
+        }
+        const result = await resumeSession(session.sessionId, activeSessions);
+        if (result.ok) touchSessionGroup(result.ds.chatId, session.sessionId);
+        await sessionReply(rootId, resumeResultMessage(result, loc));
+        break;
+      }
+
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
         if (ds && isSessionTransferring(ds)) {
@@ -4302,36 +4401,7 @@ export async function handleCommand(
             }
 
             const result = await resumeSession(managedTarget.sessionId, activeSessions);
-            if (result.ok) {
-              const cliName = sessionCliDisplayName(result.ds);
-              const resumeMsg = result.recoveryPending
-                ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
-                : resumeStartsFresh(result.ds.session)
-                  ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-                  : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
-              await sessionReply(rootId, resumeMsg);
-            } else if (result.error === 'not_closed') {
-              await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
-            } else if (result.error === 'anchor_occupied') {
-              const detail = result.activeSessionId
-                ? t('card.action.resume_anchor_holder', { short: result.activeSessionId.substring(0, 8) }, loc)
-                : '';
-              await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, loc));
-            } else if (result.error === 'adopt_unsupported') {
-              await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, loc));
-            } else if (result.error === 'deferred_unmaterialized') {
-              await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
-            } else if (result.error === 'resume_cancelled') {
-              await sessionReply(rootId, t('card.action.resume_cancelled', undefined, loc));
-            } else if (result.error === 'workspace_retired') {
-              await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, loc));
-            } else if (result.error === 'resume_start_failed') {
-              await sessionReply(rootId, t('card.action.resume_start_failed', undefined, loc));
-            } else if (result.error === 'resume_reconciliation_required') {
-              await sessionReply(rootId, t('card.action.resume_reconciliation_required', undefined, loc));
-            } else {
-              await sessionReply(rootId, t('cmd.adopt.resume_not_found', undefined, loc));
-            }
+            await sessionReply(rootId, resumeResultMessage(result, loc));
             break;
           }
         }
@@ -5995,6 +6065,7 @@ export async function handleCommand(
           t('help.heading_adopt', undefined, loc),
           t('help.adopt', undefined, loc),
           t('help.adopt_pane', undefined, loc),
+          t('help.resume', { cliName }, loc),
           t('help.detach', undefined, loc),
           '',
           t('help.heading_collab', undefined, loc),

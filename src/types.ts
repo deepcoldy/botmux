@@ -1392,6 +1392,9 @@ export interface LarkMessage {
    *  without a session (e.g. `/group`) so the handler can reach the chat
    *  roster without an active session to read `ds.chatId` from. */
   chatId?: string;
+  /** Source chat type, alongside `chatId` for session-less commands
+   *  (`/resume` copying a session into this chat needs it). */
+  chatType?: 'group' | 'p2p';
   /** Immediate parent — set when the user used the Lark "quote/reply"
    *  UI to reference a specific earlier message. Empty otherwise. */
   parentId?: string;

@@ -66,7 +66,7 @@ const CONSUMERS: Record<string, Rule> = {
       + 'session), and a scratch has no CLI session, hence no remote lineage.',
     count: 2,
   },
-  'core/worker-pool.ts::forkSession::closeSession': {
+  'core/worker-pool.ts::forkFromSource::closeSession': {
     category: 'impossible_by_invariant',
     why: 'Rolls back a just-created fork CHILD whose worker never started (slot lost '
       + 'before registration, or spawn threw). No turn ran, so no remote session '

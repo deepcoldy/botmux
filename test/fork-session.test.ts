@@ -82,6 +82,7 @@ const forkWorkerSpy = vi.fn();
 
 import {
   forkSession,
+  forkClosedSession,
   isForkCapableSession,
   forkWorker,
   setActiveSessionsRegistry,
@@ -737,5 +738,57 @@ describe('sessionAgentConfig — group defaults', () => {
     const cfg = sessionAgentConfig(ds, bot);
     expect(cfg.model).toBe('gpt-5.5');
     expect(cfg.reasoningEffort).toBe('medium');
+  });
+});
+
+describe('forkClosedSession（/resume <别处的 id>：从已关闭记录复制）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
+      botName: 'TestBot',
+    } as any);
+    setActiveSessionsRegistry(new Map());
+  });
+
+  const closedRow = (overrides: Partial<Session> = {}): Session => ({
+    ...makeSourceDs({ status: 'closed', closedAt: new Date().toISOString(), sandbox: true, reasoningEffort: 'high', ...overrides }).session,
+  });
+  const callClosedFork = (row: Session) => {
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(row);
+    return forkClosedSession(row.sessionId, 'oc_here', 'om_here_root', 'group', 'thread', {
+      forkWorkerImpl: forkWorkerSpy as any,
+      childOwnerOpenId: 'ou_resumer',
+    });
+  };
+
+  it('在目标锚点铸出带完整上下文的子会话，原关闭记录不动', async () => {
+    const row = closedRow();
+    const before = structuredClone(row);
+    const registry = new Map<string, DaemonSession>();
+    setActiveSessionsRegistry(registry);
+    const res = await callClosedFork(row);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const child = vi.mocked(sessionStore.updateSession).mock.calls.map(c => c[0]).find(s => s.sessionId === res.childSessionId)!;
+    expect(child).toMatchObject({
+      chatId: 'oc_here', rootMessageId: 'om_here_root', scope: 'thread',
+      forkedFrom: row.sessionId, pendingForkSession: true, cliSessionId: 'cli-native-src-abc',
+      sandbox: true, reasoningEffort: 'high', larkAppId: 'cli_app_test', ownerOpenId: 'ou_resumer',
+    });
+    expect(registry.get(sessionKey('om_here_root', 'cli_app_test'))?.session.sessionId).toBe(res.childSessionId);
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+    expect(row).toEqual(before);
+  });
+
+  it('只接受已关闭、未回收、可 fork 的记录', async () => {
+    expect(await callClosedFork(closedRow({ status: 'active' }))).toEqual({ ok: false, error: 'not_closed' });
+    expect(await callClosedFork(closedRow({ workspaceRetirement: { operationId: 'op', workspacePath: '/tmp/p' } as any })))
+      .toEqual({ ok: false, error: 'workspace_retired' });
+    expect(await callClosedFork(closedRow({ cliId: 'codex-app' }))).toEqual({ ok: false, error: 'fork_unsupported_backend' });
+    expect(await callClosedFork(closedRow({ cliSessionId: undefined }))).toEqual({ ok: false, error: 'not_started_yet' });
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
+    expect(await forkClosedSession('missing', 'oc_here', 'om_here_root', 'group', 'thread')).toEqual({ ok: false, error: 'not_found' });
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
   });
 });

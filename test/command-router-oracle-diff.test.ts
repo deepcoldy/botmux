@@ -24,7 +24,7 @@ import {
 /** 设计 §10 的字母表：命令 / 子命令 / 透传 / 冷启动 / 未注册 / 多行豁免 / 占位符 / 中文 / latin / 引号 / 大小写。 */
 const ALPHABET = [
   '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
-  '/context-sharing', '/effort',
+  '/context-sharing', '/effort', '/resume',
   '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
 ];
@@ -99,6 +99,13 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
     input.text.trim().toLowerCase().startsWith('/context-sharing')
     && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
     && next.kind === 'daemon' && next.cmd === '/context-sharing'
+    && next.sessionPolicy === 'sessionless',
+  // /resume 只在无会话时由 botmux 认领（恢复已关闭会话）；有会话时仍按未知命令转发给 CLI。
+  (input, legacy, next) =>
+    input.phase === 'none'
+    && input.text.trim().toLowerCase().split(/\s/)[0] === '/resume'
+    && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
+    && next.kind === 'daemon' && next.cmd === '/resume'
     && next.sessionPolicy === 'sessionless',
   // PR-2：thread 入口的 /card /cot 与新话题入口对齐为前置特判（原先走 daemon 分支，无会话时预建幽灵会话）。
   (input, legacy, next) =>

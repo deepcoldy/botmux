@@ -10630,6 +10630,25 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   return true;
 }
 
+type ForkSessionOptions = {
+  forkWorkerImpl?: typeof forkWorker;
+  childTitle?: string;
+  forkTaskText?: string;
+  larkThreadId?: string;
+  buildInitialPrompt?: (childSessionId: string) => string | CliTurnPayload;
+  turnId?: string;
+  senderOpenId?: string;
+  senderIsBot?: boolean;
+  /** Owner to stamp on the CHILD session. Defaults to the source's owner
+   *  (the common case: forker === source owner, so this is a no-op).
+   *  Set it when an admin forks someone else's session — otherwise the child
+   *  is owned by a user who may not even be in the destination chat
+   *  (`/fork --create` builds a group containing only the forker), leaving
+   *  owner-only replies and `/fork`/`/relay` on the child addressed to
+   *  someone who can't see it. */
+  childOwnerOpenId?: string;
+};
+
 /**
  * Fork a session: create a SECOND, independent botmux session that inherits the
  * source's full context at the current node, landing at a different anchor
@@ -10654,30 +10673,68 @@ export async function forkSession(
   targetRootMessageId: string,
   targetChatType: 'group' | 'p2p',
   targetScope: 'thread' | 'chat',
-  opts?: {
-    forkWorkerImpl?: typeof forkWorker;
-    childTitle?: string;
-    forkTaskText?: string;
-    larkThreadId?: string;
-    buildInitialPrompt?: (childSessionId: string) => string | CliTurnPayload;
-    turnId?: string;
-    senderOpenId?: string;
-    senderIsBot?: boolean;
-    /** Owner to stamp on the CHILD session. Defaults to the source's owner
-     *  (the common case: forker === source owner, so this is a no-op).
-     *  Set it when an admin forks someone else's session — otherwise the child
-     *  is owned by a user who may not even be in the destination chat
-     *  (`/fork --create` builds a group containing only the forker), leaving
-     *  owner-only replies and `/fork`/`/relay` on the child addressed to
-     *  someone who can't see it. */
-    childOwnerOpenId?: string;
-  },
+  opts?: ForkSessionOptions,
 ): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
+  const ds = findActiveBySessionId(sessionId);
+  if (!ds) return { ok: false, error: 'session_not_active' };
+  // A live source must sit at a clean node: not mid-lifecycle, not mid-turn.
+  if (isSessionLifecycleInFlight(ds)) return { ok: false, error: 'worker_busy' };
+  const st = ds.lastScreenStatus;
+  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
+    return { ok: false, error: 'worker_busy' };
+  }
+  return forkFromSource(ds, targetChatId, targetRootMessageId, targetChatType, targetScope, opts);
+}
+
+/**
+ * Fork a CLOSED session into another anchor (`/resume <id>` sent outside the
+ * session's own topic/chat). Same copy semantics as {@link forkSession}: the
+ * child resumes the source's CLI-native transcript through the native fork flag
+ * and writes forward under its own id, so the closed source row stays untouched
+ * and can still be resumed in place from its own close card.
+ */
+export async function forkClosedSession(
+  sessionId: string,
+  targetChatId: string,
+  targetRootMessageId: string,
+  targetChatType: 'group' | 'p2p',
+  targetScope: 'thread' | 'chat',
+  opts?: ForkSessionOptions,
+): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
+  const session = sessionStore.getOwnedSession(sessionId);
+  if (!session) return { ok: false, error: 'not_found' };
+  if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
+  if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+  // A closed row has no runtime: synthesize the read-only source view the shared
+  // fork path reads. It is never registered in activeSessions.
+  const source = {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '',
+    chatId: session.chatId,
+    chatType: session.chatType,
+    scope: session.scope === 'chat' ? 'chat' : 'thread',
+    spawnedAt: Date.now(),
+    lastMessageAt: Date.now(),
+    workingDir: session.workingDir,
+  } as DaemonSession;
+  return forkFromSource(source, targetChatId, targetRootMessageId, targetChatType, targetScope, opts);
+}
+
+async function forkFromSource(
+  ds: DaemonSession,
+  targetChatId: string,
+  targetRootMessageId: string,
+  targetChatType: 'group' | 'p2p',
+  targetScope: 'thread' | 'chat',
+  opts?: ForkSessionOptions,
+): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
+  const sessionId = ds.session.sessionId;
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
-  const ds = findActiveBySessionId(sessionId);
-  if (!ds) return { ok: false, error: 'session_not_active' };
 
   // ── Capability gate: only byte-level-forkable backends (§ design doc §4) ──
   if (!isForkCapableSession(ds)) return { ok: false, error: 'fork_unsupported_backend' };
@@ -10687,11 +10744,6 @@ export async function forkSession(
   if (ds.pendingRepo) return { ok: false, error: 'not_started_yet' };
   if (!isRelayableRealSession(ds)) return { ok: false, error: 'not_started_yet' };
   if (isSharedAdoptSession(ds)) return { ok: false, error: 'adopt_not_forkable' };
-  if (isSessionLifecycleInFlight(ds)) return { ok: false, error: 'worker_busy' };
-  const st = ds.lastScreenStatus;
-  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
-    return { ok: false, error: 'worker_busy' };
-  }
   if (currentDeviceIsolationFreezeLease()) return { ok: false, error: 'worker_busy' };
 
   // The source's CLI-native id is what we fork from. Without it there is no
