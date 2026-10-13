@@ -189,6 +189,23 @@ import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
+import {
+  APP_SLASH_COMMAND_READ_SCOPE,
+  APP_SLASH_COMMAND_WRITE_SCOPE,
+  appSlashCommandErrorMessage,
+  buildAppSlashCommandCatalog,
+  classifyAppSlashCommandReport,
+  classifyAppSlashCommandUnavailable,
+  deleteAppSlashCommand,
+  inspectAppSlashCommands,
+  syncAppSlashCommand,
+  syncAppSlashCommands,
+  unknownAppSlashCommandSnapshot,
+  type AppSlashCommandSpec,
+  type AppSlashCommandSyncResult,
+  type AppSlashCommandUnavailable,
+} from '../im/lark/app-slash-commands.js';
+import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
@@ -6689,6 +6706,152 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
   }
   writeRoleFile(cachedLarkAppId, chatId, content);
   jsonRes(res, 200, { ok: true, changed: true, byteLength: Buffer.byteLength(content, 'utf-8') });
+});
+
+// ─── Native Lark slash-command catalog (dashboard) ─────────────────────────
+// 应用级原生 Slash 命令面板：经本 daemon 自己的飞书 client 读写，每个 Bot 绑定自己
+// 的应用凭证。所需 scope 是可选的——缺失 / 租户未进灰度时返回 200 + available:false
+// （面板降级为「不可用 + 开通深链」），绝不让它变成错误或影响其它功能。
+// 批量同步只增不删；删除只走逐条显式 route，且服务端按命令名重新解析远端 ID。
+function currentAppSlashCommandCatalog(): AppSlashCommandSpec[] {
+  const config = getBot(cachedLarkAppId).config;
+  return buildAppSlashCommandCatalog({ cliId: config.cliId, locale: localeForBot(cachedLarkAppId) });
+}
+
+function appSlashCommandPermissionUrls(): { read: string; write: string } {
+  const brand = getBotBrand(cachedLarkAppId);
+  return {
+    read: buildScopeDeepLink(cachedLarkAppId, APP_SLASH_COMMAND_READ_SCOPE, brand),
+    write: buildScopeDeepLink(cachedLarkAppId, APP_SLASH_COMMAND_WRITE_SCOPE, brand),
+  };
+}
+
+function appSlashUnavailableBody(catalog: AppSlashCommandSpec[], unavailable: AppSlashCommandUnavailable) {
+  return {
+    available: false,
+    reason: unavailable.reason,
+    missingScopes: unavailable.missingScopes,
+    ...unknownAppSlashCommandSnapshot(catalog),
+    // core-only 没有可开通的权限：开权限链接只会误导。
+    ...(unavailable.reason === 'core_only' ? {} : { permissionUrls: appSlashCommandPermissionUrls() }),
+  };
+}
+
+/**
+ * core-only（apiOnly）Bot 没有飞书连接，getBotClient() 必抛 LarkTransportDisabledError。
+ * 在解析 client 之前按权威的 config.apiOnly 判定，返回只读的不可用态，而不是让它
+ * 被 catch 成 502 + 开权限链接。处理了（已写响应）返回 true。
+ */
+function respondIfCoreOnly(res: ServerResponse, catalog: AppSlashCommandSpec[], isQuery: boolean): boolean {
+  if (getBot(cachedLarkAppId).config.apiOnly !== true) return false;
+  jsonRes(res, 200, {
+    ok: isQuery,
+    ...appSlashUnavailableBody(catalog, { reason: 'core_only', missingScopes: [] }),
+  });
+  return true;
+}
+
+function appSlashErrorResponse(
+  res: ServerResponse,
+  catalog: AppSlashCommandSpec[],
+  error: unknown,
+  isQuery: boolean,
+): void {
+  // 抛错只可能来自写之前「读远端清单」这一步：写请求的异常在操作边界折成逐条 report，
+  // 写后刷新失败走 refreshError，故按 read 归类。
+  const unavailable = classifyAppSlashCommandUnavailable(error, 'read');
+  if (unavailable) {
+    // 查询：ok:true，前端按降级态渲染；写操作：ok:false，本次操作没做成。
+    return jsonRes(res, 200, { ok: isQuery, ...appSlashUnavailableBody(catalog, unavailable) });
+  }
+  return jsonRes(res, 502, {
+    ok: false,
+    available: true,
+    error: appSlashCommandErrorMessage(error),
+    ...unknownAppSlashCommandSnapshot(catalog),
+    permissionUrls: appSlashCommandPermissionUrls(),
+  });
+}
+
+function appSlashWriteResponse(res: ServerResponse, result: AppSlashCommandSyncResult, failureCode: string): void {
+  const ok = result.report.failed === 0;
+  const unavailable = ok ? null : classifyAppSlashCommandReport(result.report);
+  return jsonRes(res, 200, {
+    ok,
+    available: true,
+    ...result.snapshot,
+    report: result.report,
+    // 写结果已确认、只是事后刷新清单失败：单独暴露，不算写失败（ok 只看 report）。
+    ...(result.refreshError ? { refreshError: result.refreshError } : {}),
+    ...(ok ? {} : {
+      error: unavailable ? unavailable.reason : failureCode,
+      ...(unavailable ? { reason: unavailable.reason, missingScopes: unavailable.missingScopes } : {}),
+      permissionUrls: appSlashCommandPermissionUrls(),
+    }),
+  });
+}
+
+async function readSlashCommandBody(req: IncomingMessage, res: ServerResponse): Promise<string | null> {
+  let body: { command?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return null; }
+  if (typeof body?.command !== 'string' || !/^\/?[a-z0-9][a-z0-9_-]*$/i.test(body.command.trim())) {
+    jsonRes(res, 400, { ok: false, error: 'invalid_slash_command' });
+    return null;
+  }
+  return body.command.trim();
+}
+
+ipcRoute('GET', '/api/bot-slash-commands', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const catalog = currentAppSlashCommandCatalog();
+  if (respondIfCoreOnly(res, catalog, true)) return;
+  try {
+    const snapshot = await inspectAppSlashCommands(cachedLarkAppId, catalog);
+    return jsonRes(res, 200, { ok: true, available: true, ...snapshot });
+  } catch (error) {
+    return appSlashErrorResponse(res, catalog, error, true);
+  }
+});
+
+ipcRoute('POST', '/api/bot-slash-commands/sync', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const catalog = currentAppSlashCommandCatalog();
+  if (respondIfCoreOnly(res, catalog, false)) return;
+  try {
+    return appSlashWriteResponse(res, await syncAppSlashCommands(cachedLarkAppId, catalog), 'slash_command_sync_partial_failure');
+  } catch (error) {
+    return appSlashErrorResponse(res, catalog, error, false);
+  }
+});
+
+ipcRoute('POST', '/api/bot-slash-commands/sync-one', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const command = await readSlashCommandBody(req, res);
+  if (command === null) return;
+  const catalog = currentAppSlashCommandCatalog();
+  if (respondIfCoreOnly(res, catalog, false)) return;
+  if (!catalog.some(spec => spec.command === command.replace(/^\/+/, '').toLowerCase())) {
+    return jsonRes(res, 400, { ok: false, error: 'slash_command_not_in_catalog' });
+  }
+  try {
+    return appSlashWriteResponse(res, await syncAppSlashCommand(cachedLarkAppId, catalog, command), 'slash_command_sync_failed');
+  } catch (error) {
+    return appSlashErrorResponse(res, catalog, error, false);
+  }
+});
+
+ipcRoute('POST', '/api/bot-slash-commands/delete', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const command = await readSlashCommandBody(req, res);
+  if (command === null) return;
+  const catalog = currentAppSlashCommandCatalog();
+  if (respondIfCoreOnly(res, catalog, false)) return;
+  try {
+    return appSlashWriteResponse(res, await deleteAppSlashCommand(cachedLarkAppId, catalog, command), 'slash_command_delete_failed');
+  } catch (error) {
+    return appSlashErrorResponse(res, catalog, error, false);
+  }
 });
 
 // ─── Per-bot defaultOncall (dashboard) ─────────────────────────────────────

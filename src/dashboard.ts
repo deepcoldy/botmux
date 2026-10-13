@@ -50,6 +50,7 @@ import {
   injectControlCsrfMeta,
   managementUpgradeOrigin,
 } from './dashboard/control-csrf.js';
+import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -7382,6 +7383,15 @@ const server = createServer(async (req, res) => {
       res.end(await upstream.text());
       return;
     }
+
+    // GET  /api/bots/:appId/slash-commands — native Lark slash-command catalog.
+    // POST /api/bots/:appId/slash-commands/{sync,sync-one,delete} — writes go
+    // through the P1-11 control gate (same-origin + session-bound CSRF ticket).
+    if (await handleNativeSlashCommandsProxy(req, res, url, {
+      identity: requestIdentity,
+      csrfTokens: controlCsrfTokens,
+      proxy: proxyToDaemon,
+    })) return;
 
     // PUT /api/bots/:appId/cantalk-daemon-commands — proxy to that bot's daemon. Body
     // `{ canTalkDaemonCommands: string }` (raw text, comma/space separated; '' = clear).

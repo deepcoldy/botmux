@@ -185,6 +185,10 @@ Rules: only a leading run of passthrough lines forms a cascade (a botmux command
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
+Dashboard's **Bot Defaults → Security → Slash Commands** section also has an optional **native Lark command panel**. It lists botmux's own commands (including aliases, derived directly from the command registry) as candidates and marks each entry as synced, missing, or outdated on Lark; users decide what to register with each row's **Sync** action. Commands that only exist remotely are shown too and can be deleted one at a time. **Sync all to Lark** is an explicit additive operation: it creates missing entries and updates descriptions, but never deletes implicitly. CLI passthrough commands (`/compact`, `/model`, …) are not candidates yet, because support differs across CLIs and input backends.
+
+The panel needs the optional scopes `application:app_slash_command:read` / `application:app_slash_command:write`. They are **not** part of the default scope manifest and the startup self-check never tops them up automatically; when they are missing, or the tenant is not in Lark's gated rollout (desktop 7.70+ and the FG allowlist), the panel only shows "unavailable" plus grant links, and every other bot feature keeps working. The native `/` panel may take about five minutes to refresh in Lark clients. Working-directory `.claude` discoveries, skills, plugins, and MCP prompts are not stable app-wide capabilities, so they remain visible only in botmux's `/slash` card and are not registered remotely.
+
 ## 📡 Session Onboarding
 
 | Command | Description |
