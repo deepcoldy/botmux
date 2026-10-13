@@ -210,8 +210,6 @@ export interface BridgeSendMarker {
    *  separate compact terminal strip. Older markers omit the field and simply
    *  degrade to the live streaming-card terminal state. */
   terminalCarrier?: 'standard_reply_card' | 'non_patchable';
-  /** Original standard reply-card JSON before Lark readback normalization. */
-  terminalCarrierCard?: string;
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
   replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
   /** The send is explicitly an interim side effect and must never stand in for

@@ -32,7 +32,7 @@ import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
@@ -11541,7 +11541,6 @@ async function cmdSend(rest: string[]): Promise<void> {
     messageId: string,
     sentContent: string,
     terminalCarrier?: 'standard_reply_card' | 'non_patchable',
-    terminalCarrierCard?: string,
   ): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
@@ -11555,19 +11554,15 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
         ...(remoteRunnerOutbound ? { terminalIndependent: true } : {}),
         ...(terminalCarrier ? { terminalCarrier } : {}),
-        ...(terminalCarrier === 'standard_reply_card' && terminalCarrierCard ? { terminalCarrierCard } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
-      const markerPath = join(markerDir, `${sid}.jsonl`);
-      appendFileSync(markerPath, line, { mode: 0o600 });
-      try { chmodSync(markerPath, 0o600); } catch { /* best-effort hardening */ }
+      appendFileSync(join(markerDir, `${sid}.jsonl`), line);
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
   let unifiedReplyUsed = false;
-  let standaloneReplyCardForTerminal: string | undefined;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -12296,7 +12291,6 @@ async function cmdSend(rest: string[]): Promise<void> {
           return;
         }
         messageId = replyDelivery.messageId;
-        standaloneReplyCardForTerminal = delivered?.record.lastCard ?? replyStore.read(replyKey)?.lastCard;
       } else {
         const standaloneCard = responseKind === undefined ? replyCardJson
           : markGroupContextCardPurpose(replyCardJson, responseKind === 'progress' ? 'runtime' : 'message');
@@ -12306,7 +12300,6 @@ async function cmdSend(rest: string[]): Promise<void> {
           false,
           completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : undefined,
         );
-        standaloneReplyCardForTerminal = standaloneCard;
       }
 
     if (completionProposalRecord && completionProposalStore) {
@@ -12337,7 +12330,6 @@ async function cmdSend(rest: string[]): Promise<void> {
           customCard || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
             ? 'non_patchable'
             : 'standard_reply_card',
-          standaloneReplyCardForTerminal,
         );
       }
       console.error(`✓ 已复用本轮最终回答 ${messageId}`);
@@ -12439,7 +12431,6 @@ async function cmdSend(rest: string[]): Promise<void> {
         !customCard && !pureFileSend && !pureVideoSend
           ? 'standard_reply_card'
           : 'non_patchable',
-        standaloneReplyCardForTerminal,
       );
     }
     let advancedNextTurnId: string | undefined;

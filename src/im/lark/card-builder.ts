@@ -25,7 +25,6 @@ import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
-import { FINAL_CARD_PROPOSAL_ELEMENT_ID } from './final-card-sections.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -58,28 +57,6 @@ export function buildTurnTerminalReceiptCard(
       }],
     },
   });
-}
-
-const TURN_TERMINAL_RECEIPT_ELEMENT_ID = 'botmux_turn_terminal_receipt';
-const AUTHORED_MARKDOWN_PROTECTED_ELEMENT_IDS = new Set([
-  REPLY_CARD_FOOTER_ELEMENT_ID,
-  FINAL_CARD_PROPOSAL_ELEMENT_ID,
-  'botmux_feedback',
-  'botmux_oncall_group',
-  TURN_TERMINAL_RECEIPT_ELEMENT_ID,
-]);
-
-function isProtectedAuthoredMarkdownElementId(elementId: unknown): boolean {
-  return typeof elementId === 'string'
-    && (AUTHORED_MARKDOWN_PROTECTED_ELEMENT_IDS.has(elementId)
-      || elementId.startsWith('botmux_turn_')
-      || elementId.startsWith('botmux_feedback'));
-}
-
-interface AuthoredMarkdownEntry {
-  path: string;
-  content: string;
-  element: Record<string, any>;
 }
 
 function findCardElementById(value: unknown, elementId: string): any | undefined {
@@ -125,102 +102,23 @@ function appendTurnTerminalReceiptToFooter(content: string, label: string): stri
   return `${base} · <font color='grey'>${label}</font>`;
 }
 
-function authoredMarkdownEntries(
-  value: unknown,
-  protectedAncestor = false,
-  path = 'root',
-  out: AuthoredMarkdownEntry[] = [],
-): AuthoredMarkdownEntry[] {
-  if (Array.isArray(value)) {
-    value.forEach((child, index) => authoredMarkdownEntries(child, protectedAncestor, `${path}[${index}]`, out));
-    return out;
-  }
-  if (!value || typeof value !== 'object') return out;
-  const element = value as Record<string, any>;
-  const protectedHere = protectedAncestor || isProtectedAuthoredMarkdownElementId(element.element_id);
-  if (element.tag === 'markdown' && typeof element.content === 'string' && !protectedHere) {
-    out.push({ path, content: element.content, element });
-  }
-  for (const key of ['elements', 'columns', 'actions', 'extra'] as const) {
-    authoredMarkdownEntries(element[key], protectedHere, `${path}.${key}`, out);
-  }
-  return out;
-}
-
-function restoreAuthoredMarkdownContent(card: any, sourceCardJson?: string): void {
-  if (!sourceCardJson) return;
-  let source: any;
-  try { source = JSON.parse(sourceCardJson); } catch { return; }
-  if (!source || source.schema !== '2.0' || !source.body || !Array.isArray(source.body.elements)) return;
-  const sourceEntries = authoredMarkdownEntries(source.body.elements);
-  if (sourceEntries.length === 0) return;
-  const targetEntries = authoredMarkdownEntries(card.body.elements);
-  if (sourceEntries.length !== targetEntries.length) return;
-  // Structural drift is safer to leave untouched. Preserving the live readback
-  // may keep Lark's lossy Markdown normalization, but it avoids copying stale
-  // process/status text into the answer when runtime chrome changed shape.
-  for (let index = 0; index < sourceEntries.length; index++) {
-    if (sourceEntries[index]!.path !== targetEntries[index]!.path) return;
-  }
-  for (let index = 0; index < sourceEntries.length; index++) {
-    targetEntries[index]!.element.content = sourceEntries[index]!.content;
-  }
-}
-
-/** Merge the daemon-owned terminal state into an existing standard BotMux
- * reply card. Prefer the canonical footer so the card keeps one bottom divider
- * and one compact metadata/status line. Cards without a footer receive only a
- * small trailing line, without another divider. The live card is read back
- * from Lark immediately before this patch, so chat ownership and late
- * feedback/control mutations are preserved. When provided, sourceCardJson is
- * used only to restore model-authored markdown content that Lark readback may
- * normalize lossy; structure, footer, controls, and element IDs stay from the
- * live readback. Undefined means the message is no longer a patchable Card 2.0
- * payload and the caller must use the independent-strip fallback instead. */
-export function appendTurnTerminalReceiptToCard(
+/** Build a footer-only CardKit update. Message reads may normalize Markdown;
+ * never submit their body as the source of a full-card update. */
+export function buildTurnTerminalFooterPatch(
   cardJson: string,
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
-  sourceCardJson?: string,
-): string | undefined {
+): { content: string } | undefined {
   let card: any;
-  try {
-    card = JSON.parse(cardJson);
-  } catch {
-    return undefined;
-  }
-  if (!card || card.schema !== '2.0' || !card.body || !Array.isArray(card.body.elements)) {
-    return undefined;
-  }
-  restoreAuthoredMarkdownContent(card, sourceCardJson);
-  const label = t(`worker.turn_terminal_receipt.${kind}`, undefined, locale);
-  const terminalElement = {
-    tag: 'markdown',
-    element_id: TURN_TERMINAL_RECEIPT_ELEMENT_ID,
-    text_size: 'notation_small_v2',
-    content: `<font color='grey'>${label}</font>`,
-  };
-
-  // Migrate cards patched by the first implementation: remove its standalone
-  // terminal line and the immediately preceding divider before folding the
-  // same state into the canonical footer.
-  const existing = card.body.elements.findIndex(
-    (element: any) => element?.element_id === TURN_TERMINAL_RECEIPT_ELEMENT_ID,
-  );
-  if (existing >= 0) {
-    card.body.elements.splice(existing, 1);
-    if (existing > 0 && card.body.elements[existing - 1]?.tag === 'hr') {
-      card.body.elements.splice(existing - 1, 1);
-    }
-  }
-
+  try { card = JSON.parse(cardJson); } catch { return undefined; }
+  if (card?.schema !== '2.0' || !Array.isArray(card.body?.elements)) return undefined;
   const footer = findCardElementById(card.body.elements, REPLY_CARD_FOOTER_ELEMENT_ID);
-  if (footer && typeof footer.content === 'string' && footer.content.trim()) {
-    footer.content = appendTurnTerminalReceiptToFooter(footer.content, label);
-  } else {
-    card.body.elements.push(terminalElement);
+  if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
+    return undefined;
   }
-  return JSON.stringify(card);
+  return { content: appendTurnTerminalReceiptToFooter(
+    footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
+  ) };
 }
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，

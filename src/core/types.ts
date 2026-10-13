@@ -503,8 +503,6 @@ export interface DaemonSession {
   turnTerminalCarriers?: Map<string, {
     messageId: string;
     kind: 'standard_reply_card' | 'non_patchable';
-    /** Original card JSON captured before Lark readback normalization. */
-    cardJson?: string;
   }>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a

@@ -10,7 +10,6 @@ import {
   renderCompletionProposalCard,
 } from '../src/im/lark/completion-proposal-card.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
-import { appendTurnTerminalReceiptToCard } from '../src/im/lark/card-builder.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const dirs: string[] = [];
@@ -48,28 +47,6 @@ function setup() {
 }
 
 describe('completion proposal final-card section', () => {
-  it.each(['accepted', 'dismissed', 'expired'] as const)(
-    'restores answer markdown without reverting a %s proposal during terminal settlement',
-    status => {
-      const { record, baseCard } = setup();
-      const answer = '配置：\n\n```diff\n+ ready\n```\n\n**后续说明**';
-      baseCard.body.elements[0].content = answer;
-      const readback = renderCompletionProposalCard(baseCard, { ...record, status }) as any;
-      readback.body.elements[0].content = answer.replace('：\n\n```', '：```');
-      const liveProposal = structuredClone(readback.body.elements.find((element: any) =>
-        element.element_id === 'botmux_completion_proposal'));
-
-      const patched = JSON.parse(appendTurnTerminalReceiptToCard(
-        JSON.stringify(readback), 'completed', 'zh', JSON.stringify(baseCard),
-      )!);
-
-      expect(patched.body.elements[0].content).toBe(answer);
-      expect(patched.body.elements.find((element: any) =>
-        element.element_id === 'botmux_completion_proposal')).toEqual(liveProposal);
-      expect(JSON.stringify(patched)).not.toContain('completion_proposal_decide');
-    },
-  );
-
   it('renders result, proposal, feedback, separator and footer in one canonical order', () => {
     const { baseCard } = setup();
     const elements = baseCard.body.elements;
