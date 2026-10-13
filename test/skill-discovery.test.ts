@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -61,6 +61,28 @@ describe('skill discovery', () => {
       }),
     ]);
     rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  it('discovers native skills linked into a CLI skill root', () => {
+    const home = join(repo, 'home');
+    const skillsRoot = join(home, '.trae', 'skills');
+    const target = join(repo, 'linked-native-skill');
+    process.env.HOME = home;
+    write(join(target, 'SKILL.md'), '---\nname: linked-native-skill\ndescription: Linked native skill\n---');
+    mkdirSync(skillsRoot, { recursive: true });
+    symlinkSync(target, join(skillsRoot, 'linked-native-skill'), 'dir');
+    symlinkSync(join(repo, 'missing-skill'), join(skillsRoot, 'broken-skill'), 'dir');
+
+    const groups = discoverNativeCliSkillGroups(['traex']);
+    const trae = groups.find(group => group.rootDir === skillsRoot);
+
+    expect(trae?.skills).toEqual([
+      expect.objectContaining({
+        name: 'linked-native-skill',
+        rootDir: realpathSync(target),
+        source: expect.objectContaining({ type: 'user' }),
+      }),
+    ]);
   });
 
   it('groups skills per CLI and skips a CLI whose skill root is empty', () => {
