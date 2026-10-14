@@ -311,6 +311,29 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     expect(piped.slice(piped.indexOf('A'), piped.indexOf('C') + 1)).toBe('A\nB\r\nC');
   }, 30_000);
 
+  it.skipIf(!hasTmux)('keeps the inner PTY in UTF-8 mode and multi-byte output intact across split writes', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-osc7501-'));
+    const done = join(dir, 'done');
+    const modes = join(dir, 'modes');
+    const pipeLog = join(dir, 'pipe.log');
+    // 你 = e4 bd a0, 🙂 = f0 9f 99 82 — emitted a byte or two at a time.
+    const script = `stty -a > '${modes}'; sleep 0.5; printf '<\\344'; sleep 0.1; printf '\\275\\240\\360\\237'; sleep 0.1; printf '\\231\\202>'; sleep 0.3; : > '${done}'`;
+    const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
+    const plan = join(planDir, 'plan.json');
+    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', script] }));
+    const { command, prefixArgs } = tsRunnerPrefix();
+    const created = tmux('new-session', '-d', '-s', 'u', '-x', '80', '-y', '24', '-c', REPO_ROOT, '--',
+      command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan);
+    expect(created.status, created.stderr).toBe(0);
+    tmux('pipe-pane', '-O', '-t', 'u', `cat >> '${pipeLog}'`);
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(done) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+    await new Promise(r => setTimeout(r, 200));
+    expect(readFileSync(modes, 'utf8')).toMatch(/(^|\s)iutf8(\s|$)/);
+    const piped = readFileSync(pipeLog, 'utf8');
+    expect(piped.slice(piped.indexOf('<'), piped.indexOf('>') + 1)).toBe('<你🙂>');
+  }, 30_000);
+
   it.skipIf(!hasTmux)('never resolves stty through the CLI PATH (it runs outside the sandbox)', async () => {
     dir = mkdtempSync(join(tmpdir(), 'botmux-osc7501-'));
     const bin = join(dir, 'bin');

@@ -72,7 +72,11 @@ function spawnInner(): pty.IPty | null {
       rows: stdout.rows || 24,
       cwd: childCwd,
       env: childEnv as Record<string, string>,
-      encoding: null,
+      // Keep node-pty's default UTF-8 mode: `encoding: null` would also leave
+      // IUTF8 off on the inner PTY, so canonical-mode Backspace (e.g. a
+      // wrapperCli prompt) would delete one byte of a multi-byte character.
+      // Its StringDecoder reassembles characters split across reads.
+      encoding: 'utf8',
     });
   } catch (err) {
     runDirect(err);
