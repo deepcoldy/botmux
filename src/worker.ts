@@ -19041,7 +19041,8 @@ async function spawnCli(
             join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
           );
         } catch (e) {
-          log(`[aiden-codex] WARN reasoning shim unavailable; using Aiden default effort: ${(e as Error).message}`);
+          log(`[aiden-codex] WARN reasoning/shell-env shim unavailable; `
+            + `Aiden default effort and machine-owner shell identity: ${(e as Error).message}`);
         }
       }
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
@@ -19049,6 +19050,17 @@ async function spawnCli(
         childPath: effectiveChildEnv.PATH,
         aidenCodexRealBin: cliAdapter.resolvedBin,
         aidenCodexShimDir,
+        // Persist the shell_environment_policy overrides Aiden rejects from
+        // argv; the PATH shim reads them back when Aiden execs the real codex.
+        // trigger-user identity / lark tool binding depend on these reaching
+        // codex's tool shells — stripping silently would run tools under the
+        // machine owner's identity.
+        writeAidenShellConfigs: (configs) => {
+          if (!aidenCodexShimDir) throw new Error('aiden codex shim dir is unavailable');
+          const file = join(aidenCodexShimDir, 'shell-configs');
+          atomicWriteFileSync(file, `${configs.join('\n')}\n`, { mode: 0o600 });
+          return file;
+        },
         pathDelimiter: delimiter,
       });
       if (launch.bin) {
