@@ -14,21 +14,36 @@ function sessionTempSegment(sessionId: string): string {
   return `sha256-${createHash('sha256').update(sessionId).digest('hex')}`;
 }
 
+function sessionTempRoot(): string {
+  return join(homedir(), '.cache', 'botmux', 'session-tmp');
+}
+
+function sessionTempProfile(dataDir: string, length: number): string {
+  return createHash('sha256').update(resolve(dataDir)).digest('hex').slice(0, length);
+}
+
 /**
  * Stable scratch path owned by one logical session. It lives in the user's
  * cache tree, keyed by SESSION_DATA_DIR, rather than in the host's /tmp:
  * production Linux hosts commonly mount /tmp as tmpfs, while agent turns clone
  * repositories and build dependency trees that can be many GiB.
+ *
+ * The path becomes the CLI's TMPDIR, and tools create Unix sockets under it
+ * (Python multiprocessing, ad-hoc servers, …). AF_UNIX paths are capped at
+ * 104 bytes on macOS (108 on Linux), so both segments are short hashes: a raw
+ * UUID session id here left too little room for any socket name.
  */
 export function sessionTempDir(dataDir: string, sessionId: string): string {
   // Keep scratch outside BOTMUX_HOME. Core-only sandboxes deliberately freeze
   // that whole authority root, so placing temp under ~/.botmux would either be
   // denied or require a dangerous writable carve-out beside credentials.
-  const profile = createHash('sha256')
-    .update(resolve(dataDir))
-    .digest('hex')
-    .slice(0, 16);
-  return join(homedir(), '.cache', 'botmux', 'session-tmp', profile, sessionTempSegment(sessionId));
+  const key = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+  return join(sessionTempRoot(), sessionTempProfile(dataDir, 8), key);
+}
+
+/** Pre-shortening layout, still owned by sessions created before the change. */
+function legacySessionTempDir(dataDir: string, sessionId: string): string {
+  return join(sessionTempRoot(), sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId));
 }
 
 /** Create and validate the session scratch directory before exposing it. */
@@ -53,7 +68,11 @@ export function ensureSessionTempDir(dataDir: string, sessionId: string): string
 
 /** Best-effort caller decides when the logical session is durably closed. */
 export async function cleanupSessionTempDir(dataDir: string, sessionId: string): Promise<void> {
-  const path = sessionTempDir(dataDir, sessionId);
+  await retireSessionTempPath(sessionTempDir(dataDir, sessionId));
+  await retireSessionTempPath(legacySessionTempDir(dataDir, sessionId));
+}
+
+async function retireSessionTempPath(path: string): Promise<void> {
   const retiredPath = `${path}.retired-${process.pid}-${randomBytes(8).toString('hex')}`;
   // Claim the old tree synchronously. A resume during asynchronous removal
   // recreates `path`, and the remover can only traverse the detached tree.

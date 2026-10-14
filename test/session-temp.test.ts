@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { dirname, join, relative, resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -33,7 +34,7 @@ describe('session temp', () => {
     const path = ensureSessionTempDir(data, 'session-123');
     roots.push(dirname(path));
     expect(path.startsWith(join(homedir(), '.cache', 'botmux', 'session-tmp'))).toBe(true);
-    expect(path.endsWith('/session-123')).toBe(true);
+    expect(path).toMatch(/\/session-tmp\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
     expect(existsSync(path)).toBe(true);
 
     const env: NodeJS.ProcessEnv = {};
@@ -44,7 +45,26 @@ describe('session temp', () => {
   it('hashes unsafe session ids instead of permitting traversal', () => {
     const data = dataDir();
     const path = sessionTempDir(data, '../../escape');
-    expect(path).toMatch(/\/session-tmp\/[0-9a-f]{16}\/sha256-[0-9a-f]{64}$/);
+    expect(path).toMatch(/\/session-tmp\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
+  });
+
+  it('leaves room under the 104-byte AF_UNIX limit for sockets created in TMPDIR', () => {
+    // The scratch dir becomes the CLI's TMPDIR. A raw UUID segment used to put
+    // e.g. Python multiprocessing's listener socket past macOS's sun_path cap.
+    const path = sessionTempDir(dataDir(), '6c255026-e993-495d-80ec-85d2c3c440dc');
+    expect(relative(homedir(), path).length).toBeLessThanOrEqual(51);
+  });
+
+  it('also retires scratch left in the pre-shortening layout', async () => {
+    const data = dataDir();
+    const sessionId = '6c255026-e993-495d-80ec-85d2c3c440dc';
+    const profile = createHash('sha256').update(resolve(data)).digest('hex').slice(0, 16);
+    const legacy = join(homedir(), '.cache', 'botmux', 'session-tmp', profile, sessionId);
+    roots.push(dirname(legacy));
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, 'artifact'), 'x');
+    await cleanupSessionTempDir(data, sessionId);
+    expect(existsSync(legacy)).toBe(false);
   });
 
   it('separates sibling data directories with the same session id', () => {
