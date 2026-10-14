@@ -1019,7 +1019,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(content)');
     expect(cmdSend).toContain('const managedRenderedPayloadError = managedVcSendPayloadError({');
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(text)');
-    expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
+    expect(cmdSend).toContain('if (!noMention && !isSlashSend && !customCard && !vcMeetingManagedSendOrigin)');
     expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
       .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
@@ -1078,9 +1078,9 @@ describe('cmdSend hook context wiring', () => {
     expect(deliveryIndex).toBeGreaterThan(storeWrite);
     // Turn-completion recording is gated on the response KIND, not on the
     // feedback policy — feedback off must still produce a correlatable record.
-    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
     const oncallIndex = cmdSend.indexOf('recordOncallGroupDelivery(resolveDataDir()');
-    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
     expect(oncallIndex).toBeGreaterThan(primarySend);
     expect(oncallIndex).toBeLessThan(completionIndex);
     // The feedback control (policy + card snapshot) rides along only when a

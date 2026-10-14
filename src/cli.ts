@@ -8705,6 +8705,7 @@ import {
   prepareCardMarkdown,
   type CardRenderDiagnostic,
   type CardUsageSnapshot,
+  type ReplyCardV2,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
 import { repairReplyMarkdown } from './services/reply-markdown.js';
@@ -8716,7 +8717,7 @@ import {
 } from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
 import { buildCompletionProposalElement } from './im/lark/completion-proposal-card.js';
-import { composeFinalCardSections } from './im/lark/final-card-sections.js';
+import { composeFinalCardSections, customFinalCardError } from './im/lark/final-card-sections.js';
 import {
   completionProposalCardDispatchUuid,
   createCompletionProposalStore,
@@ -10543,6 +10544,17 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
+  const customFinal = !!customCard && effectiveResponseKind === 'final';
+  if (customFinal) {
+    const error = customFinalCardError(customCard!);
+    if (error) { console.error(`botmux send: ${error}`); process.exit(2); }
+    // A custom final enters the same authoritative reply lifecycle, never a
+    // detoured publication. Keep these gates even when feedback is disabled.
+    if (sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) {
+      console.error('botmux send: 自定义 final 卡片仅支持当前会话内回复');
+      process.exit(2);
+    }
+  }
   // Keep memory attribution in the model's rollout, but never render the
   // complete internal suffix into Lark or count it in send markers.
   content = stripTrailingOaiMemoryCitation(content);
@@ -11321,7 +11333,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
   const withOncallGroup = (card: string): string => {
-    if (effectiveResponseKind !== 'final' || customCardRequested || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
+    if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
     const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
     if (attached !== card) oncallGroupCard = JSON.parse(attached);
     return attached;
@@ -11334,8 +11346,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
-  if (feedbackPolicy && effectiveResponseKind === 'final' && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
-    console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
+  if (feedbackPolicy && effectiveResponseKind === 'final' && (asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
+    console.error('botmux send: --response-kind final 仅支持当前会话内的最终答案卡片');
     process.exit(2);
   }
   let completionProposalVisible: CompletionProposalVisibleInput | undefined;
@@ -11929,9 +11941,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // A file-sandbox relay supplies a host-private copy normalized inside the
     // sandbox namespace. Voice/doc-comment paths returned above use the same
     // already-sanitized outbound content, without card-markdown preparation.
-    let text = extractCardText(content);
+    let text = customFinal ? expectedLinkRenderedContent : extractCardText(content);
     const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
-    if (preparedContentFile) {
+    if (!customCard && preparedContentFile) {
       try { text = readFileSync(preparedContentFile, 'utf-8'); } catch { /* fall back safely below */ }
     }
 
@@ -11981,7 +11993,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
       // --slash 同理跳过：斜杠命令正文（如 `/clear`）不该被扫成 @，收件人只认
       // 显式 --mention（下面的 slash 分支只用 explicit mentions 拼 <at> 前缀）。
-      if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin) {
+      if (!noMention && !isSlashSend && !customCard && !vcMeetingManagedSendOrigin) {
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
       // Scan a code-span-stripped copy so a bot name quoted inside backticks or a
       // fenced block (e.g. an example `botmux send --mention @Bot …` or an
@@ -12083,16 +12095,19 @@ async function cmdSend(rest: string[]): Promise<void> {
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
+    let customCardUsedIds = new Set<string>();
     if (customCard) {
       const inlineResult = applyInlineMentionsToCard(customCard, mentions);
+      customCardUsedIds = inlineResult.usedIds;
+      customCard = inlineResult.card;
       const mentionFooter = orderedFooterRecipients({
         sendTo: footerAddressing.sendTo,
         mentionIds: mentions.map(m => m.open_id),
         cc: footerAddressing.cc,
         inlinedIds: inlineResult.usedIds,
       });
-      const withFooter = withCustomCardMentionFooter(
-        inlineResult.card,
+      const withFooter = customFinal ? { ok: true as const, card: customCard } : withCustomCardMentionFooter(
+        customCard,
         mentionFooter,
         localeForBot(appId),
       );
@@ -12137,7 +12152,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error(`botmux send: --layout 不作用于纯${pureFileSend ? '文件' : '视频'}消息，本次已忽略`);
       replyLayout = undefined;
     }
-    if (customCard) {
+    if (customCard && !customFinal) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
@@ -12202,6 +12217,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       messageId = videoResult.sent[0];
     } else {
       // 回复一律卡片（纯文本 post 路径已删）。
+      const customReplyCard = customCard as unknown as ReplyCardV2 | undefined;
       const cardText = repairReplyMarkdown(text);
       // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
       // aware, see applyInlineMentions); any --mention not inlined here is
@@ -12212,7 +12228,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       const layoutHeader = replyLayout
         ? buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)
         : undefined;
-      const { text: md, usedIds } = applyInlineMentions(layoutBody.markdown, mentions);
+      const { text: md, usedIds } = customCard
+        ? { text: '', usedIds: customCardUsedIds }
+        : applyInlineMentions(layoutBody.markdown, mentions);
       // Non-inlined mentions are no longer dangled as a trailing @ block at the
       // body bottom — they're consolidated onto the footer `发送给：` line below
       // (human addressee first, then explicit targets). See orderedFooterRecipients.
@@ -12232,7 +12250,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           ? 'lexical'
           : 'filesystem';
       const renderDiagnostics: CardRenderDiagnostic[] = [];
-      const elements = (md || imageKeys.length > 0)
+      const elements = customReplyCard
+        ? [...customReplyCard.body.elements]
+        : (md || imageKeys.length > 0)
         ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode, imageMode, renderDiagnostics)
         : [];
 
@@ -12318,7 +12338,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      const canonicalCard = createReplyCard([...elements], layoutHeader);
+      // Preserve caller-owned layout/header/config; only the host sections and
+      // multi-user updates join the canonical lifecycle. Never flatten to Markdown.
+      const canonicalCard: ReplyCardV2 = customReplyCard
+        ? { ...customReplyCard,
+            config: { ...customReplyCard.config, update_multi: true },
+            body: { ...customReplyCard.body, elements } }
+        : createReplyCard([...elements], layoutHeader);
       if (effectiveResponseKind === 'final') {
         composeFinalCardSections(canonicalCard, {
           ...(completionProposalRecord
@@ -12362,6 +12388,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
         && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
+        && !containsLarkAtTag(customCardPayload)
         && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
       const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
       if (replyRecord && replyKey) {
@@ -12440,7 +12467,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           Date.now(),
           messageId,
           text,
-          customCard || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
+          (customCard && !customFinal) || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
             ? 'non_patchable'
             : 'standard_reply_card',
         );
@@ -12468,11 +12495,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // gating it on `feedbackPolicy` used to mean "feedback off → no completion
     // record at all". Record every canonical in-session final answer; the
     // feedback policy/card only decides whether a *control* rides along.
-    // The excluded shapes (custom card, pure video, managed VC send) are not
-    // canonical final-answer cards — and they are exactly the shapes the
-    // feedback gate above rejects outright, so the recorded set stays identical
-    // whether feedback is on or off.
-    if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    // Schema-2 custom finals cross the same composition/delivery path above.
+    // Non-card attachments and managed VC sends retain their existing exclusions.
+    if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
       const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
@@ -12573,7 +12598,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         sentAtMs,
         messageId,
         text,
-        !customCard && !pureFileSend && !pureVideoSend
+        (!customCard || customFinal) && !pureFileSend && !pureVideoSend
           ? 'standard_reply_card'
           : 'non_patchable',
       );
