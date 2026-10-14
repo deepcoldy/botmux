@@ -137,6 +137,9 @@ describe('program-status relay launch plan', () => {
     expect(isProgramStatusRelayArgv(['/usr/bin/bun', '--no-env-file', '--config=/dev/null', '/src/botmux/src/program-status-relay.ts', plan])).toBe(true);
     // macOS `ps` fallback whitespace-splits a checkout path containing spaces.
     expect(isProgramStatusRelayArgv(`/opt/homebrew/bin/bun --no-env-file --config=/dev/null /Users/a/My Projects/botmux/src/program-status-relay.ts ${plan}`.split(' '))).toBe(true);
+    // A TMPDIR containing whitespace puts spaces in the plan path itself.
+    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/my temp/botmux-psr-AbC123/plan.json'])).toBe(true);
+    expect(isProgramStatusRelayArgv(`/opt/botmux __program-status-relay /tmp/my temp/botmux-psr-AbC123/plan.json`.split(' '))).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--resume'])).toBe(false);
   });
 

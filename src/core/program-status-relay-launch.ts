@@ -130,7 +130,8 @@ export function consumeProgramStatusRelayPlan(planPath: string | undefined): Pro
  *  path containing spaces. */
 const RELAY_ARGV_TAIL = new RegExp(
   `(?:^|[ /])(?:${RELAY_TOKEN}|${RELAY_SCRIPT.replace('.', '\\.')}|${RELAY_SOURCE.replace('.', '\\.')})`
-  + ` \\S*/${PLAN_DIR_PREFIX}[^/ ]+/${PLAN_FILE.replace('.', '\\.')}$`,
+  // The plan path may itself contain spaces (a TMPDIR with whitespace).
+  + ` .*/${PLAN_DIR_PREFIX}[^/ ]+/${PLAN_FILE.replace('.', '\\.')}$`,
 );
 
 /** True when a process argv (`/proc/<pid>/cmdline`) is a program-status relay.
