@@ -41,6 +41,23 @@ export function sessionMcpGatewayPathRegex(
  * directory is a real 0700 directory owned by this uid — a squatter can only
  * DoS session startup, never observe traffic (connections still require the
  * rotating auth token). */
+/** Root for every Gateway socket directory.
+ *
+ * spawnCli repoints the worker's own TMPDIR at the per-session scratch tree
+ * (~/.cache/botmux/session-tmp/<profile>/<sessionId>, #1592) before the host
+ * binds. Following tmpdir() after that would place g.sock ~125 bytes deep on
+ * macOS and listen() fails with EINVAL, so the worker pins the inherited root
+ * first. Unpinned callers keep the plain tmpdir() behaviour. */
+let pinnedGatewaySocketRoot: string | undefined;
+
+export function pinSessionMcpGatewaySocketRoot(root: string): void {
+  pinnedGatewaySocketRoot ??= root;
+}
+
+export function sessionMcpGatewaySocketRoot(): string {
+  return pinnedGatewaySocketRoot ?? tmpdir();
+}
+
 export function sessionMcpGatewaySocketDir(sessionId: string, dataDir: string): string {
   const uid = process.getuid?.() ?? 0;
   const sessionKey = createHash('sha256')
@@ -49,7 +66,7 @@ export function sessionMcpGatewaySocketDir(sessionId: string, dataDir: string): 
     .update(sessionId)
     .digest('hex')
     .slice(0, 16);
-  return join(tmpdir(), `bmcp-${uid}-${sessionKey}`);
+  return join(sessionMcpGatewaySocketRoot(), `bmcp-${uid}-${sessionKey}`);
 }
 
 /** Deterministic per-session Gateway socket path (see sessionMcpGatewaySocketDir). */

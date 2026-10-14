@@ -167,6 +167,8 @@ import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/co
 import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
+  pinSessionMcpGatewaySocketRoot,
+  sessionMcpGatewaySocketRoot,
   sessionMcpGatewaySocketPath,
   startSessionMcpGatewayHost,
   type SessionMcpGatewayHost,
@@ -15612,6 +15614,8 @@ async function spawnCli(
   // A worker owns exactly one logical session. Pin its own os.tmpdir() before
   // constructing any backend so FIFOs, launch configs and CLI descendants all
   // share the same collectable scratch tree.
+  // The Gateway socket must stay under the inherited, short tmpdir.
+  pinSessionMcpGatewaySocketRoot(tmpdir());
   applySessionTempEnv(process.env, sessionScratchDir);
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
     TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
@@ -18411,7 +18415,7 @@ async function spawnCli(
     }
     if (process.platform === 'darwin') {
       const gatewaySocketRoot = canonical(
-        sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : tmpdir(),
+        sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : sessionMcpGatewaySocketRoot(),
       );
       mandatoryDenyRegexes.push(sessionMcpGatewayPathRegex(gatewaySocketRoot));
       if (sessionMcpGatewayHost) {
