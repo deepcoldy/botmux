@@ -207,6 +207,7 @@ import {
 } from './global-config.js';
 import {
   stopSessionScope,
+  sessionScopePayloadPid,
   wrapCommandInSessionScope,
 } from './core/session-scope.js';
 import {
@@ -12684,9 +12685,19 @@ function releaseRawInputRestartGate(): void {
 }
 
 function readPaneLeafComm(observedBackend: SessionBackend | null = backend): string | undefined {
-  const pid = observedBackend?.getChildPid?.();
+  let pid = observedBackend?.getChildPid?.();
   if (!pid) return undefined;
-  const comm = readComm(pid);
+  let comm = readComm(pid);
+  if (isBareShellComm(comm)) {
+    // The owned scope supervisor deliberately remains a shell so tmux cannot
+    // move the payload out of its cgroup. Inspect its actual child; a payload
+    // stuck in an rcfile shell must still trigger the normal input hold.
+    const payloadPid = sessionScopePayloadPid(pid);
+    if (payloadPid !== pid) {
+      pid = payloadPid;
+      comm = readComm(pid) ?? comm;
+    }
+  }
   if (lastSpawnOuterBwrapActive && process.platform === 'linux' && isBareShellComm(comm)) {
     try {
       const commandLine = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
@@ -19303,6 +19314,7 @@ async function spawnCli(
   // launch env and proves the old key, while an actual fresh start consumes
   // the candidate and proves the new key. The worker trusts cryptographic
   // proof, not a backend's prediction flag.
+  let scopePayloadLauncherActive = false;
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
@@ -19325,6 +19337,7 @@ async function spawnCli(
       );
       spawnBin = scoped.bin;
       spawnArgs = scoped.args;
+      scopePayloadLauncherActive = !!scoped.unitName;
       if (scoped.unitName) {
         log(
           `Launching owned CLI in ${scoped.unitName}`
@@ -19549,6 +19562,34 @@ async function spawnCli(
   // wrapperCli is ignored, so there is no launcher indirection). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
+  const startScopePayloadPidResolve = (launcherPid: number): void => {
+    if (process.platform !== 'linux') return;
+    // Existing persistent panes may retain the supervisor from a prior worker.
+    // Ordinary launches without scope support need no additional retry loop.
+    if (!scopePayloadLauncherActive && sessionScopePayloadPid(launcherPid) === launcherPid) return;
+    scheduleWrapperRealCliPid(launcherPid, {
+      // A slow launch rcfile can outlive the normal wrapper-discovery budget.
+      // Keep ownership discovery until the payload appears; the existing
+      // backend/child-PID fence stops it on close or replacement.
+      maxAttempts: Number.POSITIVE_INFINITY,
+      findRealPid: sessionScopePayloadPid,
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (payloadPid) => {
+        // Preserve a deeper wrapper/native CLI resolution that already won.
+        // The pane PID remains a valid marker ancestor, but it cannot identify
+        // the payload's open transcript files or Claude's PID-keyed metadata.
+        const observed = backend as SessionBackend & { cliPid?: number };
+        if (!observed.cliPid || observed.cliPid === launcherPid || observed.cliPid === payloadPid) {
+          observed.cliPid = payloadPid;
+          publishLocalProcessAttestation(payloadPid);
+        }
+        if (bridgeCliPid === launcherPid) bridgeCliPid = payloadPid;
+        log(`Session scope: resolved payload pid ${payloadPid} under pane ${launcherPid}`);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
   const startWrapperRealPidResolve = (launcherPid: number): void => {
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
     if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
@@ -19568,6 +19609,7 @@ async function spawnCli(
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
   };
+  if (cliPid) startScopePayloadPidResolve(cliPid);
   if (cliPid) startWrapperRealPidResolve(cliPid);
   if (cliPid) observeCursorCliSessionId(cliPid);
   if (cliPid) observeAntigravityCliSessionId(cliPid);
@@ -19655,11 +19697,12 @@ async function spawnCli(
   if (cliPid && cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
     // TRAE/Codex under bwrap/launcher: best-effort immediate resolve (leaf may
     // already be forked), then a bounded retry below covers the not-yet-forked case.
+    const payloadPid = sessionScopePayloadPid(cliPid);
     const wiredPid = cfg.cliId === 'traex'
-      ? resolveTraexOwnershipPid(cliPid, traexLauncherActive)
+      ? resolveTraexOwnershipPid(payloadPid, traexLauncherActive)
       : cfg.cliId === 'codex'
-        ? resolveCodexOwnershipPid(cliPid, codexLauncherActive, codexFilterExecutable)
-        : cliPid;
+        ? resolveCodexOwnershipPid(payloadPid, codexLauncherActive, codexFilterExecutable)
+        : payloadPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
@@ -19693,11 +19736,12 @@ async function spawnCli(
           }
         }
         if (cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
+          const payloadPid = sessionScopePayloadPid(pid);
           const wiredPid = cfg.cliId === 'traex'
-            ? resolveTraexOwnershipPid(pid, traexLauncherActive)
+            ? resolveTraexOwnershipPid(payloadPid, traexLauncherActive)
             : cfg.cliId === 'codex'
-              ? resolveCodexOwnershipPid(pid, codexLauncherActive, codexFilterExecutable)
-              : pid;
+              ? resolveCodexOwnershipPid(payloadPid, codexLauncherActive, codexFilterExecutable)
+              : payloadPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
@@ -19706,6 +19750,7 @@ async function spawnCli(
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
         // pid too (mirrors the synchronous path above). No-op for non-wrapperCli.
+        startScopePayloadPidResolve(pid);
         startWrapperRealPidResolve(pid);
         observeCursorCliSessionId(pid, 'async');
         observeAntigravityCliSessionId(pid, 'async');
@@ -19745,7 +19790,7 @@ async function spawnCli(
     const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
       ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
     startBridgeWatcher(claudeJsonl, {
-      cliPid: cliPid ?? undefined,
+      cliPid: cliPid ? sessionScopePayloadPid(cliPid) : undefined,
       cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: bridgeClaudeDataDir,
