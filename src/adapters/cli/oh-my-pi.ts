@@ -20,6 +20,21 @@ const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
+// A local terminal submit bypasses botmux's input gate. Only active footer
+// shapes may revive an idle cycle; plain "Working..." can be transcript text.
+// Match ANSI-stripped lines (IdleDetector and the viewport probe strip them).
+// omp >= 18.10 reports the same edge over OSC 7501 (supportsProgramStatus);
+// this screen shape is the fallback for older omp or `terminal.programStatus`
+// off. The default `band` composer (nerd symbols) starts the footer with a
+// powerline cap (U+E0B6), then the activity spinner + elapsed time, and puts
+// the context percentage before a `─` rule (other themes use `┃`). omp
+// repositions the cursor (CSI H) instead of writing a newline, so once ANSI is
+// stripped the footer follows the previous row on the same line: the private-
+// use cap is accepted as an anchor in place of `^`. The idle footer shows a
+// status glyph instead of a braille spinner, so it never matches.
+const OMP_ACTIVE_FOOTER_PATTERN =
+  /(?:^[ \t]*|\ue0b6[ \t]*)(?:[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏][ \t]+\d+(?:\.\d+)?(?:ms|s|m|h)(?:\d+(?:\.\d+)?(?:ms|s|m|h))*[ \t]+[^\r\n]*?\d(?:\.\d+)?%[─┃]|●[ \t]+🐴[ \t]+ponytail:)/m;
+const OMP_BUSY_PATTERN = new RegExp(`Working(?:\\.\\.\\.|…)|${OMP_ACTIVE_FOOTER_PATTERN.source}`, 'm');
 
 export function ompSessionDir(sessionId: string): string {
   if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
@@ -283,7 +298,13 @@ export function createOhMyPiAdapter(
 
     completionPattern: undefined,
     readyPattern: undefined,
-    busyPattern: /Working(?:\.\.\.|…)/,
+    busyPattern: OMP_BUSY_PATTERN,
+    idleToBusyPattern: OMP_ACTIVE_FOOTER_PATTERN,
+    // omp >= 18.10 emits OSC 7501 (state=working/blocked/done/idle/error)
+    // unprompted on a TTY. Without reports (older omp, or
+    // `terminal.programStatus` off, which sends state=clear) the detector
+    // stays on the screen patterns above.
+    supportsProgramStatus: true,
     supportsTypeAhead: true,
     systemHints: [],
     altScreen: true,
