@@ -1754,13 +1754,15 @@ function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, 
   }
 }
 
-/** `/resume` 不带参数时的目标：本锚点（话题根 / 群）下最近关闭的真会话。
- *  命令预建的 worker:null 空壳（`/help` 之类）关闭后也是 closed 行，但从未跑过 CLI，跳过。 */
+/** `/resume` 不带参数时的目标：本锚点（话题根 / 群）下最近关闭、**真有过对话**的会话。
+ *  命令预建的空壳（`/help` 之类）关闭后也是 closed 行；`cliId` / `cliLaunchSnapshot` 不能当证据——
+ *  codex 实例池建行时就盖 `cliId`，`/cli` 选择也会写 snapshot。只认对话历史（与 `/cli` 的
+ *  history 判定同口径）。 */
 function latestClosedSessionAt(anchor: string): import('../types.js').Session | undefined {
   return sessionStore.listSessions()
     .filter(s => s.status === 'closed'
       && storedSessionAnchorId(s) === anchor
-      && !!(s.cliLaunchSnapshot || s.cliId || s.lastCliInput))
+      && !!(s.cliSessionId || s.lastCliInput || s.lastUserPrompt))
     .sort((a, b) => Date.parse(b.closedAt ?? b.createdAt) - Date.parse(a.closedAt ?? a.createdAt))[0];
 }
 

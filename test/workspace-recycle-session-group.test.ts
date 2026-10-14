@@ -45,7 +45,7 @@ it('finish(succeeded) keeps the retired row closed: a new group message starts f
   bot.resolvedAllowedUsers = ['ou_fixture'];
   store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
   const session = store.createSession(CHAT, 'om_original', 'recycle group fixture', 'group', 'chat');
-  Object.assign(session, { larkAppId: APP, workingDir: workspace, backendType: 'pty', cliId: 'claude-code' }); store.updateSession(session);
+  Object.assign(session, { larkAppId: APP, workingDir: workspace, backendType: 'pty', cliId: 'claude-code', cliSessionId: 'cli-native-original' }); store.updateSession(session);
   const ds = { session, larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat', workingDir: workspace,
     worker: null, workerPort: null, workerToken: null, lastMessageAt: 1, lastScreenStatus: 'idle' } as DaemonSession;
   active.set(activeSessionKey(ds), ds);
@@ -99,4 +99,28 @@ it('finish(succeeded) keeps the retired row closed: a new group message starts f
   expect(fresh).toBeTruthy();
   expect(fresh).not.toBe(session.sessionId);
   expect(store.getOwnedSession(fresh!)?.status).toBe('active');
+});
+
+it('/resume without an id skips a closed command placeholder stamped with a CLI id (codex pool) and resumes the real conversation', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-real'); mkdirSync(workspace, { recursive: true });
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex', allowedUsers: ['ou_fixture'] });
+  bot.resolvedAllowedUsers = ['ou_fixture'];
+  store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
+  const real = store.createSession(CHAT, 'om_real', 'real conversation', 'group', 'chat');
+  Object.assign(real, { larkAppId: APP, workingDir: workspace, backendType: 'tmux', cliId: 'codex', cliSessionId: 'codex-thread-real' });
+  store.updateSession(real); store.closeSession(real.sessionId);
+  // A later /help scratch: a codex instance pool stamps cliId at row creation, but no CLI ever ran.
+  const placeholder = store.createSession(CHAT, 'om_help', '/help', 'group', 'chat');
+  Object.assign(placeholder, { larkAppId: APP, workingDir: workspace, backendType: 'tmux', cliId: 'codex' });
+  store.updateSession(placeholder);
+  await new Promise(r => setTimeout(r, 5));
+  store.closeSession(placeholder.sessionId);
+
+  mocks.reply.mockClear(); mocks.send.mockClear(); mocks.fork.mockClear();
+  await handleNewTopic({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_resume_real', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/resume' }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_resume_real', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  await vi.waitFor(() => expect(store.getOwnedSession(real.sessionId)?.status).toBe('active'));
+  expect(store.getOwnedSession(placeholder.sessionId)?.status).toBe('closed');
 });
