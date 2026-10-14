@@ -192,8 +192,14 @@ const TRAEX_QUEUE_STATIC_ARMS = [
 const TRAEX_ACTIVITY_GLYPHS = '⋄✧◇✦❖◈◆';
 
 /** TraeX activity footer captured from live 0.201.6 / 0.209.1 TUIs. Keep it
- *  line- and glyph-anchored: no-alt-screen history can contain the same words. */
-const TRAEX_ACTIVITY_PATTERN = String.raw`(?:^|[\n\r])[ \t]*[${TRAEX_ACTIVITY_GLYPHS}][ \t]*[^()\r\n]{0,240}\([^()\r\n]*\d+(?:h|m|s)(?:[ \t]+\d+(?:m|s))?[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b[^()\r\n]*\)(?![ \t]*["'\x60])`;
+ *  line- and glyph-anchored: no-alt-screen history can contain the same words.
+ *  The lookahead right after `(` confirms the `esc to interrupt` phrase lives
+ *  inside this same parenthesis before consuming anything: a long near-miss
+ *  line (glyph + parenthesis full of elapsed-time tokens but no footer phrase)
+ *  otherwise backs off quadratically — observed ~18s on a 144K PTY chunk vs
+ *  <1ms with the guard. IdleDetector feeds unbounded chunks here, so the
+ *  pattern must fail fast rather than merely stay rare. */
+const TRAEX_ACTIVITY_PATTERN = String.raw`(?:^|[\n\r])[ \t]*[${TRAEX_ACTIVITY_GLYPHS}][ \t]*[^()\r\n]{0,240}\((?=[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b)[^()\r\n]*\d+(?:h|m|s)(?:[ \t]+\d+(?:m|s))?[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b[^()\r\n]*\)(?![ \t]*["'\x60])`;
 
 const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
   [

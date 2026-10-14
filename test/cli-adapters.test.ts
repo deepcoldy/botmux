@@ -3369,6 +3369,22 @@ describe('busyPattern', () => {
     expect(busy!.test('  Worked for 17s • 12:03 PM')).toBe(false);
   });
 
+  it('traex activity pattern rejects near-miss long lines without quadratic backtracking', () => {
+    // IdleDetector feeds unbounded PTY chunks to this pattern. A line starting
+    // with an activity glyph and a parenthesis full of elapsed-time-shaped
+    // tokens but WITHOUT the `esc to interrupt` phrase must fail fast: without
+    // the lookahead guard in TRAEX_ACTIVITY_PATTERN this 45K input backtracks
+    // quadratically (~2s locally, ~31s at 211K); with the guard it is <1ms.
+    const busy = createTraexAdapter('/bin/traex').busyPattern;
+    expect(busy).toBeDefined();
+    const nearMissSoup = '◆ ( ' + 'abc 123s '.repeat(5000);
+    expect(nearMissSoup.length).toBeGreaterThan(40_000);
+    const startedAt = performance.now();
+    expect(busy!.test(nearMissSoup)).toBe(false);
+    const elapsedMs = performance.now() - startedAt;
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
   it('traex staticBusyPattern latches only on line-anchored queue evidence', () => {
     // The pre-idle static latch (ZMX gap) consumes queue evidence straight
     // from the PTY byte stream — see TRAEX_STATIC_BUSY_PATTERN in traex.ts.
