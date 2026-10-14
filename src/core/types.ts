@@ -592,6 +592,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** A confirmed native-menu preference awaiting its first new turn. */
+  codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Claude model fallback still in effect, reported by the worker from the
    *  session transcript. Mirrored to Session.modelFallback so a card rebuilt
    *  without a live worker keeps the notice. Unlike the other runtime facts it
