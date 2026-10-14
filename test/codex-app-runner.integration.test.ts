@@ -666,7 +666,7 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
-  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused'] as const)(
+  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit'] as const)(
     'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
       resetAskBroker();
       setCanTalkChecker(() => true);
@@ -689,6 +689,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           const input = parseAskBody(body);
           if ('error' in input || !input.asyncUserInput) throw new Error('invalid async ask');
           res.on('close', () => { responseClosed = true; });
+          if (input.asyncFailure) { res.writeHead(409); res.end('async question could not be displayed'); return; }
           if (outcome === 'refused') { res.writeHead(400); res.end('refused'); return; }
           const result = await registerAskForResponse({ ...input, timeoutMs: outcome === 'timedOut' ? 1000 : input.timeoutMs,
             answererOpenId: 'ou_owner', backendSurvivesRestart: false }, res);
@@ -719,13 +720,22 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       try {
         await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', undefined, 'om_async_input')}\r`);
-        if (outcome === 'refused') {
+        if (outcome === 'limit') {
+          await waitFor(harness, () => posts.some(p => p.asyncFailure === 'limit') && control.finals.length > 0);
+          expect(cards).toHaveLength(32);
+          expect(posts.filter(p => p.asyncFailure === 'limit')).toHaveLength(1);
+          expect(deliveries).toHaveLength(0);
+        } else if (outcome === 'refused') {
           await waitFor(harness, () => control.finals.length > 0 && harness.stdout.includes('async question call_async_question failed'));
           expect(cards).toHaveLength(0); expect(deliveries).toHaveLength(0);
           expect(control.finals[0].content).toBe('Independent work completed');
         } else if (outcome === 'foreign' || outcome === 'malformed' || outcome === 'workflow') {
           await waitFor(harness, () => control.finals.length > 0);
-          expect(posts).toHaveLength(0); expect(cards).toHaveLength(0);
+          if (outcome === 'malformed') {
+            await waitFor(harness, () => posts.length === 1);
+            expect(posts[0].asyncFailure).toBe('invalid_questions');
+          } else expect(posts).toHaveLength(0);
+          expect(cards).toHaveLength(0);
         } else {
           await waitFor(harness, () => cards.length === 1);
           expect(posts).toHaveLength(1);
@@ -742,11 +752,12 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             // the question remains live and did not leak into the final.
             await waitFor(harness, () => control.finals.length > 0);
             expect(control.finals[0].content).toBe('Independent work completed');
+            expect(harness.stdout).not.toContain('PPE (Recommended) / Production');
             expect(deliveries).toHaveLength(0);
             const ask = cards[0];
             if (outcome === 'selected') {
               expect(submitAsk({ askId: ask.askId, nonce: ask.nonce, by: 'ou_owner',
-                selections: [['Production'], ['Elia']] })).toBe('accepted');
+                selections: [['o1'], ['o0']] })).toBe('accepted');
             } else {
               expect(submitCustomReply({ askId: ask.askId, by: 'ou_owner', text: 'Use PPE and Elia' })).toBe('accepted');
             }

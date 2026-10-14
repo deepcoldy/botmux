@@ -30,6 +30,7 @@ export interface AskApiBody {
   originKind?: string;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
+  asyncFailure?: 'limit' | 'invalid_questions';
 }
 
 export type AskApiBodyError =
@@ -107,6 +108,8 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
 
+  if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
+    || (r.asyncFailure !== 'limit' && r.asyncFailure !== 'invalid_questions'))) return { error: 'bad_asyncUserInput' };
   let questions: AskQuestion[];
   const asyncUserInput = r.asyncUserInput === undefined ? undefined : parseCodexAsyncUserInput(r.asyncUserInput);
   if ((r.asyncUserInput !== undefined && !asyncUserInput)
@@ -116,7 +119,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseAskQuestions(r.questions);
+    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput });
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {
@@ -151,6 +154,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     ...(originKind !== undefined ? { originKind } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
     ...(asyncUserInput ? { asyncUserInput } : {}),
+    ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),
   };
   // Reject semantics this receiver did not parse instead of silently creating
   // a different kind of Ask. Identity claims remain on the raw body for the

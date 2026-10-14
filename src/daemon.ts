@@ -719,6 +719,8 @@ import {
   registerHostAsk,
   restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
+  listPendingAsksByAnchor,
+  askAnswerActorFor,
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
@@ -729,7 +731,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
-import { deliverCodexAsyncAnswer } from './services/codex-async-user-input.js';
+import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer } from './services/codex-async-user-input.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -7845,6 +7847,10 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+export function __testOnly_setScheduleAuthorityStore(store: ScheduleAuthorityStore | null): ScheduleAuthorityStore | null {
+  const previous = scheduleAuthorityStore; scheduleAuthorityStore = store; return previous;
+}
+
 const explicitAskContinuation = createExplicitAskContinuation({
   dir: join(config.session.dataDir, 'explicit-ask-receipts'),
   get appId() { return selfDaemonLarkAppId ?? ''; },
@@ -7868,6 +7874,42 @@ const explicitAskContinuation = createExplicitAskContinuation({
   },
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
 });
+
+/** Resolve once at registration; delivery must not consult evictable replyTargets
+ * or mutable lastCallerOpenId. Autonomous asks use the existing canTalk policy. */
+function asyncAskAudience(ds: DaemonSession, originTurnId: string | undefined):
+  { kind: 'human'; answererOpenId: string } | { kind: 'shared' } | { kind: 'silent' } | { kind: 'unavailable' } {
+  const taskId = originTurnId ? parseScheduledTurnId(originTurnId) : null;
+  if (taskId) {
+    const task = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId)?.task;
+    if (!task || (task.larkAppId && task.larkAppId !== ds.larkAppId)
+      || !scheduleStore.effectiveScheduleChatIds(task).includes(ds.chatId)) return { kind: 'unavailable' };
+    // silent means no IM side effects, including unsolicited interactive cards.
+    if (task.silent) return { kind: 'silent' };
+    const owner = task.ownerOpenId ?? ds.session.ownerOpenId;
+    return owner && canOperate(ds.larkAppId, ds.chatId, owner)
+      ? { kind: 'shared' } : { kind: 'unavailable' };
+  }
+  const frozen = originTurnId ? pickTurnReplyTarget(ds.session, originTurnId) : undefined;
+  const sender = frozen?.senderOpenId;
+  const botSender = sender && (ds.session.turnReplyContexts?.[originTurnId ?? '']?.replyTargetSenderIsBot
+    || (ds.session.quoteTargetId === originTurnId && ds.session.quoteTargetSenderIsBot) || frozen?.participants?.some(p => p.openId === sender && p.isBot)
+    || isKnownPeerBot(config.session.dataDir, ds.larkAppId, sender));
+  if (sender && !botSender) return canOperate(ds.larkAppId, ds.chatId, sender)
+    ? { kind: 'human', answererOpenId: sender } : { kind: 'unavailable' };
+  // A missing human turn's exact identity must not be reassigned to its owner.
+  if (originTurnId?.startsWith('om_') && !sender) return { kind: 'unavailable' };
+  return ds.session.ownerOpenId && canOperate(ds.larkAppId, ds.chatId, ds.session.ownerOpenId)
+    ? { kind: 'shared' } : { kind: 'unavailable' };
+}
+
+async function notifyAsyncAsk(ds: DaemonSession, root: string | null, turnId: string | undefined, text: string): Promise<void> {
+  try {
+    await sessionReply(sessionAnchorId(ds), [...text].slice(0, 6000).join(''), 'text', ds.larkAppId, turnId, {
+      replyTarget: root ? { mode: 'thread', rootMessageId: root } : { mode: 'plain', chatId: ds.chatId },
+    });
+  } catch (error) { logger.warn(`[ask:${ds.session.sessionId}] could not show async question notice: ${String(error)}`); }
+}
 
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
@@ -7970,13 +8012,28 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   const asyncInput = boundAsk.asyncUserInput;
   const asyncWorker = askSession?.worker;
   const asyncGeneration = askSession?.session.workerGeneration;
-  const asyncCaller = askSession?.session.lastCallerOpenId;
+  const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  const audience = asyncInput && askSession ? asyncAskAudience(askSession, asyncOriginTurn) : undefined;
+  const asyncCaller = audience?.kind === 'human' ? audience.answererOpenId : undefined;
   const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
     ? body.originTurnId : askSession?.session.rootMessageId;
-  if (asyncInput && (!askSession || !asyncWorker || asyncWorker.killed || !asyncCaller
+  if (asyncInput && (!askSession || !asyncWorker || asyncWorker.killed
     || (askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId) !== 'codex-app'
     || askSession.session.cliSessionId !== asyncInput.threadId)) {
+    if (askSession && audience?.kind !== 'silent') await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+      tr('card.ask.async_unavailable', undefined, localeForBot(askSession.larkAppId)));
     return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
+  }
+  if (asyncInput && askSession) {
+    if (audience?.kind === 'silent') return jsonRes(res, 200, { kind: 'invalidated', reason: 'silent_schedule', selected: null, by: null, comment: null, timedOut: false });
+    if (audience?.kind === 'unavailable' || boundAsk.asyncFailure) {
+      await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+        tr(boundAsk.asyncFailure === 'limit' ? 'card.ask.async_limit'
+          : boundAsk.asyncFailure === 'invalid_questions' ? 'card.ask.async_invalid' : 'card.ask.async_unavailable',
+          undefined, localeForBot(askSession.larkAppId))
+        + (boundAsk.asyncFailure === 'invalid_questions' ? '' : '\n' + boundAsk.questions.map(q => q.prompt).join('\n')));
+      return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
+    }
   }
   if (!askChatType) {
     // 查不到会话 → chatType 缺省 → p2pOpen 腿 fail-closed（答复权退回原语义）。不致命，但
@@ -7997,7 +8054,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
-    ...(asyncInput ? { answererOpenId: asyncCaller } : {}),
+    ...(asyncCaller ? { answererOpenId: asyncCaller } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
     // authenticated session's FROZEN backend, not the client's origin string. A
     // PTY-backed session dies with the daemon, so its ask must NOT persist; only
@@ -8021,22 +8078,24 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     const isCurrent = () => findActiveBySessionId(boundAsk.sessionId) === askSession
       && askSession.worker === asyncWorker && !!asyncWorker && !asyncWorker.killed
       && askSession.session.workerGeneration === asyncGeneration
-      && askSession.session.cliSessionId === asyncInput.threadId
-      && askSession.session.lastCallerOpenId === asyncCaller;
+      && askSession.session.cliSessionId === asyncInput.threadId;
     const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {
       isCurrent,
       deliver: async (text, by) => {
-        const sender = await resolveSender(askSession.larkAppId, by, 'user');
+        const actor = askAnswerActorFor(result);
+        const byIsBot = actor?.botSender === true || isKnownPeerBot(config.session.dataDir, askSession.larkAppId, by);
+        const byType = byIsBot ? true : actor ? (actor.senderType === 'user' ? false : undefined) : false;
+        const sender = await resolveSender(askSession.larkAppId, by, byIsBot ? 'bot' : 'user');
         // Never send an old card's answer into a replacement runner, another
         // native thread or another principal's active session after this await.
-        if (!isCurrent() || by !== asyncCaller) return false;
+        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
         const turnId = `codex-async-answer-${randomUUID()}`;
         const bot = getBot(askSession.larkAppId);
         askSession.session.quoteTargetId = asyncOriginMessageId;
         askSession.session.quoteTargetSenderOpenId = by;
-        askSession.session.quoteTargetSenderIsBot = false;
+        askSession.session.quoteTargetSenderIsBot = byIsBot;
         beginReplyTargetTurn(askSession, boundAsk.rootMessageId ?? undefined, turnId, new Date().toISOString(), {
-          senderOpenId: by, participants: [{ openId: by, isBot: false }], inThread: !!boundAsk.rootMessageId,
+          senderOpenId: by, participants: [{ openId: by, isBot: byIsBot }], inThread: !!boundAsk.rootMessageId,
         });
         const input = buildFollowUpCliInput(text, boundAsk.sessionId, {
           cliId: 'codex-app', sender, codexAppText: text,
@@ -8048,8 +8107,10 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         // Use the same accepted-input ledger and serial FIFO as human messages.
         // A live turn is allowed to finish; its answer then starts a new turn in
         // the SAME native thread, with its own Botmux delivery identity.
+        await noteTurnReceived(askSession, turnId, text, sender, turnId);
+        if (!isCurrent()) return false;
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
-          trustedCaller: trustedCallerForTurn(boundAsk.larkAppId, by, undefined, false) })) return false;
+          trustedCaller: trustedCallerForTurn(boundAsk.larkAppId, by, actor?.memberUnionId, byType) })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
         rememberLastCliInput(askSession, text, input);
         markSessionActivity(askSession);
@@ -8060,8 +8121,15 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     });
     if (!delivered) {
       logger.warn(`[${boundAsk.sessionId.slice(0, 8)}] async question ${asyncInput.itemId} answer not delivered: session changed`);
+      await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+        tr('card.ask.async_not_delivered', undefined, localeForBot(askSession.larkAppId)));
       return jsonRes(res, 409, { ok: false, error: 'async_answer_not_delivered' });
     }
+  }
+
+  if (asyncInput && askSession && (result.kind === 'timedOut' || result.kind === 'invalidated')) {
+    await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
+      tr('card.ask.async_ended', undefined, localeForBot(askSession.larkAppId)));
   }
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
@@ -25445,7 +25513,13 @@ async function handleThreadReplyAdmitted(
     isWorkflowGrillTrigger: !!threadGrill,
   });
   if (askCandidate) {
-    const pendingAsk = findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
+    const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
+    const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId);
+    const ambiguous = candidates.length > 1 && candidates.some(ask => ask.originKind === CODEX_ASYNC_ASK_ORIGIN);
+    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor }));
+    if (ambiguous && !quoted) {
+      await sessionReply(anchor, tr('card.ask.async_ambiguous', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+    }
     if (pendingAsk) {
       const hostChoiceText = askCandidate.text.trim();
       const hostChoiceAllowsText = pendingAsk.originKind === 'host_cross_principal_classification'
@@ -25472,6 +25546,8 @@ async function handleThreadReplyAdmitted(
         // evaluateTalk's teamMember union leg. Omitting it (card clicks) degrades
         // to the plain evaluateTalk(openId, chatType).
         actor: {
+          senderType: senderIsBotTriState(parsed.senderType, isForeignBot) === true ? 'bot'
+            : parsed.senderType === 'user' ? 'user' : undefined,
           botSender: isBotSenderType || isForeignBot,
           senderUnionId: threadTeamTrustUnionId,
           memberUnionId: threadSenderUnionId,

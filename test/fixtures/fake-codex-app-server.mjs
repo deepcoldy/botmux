@@ -117,7 +117,17 @@ function reject(id, code, message) {
   write({ id, error: { code, message } });
 }
 
+const startedAgentItems = new Set();
 function notify(method, params) {
+  const key = `${params.turnId}:${params.item?.id ?? params.itemId}`;
+  if (method === 'item/started' && params.item?.type === 'agentMessage') startedAgentItems.add(key);
+  if (method === 'item/agentMessage/delta' && !startedAgentItems.has(key)
+      && !(behavior === 'async-user-input-no-start' && params.itemId === 'call_async_question')) {
+    // Real streams declare delivery before deltas. Keep the no-start async
+    // case explicit so buffering is tested rather than inferred from sleeps.
+    notify('item/started', { threadId: params.threadId, turnId: params.turnId,
+      item: { type: 'agentMessage', id: params.itemId, delivery: null } });
+  }
   write({ method, params });
 }
 
@@ -161,13 +171,16 @@ function completeTurn(request) {
         { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
         { title: 'Which voice?', options: null },
       ] };
-    if (behavior === 'async-user-input-malformed') item.questions[0].options = ['only'];
+    if (behavior === 'async-user-input-malformed') item.questions[0].options = [];
     if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
     const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
-    notify('item/started', { threadId: notificationThread, turnId, item });
+    if (behavior !== 'async-user-input-no-start') notify('item/started', { threadId: notificationThread, turnId, item });
     notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
     notify('item/completed', { threadId: notificationThread, turnId, item });
     if (behavior === 'async-user-input-duplicate') notify('item/completed', { threadId, turnId, item });
+    if (behavior === 'async-user-input-limit') {
+      for (let n = 1; n <= 32; n++) notify('item/completed', { threadId, turnId, item: { ...item, id: `call_limit_${n}` } });
+    }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
     if (behavior === 'async-user-input-exit') { setTimeout(() => process.exit(1), 400); return; }
     setTimeout(() => {

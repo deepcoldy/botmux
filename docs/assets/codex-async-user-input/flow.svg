@@ -22,9 +22,9 @@
     <rect x="680" y="92" width="248" height="188" rx="12" fill="white" stroke="#dfe4eb"/>
     <text x="698" y="126" font-size="16" font-weight="bold">Answer → same thread</text>
     <text x="698" y="160" font-size="14">Original question ID retained</text>
-    <text x="698" y="186" font-size="14">Initiating caller validated</text>
+    <text x="698" y="186" font-size="14">Frozen initiator / canTalk</text>
     <text x="698" y="224" font-size="14" fill="#5e6c84">Admitted through worker FIFO</text>
     <text x="698" y="248" font-size="14" fill="#5e6c84">as a subsequent native turn.</text>
-    <text x="32" y="326" font-size="14" fill="#5e6c84">Interrupted, replaced or expired requests do not inject an answer. Earlier questions are not backfilled.</text>
+    <text x="32" y="326" font-size="14" fill="#5e6c84">Quote the intended card when several are pending. Silent schedules do not post cards.</text>
   </g>
 </svg>

@@ -1,5 +1,5 @@
 import type { AskQuestion, AskResult } from '../core/ask-types.js';
-import { codexUserInputAnswer, parseCodexUserInputQuestions } from './codex-user-input.js';
+import { codexUserInputAnswer } from './codex-user-input.js';
 
 export const CODEX_ASYNC_ASK_ORIGIN = 'native-user-input-async';
 export interface CodexAsyncUserInput { threadId: string; itemId: string }
@@ -19,17 +19,20 @@ export function parseCodexAsyncQuestions(item: unknown): AskQuestion[] {
   if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Invalid async question item');
   const v = item as Record<string, unknown>;
   if (v.type !== 'agentMessage' || v.delivery !== 'async' || !Array.isArray(v.questions)
-    || v.questions.length === 0 || v.questions.length > 3) throw new Error('Invalid async question batch');
-  return parseCodexUserInputQuestions({ questions: v.questions.map((raw, index) => {
+    || v.questions.length === 0) throw new Error('Invalid async question batch');
+  return v.questions.map(raw => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid async question');
     const q = raw as Record<string, unknown>;
     if (typeof q.title !== 'string' || !q.title.trim() || q.isSecret === true) throw new Error('Invalid async question title');
-    if (q.options != null && (!Array.isArray(q.options) || q.options.some(o => typeof o !== 'string'))) {
+    if (q.options == null) return { prompt: q.title, inputMode: 'text' as const, multiSelect: false, options: [] };
+    if (!Array.isArray(q.options) || !q.options.length || q.options.some(o => typeof o !== 'string')) {
       throw new Error('Invalid async question options');
     }
-    return { id: `q${index}`, question: q.title,
-      options: q.options == null ? null : (q.options as string[]).map(label => ({ label })) };
-  }) }).map(q => q.question);
+    // Native options are labels, not keys: index keys preserve even identical
+    // (or empty) labels without introducing ambiguous broker identities.
+    return { prompt: q.title, multiSelect: false,
+      options: q.options.map((label, index) => ({ key: `o${index}`, label: label as string })) };
+  });
 }
 
 /** Match the native question reply envelope, preserving call id and index.
@@ -43,8 +46,10 @@ export function codexAsyncAnswerText(
   const answers = codexUserInputAnswer(entries, result).answers;
   const replies = entries.map((entry, index) => ({
     questionItemId: JSON.stringify(['request_user_input_async', input.itemId, index]),
-    question: entry.question.prompt,
-    answer: answers[entry.id].answers.join('\n'),
+    question: [...entry.question.prompt.replace(/[\r\n]/g, ' ')].slice(0, 512).join(''),
+    answer: (result.kind === 'answered' && result.answers?.[index]?.length
+      ? answers[entry.id].answers.map(key => entry.question.options.find(o => o.key === key)!.label)
+      : answers[entry.id].answers).join('\n'),
   }));
   const json = JSON.stringify(replies).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
   return `<send_user_message_question_reply>\n${json}\n</send_user_message_question_reply>`;

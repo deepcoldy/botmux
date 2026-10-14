@@ -103,6 +103,7 @@ export async function postCodexAsk(
   questions: AskQuestion[],
   signal?: AbortSignal,
   asyncUserInput?: { threadId: string; itemId: string },
+  asyncFailure?: 'limit' | 'invalid_questions',
 ): Promise<AskResult> {
   const env = context.env ?? process.env;
   if (env.BOTMUX_WORKFLOW === '1') {
@@ -139,6 +140,7 @@ export async function postCodexAsk(
       requestId: asyncUserInput?.itemId ?? randomUUID(),
       originKind: asyncUserInput ? 'native-user-input-async' : 'native-user-input',
       ...(asyncUserInput ? { asyncUserInput } : {}),
+      ...(asyncFailure ? { asyncFailure } : {}),
       ...(claim ? { originCapability: claim.capability } : {}),
       ...((context.originTurnId ?? claim?.turnId) ? { originTurnId: context.originTurnId ?? claim?.turnId } : {}),
       ...((context.originDispatchAttempt ?? claim?.dispatchAttempt)

@@ -150,3 +150,5 @@ External applications can use experimental [model proxy mode](docs/model-proxy.m
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
 
 [Group creation options and defaults](docs/guide/group-creation.md)
+
+Run `bun run build` before compiling a standalone binary: it generates `dist/.runtime-build-id`, which is inlined into the binary rather than read at runtime.
