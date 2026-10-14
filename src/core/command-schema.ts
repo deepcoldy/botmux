@@ -185,6 +185,16 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
   return BY_NAME.get(cmd.trim().toLowerCase());
 }
 
+/**
+ * Every slash token Botmux itself owns: table names and aliases (including
+ * CLI-specific ones such as `/effort`) plus the topic-header commands. Plugin
+ * commands may never claim one of these.
+ */
+export function isBuiltinSlashCommandName(cmd: string): boolean {
+  const key = cmd.trim().toLowerCase();
+  return BY_NAME.has(key) || FORCE_TOPIC_COMMANDS.has(key);
+}
+
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────
 
 const GLOBAL_COMMANDS = COMMANDS.filter(s => !s.cliId);

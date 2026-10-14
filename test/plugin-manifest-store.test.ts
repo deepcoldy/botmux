@@ -217,6 +217,33 @@ describe('plugin manifest and registry basics', () => {
     )).toThrow(/unsupported_plugin_mcp_runtime_template/);
   });
 
+  it('scans Lark slash command declarations and rejects reserved names', () => {
+    const makeSource = (name: string, commands: unknown[]) => {
+      const root = join(home, name);
+      mkdirSync(join(root, 'commands'), { recursive: true });
+      mkdirSync(join(root, 'service'), { recursive: true });
+      writeFileSync(join(root, 'service', 'index.js'), 'export default {};\n');
+      writeFileSync(join(root, 'commands', 'index.json'), JSON.stringify({
+        schemaVersion: 1, endpoint: '/botmux/commands/v1', commands,
+      }));
+      return root;
+    };
+    const manifest = (id: string) => ({ schemaVersion: 1 as const, id, service: { mode: 'auto' as const } });
+
+    expect(scanPluginContributions(
+      makeSource('cmd-ok', [{ name: '/work-bind', description: '绑定工作项' }]),
+      manifest('cmd-ok'),
+    )?.commands).toEqual({
+      schemaVersion: 1,
+      endpoint: '/botmux/commands/v1',
+      commands: [{ name: '/work-bind', description: '绑定工作项' }],
+    });
+    for (const reserved of ['/close', '/disconnect', '/effort', '/t', '/compact']) {
+      expect(() => scanPluginContributions(makeSource(`cmd-${reserved.slice(1)}`, [{ name: reserved }]), manifest('cmd-x')))
+        .toThrow(`plugin_command_reserved:${reserved}`);
+    }
+  });
+
   it('scans Streamable HTTP MCP declarations without a local command', () => {
     const root = join(home, 'http-mcp');
     mkdirSync(join(root, 'mcp'), { recursive: true });
