@@ -243,6 +243,7 @@ import { setCardDispatcher, setCanTalkChecker, listPendingAsksByAnchor, submitAs
 import { beginReplyTargetTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { __testOnly_setScheduleAuthorityStore } from '../src/daemon.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
+import { canOperate, evaluateAskAnswerTalk } from '../src/im/lark/event-dispatcher.js';
 import type { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 
 const APP = 'rename_route_app';
@@ -666,8 +667,87 @@ describe('/rename production routing — must not pre-create a session (review P
         invalidateAll('fixture cleanup'); await server.close();
         setIpcAuthSecret(null); setActiveSessionsRegistry(undefined);
       }
-      return { ds, root, send, cards, post, close };
+      return { ds, root, send, cards, post, close, bot };
     }
+
+    it.each(['thread', 'chat'] as const)('keeps talk-only human origin parity with blocking card clicks in %s scope', async scope => {
+      const h = await setup(scope);
+      const caller = 'ou_talk_only';
+      try {
+        h.bot.config.allowedUsers = [OWNER];
+        h.bot.resolvedAllowedUsers = [OWNER];
+        h.bot.config.allowedChatGroups = [CHAT];
+        setCanTalkChecker(evaluateAskAnswerTalk);
+        expect(canOperate(APP, CHAT, caller)).toBe(false);
+        expect(evaluateAskAnswerTalk(APP, CHAT, caller, 'group')).toBe(true);
+        beginReplyTargetTurn(h.ds, scope === 'thread' ? h.root : undefined, 'om_async_origin', NOW,
+          { senderOpenId: caller });
+        const response = h.post('call_talk_only');
+        await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+        const card = h.cards[0];
+        expect(card.answererOpenId).toBe(caller);
+        // canTalk admits the card; the frozen origin still controls who may answer.
+        expect(evaluateAskAnswerTalk(APP, CHAT, OWNER, 'group')).toBe(true);
+        expect(submitAsk({ askId: card.askId, nonce: card.nonce, by: OWNER,
+          selections: [['o0']] })).toBe('unauthorized');
+        expect(submitAsk({ askId: card.askId, nonce: card.nonce, by: caller,
+          selections: [['o0']] })).toBe('accepted');
+        expect((await response).status).toBe(200);
+        const answers = h.send.mock.calls.map(([m]) => m).filter(m => m.type === 'message');
+        expect(answers).toHaveLength(1);
+        expect(answers[0].trustedCaller.requestUserOpenId).toBe(caller);
+        expect(answers[0].codexAppInput.text).toContain('call_talk_only');
+        expect(h.ds.session.cliSessionId).toBe('native-review-thread');
+      } finally { await h.close(); }
+    });
+
+    it.each(['ungranted', 'blocked'] as const)('refuses a frozen human origin without canTalk and shows a notice: %s', async mode => {
+      const h = await setup();
+      const caller = 'ou_ungranted';
+      try {
+        h.bot.config.allowedUsers = [OWNER];
+        h.bot.resolvedAllowedUsers = [OWNER];
+        if (mode === 'blocked') {
+          h.bot.config.allowedChatGroups = [CHAT];
+          h.bot.resolvedBlockedUsers = [caller];
+        }
+        setCanTalkChecker(evaluateAskAnswerTalk);
+        expect(canOperate(APP, CHAT, caller)).toBe(false);
+        expect(evaluateAskAnswerTalk(APP, CHAT, caller, 'group')).toBe(false);
+        beginReplyTargetTurn(h.ds, h.root, 'om_async_origin', NOW, { senderOpenId: caller });
+        // Keep denial regressions bounded: an incorrectly admitted card times out
+        // with HTTP 200, which must fail the explicit 409 assertion below.
+        const response = await h.post('call_no_talk', 'om_async_origin', false, 1000);
+        expect(response.status).toBe(409);
+        expect((await response.json()).error).toBe('async_question_origin_unavailable');
+        expect(h.cards).toHaveLength(0);
+        expect(repliedText()).toContain('身份不可用');
+        expect(h.send).not.toHaveBeenCalled();
+      } finally { await h.close(); }
+    });
+
+    it('keeps canOperate authority for scheduled creators even when they have canTalk', async () => {
+      const h = await setup('chat');
+      const creator = 'ou_talk_only_creator';
+      const previous = __testOnly_setScheduleAuthorityStore({ getRecord: () => ({ task: {
+        id: 'abcd1234', larkAppId: APP, chatId: CHAT, ownerOpenId: creator,
+        enabled: false, disabledReason: 'once_completed',
+      } }) } as unknown as ScheduleAuthorityStore);
+      try {
+        h.bot.config.allowedUsers = [OWNER];
+        h.bot.resolvedAllowedUsers = [OWNER];
+        h.bot.config.allowedChatGroups = [CHAT];
+        setCanTalkChecker(evaluateAskAnswerTalk);
+        expect(canOperate(APP, CHAT, creator)).toBe(false);
+        expect(evaluateAskAnswerTalk(APP, CHAT, creator, 'group')).toBe(true);
+        const response = await h.post('call_schedule_talk_only',
+          'schedule:abcd1234:00000000-0000-0000-0000-000000000001', false, 1000);
+        expect(response.status).toBe(409);
+        expect(h.cards).toHaveLength(0);
+        expect(repliedText()).toContain('身份不可用');
+        expect(h.send).not.toHaveBeenCalled();
+      } finally { __testOnly_setScheduleAuthorityStore(previous); await h.close(); }
+    });
 
     it.each(['interjection', 'eviction'] as const)('freezes A at registration and still delivers after %s', async mode => {
       const h = await setup();

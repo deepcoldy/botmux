@@ -7895,7 +7895,9 @@ function asyncAskAudience(ds: DaemonSession, originTurnId: string | undefined):
   const botSender = sender && (ds.session.turnReplyContexts?.[originTurnId ?? '']?.replyTargetSenderIsBot
     || (ds.session.quoteTargetId === originTurnId && ds.session.quoteTargetSenderIsBot) || frozen?.participants?.some(p => p.openId === sender && p.isBot)
     || isKnownPeerBot(config.session.dataDir, ds.larkAppId, sender));
-  if (sender && !botSender) return canOperate(ds.larkAppId, ds.chatId, sender)
+  // Human-origin cards use the same talk policy as ordinary input and Ask clicks.
+  // This only admits registration; the answerer remains frozen to this sender.
+  if (sender && !botSender) return evaluateAskAnswerTalk(ds.larkAppId, ds.chatId, sender, ds.chatType)
     ? { kind: 'human', answererOpenId: sender } : { kind: 'unavailable' };
   // A missing human turn's exact identity must not be reassigned to its owner.
   if (originTurnId?.startsWith('om_') && !sender) return { kind: 'unavailable' };

@@ -1198,8 +1198,8 @@ function reportIdentityConflict(turn: ActiveTurn, observedNativeTurnId?: string,
   // client turn id; never reuse untrusted native text.
   turn.finalText = `Codex App turn failed: ${message}`;
   turn.allAgentText = '';
-    turn.itemText.clear();
-    turn.knownAgentItemIds.clear();
+  turn.itemText.clear();
+  turn.knownAgentItemIds.clear();
   if (turn.nativeTurnId && nativeActiveTurnId === turn.nativeTurnId) {
     nativeActiveTurnId = undefined;
   }
@@ -2004,8 +2004,8 @@ async function reconcileSteeredGroupFromHistory(
       const { turn: matched, lastIndex } = matches[0];
       turn.finalText = rebuildReconciledFinal(matched, lastIndex);
       turn.allAgentText = '';
-    turn.itemText.clear();
-    turn.knownAgentItemIds.clear();
+      turn.itemText.clear();
+      turn.knownAgentItemIds.clear();
       turn.terminalCompletion = matched;
       // R4-B3: the matched turn is now the authoritative native identity for this
       // group — the final marker, native id, and usage drain must all key off
@@ -2347,9 +2347,8 @@ async function runTurn(message: QueuedInput): Promise<void> {
         turn.pendingNotifications.length = 0;
         turn.finalText = '';
         turn.allAgentText = '';
-    turn.itemText.clear();
-    turn.knownAgentItemIds.clear();
         turn.itemText.clear();
+        turn.knownAgentItemIds.clear();
         writeLine('[codex-app] captured native turn completed before steer acceptance; starting the same client-id input as a new turn');
         continue;
       }
