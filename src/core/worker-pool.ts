@@ -1130,9 +1130,11 @@ export function isDisposableCommandScratch(ds: DaemonSession): boolean {
  * `cliLaunchSnapshot` from `/cli`), which are selections, not launches. Used only
  * by `/resume` recovery, which may evict such a row to restore the real session. */
 export function isResumeRecoveryPlaceholder(ds: DaemonSession): boolean {
+  // Persisted evidence only: restore rewrites runtime flags such as hasHistory.
   return !ds.worker
-    && !ds.hasHistory
     && !ds.pendingRepo
+    && !ds.worktreeCreating
+    && !ds.pendingRepoCommitInFlight
     && ds.pendingPrompt === undefined
     && ds.pendingRawInput === undefined
     && !ds.adoptedFrom

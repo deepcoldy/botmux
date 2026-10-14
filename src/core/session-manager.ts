@@ -1,4 +1,4 @@
-import { touchSessionGroup } from '../services/session-groups-store.js';
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
@@ -3829,7 +3829,7 @@ export async function resumeSession(
   // auto-resumes, so any recovery path (close card, /resume, /adopt <id>, CLI)
   // may bring back an older resident; keep the registry pointing at it so
   // /dismiss sees the live resident. No-op for chats that are not session groups.
-  if (scope === 'chat') touchSessionGroup(session.chatId, sessionId);
+  if (scope === 'chat' && isSessionGroup(session.chatId)) touchSessionGroup(session.chatId, sessionId);
   return {
     ok: true,
     ds,

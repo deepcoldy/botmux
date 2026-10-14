@@ -151,3 +151,18 @@ it('/resume evicts a live codex-pool command placeholder at the anchor, restores
   expect(store.getOwnedSession(placeholder.sessionId)?.status).toBe('closed');
   expect(getSessionGroup(CHAT)?.lastSessionId).toBe(real.sessionId);
 });
+
+it('/resume placeholder detection uses persisted evidence only and never evicts in-flight repo setup', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-ph-flags'); mkdirSync(workspace, { recursive: true });
+  registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex', allowedUsers: ['ou_fixture'] });
+  store.init(APP); initSessionGroups(APP);
+  const row = store.createSession(CHAT, 'om_ph_flags', '/help', 'group', 'chat');
+  Object.assign(row, { larkAppId: APP, workingDir: workspace, cliId: 'codex' });
+  const ds = { session: row, larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat', workingDir: workspace,
+    worker: null, workerPort: null, workerToken: null, lastMessageAt: 1, lastScreenStatus: 'idle' } as DaemonSession;
+  // restoreActiveSessions sets hasHistory=true on every restored row; still a placeholder.
+  expect(pool.isResumeRecoveryPlaceholder({ ...ds, hasHistory: true } as DaemonSession)).toBe(true);
+  expect(pool.isResumeRecoveryPlaceholder({ ...ds, worktreeCreating: true } as DaemonSession)).toBe(false);
+  expect(pool.isResumeRecoveryPlaceholder({ ...ds, pendingRepoCommitInFlight: true } as DaemonSession)).toBe(false);
+  expect(pool.isResumeRecoveryPlaceholder({ ...ds, session: { ...row, lastUserPrompt: 'hi' } } as DaemonSession)).toBe(false);
+});
