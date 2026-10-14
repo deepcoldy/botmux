@@ -29,6 +29,7 @@ import { WorkspaceRecycleRuntime } from '../src/core/workspace-recycle-runtime.j
 import { WorkspaceRecycler } from '../src/services/workspace-recycle.js';
 import { __testOnly_activeSessions as active, __testOnly_handleNewTopic as handleNewTopic, __testOnly_handleThreadReply as handleThreadReply } from '../src/daemon.js';
 import { type DaemonSession, activeSessionKey } from '../src/core/types.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
 const APP = 'app-recycle-group';
 const CHAT = 'oc_recycle_group';
@@ -143,6 +144,7 @@ it('/resume evicts a live codex-pool command placeholder at the anchor, restores
   registerSessionGroup(CHAT, { ownerOpenId: 'ou_fixture', lastSessionId: placeholder.sessionId, createdAt: 1, lastActiveAt: 1 });
 
   mocks.reply.mockClear(); mocks.send.mockClear(); mocks.fork.mockClear();
+  const publish = vi.spyOn(dashboardEventBus, 'publish');
   await handleThreadReply({
     sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
     message: { message_id: 'om_resume_ph', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/resume' }), create_time: String(Date.now()) },
@@ -150,6 +152,10 @@ it('/resume evicts a live codex-pool command placeholder at the anchor, restores
   await vi.waitFor(() => expect(store.getOwnedSession(real.sessionId)?.status).toBe('active'));
   expect(store.getOwnedSession(placeholder.sessionId)?.status).toBe('closed');
   expect(getSessionGroup(CHAT)?.lastSessionId).toBe(real.sessionId);
+  await vi.waitFor(() => expect(publish).toHaveBeenCalledWith({
+    type: 'session.update', body: { sessionId: real.sessionId, patch: { status: 'active', closedAt: null } },
+  }));
+  publish.mockRestore();
 });
 
 it('/resume placeholder detection uses persisted evidence only and never evicts in-flight repo setup', async () => {
@@ -187,4 +193,26 @@ it('a command that pre-creates the chat-scope session (/help after /close) becom
   const resident = getSessionGroup(CHAT)?.lastSessionId;
   expect(resident).not.toBe(old.sessionId);
   expect(store.getOwnedSession(resident!)?.status).toBe('active');
+});
+
+it('a pre-created command session that loses registration to a concurrently resumed resident is not recorded as the group resident', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-loser'); mkdirSync(workspace, { recursive: true });
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'claude-code', allowedUsers: ['ou_fixture'], workingDir: workspace } as any);
+  bot.resolvedAllowedUsers = ['ou_fixture'];
+  store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
+  // The old resident was just resumed (e.g. via its close card) and owns the chat slot.
+  const resident = store.createSession(CHAT, 'om_resident', 'resident', 'group', 'chat');
+  Object.assign(resident, { larkAppId: APP, workingDir: workspace, cliId: 'claude-code', cliSessionId: 'cli-resident' });
+  store.updateSession(resident);
+  const residentDs = { session: resident, larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat', workingDir: workspace,
+    worker: null, workerPort: null, workerToken: null, lastMessageAt: 1, lastScreenStatus: 'idle' } as DaemonSession;
+  active.set(activeSessionKey(residentDs), residentDs);
+  registerSessionGroup(CHAT, { ownerOpenId: 'ou_fixture', lastSessionId: resident.sessionId, createdAt: 1, lastActiveAt: 1 });
+  // A /help that was classified on the new-topic path pre-creates a scaffold, then loses the slot.
+  await handleNewTopic({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_help_loser', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/help' }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_help_loser', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  expect(getSessionGroup(CHAT)?.lastSessionId).toBe(resident.sessionId);
+  expect(active.get(activeSessionKey(residentDs))).toBe(residentDs);
 });

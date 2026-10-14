@@ -23884,10 +23884,6 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // break. Chat-scope keeps the inbound messageId as audit only.
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
-      // Session-group registry: same as the ordinary creation path — a command
-      // that pre-creates the chat-scope session (e.g. `/help` after `/close`) makes it
-      // the group's resident, so /dismiss and AI titling see the live session.
-      if (scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) touchSessionGroup(chatId, session.sessionId);
       const now = Date.now();
       if (chatType === 'p2p') {
         setDirectChatDisplayNameFromSender(
@@ -23965,6 +23961,13 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
         ...cmdPending,
       };
       const registration = await claimNewDaemonSession(activeSessions, cmdDs);
+      // Session-group registry: once this pre-created chat-scope session wins the
+      // slot it is the group's resident (e.g. `/help` after `/close`), same as the
+      // ordinary creation path. A loser (e.g. an old session resumed concurrently)
+      // must not be recorded — the incumbent already is.
+      if (registration.accepted && scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) {
+        touchSessionGroup(chatId, cmdDs.session.sessionId);
+      }
       if (!registration.accepted) {
         if (registration.reason !== 'existing_owner') return true;
       } else if (cmdDs.pendingRepo) {
@@ -27192,10 +27195,6 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // handleCommand's `!ds` branch reply no_active_session instead.
       if (chatId && slashDecision.sessionPolicy === 'precreate') {
         const session = sessionStore.createSession(chatId, anchor, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
-        // Session-group registry: same as the ordinary creation path — a command
-        // that pre-creates the chat-scope session (e.g. `/help` after `/close`) makes it
-        // the group's resident, so /dismiss and AI titling see the live session.
-        if (scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) touchSessionGroup(chatId, session.sessionId);
         const now = Date.now();
         if (chatType === 'p2p') {
           setDirectChatDisplayNameFromSender(
@@ -27250,6 +27249,11 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           ...cmdPending,
         };
         const registration = await claimNewDaemonSession(activeSessions, cmdDs);
+        // Session-group registry: see the new-topic pre-create path — record the
+        // winner only.
+        if (registration.accepted && scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) {
+          touchSessionGroup(chatId, cmdDs.session.sessionId);
+        }
         if (!registration.accepted) {
           if (registration.reason !== 'existing_owner') return true;
         } else if (cmdDs.pendingRepo) {

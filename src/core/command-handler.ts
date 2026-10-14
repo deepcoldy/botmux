@@ -122,6 +122,7 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
+import { dashboardEventBus } from './dashboard-events.js';
 import { rehomeReplyTargetState } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
@@ -4363,6 +4364,14 @@ export async function handleCommand(
             return;
           }
           const result = await resumeSession(session.sessionId, activeSessions);
+          if (result.ok) {
+            // Same as the HTTP resume endpoint: flip connected dashboards back to active
+            // (`null`, not undefined, so the SSE patch actually clears closedAt).
+            dashboardEventBus.publish({
+              type: 'session.update',
+              body: { sessionId: session.sessionId, patch: { status: 'active', closedAt: null } },
+            });
+          }
           await sessionReply(rootId, resumeResultMessage(result, loc));
         };
         if (larkAppId) await runDetachedBotTurnAdmission(larkAppId, runResume);
