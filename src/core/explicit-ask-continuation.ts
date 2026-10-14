@@ -101,6 +101,10 @@ export function createExplicitAskContinuation(deps: {
           }
           // Allow the normal HTTP caller to emit stdout and acknowledge first.
           if (now() - receipt.settledAt! < 5000 || !deps.canResume(receipt)) continue;
+          // Generic recovery creates a fresh turn without a document-comment
+          // binding. Keep the receipt for the original caller to reconnect;
+          // never continue a document task in an unbound turn.
+          if (receipt.input.deliveryTarget || receipt.input.chatId.startsWith('doc:')) continue;
           if (await deps.dispatch(receipt, `ask-${key}`)) {
             // Re-read: a normal claimant may have acknowledged during dispatch.
             write(key, { ...read(key)!, delivered: true });
@@ -116,6 +120,9 @@ export function createExplicitAskContinuation(deps: {
 /** Shared production builder: group-only chat permission must never leak into
  * private sessions. Recovery is a quiet append, never a new task or a steer. */
 export function explicitAskRecoveryRequest(receipt: ExplicitAskReceipt, key: string, chatType?: 'group' | 'p2p'): TriggerRequest {
+  if (receipt.input.deliveryTarget || receipt.input.chatId.startsWith('doc:')) {
+    throw new Error('Document ask automatic recovery requires a bound document turn; reconnect to the original ask');
+  }
   return {
     source: { type: 'ui', connectorId: 'ask-continuation', requestId: key },
     target: { kind: 'turn', sessionId: receipt.input.sessionId },

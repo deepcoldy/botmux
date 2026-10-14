@@ -1643,6 +1643,8 @@ export const messages: Record<string, string> = {
   'card.ask.toast.empty_confirm_needed': 'Nothing selected — click confirm once more to answer empty',
   'card.ask.custom_reply_hint': '💬 None of the options fit? Just reply with your answer in this topic.',
   'card.ask.text_reply_hint': '💬 Reply with your answer in this conversation.',
+  'card.ask.document_origin': 'Document task: {document} · Comment: {comment}',
+  'card.ask.document_reply_hint': '💬 This question belongs to a document comment. To answer in text, use Reply on this exact card. Only the original comment author may answer.',
   'card.ask.title': 'botmux ask',
   'card.ask.title_done': 'botmux ask · done',
   'card.ask.toast.unauthorized': "You're not allowed to answer this ask",

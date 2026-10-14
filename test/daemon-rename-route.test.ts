@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => {
     resolveLarkCliHomeForTurn: vi.fn(async () => `${dataDir}/fixture-lark-home`),
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    isHumanOpenId: vi.fn(async () => true),
     deleteMessage: vi.fn(async () => true),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
@@ -126,6 +127,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    isHumanOpenId: mocks.isHumanOpenId,
     deleteMessage: mocks.deleteMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
@@ -243,6 +245,11 @@ import { getDocSubscription, putDocSubscription, removeDocSubscription } from '.
 import { config } from '../src/config.js';
 
 import { sessionIdentityPath } from '../src/core/cli-identity.js';
+import { _resetForTest as resetAsks, registerAsk, setCardDispatcher, setCanTalkChecker, submitAsk } from '../src/core/ask-broker.js';
+import { startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
+import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
+import type { PendingAsk } from '../src/core/ask-types.js';
+import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
@@ -250,6 +257,81 @@ const PEER = 'ou_peer_bot';
 const PEER_UNION = 'on_peer_bot';
 const NOW = new Date().toISOString();
 const repoFixtureDirs: string[] = [];
+
+describe('document Ask production routing', () => {
+  beforeEach(() => {
+    resetRouteTestState();
+    resetAsks();
+    setActiveSessionsRegistry(activeSessions);
+    mocks.isHumanOpenId.mockResolvedValue(true);
+    setCanTalkChecker((_app, _chat, by) => by === OWNER);
+  });
+  afterEach(() => { resetAsks(); activeSessions.clear(); setActiveSessionsRegistry(undefined); });
+
+  const questions = [{ prompt: 'Rebuild?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }];
+  function seedDocument() {
+    const anchor = 'doc:fixture:comment';
+    const ds = seedThreadSession(anchor, 'document task');
+    ds.chatId = anchor; ds.scope = 'chat'; ds.session.scope = 'chat'; ds.session.chatId = anchor;
+    ds.session.docCommentTargets = {
+      'turn-A': { fileToken: 'fixture', fileType: 'docx', commentId: 'comment', turnId: 'turn-A', replyToOpenId: OWNER },
+    };
+    return ds;
+  }
+
+  it.each(['answer', 'missing-turn', 'unknown-author', 'closed-during-lookup'])(
+    'authenticates the real Ask HTTP route and freezes document delivery: %s', async mode => {
+      const ds = seedDocument();
+      if (mode === 'unknown-author') mocks.isHumanOpenId.mockResolvedValue(false);
+      if (mode === 'closed-during-lookup') mocks.isHumanOpenId.mockImplementation(async () => { ds.session.status = 'closed'; return true; });
+      let card: PendingAsk | undefined;
+      setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_document_card' }; } });
+      const secret = 'document-ask-test-secret';
+      setIpcAuthSecret(secret);
+      const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      try {
+        const path = '/api/asks';
+        const response = fetch(`http://127.0.0.1:${server.port}${path}`, {
+          method: 'POST', headers: daemonIpcAuthHeaders({ secret, port: server.port, method: 'POST', path,
+            headers: { 'content-type': 'application/json' } }),
+          body: JSON.stringify({ sessionId: ds.session.sessionId, larkAppId: 'spoofed-app',
+            chatId: 'oc_spoofed', rootMessageId: 'om_spoofed', questions, timeoutMs: 60_000,
+            originKind: 'native-user-input', originTurnId: mode === 'missing-turn' ? 'missing' : 'turn-A' }),
+        });
+        if (mode === 'answer') {
+          await vi.waitFor(() => expect(card).toBeDefined());
+          expect(card).toMatchObject({ larkAppId: APP, chatId: 'doc:fixture:comment', rootMessageId: null,
+            sessionId: ds.session.sessionId, answererOpenId: OWNER,
+            deliveryTarget: { kind: 'document-author', openId: OWNER, turnId: 'turn-A' } });
+          expect(submitAsk({ askId: card!.askId, nonce: card!.nonce, by: OWNER, selections: [['yes']] })).toBe('accepted');
+          expect(await (await response).json()).toMatchObject({ kind: 'answered', answers: [['yes']] });
+        } else {
+          const result = await response;
+          expect(result.status).toBe(mode === 'closed-during-lookup' ? 409 : 422);
+          expect(card).toBeUndefined();
+        }
+      } finally { await server.close(); }
+    },
+  );
+
+  it.each(['new-topic', 'thread'])('DM %s reply answers the document without starting another CLI', async route => {
+    let card!: PendingAsk;
+    setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_document_card' }; } });
+    const result = registerAsk({ sessionId: 'doc-session', larkAppId: APP, chatId: 'doc:fixture:comment',
+      rootMessageId: null, chatType: 'group', answererOpenId: OWNER, questions, timeoutMs: 60_000,
+      deliveryTarget: { kind: 'document-author', openId: OWNER, turnId: 'turn-A', fileToken: 'fixture', commentId: 'comment' } });
+    await vi.waitFor(() => expect(card).toBeDefined());
+    const data = makeEventData('om_answer', 'Preserve labels', route === 'thread' ? 'om_document_card' : undefined);
+    data.message.parent_id = 'om_document_card';
+    data.message.chat_type = 'p2p';
+    const ctx = { ...makeCtx('om_document_card', 'om_answer'), chatType: 'p2p' };
+    if (route === 'new-topic') await handleNewTopic(data, ctx);
+    else await handleThreadReply(data, ctx);
+    expect(await result).toMatchObject({ kind: 'answered', comment: 'Preserve labels' });
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+});
 
 function makeRepoFixtureDir(): string {
   const root = join(mocks.dataDir, 'repo-fixtures');

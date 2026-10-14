@@ -1641,6 +1641,8 @@ export const messages: Record<string, string> = {
   'card.ask.toast.empty_confirm_needed': '未勾选任何选项，如确实要空作答请再点一次确认',
   'card.ask.custom_reply_hint': '💬 选项都不合适？直接在话题里回复你的答案即可。',
   'card.ask.text_reply_hint': '💬 请直接在当前会话回复你的答案。',
+  'card.ask.document_origin': '文档任务：{document} · 评论：{comment}',
+  'card.ask.document_reply_hint': '💬 这是文档评论任务的提问。文字作答请使用“回复”引用这张卡片；仅原评论发起人可答复。',
   'card.ask.title': 'botmux ask',
   'card.ask.title_done': 'botmux ask 已结束',
   'card.ask.toast.unauthorized': '你没有权限回答这个 ask',

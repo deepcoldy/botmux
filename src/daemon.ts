@@ -736,6 +736,9 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
+import { isHumanOpenId } from './im/lark/client.js';
+import { submitDocumentAskReply } from './core/ask-broker.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -8068,13 +8071,36 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
+  let documentDelivery: Awaited<ReturnType<typeof resolveDocumentAskDelivery>>;
+  const askGeneration = askSession && captureRoutingGeneration(askSession);
+  const askWorker = askSession?.worker;
+  const askOrigin = askSession?.managedTurnOrigin;
+  try {
+    documentDelivery = askSession
+      ? await resolveDocumentAskDelivery(askSession, body.originTurnId,
+        async (appId, openId) => evaluateAskAnswerTalk(appId, askSession.chatId, openId, 'p2p')
+          && await isHumanOpenId(appId, openId))
+      : undefined;
+    if (documentDelivery && askGeneration && (!isCurrentRoutingGeneration(askGeneration)
+      || askSession!.worker !== askWorker || askSession!.managedTurnOrigin !== askOrigin)) {
+      return jsonRes(res, 409, { ok: false, error: 'origin_unproven',
+        detail: 'Document ask origin changed while resolving its recipient' });
+    }
+  } catch (error) {
+    return jsonRes(res, 422, {
+      ok: false, error: 'card_delivery_failed',
+      detail: error instanceof Error ? error.message : 'Confirmation card cannot be delivered',
+    });
+  }
   const askInput = {
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
     questions: boundAsk.questions,
-    replyCardTarget: replyCardAskTarget(askSession, boundAsk, body),
+    replyCardTarget: documentDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
+    deliveryTarget: documentDelivery,
+    ...(documentDelivery ? { answererOpenId: documentDelivery.openId } : {}),
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
     // Invocation identity (from the hook; enables cross-restart re-attach).
@@ -22801,7 +22827,21 @@ function shouldSeedSessionGroupTitle(content: string): boolean {
 
 
 
+/** Answer a document task without creating/steering an unrelated DM session.
+ * Only signed inbound plain-text replies to the exact delivered card qualify. */
+function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
+  if (ctx.chatType !== 'p2p' || data.sender?.sender_type !== 'user'
+    || data.message?.message_type !== 'text') return false;
+  const { parsed, resources } = parseEventMessage(data);
+  if (resources.length || !parsed.senderId || !parsed.parentId) return false;
+  return submitDocumentAskReply({
+    larkAppId: ctx.larkAppId, chatType: 'p2p', by: parsed.senderId,
+    parentMessageId: parsed.parentId, text: parsed.content,
+  });
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
+  if (handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // Session-group birth re-homes the turn into the new group: replies/quotes
@@ -25106,6 +25146,7 @@ async function handleThreadReplyAdmitted(
   prepared?: PreparedThreadReply,
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
 ): Promise<void> {
+  if (!replay && handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
   const runtimeSessionKey = sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId);

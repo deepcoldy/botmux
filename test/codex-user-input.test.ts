@@ -81,4 +81,11 @@ describe('Codex native user input bridge', () => {
     await expect(bridgeCodexUserInput(context, params, controller.signal)).rejects.toThrow();
     expect(mocks.post).toHaveBeenCalledTimes(1);
   });
+  it('identifies recipient-resolution failure as undeliverable, not unanswered', async () => {
+    mocks.post.mockResolvedValue(Response.json({
+      error: 'card_delivery_failed', detail: 'No verified document-turn recipient',
+    }, { status: 422 }));
+    await expect(bridgeCodexUserInput(context, params))
+      .rejects.toThrow('Confirmation card could not be delivered: No verified document-turn recipient');
+  });
 });

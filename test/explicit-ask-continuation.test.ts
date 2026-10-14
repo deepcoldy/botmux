@@ -53,6 +53,22 @@ describe('explicit Ask durable continuation', () => {
     expect(t.dispatch).toHaveBeenCalledTimes(1);
     expect(t.dispatch.mock.calls[0]![0].input.sessionId).toBe('session');
   });
+  it('retains a document answer for reconnect without dispatching an unbound recovery turn', async () => {
+    const t = setup();
+    const documentInput = { ...input, chatId: 'doc:fixture:comment', answererOpenId: 'ou_author',
+      deliveryTarget: { kind: 'document-author' as const, openId: 'ou_author',
+        turnId: 'comment-turn', fileToken: 'fixture', commentId: 'comment' } };
+    await t.manager.wait(documentInput);
+    t.tick();
+    const rebooted = createExplicitAskContinuation(t.deps);
+    await rebooted.sweep();
+    expect(t.dispatch).not.toHaveBeenCalled();
+    expect(await rebooted.wait(documentInput)).toEqual(answer);
+    expect(rebooted.acknowledge(documentInput)).toEqual(answer);
+    expect(t.register).toHaveBeenCalledTimes(1);
+    expect(() => explicitAskRecoveryRequest({ version: 1, input: documentInput, result: answer }, 'key', 'group'))
+      .toThrow(/document.*recovery/i);
+  });
   it('failed/ambiguous dispatch retries with identical key; concurrent sweeps serialize', async () => {
     const t = setup(); t.dispatch.mockResolvedValueOnce(false);
     await t.manager.wait(input); t.tick();
