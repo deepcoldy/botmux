@@ -165,4 +165,26 @@ it('/resume placeholder detection uses persisted evidence only and never evicts 
   expect(pool.isResumeRecoveryPlaceholder({ ...ds, worktreeCreating: true } as DaemonSession)).toBe(false);
   expect(pool.isResumeRecoveryPlaceholder({ ...ds, pendingRepoCommitInFlight: true } as DaemonSession)).toBe(false);
   expect(pool.isResumeRecoveryPlaceholder({ ...ds, session: { ...row, lastUserPrompt: 'hi' } } as DaemonSession)).toBe(false);
+  // Accepted-but-unstarted work kept by restore must never be evicted.
+  expect(pool.isResumeRecoveryPlaceholder({ ...ds, initialStartPending: true } as DaemonSession)).toBe(false);
+  expect(pool.isResumeRecoveryPlaceholder({ ...ds, session: { ...row, queuedActivationTail: [{} as any] } } as DaemonSession)).toBe(false);
+  expect(pool.isResumeRecoveryPlaceholder({ ...ds, session: { ...row, queuedActivationPending: true } } as DaemonSession)).toBe(false);
+});
+
+it('a command that pre-creates the chat-scope session (/help after /close) becomes the session-group resident', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-precreate'); mkdirSync(workspace, { recursive: true });
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'claude-code', allowedUsers: ['ou_fixture'], workingDir: workspace } as any);
+  bot.resolvedAllowedUsers = ['ou_fixture'];
+  store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
+  const old = store.createSession(CHAT, 'om_old', 'old', 'group', 'chat');
+  Object.assign(old, { larkAppId: APP, workingDir: workspace, cliId: 'claude-code', cliSessionId: 'cli-old' });
+  store.updateSession(old); store.closeSession(old.sessionId);
+  registerSessionGroup(CHAT, { ownerOpenId: 'ou_fixture', lastSessionId: old.sessionId, createdAt: 1, lastActiveAt: 1 });
+  await handleNewTopic({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_help_pre', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/help' }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_help_pre', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  const resident = getSessionGroup(CHAT)?.lastSessionId;
+  expect(resident).not.toBe(old.sessionId);
+  expect(store.getOwnedSession(resident!)?.status).toBe('active');
 });

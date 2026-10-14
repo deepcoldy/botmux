@@ -1141,6 +1141,9 @@ export function isResumeRecoveryPlaceholder(ds: DaemonSession): boolean {
     && !ds.session.adoptedFrom
     && !ds.session.headless
     && !ds.session.queued
+    // Accepted-but-unstarted work (activation head/tail, initial-start reservation,
+    // principal-lane tail, repo setup) survives without a worker or history.
+    && !hasProtectedSessionMutationOwnership(ds)
     && !ds.session.cliSessionId
     && !ds.session.lastCliInput
     && !ds.session.lastUserPrompt;
