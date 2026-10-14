@@ -69,6 +69,20 @@ it('finish(succeeded) keeps the retired row closed: a new group message starts f
   }, { chatId: CHAT, messageId, chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
   const retired = () => store.loadAllSessionsStrict(mocks.dataDir).find(s => s.sessionId === session.sessionId);
 
+  // Durable primary: typed /resume must not mutate lifecycle state outside the
+  // durable commit path; it only points at the close card's resume button.
+  mocks.reply.mockClear(); mocks.send.mockClear();
+  process.env.BOTMUX_COORDINATION_MODE = 'primary';
+  try {
+    await ingress('om_resume_primary', '/resume');
+    await vi.waitFor(() => expect([...mocks.reply.mock.calls, ...mocks.send.mock.calls].flat().join(' '))
+      .toMatch(/持久协调|durable coordination/));
+  } finally {
+    delete process.env.BOTMUX_COORDINATION_MODE;
+  }
+  expect(active.size).toBe(0);
+  expect(mocks.fork).not.toHaveBeenCalled();
+
   // /resume (no session in the chat → claimed by botmux) targets the retired row and is refused.
   mocks.reply.mockClear(); mocks.send.mockClear();
   await ingress('om_resume', '/resume');

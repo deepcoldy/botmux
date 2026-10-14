@@ -120,7 +120,8 @@ import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
+import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { rehomeReplyTargetState } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
@@ -4291,64 +4292,76 @@ export async function handleCommand(
 
       case '/resume': {
         // 路由只在本话题/本群没有会话时把 /resume 交到这里；有会话时它透传给 CLI 自带的 /resume。
-        const target = message.content.replace(/^\/resume\s*/i, '').trim();
-        const session = target
-          ? sessionStore.getOwnedSession(target)
-            ?? sessionStore.listSessions().find(s => s.cliSessionId === target)
-          : latestClosedSessionAt(rootId);
-        if (!session) {
-          await sessionReply(rootId, t(target ? 'cmd.adopt.resume_not_found' : 'cmd.resume.none', undefined, loc));
+        // durable primary 只给卡片按钮的 close/resume 接了生命周期提交；打字命令在本地改状态
+        // 会让权威记录与副本分叉，支持之前先引导去点「恢复会话」。
+        if (coordinationModeIsPrimary()) {
+          await sessionReply(rootId, t('cmd.resume.primary_unsupported', undefined, loc));
           break;
         }
-        if (storedSessionAnchorId(session) !== rootId) {
-          // 别处的会话：像 /fork 一样复制到这里（继承完整上下文），原会话不动、仍可在原处恢复。
-          if (session.status !== 'closed') {
-            await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
-            break;
+        // 走 sessionless 的 fast-ACK 分离执行，入口的 bot 准入租约已经释放：重新领一份，
+        // 让 /dismiss 等独占生命周期操作能等到这次恢复/复制落定。
+        const runResume = async (): Promise<void> => {
+          const target = message.content.replace(/^\/resume\s*/i, '').trim();
+          const session = target
+            ? sessionStore.getOwnedSession(target)
+              ?? sessionStore.listSessions().find(s => s.cliSessionId === target)
+            : latestClosedSessionAt(rootId);
+          if (!session) {
+            await sessionReply(rootId, t(target ? 'cmd.adopt.resume_not_found' : 'cmd.resume.none', undefined, loc));
+            return;
           }
-          const resumeChatId = message.chatId ?? session.chatId;
-          const senderIsBot = message.senderType === 'app' || message.senderType === 'bot'
-            || (!!larkAppId && isKnownPeerBot(config.session.dataDir, larkAppId, message.senderId));
-          const { forkClosedSession } = await import('./worker-pool.js');
-          const forked = await forkClosedSession(
-            session.sessionId,
-            resumeChatId,
-            rootId,
-            message.chatType ?? 'group',
-            rootId === resumeChatId ? 'chat' : 'thread',
-            {
-              childTitle: session.title,
-              larkThreadId: rootId === resumeChatId ? undefined : message.threadId,
-              turnId: message.messageId,
-              senderOpenId: message.senderId,
-              senderIsBot,
-              childOwnerOpenId: senderIsBot ? undefined : message.senderId,
-            },
-          );
-          if (forked.ok) {
-            if (rootId === resumeChatId) touchSessionGroup(resumeChatId, forked.childSessionId);
-            await sessionReply(rootId, t('cmd.resume.forked', { title: session.title || session.sessionId.substring(0, 8) }, loc));
-          } else if (forked.error === 'fork_unsupported_backend') {
-            const cliName = getCliDisplayName((session.cliId ?? getBot(session.larkAppId ?? larkAppId!).config.cliId ?? 'claude-code') as CliId);
-            await sessionReply(rootId, t('cmd.resume.fork_unsupported', { cli: cliName, id: session.sessionId }, loc));
-          } else if (forked.error === 'workspace_retired') {
-            await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, loc));
-          } else if (forked.error === 'adopt_not_forkable') {
-            await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
-          } else if (forked.error === 'not_started_yet') {
-            await sessionReply(rootId, t('cmd.fork.not_started_yet', undefined, loc));
-          } else if (forked.error === 'target_chat_has_session') {
-            await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail: '' }, loc));
-          } else {
-            await sessionReply(rootId, t('cmd.fork.failed', { error: forked.error }, loc));
+          if (storedSessionAnchorId(session) !== rootId) {
+            // 别处的会话：像 /fork 一样复制到这里（继承完整上下文），原会话不动、仍可在原处恢复。
+            if (session.status !== 'closed') {
+              await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
+              return;
+            }
+            const resumeChatId = message.chatId ?? session.chatId;
+            const senderIsBot = message.senderType === 'app' || message.senderType === 'bot'
+              || (!!larkAppId && isKnownPeerBot(config.session.dataDir, larkAppId, message.senderId));
+            const { forkClosedSession } = await import('./worker-pool.js');
+            const forked = await forkClosedSession(
+              session.sessionId,
+              resumeChatId,
+              rootId,
+              message.chatType ?? 'group',
+              rootId === resumeChatId ? 'chat' : 'thread',
+              {
+                childTitle: session.title,
+                larkThreadId: rootId === resumeChatId ? undefined : message.threadId,
+                turnId: message.messageId,
+                senderOpenId: message.senderId,
+                senderIsBot,
+                childOwnerOpenId: senderIsBot ? undefined : message.senderId,
+              },
+            );
+            if (forked.ok) {
+              if (rootId === resumeChatId) touchSessionGroup(resumeChatId, forked.childSessionId);
+              await sessionReply(rootId, t('cmd.resume.forked', { title: session.title || session.sessionId.substring(0, 8) }, loc));
+            } else if (forked.error === 'fork_unsupported_backend') {
+              const cliName = getCliDisplayName((session.cliId ?? getBot(session.larkAppId ?? larkAppId!).config.cliId ?? 'claude-code') as CliId);
+              await sessionReply(rootId, t('cmd.resume.fork_unsupported', { cli: cliName, id: session.sessionId }, loc));
+            } else if (forked.error === 'workspace_retired') {
+              await sessionReply(rootId, t('card.action.resume_workspace_retired', undefined, loc));
+            } else if (forked.error === 'adopt_not_forkable') {
+              await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
+            } else if (forked.error === 'not_started_yet') {
+              await sessionReply(rootId, t('cmd.fork.not_started_yet', undefined, loc));
+            } else if (forked.error === 'target_chat_has_session') {
+              await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail: '' }, loc));
+            } else {
+              await sessionReply(rootId, t('cmd.fork.failed', { error: forked.error }, loc));
+            }
+            return;
           }
-          break;
-        }
-        const result = await resumeSession(session.sessionId, activeSessions);
-        // Only a chat-scope session is the group's resident; a resumed subtopic must not
-        // displace it (top-level /dismiss requires a chat-scope resident).
-        if (result.ok && result.ds.scope === 'chat') touchSessionGroup(result.ds.chatId, session.sessionId);
-        await sessionReply(rootId, resumeResultMessage(result, loc));
+          const result = await resumeSession(session.sessionId, activeSessions);
+          // Only a chat-scope session is the group's resident; a resumed subtopic must not
+          // displace it (top-level /dismiss requires a chat-scope resident).
+          if (result.ok && result.ds.scope === 'chat') touchSessionGroup(result.ds.chatId, session.sessionId);
+          await sessionReply(rootId, resumeResultMessage(result, loc));
+        };
+        if (larkAppId) await runDetachedBotTurnAdmission(larkAppId, runResume);
+        else await runResume();
         break;
       }
 
