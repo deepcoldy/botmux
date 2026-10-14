@@ -26,6 +26,7 @@ import {
   programStatusRelayLaunch,
 } from '../src/core/program-status-relay-launch.js';
 import { cliIdFromCommArgv } from '../src/core/session-discovery.js';
+import { buildBotWorkerEnv } from '../src/core/env-policy.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -85,6 +86,14 @@ describe('ProgramStatusProbeRelay', () => {
 
   it('replies with the ST-terminated handshake', () => {
     expect(PROGRAM_STATUS_PROBE_REPLY).toBe(PROBE_ST);
+  });
+});
+
+describe('relay kill switch', () => {
+  it('reaches strict-policy workers like any other worker control knob', () => {
+    const env = buildBotWorkerEnv({ BOTMUX_PROGRAM_STATUS_RELAY: '0', UNRELATED_SECRET: 'x' }, { mode: 'strict' });
+    expect(env.BOTMUX_PROGRAM_STATUS_RELAY).toBe('0');
+    expect(env.UNRELATED_SECRET).toBeUndefined();
   });
 });
 

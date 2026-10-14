@@ -19180,27 +19180,6 @@ async function spawnCli(
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
     }
-    if (
-      !cfg.adoptMode && !willReattachPersistent && effectiveBackendType === 'tmux'
-      && cliAdapter.id === 'claude-code' && cliAdapter.supportsProgramStatus
-      && process.env.BOTMUX_PROGRAM_STATUS_RELAY !== '0'
-    ) {
-      // tmux answers the CLI's DA1 sentinel itself, before the worker can see
-      // the OSC 7501 probe via pipe-pane, so Claude Code would disable program
-      // status. An in-pane relay answers the probe ahead of the DA1 query
-      // (src/program-status-relay.ts). The pane pid becomes the relay; the
-      // real CLI pid is resolved below (startWrapperRealPidResolve).
-      const relayed = programStatusRelayLaunch(spawnBin, spawnArgs);
-      if (relayed) {
-        spawnBin = relayed.bin;
-        spawnArgs = relayed.args;
-        programStatusRelayPlanCleanup = relayed.cleanup;
-        programStatusRelayLaunched = true;
-        log('[program-status] launching CLI behind in-pane OSC 7501 relay');
-      } else {
-        log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
-      }
-    }
     if (!cfg.adoptMode && !willReattachPersistent && !isRemoteBackendType(effectiveBackendType)) {
       // Wrap the command executed INSIDE the pane, not `tmux new-session`.
       // The shared tmux server keeps its own cgroup while the owned CLI and all
@@ -19226,6 +19205,32 @@ async function spawnCli(
         );
       } else if (scoped.capabilities.reason) {
         log(`Session scope unavailable; using backend lifecycle cleanup: ${scoped.capabilities.reason}`);
+      }
+    }
+    if (
+      !cfg.adoptMode && !willReattachPersistent && effectiveBackendType === 'tmux'
+      && cliAdapter.id === 'claude-code' && cliAdapter.supportsProgramStatus
+      && process.env.BOTMUX_PROGRAM_STATUS_RELAY !== '0'
+    ) {
+      // tmux answers the CLI's DA1 sentinel itself, before the worker can see
+      // the OSC 7501 probe via pipe-pane, so Claude Code would disable program
+      // status. An in-pane relay answers the probe ahead of the DA1 query
+      // (src/program-status-relay.ts). The pane pid becomes the relay; the
+      // real CLI pid is resolved below (startWrapperRealPidResolve).
+      // Outermost, i.e. OUTSIDE the session scope: the relay's launch shim is a
+      // shell script with `$VAR` references, and systemd-run (258+) expands
+      // environment references in its payload by default. `systemd-run
+      // --scope` execs in place, so the relay's direct child is still exactly
+      // the process the pane pid used to be.
+      const relayed = programStatusRelayLaunch(spawnBin, spawnArgs);
+      if (relayed) {
+        spawnBin = relayed.bin;
+        spawnArgs = relayed.args;
+        programStatusRelayPlanCleanup = relayed.cleanup;
+        programStatusRelayLaunched = true;
+        log('[program-status] launching CLI behind in-pane OSC 7501 relay');
+      } else {
+        log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
       }
     }
     backend.spawn(spawnBin, spawnArgs, {
