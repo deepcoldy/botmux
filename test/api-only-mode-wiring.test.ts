@@ -883,7 +883,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // non-empty 4th argument, and it must be the tri-state helper rather than a
     // bare `sender_type` comparison — that one reads a cross-ref-identified peer
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
-    const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
+    const trustedCallerArgs = [...daemonSource.matchAll(/const\s+\w+\s*=\s*trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
     // Three IM entry paths plus the authenticated dispatch launch caller.
     expect(trustedCallerArgs.length).toBe(4);
@@ -905,6 +905,12 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(dispatchArgs.slice(0, 3).join(', ')).toContain('operation.callerUnionId');
     expect(dispatchArgs[3]).toBe('true');
     expect(daemonSource).toContain('trustedCaller: dispatchTrustedCaller');
+    // Inline queue admission uses a previously computed tri-state value. A
+    // regex spanning to its rollback call is not another direct IM entry.
+    const queue = region(daemonSource, 'async function submitQueuedMessage(', '// Dependencies passed to command-handler');
+    expect(queue).toContain('const senderIsBot = senderIsBotTriState(message.senderType,');
+    expect(queue).toContain('isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId)');
+    expect(queue).toContain('trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot)');
     // The source testimony must never be reused as evaluateBotTalk's bot union.
     expect(daemonSource).toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId)');
     expect(daemonSource).not.toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId, callerUnionId)');
