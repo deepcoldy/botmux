@@ -53,8 +53,11 @@ import {
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
+import {
+  deliverValidatedTrustedResultDelivery,
+} from './plugins/mcp/trusted-result-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, uploadFileBuffer, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
@@ -16816,6 +16819,79 @@ function setupWorkerHandlers(
               + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
+        }
+        break;
+      }
+
+      case 'plugin_result_delivery': {
+        const deliveryUuid = (kind: string) => `prd_${createHash('sha256')
+          .update(`${msg.pluginId}\0${msg.deliveryId}\0${kind}`, 'utf8')
+          .digest('hex')
+          .slice(0, 46)}`;
+        const reply = (value: Extract<DaemonToWorker, { type: 'plugin_result_delivery_result' }>) => {
+          if (worker.connected) worker.send(value);
+        };
+        const reject = (error: string) => reply({
+          type: 'plugin_result_delivery_result',
+          requestId: msg.requestId,
+          ok: false,
+          error,
+        });
+        if (!ownsWorkerSession() || msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Rejected plugin result delivery from stale worker`);
+          reject('stale_worker');
+          break;
+        }
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          reject('delivery_suppressed_for_turn');
+          break;
+        }
+        const expectedCaller = currentGatewayCallerOpenId(ds, msg.turnId);
+        if (!expectedCaller || msg.callerOpenId !== expectedCaller) {
+          logger.warn(`[${t}] Rejected plugin result delivery with mismatched turn caller`);
+          reject('trusted_caller_mismatch');
+          break;
+        }
+        const frozen = frozenReplyContextForTurn(ds, msg.turnId);
+        try {
+          const messageIds = await deliverValidatedTrustedResultDelivery(msg, {
+            async sendMarkdown(markdown) {
+              const card = buildCanonicalFinalReplyCard({
+                markdown,
+                recipientOpenId: expectedCaller,
+                brand: resolveBrandLabel(ds.larkAppId),
+                locale: localeForBot(ds.larkAppId),
+                workingDir: cb.getSessionWorkingDir(ds),
+              });
+              return scopedReply(card, 'interactive', msg.turnId, {
+                uuid: deliveryUuid('summary'),
+                replyTarget: frozen.target,
+              });
+            },
+            async sendFile(file, index) {
+              const fileKey = await uploadFileBuffer(
+                ds.larkAppId,
+                file.name,
+                file.data,
+              );
+              return scopedReply(JSON.stringify({ file_key: fileKey }), 'file', msg.turnId, {
+                uuid: deliveryUuid(`file:${index}`),
+                replyTarget: frozen.target,
+              });
+            },
+          });
+          reply({
+            type: 'plugin_result_delivery_result',
+            requestId: msg.requestId,
+            ok: true,
+            messageIds,
+          });
+        } catch (error) {
+          logger.error(
+            `[${t}] Plugin result delivery failed plugin=${msg.pluginId}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          reject(error instanceof Error ? error.message : String(error));
         }
         break;
       }

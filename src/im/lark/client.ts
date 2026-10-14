@@ -1753,6 +1753,28 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
   });
 }
 
+/** Upload an in-memory file that has already crossed a trusted IPC boundary.
+ * This avoids reopening a same-UID filesystem path after validation. */
+export async function uploadFileBuffer(
+  larkAppId: string,
+  fileName: string,
+  data: Buffer,
+): Promise<string> {
+  assertLarkTransport(larkAppId, 'uploadFileBuffer');
+  return executeWithLarkGate(larkAppId, 'uploadFileBuffer', async () => {
+    const c = getBotUploadClient(larkAppId);
+    const safeName = basename(fileName) || 'attachment';
+    const fileType = EXT_TO_FILE_TYPE[extname(safeName).toLowerCase()] ?? 'stream';
+    const res = await c.im.v1.file.create({
+      data: { file_type: fileType as any, file_name: safeName, file: data },
+    });
+    const fileKey = res?.file_key;
+    if (!fileKey) throw new Error(`Failed to upload in-memory file: no file_key in response (${JSON.stringify(res)})`);
+    logger.info(`Uploaded in-memory file ${safeName} → ${fileKey}`);
+    return fileKey;
+  });
+}
+
 /**
  * Resolve emails to Lark open_ids via batch user lookup.
  * Accepts mixed input: items starting with "ou_" are kept as-is; everything else

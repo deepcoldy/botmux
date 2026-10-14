@@ -19,7 +19,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   6. On 'close', kills CLI and exits
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
@@ -185,6 +185,12 @@ import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from './core/plugins/mcp/environment.js';
+import type { GatewayTrustedResultDeliveryHandler } from './core/plugins/mcp/gateway.js';
+import {
+  sendTrustedDeliveryIpcWithBackpressure,
+  trustedResultDeliveryIpcFiles,
+  trustedResultTerminalObservation,
+} from './core/plugins/mcp/trusted-result-delivery.js';
 import {
   readSessionMcpRuntimeManifest,
   sessionMcpRuntimeHostOnlyPaths,
@@ -1665,6 +1671,75 @@ let readIsolationOriginCapabilityFile: string | null = null;
 let readIsolationOriginChannelId: string | null = null;
 let sandboxTeardownDone = false;                     // guards the exit-time best-effort teardown from double-running / running on suspend-for-resume
 let sessionMcpGatewayHost: SessionMcpGatewayHost | null = null;
+const pendingPluginResultDeliveries = new Map<string, {
+  resolve: (value: { messageIds: string[] }) => void;
+  reject: (error: Error) => void;
+}>();
+
+const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = async (input) => {
+  const { identity, delivery } = input;
+  if (!identity.turnId || !identity.caller?.requestUserUnionId) {
+    throw new Error('plugin_result_delivery_missing_identity');
+  }
+  const requestId = randomUUID();
+  let resolveResponse!: (value: { messageIds: string[] }) => void;
+  let rejectResponse!: (error: Error) => void;
+  const responsePromise = new Promise<{ messageIds: string[] }>((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  pendingPluginResultDeliveries.set(requestId, {
+    resolve: resolveResponse,
+    reject: rejectResponse,
+  });
+  const payload: WorkerToDaemon = {
+    type: 'plugin_result_delivery',
+    requestId,
+    sessionId,
+    pluginId: input.pluginId,
+    turnId: identity.turnId!,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+    ...(identity.caller?.requestUserOpenId ? { callerOpenId: identity.caller.requestUserOpenId } : {}),
+    callerUnionId: identity.caller!.requestUserUnionId!,
+    deliveryId: delivery.deliveryId,
+    ...(delivery.markdown !== undefined ? { markdown: delivery.markdown } : {}),
+    ...(delivery.files ? { files: trustedResultDeliveryIpcFiles(delivery) } : {}),
+    responseKind: delivery.responseKind ?? 'final',
+  };
+  try {
+    await sendTrustedDeliveryIpcWithBackpressure({
+      get connected() { return process.connected; },
+      send(message, callback) {
+        if (!process.send) throw new Error('plugin_result_delivery_ipc_unavailable');
+        return process.send(message, callback);
+      },
+    }, payload);
+  } catch (error) {
+    pendingPluginResultDeliveries.delete(requestId);
+    rejectResponse(error instanceof Error ? error : new Error(String(error)));
+    // Observe the rejected promise before rethrowing the enqueue failure.
+    await responsePromise.catch(() => undefined);
+    throw error;
+  }
+  const response = await responsePromise.finally(() => {
+    pendingPluginResultDeliveries.delete(requestId);
+  });
+  if ((delivery.responseKind ?? 'final') === 'final') {
+    const terminal = trustedResultTerminalObservation(delivery, response.messageIds);
+    send({
+      type: 'explicit_reply_observed',
+      turnId: identity.turnId,
+      messageId: terminal.messageId,
+      responseKind: 'final',
+      terminalCarrier: terminal.terminalCarrier,
+    });
+  }
+  return {
+    delivered: true as const,
+    deliveryId: delivery.deliveryId,
+    fileCount: delivery.files?.length ?? 0,
+  };
+};
 /** Counts consecutive in-worker restart cycles (see case 'restart'). Used by
  *  the SECONDARY guard so an adapter whose checkResumeTargetExists misses
  *  (returns undefined) or whose resume target vanishes between the check and
@@ -1850,6 +1925,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     sessionId,
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
+    trustedResultDelivery: deliverPluginResultThroughHost,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
@@ -23691,6 +23767,14 @@ process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'plugin_result_delivery_result': {
+      const pending = pendingPluginResultDeliveries.get(msg.requestId);
+      if (!pending) break;
+      pendingPluginResultDeliveries.delete(msg.requestId);
+      if (msg.ok) pending.resolve({ messageIds: msg.messageIds ?? [] });
+      else pending.reject(new Error(msg.error ?? 'plugin_result_delivery_failed'));
+      break;
+    }
     case 'init': {
       const initStartedAtMs = Date.now();
       const ordinaryImTurnId = !msg.adoptMode
