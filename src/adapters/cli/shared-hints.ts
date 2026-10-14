@@ -251,6 +251,7 @@ export function buildManagedLarkToolPromptBlocks(
   policy: TriggerUserAuthConfig | undefined,
   larkToolAppId: string | undefined,
   locale?: Locale,
+  noTransport = false,
 ): string {
   const effectivePolicy = larkToolAppId && policy
     ? { ...policy, tools: policy.tools.filter(tool => tool !== 'lark-cli') }
@@ -262,7 +263,7 @@ export function buildManagedLarkToolPromptBlocks(
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',
-      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale))}`,
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, noTransport))}`,
       '</botmux_lark_tool>',
     ].join('\n')
     : '';
@@ -423,7 +424,7 @@ export function buildBotmuxSystemPromptText(opts: {
   // determined user or a prompt injection. It exists because the likeliest way
   // these files get read is an agent troubleshooting an auth failure and
   // grepping the data directory, which a clear instruction does prevent.
-  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale);
+  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale, noTransport);
   return [
     '<botmux_routing>',
     ...routingInner,

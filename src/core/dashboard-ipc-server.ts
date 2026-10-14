@@ -378,7 +378,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { refreshSessionIdentity } from './cli-identity.js';
-import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
+import { larkToolBindingPath, readLarkToolBinding, larkToolIdentityEnabled } from './lark-tool-binding.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { getLarkToolDelegation } from './lark-tool-delegation.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
@@ -2535,7 +2535,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   try { body = await readBoundedJsonBody(req, 4096, 1000); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
   const ds = findActiveBySessionId(params.sessionId);
-  if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
+  if (!ds || ds.session.status !== 'active' || sessionLarkToolIdentityDisabled(ds)
     || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
@@ -2557,13 +2557,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
       return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
     }
     if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
-      || sessionTransportDisabled(ds) || ds.larkAppId !== bot.larkAppId
+      || sessionLarkToolIdentityDisabled(ds) || ds.larkAppId !== bot.larkAppId
       || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
     }
     return jsonRes(res, 200, {
       ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
     });
+  }
+  // Headless runners have no current human channel. They may use their own
+  // bot's tools, but cannot inherit a user grant from a stale turn or owner.
+  if (sessionTransportDisabled(ds)) {
+    return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
   }
   const origin = ds.managedTurnOrigin;
   const originSender = origin?.callerOpenId;
@@ -2585,7 +2590,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
   }
   const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), sender);
-  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
+  if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
+    || sessionTransportDisabled(ds) || ds.larkAppId !== bot.larkAppId
+    || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
+    || ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
     || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
@@ -3178,6 +3186,13 @@ function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): b
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
   return !larkTransportEnabled({ chatId: s.chatId ?? '', apiOnly });
+}
+
+function sessionLarkToolIdentityDisabled(s: { chatId?: string; larkAppId?: string; session: { headless?: { id: string; source: string } } }): boolean {
+  if (!s.larkAppId) return true;
+  try {
+    return !larkToolIdentityEnabled({ chatId: s.chatId ?? '', apiOnly: getBot(s.larkAppId).config.apiOnly, headless: s.session.headless });
+  } catch { return true; }
 }
 
 /** Mutating IPC routes may only touch this daemon's own bot-partitioned store. */
