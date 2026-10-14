@@ -44,7 +44,7 @@ import {
   statSync,
   type Dirent,
 } from 'node:fs';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import {
   splitCodexEventsByCutoff,
   extractLastCodexTurn,
@@ -103,7 +103,7 @@ const TRAEX_ROLLOUT_LOOKUP_MISS_CACHE_MAX = 256;
 const TRAEX_YEAR_DIR_RE = /^\d{4}$/;
 const TRAEX_MONTH_DIR_RE = /^(?:0[1-9]|1[0-2])$/;
 const TRAEX_DAY_DIR_RE = /^(?:0[1-9]|[12]\d|3[01])$/;
-const TRAEX_ROLLOUT_SESSION_RE = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i;
+const TRAEX_ROLLOUT_SESSION_RE = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i;
 
 interface TraexRolloutLookupMiss {
   nextFilesystemScanAtMs: number;
@@ -123,7 +123,7 @@ const traexRolloutLookupMisses = new Map<string, TraexRolloutLookupMiss>();
  * turn id, not a new resumable session id. The generic Codex parser selects
  * the final UUID and therefore cannot be used for TRAE segmented rollouts. */
 export function traexSessionIdFromRolloutPath(path: string): string | undefined {
-  return TRAEX_ROLLOUT_SESSION_RE.exec(path)?.[1];
+  return TRAEX_ROLLOUT_SESSION_RE.exec(basename(path))?.[1];
 }
 
 type DatabaseSyncLike = {

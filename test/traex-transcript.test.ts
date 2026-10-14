@@ -248,6 +248,10 @@ describe('findTraexRolloutBySessionId', () => {
       `rollout-2026-06-04T12-00-00-${SID}_${resumeTurnId}.jsonl`,
     )).toBe(SID);
     expect(traexSessionIdFromRolloutPath('rollout-not-a-session.jsonl')).toBeUndefined();
+    expect(traexSessionIdFromRolloutPath(`notes-${SID}.jsonl`)).toBeUndefined();
+    expect(traexSessionIdFromRolloutPath(
+      `/tmp/.trae/cli/sessions/2026/06/04/rollout-blobs/tool-results/blob-${SID}.jsonl`,
+    )).toBeUndefined();
   });
 
   it('does not resolve rollout-shaped files inside TRAE sidecar directories', () => {
@@ -290,6 +294,32 @@ describe('findTraexRolloutBySessionId', () => {
 
     try {
       expect(findTraexRolloutBySessionId(SID)).toBe(rollout);
+    } finally {
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
+  it('rejects a threads index path owned by another session and falls back to this session', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home');
+    const dayDir = join(traeHome, 'cli', 'sessions', '2026', '06', '04');
+    const foreignSid = 'ffffffff-ffff-7fff-8fff-ffffffffffff';
+    const ownRollout = join(dayDir, `rollout-2026-06-04T11-00-00-${SID}.jsonl`);
+    const foreignRollout = join(dayDir, `rollout-2026-06-04T12-00-00-${foreignSid}.jsonl`);
+    const dbPath = join(traeHome, 'cli', 'state_5.sqlite');
+    mkdirSync(dayDir, { recursive: true });
+    writeFileSync(ownRollout, line(user('own rollout')));
+    writeFileSync(foreignRollout, line(user('foreign rollout')));
+    const db = openDatabaseSyncNow(dbPath);
+    expect(db).not.toBeNull();
+    db!.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)');
+    db!.prepare('INSERT INTO threads (id, rollout_path) VALUES (?, ?)').run(SID, foreignRollout);
+    db!.close();
+    process.env.TRAE_HOME = traeHome;
+
+    try {
+      expect(findTraexRolloutBySessionId(SID)).toBe(ownRollout);
     } finally {
       if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
       else process.env.TRAE_HOME = previousTraeHome;
@@ -436,6 +466,51 @@ describe('findTraexRolloutBySessionId', () => {
 });
 
 describe('drainTraexRollout', () => {
+  it('tags events from a resumed segment with the stable session id', () => {
+    const turnId = '00000000-0000-7000-8000-000000000099';
+    path = join(dir, `rollout-2000-01-01T00-00-00-${SID}_${turnId}.jsonl`);
+    writeFileSync(path, [
+      line(user('segmented input', '2000-01-01T00:00:01.000Z', turnId)),
+      line({
+        ...taskComplete('segmented final'),
+        payload: { ...taskComplete('segmented final').payload, turn_id: turnId },
+      }),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events).toEqual([
+      expect.objectContaining({ kind: 'user', sourceSessionId: SID, sourceTurnId: turnId }),
+      expect.objectContaining({
+        kind: 'assistant_final', text: 'segmented final', sourceSessionId: SID, sourceTurnId: turnId,
+      }),
+    ]);
+  });
+
+  it('does not recover completion text from another thread inside a resumed segment', () => {
+    const turnId = '00000000-0000-7000-8000-000000000099';
+    const foreignSid = 'ffffffff-ffff-7fff-8fff-ffffffffffff';
+    path = join(dir, `rollout-2000-01-01T00-00-00-${SID}_${turnId}.jsonl`);
+    const foreignCompletion = historyDisplayCompletion({
+      type: 'AgentMessage',
+      id: 'foreign-agent',
+      content: [{ type: 'Text', text: 'must not escape from the foreign thread' }],
+    }, turnId, '2000-01-01T00:00:02.000Z');
+    foreignCompletion.payload.display_completions[0].thread_id = foreignSid;
+    writeFileSync(path, [
+      line(user('segmented input', '2000-01-01T00:00:01.000Z', turnId)),
+      line(foreignCompletion),
+      line({
+        ...taskComplete(),
+        payload: { ...taskComplete().payload, turn_id: turnId },
+      }),
+    ].join(''));
+
+    const events = drainTraexRollout(path, 0).events;
+    expect(events.some(event => event.text.includes('must not escape'))).toBe(false);
+    expect(events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final', text: '', sourceSessionId: SID, sourceTurnId: turnId,
+    }));
+  });
+
   it.each([
     'model output limit exceeded: max_output_tokens',
     'stream disconnected before completion: invalid completed function call arguments: EOF while parsing a string',
