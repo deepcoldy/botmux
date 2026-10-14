@@ -7896,6 +7896,14 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
         model: codex.latestModel,
         reasoningEffort: codex.latestReasoningEffort,
       });
+      // The cursor jumps to EOF below, so sub-agents started on the live side
+      // of the cutoff must be registered from this drain or never at all.
+      // Pre-cutoff ones are history, same as the absorbed parent events.
+      codexSubagentLimitTracker.observe(
+        codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
+        Date.now(),
+      );
+      maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
     }
     // Reuse this drain's runtime observation instead of a second full-file
     // scan — split-live already read the whole rollout above.
@@ -8702,7 +8710,7 @@ function codexBridgeIngest(opts: {
       reasoningEffort: codex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
     });
     maybeEmitCodexStructuredRateLimit(result.events);
-    codexSubagentLimitTracker.observe(codex.spawnedSubagentThreadIds, Date.now());
+    codexSubagentLimitTracker.observe(codex.spawnedSubagents, Date.now());
     maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
@@ -8830,7 +8838,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
   for (const ev of events) {
     if (!isCodexRateLimitEvent(ev) || emittedRateLimitUuids.has(ev.uuid)) continue;
     emittedRateLimitUuids.add(ev.uuid);
-    const usageLimit = structuredCodexLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
+    const usageLimit = structuredCodexLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests', ev.terminalLimitKind);
     usageLimitTracker.noteStructuredLimit(usageLimit);
     send({
       type: 'screen_update',

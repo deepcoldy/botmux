@@ -187,6 +187,11 @@ export interface CodexBridgeEvent {
   /** Safe, bounded user-facing detail extracted from a structured failure.
    *  Raw provider payloads stay in the rollout/Web terminal. */
   terminalErrorSummary?: string;
+  /** Codex `codex_rate_limited` terminals only: whether the provider reported
+   *  account quota exhaustion (`usage`) or a transient rate limit (`rate`).
+   *  Taken from the raw structured error before summary redaction, so an
+   *  empty or redacted summary cannot flip a quota failure back to `rate`. */
+  terminalLimitKind?: 'usage' | 'rate';
   sourceSessionId?: string;
   /** Native provider turn id when the transcript format exposes one. Bridges
    *  can use it to bind cosmetic/terminal events to the exact started turn
@@ -533,10 +538,22 @@ export function codexTaskFailureCode(error: unknown): string {
  *  so TRAE / pi keep their taxonomy (TraeX continuation would otherwise start
  *  retrying an exhausted quota as a transient rate limit). */
 export function codexRolloutFailureCode(error: unknown): string {
+  if (isCodexUsageLimitError(error)) return CODEX_RATE_LIMIT_ERROR_CODE;
+  return codexTaskFailureCode(error);
+}
+
+function isCodexUsageLimitError(error: unknown): boolean {
   let serialized = '';
   try { serialized = JSON.stringify(error); } catch { serialized = String(error ?? ''); }
-  if (/usage[_ -]?limit/i.test(serialized)) return CODEX_RATE_LIMIT_ERROR_CODE;
-  return codexTaskFailureCode(error);
+  return /usage[_ -]?limit/i.test(serialized ?? '');
+}
+
+/** Structured limit kind of a Codex rollout failure, or undefined when the
+ *  failure is not a limit at all. Decided on the raw error (including
+ *  `codex_error_info`), never on the redacted display summary. */
+export function codexRolloutLimitKind(error: unknown): 'usage' | 'rate' | undefined {
+  if (isCodexUsageLimitError(error)) return 'usage';
+  return codexTaskFailureCode(error) === CODEX_RATE_LIMIT_ERROR_CODE ? 'rate' : undefined;
 }
 
 /** Exact opt-in classifier used only by the TraeX task-continuation
@@ -561,6 +578,14 @@ export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
 /** Codex thread ids are UUID-shaped; anything else must never reach a
  *  filesystem lookup built from it. */
 const CODEX_THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A collaboration sub-agent whose `SubAgentActivity` `started` record was
+ *  read from the parent rollout. `startedAtMs` is the record timestamp, so a
+ *  split-live attach can apply the same history/live cutoff as parent events. */
+export interface CodexSpawnedSubagent {
+  threadId: string;
+  startedAtMs: number;
+}
 
 /** `event_msg/item_completed` → `SubAgentActivity` `started` carries the
  *  spawned collaboration sub-agent's own thread id. */
@@ -613,11 +638,37 @@ export function findCodexSubagentRollout(
   return undefined;
 }
 
+/** Incremental read position in a sub-agent rollout. `ordinal` counts the
+ *  complete records already consumed; `ownFromOrdinal` is where the
+ *  sub-agent's own records start (learned from its first `session_meta`). */
+export interface CodexSubagentCursor {
+  offset: number;
+  ordinal: number;
+  ownFromOrdinal?: number;
+}
+
+export const INITIAL_CODEX_SUBAGENT_CURSOR: CodexSubagentCursor = Object.freeze({ offset: 0, ordinal: 0 });
+
 export interface CodexSubagentLimitDrain {
   /** Rate/usage-limit terminals (`isCodexRateLimitEvent` shape) found in the
-   *  newly appended complete lines. Every other record is ignored. */
+   *  sub-agent's OWN newly appended complete lines. Every other record —
+   *  including history inherited from the parent on fork — is ignored. */
   events: CodexBridgeEvent[];
-  newOffset: number;
+  cursor: CodexSubagentCursor;
+}
+
+/** First record of a sub-agent rollout → ordinal of its first own record.
+ *  A fork copies parent history (task_complete failures included, restamped
+ *  with the fork time) in front of the sub-agent's own records, and Codex
+ *  records the boundary as `subagent_history_start_ordinal`. A fork without
+ *  that boundary cannot be split safely, so none of it is trusted. */
+function codexSubagentOwnFromOrdinal(obj: any): number {
+  if (obj?.type !== 'session_meta') return 0;
+  const meta = obj.payload ?? {};
+  const boundary = meta.subagent_history_start_ordinal;
+  if (Number.isInteger(boundary) && boundary >= 0) return boundary;
+  const forked = typeof meta.forked_from_id === 'string' && meta.forked_from_id !== '';
+  return forked ? Number.POSITIVE_INFINITY : 0;
 }
 
 /** Incrementally read a sub-agent rollout for limit terminals only. A
@@ -626,25 +677,40 @@ export interface CodexSubagentLimitDrain {
  *  parent drain nor the (active-work suppressed) screen scan sees the limit.
  *  Codex quota is per account, so a sub-agent's usage limit means the parent
  *  is out too. */
-export function drainCodexSubagentLimits(path: string, fromOffset: number): CodexSubagentLimitDrain {
+export function drainCodexSubagentLimits(
+  path: string,
+  from: CodexSubagentCursor = INITIAL_CODEX_SUBAGENT_CURSOR,
+): CodexSubagentLimitDrain {
   let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset }; }
-  const start = size < fromOffset ? 0 : fromOffset;
-  if (size === start) return { events: [], newOffset: start };
+  try { size = statSync(path).size; } catch { return { events: [], cursor: from }; }
+  // Truncation/rotation: the ordinal is only meaningful from the file start.
+  const base: CodexSubagentCursor = size < from.offset ? INITIAL_CODEX_SUBAGENT_CURSOR : from;
+  const start = base.offset;
+  if (size === start) return { events: [], cursor: base };
   const len = size - start;
   const buf = Buffer.alloc(len);
   let fd: number;
-  try { fd = openSync(path, 'r'); } catch { return { events: [], newOffset: fromOffset }; }
+  try { fd = openSync(path, 'r'); } catch { return { events: [], cursor: from }; }
   try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
   const text = buf.toString('utf8');
   const lastNl = text.lastIndexOf('\n');
-  if (lastNl < 0) return { events: [], newOffset: start };
+  if (lastNl < 0) return { events: [], cursor: base };
   const complete = text.slice(0, lastNl + 1);
   const events: CodexBridgeEvent[] = [];
+  let ordinal = base.ordinal;
+  let ownFromOrdinal = base.ownFromOrdinal;
   let cursor = start;
   for (const line of complete.split('\n')) {
     const lineStart = cursor;
     cursor += Buffer.byteLength(line, 'utf8') + 1;
+    if (line === '') continue;
+    const recordOrdinal = ordinal++;
+    if (recordOrdinal === 0) {
+      let meta: any;
+      try { meta = JSON.parse(line); } catch { /* not a session_meta */ }
+      ownFromOrdinal = codexSubagentOwnFromOrdinal(meta);
+    }
+    if (recordOrdinal < (ownFromOrdinal ?? 0)) continue;
     // Cheap prefilter: only failed task_complete records matter here.
     if (!line.includes('"task_complete"') || !line.includes('"error"')) continue;
     let obj: any;
@@ -652,7 +718,8 @@ export function drainCodexSubagentLimits(path: string, fromOffset: number): Code
     const p = obj?.payload;
     if (obj?.type !== 'event_msg' || p?.type !== 'task_complete') continue;
     if (p.error === null || p.error === undefined) continue;
-    if (codexRolloutFailureCode(p.error) !== CODEX_RATE_LIMIT_ERROR_CODE) continue;
+    const limitKind = codexRolloutLimitKind(p.error);
+    if (!limitKind) continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     events.push({
       uuid: `${path}:${lineStart}`,
@@ -662,10 +729,18 @@ export function drainCodexSubagentLimits(path: string, fromOffset: number): Code
       terminalStatus: 'failed',
       terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE,
       terminalErrorSummary: safeFailureSummary(p.error),
+      terminalLimitKind: limitKind,
       ...(typeof p.turn_id === 'string' ? { sourceTurnId: p.turn_id } : {}),
     });
   }
-  return { events, newOffset: start + Buffer.byteLength(complete, 'utf8') };
+  return {
+    events,
+    cursor: {
+      offset: start + Buffer.byteLength(complete, 'utf8'),
+      ordinal,
+      ...(ownFromOrdinal !== undefined ? { ownFromOrdinal } : {}),
+    },
+  };
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -734,11 +809,11 @@ export interface CodexDrainResult {
   /** Newest executor reasoning effort observed in this byte range (from
    *  `turn_context`), latest-wins. Undefined when none appeared. */
   latestReasoningEffort?: string;
-  /** Native collaboration sub-agent thread ids whose `SubAgentActivity`
-   *  `started` record appeared in this byte range. Sub-agents write their own
-   *  rollout (`rollout-<ts>-<thread id>.jsonl`), so their terminal failures
-   *  never reach this drain; the worker tails those files separately. */
-  spawnedSubagentThreadIds?: string[];
+  /** Native collaboration sub-agents whose `SubAgentActivity` `started`
+   *  record appeared in this byte range. Sub-agents write their own rollout
+   *  (`rollout-<ts>-<thread id>.jsonl`), so their terminal failures never
+   *  reach this drain; the worker tails those files separately. */
+  spawnedSubagents?: CodexSpawnedSubagent[];
   /** Stateless-reader continuation carried by the worker between live ticks.
    *  `nextOffset` binds the turn lower bound to the exact cursor it follows,
    *  so truncation or an unrelated seek cannot reuse stale state. */
@@ -1384,7 +1459,7 @@ export function drainCodexRollout(
   const { completeText, pendingTail, newOffset } = step.window;
 
   const events: CodexBridgeEvent[] = [];
-  const spawnedSubagentThreadIds: string[] = [];
+  const spawnedSubagents: CodexSpawnedSubagent[] = [];
   let latestThreadSettings: CodexThreadSettings | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
@@ -1429,7 +1504,7 @@ export function drainCodexRollout(
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     const subagentThreadId = spawnedSubagentThreadId(obj);
-    if (subagentThreadId) spawnedSubagentThreadIds.push(subagentThreadId);
+    if (subagentThreadId) spawnedSubagents.push({ threadId: subagentThreadId, startedAtMs: timestampMs });
     // Codex can persist task_started well before the matching response_item
     // user record (AGENTS/environment scaffolding may be written in between).
     // Surface this authoritative lifecycle edge so the queue does not expire
@@ -1523,6 +1598,7 @@ export function drainCodexRollout(
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
+      const failureLimitKind = failed ? codexRolloutLimitKind(p.error) : undefined;
       const terminalTurnStart = turnFullyCovered
         ? (turnStartOffset ?? start)
         : resolveTurnStartOffset();
@@ -1541,6 +1617,7 @@ export function drainCodexRollout(
           terminalStatus: 'failed' as const,
           terminalErrorCode: codexRolloutFailureCode(p.error),
           terminalErrorSummary: safeFailureSummary(p.error),
+          ...(failureLimitKind ? { terminalLimitKind: failureLimitKind } : {}),
         } : {}),
         sourceTurnId: p.turn_id,
       });
@@ -1593,7 +1670,7 @@ export function drainCodexRollout(
     latestThreadSettings,
     latestModel,
     latestReasoningEffort,
-    ...(spawnedSubagentThreadIds.length > 0 ? { spawnedSubagentThreadIds } : {}),
+    ...(spawnedSubagents.length > 0 ? { spawnedSubagents } : {}),
     ...(turnStartOffset !== undefined ? {
       state: { nextOffset: newOffset, turnStartOffset },
     } : {}),

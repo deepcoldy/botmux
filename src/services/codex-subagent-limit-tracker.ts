@@ -11,14 +11,20 @@
  * parent's next model call fails the same way — so the sub-agent terminal is a
  * reliable signal for the whole session.
  *
- * Only sub-agents whose `started` record is ingested live are tracked; the
- * parent baseline (history before the worker attached) is never replayed, so a
- * stale limit from an earlier quota window cannot trigger a handoff.
+ * Only sub-agents whose `started` record is live are tracked: the parent
+ * baseline (history before the worker attached) is never replayed, and an
+ * adopt split-live attach registers only sub-agents started after its cutoff.
+ * Within a tracked sub-agent rollout, history inherited from the parent on
+ * fork is skipped (see drainCodexSubagentLimits), so a stale limit from an
+ * earlier quota window cannot trigger a handoff either way.
  */
 import {
   drainCodexSubagentLimits,
   findCodexSubagentRollout,
+  INITIAL_CODEX_SUBAGENT_CURSOR,
   type CodexBridgeEvent,
+  type CodexSpawnedSubagent,
+  type CodexSubagentCursor,
 } from './codex-transcript.js';
 
 /** Bound on concurrently tracked sub-agents; the oldest are dropped first. */
@@ -30,9 +36,13 @@ export const CODEX_SUBAGENT_LOOKUP_WINDOW_MS = 2 * 60 * 1000;
 export const CODEX_SUBAGENT_LOOKUP_INTERVAL_MS = 2_000;
 
 interface TrackedSubagent {
+  /** `started` record time: selects the local-date directories to list. */
   startedAtMs: number;
+  /** When the worker registered it: bounds the lookup window, so a sub-agent
+   *  found late by an adopt attach still gets its full window. */
+  observedAtMs: number;
   path?: string;
-  offset: number;
+  cursor: CodexSubagentCursor;
   nextLookupAtMs: number;
 }
 
@@ -56,11 +66,16 @@ export class CodexSubagentLimitTracker {
 
   get size(): number { return this.tracked.size; }
 
-  observe(threadIds: readonly string[] | undefined, startedAtMs: number): void {
-    if (!threadIds) return;
-    for (const id of threadIds) {
-      if (this.tracked.has(id)) continue;
-      this.tracked.set(id, { startedAtMs, offset: 0, nextLookupAtMs: 0 });
+  observe(subagents: readonly CodexSpawnedSubagent[] | undefined, observedAtMs: number): void {
+    if (!subagents) return;
+    for (const { threadId, startedAtMs } of subagents) {
+      if (this.tracked.has(threadId)) continue;
+      this.tracked.set(threadId, {
+        startedAtMs,
+        observedAtMs,
+        cursor: INITIAL_CODEX_SUBAGENT_CURSOR,
+        nextLookupAtMs: 0,
+      });
     }
     while (this.tracked.size > MAX_TRACKED_CODEX_SUBAGENTS) {
       const oldest = this.tracked.keys().next().value;
@@ -74,7 +89,7 @@ export class CodexSubagentLimitTracker {
     const out: CodexBridgeEvent[] = [];
     for (const [id, sub] of this.tracked) {
       if (!sub.path) {
-        if (nowMs - sub.startedAtMs > CODEX_SUBAGENT_LOOKUP_WINDOW_MS) {
+        if (nowMs - sub.observedAtMs > CODEX_SUBAGENT_LOOKUP_WINDOW_MS) {
           this.tracked.delete(id);
           continue;
         }
@@ -83,8 +98,8 @@ export class CodexSubagentLimitTracker {
         sub.path = this.findRollout(id, sub.startedAtMs);
         if (!sub.path) continue;
       }
-      const result = this.drain(sub.path, sub.offset);
-      sub.offset = result.newOffset;
+      const result = this.drain(sub.path, sub.cursor);
+      sub.cursor = result.cursor;
       out.push(...result.events);
     }
     return out;
