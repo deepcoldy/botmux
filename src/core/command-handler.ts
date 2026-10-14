@@ -111,7 +111,7 @@ import {
 } from '../services/role-profile-store.js';
 import type { LarkMessage, CodexAppTurnInput, FrozenSessionReplyTarget, ScheduleExecutionPosition, SessionCliLaunchSnapshotV1, CliTurnPayload } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, markRepoCardConsumed } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId, principalLaneRoutingAnchorId, markRepoCardConsumed } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
@@ -1786,6 +1786,12 @@ function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, 
   }
 }
 
+/** principal lane 的影子车道行：可见锚点与源会话相同，但路由身份是虚拟车道锚点。
+ *  /resume 走普通锚点恢复，既不会水合车道授权也不会设 runtimeRoutingAnchor，不能用于这类行。 */
+function isPrincipalLaneShadowRow(s: import('../types.js').Session): boolean {
+  return principalLaneRoutingAnchorId(s) !== storedSessionAnchorId(s);
+}
+
 /** `/resume` 不带参数时的目标：本锚点（话题根 / 群）下最近关闭、**真有过对话**的会话。
  *  命令预建的空壳（`/help` 之类）关闭后也是 closed 行；`cliId` / `cliLaunchSnapshot` 不能当证据——
  *  codex 实例池建行时就盖 `cliId`，`/cli` 选择也会写 snapshot。只认对话历史（与 `/cli` 的
@@ -1794,6 +1800,7 @@ function latestClosedSessionAt(anchor: string): import('../types.js').Session | 
   return sessionStore.listSessions()
     .filter(s => s.status === 'closed'
       && storedSessionAnchorId(s) === anchor
+      && !isPrincipalLaneShadowRow(s)
       && !!(s.cliSessionId || s.lastCliInput || s.lastUserPrompt))
     .sort((a, b) => Date.parse(b.closedAt ?? b.createdAt) - Date.parse(a.closedAt ?? a.createdAt))[0];
 }
@@ -4343,6 +4350,10 @@ export async function handleCommand(
             : latestClosedSessionAt(rootId);
           if (!session) {
             await sessionReply(rootId, t(target ? 'cmd.adopt.resume_not_found' : 'cmd.resume.none', undefined, loc));
+            return;
+          }
+          if (isPrincipalLaneShadowRow(session)) {
+            await sessionReply(rootId, t('cmd.resume.lane_unsupported', undefined, loc));
             return;
           }
           // 路由把命令空壳当作「无会话」认领了 /resume；恢复/复制前先清掉占位，

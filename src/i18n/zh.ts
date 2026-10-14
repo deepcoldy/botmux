@@ -586,6 +586,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用。',
   'cmd.adopt.managed_other_topic': '⚠️ 该 ID 是另一个话题的 Botmux 会话，不能用 /adopt 搬到当前话题。请到原话题点击「恢复会话」，或在本机运行 `botmux resume {id}`。',
   'cmd.resume.none': '⚠️ 这里没有可恢复的已关闭会话。',
+  'cmd.resume.lane_unsupported': 'ℹ️ 该会话是并行车道的分身，不能用 /resume 恢复。请在原会话上继续。',
   'cmd.resume.primary_unsupported': 'ℹ️ 当前部署启用了持久协调（primary），暂不支持用 /resume 恢复。请点击原会话关闭卡上的「恢复会话」按钮。',
   'cmd.resume.forked': '✅ 已把会话「{title}」复制到这里继续（继承完整上下文），原会话保持关闭，仍可在原处恢复。',
   'cmd.resume.fork_unsupported': 'ℹ️ 该 {cli} 会话不支持跨话题/群恢复（需要 CLI 原生 fork，同 /fork 的限制）。请到原话题/群点击「恢复会话」，或在本机运行 `botmux resume {id}`。',

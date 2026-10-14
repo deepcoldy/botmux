@@ -18463,6 +18463,21 @@ type NewDaemonSessionClaim =
  * closed because choosing either generation would risk dropping accepted
  * work.
  */
+/**
+ * Session-group registry: every freshly created session that WINS the ordinary
+ * chat key of a session group becomes its resident (/dismiss and AI titling act
+ * on it). Centralised here so no creation path (ordinary birth, command
+ * pre-create, cold-start passthrough, …) can forget it, and a registration loser
+ * is never recorded. Thread-scope subtopics (`/t`) and principal-lane shadows
+ * (virtual routing keys) are not residents.
+ */
+function recordSessionGroupResident(ds: DaemonSession, key: string): void {
+  if (ds.scope !== 'chat' || ds.chatType !== 'group') return;
+  if (key !== sessionKey(ds.chatId, ds.larkAppId)) return;
+  if (!isSessionGroup(ds.chatId)) return;
+  touchSessionGroup(ds.chatId, ds.session.sessionId);
+}
+
 async function claimNewDaemonSession(
   map: Map<string, DaemonSession>,
   incoming: DaemonSession,
@@ -18472,6 +18487,7 @@ async function claimNewDaemonSession(
     const incumbent = map.get(key);
     if (!incumbent || incumbent === incoming) {
       map.set(key, incoming);
+      recordSessionGroupResident(incoming, key);
       return { accepted: true as const, key, owner: incoming };
     }
 
@@ -23465,14 +23481,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
-  // Session-group registry: point the group at its new resident so /dismiss and
-  // the async AI title can find it — only once this row WON the slot. A loser
-  // (e.g. the old session resumed concurrently) is closed and rerouted below.
-  // Chat scope only: a `/t` topic header flips this birth to a thread-scope
-  // subtopic, which must not displace the group's chat-scope resident.
-  if (registration.accepted && scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) {
-    touchSessionGroup(chatId, session.sessionId);
-  }
   if (!registration.accepted) {
     if (registration.reason === 'existing_owner'
       && activeSessions.get(registration.key) === registration.owner) {
@@ -23990,13 +23998,6 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
         ...cmdPending,
       };
       const registration = await claimNewDaemonSession(activeSessions, cmdDs);
-      // Session-group registry: once this pre-created chat-scope session wins the
-      // slot it is the group's resident (e.g. `/help` after `/close`), same as the
-      // ordinary creation path. A loser (e.g. an old session resumed concurrently)
-      // must not be recorded — the incumbent already is.
-      if (registration.accepted && scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) {
-        touchSessionGroup(chatId, cmdDs.session.sessionId);
-      }
       if (!registration.accepted) {
         if (registration.reason !== 'existing_owner') return true;
       } else if (cmdDs.pendingRepo) {
@@ -27283,11 +27284,6 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           ...cmdPending,
         };
         const registration = await claimNewDaemonSession(activeSessions, cmdDs);
-        // Session-group registry: see the new-topic pre-create path — record the
-        // winner only.
-        if (registration.accepted && scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) {
-          touchSessionGroup(chatId, cmdDs.session.sessionId);
-        }
         if (!registration.accepted) {
           if (registration.reason !== 'existing_owner') return true;
         } else if (cmdDs.pendingRepo) {

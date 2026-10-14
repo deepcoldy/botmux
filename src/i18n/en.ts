@@ -589,6 +589,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use.',
   'cmd.adopt.managed_other_topic': '⚠️ That ID belongs to a Botmux session in another topic and cannot be moved here with /adopt. Resume it from the original topic, or run `botmux resume {id}` locally.',
   'cmd.resume.none': '⚠️ There is no closed session to resume here.',
+  'cmd.resume.lane_unsupported': 'ℹ️ That session is a parallel-lane shadow and cannot be resumed with /resume. Continue in the original session.',
   'cmd.resume.primary_unsupported': 'ℹ️ This deployment runs durable coordination (primary); /resume is not supported yet. Click "Resume session" on the original session\'s close card instead.',
   'cmd.resume.forked': '✅ Copied session "{title}" here with its full context. The original stays closed and can still be resumed where it was.',
   'cmd.resume.fork_unsupported': 'ℹ️ This {cli} session cannot be resumed in another topic/chat (needs a native CLI fork, same limit as /fork). Resume it from its original topic/chat, or run `botmux resume {id}` locally.',

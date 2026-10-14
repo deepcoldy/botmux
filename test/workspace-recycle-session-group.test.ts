@@ -250,3 +250,51 @@ it('a /t subtopic born in a session group does not displace the chat-scope resid
   }, { chatId: CHAT, messageId: 'om_t_sub', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
   expect(getSessionGroup(CHAT)?.lastSessionId).toBe('sess-chat-resident');
 });
+
+it('a cold-start passthrough (/goal) session born in a session group becomes the resident', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-goal'); mkdirSync(workspace, { recursive: true });
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'claude-code', allowedUsers: ['ou_fixture'], workingDir: workspace } as any);
+  bot.resolvedAllowedUsers = ['ou_fixture'];
+  store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
+  const old = store.createSession(CHAT, 'om_old_goal', 'old', 'group', 'chat');
+  Object.assign(old, { larkAppId: APP, workingDir: workspace, cliId: 'claude-code', cliSessionId: 'cli-old-goal' });
+  store.updateSession(old); store.closeSession(old.sessionId);
+  registerSessionGroup(CHAT, { ownerOpenId: 'ou_fixture', lastSessionId: old.sessionId, createdAt: 1, lastActiveAt: 1 });
+  await handleNewTopic({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_goal', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/goal 修好登录页' }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_goal', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  const resident = getSessionGroup(CHAT)?.lastSessionId;
+  expect(resident).not.toBe(old.sessionId);
+  expect(store.getOwnedSession(resident!)?.status).toBe('active');
+});
+
+it('/resume skips a closed principal-lane shadow at the same visible anchor and refuses one named explicitly', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-lane'); mkdirSync(workspace, { recursive: true });
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'claude-code', allowedUsers: ['ou_fixture'], workingDir: workspace } as any);
+  bot.resolvedAllowedUsers = ['ou_fixture'];
+  store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
+  const source = store.createSession(CHAT, 'om_lane_src', 'source', 'group', 'chat');
+  Object.assign(source, { larkAppId: APP, workingDir: workspace, cliId: 'claude-code', cliSessionId: 'cli-lane-src' });
+  store.updateSession(source); store.closeSession(source.sessionId);
+  await new Promise(r => setTimeout(r, 5));
+  const shadow = store.createSession(CHAT, 'om_lane_shadow', 'shadow', 'group', 'chat');
+  Object.assign(shadow, { larkAppId: APP, workingDir: workspace, cliId: 'claude-code', cliSessionId: 'cli-lane-shadow',
+    principalLane: { routingAnchor: 'lane:virtual-anchor' } as any });
+  store.updateSession(shadow); store.closeSession(shadow.sessionId);
+
+  mocks.reply.mockClear(); mocks.send.mockClear();
+  await handleNewTopic({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_lane_shadow_resume', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: `/resume ${shadow.sessionId}` }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_lane_shadow_resume', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  await vi.waitFor(() => expect([...mocks.reply.mock.calls, ...mocks.send.mock.calls].flat().join(' ')).toMatch(/并行车道|parallel-lane/));
+  expect(store.getOwnedSession(shadow.sessionId)?.status).toBe('closed');
+
+  await handleNewTopic({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_lane_resume', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/resume' }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_lane_resume', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  await vi.waitFor(() => expect(store.getOwnedSession(source.sessionId)?.status).toBe('active'));
+  expect(store.getOwnedSession(shadow.sessionId)?.status).toBe('closed');
+});
