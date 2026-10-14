@@ -48,7 +48,10 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
   it.skipIf(!canIsolateNetwork)('resolves the injected bot token for a real API command before the isolated network rejects it', () => {
     const env = larkToolChildEnv({ ...process.env, HOME: join(root, 'home') }, binding,
       { mode: 'bot', credential: 'fake-not-a-live-token' });
-    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/', '--',
+    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/',
+      // The verified headless sandbox exposes this isolated config read-only.
+      // Injected bot credentials must work without writing a global keystore.
+      '--ro-bind', binding.configDir, binding.configDir, '--',
       binding.realBinary, 'api', 'GET', '/open-apis/im/v1/messages/fake-message', '--as', 'bot'], {
       env, encoding: 'utf8', timeout: 10_000,
     });
