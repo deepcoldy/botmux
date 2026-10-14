@@ -15,6 +15,7 @@ const outboundRunner = resolve('test/fixtures/remote-runner-outbound.mjs');
 const sessionToolRunner = resolve('test/fixtures/remote-runner-session-tool.mjs');
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
+const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -331,6 +332,46 @@ describe('RemoteRunnerBackend', () => {
     spawnBackend(backend);
     await ready;
     expect(backend.getBackendState()).toEqual(initialState);
+  });
+
+  it('reattaches a provider-owned turn without submitting its prompt again', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'recovered-test',
+      generation: 7,
+      remoteSessionId: 'tae-session-existing',
+      agentThreadId: 'thread-existing',
+    };
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'recovered-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'turn_recovery',
+      ],
+    }, 'session-recovered', initialState);
+    children.push(backend);
+    const recovered = once<{ turnId: string; dispatchAttempt?: number }>(cb => {
+      backend.onTurnRecovered?.(turn => cb(turn));
+    });
+    const progress: string[] = [];
+    backend.onData(data => progress.push(data));
+    const final = once<{ text: string; turnId?: string }>(cb => {
+      backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
+    });
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, recoveredTurnRunner);
+
+    await ready;
+    await expect(recovered).resolves.toMatchObject({
+      turnId: 'turn-survived',
+      dispatchAttempt: 4,
+    });
+    expect(progress.join('')).toContain('recovered progress');
+    await expect(backend.submitTurn({ turnId: 'turn-new', content: 'must not run' }))
+      .resolves.toMatchObject({ submitted: false });
+    await expect(final).resolves.toEqual({
+      text: 'recovered final',
+      turnId: 'turn-survived',
+    });
   });
 
   it('requires an explicit closed-session rebuild to advance the remote generation', async () => {

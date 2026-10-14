@@ -41,11 +41,17 @@ export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
   'session_tool',
 ] as const;
 
+/** Optional recovery of a provider-owned turn that survived the host process. */
+export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
+  'turn_recovery',
+] as const;
+
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
   ...REMOTE_RUNNER_OUTBOUND_CAPABILITIES,
   ...REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES,
+  ...REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -108,6 +114,14 @@ export interface RemoteRunnerTrustedCaller {
   source?: 'schedule_creator';
   taskId?: string;
   senderType?: 'user' | 'bot';
+}
+
+export interface RemoteRunnerRecoveredTurn {
+  turnId: string;
+  generation: number;
+  dispatchAttempt?: number;
+  startedAtMs?: number;
+  trustedCaller?: RemoteRunnerTrustedCaller;
 }
 
 export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
@@ -227,6 +241,7 @@ export type RemoteRunnerCommand =
       type: 'turn';
       turnId: string;
       content: string;
+      dispatchAttempt?: number;
       trustedCaller?: RemoteRunnerTrustedCaller;
     })
   | (RemoteRunnerCommandBase & { type: 'cancel' })
@@ -276,6 +291,7 @@ export type RemoteRunnerEvent =
       type: 'ready';
       requestId: string;
       state: RemoteRunnerBackendState;
+      recoveredTurn?: RemoteRunnerRecoveredTurn;
     })
   | (RemoteRunnerEventBase & {
       type: 'progress';
@@ -442,6 +458,44 @@ function stateField(raw: Record<string, unknown>): RemoteRunnerBackendState | un
 
 function nonNegativeInteger(value: unknown): number | undefined {
   return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : undefined;
+}
+
+function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | undefined {
+  const raw = record(value);
+  if (!raw) return undefined;
+  const turnId = nonEmptyString(raw.turnId, 256);
+  const generation = nonNegativeInteger(raw.generation);
+  const dispatchAttempt = raw.dispatchAttempt === undefined
+    ? undefined
+    : nonNegativeInteger(raw.dispatchAttempt);
+  const startedAtMs = raw.startedAtMs === undefined
+    ? undefined
+    : nonNegativeInteger(raw.startedAtMs);
+  if (!turnId || !ID_RE.test(turnId) || generation === undefined
+      || (raw.dispatchAttempt !== undefined && dispatchAttempt === undefined)
+      || (raw.startedAtMs !== undefined && startedAtMs === undefined)) return undefined;
+
+  let trustedCaller: RemoteRunnerTrustedCaller | undefined;
+  if (raw.trustedCaller !== undefined) {
+    const caller = record(raw.trustedCaller);
+    const openId = nonEmptyString(caller?.requestUserOpenId, 256);
+    const appId = nonEmptyString(caller?.requestLarkAppId, 256);
+    if (!caller || !openId || !appId || !['user', 'bot'].includes(String(caller.senderType))) {
+      return undefined;
+    }
+    trustedCaller = {
+      requestUserOpenId: openId,
+      requestLarkAppId: appId,
+      senderType: caller.senderType as 'user' | 'bot',
+    };
+  }
+  return {
+    turnId,
+    generation,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(startedAtMs !== undefined ? { startedAtMs } : {}),
+    ...(trustedCaller ? { trustedCaller } : {}),
+  };
 }
 
 function normalizeTokenPair(value: unknown): { in: number; out: number } | undefined {
@@ -701,9 +755,13 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     if (!state) return undefined;
     if (raw.type === 'ready') {
       const id = requestId(raw);
-      if (!id) return undefined;
+      const recoveredTurn = raw.recoveredTurn === undefined
+        ? undefined
+        : normalizeRecoveredTurn(raw.recoveredTurn);
+      if (!id || (raw.recoveredTurn !== undefined && !recoveredTurn)) return undefined;
       return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
-        type: 'ready', requestId: id, state };
+        type: 'ready', requestId: id, state,
+        ...(recoveredTurn ? { recoveredTurn } : {}) };
     }
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'lineage_changed', state };

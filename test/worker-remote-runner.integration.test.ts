@@ -59,6 +59,135 @@ async function readTerminalSeed(
 }
 
 describe('remote runner worker wiring', () => {
+  it('reattaches an active provider turn and emits its original terminal without replaying input', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-takeover-'));
+    tempDirs.push(root);
+    const commandsPath = join(root, 'commands.jsonl');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(command) + '\\n');
+  if (command.type === 'hello') {
+    emit({
+      type: 'hello', requestId: command.requestId, provider: 'takeover-provider',
+      capabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_recovery'],
+    });
+  } else if (command.type === 'resume') {
+    const state = command.state;
+    const ready = {
+      protocol, version, type: 'ready', requestId: command.requestId, state,
+      recoveredTurn: {
+        turnId: 'om_turn_survived', generation: state.generation, startedAtMs: 1000,
+        trustedCaller: {
+          requestUserOpenId: 'ou_remote_user', requestLarkAppId: 'app_remote_takeover', senderType: 'user',
+        },
+      },
+    };
+    const progress = { protocol, version, type: 'progress', turnId: 'om_turn_survived', content: 'still running' };
+    process.stdout.write(JSON.stringify(ready) + '\\n' + JSON.stringify(progress) + '\\n');
+    setTimeout(() => emit({ type: 'final', turnId: 'om_turn_survived', content: 'TAKEOVER_OK', state }), 50);
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_remote_takeover',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: {
+        expectedProvider: 'takeover-provider',
+        requiredCapabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_recovery'],
+      },
+    }]));
+    const persistedState = {
+      version: 1 as const,
+      provider: 'takeover-provider',
+      generation: 7,
+      remoteSessionId: 'compute-7',
+      agentThreadId: 'thread-stable',
+    };
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-remote-takeover',
+        LARK_APP_ID: 'app_remote_takeover',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-remote-takeover',
+      chatId: 'oc_remote_takeover',
+      rootMessageId: 'om_remote_takeover',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: {
+        expectedProvider: 'takeover-provider',
+        requiredCapabilities: ['start','resume','turn','cancel','detach','reattach','status','turn_recovery'],
+      },
+      remoteBackendState: persistedState,
+      prompt: '',
+      larkAppId: 'app_remote_takeover',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_turn_survived'
+        && message.status === 'completed'),
+      () => `remote runner takeover did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    const commands = readFileSync(commandsPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    expect(commands.some(command => command.type === 'turn')).toBe(false);
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'capture_identity',
+        turnId: 'om_turn_survived',
+      }),
+      expect.objectContaining({
+        type: 'final_output',
+        turnId: 'om_turn_survived',
+        content: 'TAKEOVER_OK',
+      }),
+      expect.objectContaining({
+        type: 'turn_terminal',
+        turnId: 'om_turn_survived',
+        status: 'completed',
+      }),
+    ]));
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
   it('passes persisted provider state to resume after a worker restart', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-resume-'));
     tempDirs.push(root);

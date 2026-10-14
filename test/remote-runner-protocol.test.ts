@@ -118,6 +118,42 @@ describe('remote runner protocol', () => {
     });
   });
 
+  it('validates a generation-fenced recovered turn on ready', () => {
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-1',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        dispatchAttempt: 3,
+        startedAtMs: 1234,
+        trustedCaller: {
+          requestUserOpenId: 'ou_actor',
+          requestLarkAppId: 'cli_app',
+          senderType: 'user',
+        },
+      },
+    }))).toMatchObject({
+      type: 'ready',
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        dispatchAttempt: 3,
+      },
+    });
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-bad',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: { turnId: 'turn-survived', generation: -1 },
+    }))).toBeUndefined();
+  });
+
   it('validates generation-fenced terminal screen snapshots', () => {
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
