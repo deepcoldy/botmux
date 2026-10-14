@@ -1025,7 +1025,9 @@ describe('cmdSend hook context wiring', () => {
     expect(primarySend).toBeGreaterThanOrEqual(0);
     // The delivery record is written AFTER the message is actually sent.
     expect(deliveryIndex).toBeGreaterThan(primarySend);
-    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', deliveryIndex), deliveryIndex)).toContain('getSkillFeedbackStore');
+    const storeWrite = cmdSend.indexOf('getSkillFeedbackStore(resolveDataDir())', primarySend);
+    expect(storeWrite).toBeGreaterThan(primarySend);
+    expect(deliveryIndex).toBeGreaterThan(storeWrite);
     // Turn-completion recording is gated on the response KIND, not on the
     // feedback policy — feedback off must still produce a correlatable record.
     expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
@@ -1040,6 +1042,30 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('...(carriesFeedbackControl ? { policy: feedbackPolicy } : {})');
     expect(cmdSend).toContain('...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {})');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
+  });
+
+  it('falls back to daemon indexing only when an isolated CLI cannot open the shared feedback store', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const block = cmdSend.slice(completionIndex, cmdSend.indexOf('turn delivery indexing failed after delivery', completionIndex));
+    const localWrite = block.indexOf('getSkillFeedbackStore(resolveDataDir())');
+    const fallback = block.indexOf('if (indexError !== undefined) {');
+    // The local write is always tried first; wherever the store is writable
+    // nothing changes and no IPC is made.
+    expect(localWrite).toBeGreaterThan(0);
+    expect(fallback).toBeGreaterThan(localWrite);
+    const relay = block.slice(fallback);
+    // Isolation is decided the same way postSessionCliIpc decides it.
+    expect(relay).toContain('let isolated = !!process.env.BOTMUX_SEND_RELAY;');
+    expect(relay).toContain('try { loadDaemonIpcSecret(); } catch { isolated = true; }');
+    expect(relay).toContain('const deliveryIpcPort = isolated');
+    // Only the delivered message id + text cross: every correlation field is
+    // the daemon's to derive from the live session.
+    expect(relay).toContain("postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text })");
+    expect(relay).toContain('if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId)');
+    expect(relay).not.toContain('getSkillFeedbackStore');
   });
 
   it('returns after a concurrent final replay before any post-primary side effects', () => {

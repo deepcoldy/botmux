@@ -5665,7 +5665,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -12385,6 +12385,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
+      let indexError: unknown;
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
@@ -12417,8 +12418,39 @@ async function cmdSend(rest: string[]): Promise<void> {
           context: { ...(resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) } : {}) },
         });
       } catch (error) {
+        indexError = error;
+      }
+      if (indexError !== undefined) {
+        // An isolated CLI (bwrap relay / macOS read isolation) cannot open the
+        // shared feedback store — it holds every bot's rows — so hand the row
+        // to the daemon, which derives it from the live session. Same test as
+        // postSessionCliIpc: a relay env or no readable host secret.
+        let isolated = !!process.env.BOTMUX_SEND_RELAY;
+        if (!isolated) {
+          try { loadDaemonIpcSecret(); } catch { isolated = true; }
+        }
+        const deliveryIpcPort = isolated
+          ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+          : undefined;
+        // The daemon binds the row to the capability's turn and the session's
+        // own chat; an unbound turn or a cross-chat publish has nothing there
+        // to correlate against.
+        if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId) {
+          try {
+            const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text });
+            if (!res.ok) {
+              const detail = await res.json().catch(() => undefined) as { error?: string } | undefined;
+              throw new Error(detail?.error ?? `HTTP ${res.status}`);
+            }
+            indexError = undefined;
+          } catch (error) {
+            indexError = error;
+          }
+        }
+      }
+      if (indexError !== undefined) {
         console.error(
-          `botmux send: turn delivery indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
+          `botmux send: turn delivery indexing failed after delivery: ${indexError instanceof Error ? indexError.message : String(indexError)}`,
         );
       }
     }

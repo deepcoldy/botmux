@@ -139,7 +139,8 @@ import type {
 } from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
-import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
+import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
+import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
@@ -1022,7 +1023,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|durable-send|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1691,6 +1692,40 @@ ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, param
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
+  }
+});
+
+/** Delivery row for a final answer an isolated CLI already sent: the CLI
+ * cannot open the shared feedback store, so the daemon records it with
+ * correlation fields taken from the live session (see relayed-turn-delivery). */
+ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req, RELAYED_TURN_DELIVERY_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  try {
+    const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
+    let webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
+    try { webhookDestinations = ds ? getBot(ds.larkAppId).config.feedbackWebhooks?.destinations : undefined; } catch { /* bot gone */ }
+    const result = recordRelayedTurnDelivery({
+      ds,
+      body,
+      store: await getSkillFeedbackStore(config.session.dataDir),
+      webhookDestinations,
+      teamId: ds ? resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) : undefined,
+    });
+    return result.ok
+      ? jsonRes(res, 200, result)
+      : jsonRes(res, result.status, { ok: false, error: result.error });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
 });
 
