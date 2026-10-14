@@ -23468,7 +23468,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Session-group registry: point the group at its new resident so /dismiss and
   // the async AI title can find it — only once this row WON the slot. A loser
   // (e.g. the old session resumed concurrently) is closed and rerouted below.
-  if (registration.accepted && chatType === 'group' && isSessionGroup(chatId)) {
+  // Chat scope only: a `/t` topic header flips this birth to a thread-scope
+  // subtopic, which must not displace the group's chat-scope resident.
+  if (registration.accepted && scope === 'chat' && chatType === 'group' && isSessionGroup(chatId)) {
     touchSessionGroup(chatId, session.sessionId);
   }
   if (!registration.accepted) {

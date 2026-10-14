@@ -74,6 +74,12 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotBrand: vi.fn(() => 'feishu'),
 }));
 
+const sessionGroups = vi.hoisted(() => ({ groups: new Set<string>(), touch: vi.fn() }));
+vi.mock('../src/services/session-groups-store.js', () => ({
+  isSessionGroup: (chatId: string) => sessionGroups.groups.has(chatId),
+  touchSessionGroup: (...args: unknown[]) => sessionGroups.touch(...args),
+}));
+
 vi.mock('../src/core/dashboard-events.js', () => ({
   dashboardEventBus: { publish: vi.fn() },
 }));
@@ -817,6 +823,29 @@ describe('forkClosedSession（/resume <别处的 id>：从已关闭记录复制�
     for (const cliId of ['codex', 'traex'] as const) {
       expect(await callClosedFork(closedRow({ cliId }))).toEqual({ ok: false, error: 'fork_unsupported_backend' });
     }
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('会话群顶层（chat-scope）复制成功后把子会话登记为常驻；子话题与非会话群不登记', async () => {
+    const row = closedRow();
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(row);
+    sessionGroups.groups = new Set(['oc_group']);
+    sessionGroups.touch.mockClear();
+    setActiveSessionsRegistry(new Map());
+    const chat = await forkClosedSession(row.sessionId, 'oc_group', 'oc_group', 'group', 'chat', { forkWorkerImpl: forkWorkerSpy as any });
+    expect(chat.ok).toBe(true);
+    expect(sessionGroups.touch).toHaveBeenCalledWith('oc_group', (chat as { childSessionId: string }).childSessionId);
+    sessionGroups.touch.mockClear();
+    setActiveSessionsRegistry(new Map());
+    expect((await forkClosedSession(row.sessionId, 'oc_group', 'om_sub_root', 'group', 'thread', { forkWorkerImpl: forkWorkerSpy as any })).ok).toBe(true);
+    setActiveSessionsRegistry(new Map());
+    expect((await forkClosedSession(row.sessionId, 'oc_plain', 'oc_plain', 'group', 'chat', { forkWorkerImpl: forkWorkerSpy as any })).ok).toBe(true);
+    expect(sessionGroups.touch).not.toHaveBeenCalled();
+    sessionGroups.groups = new Set();
+  });
+
+  it('关闭行缺少 larkAppId：拒绝而不是回退到其它 bot 的身份', async () => {
+    expect(await callClosedFork(closedRow({ larkAppId: undefined }))).toEqual({ ok: false, error: 'not_found' });
     expect(forkWorkerSpy).not.toHaveBeenCalled();
   });
 

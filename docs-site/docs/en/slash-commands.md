@@ -17,7 +17,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/stop` | Interrupt the current turn while keeping the session; same as the streaming card's Stop button |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command). A later message starts a new session |
-| `/resume [session id]` | When this topic/chat has **no session**, resume a closed one: no argument resumes the latest one closed here; an id from elsewhere is copied here like `/fork` (full context, original untouched; fork-capable CLIs only; closed Codex / TraeX sessions must be resumed where they were). **With a session**, it goes to the CLI's own `/resume` unchanged |
+| `/resume [session id]` | When this topic/chat has **no session**, resume a closed one: no argument resumes the latest one closed here; an id from elsewhere is copied here like `/fork` (full context, original untouched; fork-capable CLIs only; closed Codex / TraeX sessions must be resumed where they were). **With a session**, it goes to the CLI's own `/resume` unchanged. Anyone who can talk to the bot may use it; cross-location copies are keyed by the session id (visible only in the original chat, not guessable), the same trust level as `/fork` |
 | `/dismiss` | Top level of a dedicated session group only: after confirmation, closes the session and disbands the whole group (the creator with operator permission only; code and worktrees are kept; not supported in DMs, ordinary groups, subtopics, or adopted sessions). To keep the chat, use `/close` |
 | `/cleanup-wt <ID>` | Retry a persisted worktree cleanup after a final removal failure; revalidates authorization, active sessions, worktree identity, and safety state before deleting |
 | `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family, Codex terminal, or TraeX terminal mode) |
@@ -94,7 +94,7 @@ Controls how the bot opens a session when @mentioned. No argument (or `status`) 
 | `/reply-mode` `/reply-mode status` | Show the current DM session mode |
 | `/reply-mode chat` | Each 1:1 DM is one flat continuous session — all messages in that DM share one session (**default**) |
 | `/reply-mode topic` `/reply-mode new-topic` | Each **top-level** DM opens its own session/thread; replies inside an existing thread continue that thread's session |
-| `/reply-mode group` | Each **top-level** DM births a dedicated user+bot session group hosting the conversation (AI-generated name; returning to the group resumes the session — see `p2pMode=group`) |
+| `/reply-mode group` | Each **top-level** DM births a dedicated user+bot session group hosting the conversation (AI-generated name; after the session closes a new message starts a fresh one — use the close card's "Resume session" or `/resume` to continue; see `p2pMode=group`) |
 
 `shared` / `chat-topic` rely on native group topics and are rejected in DMs.
 

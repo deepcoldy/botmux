@@ -44,7 +44,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -122,14 +122,13 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
-import { dashboardEventBus } from './dashboard-events.js';
 import { rehomeReplyTargetState } from './reply-target.js';
 import { isSharedAdoptSession } from './shared-adopt.js';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
-import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { isSessionGroup } from '../services/session-groups-store.js';
 import { tagClosedSessionGroup } from '../services/feed-group-tagger.js';
 import { dismissSessionGroup } from './dismiss-command.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
@@ -4354,6 +4353,8 @@ export async function handleCommand(
           }
           if (storedSessionAnchorId(session) !== rootId) {
             // 别处的会话：像 /fork 一样复制到这里（继承完整上下文），原会话不动、仍可在原处恢复。
+            // 信任模型（有意）：/resume 是对话级命令，不校验源会话业主——凭会话 id 复制，
+            // id 只在原聊天里可见、不可猜，与开放模式下的 /fork 同一信任级。子会话归发起人。
             if (session.status !== 'closed') {
               await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
               return;
@@ -4361,7 +4362,6 @@ export async function handleCommand(
             const resumeChatId = message.chatId ?? session.chatId;
             const senderIsBot = message.senderType === 'app' || message.senderType === 'bot'
               || (!!larkAppId && isKnownPeerBot(config.session.dataDir, larkAppId, message.senderId));
-            const { forkClosedSession } = await import('./worker-pool.js');
             const forked = await forkClosedSession(
               session.sessionId,
               resumeChatId,
@@ -4378,8 +4378,7 @@ export async function handleCommand(
               },
             );
             if (forked.ok) {
-              if (rootId === resumeChatId) touchSessionGroup(resumeChatId, forked.childSessionId);
-              await sessionReply(rootId, t('cmd.resume.forked', { title: session.title || session.sessionId.substring(0, 8) }, loc));
+                await sessionReply(rootId, t('cmd.resume.forked', { title: session.title || session.sessionId.substring(0, 8) }, loc));
             } else if (forked.error === 'fork_unsupported_backend') {
               const cliName = getCliDisplayName((session.cliId ?? getBot(session.larkAppId ?? larkAppId!).config.cliId ?? 'claude-code') as CliId);
               await sessionReply(rootId, t('cmd.resume.fork_unsupported', { cli: cliName, id: session.sessionId }, loc));
@@ -4397,14 +4396,6 @@ export async function handleCommand(
             return;
           }
           const result = await resumeSession(session.sessionId, activeSessions);
-          if (result.ok) {
-            // Same as the HTTP resume endpoint: flip connected dashboards back to active
-            // (`null`, not undefined, so the SSE patch actually clears closedAt).
-            dashboardEventBus.publish({
-              type: 'session.update',
-              body: { sessionId: session.sessionId, patch: { status: 'active', closedAt: null } },
-            });
-          }
           await sessionReply(rootId, resumeResultMessage(result, loc));
         };
         if (larkAppId) await runDetachedBotTurnAdmission(larkAppId, runResume);

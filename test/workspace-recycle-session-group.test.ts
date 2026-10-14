@@ -237,3 +237,16 @@ it('an ordinary message whose fresh session loses registration to a concurrently
   expect(getSessionGroup(CHAT)?.lastSessionId).toBe(resident.sessionId);
   expect(active.get(activeSessionKey(residentDs))).toBe(residentDs);
 });
+
+it('a /t subtopic born in a session group does not displace the chat-scope resident', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-t'); mkdirSync(workspace, { recursive: true });
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'claude-code', allowedUsers: ['ou_fixture'], workingDir: workspace } as any);
+  bot.resolvedAllowedUsers = ['ou_fixture'];
+  store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
+  registerSessionGroup(CHAT, { ownerOpenId: 'ou_fixture', lastSessionId: 'sess-chat-resident', createdAt: 1, lastActiveAt: 1 });
+  await handleNewTopic({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_t_sub', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/t 开个子话题干活' }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_t_sub', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  expect(getSessionGroup(CHAT)?.lastSessionId).toBe('sess-chat-resident');
+});

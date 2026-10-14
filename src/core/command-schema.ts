@@ -42,6 +42,11 @@ export interface CommandSpec {
    * 自带同名命令）。同 `cliId` 命令一样不进全局集合：不遮蔽自定义透传、不进 canTalk 名单。
    */
   readonly claimWithoutSessionOnly?: boolean;
+  /**
+   * 权限门槛。缺省 = 需要 canOperate（可被 bot 的 canTalkDaemonCommands 逐条降到 canTalk）；
+   * `'talk'` = 有对话权限即可执行（`canRunDaemonCommand` 直接按 canTalk 判）。
+   */
+  readonly permission?: 'talk';
   readonly sessionPolicy: CommandSessionPolicy;
   /**
    * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器，从不建会话。
@@ -172,8 +177,9 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
   { name: '/effort', cliId: 'codex-app', sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
   {
-    name: '/resume', claimWithoutSessionOnly: true, sessionPolicy: 'sessionless', help: ['help.resume'],
-    notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume',
+    name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
+    notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'
+      + '有对话权限即可用；带别处 id 时凭会话 id 复制（信任模型同 /fork：id 只在原聊天可见、不可猜）',
   },
 ];
 

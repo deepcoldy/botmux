@@ -232,7 +232,7 @@ type SessionPhase =
 
 | 变化 | 今天 | 之后 | 理由 | PR |
 |---|---|---|---|---|
-| `/resume [id]` | 未注册，整条当未知命令转发给 CLI | 无会话（相位 `none`）时由 schema 的 `claimWithoutSessionOnly` 认领为 sessionless daemon 命令：恢复本锚点最近关闭的会话，或把别处的已关闭会话复制（cold fork）到这里；有会话时与今天逐字一致（自定义透传照常透传，否则未知命令转发）。不进全局 daemon 集合 | 会话群关闭后改为默认开新会话，需要一个不翻聊天记录的恢复入口；有会话时保留 CLI 原生 `/resume` | session-group 新会话 |
+| `/resume [id]` | 未注册，整条当未知命令转发给 CLI | 无会话（相位 `none`，或现有会话只是命令空壳 `sessionIsCommandScratch`；`closed` 臂是防御性的，两条入口关闭即删注册项、当前不可达）时由 schema 的 `claimWithoutSessionOnly` 认领为 sessionless daemon 命令（`permission: 'talk'`，有对话权限即可）：恢复本锚点最近关闭的会话，或把别处的已关闭会话复制（cold fork）到这里；有会话时与今天逐字一致（自定义透传照常透传，否则未知命令转发）。不进全局 daemon 集合 | 会话群关闭后改为默认开新会话，需要一个不翻聊天记录的恢复入口；有会话时保留 CLI 原生 `/resume` | session-group 新会话 |
 | Codex App 会话内 `/effort <档位>` | 无 raw 透传面，作为普通模型输入 | schema 按 `cliId: codex-app` 登记为只用于已有会话的 daemon 命令，通过原生设置接口更新；其它 CLI 仍透传 | 调整后续轮次推理强度；更新当前轮需显式启用实验特性 `step_model_switching`（默认关闭）；不创建模型轮次，CLI 专属命令不进入全局 daemon 集合 | #1817 |
 | 头部 `/repo wt <目标> [分支]` | 拒（`repo_worktree_unsupported`） | 可用 | 直接动因 | PR-1 |
 | `/repo wt` 用法串与帮助行不一致（zh/en） | 两条互相矛盾 | 由 schema 生成一条 | 自相矛盾的东西修好必然改掉一条 | PR-2 |

@@ -14,6 +14,7 @@ import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { commandSpec } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
@@ -2300,7 +2301,9 @@ export function canRunDaemonCommand(
   }
   const botConfig = getBot(larkAppId).config;
   const triggerUserLogin = cmd === '/login' && botConfig.triggerUserAuth?.enabled === true;
-  if (!triggerUserLogin && !botConfig.canTalkDaemonCommands?.includes(cmd)) return false;
+  // Commands the schema declares talk-level (e.g. /resume) need only canTalk.
+  const talkLevelCommand = commandSpec(cmd)?.permission === 'talk';
+  if (!triggerUserLogin && !talkLevelCommand && !botConfig.canTalkDaemonCommands?.includes(cmd)) return false;
   return botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
     : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);

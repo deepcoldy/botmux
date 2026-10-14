@@ -727,6 +727,7 @@ import {
   type DaemonSession,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -10775,6 +10776,9 @@ export async function forkClosedSession(
   if (!session) return { ok: false, error: 'not_found' };
   if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+  // Never fall back to another bot's identity (getAllBots()[0]): a child minted
+  // under the wrong larkAppId is a cross-bot misattribution. Unbound rows refuse.
+  if (!session.larkAppId) return { ok: false, error: 'not_found' };
   // A closed row has no runtime: synthesize the read-only source view the shared
   // fork path reads. It is never registered in activeSessions.
   const source = {
@@ -10782,7 +10786,7 @@ export async function forkClosedSession(
     worker: null,
     workerPort: null,
     workerToken: null,
-    larkAppId: session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '',
+    larkAppId: session.larkAppId,
     chatId: session.chatId,
     chatType: session.chatType,
     scope: session.scope === 'chat' ? 'chat' : 'thread',
@@ -11001,6 +11005,10 @@ async function forkFromSource(
       await closeSession(childSession.sessionId).catch(() => { /* best effort */ });
       return { ok: false, error: 'target_chat_has_session' };
     }
+    // A chat-scope child that won a session group's slot is now its resident
+    // (e.g. `/resume <id from elsewhere>` at the group's top level). No-op for
+    // thread-scope children and for chats that are not session groups.
+    if (targetScope === 'chat' && isSessionGroup(targetChatId)) touchSessionGroup(targetChatId, childSession.sessionId);
 
     dashboardEventBus.publish({
       type: 'session.update',
