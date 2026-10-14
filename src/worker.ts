@@ -25,7 +25,7 @@ import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrap
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
-import { installAidenCodexShim } from './services/aiden-codex-shim.js';
+import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -19033,6 +19033,15 @@ async function spawnCli(
           : undefined,
       });
       let aidenCodexShimDir: string | undefined;
+      // Session identity has NO channel other than the shim: when trigger-user
+      // auth / Lark tool binding injects the non-prefixed identity keys
+      // (SESSION_DATA_DIR / ZDOTDIR / BASH_ENV / GIT_ASKPASS,
+      // BOTMUX_LARK_TOOL_BINDING), aiden replaces Aiden's env but Codex does not
+      // forward its process env to the shells it spawns. Losing the shim would
+      // silently run tool shells as the machine owner, so fail the launch
+      // explicitly instead of degrading. Plain aiden-codex sessions (BOTMUX_*
+      // collaboration vars only) keep the old best-effort WARN behavior.
+      const aidenCodexIdentityShellEnv = cfg.triggerUserAuth?.enabled || boundLark;
       if (parseWrapperCli(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
         try {
           accessSync(cliAdapter.resolvedBin, fsConstants.X_OK);
@@ -19041,6 +19050,12 @@ async function spawnCli(
             join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
           );
         } catch (e) {
+          if (aidenCodexIdentityShellEnv) {
+            throw new Error(
+              'aiden x codex launch refused: session identity (trigger-user auth / Lark tool '
+              + `binding) requires the PATH shim, but it could not be installed: ${(e as Error).message}`,
+            );
+          }
           log(`[aiden-codex] WARN reasoning/shell-env shim unavailable; `
             + `Aiden default effort and machine-owner shell identity: ${(e as Error).message}`);
         }
@@ -19050,16 +19065,19 @@ async function spawnCli(
         childPath: effectiveChildEnv.PATH,
         aidenCodexRealBin: cliAdapter.resolvedBin,
         aidenCodexShimDir,
-        // Persist the shell_environment_policy overrides Aiden rejects from
-        // argv; the PATH shim reads them back when Aiden execs the real codex.
-        // trigger-user identity / lark tool binding depend on these reaching
-        // codex's tool shells — stripping silently would run tools under the
-        // machine owner's identity.
+        // Gate the fail-closed behavior on the SAME condition that adds the
+        // non-prefixed identity keys (see identityShellEnv above): only then is
+        // the shim the sole channel for a credential-boundary value.
+        requireAidenCodexShim: aidenCodexIdentityShellEnv,
+        // Persist the Codex config overrides Aiden rejects from argv
+        // (shell_environment_policy.*, service_tier, tui.auto_recap); the PATH
+        // shim reads them back when Aiden execs the real codex. trigger-user
+        // identity / lark tool binding depend on these reaching codex's tool
+        // shells — stripping silently would run tools under the machine owner's
+        // identity.
         writeAidenShellConfigs: (configs) => {
           if (!aidenCodexShimDir) throw new Error('aiden codex shim dir is unavailable');
-          const file = join(aidenCodexShimDir, 'shell-configs');
-          atomicWriteFileSync(file, `${configs.join('\n')}\n`, { mode: 0o600 });
-          return file;
+          return writeAidenCodexShellConfigs(aidenCodexShimDir, configs);
         },
         pathDelimiter: delimiter,
       });

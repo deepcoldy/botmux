@@ -66,3 +66,18 @@ export function installAidenCodexShim(binDir: string): string {
   ].join('\n'), { mode: 0o755 });
   return binDir;
 }
+
+/**
+ * Persist the transported Codex `-c key=value` overrides (one per line) for the
+ * PATH shim to read back. Lives next to the shim inside the session identity dir
+ * (0700); the file itself is 0600 because a co-tenant could otherwise read the
+ * session paths/IDs it carries. Kept as its own exported seam so the file mode
+ * is directly testable (the worker only derives the path).
+ */
+export function writeAidenCodexShellConfigs(shimDir: string, configs: readonly string[]): string {
+  const file = join(shimDir, 'shell-configs');
+  // A config value never contains a newline (JSON.stringify keeps it escaped),
+  // so one line per override round-trips exactly through the shim's `read -r`.
+  atomicWriteFileSync(file, `${configs.join('\n')}\n`, { mode: 0o600 });
+  return file;
+}

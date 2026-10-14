@@ -1,9 +1,9 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import { installAidenCodexShim, renderAidenCodexShim } from '../src/services/aiden-codex-shim.js';
+import { installAidenCodexShim, renderAidenCodexShim, writeAidenCodexShellConfigs } from '../src/services/aiden-codex-shim.js';
 
 const dirs: string[] = [];
 
@@ -176,5 +176,36 @@ describe('Aiden Codex shell-config file', () => {
     });
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/cannot open|No such file/);
+  });
+});
+
+describe('writeAidenCodexShellConfigs', () => {
+  // The config file carries session paths / identity-dir locations (no credentials,
+  // but still per-session data a co-tenant pane must not read). Its 0600 mode is a
+  // deliberate guard, so assert it against the real filesystem rather than trusting
+  // the call site.
+  it('writes one override per line with 0600 permissions', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-aiden-shellcfg-'));
+    dirs.push(dir);
+    const shimDir = installAidenCodexShim(join(dir, 'shim'));
+    const configs = [
+      'service_tier="priority"',
+      'shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x"',
+      'shell_environment_policy.set.ZDOTDIR="/data/x/shell"',
+    ];
+    const file = writeAidenCodexShellConfigs(shimDir, configs);
+
+    // umask must not widen it: assert the exact mode, not just "not world-writable".
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(readFileSync(file, 'utf8')).toBe(configs.join('\n') + '\n');
+  });
+
+  it('leaves the value bytes intact for a value with spaces/quotes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-aiden-shellcfg-bytes-'));
+    dirs.push(dir);
+    const shimDir = installAidenCodexShim(join(dir, 'shim'));
+    const value = 'shell_environment_policy.set.X="/a b $HOME `x` \\"q\\""';
+    const file = writeAidenCodexShellConfigs(shimDir, [value]);
+    expect(readFileSync(file, 'utf8')).toBe(value + '\n');
   });
 });

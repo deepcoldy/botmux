@@ -401,6 +401,42 @@ describe('rewriteAidenCodexArgs', () => {
     ]).forwardedArgs).toEqual(['-c', 'shell_environment_policy.set.SOMETHING_ELSE="1"']);
   });
 
+  it('extracts the service_tier / tui.auto_recap root overrides for the shim', () => {
+    // Both are botmux-injected root configs that Aiden rejects from argv but
+    // that must still reach the real codex (chosen tier / recap suppression).
+    // 'default' is included because sessionServiceTier only hides
+    // undefined/inherit — an explicit default is injected and forwarded too.
+    for (const value of [
+      'service_tier="default"',
+      'service_tier="priority"',
+      'service_tier="ultrafast"',
+      'tui.auto_recap=false',
+      'tui.auto_recap=true',
+    ]) {
+      expect(rewriteAidenCodexArgs(['-c', value, 'resume', 'cid']), value).toEqual({
+        reasoningEffort: undefined,
+        shellConfigs: [value],
+        forwardedArgs: ['resume', 'cid'],
+      });
+    }
+  });
+
+  it.each([
+    'service_tier="bogus"',      // not a botmux-emitted tier
+    'service_tier=priority',      // wrong shape (unquoted)
+    'tui.auto_recap=maybe',       // not true/false
+    'tui.auto_recap',             // bare key
+    'tuiXauto_recap=false',       // regex must not treat '.' as any-char
+    'my_service_tier="priority"',     // prefix must not match mid-string
+    'service_tier="priority" ',       // trailing junk must not match (anchored $)
+    'x=tui.auto_recap=false',          // suffix must not match mid-string
+  ])('leaves a user-owned near-miss %s on the forwarded argv', (value) => {
+    // The predicates are anchored and exact so a user's own -c is never hijacked
+    // into the shim file channel (where it would be silently relocated).
+    expect(rewriteAidenCodexArgs(['-c', value, 'resume']).forwardedArgs)
+      .toEqual(['-c', value, 'resume']);
+  });
+
   it('still drops update/nudge suppressions, hook-trust and settings on the aiden codex path', () => {
     expect(rewriteAidenCodexArgs([
       '--dangerously-bypass-hook-trust',
@@ -599,6 +635,51 @@ describe('buildWrappedLaunch', () => {
     expect(out.env).toBeUndefined();
   });
 
+  // Fail-closed (maintainer decision): when the launch carries session identity
+  // (trigger-user auth / Lark tool binding) the shim is the ONLY channel for the
+  // non-prefixed identity keys. Degrading here would silently run tool shells as
+  // the machine owner, so it must throw instead of stripping the overrides.
+  describe('requireAidenCodexShim (identity-bearing launches fail closed)', () => {
+    it('throws when the shim dir is unavailable', () => {
+      expect(() => buildWrappedLaunch(
+        'aiden x codex',
+        ['-c', 'shell_environment_policy.set.ZDOTDIR="/d/x"', 'resume', 'cid'],
+        (b) => b,
+        { requireAidenCodexShim: true },
+      )).toThrow(/launch refused: session identity/);
+    });
+
+    it('throws when the persistence hook is missing', () => {
+      expect(() => buildWrappedLaunch(
+        'aiden x codex',
+        ['-c', 'shell_environment_policy.set.ZDOTDIR="/d/x"'],
+        (b) => b,
+        { aidenCodexShimDir: '/botmux/shim', requireAidenCodexShim: true },
+      )).toThrow(/persistence hook/);
+    });
+
+    it('does NOT throw for a reasoning-only launch with a shim (no identity present)', () => {
+      // requireAidenCodexShim is only ever set alongside identity keys; a
+      // reasoning-only launch still takes the shim normally.
+      const out = buildWrappedLaunch(
+        'aiden x codex',
+        ['-c', 'model_reasoning_effort="high"'],
+        (b) => b,
+        { aidenCodexShimDir: '/botmux/shim', requireAidenCodexShim: true },
+      );
+      expect(out.bin).toBe('/botmux/shim/launch');
+      expect(out.env).toMatchObject({ BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high' });
+    });
+
+    it('does NOT throw for a launch with nothing to transport (no shim needed)', () => {
+      // Nothing is injected, so no shim is attempted and no fail-closed applies.
+      const out = buildWrappedLaunch('aiden x codex', ['--no-alt-screen', 'resume', 'cid'],
+        (b) => b, { requireAidenCodexShim: true });
+      expect(out.bin).toBe('aiden');
+      expect(out.args).toEqual(['x', 'codex', '--no-alt-screen', 'resume', 'cid']);
+    });
+  });
+
   // Regression: aiden's launcher injects codex's --dangerously-bypass-hook-trust itself,
   // so botmux's copy (codex.ts buildArgs, gated by bypassCodexHookTrust) reaching the
   // launcher made codex see the flag twice → `error: the argument
@@ -665,6 +746,21 @@ describe('buildWrappedLaunch', () => {
   ] as const)('rewrites the non-prefixed %s identity override to --config (cjadk codex)', (_label, value) => {
     const out = buildWrappedLaunch('cjadk codex', ['--no-alt-screen', '-c', value]);
     expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['codex', '--no-alt-screen', '--config', value]);
+    expect(out.args).not.toContain('-c');
+  });
+
+  // Same -c → --config requirement for the two root overrides the codex adapter
+  // injects: without the shared predicate cjadk would claim them as --command and
+  // never forward the chosen tier / recap suppression to the real codex.
+  it.each([
+    'service_tier="default"',
+    'service_tier="priority"',
+    'service_tier="ultrafast"',
+    'tui.auto_recap=false',
+    'tui.auto_recap=true',
+  ] as const)('rewrites the %s root override to --config (cjadk codex)', (value) => {
+    const out = buildWrappedLaunch('cjadk codex', ['--no-alt-screen', '-c', value]);
     expect(out.args).toEqual(['codex', '--no-alt-screen', '--config', value]);
     expect(out.args).not.toContain('-c');
   });

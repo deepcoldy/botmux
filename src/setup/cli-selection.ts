@@ -357,11 +357,39 @@ function isBotmuxCodexShellEnvConfigValue(value: string | undefined): boolean {
   return !!value && BOTMUX_CODEX_SHELL_ENV_PREFIXES.some((prefix) => value.startsWith(prefix));
 }
 
+/**
+ * codex 适配器实际发射的 `service_tier` 覆盖（`-c service_tier=${JSON.stringify(tier)}`，
+ * 见 codex.ts buildArgs）。精确锚定三个合法档位，避免误伤用户自带的 `-c service_tier=…`。
+ * 注意 `'default'` 也会到达这里：sessionServiceTier 只消隐 undefined/inherit，显式
+ * default 照常注入（用于覆盖 Codex 原生加速配置），所以它同样必须被转运。
+ */
+const BOTMUX_CODEX_SERVICE_TIER_RE = /^service_tier="(?:default|priority|ultrafast)"$/;
+
+/** codex 适配器实际发射的 `tui.auto_recap` 覆盖（quietResume/自动升级 restoring 路径，
+ * 值只可能是 true/false）。与 effort 正则同风格锚定，避免误伤用户自带 `-c`。 */
+const BOTMUX_CODEX_AUTO_RECAP_RE = /^tui\.auto_recap=(?:true|false)$/;
+
+/**
+ * 是否为 botmux 注入、必须**转运**到真 Codex 的 root config 覆盖：
+ *  - `shell_environment_policy.*` 会话/身份/读隔离覆盖（aiden 经 shim 文件回注，cjadk 改 --config）；
+ *  - `service_tier` / `tui.auto_recap` 两条进程级 root 覆盖（aiden 网关拒收裸 `-c`，同样走 shim
+ *    文件；cjadk 的 `code` 子命令会把裸 `-c` 吞成 `--command`，同样要改 `--config`）。
+ * 与「可直接丢弃」的 botmux `-c`（更新检查/nudge/cwd 信任）分开：这两类丢掉了会静默
+ * 关掉用户选的加速档或恢复期弹窗抑制，故一律转运。
+ */
+function isBotmuxCodexTransportedConfigValue(value: string | undefined): boolean {
+  return !!value && (
+    isBotmuxCodexShellEnvConfigValue(value)
+    || BOTMUX_CODEX_SERVICE_TIER_RE.test(value)
+    || BOTMUX_CODEX_AUTO_RECAP_RE.test(value)
+  );
+}
+
 /** 是否为 botmux 自己给 Codex 注入的 config 覆盖。精确白名单避免误伤用户自带的
  * `-c key=val`；wrapper 层据此决定剥离（aiden）或改成长参数（cjadk）。 */
 function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
-    isBotmuxCodexShellEnvConfigValue(value)
+    isBotmuxCodexTransportedConfigValue(value)
     || value === 'check_for_update_on_startup=false'
     // 关闭 codex 低额度切 luna 的模型 nudge 弹窗（见 codex 适配器 buildArgs），
     // 同属 botmux 注入的进程级 config 覆盖，须与上面的更新检查一并被 wrapper 识别，
@@ -445,8 +473,10 @@ const AIDEN_CODEX_REASONING_CONFIG = new RegExp(
  * Single-pass classification of the codex argv for `aiden x codex`:
  *  - the exact Botmux reasoning config → extracted for the shim env;
  *  - shell_environment_policy overrides (BOTMUX_* session vars, identity
- *    ZDOTDIR/BASH_ENV/SESSION_DATA_DIR, read-isolation inherit) → extracted for
- *    the shim config FILE so they still reach the REAL codex's tool shells;
+ *    ZDOTDIR/BASH_ENV/SESSION_DATA_DIR, read-isolation inherit) AND the
+ *    service_tier / tui.auto_recap root overrides → extracted for the shim
+ *    config FILE so they still reach the REAL codex (tool shells, or the
+ *    process config itself);
  *  - other Botmux-injected `-c` (update/nudge suppressions, cwd-trust) and
  *    `--dangerously-bypass-hook-trust` / `--settings` → dropped (Aiden cannot
  *    carry them and has its own handling/fallbacks);
@@ -473,10 +503,10 @@ export function rewriteAidenCodexArgs(args: ReadonlyArray<string>): {
         i++;
         continue;
       }
-      // MUST precede the generic botmux-config check: the shell-env overrides
+      // MUST precede the generic botmux-config check: the transported overrides
       // are a subset of isBotmuxCodexConfigValue, and their channel on the
       // aiden path is the shim rather than drop.
-      if (isBotmuxCodexShellEnvConfigValue(next)) {
+      if (isBotmuxCodexTransportedConfigValue(next)) {
         shellConfigs.push(next!);
         i++;
         continue;
@@ -546,12 +576,21 @@ export interface WrappedLaunchOptions {
   /** Directory containing Botmux's `codex` PATH shim. */
   readonly aidenCodexShimDir?: string;
   /**
-   * Receives the shell-env config overrides extracted from the codex argv
+   * Fail closed when the shim cannot deliver a session-identity launch: set by
+   * the worker when trigger-user auth / Lark tool binding injects non-prefixed
+   * identity keys that have NO channel other than the shim. Without it, a
+   * missing shim degrades to a stripped launch (WARN) — which silently runs
+   * tool shells as the machine owner.
+   */
+  readonly requireAidenCodexShim?: boolean;
+  /**
+   * Receives the transported config overrides extracted from the codex argv
    * (one complete key=value per item), persists them wherever the caller
    * chooses (the worker writes a file in the session identity dir) and
    * returns the path handed to the shim via the corresponding env var.
-   * Required to route shell-environment overrides through the shim; without
-   * it they are stripped like before and shell-env forwarding is lost.
+   * Required to route shell-environment/root overrides through the shim;
+   * without it they are stripped like before and the session-env forwarding
+   * (or the chosen service tier / recap suppression) is lost.
    */
   readonly writeAidenShellConfigs?: (configs: readonly string[]) => string;
   /** Platform PATH delimiter supplied by the server-side caller. */
@@ -656,6 +695,13 @@ export function buildWrappedLaunch(
     const realCodexBin = opts.aidenCodexRealBin ?? binResolver('codex');
     const shimDir = opts.aidenCodexShimDir;
     if (!shimDir) {
+      if (opts.requireAidenCodexShim) {
+        throw new Error(
+          'aiden x codex launch refused: session identity (trigger-user auth / Lark tool '
+          + 'binding) requires the PATH shim to forward shell_environment_policy overrides, '
+          + 'but the shim is unavailable',
+        );
+      }
       return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
     }
     const shimEnv: Record<string, string> = {
@@ -666,7 +712,14 @@ export function buildWrappedLaunch(
       if (!opts.writeAidenShellConfigs) {
         // No persistence hook (should not happen in the worker path): do not
         // pretend the overrides were delivered — fall back to the stripped
-        // launch and let the caller log the degraded case.
+        // launch and let the caller log the degraded case. Identity-bearing
+        // launches must not degrade, so fail closed there instead.
+        if (opts.requireAidenCodexShim) {
+          throw new Error(
+            'aiden x codex launch refused: session identity requires the shim config-file '
+            + 'persistence hook, but none was supplied',
+          );
+        }
         return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
       }
       shimEnv[AIDEN_CODEX_SHELL_CONFIG_FILE_ENV] = opts.writeAidenShellConfigs(shellConfigs);
