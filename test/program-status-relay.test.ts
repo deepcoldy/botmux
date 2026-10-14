@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import {
   PROGRAM_STATUS_PROBE_REPLY,
   ProgramStatusProbeRelay,
+  writeProbeReplySync,
   type ProbeRelayAction,
 } from '../src/utils/program-status-probe-relay.js';
 import {
@@ -87,6 +88,34 @@ describe('ProgramStatusProbeRelay', () => {
   });
 });
 
+describe('writeProbeReplySync', () => {
+  // node-pty's write() goes through the libuv thread pool; with the pool busy the
+  // reply would trail the DA1 query we forward right after it. Bun's PTY read
+  // path also uses the pool, so the observation below is Node-only.
+  it.skipIf(!!process.versions.bun)('puts the reply into the PTY immediately even when the thread pool is saturated', async () => {
+    const pty = await import('../src/utils/pty.js');
+    const { pbkdf2 } = await import('node:crypto');
+    const echo = `process.stdin.setRawMode(true); process.stdin.on('data', d => process.stdout.write(d.includes('\\x1b]7501;?') ? 'GOT' : ''));`;
+    const term = pty.spawn(process.execPath, ['-e', echo], { cols: 80, rows: 24, cwd: process.cwd(), env: process.env as Record<string, string> });
+    let out = '';
+    term.onData(d => { out += d; });
+    try {
+      await new Promise(r => setTimeout(r, 500)); // child ready
+      // Occupy every pool thread for well over a second.
+      const busy = Array.from({ length: 16 }, () => new Promise(r => pbkdf2('x', 'y', 2_000_000, 64, 'sha512', r)));
+      const t0 = Date.now();
+      writeProbeReplySync(term as never);
+      while (!out.includes('GOT') && Date.now() - t0 < 5_000) await new Promise(r => setTimeout(r, 10));
+      const latency = Date.now() - t0;
+      await Promise.all(busy);
+      expect(out).toContain('GOT');
+      expect(latency).toBeLessThan(400);
+    } finally {
+      term.kill();
+    }
+  }, 30_000);
+});
+
 describe('program-status relay launch plan', () => {
   const realArgv1 = process.argv[1];
   let planRoot = '';
@@ -147,6 +176,15 @@ describe('program-status relay launch plan', () => {
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--system-prompt-file', '/tmp/program-status-relay.ts'])).toBe(false);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--system-prompt-file', '/tmp/program-status-relay.ts', '--verbose'])).toBe(false);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', 'program-status-relay.js', 'plan.json'])).toBe(false);
+  });
+
+  it('does not mistake a launcher that has not exec\'d the relay yet for the relay', () => {
+    // Under a user-systemd session scope the pane process starts as systemd-run
+    // (then the env shim); both argvs END with the relay command.
+    const relay = ['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/botmux-psr-AbC123/plan.json'];
+    expect(isProgramStatusRelayArgv(['systemd-run', '--user', '--scope', '--quiet', '--collect', '--unit=x', '--', ...relay])).toBe(false);
+    expect(isProgramStatusRelayArgv(['/bin/sh', '-c', 'exec "$@"', 'botmux-program-status-relay', ...relay])).toBe(false);
+    expect(isProgramStatusRelayArgv(relay)).toBe(true);
   });
 
   it('keeps the CLI name out of argv so discovery never mistakes the relay for the CLI', () => {

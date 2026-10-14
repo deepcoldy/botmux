@@ -18,7 +18,7 @@ import { spawn as spawnChild, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { consumeProgramStatusRelayPlan, relayChildLaunch } from './core/program-status-relay-launch.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
-import { PROGRAM_STATUS_PROBE_REPLY, ProgramStatusProbeRelay } from './utils/program-status-probe-relay.js';
+import { ProgramStatusProbeRelay, writeProbeReplySync } from './utils/program-status-probe-relay.js';
 import * as pty from './utils/pty.js';
 
 /** A lone trailing ESC (or partial probe) is held at most this long. */
@@ -114,7 +114,7 @@ function relayThrough(term: pty.IPty): void {
   term.onData((data: string | Buffer) => {
     const chunk = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
     for (const action of relay.feed(chunk)) {
-      if ('answer' in action) term.write(PROGRAM_STATUS_PROBE_REPLY);
+      if ('answer' in action) writeProbeReplySync(term);
       else forward(action.forward);
     }
     if (heldTimer) { clearTimeout(heldTimer); heldTimer = null; }

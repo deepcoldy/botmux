@@ -19,6 +19,8 @@
  * seeing them.
  */
 
+import { writeSync } from 'node:fs';
+
 export const PROGRAM_STATUS_PROBE_REPLY = '\x1b]7501;?\x1b\\';
 
 const PROBES = ['\x1b]7501;?\x07', '\x1b]7501;?\x1b\\'] as const;
@@ -84,4 +86,34 @@ export class ProgramStatusProbeRelay {
     this.held = '';
     return b;
   }
+}
+
+/**
+ * Put the probe reply into the inner PTY BEFORE the bytes after the probe (the
+ * DA1 query) are forwarded. node-pty's `write()` only enqueues — the actual
+ * write happens later on the libuv thread pool — so it gives no ordering
+ * guarantee against a DA1 answer tmux produces as soon as we forward the query.
+ * Write the master fd synchronously instead; the reply is a few bytes, so it
+ * lands whole. Fall back to the queued write only if the fd is unavailable.
+ */
+export function writeProbeReplySync(term: { fd?: number; write(data: string): void }): void {
+  const fd = term.fd;
+  if (typeof fd === 'number') {
+    const reply = Buffer.from(PROGRAM_STATUS_PROBE_REPLY, 'latin1');
+    let written = 0;
+    for (let attempt = 0; attempt < 100 && written < reply.length; attempt++) {
+      try {
+        written += writeSync(fd, reply, written);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EAGAIN' && code !== 'EWOULDBLOCK' && code !== 'EINTR') break;
+      }
+    }
+    if (written === reply.length) return;
+    if (written > 0) {
+      term.write(reply.subarray(written).toString('latin1'));
+      return;
+    }
+  }
+  term.write(PROGRAM_STATUS_PROBE_REPLY);
 }

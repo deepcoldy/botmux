@@ -122,21 +122,28 @@ export function consumeProgramStatusRelayPlan(planPath: string | undefined): Pro
   return { bin: plan.bin, args: plan.args };
 }
 
-/** A relay argv ENDS with its entry (hidden subcommand or script) followed by
- *  the plan path this module minted. Matching that tail — rather than any
- *  token — keeps an ordinary CLI argument that merely names a file
- *  `program-status-relay.ts` from passing; matching on the joined string keeps
- *  working when macOS readCmdline() falls back to `ps` and whitespace-splits a
- *  path containing spaces. */
-const RELAY_ARGV_TAIL = new RegExp(
-  `(?:^|[ /])(?:${RELAY_TOKEN}|${RELAY_SCRIPT.replace('.', '\\.')}|${RELAY_SOURCE.replace('.', '\\.')})`
-  // The plan path may itself contain spaces (a TMPDIR with whitespace).
-  + ` .*/${PLAN_DIR_PREFIX}[^/ ]+/${PLAN_FILE.replace('.', '\\.')}$`,
-);
+const escapeRegExp = (v: string): string => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** True when a process argv (`/proc/<pid>/cmdline`) is a program-status relay.
- *  Node: `<node> …/program-status-relay.js <plan>`; Bun adds runtime flags
- *  before the script; compiled: `<binary> __program-status-relay <plan>`. */
-export function isProgramStatusRelayArgv(argv: readonly string[]): boolean {
-  return RELAY_ARGV_TAIL.test(argv.join(' '));
+/** Interpreters a relay can run under: this process's own executable (the
+ *  worker relaunches through process.execPath — node, bun or the compiled
+ *  botmux binary) plus any node/bun/botmux by basename, so a relay started by
+ *  an earlier daemon is still recognised after a restart. */
+function relayInterpreterPattern(execPath: string): string {
+  return `(?:${escapeRegExp(execPath)}|(?:\\S*/)?(?:node|nodejs|bun|botmux[^/ ]*))`;
+}
+
+/** True when a process argv (`/proc/<pid>/cmdline`) is a program-status relay:
+ *    <interpreter> [--no-env-file --config=/dev/null] <entry> <plan>
+ *  where <entry> is `__program-status-relay` (compiled) or the relay script.
+ *  Anchored at BOTH ends: a launcher whose argv merely ends with the relay
+ *  command (`systemd-run … -- <relay>`, the `/bin/sh -c` env shim) must not
+ *  pass before it has exec'd, and neither may a CLI argument that names a file
+ *  `program-status-relay.ts`. Matching the joined string keeps working when
+ *  macOS readCmdline() falls back to `ps` and whitespace-splits paths that
+ *  contain spaces (interpreter, script or a TMPDIR-based plan path). */
+export function isProgramStatusRelayArgv(argv: readonly string[], execPath: string = process.execPath): boolean {
+  const entry = `(?:${RELAY_TOKEN}|(?:\\S.*/)?(?:${escapeRegExp(RELAY_SCRIPT)}|${escapeRegExp(RELAY_SOURCE)}))`;
+  const plan = `(?:\\S.*)?/${PLAN_DIR_PREFIX}[^/ ]+/${escapeRegExp(PLAN_FILE)}`;
+  const pattern = new RegExp(`^${relayInterpreterPattern(execPath)} (?:--no-env-file --config=/dev/null )?${entry} ${plan}$`);
+  return pattern.test(argv.join(' '));
 }
