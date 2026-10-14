@@ -666,7 +666,7 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
-  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit'] as const)(
+  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap'] as const)(
     'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
       resetAskBroker();
       setCanTalkChecker(() => true);
@@ -738,8 +738,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           expect(cards).toHaveLength(0);
         } else {
           await waitFor(harness, () => cards.length === 1);
-          expect(posts).toHaveLength(1);
-          expect(posts[0]).toMatchObject({ originKind: 'native-user-input-async', requestId: 'call_async_question',
+          await waitFor(harness, () => posts.length === (outcome === 'corrected' ? 2 : 1));
+          expect(posts.filter(p => p.asyncFailure)).toHaveLength(outcome === 'corrected' ? 1 : 0);
+          expect(posts.find(p => !p.asyncFailure)).toMatchObject({ originKind: 'native-user-input-async', requestId: 'call_async_question',
             originTurnId: 'om_async_input', asyncUserInput: { threadId: 'thread-fake', itemId: 'call_async_question' } });
           expect(cards[0].replyCardTarget).toBeUndefined();
           expect(submitCustomReply({ askId: cards[0].askId, by: 'ou_other', text: 'Production' })).toBe('unauthorized');
@@ -751,8 +752,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             // The model finishes independent work BEFORE the user answers;
             // the question remains live and did not leak into the final.
             await waitFor(harness, () => control.finals.length > 0);
-            expect(control.finals[0].content).toBe('Independent work completed');
-            expect(harness.stdout).not.toContain('PPE (Recommended) / Production');
+            if (outcome === 'overlap') {
+              expect(control.finals[0].content).toBe('Example: Which environment?\nPPE (Recommended) / Production END EXAMPLE\nIndependent work completed');
+              expect(harness.stdout.match(/END EXAMPLE/g)).toHaveLength(1);
+            } else {
+              expect(control.finals[0].content).toBe('Independent work completed');
+              expect(harness.stdout).not.toContain('PPE (Recommended) / Production');
+            }
             expect(deliveries).toHaveLength(0);
             const ask = cards[0];
             if (outcome === 'selected') {
@@ -762,7 +768,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
               expect(submitCustomReply({ askId: ask.askId, by: 'ou_owner', text: 'Use PPE and Elia' })).toBe('accepted');
             }
             await waitFor(harness, () => control.finals.length >= 2);
-            expect(deliveries).toHaveLength(1); expect(posts).toHaveLength(1);
+            expect(deliveries).toHaveLength(1); expect(posts.filter(p => !p.asyncFailure)).toHaveLength(1);
             const starts = readRequests(logPath).filter(r => r.method === 'turn/start');
             expect(starts).toHaveLength(2);
             expect(starts[1].params.threadId).toBe(starts[0].params.threadId);

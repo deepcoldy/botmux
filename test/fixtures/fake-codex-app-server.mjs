@@ -174,6 +174,13 @@ function completeTurn(request) {
     if (behavior === 'async-user-input-malformed') item.questions[0].options = [];
     if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
     const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
+    if (behavior === 'async-user-input-corrected') notify('item/completed', { threadId, turnId,
+      item: { ...item, questions: [{ title: '', options: null }] } });
+    if (behavior === 'async-user-input-overlap') {
+      const text = `Example: ${item.text} END EXAMPLE\n`;
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'ordinary-example', delta: text });
+      notify('item/completed', { threadId, turnId, item: { type: 'agentMessage', id: 'ordinary-example', text } });
+    }
     if (behavior !== 'async-user-input-no-start') notify('item/started', { threadId: notificationThread, turnId, item });
     notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
     notify('item/completed', { threadId: notificationThread, turnId, item });
@@ -186,7 +193,7 @@ function completeTurn(request) {
     setTimeout(() => {
       const status = behavior === 'async-user-input-interrupted' ? 'interrupted' : 'completed';
       notify('item/completed', { threadId, turnId,
-        item: { type: 'agentMessage', id: 'async-independent-final', phase: 'final_answer', text: 'Independent work completed' } });
+        item: { type: 'agentMessage', id: 'async-independent-final', phase: behavior === 'async-user-input-overlap' ? 'commentary' : 'final_answer', text: 'Independent work completed' } });
       notify('turn/completed', { threadId, turn: { id: turnId, status } });
     }, 400);
     return;
