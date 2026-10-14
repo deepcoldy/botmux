@@ -631,6 +631,7 @@ import type { WorkflowDaemonMutation } from './workflows/v3/daemon-ipc-client.js
 import type { SavedWorkflowActorContext } from './workflows/v3/library-service.js';
 import { resolveEffectivePluginIds } from './core/plugins/effective.js';
 import { pluginCommandGateway } from './core/plugins/commands/runtime.js';
+import { startLarkSlashCommandSync } from './core/lark-slash-command-sync.js';
 import {
   buildCodexCompletionCard,
   buildCodexNotifierResultCard,
@@ -30704,6 +30705,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();
+  if (!cfg.apiOnly) startLarkSlashCommandSync(cfg.larkAppId);
 
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
   // are mid-CLI-turn so the primary daemon's maintenance gate sees activity
