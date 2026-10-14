@@ -44,7 +44,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -4312,6 +4312,12 @@ export async function handleCommand(
             await sessionReply(rootId, t(target ? 'cmd.adopt.resume_not_found' : 'cmd.resume.none', undefined, loc));
             return;
           }
+          // 路由把命令空壳当作「无会话」认领了 /resume；恢复/复制前先清掉占位，
+          // 否则原地恢复会因锚点被占而失败。真会话（有对话历史、排队、选仓等）不动。
+          const placeholder = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
+          if (placeholder && isResumeRecoveryPlaceholder(placeholder)) {
+            await closeWorkerPoolSession(placeholder.session.sessionId);
+          }
           if (storedSessionAnchorId(session) !== rootId) {
             // 别处的会话：像 /fork 一样复制到这里（继承完整上下文），原会话不动、仍可在原处恢复。
             if (session.status !== 'closed') {
@@ -4357,9 +4363,6 @@ export async function handleCommand(
             return;
           }
           const result = await resumeSession(session.sessionId, activeSessions);
-          // Only a chat-scope session is the group's resident; a resumed subtopic must not
-          // displace it (top-level /dismiss requires a chat-scope resident).
-          if (result.ok && result.ds.scope === 'chat') touchSessionGroup(result.ds.chatId, session.sessionId);
           await sessionReply(rootId, resumeResultMessage(result, loc));
         };
         if (larkAppId) await runDetachedBotTurnAdmission(larkAppId, runResume);

@@ -27,7 +27,7 @@ import * as pool from '../src/core/worker-pool.js';
 import { initSessionGroups, registerSessionGroup, getSessionGroup } from '../src/services/session-groups-store.js';
 import { WorkspaceRecycleRuntime } from '../src/core/workspace-recycle-runtime.js';
 import { WorkspaceRecycler } from '../src/services/workspace-recycle.js';
-import { __testOnly_activeSessions as active, __testOnly_handleNewTopic as handleNewTopic } from '../src/daemon.js';
+import { __testOnly_activeSessions as active, __testOnly_handleNewTopic as handleNewTopic, __testOnly_handleThreadReply as handleThreadReply } from '../src/daemon.js';
 import { type DaemonSession, activeSessionKey } from '../src/core/types.js';
 
 const APP = 'app-recycle-group';
@@ -123,4 +123,31 @@ it('/resume without an id skips a closed command placeholder stamped with a CLI 
   }, { chatId: CHAT, messageId: 'om_resume_real', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
   await vi.waitFor(() => expect(store.getOwnedSession(real.sessionId)?.status).toBe('active'));
   expect(store.getOwnedSession(placeholder.sessionId)?.status).toBe('closed');
+});
+
+it('/resume evicts a live codex-pool command placeholder at the anchor, restores the real session and repoints the group resident', async () => {
+  const workspace = join(mocks.dataDir, 'workspace-placeholder'); mkdirSync(workspace, { recursive: true });
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex', allowedUsers: ['ou_fixture'] });
+  bot.resolvedAllowedUsers = ['ou_fixture'];
+  store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
+  const real = store.createSession(CHAT, 'om_real2', 'real conversation', 'group', 'chat');
+  Object.assign(real, { larkAppId: APP, workingDir: workspace, backendType: 'tmux', cliId: 'codex', cliSessionId: 'codex-thread-real2' });
+  store.updateSession(real); store.closeSession(real.sessionId);
+  // Live /help scaffold: worker-less, cliId pre-stamped by the instance pool, no conversation.
+  const placeholder = store.createSession(CHAT, 'om_help2', '/help', 'group', 'chat');
+  Object.assign(placeholder, { larkAppId: APP, workingDir: workspace, backendType: 'tmux', cliId: 'codex' });
+  store.updateSession(placeholder);
+  const placeholderDs = { session: placeholder, larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat', workingDir: workspace,
+    worker: null, workerPort: null, workerToken: null, lastMessageAt: 1, lastScreenStatus: 'idle' } as DaemonSession;
+  active.set(activeSessionKey(placeholderDs), placeholderDs);
+  registerSessionGroup(CHAT, { ownerOpenId: 'ou_fixture', lastSessionId: placeholder.sessionId, createdAt: 1, lastActiveAt: 1 });
+
+  mocks.reply.mockClear(); mocks.send.mockClear(); mocks.fork.mockClear();
+  await handleThreadReply({
+    sender: { sender_id: { open_id: 'ou_fixture' }, sender_type: 'user' },
+    message: { message_id: 'om_resume_ph', chat_id: CHAT, message_type: 'text', content: JSON.stringify({ text: '/resume' }), create_time: String(Date.now()) },
+  }, { chatId: CHAT, messageId: 'om_resume_ph', chatType: 'group', scope: 'chat', anchor: CHAT, larkAppId: APP });
+  await vi.waitFor(() => expect(store.getOwnedSession(real.sessionId)?.status).toBe('active'));
+  expect(store.getOwnedSession(placeholder.sessionId)?.status).toBe('closed');
+  expect(getSessionGroup(CHAT)?.lastSessionId).toBe(real.sessionId);
 });

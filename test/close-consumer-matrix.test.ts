@@ -92,6 +92,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'ordinary success or remove a worktree while cleanup is unproven.',
     count: 6,
   },
+  'core/command-handler.ts::runResume::closeSession': {
+    category: 'impossible_by_invariant',
+    why: '/resume evicts only an isResumeRecoveryPlaceholder at its own anchor: '
+      + 'worker-less, no conversation history, never launched a CLI, not adopted / '
+      + 'queued / headless. No remote session or local subtree can exist for it.',
+  },
   'core/command-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',
     why: 'Text /repo: a refusal or residual aborts the switch and names the id.',

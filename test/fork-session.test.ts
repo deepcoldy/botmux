@@ -813,6 +813,13 @@ describe('forkClosedSession（/resume <别处的 id>：从已关闭记录复制�
     expect(forkWorkerSpy).not.toHaveBeenCalled();
   });
 
+  it('已关闭的 Codex/TraeX 会话无法确认是否以 RPC 启动：fail closed', async () => {
+    for (const cliId of ['codex', 'traex'] as const) {
+      expect(await callClosedFork(closedRow({ cliId }))).toEqual({ ok: false, error: 'fork_unsupported_backend' });
+    }
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
   it('只接受已关闭、未回收、可 fork 的记录', async () => {
     expect(await callClosedFork(closedRow({ status: 'active' }))).toEqual({ ok: false, error: 'not_closed' });
     expect(await callClosedFork(closedRow({ workspaceRetirement: { operationId: 'op', workspacePath: '/tmp/p' } as any })))
