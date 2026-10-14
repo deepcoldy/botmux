@@ -10,6 +10,7 @@ import {
   parseTrustedResultDelivery,
   sendTrustedDeliveryIpcWithBackpressure,
   TrustedResultDeliverySerialQueue,
+  TrustedResultDeliveryEffectError,
   trustedResultDeliveryIpcFiles,
   trustedResultTerminalObservation,
 } from '../src/core/plugins/mcp/trusted-result-delivery.js';
@@ -294,6 +295,28 @@ describe('trusted plugin result delivery', () => {
     }
     expect(markdownCalls).toBe(0);
     expect(uploadCalls).toBe(0);
+  });
+
+  it('retains only acknowledged message ids when a delivery effect fails', async () => {
+    const delivery = deliverValidatedTrustedResultDelivery({
+      deliveryId: 'report_20261025',
+      markdown: 'CONFIDENTIAL_RESULT_SENTINEL',
+      responseKind: 'final',
+      files: [{ name: 'secret.xlsx', dataBase64: Buffer.from('secret').toString('base64') }],
+    }, {
+      async sendMarkdown() { return 'om_primary'; },
+      async sendFile() { throw new Error('/private/path/secret.xlsx'); },
+    });
+    await expect(delivery).rejects.toMatchObject({
+      name: 'TrustedResultDeliveryEffectError',
+      message: 'plugin_result_delivery_effect_failed',
+      messageIds: ['om_primary'],
+    } satisfies Partial<TrustedResultDeliveryEffectError>);
+    await delivery.catch(error => {
+      expect(JSON.stringify(error)).not.toContain('CONFIDENTIAL_RESULT_SENTINEL');
+      expect(JSON.stringify(error)).not.toContain('secret.xlsx');
+      expect(String(error)).not.toContain('/private/path');
+    });
   });
 
   it('marks host-delivered finals with the correct terminal carrier', () => {

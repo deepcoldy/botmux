@@ -315,6 +315,7 @@ export class PluginMcpGateway {
   private readonly env: NodeJS.ProcessEnv;
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  private readonly allowHostOnlyTools: boolean;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -333,11 +334,13 @@ export class PluginMcpGateway {
     opts: {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+      allowHostOnlyTools?: boolean;
     } = {},
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
+    this.allowHostOnlyTools = opts.allowHostOnlyTools === true;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -527,6 +530,10 @@ export class PluginMcpGateway {
   private trustedTurnMeta(identity: GatewayTrustedTurnIdentity | undefined): Record<string, unknown> | undefined {
     const caller = identity?.caller;
     if (!caller && !identity?.turnId) return undefined;
+    const hostCapabilities = [
+      ...(this.trustedResultDelivery ? ['result_delivery_v1'] : []),
+      ...(this.allowHostOnlyTools ? ['frozen_query_v1'] : []),
+    ];
     return {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
@@ -544,7 +551,7 @@ export class PluginMcpGateway {
       ...(caller?.senderType ? { senderType: caller.senderType } : {}),
       ...(identity?.turnId ? { turnId: identity.turnId } : {}),
       ...(identity?.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
-      ...(this.trustedResultDelivery ? { hostCapabilities: ['result_delivery_v1'] } : {}),
+      ...(hostCapabilities.length > 0 ? { hostCapabilities } : {}),
     };
   }
 
@@ -607,7 +614,9 @@ export class PluginMcpGateway {
     for (const connection of this.capable('tools')) {
       try {
         const tools = await allPages<any>(cursor => connection.client.listTools(cursor ? { cursor } : {}) as any, 'tools');
-        entries.push(...tools.map(tool => ({ connection, tool })));
+        entries.push(...tools
+          .filter(tool => this.allowHostOnlyTools || tool?._meta?.botmuxHostOnly !== true)
+          .map(tool => ({ connection, tool })));
         const diagnostic = this.diagnostics.find(item => item.status === 'connected' && item.pluginId === connection.pluginId && item.serverName === connection.server.name);
         if (diagnostic) diagnostic.tools = tools.length;
       } catch (err) {

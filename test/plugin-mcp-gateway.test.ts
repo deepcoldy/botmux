@@ -149,6 +149,44 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('hides host-only tools from model gateways and exposes them only with a host capability', async () => {
+    installFixturePlugin('plugin-hostonly', 'hostonly');
+    const identity = () => ({
+      caller: { requestUserOpenId: 'ou_host', requestUserUnionId: 'on_host', senderType: 'user' as const },
+      turnId: 'om_host',
+    });
+
+    const modelGateway = new PluginMcpGateway(
+      ['plugin-hostonly'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-model' },
+      { trustedTurnIdentity: identity },
+    );
+    const modelClient = new Client({ name: 'model-gateway-test', version: '1.0.0' });
+    const [modelClientTransport, modelServerTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([modelGateway.connect(modelServerTransport), modelClient.connect(modelClientTransport)]);
+    expect((await modelClient.listTools()).tools.map(tool => tool.name)).toEqual(['echo']);
+    await expect(modelClient.callTool({ name: 'frozen_query_raw', arguments: {} }))
+      .rejects.toThrow(/No enabled plugin MCP handles/);
+    await modelClient.close();
+    await modelGateway.close();
+
+    const hostGateway = new PluginMcpGateway(
+      ['plugin-hostonly'],
+      { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host' },
+      { trustedTurnIdentity: identity, allowHostOnlyTools: true },
+    );
+    const hostClient = new Client({ name: 'host-gateway-test', version: '1.0.0' });
+    const [hostClientTransport, hostServerTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([hostGateway.connect(hostServerTransport), hostClient.connect(hostClientTransport)]);
+    expect((await hostClient.listTools()).tools.map(tool => tool.name)).toEqual(['echo', 'frozen_query_raw']);
+    const result = await hostClient.callTool({ name: 'frozen_query_raw', arguments: {} });
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('frozen_query_v1');
+    expect(text).not.toContain('result_delivery_v1');
+    await hostClient.close();
+    await hostGateway.close();
+  });
+
   it('isolates a failed downstream server', async () => {
     const connectSpy = vi.spyOn(Client.prototype, 'connect');
     installFixturePlugin('plugin-a', 'alpha');

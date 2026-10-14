@@ -36,6 +36,16 @@ export interface TrustedResultDeliveryReceipt {
   fileCount: number;
 }
 
+/** A delivery effect failed after the complete envelope was validated. Only
+ * acknowledged message ids cross this boundary; the original content, file
+ * names, provider payload, and error details remain out of result storage. */
+export class TrustedResultDeliveryEffectError extends Error {
+  constructor(readonly messageIds: string[]) {
+    super('plugin_result_delivery_effect_failed');
+    this.name = 'TrustedResultDeliveryEffectError';
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -198,11 +208,15 @@ export async function deliverValidatedTrustedResultDelivery(
   // callback argument before the complete envelope has passed validation.
   const envelope = decodeTrustedResultDeliveryIpcEnvelope(value);
   const messageIds: string[] = [];
-  if (envelope.markdown?.trim()) {
-    messageIds.push(await effects.sendMarkdown(envelope.markdown));
-  }
-  for (let index = 0; index < envelope.files.length; index += 1) {
-    messageIds.push(await effects.sendFile(envelope.files[index], index));
+  try {
+    if (envelope.markdown?.trim()) {
+      messageIds.push(await effects.sendMarkdown(envelope.markdown));
+    }
+    for (let index = 0; index < envelope.files.length; index += 1) {
+      messageIds.push(await effects.sendFile(envelope.files[index], index));
+    }
+  } catch {
+    throw new TrustedResultDeliveryEffectError([...messageIds]);
   }
   return messageIds;
 }

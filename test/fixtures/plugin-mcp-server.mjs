@@ -32,14 +32,29 @@ const server = new Server(
   },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, request => request.params?.cursor
-  ? {
-      tools: [{ name: `${serverName}_unique`, description: `${serverName} unique`, inputSchema: { type: 'object' } }],
-    }
-  : {
-      tools: [{ name: 'echo', description: `${serverName} echo`, inputSchema: { type: 'object' } }],
-      nextCursor: 'second-page',
-    });
+server.setRequestHandler(ListToolsRequestSchema, request => {
+  if (serverName === 'hostonly') {
+    return {
+      tools: [
+        { name: 'echo', description: 'public tool', inputSchema: { type: 'object' } },
+        {
+          name: 'frozen_query_raw',
+          description: 'host-only raw result',
+          inputSchema: { type: 'object' },
+          _meta: { botmuxHostOnly: true },
+        },
+      ],
+    };
+  }
+  return request.params?.cursor
+    ? {
+        tools: [{ name: `${serverName}_unique`, description: `${serverName} unique`, inputSchema: { type: 'object' } }],
+      }
+    : {
+        tools: [{ name: 'echo', description: `${serverName} echo`, inputSchema: { type: 'object' } }],
+        nextCursor: 'second-page',
+      };
+});
 
 server.setRequestHandler(CallToolRequestSchema, request => {
   if (serverName === 'delivery') {

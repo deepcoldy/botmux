@@ -55,6 +55,7 @@ import {
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import {
   deliverValidatedTrustedResultDelivery,
+  TrustedResultDeliveryEffectError,
 } from './plugins/mcp/trusted-result-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, uploadFileBuffer, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
@@ -16853,6 +16854,33 @@ function setupWorkerHandlers(
           break;
         }
         const frozen = frozenReplyContextForTurn(ds, msg.turnId);
+        const resultBinding = msg.responseKind === 'final'
+          ? turnResultBinding(ds, msg.turnId, msg.dispatchAttempt, workerGeneration)
+          : undefined;
+        const resultMessages = (messageIds: string[]): TurnDeliveryReceipt['messages'] => {
+          const hasPrimary = !!msg.markdown?.trim();
+          return messageIds.map((messageId, index) => ({
+            messageId,
+            kind: hasPrimary && index === 0 ? 'primary' : 'attachment',
+          }));
+        };
+        const observeDelivery = (
+          status: TurnDeliveryReceipt['status'],
+          messageIds: string[],
+          reason?: string,
+        ) => observeTurnResultDelivery(
+          resultBinding,
+          { status: 'unavailable', reason: 'trusted_plugin_delivery' },
+          {
+            channel: 'im',
+            status,
+            platform: 'lark',
+            chatId: ds.chatId,
+            ...(frozen.target.mode !== 'plain' ? { parentMessageId: frozen.target.rootMessageId } : {}),
+            messages: resultMessages(messageIds),
+            ...(reason ? { reason } : {}),
+          },
+        );
         try {
           const messageIds = await deliverValidatedTrustedResultDelivery(msg, {
             async sendMarkdown(markdown) {
@@ -16880,6 +16908,10 @@ function setupWorkerHandlers(
               });
             },
           });
+          // Persist the delivery fact before acknowledging the worker. Once
+          // acknowledged it may immediately emit turn_terminal, so reversing
+          // this order creates an empty/not-ready terminal race.
+          observeDelivery('delivered', messageIds);
           reply({
             type: 'plugin_result_delivery_result',
             requestId: msg.requestId,
@@ -16887,6 +16919,14 @@ function setupWorkerHandlers(
             messageIds,
           });
         } catch (error) {
+          const messageIds = error instanceof TrustedResultDeliveryEffectError
+            ? error.messageIds
+            : [];
+          observeDelivery(
+            messageIds.length ? 'partial' : 'failed',
+            messageIds,
+            'trusted_plugin_delivery_failed',
+          );
           logger.error(
             `[${t}] Plugin result delivery failed plugin=${msg.pluginId}: `
             + `${error instanceof Error ? error.message : String(error)}`,
