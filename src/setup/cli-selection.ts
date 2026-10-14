@@ -25,7 +25,7 @@ import { CLI_ID_CHOICES, CLI_OPTIONS } from './bot-config-editor.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { CODEX_REASONING_EFFORTS } from '../services/codex-reasoning-effort.js';
-import { AIDEN_CODEX_SHELL_CONFIG_FILE_ENV } from '../services/aiden-codex-shim.js';
+import { AIDEN_CODEX_SHELL_CONFIG_FILE_ENV } from '../services/aiden-codex-shim.shared.js';
 
 /** 一个用户可选项；wrapperCli 不为空时表示它以该前缀启动（如 `aiden x claude`）。 */
 export interface CliSelectOption {
