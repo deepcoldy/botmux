@@ -148,6 +148,28 @@ describe('plugin card action gateway', () => {
     expect(body.operator).not.toHaveProperty('user_id');
   });
 
+  it('forwards host-computed privileges and degrades a failing resolver to no authority', async () => {
+    const record = makeRecord('privileged', { actions: ['example.priv.submit'] });
+    const request = vi.fn(async () => successResponse());
+    const dispatch = (resolvePrivileges: () => { canOperate: boolean; canTalk: boolean }) => createPluginCardActionGateway({
+      resolvePluginIds: () => [record.id],
+      readRegistry: () => registryOf(record),
+      readServiceState: pluginId => onlineState(pluginId),
+      readToken: () => 'secret',
+      request,
+      resolvePrivileges,
+    }).dispatch({
+      operator: { open_id: 'ou_verified' },
+      action: { name: 'example.priv.submit', value: { canOperate: true } },
+    }, 'cli_current');
+
+    await dispatch(() => ({ canOperate: true, canTalk: true }));
+    await dispatch(() => { throw new Error('registry down'); });
+    const bodies = request.mock.calls.map(call => JSON.parse(String(call[1].body)));
+    expect(bodies[0].privileges).toEqual({ canOperate: true, canTalk: true });
+    expect(bodies[1].privileges).toEqual({ canOperate: false, canTalk: false });
+  });
+
   it('保持既有 Botmux 卡片动作行为不变', async () => {
     const record = makeRecord('external-actions', { actions: ['external.submit'] });
     const request = vi.fn(async () => successResponse());
