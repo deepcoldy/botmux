@@ -249,7 +249,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
@@ -467,7 +467,8 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
@@ -5066,8 +5067,10 @@ function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): 
  * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
  * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
  * real limit. So we suppress the screen-scan `rate` verdict and let the
- * structured path be the sole authority. `usage` (quota "hit your limit …") has
- * no structured equivalent yet, so it still comes from the screen.
+ * structured path be the sole authority. `usage` (quota "hit your limit …") is
+ * never suppressed on screen; for codex it is ALSO structured (a
+ * `usage_limit_exceeded` terminal, including a collaboration sub-agent's),
+ * because the screen scan is muted while the CLI is still working.
  *
  * Gate on the two capability fields (`claudeDataDir` for the Claude family;
  * `emitsStructuredRateLimit` for codex), NOT on `reliableTurnTerminal`. The
@@ -5215,6 +5218,13 @@ const bridgeRestoreGate = new BridgeRestoreGate();
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
+/** Codex collaboration sub-agents spawned during live ingest. Their quota
+ *  failures land in their own rollouts and reach the parent only as tool
+ *  results, so they are tailed separately and fed into the same structured
+ *  limit emit (see codex-subagent-limit-tracker.ts). */
+const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
+  () => codexBridgeRolloutPath ? codexSessionsRootFromRolloutPath(codexBridgeRolloutPath) : undefined,
+);
 /** Claude Code's automatic model switches for this bridge. The tracker owns the
  *  binding to the CURRENT Claude session id, the record-uuid dedupe and the
  *  "only report the serving model when it changed" rule; every transcript drain
@@ -7831,6 +7841,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   codexBridgeRolloutPath = rolloutPath;
+  codexSubagentLimitTracker.clear();
   if (structuredBridgeIs('codex')) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -8127,6 +8138,7 @@ function codexBridgeDetachFile(): void {
   }
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexSubagentLimitTracker.clear();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   structuredBridgeDriverState = undefined;
@@ -8690,6 +8702,8 @@ function codexBridgeIngest(opts: {
       reasoningEffort: codex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
     });
     maybeEmitCodexStructuredRateLimit(result.events);
+    codexSubagentLimitTracker.observe(codex.spawnedSubagentThreadIds, Date.now());
+    maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
@@ -8816,7 +8830,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
   for (const ev of events) {
     if (!isCodexRateLimitEvent(ev) || emittedRateLimitUuids.has(ev.uuid)) continue;
     emittedRateLimitUuids.add(ev.uuid);
-    const usageLimit = structuredRateLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
+    const usageLimit = structuredCodexLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
     usageLimitTracker.noteStructuredLimit(usageLimit);
     send({
       type: 'screen_update',
@@ -8826,7 +8840,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
-    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, kind=${usageLimit.kind}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
     return;
   }
 }
@@ -9440,6 +9454,7 @@ function stopCodexBridge(): void {
   publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexSubagentLimitTracker.clear();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   structuredBridgeDriverState = undefined;

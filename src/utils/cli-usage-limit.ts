@@ -288,3 +288,16 @@ export function structuredRateLimitState(text = '', now = new Date()): CliUsageL
     retryReady: now.getTime() >= retryAtMs,
   };
 }
+
+/**
+ * Same as structuredRateLimitState, but keeps the quota/rate distinction the
+ * screen scan makes. Codex reports both 429s and account quota exhaustion
+ * ("You’ve hit your usage limit … try again at 9:00 AM") through one
+ * structured `codex_rate_limited` terminal; the summary text decides whether
+ * the owner notice and `quotaFallbackBot.kinds` see `usage` or `rate`.
+ */
+export function structuredCodexLimitState(text = '', now = new Date()): CliUsageLimitState {
+  const state = structuredRateLimitState(text, now);
+  const isUsage = !hasPattern(text, RATE_LIMIT_PATTERNS) && hasPattern(text, USAGE_LIMIT_PATTERNS);
+  return isUsage ? { ...state, kind: 'usage' } : state;
+}
