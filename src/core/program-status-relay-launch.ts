@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -20,6 +21,13 @@ import { isStandaloneBinary, resolveEntrySpawn } from './self-spawn.js';
  *     token in the relay's argv would make /adopt and the pid resolvers
  *     mistake the relay for Claude itself.
  * The relay deletes the file as soon as it has read it.
+ *
+ * The file is NOT trusted on its own: it lives in a temp directory that other
+ * (sandboxed) sessions running as the same OS user can write to, and the relay
+ * executes its command OUTSIDE any sandbox. Its SHA-256 travels in argv (set
+ * by the worker, outside the attacker's reach) and the relay refuses a plan
+ * whose content does not match — a swapped plan cannot drop the confinement
+ * wrapper or run a host command.
  */
 export interface ProgramStatusRelayPlan { bin: string; args: string[] }
 
@@ -97,23 +105,32 @@ export function programStatusRelayLaunch(
   const dir = mkdtempSync(join(planRoot, PLAN_DIR_PREFIX));
   const planPath = join(dir, PLAN_FILE);
   const plan: ProgramStatusRelayPlan = { bin, args };
-  writeFileSync(planPath, JSON.stringify(plan), { mode: 0o600 });
+  const raw = JSON.stringify(plan);
+  writeFileSync(planPath, raw, { mode: 0o600 });
   return {
     bin: '/bin/sh',
-    args: ['-c', PARK_LOADER_ENV_SCRIPT, 'botmux-program-status-relay', entry.command, ...entry.args, planPath],
+    args: ['-c', PARK_LOADER_ENV_SCRIPT, 'botmux-program-status-relay', entry.command, ...entry.args, planDigest(raw), planPath],
     cleanup: () => { rmSync(dir, { recursive: true, force: true }); },
   };
 }
 
-/** Read and delete the plan file written by {@link programStatusRelayLaunch}. */
-export function consumeProgramStatusRelayPlan(planPath: string | undefined): ProgramStatusRelayPlan {
-  if (!planPath) throw new Error('program-status-relay: missing launch plan');
+function planDigest(raw: string): string {
+  return createHash('sha256').update(raw, 'utf8').digest('hex');
+}
+
+/** Read and delete the plan file written by {@link programStatusRelayLaunch},
+ *  accepting it only if its content matches the digest passed alongside it. */
+export function consumeProgramStatusRelayPlan(expectedDigest: string | undefined, planPath: string | undefined): ProgramStatusRelayPlan {
+  if (!planPath || !expectedDigest) throw new Error('program-status-relay: missing launch plan');
   let raw: string;
   try {
     raw = readFileSync(planPath, 'utf8');
   } finally {
     const dir = dirname(planPath);
     if (basename(planPath) === PLAN_FILE && basename(dir).startsWith(PLAN_DIR_PREFIX)) rmSync(dir, { recursive: true, force: true });
+  }
+  if (!/^[0-9a-f]{64}$/.test(expectedDigest) || planDigest(raw) !== expectedDigest) {
+    throw new Error('program-status-relay: launch plan does not match its digest (tampered?); refusing to run it');
   }
   const plan = JSON.parse(raw) as Partial<ProgramStatusRelayPlan>;
   if (typeof plan.bin !== 'string' || !plan.bin || !Array.isArray(plan.args) || !plan.args.every(a => typeof a === 'string')) {
@@ -133,7 +150,7 @@ function relayInterpreterPattern(execPath: string): string {
 }
 
 /** True when a process argv (`/proc/<pid>/cmdline`) is a program-status relay:
- *    <interpreter> [--no-env-file --config=/dev/null] <entry> <plan>
+ *    <interpreter> [--no-env-file --config=/dev/null] <entry> <sha256> <plan>
  *  where <entry> is `__program-status-relay` (compiled) or the relay script.
  *  Anchored at BOTH ends: a launcher whose argv merely ends with the relay
  *  command (`systemd-run … -- <relay>`, the `/bin/sh -c` env shim) must not
@@ -144,6 +161,6 @@ function relayInterpreterPattern(execPath: string): string {
 export function isProgramStatusRelayArgv(argv: readonly string[], execPath: string = process.execPath): boolean {
   const entry = `(?:${RELAY_TOKEN}|(?:\\S.*/)?(?:${escapeRegExp(RELAY_SCRIPT)}|${escapeRegExp(RELAY_SOURCE)}))`;
   const plan = `(?:\\S.*)?/${PLAN_DIR_PREFIX}[^/ ]+/${escapeRegExp(PLAN_FILE)}`;
-  const pattern = new RegExp(`^${relayInterpreterPattern(execPath)} (?:--no-env-file --config=/dev/null )?${entry} ${plan}$`);
+  const pattern = new RegExp(`^${relayInterpreterPattern(execPath)} (?:--no-env-file --config=/dev/null )?${entry} [0-9a-f]{64} ${plan}$`);
   return pattern.test(argv.join(' '));
 }

@@ -19488,7 +19488,9 @@ async function spawnCli(
     scheduleWrapperRealCliPid(panePid, {
       findRealPid: (lp) => {
         if (!isProgramStatusRelayArgv(readCmdline(lp))) return null;
-        const children = getChildPids(lp);
+        // The relay briefly runs `stty` (raw mode) before creating the CLI's
+        // PTY; never bind that helper. Otherwise its only child is the CLI.
+        const children = getChildPids(lp).filter(pid => readComm(pid) !== 'stty');
         return children.length === 1 ? children[0] : null;
       },
       getBackend: () => backend,

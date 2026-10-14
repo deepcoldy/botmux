@@ -67,6 +67,8 @@ function runWorkerWiring(late: boolean, options: {
   execAfterReads?: number;
   /** Direct children of the relay (pid 100). Defaults to the single child 150. */
   relayChildren?: number[];
+  /** comm of relay children (defaults to "claude"). */
+  childComms?: Record<number, string>;
   backendType?: string;
   /** This spawn wrapped the CLI in the OSC 7501 relay / backend reused an existing pane. */
   relayLaunched?: boolean;
@@ -110,6 +112,7 @@ function runWorkerWiring(late: boolean, options: {
       };
     })(),
     getChildPids: (pid: number) => (pid === 100 ? (options.relayChildren ?? [150]) : []),
+    readComm: (pid: number) => (pid === 100 ? (options.comm ?? 'node') : (options.childComms?.[pid] ?? 'claude')),
     isProgramStatusRelayArgv,
     programStatusRelayLaunched: options.relayLaunched ?? false,
     effectiveBackendType: options.backendType ?? 'tmux',
@@ -139,7 +142,7 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
   });
 
-  const RELAY_ARGV = ['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/botmux-psr-x/plan.json'];
+  const RELAY_ARGV = ['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', 'a'.repeat(64), '/tmp/botmux-psr-x/plan.json'];
   it.each([false, true])('binds the relay\'s direct child — whatever its comm — as the CLI pid (late PID=%s)', late => {
     // The child is exactly what the pane pid was before the relay existed, so a
     // node-named Claude (comm-only discovery cannot see it) is still bound.
@@ -181,6 +184,19 @@ describe('worker wrapper PID wiring', () => {
     expect(result.backend.cliPid).toBe(100);
   });
 
+  it.each([false, true])('never binds the relay\'s transient stty helper (late PID=%s)', late => {
+    const only = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', paneCmdline: RELAY_ARGV,
+      relayChildren: [149], childComms: { 149: 'stty' },
+    });
+    expect(only.backend.cliPid).toBe(100);
+    const both = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', paneCmdline: RELAY_ARGV,
+      relayChildren: [149, 150], childComms: { 149: 'stty' },
+    });
+    expect(both.backend.cliPid).toBe(150);
+  });
+
   it.each([false, true])('does not bind an ambiguous child set (late PID=%s)', late => {
     const result = runWorkerWiring(late, {
       cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', paneCmdline: RELAY_ARGV, relayChildren: [150, 151],
@@ -200,7 +216,7 @@ describe('worker wrapper PID wiring', () => {
   it.each([false, true])('binds the sandbox wrapper under the relay, as the pane pid was before (late PID=%s)', late => {
     const result = runWorkerWiring(late, {
       cliId: 'claude-code', claudeDataDir: '/claude', sandboxRequested: true,
-      paneCmdline: ['/opt/botmux', '__program-status-relay', '/tmp/botmux-psr-x/plan.json'],
+      paneCmdline: ['/opt/botmux', '__program-status-relay', 'a'.repeat(64), '/tmp/botmux-psr-x/plan.json'],
     });
     expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
     expect(result.backend.cliPid).toBe(150);

@@ -9,6 +9,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -30,6 +31,14 @@ import { buildBotWorkerEnv } from '../src/core/env-policy.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const sha256 = (raw: string) => createHash('sha256').update(raw, 'utf8').digest('hex');
+/** Write a relay plan the way the worker does: file + the digest that authenticates it. */
+function writeRelayPlan(planPath: string, plan: { bin: string; args: string[] }): string {
+  const raw = JSON.stringify(plan);
+  writeFileSync(planPath, raw);
+  return sha256(raw);
+}
+const D = 'a'.repeat(64);
 const PROBE_BEL = '\x1b]7501;?\x07';
 const PROBE_ST = '\x1b]7501;?\x1b\\';
 
@@ -140,9 +149,9 @@ describe('program-status relay launch plan', () => {
     const launch = compiledLaunch('/usr/bin/claude', ['--resume', 'x y', '']);
     const relayArgv = launch.args.slice(3);
     expect(relayArgv.slice(1, 2)).toEqual(['__program-status-relay']);
-    const planPath = relayArgv[2];
+    const [digest, planPath] = relayArgv.slice(2);
     expect(statSync(planPath).mode & 0o777).toBe(0o600);
-    expect(consumeProgramStatusRelayPlan(planPath)).toEqual({ bin: '/usr/bin/claude', args: ['--resume', 'x y', ''] });
+    expect(consumeProgramStatusRelayPlan(digest, planPath)).toEqual({ bin: '/usr/bin/claude', args: ['--resume', 'x y', ''] });
     expect(existsSync(dirname(planPath))).toBe(false);
     launch.cleanup(); // no-op after consumption
   });
@@ -171,13 +180,13 @@ describe('program-status relay launch plan', () => {
     // What the pane runs once the loader-env shim has exec'd.
     expect(isProgramStatusRelayArgv(launch.args.slice(3))).toBe(true);
     const plan = '/tmp/botmux-psr-AbC123/plan.json';
-    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', plan])).toBe(true);
-    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '--no-env-file', '--config=/dev/null', '/src/botmux/src/program-status-relay.ts', plan])).toBe(true);
+    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', D, plan])).toBe(true);
+    expect(isProgramStatusRelayArgv(['/usr/bin/bun', '--no-env-file', '--config=/dev/null', '/src/botmux/src/program-status-relay.ts', D, plan])).toBe(true);
     // macOS `ps` fallback whitespace-splits a checkout path containing spaces.
-    expect(isProgramStatusRelayArgv(`/opt/homebrew/bin/bun --no-env-file --config=/dev/null /Users/a/My Projects/botmux/src/program-status-relay.ts ${plan}`.split(' '))).toBe(true);
+    expect(isProgramStatusRelayArgv(`/opt/homebrew/bin/bun --no-env-file --config=/dev/null /Users/a/My Projects/botmux/src/program-status-relay.ts ${D} ${plan}`.split(' '))).toBe(true);
     // A TMPDIR containing whitespace puts spaces in the plan path itself.
-    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/my temp/botmux-psr-AbC123/plan.json'])).toBe(true);
-    expect(isProgramStatusRelayArgv(`/opt/botmux __program-status-relay /tmp/my temp/botmux-psr-AbC123/plan.json`.split(' '))).toBe(true);
+    expect(isProgramStatusRelayArgv(['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', D, '/tmp/my temp/botmux-psr-AbC123/plan.json'])).toBe(true);
+    expect(isProgramStatusRelayArgv(`/opt/botmux __program-status-relay ${D} /tmp/my temp/botmux-psr-AbC123/plan.json`.split(' '))).toBe(true);
     expect(isProgramStatusRelayArgv(['/usr/bin/claude', '--resume'])).toBe(false);
   });
 
@@ -190,7 +199,7 @@ describe('program-status relay launch plan', () => {
   it('does not mistake a launcher that has not exec\'d the relay yet for the relay', () => {
     // Under a user-systemd session scope the pane process starts as systemd-run
     // (then the env shim); both argvs END with the relay command.
-    const relay = ['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', '/tmp/botmux-psr-AbC123/plan.json'];
+    const relay = ['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', D, '/tmp/botmux-psr-AbC123/plan.json'];
     expect(isProgramStatusRelayArgv(['systemd-run', '--user', '--scope', '--quiet', '--collect', '--unit=x', '--', ...relay])).toBe(false);
     expect(isProgramStatusRelayArgv(['/bin/sh', '-c', 'exec "$@"', 'botmux-program-status-relay', ...relay])).toBe(false);
     expect(isProgramStatusRelayArgv(relay)).toBe(true);
@@ -225,12 +234,23 @@ describe('program-status relay launch plan', () => {
     expect(relayChildLaunch({ KEEP: '1' }, '/here')).toEqual({ cwd: '/here', env: { KEEP: '1' } });
   });
 
+  it('refuses a plan whose content was swapped after the worker wrote it', () => {
+    // Same-UID sandboxed sessions can write the temp dir; the relay runs the plan
+    // OUTSIDE the sandbox, so only the content the worker digested may run.
+    const launch = compiledLaunch('/usr/bin/bwrap', ['--', '/usr/bin/claude']);
+    const [digest, planPath] = launch.args.slice(-2);
+    writeFileSync(planPath, JSON.stringify({ bin: '/bin/sh', args: ['-c', 'echo pwned'] }));
+    expect(() => consumeProgramStatusRelayPlan(digest, planPath)).toThrow(/digest/);
+    expect(existsSync(dirname(planPath))).toBe(false);
+    expect(() => consumeProgramStatusRelayPlan('not-a-digest', planPath)).toThrow();
+  });
+
   it('rejects a missing or malformed plan', () => {
     planRoot = mkdtempSync(join(tmpdir(), 'relay-plan-test-'));
-    expect(() => consumeProgramStatusRelayPlan(undefined)).toThrow(/missing/);
+    expect(() => consumeProgramStatusRelayPlan(undefined, undefined)).toThrow(/missing/);
     const bad = join(planRoot, 'plan.json');
     writeFileSync(bad, '{"bin":1}');
-    expect(() => consumeProgramStatusRelayPlan(bad)).toThrow(/malformed/);
+    expect(() => consumeProgramStatusRelayPlan(sha256('{"bin":1}'), bad)).toThrow(/malformed/);
     // Only a botmux-psr-* directory is ever removed.
     expect(existsSync(planRoot)).toBe(true);
   });
@@ -298,10 +318,10 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     const script = `sleep 0.5; stty -opost; printf 'A\\nB\\r\\nC'; sleep 0.3; : > '${done}'`;
     const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
     const plan = join(planDir, 'plan.json');
-    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', script] }));
+    const digest = writeRelayPlan(plan, { bin: '/bin/sh', args: ['-c', script] });
     const { command, prefixArgs } = tsRunnerPrefix();
     const created = tmux('new-session', '-d', '-s', 'b', '-x', '80', '-y', '24', '-c', REPO_ROOT, '--',
-      command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan);
+      command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), digest, plan);
     expect(created.status, created.stderr).toBe(0);
     tmux('pipe-pane', '-O', '-t', 'b', `cat >> '${pipeLog}'`);
     const deadline = Date.now() + 15_000;
@@ -320,10 +340,10 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     const script = `stty -a > '${modes}'; sleep 0.5; printf '<\\344'; sleep 0.1; printf '\\275\\240\\360\\237'; sleep 0.1; printf '\\231\\202>'; sleep 0.3; : > '${done}'`;
     const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
     const plan = join(planDir, 'plan.json');
-    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', script] }));
+    const digest = writeRelayPlan(plan, { bin: '/bin/sh', args: ['-c', script] });
     const { command, prefixArgs } = tsRunnerPrefix();
     const created = tmux('new-session', '-d', '-s', 'u', '-x', '80', '-y', '24', '-c', REPO_ROOT, '--',
-      command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan);
+      command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), digest, plan);
     expect(created.status, created.stderr).toBe(0);
     tmux('pipe-pane', '-O', '-t', 'u', `cat >> '${pipeLog}'`);
     const deadline = Date.now() + 15_000;
@@ -343,11 +363,11 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     const done = join(dir, 'done');
     const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
     const plan = join(planDir, 'plan.json');
-    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', `: > '${done}'; sleep 0.3`] }));
+    const digest = writeRelayPlan(plan, { bin: '/bin/sh', args: ['-c', `: > '${done}'; sleep 0.3`] });
     const { command, prefixArgs } = tsRunnerPrefix();
     // (tmux's own `-e PATH=` does not reach the first pane command on 3.3a.)
     const created = tmux('new-session', '-d', '-s', 's', '-c', REPO_ROOT, '--',
-      '/usr/bin/env', `PATH=${bin}:${process.env.PATH}`, command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan);
+      '/usr/bin/env', `PATH=${bin}:${process.env.PATH}`, command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), digest, plan);
     expect(created.status, created.stderr).toBe(0);
     const deadline = Date.now() + 15_000;
     while (!existsSync(done) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
@@ -362,9 +382,9 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     const result = join(dir, 'relay.json');
     const planDir = mkdtempSync(join(dir, 'botmux-psr-'));
     const plan = join(planDir, 'plan.json');
-    writeFileSync(plan, JSON.stringify({ bin: '/bin/sh', args: ['-c', 'sleep 0.3; exec "$0" "$1" "$2"', process.execPath, fake, result] }));
+    const digest = writeRelayPlan(plan, { bin: '/bin/sh', args: ['-c', 'sleep 0.3; exec "$0" "$1" "$2"', process.execPath, fake, result] });
     const { command, prefixArgs } = tsRunnerPrefix();
-    const { order, piped } = await runInPane([command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), plan], result);
+    const { order, piped } = await runInPane([command, ...prefixArgs, join(REPO_ROOT, 'src/program-status-relay.ts'), digest, plan], result);
     expect(order).toEqual(['7501', 'da1']);
     expect(existsSync(planDir)).toBe(false);
     // The worker must not see the probe (it would send a second, late reply).

@@ -31,7 +31,8 @@ const FINAL_KILL_MS = 2000;
  *  helpers through the CLI's (possibly agent-writable) PATH. */
 const STTY = ['/bin/stty', '/usr/bin/stty'].find(p => existsSync(p)) ?? '/bin/stty';
 
-const plan = consumeProgramStatusRelayPlan(process.argv.slice(isStandaloneBinary() ? 3 : 2)[0]);
+const [planDigestArg, planPathArg] = process.argv.slice(isStandaloneBinary() ? 3 : 2);
+const plan = consumeProgramStatusRelayPlan(planDigestArg, planPathArg);
 const stdin = process.stdin;
 const stdout = process.stdout;
 // The launch shim parked interpreter loader options and moved us to `/` so no
