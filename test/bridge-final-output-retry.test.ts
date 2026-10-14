@@ -430,13 +430,40 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted] [Input]');
   });
 
-  it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
-    'does not add host image uploads to %s sessions', async mode => {
+  it.each(['workspace', 'temporary'])('uploads a local Codex App %s screenshot before replying', async location => {
+    const dir = mkdtempSync(join(location === 'workspace' ? config.session.dataDir : tmpdir(), 'codex-reply-image-'));
+    try {
+      const png = Buffer.from('89504e470d0a1a0a', 'hex');
+      const path = join(dir, 'receipt.png');
+      writeFileSync(path, png);
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'codex-app';
+      ds.workingDir = config.session.dataDir;
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), content: `Submitted. ![Receipt](${path})` }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('![Receipt](img_v3_uploaded_preview)');
+      expect(sessionReply.mock.calls[0][1]).not.toContain(path);
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'].flatMap(mode =>
+    (mode === 'non-adopted' ? ['claude-code'] : ['claude-code', 'codex-app']).map(cliId => ({ mode, cliId }))))(
+    'does not add host image uploads to $mode $cliId sessions', async ({ mode, cliId }) => {
       writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
       const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
       const ds = makeDs();
       ds.workingDir = config.session.dataDir;
+      ds.session.cliId = cliId;
       if (mode === 'non-adopted') ds.adoptedFrom = undefined;
       if (mode === 'sandbox') ds.session.sandbox = true;
       if (mode === 'remote') ds.session.backendType = 'remote-runner';
@@ -559,9 +586,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   });
 
   it.each([
-    { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } },
     { response: { status: 400, data: { code: 230001, msg: 'Invalid request' } } },
-    { response: { status: 400, data: { code: 230099, msg: 'ErrCode: 200571; card contains invalid image keys' } } },
     new Error('Request failed with status code 400'),
     new Error('card contains invalid image keys'),
   ])('does not treat an unrelated rejection as permission to downgrade images: %j', async error => {
@@ -1642,6 +1667,78 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
     expect(sessionReply.mock.calls[1][5]?.replyTarget)
       .toEqual({ mode: 'thread', rootMessageId: 'om_topic_b' });
+  });
+
+  it.each([
+    { imageRejected: false, noticeFails: false },
+    { imageRejected: true, noticeFails: false },
+    { imageRejected: false, noticeFails: true },
+  ])('settles permanent card rejection without replay or blocking the next turn: %j', async ({ imageRejected, noticeFails }) => {
+    const rejection = imageRejected
+      ? new Error('Failed to reply message: ErrCode: 200570; card contains invalid image keys (code: 230099)')
+      : { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } };
+    const sessionReply = vi.fn().mockRejectedValueOnce(rejection);
+    if (imageRejected) sessionReply.mockRejectedValueOnce(rejection);
+    if (noticeFails) sessionReply.mockRejectedValueOnce(new Error('notice unavailable'));
+    sessionReply.mockResolvedValue('om_reply');
+    const closeSession = vi.fn();
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-a', turnId: 'turn-a', state: 'prepared', content: 'A',
+        replyTarget: { mode: 'thread', rootMessageId: 'om_topic_a' } },
+      { dispatchId: 'dispatch-b', turnId: 'turn-b', state: 'accepted', content: 'B' },
+    ];
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const final = {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: imageRejected ? 'Answer A. ![Preview](img_v3_rejected)' : 'Answer A.',
+      lastUuid: 'uuid-a', turnId: 'turn-a',
+      codexAppSettlement: {
+        requestId: 'settle-a', generation: 'generation-1', seq: 1, dispatchId: 'dispatch-a',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>;
+    worker.emit('message', final);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toHaveLength(1));
+    const expectedCalls = imageRejected ? 3 : 2;
+    expect(sessionReply).toHaveBeenCalledTimes(expectedCalls);
+    const notice = sessionReply.mock.calls.at(-1)!;
+    expect(notice[2]).toBe('text');
+    expect(notice[1]).toContain('230099');
+    expect(notice[1]).not.toContain('Answer A.');
+    expect(notice[5].replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_topic_a' });
+    expect(notice[5].uuid).toHaveLength(50);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: 'card content 230099' });
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'codex_app_dispatch_persisted', requestId: 'settle-a', ok: true,
+    }));
+    expect(updateSessionMock).toHaveBeenCalled();
+
+    worker.emit('message', { ...final, codexAppSettlement: { ...final.codexAppSettlement, requestId: 'replay-a' } });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(expectedCalls);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'codex_app_dispatch_persisted', requestId: 'replay-a', ok: true,
+    }));
+
+    worker.emit('message', {
+      type: 'codex_app_dispatch_transition', sessionId: ds.session.sessionId,
+      requestId: 'prepare-b', operation: 'submit', entries: [{ dispatchId: 'dispatch-b', turnId: 'turn-b' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    worker.emit('message', {
+      ...final, content: 'Answer B.', turnId: 'turn-b', lastUuid: 'uuid-b',
+      codexAppSettlement: { requestId: 'settle-b', generation: 'generation-1', seq: 2, dispatchId: 'dispatch-b' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toHaveLength(0));
+    expect(sessionReply).toHaveBeenCalledTimes(expectedCalls + 1);
+    expect(sessionReply.mock.calls.at(-1)?.[1]).toContain('Answer B.');
+    expect(closeSession).not.toHaveBeenCalled();
   });
 
   it.each(['doc_comment', 'http_wait', 'http_async', 'suppressed'] as const)(
