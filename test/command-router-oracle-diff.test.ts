@@ -24,7 +24,7 @@ import {
 /** 设计 §10 的字母表：命令 / 子命令 / 透传 / 冷启动 / 未注册 / 多行豁免 / 占位符 / 中文 / latin / 引号 / 大小写。 */
 const ALPHABET = [
   '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
-  '/context-sharing', '/effort', '/resume',
+  '/context-sharing', '/effort', '/queue', '/resume',
   '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
 ];
@@ -88,6 +88,11 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // /queue is an explicit existing-session daemon command, not model text.
+  (input, legacy, next) => legacy.kind === 'forward'
+    && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
+    && next.kind === 'daemon' && next.cmd === '/queue'
+    && next.sessionPolicy === 'existing_only',
   // Codex App 的 /effort 由原生控制接口处理；其它 CLI 保留冻结的透传行为。
   (input, legacy, next) =>
     input.cliId === 'codex-app'

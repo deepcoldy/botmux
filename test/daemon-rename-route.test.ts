@@ -22,7 +22,7 @@
  * Run:  pnpm vitest run test/daemon-rename-route.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => {
   const sessions = new Map<string, any>();
   return {
     dataDir,
+    resolveLarkCliHomeForTurn: vi.fn(async () => `${dataDir}/fixture-lark-home`),
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     deleteMessage: vi.fn(async () => true),
@@ -161,6 +162,11 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
+vi.mock('../src/services/lark-cli-auth.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/lark-cli-auth.js');
+  return { ...actual, resolveLarkCliHomeForTurn: mocks.resolveLarkCliHomeForTurn };
+});
+
 vi.mock('../src/core/session-discovery.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-discovery.js');
   return { ...actual, discoverAdoptableSessions: mocks.discoverAdoptableSessions };
@@ -236,6 +242,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 
+import { sessionIdentityPath } from '../src/core/cli-identity.js';
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
@@ -622,6 +629,147 @@ describe('/rename production routing — must not pre-create a session (review P
 
   afterEach(() => {
     rmSync(crossRefPath(), { force: true });
+  });
+
+  it.each([false, true])('/queue missing session creates nothing (reply=%s)', async reply => {
+    const root = 'om_queue_missing';
+    const id = reply ? 'om_queue_missing_reply' : root;
+    const data = makeEventData(id, '/queue later', reply ? root : undefined);
+    if (reply) await handleThreadReply(data, makeCtx(root, id));
+    else await handleNewTopic(data, makeCtx(root, id));
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText()).toContain('没有活跃的会话');
+  });
+
+  it('/queue freezes serial inputs and preserves FIFO IDs, caller, body and reply placement', async () => {
+    const root = 'om_queue_root';
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: [OWNER], codexAppCleanInput: true });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'queue');
+    ds.session.cliId = 'codex-app';
+    ds.session.cliSessionId = 'native-queue-thread';
+    ds.workingDir = '/tmp';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    // Bot config remains Claude: the existing session's frozen CLI wins.
+    for (const [id, text] of [['om_queue_1', 'first <tag>\n/compact is literal text'], ['om_queue_2', 'next']]) {
+      await handleThreadReply(makeEventData(id, `/queue ${text}`, root), makeCtx(root, id));
+    }
+    expect(repliedText()).toContain('已接纳');
+    const turns = send.mock.calls.map(([m]) => m).filter(m => m.type === 'message');
+    expect(turns).toHaveLength(2);
+    expect(turns.map(m => m.turnId)).toEqual(['om_queue_1', 'om_queue_2']);
+    expect(turns.map(m => m.codexAppInput.text)).toEqual(['first <tag>\n/compact is literal text', 'next']);
+    for (const turn of turns) {
+      expect(turn.codexAppSteerable).toBeUndefined();
+      expect(turn.trustedCaller).toMatchObject({ requestUserOpenId: OWNER, senderType: 'user' });
+      expect(turn.content).not.toContain('/queue');
+    }
+    expect(ds.session.codexAppDispatchLedger?.map(e => e.turnId)).toEqual(['om_queue_1', 'om_queue_2']);
+    for (const entry of ds.session.codexAppDispatchLedger ?? []) {
+      expect(entry.codexAppSteerable).toBeUndefined();
+      expect(entry.replyTarget).toEqual({ mode: 'thread', rootMessageId: root });
+    }
+    expect(repliedText()).toContain('已接纳');
+  });
+
+  it.each(['other-cli', 'no-worker', 'killed', 'pending-repo', 'empty', 'post', 'sender-denied'])(
+    '/queue refuses %s without injecting model input', async mode => {
+      const root = 'om_queue_refused';
+      const ds = seedThreadSession(root, 'queue refused');
+      ds.session.cliId = mode === 'other-cli' ? 'claude-code' : 'codex-app';
+      ds.workingDir = '/tmp';
+      const send = vi.fn();
+      ds.worker = mode === 'no-worker' ? null : { killed: mode === 'killed', send } as any;
+      ds.pendingRepo = mode === 'pending-repo';
+      const data = makeEventData('om_queue_refusal', mode === 'empty' ? '/queue' : '/queue later', root);
+      if (mode === 'post') {
+        data.message.message_type = 'post';
+        data.message.content = JSON.stringify({ zh_cn: { title: '', content: [[{ tag: 'text', text: '/queue later' }, { tag: 'img', image_key: 'img_fake' }]] } });
+      }
+      if (mode === 'sender-denied') data.sender.sender_id.open_id = 'ou_unknown';
+      await handleThreadReply(data, makeCtx(root, 'om_queue_refusal'));
+      expect(send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+      expect(ds.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+      expect(repliedText()).not.toContain('已接纳');
+    },
+  );
+
+  it.each(['idle', 'working'] as const)('/queue publishes this turn and caller identity before IPC while %s', async state => {
+    const root = 'om_queue_identity';
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex-app',
+      allowedUsers: [OWNER], triggerUserAuth: { enabled: true, tools: ['lark-cli'], unauthorized: {} } as any });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'identity queue');
+    ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp'; ds.lastScreenStatus = state;
+    mkdirSync(`${mocks.dataDir}/fixture-lark-home`, { recursive: true });
+    const send = vi.fn((message: any) => {
+      if (message.type === 'message') {
+        const env = readFileSync(sessionIdentityPath(mocks.dataDir, ds.session.sessionId, 'lark-cli'), 'utf8');
+        expect(env).toContain("BOTMUX_IDENTITY_TURN='om_queue_identity_reply'");
+        expect(env).toContain('fixture-lark-home');
+      }
+    });
+    ds.worker = { killed: false, send } as any;
+    await handleThreadReply(makeEventData('om_queue_identity_reply', '/queue governed tools', root),
+      makeCtx(root, 'om_queue_identity_reply'));
+    expect(mocks.resolveLarkCliHomeForTurn).toHaveBeenCalledWith(OWNER);
+    expect(send.mock.calls.some(([m]) => m.type === 'message')).toBe(true);
+    expect(repliedText()).toContain('轮次不匹配');
+  });
+
+  it('/queue rolls back reply metadata when IPC cannot accept the input', async () => {
+    const root = 'om_queue_failed';
+    const ds = seedThreadSession(root, 'rejected queue');
+    ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp';
+    ds.session.quoteTargetId = 'om_previous'; ds.session.quoteTargetSenderOpenId = OWNER;
+    ds.worker = { killed: false, send: vi.fn(() => { throw new Error('fixture IPC closed'); }) } as any;
+    await handleThreadReply(makeEventData('om_queue_failed_reply', '/queue later', root),
+      makeCtx(root, 'om_queue_failed_reply'));
+    expect(ds.session.quoteTargetId).toBe('om_previous');
+    expect(ds.session.replyTargets?.om_queue_failed_reply).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.om_queue_failed_reply).toBeUndefined();
+    expect(repliedText()).toContain('未能入队');
+  });
+
+  it('/queue rechecks worker after the reaction await and does not send to its replacement', async () => {
+    const root = 'om_queue_reaction';
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex-app',
+      allowedUsers: [OWNER], disableStreamingCard: true });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'reaction queue');
+    ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp';
+    const original = vi.fn(), replacement = vi.fn();
+    ds.worker = { killed: false, send: original } as any;
+    mocks.addReaction.mockImplementationOnce(async () => {
+      ds.worker = { killed: false, send: replacement } as any;
+      return 'reaction_received';
+    });
+    await handleThreadReply(makeEventData('om_queue_reaction_reply', '/queue later', root),
+      makeCtx(root, 'om_queue_reaction_reply'));
+    expect(mocks.addReaction).toHaveBeenCalled();
+    expect([...original.mock.calls, ...replacement.mock.calls].some(([m]) => m.type === 'message')).toBe(false);
+    expect(repliedText()).toContain('未能入队');
+  });
+
+  it('/queue refuses a replaced worker after sender lookup without injecting into the replacement', async () => {
+    const root = 'om_queue_replaced';
+    const ds = seedThreadSession(root, 'queue replaced');
+    ds.session.cliId = 'codex-app';
+    ds.workingDir = '/tmp';
+    const original = vi.fn();
+    const replacement = vi.fn();
+    ds.worker = { killed: false, send: original } as any;
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      ds.worker = { killed: false, send: replacement } as any;
+      return { openId: OWNER, type: 'user' };
+    });
+    await handleThreadReply(makeEventData('om_queue_replaced_reply', '/queue later', root),
+      makeCtx(root, 'om_queue_replaced_reply'));
+    expect([...original.mock.calls, ...replacement.mock.calls].filter(([m]) => m.type === 'message')).toHaveLength(0);
+    expect(repliedText()).toContain('未能入队');
   });
 
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {

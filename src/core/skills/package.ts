@@ -5,6 +5,11 @@ import type { SkillPackage, SkillSource } from './types.js';
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/;
 
+export function isPathWithin(parent: string, target: string): boolean {
+  const rel = relative(parent, target);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
 export function isValidSkillName(name: string): boolean {
   return NAME_RE.test(name);
 }
@@ -22,8 +27,7 @@ export function loadSkillPackage(
   if (!valid.ok) throw new Error(valid.reason);
   const rootDir = realpathSync(dir);
   const entrypoint = realpathSync(join(rootDir, 'SKILL.md'));
-  const entrypointRelative = relative(rootDir, entrypoint);
-  if (entrypointRelative === '..' || entrypointRelative.startsWith(`..${sep}`) || isAbsolute(entrypointRelative)) {
+  if (!isPathWithin(rootDir, entrypoint)) {
     throw new Error('skill_entrypoint_outside_root');
   }
   if (!statSync(entrypoint).isFile()) throw new Error('skill_entrypoint_not_file');

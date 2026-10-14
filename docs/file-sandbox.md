@@ -233,6 +233,31 @@ daemon 不可达时，`delete` 等命令也不能退回离线写会话库。正�
 持有真实凭据后自行调用 API 或内核逃逸。规则继承与叠加语义见
 [Linux seccomp 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
 
+### 仅凭据隔离（credential-only）的发送通道与威胁模型
+
+设备已注册、但 Bot 没开完整文件沙盒时，Linux 用仅凭据隔离 bwrap：`/` 整体可读写，
+只把设备凭据目录、`.dashboard-secret*` 等宿主权威文件遮掉。这种形态下 pane 内的
+`botmux send` 走与完整沙盒**同一条 relay**：
+
+- 每个会话有自己的 outbox（`<数据目录>/sandboxes/<会话>/outbox`），以读写 bind
+  挂进 pane；`BOTMUX_SEND_RELAY` 由 bwrap 的 `--setenv` 注入（tmux 后端不会把
+  `BOTMUX*` 变量送进 pane，只靠 worker 的环境变量送不到）。
+- `<数据目录>/sandboxes` 整体被 tmpfs 遮住，只重新挂上本会话的 outbox：每个 outbox
+  里都有该会话的 relay capability，不能让一个 pane 读到兄弟会话的。
+- 热重连（daemon 重启、话题转移、挂起恢复）复用原 outbox 目录并重新发布
+  capability；原目录已丢失时不重连，改为 kill + 冷启。
+- `botmux dispatch --into <om_根消息>` 也经 relay 执行，宿主侧投递前会核对该根消息
+  确实在目标群里（`dispatch_chat_mismatch`）。
+- 隔离 pane 标记版本因此升至 16，旧 pane 冷启动一次。
+
+**威胁模型 / 已知边界**：设备凭据隔离（包括 credential-only）防的是 agent **无意中
+读到**设备凭据，不是对抗恶意 agent 的代码完整性边界。credential-only pane 对 `/` 可写，
+因此可以改动本机 botmux 的构建产物（如 `dist/cli.js`）及其依赖；宿主侧 outbox watcher
+会在 pane 外以同一份 CLI 重新执行请求，daemon 之后启动 worker / CLI 时同样会执行这些
+文件。也就是说，被篡改的构建产物会在宿主执行——这在引入 relay 之前就成立，relay 没有
+增加新能力。需要防恶意代码时请开启完整文件沙盒（只读挂载 botmux 安装目录），或使用
+远端执行后端。
+
 ## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
 
 no-transport 会话（core-only `apiOnly` bot、或 `http_async_*`/`http_wait_*` HTTP virtual 会话）**不被自动强制文件隔离**。它们的磁盘可读写范围和普通聊天会话一样，只由 bot 自己的 `sandbox`/`readIsolation` 配置决定：没配 → 不隔离（以同一 OS 用户身份对宿主文件有完整**读写**权，能读宿主 `bots.json`、也能改写宿主配置）；配了 → 照常隔离。

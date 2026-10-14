@@ -8934,7 +8934,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     process.exit(2);
   }
   const allowedFlags = new Set([
-    '--title', '--bot-app', '--chat-id', '--steer',
+    '--title', '--bot-app', '--chat-id', '--into', '--steer',
     '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
   ]);
   const unsupportedFlags = [...new Set(rest
@@ -8952,6 +8952,27 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     }));
     process.exit(2);
   }
+  // `--into` (append to an existing topic) is relayed as ONE bounded `om_` id.
+  // The host re-exec runs the ordinary dispatch path, whose daemon delivery
+  // route re-resolves the root's real chat and refuses it unless it equals the
+  // validated target chat (dispatch_chat_mismatch) — the thread and the chat
+  // are never two independently authorized targets. Reject ambiguity here so
+  // a duplicate cannot be resolved differently on either side of the relay.
+  const intoTokens = rest.filter(token => token === '--into' || token.startsWith('--into='));
+  const parsedRelayArgs = parseDispatchArgs(rest);
+  const intoRoot = parsedRelayArgs.ok ? parsedRelayArgs.value.into?.trim() : undefined;
+  if (intoTokens.length > 1 || (intoTokens.length === 1
+    && (!intoRoot || !/^om_[A-Za-z0-9_-]{1,128}$/.test(intoRoot)))) {
+    console.error(JSON.stringify({
+      success: false,
+      sourceSessionId: sid,
+      transportState: 'failed',
+      acceptanceState: 'not_requested',
+      errorCode: 'INVALID_DISPATCH_ROOT',
+      detail: 'sandbox dispatch --into takes exactly one om_ topic root message id',
+    }));
+    process.exit(2);
+  }
   const briefFile = argValue(rest, '--brief-file');
   let brief = argValue(rest, '--brief') ?? '';
   if (briefFile) {
@@ -8965,6 +8986,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   for (const flag of ['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate'] as const) {
     for (const value of argValues(rest, flag)) flags.push(flag, value);
   }
+  if (intoRoot) flags.push('--into', intoRoot);
   if (rest.includes('--steer')) flags.push('--steer');
   const id = randomBytes(8).toString('hex');
   const contentBase = `${id}.content`;
@@ -16597,6 +16619,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
+  else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the

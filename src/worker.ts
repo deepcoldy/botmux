@@ -25,7 +25,7 @@ import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrap
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
-import { installAidenCodexShim } from './services/aiden-codex-shim.js';
+import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -249,7 +249,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
@@ -332,6 +332,8 @@ import {
   findLaunchedCliPid,
   scheduleWrapperRealCliPid,
   readComm,
+  readCmdline,
+  getChildPids,
   cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
@@ -407,6 +409,8 @@ import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
   credentialOnlySandboxAvailable,
+  prepareCredentialOnlyRelayOutbox,
+  attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
   attachSandboxOutbox,
   startOutboxWatcher,
@@ -448,6 +452,7 @@ import {
   type IdleEvidenceSource,
 } from './utils/idle-detector.js';
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
+import { isProgramStatusRelayArgv, programStatusRelayLaunch } from './core/program-status-relay-launch.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { inspectPostTerminalComposer, resolvePtyInputPolicy } from './utils/pty-input-policy.js';
 import {
@@ -467,7 +472,8 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
 import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
@@ -5066,8 +5072,10 @@ function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): 
  * editing rate-limit code/tests puts phrases like "429 Too Many Requests" /
  * "exceeded retry limit" on screen, which the scraper cannot distinguish from a
  * real limit. So we suppress the screen-scan `rate` verdict and let the
- * structured path be the sole authority. `usage` (quota "hit your limit …") has
- * no structured equivalent yet, so it still comes from the screen.
+ * structured path be the sole authority. `usage` (quota "hit your limit …") is
+ * never suppressed on screen; for codex it is ALSO structured (a
+ * `usage_limit_exceeded` terminal, including a collaboration sub-agent's),
+ * because the screen scan is muted while the CLI is still working.
  *
  * Gate on the two capability fields (`claudeDataDir` for the Claude family;
  * `emitsStructuredRateLimit` for codex), NOT on `reliableTurnTerminal`. The
@@ -5215,6 +5223,13 @@ const bridgeRestoreGate = new BridgeRestoreGate();
  *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
  *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
+/** Codex collaboration sub-agents spawned during live ingest. Their quota
+ *  failures land in their own rollouts and reach the parent only as tool
+ *  results, so they are tailed separately and fed into the same structured
+ *  limit emit (see codex-subagent-limit-tracker.ts). */
+const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
+  () => codexBridgeRolloutPath ? codexSessionsRootFromRolloutPath(codexBridgeRolloutPath) : undefined,
+);
 /** Claude Code's automatic model switches for this bridge. The tracker owns the
  *  binding to the CURRENT Claude session id, the record-uuid dedupe and the
  *  "only report the serving model when it changed" rule; every transcript drain
@@ -7831,6 +7846,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   antigravityQuietCandidateKey = undefined;
   antigravityQuietCandidateCompleteOffset = undefined;
   codexBridgeRolloutPath = rolloutPath;
+  codexSubagentLimitTracker.clear();
   if (structuredBridgeIs('codex')) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -7885,6 +7901,14 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
         model: codex.latestModel,
         reasoningEffort: codex.latestReasoningEffort,
       });
+      // The cursor jumps to EOF below, so sub-agents started on the live side
+      // of the cutoff must be registered from this drain or never at all.
+      // Pre-cutoff ones are history, same as the absorbed parent events.
+      codexSubagentLimitTracker.observe(
+        codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
+        Date.now(),
+      );
+      maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
     }
     // Reuse this drain's runtime observation instead of a second full-file
     // scan — split-live already read the whole rollout above.
@@ -7944,6 +7968,13 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           model: codex.latestModel,
           reasoningEffort: codex.latestReasoningEffort,
         });
+        // Same as split-live: the cursor jumps to EOF, so live-side sub-agents
+        // must be registered from this drain or never at all.
+        codexSubagentLimitTracker.observe(
+          codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
+          Date.now(),
+        );
+        maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
       }
       if (structuredBridgeIs('traex')) {
         const traex = result as TraexDrainResult;
@@ -8127,6 +8158,7 @@ function codexBridgeDetachFile(): void {
   }
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexSubagentLimitTracker.clear();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   structuredBridgeDriverState = undefined;
@@ -8690,6 +8722,8 @@ function codexBridgeIngest(opts: {
       reasoningEffort: codex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
     });
     maybeEmitCodexStructuredRateLimit(result.events);
+    codexSubagentLimitTracker.observe(codex.spawnedSubagents, Date.now());
+    maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
@@ -8816,7 +8850,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
   for (const ev of events) {
     if (!isCodexRateLimitEvent(ev) || emittedRateLimitUuids.has(ev.uuid)) continue;
     emittedRateLimitUuids.add(ev.uuid);
-    const usageLimit = structuredRateLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
+    const usageLimit = structuredCodexLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests', ev.terminalLimitKind);
     usageLimitTracker.noteStructuredLimit(usageLimit);
     send({
       type: 'screen_update',
@@ -8826,7 +8860,7 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
-    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, kind=${usageLimit.kind}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
     return;
   }
 }
@@ -9440,6 +9474,7 @@ function stopCodexBridge(): void {
   publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexSubagentLimitTracker.clear();
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   structuredBridgeDriverState = undefined;
@@ -12462,7 +12497,13 @@ function onPtyData(data: string, isLiveStream = true): void {
         spawnArgvTurnStartEvidenceSeen = true;
         spawnArgvTurnStartBusyScanTail = '';
       }
+      const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
       idleDetector?.observeProgramStatus(part.event);
+      if (!wasAuthoritative && idleDetector?.programStatusActive()) {
+        // The probe log above only proves a probe was seen and answered; an
+        // accepted status report is the evidence the CLI took the handshake.
+        log(`[program-status] status received (state=${part.event.state}); authority engaged`);
+      }
     } else if (part.type === 'data') {
       handlePtyDataChunk(part.text);
     }
@@ -16726,7 +16767,7 @@ async function spawnCli(
     const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
     // isolatedPaneReattachSafe only means anything under a policy-ON spawn; the
     // state machine consults it only in that arm.
-    const isolationMarkerReattachSafe = appliedIsolationCapabilities.length > 0
+    const isolationMarkerMatches = appliedIsolationCapabilities.length > 0
       && isolatedPaneReattachSafe(marker, {
         requiredCapabilities: appliedIsolationCapabilities,
         exactCapabilities: true,
@@ -16737,6 +16778,20 @@ async function spawnCli(
           policyDigest: managedOriginChannelPolicyDigest,
         } : {}),
       });
+    // A live credential-only bwrap pane can only send through the relay outbox
+    // it bound at spawn (by inode). If that directory is gone, a successor
+    // worker cannot re-serve it — recreating the path yields an inode the pane
+    // never sees — so every send would time out. Treat it like any other unsafe
+    // generation: kill + cold-spawn, which provisions a fresh outbox and bind.
+    const credentialOnlyRelayReattachable = !credentialOnlyBwrap
+      || attachCredentialOnlyRelayOutbox({
+        sessionId: cfg.sessionId,
+        dataDir: isolationRuntimeDataDir,
+      }) !== null;
+    if (paneLive && isolationMarkerMatches && !credentialOnlyRelayReattachable) {
+      log(`[device-credential-isolation] persistent pane ${cfg.sessionId} lost its relay outbox — killing + cold-spawning instead of reattaching`);
+    }
+    const isolationMarkerReattachSafe = isolationMarkerMatches && credentialOnlyRelayReattachable;
     // Tombstone authorizes a policy-off warm reattach ONLY when it passes a SECURE
     // read (real 0600 regular file, right owner) + schema/version validation — a
     // bare lstat "present" (empty / dir / symlink / garbage) must NOT authorize.
@@ -17963,10 +18018,11 @@ async function spawnCli(
     childEnv.BOTMUX_ORIGIN_CHANNEL_ID = readIsolationOriginChannelId;
   }
 
-  // Credential-only children have no writable relay outbox. Publish the same
-  // rotating managed-origin claim through a host-owned per-channel directory
-  // before the Seatbelt/bwrap wrapper is compiled, then expose only that
-  // directory read-only below.
+  // Credential-only children also get the rotating managed-origin claim through
+  // a host-owned per-channel directory, published before the Seatbelt/bwrap
+  // wrapper is compiled and exposed read-only below. (Linux bwrap additionally
+  // gets a relay outbox further down; this first publish predates it and the
+  // credential-only arms publish again once the outbox is wired.)
   if (readIsolationOriginChannelId && !sandboxRequested) {
     readIsolationOriginCapabilityFile = managedOriginCapabilityPath(
       isolationRuntimeDataDir,
@@ -19011,6 +19067,15 @@ async function spawnCli(
           : undefined,
       });
       let aidenCodexShimDir: string | undefined;
+      // Session identity has NO channel other than the shim: when trigger-user
+      // auth / Lark tool binding injects the non-prefixed identity keys
+      // (SESSION_DATA_DIR / ZDOTDIR / BASH_ENV / GIT_ASKPASS,
+      // BOTMUX_LARK_TOOL_BINDING), aiden replaces Aiden's env but Codex does not
+      // forward its process env to the shells it spawns. Losing the shim would
+      // silently run tool shells as the machine owner, so fail the launch
+      // explicitly instead of degrading. Plain aiden-codex sessions (BOTMUX_*
+      // collaboration vars only) keep the old best-effort WARN behavior.
+      const aidenCodexIdentityShellEnv = cfg.triggerUserAuth?.enabled || boundLark;
       if (parseWrapperCli(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
         try {
           accessSync(cliAdapter.resolvedBin, fsConstants.X_OK);
@@ -19019,7 +19084,14 @@ async function spawnCli(
             join(sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId), 'aiden-codex'),
           );
         } catch (e) {
-          log(`[aiden-codex] WARN reasoning shim unavailable; using Aiden default effort: ${(e as Error).message}`);
+          if (aidenCodexIdentityShellEnv) {
+            throw new Error(
+              'aiden x codex launch refused: session identity (trigger-user auth / Lark tool '
+              + `binding) requires the PATH shim, but it could not be installed: ${(e as Error).message}`,
+            );
+          }
+          log(`[aiden-codex] WARN reasoning/shell-env shim unavailable; `
+            + `Aiden default effort and machine-owner shell identity: ${(e as Error).message}`);
         }
       }
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
@@ -19027,6 +19099,20 @@ async function spawnCli(
         childPath: effectiveChildEnv.PATH,
         aidenCodexRealBin: cliAdapter.resolvedBin,
         aidenCodexShimDir,
+        // Gate the fail-closed behavior on the SAME condition that adds the
+        // non-prefixed identity keys (see identityShellEnv above): only then is
+        // the shim the sole channel for a credential-boundary value.
+        requireAidenCodexShim: aidenCodexIdentityShellEnv,
+        // Persist the Codex config overrides Aiden rejects from argv
+        // (shell_environment_policy.*, service_tier, tui.auto_recap); the PATH
+        // shim reads them back when Aiden execs the real codex. trigger-user
+        // identity / lark tool binding depend on these reaching codex's tool
+        // shells — stripping silently would run tools under the machine owner's
+        // identity.
+        writeAidenShellConfigs: (configs) => {
+          if (!aidenCodexShimDir) throw new Error('aiden codex shim dir is unavailable');
+          return writeAidenCodexShellConfigs(aidenCodexShimDir, configs);
+        },
         pathDelimiter: delimiter,
       });
       if (launch.bin) {
@@ -19210,8 +19296,26 @@ async function spawnCli(
     }
     let credentialCliBin = spawnBin;
     try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
+    // A credential-only pane has no sound in-pane send authority (see
+    // prepareCredentialOnlyRelayOutbox for the four measured reasons), so give it
+    // the SAME host-side relay the full sandbox uses. Without this the confined
+    // `botmux send` fails closed on the data-root locator gate and the agent
+    // cannot answer the user at all.
+    const credentialRelay = prepareCredentialOnlyRelayOutbox({
+      sessionId: cfg.sessionId,
+      dataDir: isolationRuntimeDataDir,
+    });
+    if (!credentialRelay) {
+      throw new Error(
+        `[device-credential-isolation] refusing to start session ${cfg.sessionId}: `
+        + 'credential-only relay outbox could not be prepared',
+      );
+    }
     const credentialSandbox = prepareCredentialOnlySandbox({
-      hideDirectories: [...hideDirectories],
+      writableOutbox: credentialRelay.outbox,
+      // Hide every session's relay outbox (and its capability leaf); only this
+      // session's outbox is re-bound on top, after all masks.
+      hideDirectories: [...hideDirectories, credentialRelay.sessionsRoot],
       hideFiles: [...hideFiles],
       privateReadonlyDirectories: [
         {
@@ -19243,10 +19347,61 @@ async function spawnCli(
     }
     spawnBin = credentialSandbox.bin;
     spawnArgs = credentialSandbox.args;
+    // Same contract as the full sandbox: the child sees only the outbox path and
+    // never a Feishu credential; the host watcher re-execs the send outside the
+    // pane and performs the authoritative origin check.
+    childEnv.BOTMUX_SEND_RELAY = credentialRelay.outbox;
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+    if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+    sandboxCleanup = credentialRelay.cleanup;
+    sandboxRelayOutbox = credentialRelay.outbox;
+    // session-id is FORCED so a relayed send cannot target another session.
+    sandboxStopWatcher = startOutboxWatcher(
+      credentialRelay.outbox,
+      childEnv,
+      cfg.sessionId,
+      { authorize: authorizeManagedSend },
+    );
+    // Re-publish so the outbox capability leaf exists too: the earlier
+    // credential-only publish ran before an outbox existed and therefore wrote
+    // only the managed-origin copy.
+    publishSandboxRelayCapability({ failClosed: true });
     log(
       `[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only bwrap `
-      + `(${hideDirectories.size} authority dir(s), ${hideFiles.size} exact file(s))`,
+      + `(${hideDirectories.size} authority dir(s), ${hideFiles.size} exact file(s), `
+      + `relay outbox=${credentialRelay.outbox})`,
     );
+  } else if (willReattachPersistent && credentialOnlyBwrap) {
+    // Warm reattach (daemon restart, detach_for_transfer, suspend→resume) of a
+    // live credential-only pane: backend.spawn() ignores bin/args, so nothing
+    // above runs. The pane still has its outbox bind + BOTMUX_SEND_RELAY, but the
+    // previous worker's teardown revoked the capability leaf and its watcher died
+    // with it. Re-serve the SAME outbox (never recreate it — see
+    // attachCredentialOnlyRelayOutbox) exactly like the full-sandbox reattach
+    // arm, or every send from the surviving CLI is refused as stale/missing.
+    // The isolation-marker gate already cold-spawned any pane whose outbox is
+    // gone, so a null here means it vanished in between: fail closed.
+    const credentialRelay = attachCredentialOnlyRelayOutbox({
+      sessionId: cfg.sessionId,
+      dataDir: isolationRuntimeDataDir,
+    });
+    if (!credentialRelay) {
+      throw new Error(
+        `[device-credential-isolation] refusing to reattach session ${cfg.sessionId}: `
+        + 'credential-only relay outbox disappeared before it could be re-served',
+      );
+    }
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+    sandboxCleanup = credentialRelay.cleanup;
+    sandboxRelayOutbox = credentialRelay.outbox;
+    sandboxStopWatcher = startOutboxWatcher(
+      credentialRelay.outbox,
+      childEnv,
+      cfg.sessionId,
+      { authorize: authorizeManagedSend },
+    );
+    publishSandboxRelayCapability();
+    log(`[device-credential-isolation] REATTACH (${cfg.cliId}): live pane kept, re-wired relay outbox=${credentialRelay.outbox}`);
   }
 
   // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
@@ -19281,6 +19436,8 @@ async function spawnCli(
   // launch env and proves the old key, while an actual fresh start consumes
   // the candidate and proves the new key. The worker trusts cryptographic
   // proof, not a backend's prediction flag.
+  let programStatusRelayPlanCleanup: (() => void) | undefined;
+  let programStatusRelayLaunched = false;
   try {
     if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
@@ -19314,6 +19471,32 @@ async function spawnCli(
         log(`Session scope unavailable; using backend lifecycle cleanup: ${scoped.capabilities.reason}`);
       }
     }
+    if (
+      !cfg.adoptMode && !willReattachPersistent && effectiveBackendType === 'tmux'
+      && cliAdapter.id === 'claude-code' && cliAdapter.supportsProgramStatus
+      && process.env.BOTMUX_PROGRAM_STATUS_RELAY !== '0'
+    ) {
+      // tmux answers the CLI's DA1 sentinel itself, before the worker can see
+      // the OSC 7501 probe via pipe-pane, so Claude Code would disable program
+      // status. An in-pane relay answers the probe ahead of the DA1 query
+      // (src/program-status-relay.ts). The pane pid becomes the relay; the
+      // real CLI pid is resolved below (startWrapperRealPidResolve).
+      // Outermost, i.e. OUTSIDE the session scope: the relay's launch shim is a
+      // shell script with `$VAR` references, and systemd-run (258+) expands
+      // environment references in its payload by default. `systemd-run
+      // --scope` execs in place, so the relay's direct child is still exactly
+      // the process the pane pid used to be.
+      const relayed = programStatusRelayLaunch(spawnBin, spawnArgs);
+      if (relayed) {
+        spawnBin = relayed.bin;
+        spawnArgs = relayed.args;
+        programStatusRelayPlanCleanup = relayed.cleanup;
+        programStatusRelayLaunched = true;
+        log('[program-status] launching CLI behind in-pane OSC 7501 relay');
+      } else {
+        log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
+      }
+    }
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
       cols: PTY_COLS,
@@ -19334,12 +19517,15 @@ async function spawnCli(
     if (!willReattachPersistent) writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
   } catch (err) {
     cleanupCodexAppControlBootstrap();
+    programStatusRelayPlanCleanup?.();
     throw err;
   } finally {
     delete childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV];
   }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // A late same-named pane was reused, so the relay never ran to consume its plan.
+  if (actuallyReattachedPersistent) programStatusRelayPlanCleanup?.();
   if (actuallyReattachedPersistent) lastSpawnArgvDurableInitialPrompt = false;
   // ── Generational-race commit/teardown for the read-isolation provenance proof ──
   // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
@@ -19527,21 +19713,55 @@ async function spawnCli(
   // wrapperCli is ignored, so there is no launcher indirection). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
-  const startWrapperRealPidResolve = (launcherPid: number): void => {
+  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): void => {
+    log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
+    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+    // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
+    // module-level bridgeCliPid and re-points to the real CLI's jsonl.
+    bridgeCliPid = realPid;
+    publishLocalProcessAttestation(realPid);
+  };
+  // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
+  // reports while this spawn is current (equal to launcherPid unless a relay
+  // sits between the pane and the launcher).
+  const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
     if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
+      getChildPid: () => (backend?.getChildPid?.() === panePid ? launcherPid : null),
+      applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  const startWrapperRealPidResolve = (panePid: number): void => {
+    // The OSC 7501 relay sits between the pane and what used to be the pane
+    // process: its single direct child is exactly the pid the pane reported
+    // before the relay existed (CLI, sandbox wrapper or wrapperCli launcher),
+    // whatever that process's comm. Unwrap that one level, then resolve as
+    // before. A fresh relayed launch is known from this spawn's decision — the
+    // pane may still be the launch shell that has not exec'd the relay yet. A
+    // daemon-restart reattach to an already-relayed pane is recognised from
+    // its cmdline.
+    const viaRelay = (programStatusRelayLaunched && !actuallyReattachedPersistent)
+      || (effectiveBackendType === 'tmux' && isProgramStatusRelayArgv(readCmdline(panePid)));
+    if (!viaRelay) { resolveBehindWrapper(panePid, panePid); return; }
+    if (!claudeDataDir && cfg.cliId !== 'codex') return;
+    scheduleWrapperRealCliPid(panePid, {
+      findRealPid: (lp) => {
+        if (!isProgramStatusRelayArgv(readCmdline(lp))) return null;
+        // The relay briefly runs `stty` (raw mode) before creating the CLI's
+        // PTY; never bind that helper. Otherwise its only child is the CLI.
+        const children = getChildPids(lp).filter(pid => readComm(pid) !== 'stty');
+        return children.length === 1 ? children[0] : null;
+      },
+      getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
-      applyRealPid: (realPid) => {
-        log(`wrapperCli "${cfg.wrapperCli}": resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${targetCliId}); rewiring session discovery + bridge`);
-        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
-        // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
-        // module-level bridgeCliPid and re-points to the real CLI's jsonl.
-        bridgeCliPid = realPid;
-        publishLocalProcessAttestation(realPid);
+      applyRealPid: (childPid) => {
+        applyResolvedCliPid(childPid, 'program-status relay', panePid);
+        resolveBehindWrapper(childPid, panePid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });

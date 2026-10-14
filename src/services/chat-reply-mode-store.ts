@@ -22,12 +22,15 @@
  * chat / shared deliberately fold native topics into the group session.
  *
  * Resolution: per-chat override (`chatReplyModes[chatId]`) wins; otherwise fall
- * back to the per-bot default (`regularGroupReplyMode`, default 'chat-topic'). The
+ * back to the per-bot default (`regularGroupReplyMode`, default 'chat-topic').
+ * An explicit set always persists as an override (even when equal to the
+ * default); only clearChatReplyMode (`/reply-mode inherit`) restores inheritance. The
  * setting is bot-scoped: Bot A can prefer topic replies in one group while Bot B
  * or another group stays flat.
  */
 import { rmwBotEntry } from './config-store.js';
 import { getBot, type ChatReplyMode, type GroupMentionMode } from '../bot-registry.js';
+import { dashboardEventBus } from '../core/dashboard-events.js';
 import { logger } from '../utils/logger.js';
 import { signedChatMentionDefault } from './signed-chat-defaults.js';
 
@@ -51,13 +54,49 @@ export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'new-top
   return 'chat';
 }
 
+/** `/reply-mode inherit` 及其别名：清除群级覆盖、恢复跟随 Bot 默认。 */
+export function isChatReplyModeInheritArg(raw: string | undefined): boolean {
+  const v = raw?.trim().toLowerCase();
+  return v === 'inherit' || v === 'default' || v === 'reset' || v === 'clear';
+}
+
 /** Per-bot default regular-group mode (`regularGroupReplyMode`, default 'chat-topic'). */
-function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
+export function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
   try {
     return getBot(larkAppId).config.regularGroupReplyMode ?? 'chat-topic';
   } catch {
     return 'chat-topic';
   }
+}
+
+export interface ChatReplyModeState {
+  /** 显式群级覆盖；`null` 表示本群继承 Bot 默认。 */
+  override: ChatReplyMode | null;
+  /** Bot 默认（`regularGroupReplyMode`）。 */
+  default: ChatReplyMode;
+  /** 当前生效值 = override ?? default。 */
+  effective: ChatReplyMode;
+  inherited: boolean;
+}
+
+/** 读出 (bot × chat) 的完整回复模式策略，包括生效值来自哪里。 */
+export function getChatReplyModeState(larkAppId: string, chatId: string): ChatReplyModeState {
+  const defaultMode = regularGroupDefaultMode(larkAppId);
+  let override: ChatReplyMode | undefined;
+  try {
+    override = getBot(larkAppId).config.chatReplyModes?.[chatId];
+  } catch { /* 与 resolveRegularGroupMode 同口径：读不到 bot 即视为继承 */ }
+  return {
+    override: override ?? null,
+    default: defaultMode,
+    effective: override ?? defaultMode,
+    inherited: override === undefined,
+  };
+}
+
+/** 通知 Dashboard 群矩阵快照失效（经 daemon SSE → aggregator）。chatId 缺省表示 Bot 默认变化、影响所有继承群。 */
+export function publishReplyPolicyChanged(chatId?: string): void {
+  dashboardEventBus.publish({ type: 'groups.reply-policy.changed', body: chatId ? { chatId } : {} });
 }
 
 /**
@@ -130,40 +169,125 @@ export function resolveRegularGroupMode(larkAppId: string, chatId: string | unde
   return regularGroupDefaultMode(larkAppId);
 }
 
-export async function setChatReplyMode(
+/**
+ * 同一 bot 的 chatReplyModes「落盘 + 内存同步」按进程内队列串行。
+ *
+ * 写路径把磁盘上的整份快照赋给内存（顺带修复陈旧/外部编辑），所以两次写的「内存
+ * 赋值」必须与「落盘」同序：withFileLock 在关闭锁文件句柄前就已释放锁，较早的
+ * 请求可能在较晚的请求落盘并同步内存之后才恢复，再把自己的旧快照盖回内存——两个
+ * 不同群并发修改时会丢掉较晚那个群的覆盖（bots.json 里两者都在），同一群并发时
+ * 内存会停在较旧的值。串行后每次都基于上一次落盘结果，内存与磁盘顺序一致。
+ */
+const replyModeWriteQueues = new Map<string, Promise<void>>();
+
+function serializeReplyModeWrite<T>(larkAppId: string, task: () => Promise<T>): Promise<T> {
+  const previous = replyModeWriteQueues.get(larkAppId) ?? Promise.resolve();
+  const run = previous.then(task);
+  const tail = run.then(() => undefined, () => undefined);
+  replyModeWriteQueues.set(larkAppId, tail);
+  void tail.then(() => {
+    if (replyModeWriteQueues.get(larkAppId) === tail) replyModeWriteQueues.delete(larkAppId);
+  });
+  return run;
+}
+
+export function setChatReplyMode(
   larkAppId: string,
   chatId: string,
   mode: ChatReplyMode,
-): Promise<{ ok: true; mode: ChatReplyMode } | { ok: false; reason: string }> {
+): Promise<({ ok: true; mode: ChatReplyMode } & ChatReplyModeState) | { ok: false; reason: string }> {
+  return serializeReplyModeWrite(larkAppId, () => setChatReplyModeNow(larkAppId, chatId, mode));
+}
+
+async function setChatReplyModeNow(
+  larkAppId: string,
+  chatId: string,
+  mode: ChatReplyMode,
+): Promise<({ ok: true; mode: ChatReplyMode } & ChatReplyModeState) | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  // Persist only when the per-chat mode differs from the per-bot default, so
-  // bots.json stays tidy in the common default-off case while an explicit
-  // opt-out (e.g. per-bot default new-topic, this chat pinned back to chat)
-  // still sticks instead of being silently dropped.
-  const redundant = mode === regularGroupDefaultMode(larkAppId);
-
-  const r = await rmwBotEntry<ChatReplyMode>(larkAppId, (entry) => {
-    if (!entry.chatReplyModes || typeof entry.chatReplyModes !== 'object' || Array.isArray(entry.chatReplyModes)) {
-      entry.chatReplyModes = {};
-    }
-    if (redundant) {
-      delete entry.chatReplyModes[chatId];
-      if (Object.keys(entry.chatReplyModes).length === 0) delete entry.chatReplyModes;
-    } else {
-      entry.chatReplyModes[chatId] = mode;
-    }
-    return { write: true, result: mode };
+  // 显式设置一律落盘为群级覆盖，即使当前恰好等于 Bot 默认：否则日后改 Bot 默认会
+  // 悄悄改变这个群。恢复继承只走 clearChatReplyMode（`/reply-mode inherit`）。
+  const r = await rmwBotEntry<Record<string, ChatReplyMode>>(larkAppId, (entry) => {
+    const next = normalizeChatReplyModeMap(entry.chatReplyModes);
+    next[chatId] = mode;
+    entry.chatReplyModes = next;
+    return { write: true, result: next };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
-  const next = { ...(bot.config.chatReplyModes ?? {}) };
-  if (redundant) delete next[chatId];
-  else next[chatId] = mode;
-  bot.config.chatReplyModes = Object.keys(next).length > 0 ? next : undefined;
-  logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=${mode}`);
-  return { ok: true, mode };
+  const othersResynced = !sameModesExcept(bot.config.chatReplyModes, r.result, chatId);
+  bot.config.chatReplyModes = r.result;
+  logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=${mode}${othersResynced ? ' (resynced other chats from disk)' : ''}`);
+  // 磁盘快照若同时改变了其它群（bots.json 被外部改过），按整表失效而不只本群。
+  publishReplyPolicyChanged(othersResynced ? undefined : chatId);
+  return { ok: true, mode, ...getChatReplyModeState(larkAppId, chatId) };
+}
+
+/** 删除群级覆盖，让本群重新跟随 Bot 默认。幂等：没有覆盖时 cleared=false。 */
+export function clearChatReplyMode(
+  larkAppId: string,
+  chatId: string,
+): Promise<({ ok: true; cleared: boolean } & ChatReplyModeState) | { ok: false; reason: string }> {
+  return serializeReplyModeWrite(larkAppId, () => clearChatReplyModeNow(larkAppId, chatId));
+}
+
+async function clearChatReplyModeNow(
+  larkAppId: string,
+  chatId: string,
+): Promise<({ ok: true; cleared: boolean } & ChatReplyModeState) | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const r = await rmwBotEntry<{ cleared: boolean; modes?: Record<string, ChatReplyMode> }>(larkAppId, (entry) => {
+    const raw = entry.chatReplyModes;
+    const rawRecord = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+    const cleared = rawRecord !== undefined && Object.prototype.hasOwnProperty.call(rawRecord, chatId);
+    const next = normalizeChatReplyModeMap(raw);
+    delete next[chatId];
+    const modes = Object.keys(next).length > 0 ? next : undefined;
+    if (!cleared) return { write: false, result: { cleared, modes } };
+    if (modes) entry.chatReplyModes = modes;
+    else delete entry.chatReplyModes;
+    return { write: true, result: { cleared, modes } };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  // 即使是幂等空清除，也用磁盘快照覆盖内存，顺手修复陈旧的内存覆盖。这种重同步可能
+  // 改变其它群（甚至本群）的生效策略：只要内存表实际变了就发失效事件，不论请求的 key
+  // 在磁盘上是否存在——经飞书 `/reply-mode inherit` 触发时 dashboard 只能靠这条事件得知。
+  const before = bot.config.chatReplyModes;
+  const othersResynced = !sameModesExcept(before, r.result.modes, chatId);
+  const selfChanged = before?.[chatId] !== r.result.modes?.[chatId];
+  bot.config.chatReplyModes = r.result.modes;
+  logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=inherit cleared=${r.result.cleared}${othersResynced ? ' (resynced other chats from disk)' : ''}`);
+  if (othersResynced) publishReplyPolicyChanged();
+  else if (r.result.cleared || selfChanged) publishReplyPolicyChanged(chatId);
+  return { ok: true, cleared: r.result.cleared, ...getChatReplyModeState(larkAppId, chatId) };
+}
+
+/** 两张覆盖表在忽略 `chatId` 之后是否完全相同（用于判断重同步是否波及其它群）。 */
+function sameModesExcept(
+  a: Record<string, ChatReplyMode> | undefined,
+  b: Record<string, ChatReplyMode> | undefined,
+  chatId: string,
+): boolean {
+  const keys = new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})]);
+  keys.delete(chatId);
+  for (const key of keys) if (a?.[key] !== b?.[key]) return false;
+  return true;
+}
+
+function normalizeChatReplyModeMap(raw: unknown): Record<string, ChatReplyMode> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, ChatReplyMode> = {};
+  for (const [chatId, value] of Object.entries(raw)) {
+    if (!chatId.trim() || typeof value !== 'string') continue;
+    const mode = normalizeChatReplyMode(value);
+    if (mode) out[chatId] = mode;
+  }
+  return out;
 }
 
 /**

@@ -18,13 +18,13 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 /**
  * Field wedge (TraeX, high-traffic "ambient" groups): TraeX redrew its
  * composer and the screen went quiet BEFORE task_complete reached the rollout.
- * Screen-idle published prompt-ready; the later structured terminal re-armed
- * the post-terminal composer fence (isPromptReady=false), and the external
- * fireIdle() was a no-op because the detector was already idle. The screen
- * then stayed static forever, so no idle edge ever re-ran the fence check.
- * A new durable IM message cleared the fence via a fresh capture but could not
- * type-ahead (dispatchAttempt), and nothing restored prompt-ready — every
- * later message queued until a human typed into the web terminal.
+ * The structured lifecycle gate keeps a started turn unpublished (a quiet
+ * mid-turn composer is rejected), so when task_complete later reaches the
+ * rollout the post-terminal composer fence is armed with isPromptReady=false.
+ * The transcript's fireIdle() then has to re-run the fence verification against
+ * a screen that stays completely static — without it no idle edge would ever
+ * restore prompt-ready, and every later durable (dispatchAttempt) message would
+ * stay queued until a human typed into the web terminal.
  */
 
 const children = new Set<ChildProcess>();
@@ -256,22 +256,36 @@ setInterval(() => {
     appendFileSync(rolloutPath, rolloutUser(firstSubmission.text, nativeTurnId));
 
     // TraeX redraws its composer and goes quiet BEFORE the rollout terminal.
+    // With the structured lifecycle gate, a quiet composer mid-turn must NOT
+    // publish prompt-ready: the started turn is still unfinished, so the idle
+    // heuristic is rejected until task_complete lands.
     const readyBeforeComposer = messages.filter(m => m.type === 'prompt_ready').length;
+    const logsBeforeComposer = logs.length;
     writeFileSync(releasePath, '1');
     await waitFor(
       child,
-      () => messages.filter(m => m.type === 'prompt_ready').length > readyBeforeComposer,
+      () => logs.slice(logsBeforeComposer).some(line =>
+        line.includes('Ignoring prompt-ready heuristic while a structured turn is unfinished')),
       logs,
-      'screen-idle prompt readiness on the quiet composer',
+      'lifecycle gate rejects the quiet composer before the terminal',
     );
+    expect(messages.filter(m => m.type === 'prompt_ready').length).toBe(readyBeforeComposer);
 
-    // The structured terminal arrives afterwards; the screen never changes again.
+    // The structured terminal arrives afterwards; the screen never changes
+    // again. The transcript's fireIdle() runs the post-terminal fence recheck
+    // on the static screen, which restores prompt-ready before any later input.
     appendFileSync(rolloutPath, rolloutTerminal(nativeTurnId));
     await waitFor(
       child,
       () => messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_first'),
       logs,
       'structured terminal for the first turn',
+    );
+    await waitFor(
+      child,
+      () => messages.filter(m => m.type === 'prompt_ready').length > readyBeforeComposer,
+      logs,
+      'prompt-ready restored after the terminal despite a static screen',
     );
 
     child.send({ type: 'message', content: 'second prompt', turnId: 'om_second', dispatchAttempt: 1 } satisfies DaemonToWorker);

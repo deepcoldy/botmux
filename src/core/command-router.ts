@@ -51,13 +51,15 @@ export function parseSlashCommandInvocation(content: string): SlashCommandInvoca
   const cmd = cmdRaw?.toLowerCase();
   if (!cmd) return null;
 
+  // Explicit payload commands keep their entire body, including examples.
+  const literalBody = commandSpec(cmd)?.literalBody === true;
   // Treat angle-bracket placeholders as documentation, not an invocation.
-  if (/<[^>\r\n]+>/.test(firstLine)) return null;
+  if (!literalBody && /<[^>\r\n]+>/.test(firstLine)) return null;
 
   const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
   if (restNonBlank.length > 0) {
     // A list of slash commands is almost certainly discussion / planning text.
-    if (restNonBlank.some(l => l.startsWith('/'))) return null;
+    if (!literalBody && restNonBlank.some(l => l.startsWith('/'))) return null;
     if (!MULTILINE_COMMANDS.has(cmd)) return null;
   }
 

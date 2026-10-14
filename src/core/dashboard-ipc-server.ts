@@ -154,7 +154,14 @@ import {
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
-import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
+import {
+  clearChatReplyMode,
+  getChatReplyModeState,
+  isChatReplyModeInheritArg,
+  normalizeChatReplyMode,
+  setChatReplyMode,
+  type ChatReplyMode,
+} from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import {
@@ -173,7 +180,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -5701,6 +5708,42 @@ ipcRoute('PUT', '/api/chat-group-grant', requireBoundBot(async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+// 只读：单群拓扑（群管理对话框打开时查一次）。列表接口 /im/v1/chats 不返回
+// group_message_type，「普通群切成话题布局」只能靠单群详情识别；复用
+// getChatModeStrict（自带缓存），失败时回 'unknown' 让前端保守处理。
+ipcRoute('GET', '/api/group-chat-mode/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  const chatMode = await getChatModeStrict(cachedLarkAppId, p.chatId);
+  return jsonRes(res, 200, { ok: true, chatId: p.chatId, chatMode });
+});
+
+// 群管理页按 (群 × bot) 设置普通群回复模式。mode='inherit' 清除群级覆盖、恢复
+// 跟随 Bot 默认——收缩性删除，不做拓扑闸（群被切成话题布局后也要能清掉休眠覆盖）；
+// 其它值写入新覆盖，必须严格确认是普通群（查不到拓扑时 fail-closed）。
+// VC 会议仍走上面兼容的 POST /api/chat-reply-mode（本地写、不查拓扑）。
+ipcRoute('PUT', '/api/group-reply-mode/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const rawMode = typeof (body as any)?.mode === 'string' ? (body as any).mode : '';
+  if (isChatReplyModeInheritArg(rawMode)) {
+    const result = await clearChatReplyMode(cachedLarkAppId, p.chatId);
+    if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
+    return jsonRes(res, 200, { ...result, chatId: p.chatId });
+  }
+  const mode = normalizeChatReplyMode(rawMode);
+  if (!mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  const chatMode = await getChatModeStrict(cachedLarkAppId, p.chatId);
+  if (chatMode === 'unknown') return jsonRes(res, 503, { ok: false, error: 'chat_mode_unconfirmed' });
+  if (chatMode !== 'group') return jsonRes(res, 409, { ok: false, error: 'regular_group_required' });
+  if (isSessionGroup(p.chatId)) return jsonRes(res, 409, { ok: false, error: 'session_group_not_configurable' });
+  const result = await setChatReplyMode(cachedLarkAppId, p.chatId, mode);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
+  return jsonRes(res, 200, { ...result, chatId: p.chatId });
+});
+
 ipcRoute('PUT', '/api/group-idle-close/:chatId', requireBoundBot(async (req, res, p) => {
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   let settings: GroupIdleCloseSettings;
@@ -5810,6 +5853,7 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
         ...agentDefaults,
         serialInput: groupSerialInput[c.chatId] === true,
         idleClose: groupIdleClose[c.chatId] ?? DEFAULT_GROUP_IDLE_CLOSE,
+        replyMode: getChatReplyModeState(cachedLarkAppId, c.chatId),
         ...(groupDefaultModels[c.chatId] ? { defaultModels: groupDefaultModels[c.chatId] } : {}),
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,

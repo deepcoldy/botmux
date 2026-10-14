@@ -1,5 +1,6 @@
 import { GroupIdleCloseRow } from './group-idle-close.js';
 import { GroupCardModeRow } from './group-card-mode.js';
+import { GroupReplyModeSection } from './group-reply-mode.js';
 import { GroupSerialInputRow } from './group-serial-input.js';
 import { GroupDefaultModelsRow } from './group-default-models.js';
 import { describeCloseResidual } from '../../core/close-residual.js';
@@ -1655,6 +1656,11 @@ export function ManageDialog(props: {
           onSaved={() => props.onReloadGroups({ force: true })}
         />)}
       </fieldset>
+
+      {chat.sessionGroup ? null : <GroupReplyModeSection
+        chat={chat} disabled={!available}
+        onSaved={() => props.onReloadGroups({ force: true })}
+      />}
 
       <fieldset data-group-idle-close>
         <legend>{tr('groups.idleClose')}</legend>

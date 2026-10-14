@@ -27,7 +27,7 @@ botmux workspace-recycle finish \
 botmux workspace-recycle status --operation reclaim-example-001
 ```
 
-同一次操作的终态事件不能从失败改成成功，也不能换 `eventId`。失败回收后的新一轮使用新的 `operationId`。准备失败时，外部 Hook 应停止工作区删除；修复原因后重新准备，身份或目标集合变更时创建新的操作。相同成功事件可以重放，已验证关闭的会话只回读。
+同一次操作的终态事件不能从失败改成成功，也不能换 `eventId`。失败回收后的新一轮使用新的 `operationId`。从未准备落盘的操作（例如发现失败而被拒绝）收到失败事件时返回 `not_prepared`，不关闭任何会话；收到成功事件则拒绝。准备失败时，外部 Hook 应停止工作区删除；修复原因后重新准备，身份或目标集合变更时创建新的操作。相同成功事件可以重放，已验证关闭的会话只回读。
 
 主机 CLI 会从受管进程上下文识别当前会话；脱离会话的 Hook 可在 `prepare` 显式传 `--initiator <exact-sessionId>`。它必须属于发现的目标集合。准备时允许该发起会话仍在运行，其他忙碌会话会阻止准备成功。成功回收后：
 
@@ -73,7 +73,7 @@ Botmux 不调用工作区删除程序。外部生命周期系统通过显式配�
 配置方应保证：
 
 - before 事件在删除前执行，准备失败会阻止删除；after 事件读取实际回收结果。
-- 删除失败或被阻止时，以同一 operationId 发送 `outcome: failed` 的 after 事件。准备从未落盘的操作（例如发现失败而被拒绝）返回 `not_prepared`，不关闭任何会话；成功事件仍要求已准备的操作。
+- 删除失败或被阻止时，以同一 operationId 发送 `outcome: failed` 的 after 事件；未准备的操作按上文返回 `not_prepared`。
 - Hook 重试沿用原 operationId 与 eventId。
 - operationId、原事件和命令回执保存在工作区之外；同一次失败的网络回执先回读再重放。
 - 两个阶段使用相同主机与 `SESSION_DATA_DIR`，覆盖所有相关 Bot。daemon 不在线、版本缺少此接口、鉴权失败或任意 store 无法读取均作为失败处理。

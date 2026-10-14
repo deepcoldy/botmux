@@ -1897,7 +1897,7 @@ export interface BotConfig {
    * Codex flagged in review.
    */
   defaultOncallAutoboundChats?: string[];
-  /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
+  /** Per-chat reply mode override: chat_id → 普通群 @bot 后回复形态。缺省时继承 regularGroupReplyMode；由 /reply-mode 或 dashboard 群管理写入，`/reply-mode inherit` 清除。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
@@ -3609,8 +3609,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
-    // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
-    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
+    // new-topic｜shared 都保留解析。显式设置即使与当前 per-bot 默认相同也保留为覆盖；
+    // 只有 clearChatReplyMode（`/reply-mode inherit`）才删除键、恢复继承。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};

@@ -34229,6 +34229,12 @@ a.card-menu-item {
 .group-card-mode-row > small[data-card-mode-state]:not(.hint-warn-inline) { color: var(--text-2); }
 .group-card-mode-row > small:empty { display: none; }
 
+.group-reply-mode-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 8px 0; }
+.group-reply-mode-row + .group-reply-mode-row { border-top: 1px solid var(--border); }
+.group-reply-mode-row select { width: auto; min-width: 0; max-width: 100%; }
+.group-reply-mode-row > small { flex-basis: 100%; }
+.group-reply-mode-row > small:empty { display: none; }
+
 .group-idle-close-row { display: grid; gap: 10px; padding: 12px 0; }
 .group-idle-close-row + .group-idle-close-row { border-top: 1px solid var(--border); }
 .group-idle-close-row .toggle-row { margin: 0; }

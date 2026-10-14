@@ -11,14 +11,17 @@
  * test/helpers/traex-tape-player.mjs replays the result as a fake `traex`.
  *
  * Only the rollout records the worker bridge consumes are kept (see
- * keepRollout); records carrying system prompts or reasoning are dropped. Paths are replaced by
- * placeholders. Review the tape before committing it.
+ * keepRollout); records carrying system prompts or reasoning are dropped.
+ * Identifying data is removed by scripts/traex-tape-redaction.ts, which refuses
+ * to write a tape it cannot prove clean. Review the tape before committing it.
  *
  * Usage: node --import tsx scripts/record-traex-tape.ts [out.json] [prompt...]
  * (node-pty delivers no output under bun, so run it with node.)
  */
 import { execFileSync } from 'node:child_process';
 import { spawn as ptySpawn } from 'node-pty';
+import { findTraexRolloutSetByPid } from '../src/services/traex-transcript.js';
+import { createTapeRedactor, isIdleRepaintChunk, measureReplayCells, parseGreetingName, secretTokens, stripAnsi } from './traex-tape-redaction.js';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -50,37 +53,15 @@ function listRollouts(dir: string, acc: string[] = []): string[] {
   return acc;
 }
 
-// The banner greets the logged-in account ("Hello, <name>"); never commit it.
+// The banner greets the logged-in account ("Hello, <name>" / "Good
+// afternoon, <name>"); never commit it.
 let accountName: string | undefined;
 // Provider model names (banner + status bar + turn_context) are not ours to publish.
 const modelNames = new Set<string>();
 
-function sameWidth(base: string, width: number): string {
-  return base.length >= width ? base.slice(0, width) : base.padEnd(width, '-');
-}
-
-function sanitize(text: string): string {
-  let out = text
-    .replaceAll(workDir, '{{CWD}}')
-    .replaceAll(homedir(), '{{HOME}}');
-  // Same-width placeholders keep the recorded box drawing aligned.
-  if (accountName) out = out.replaceAll(accountName, sameWidth('tape-user', accountName.length));
-  for (const model of modelNames) out = out.replaceAll(model, sameWidth('tape-model', model.length));
-  return out;
-}
-
 // TraeX 0.209's banner logo blinks forever (◆/─ eyes repainted in place), so
 // the PTY is never byte-silent. Quiescence for recording purposes ignores
-// chunks whose visible content is only those glyphs.
-function stripAnsi(data: string): string {
-  // eslint-disable-next-line no-control-regex
-  return data.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b[78]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
-}
-
-function isLogoBlink(data: string): boolean {
-  return /^[◆─\s]*$/.test(stripAnsi(data));
-}
-
+// idle repaints (see isIdleRepaintChunk).
 // Allow-list of rollout records the worker bridge consumes. Everything else
 // (session_meta, world_state, thread_settings_applied, model-side history
 // items, reasoning) carries system prompts or private context.
@@ -89,17 +70,17 @@ const KEPT_EVENT_MSGS = new Set(['task_started', 'task_complete', 'token_count',
 function keepRollout(record: any): unknown | undefined {
   const p = record?.payload ?? {};
   if (record?.type === 'event_msg' && KEPT_EVENT_MSGS.has(p.type)) {
-    return JSON.parse(sanitize(JSON.stringify(record)));
+    return record;
   }
   if (record?.type === 'history_mutation' && Array.isArray(p.display_completions)) {
     const display = p.display_completions.filter((c: any) =>
       c?.item?.type === 'UserMessage' || c?.item?.type === 'AgentMessage');
     if (display.length === 0) return undefined;
-    return JSON.parse(sanitize(JSON.stringify({
+    return {
       timestamp: record.timestamp,
       type: 'history_mutation',
       payload: { version: p.version, operation: p.operation, turn_id: p.turn_id, items: [], display_completions: display },
-    })));
+    };
   }
   if (record?.type === 'turn_context') {
     return { timestamp: record.timestamp, type: 'turn_context', payload: { turn_id: p.turn_id, model: p.model, effort: p.effort } };
@@ -127,10 +108,10 @@ const pty = ptySpawn(bin, [
 const rawPty: Array<{ t: number; data: string }> = [];
 pty.onData((data) => {
   const t = now();
-  if (!isLogoBlink(data)) lastPtyAt = t;
+  if (!isIdleRepaintChunk(data)) lastPtyAt = t;
   screenTail = (screenTail + data).slice(-4000);
   const visibleTail = stripAnsi(screenTail);
-  accountName ??= visibleTail.match(/Hello, ([^\s│]+)/)?.[1];
+  accountName ??= parseGreetingName(visibleTail);
   const model = visibleTail.match(/model:\s+(\S+)\s+\/model/)?.[1];
   if (model && model !== 'loading') modelNames.add(model);
   rawPty.push({ t, data });
@@ -150,9 +131,24 @@ function readAppended(path: string, offset: number): { text: string; next: numbe
   return { text: buf.toString('utf8'), next: size };
 }
 
+// history.jsonl is shared by every TraeX pane under this TRAE_HOME. Buffer
+// it raw and keep only the recorded session's lines once that is proven.
+const historyLines: Array<{ t: number; line: string }> = [];
+
 const poll = setInterval(() => {
   if (!rolloutPath) {
-    rolloutPath = listRollouts(sessionsRoot).find(p => !existing.has(p));
+    // Another pane may create a rollout concurrently: accept only one the
+    // spawned process itself holds open (fd ownership, Linux /proc).
+    const owned = findTraexRolloutSetByPid(pty.pid);
+    if (owned === undefined) {
+      clearInterval(poll);
+      pty.kill();
+      throw new Error('cannot prove rollout ownership (fd enumeration unavailable); refusing to record');
+    }
+    rolloutPath = listRollouts(sessionsRoot).find(p => {
+      const sid = p.match(/([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/)?.[1]?.toLowerCase();
+      return !existing.has(p) && !!sid && owned.has(sid);
+    });
   }
   if (rolloutPath && existsSync(rolloutPath)) {
     const { text, next } = readAppended(rolloutPath, rolloutOffset);
@@ -176,7 +172,7 @@ const poll = setInterval(() => {
     const lines = historyPending.split('\n');
     historyPending = lines.pop() ?? '';
     for (const line of lines) {
-      if (line.trim()) events.push({ t: now(), kind: 'history', record: JSON.parse(sanitize(line)) });
+      if (line.trim()) historyLines.push({ t: now(), line });
     }
   }
 }, 10);
@@ -209,31 +205,37 @@ try {
   pty.kill();
 }
 
-// Sanitize PTY bytes only now: the account name may be learnt mid-stream.
+const nativeSessionId = rolloutPath?.match(/([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/)?.[1];
+if (!nativeSessionId) throw new Error('no owned rollout was recorded');
+for (const { t, line } of historyLines) {
+  const record = JSON.parse(line);
+  if (record?.session_id === nativeSessionId) events.push({ t, kind: 'history', record });
+}
 for (const chunk of rawPty) events.push({ t: chunk.t, kind: 'pty', data: chunk.data });
 events.sort((a, b) => a.t - b.t);
-const finalEvents: TapeEvent[] = JSON.parse(sanitize(JSON.stringify(events)));
-const serialized = JSON.stringify(finalEvents);
-// Independent of what the banner parser learnt: the OS account must never
-// appear either (it is usually a prefix of the greeting name).
-if (!accountName) throw new Error('could not find the banner greeting; refusing to write an unsanitized tape');
-for (const secret of [accountName, userInfo().username, ...modelNames]) {
-  if (!secret) continue;
-  const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Word-bounded so identifiers such as `root_turn_id` do not trip a `root` account.
-  if (new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`).test(serialized)) {
-    throw new Error(`sanitizer left "${secret}" in the tape`);
-  }
-}
 
-const nativeSessionId = rolloutPath?.match(/([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/)?.[1];
-writeFileSync(out, `${JSON.stringify({
+// Redact and validate the WHOLE tape (prompts included), not just events: the
+// account name may be learnt mid-stream, so this runs last.
+if (!accountName) throw new Error('could not find the banner greeting; refusing to write an unsanitized tape');
+const secrets = {
+  accountName,
+  osUser: userInfo().username,
+  homeDir: homedir(),
+  workDir,
+  modelNames,
+};
+// Placeholder widths must match the worker's headless renderer exactly.
+const cellWidth = await measureReplayCells([...secretTokens(secrets), ...modelNames]);
+const redactor = createTapeRedactor(secrets, cellWidth);
+const tape = redactor.redactTape({
   version: 1,
   recordedWith: (() => { try { return execFileSync(bin, ['--version']).toString().split('\n')[0]; } catch { return 'unknown'; } })(),
   cols: 160,
   rows: 50,
   nativeSessionId,
   prompts,
-  events: finalEvents,
-}, null, 1)}\n`);
-console.log(`tape: ${out} (${events.length} events, session ${nativeSessionId})`);
+  events,
+});
+redactor.assertCleanTape(tape);
+writeFileSync(out, `${JSON.stringify(tape, null, 1)}\n`);
+console.log(`tape: ${out} (${tape.events.length} events, session ${nativeSessionId})`);

@@ -83,13 +83,14 @@ describe('structured-bridge-clis', () => {
     // started Pi turn may suppress the screen-ready heuristic (the custom-tool
     // terminate:true gap is accepted — next user turn HOL-drops the head).
     // grok: user_message_chunk → turn_completed with normalized stop reasons.
-    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'pi', 'oh-my-pi', 'ebsd', 'grok']);
+    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex', 'traex', 'pi', 'oh-my-pi', 'ebsd', 'grok']);
     expect(isStructuredBridgeLifecycleBlockingCli('codex')).toBe(true);
+    expect(isStructuredBridgeLifecycleBlockingCli('traex')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('pi')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('oh-my-pi')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('ebsd')).toBe(true);
     expect(isStructuredBridgeLifecycleBlockingCli('grok')).toBe(true);
-    for (const id of ['traex', 'coco', 'hermes', 'mtr', 'cursor', 'antigravity']) {
+    for (const id of ['coco', 'hermes', 'mtr', 'cursor', 'antigravity']) {
       expect(isStructuredBridgeLifecycleBlockingCli(id)).toBe(false);
     }
   });
