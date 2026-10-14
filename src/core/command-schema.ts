@@ -38,7 +38,7 @@ export interface CommandSpec {
   /** 别名（fallthrough case），含前导 `/`。 */
   readonly aliases?: readonly string[];
   /** 仅指定 CLI 由 daemon 处理；不加入全局命令集合，保留其它 CLI 的透传行为。 */
-  readonly cliId?: string;
+  readonly cliId?: string | readonly string[];
   readonly sessionPolicy: CommandSessionPolicy;
   /**
    * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器，从不建会话。
@@ -169,7 +169,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
-  { name: '/effort', cliId: 'codex-app', sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
+  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
 ];
 
 /** 话题路由元命令：由 `parseTopicHeader` 在命令表之前拦截，不在 `DAEMON_COMMANDS` 里。

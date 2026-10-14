@@ -391,6 +391,17 @@ describe('buildStreamingCard: signature stability', () => {
 
 
 describe('session reasoning selector', () => {
+  it('shows next-turn scope for a confirmed CLI menu preference while displaying actual current effort', () => {
+    const card = build({ cliId: 'codex', usage: {
+      context: null, tokens: null, reasoningEffort: 'high',
+      reasoningControl: { choices: ['high', 'max'], selected: 'max', pending: true, nextTurn: true },
+    } });
+    const select = card.elements.flatMap((e: any) => e.actions ?? []).find((a: any) => a.tag === 'select_static');
+    expect(select.initial_option).toBe('high');
+    expect(JSON.stringify(card)).toContain('下一轮生效');
+    expect(JSON.stringify(card)).not.toContain('下次冷启动');
+  });
+
   it.each([undefined, 'unrecognized'])('falls back to the saved choice when reported effort is %s', reasoningEffort => {
     const card = build({ cliId: 'codex', usage: {
       context: null, tokens: null, reasoningEffort,

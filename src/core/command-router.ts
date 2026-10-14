@@ -183,7 +183,8 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   if (special) return { kind: 'special', cmd, content, handler: special };
 
   const spec = commandSpec(cmd);
-  const cliCommand = spec?.cliId !== undefined && spec.cliId === input.cliId;
+  const cliCommand = spec?.cliId !== undefined && (typeof spec.cliId === 'string'
+    ? spec.cliId === input.cliId : spec.cliId.includes(input.cliId ?? ''));
 
   // ④ 透传闸（先于 DAEMON_COMMANDS；两集合恒不相交，顺序因此不可观测）。
   if (!cliCommand && input.passthrough.has(cmd)) {

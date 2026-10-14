@@ -7852,6 +7852,9 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
   return {
     choices: reasoningEffortsForCliModel('codex', ds.activeModel ?? cfg.model),
     selected: ds.session.reasoningEffort,
+    ...(ds.codexCliEffortConfirmed?.effort === ds.session.reasoningEffort
+      && ds.codexCliEffortConfirmed?.workerGeneration === ds.workerGeneration
+      && ds.codexCliEffortConfirmed ? { nextTurn: true } : {}),
     pending: !!ds.session.reasoningEffort && (!!ds.session.suspendedColdResume
       || ds.session.reasoningEffort !== (ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort)),
   };
@@ -9905,6 +9908,82 @@ export type ExactTurnInterruptResult =
   | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
 
 /** Native settings use their own receipt, without rotating business-turn state. */
+const pendingCodexCliEffort = new WeakSet<DaemonSession>();
+
+/** A native menu receipt saves a future-turn preference, never activeRuntime. */
+export function updateCodexCliEffort(
+  ds: DaemonSession, effort: string, timeoutMs = 35_000,
+): Promise<import('../types.js').CodexAppEffortResult> {
+  const worker = ds.worker;
+  const cfg = ds.initConfig ?? ds.session;
+  if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex'
+    || !worker || worker.killed || !ds.workerReady || !ds.cliReady
+    || ds.session.status !== 'active' || isSessionTransferring(ds)
+    || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli
+    || ds.initConfig?.codexRpcInput || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
+    || pendingCodexCliEffort.has(ds)) return Promise.resolve({ status: 'unavailable', reason: 'cli_menu_unavailable' });
+  if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) return Promise.resolve({ status: 'invalid' });
+  const generation = ds.workerGeneration;
+  const nativeId = ds.session.cliSessionId;
+  const sessionGeneration = ds.session.workerGeneration;
+  const requestId = randomUUID();
+  pendingCodexCliEffort.add(ds);
+  return new Promise(resolve => {
+    let settled = false;
+    const current = () => ds.worker === worker && ds.workerGeneration === generation
+      && ds.session.workerGeneration === sessionGeneration
+      && ds.session.cliSessionId === nativeId && ds.session.status === 'active';
+    const finish = (result: import('../types.js').CodexAppEffortResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      pendingCodexCliEffort.delete(ds);
+      resolve(result);
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type !== 'codex_cli_effort_result' || msg.requestId !== requestId) return;
+      if (!current()) return finish({ status: 'error' });
+      if (msg.status === 'future_only' && msg.reason === 'cli_next_turn') {
+        const selected = effort as NonNullable<Session['reasoningEffort']>;
+        const before = ds.session.reasoningEffort;
+        const snapshot = ds.session.cliLaunchSnapshot;
+        const beforeSnapshot = snapshot?.reasoningEffort ?? null;
+        ds.session.reasoningEffort = selected;
+        if (snapshot) snapshot.reasoningEffort = selected;
+        try { sessionStore.updateSession(ds.session); }
+        catch {
+          ds.session.reasoningEffort = before;
+          if (snapshot) snapshot.reasoningEffort = beforeSnapshot;
+          return finish({ status: 'error' });
+        }
+        if (ds.initConfig) ds.initConfig.reasoningEffort = selected;
+        ds.codexCliEffortConfirmed = { effort: selected, workerGeneration: generation };
+        scheduleActiveRuntimePatch(ds);
+      }
+      finish(msg);
+    };
+    const onExit = (): void => finish({ status: 'error' });
+    const timer = setTimeout(() => {
+      try { if (current()) worker.send({ type: 'codex_cli_effort_cancel', requestId } satisfies DaemonToWorker); } catch { /* exited */ }
+      finish({ status: 'error' });
+    }, timeoutMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    try {
+      if (!afterWorkerIpcBootstrap(worker, () => {
+        if (settled) return;
+        if (!current()) return finish({ status: 'unavailable' });
+        worker.send({ type: 'codex_cli_effort', requestId, effort,
+          deadline: Date.now() + Math.max(1, timeoutMs - 2_000) } satisfies DaemonToWorker);
+      })) finish({ status: 'unavailable' });
+    } catch { finish({ status: 'error' }); }
+  });
+}
+
 export function updateCodexAppEffort(
   ds: DaemonSession,
   effort: string,
@@ -15036,6 +15115,7 @@ function setupWorkerHandlers(
         }
         ds.activeModel = model;
         ds.activeReasoningEffort = reasoningEffort;
+        if (ds.codexCliEffortConfirmed?.effort === reasoningEffort) ds.codexCliEffortConfirmed = undefined;
         if (ds.session.dispatchLaunchSpec && model) {
           ds.session.dispatchLaunchSpec.effectiveRuntime = {
             model, ...(reasoningEffort ? { reasoningEffort } : {}),

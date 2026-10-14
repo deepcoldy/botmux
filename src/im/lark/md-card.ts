@@ -164,6 +164,8 @@ export interface CardUsageSnapshot {
   reasoningEffort?: string;
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {
+    /** Native CLI menu accepted this setting for the next turn. */
+    nextTurn?: boolean;
     choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
     selected?: string;
     pending: boolean;

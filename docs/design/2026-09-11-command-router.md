@@ -234,6 +234,7 @@ type SessionPhase =
 |---|---|---|---|---|
 | `/queue <消息>` | 未注册，作为普通模型输入，可引导当前轮 | existingOnly、多行 daemon 命令；Codex App 活会话冻结为 serial FIFO，新轮次执行；其它 CLI / 无活 worker 明确拒绝 | 不改变普通消息引导；不创建会话；仍走命令授权；附件暂不支持 |  #1880（接纳前刷新按人身份；等待期间单槽可被新消息覆盖） |
 | Codex App 会话内 `/effort <档位>` | 无 raw 透传面，作为普通模型输入 | schema 按 `cliId: codex-app` 登记为只用于已有会话的 daemon 命令，通过原生设置接口更新；其它 CLI 仍透传 | 调整后续轮次推理强度；更新当前轮需显式启用实验特性 `step_model_switching`（默认关闭）；不创建模型轮次，CLI 专属命令不进入全局 daemon 集合 | #1817 |
+| Codex CLI 会话内 `/effort <档位>` | 原样透传，CLI 不识别 `/effort` | schema 匹配 `codex`，操作原生 `/model` 菜单；按新增的原生设置记录确认后保存会话设置 | 仅后续轮次生效；不创建或中断模型轮次，其它 CLI 继续透传 | 本次变更 |
 | 头部 `/repo wt <目标> [分支]` | 拒（`repo_worktree_unsupported`） | 可用 | 直接动因 | PR-1 |
 | `/repo wt` 用法串与帮助行不一致（zh/en） | 两条互相矛盾 | 由 schema 生成一条 | 自相矛盾的东西修好必然改掉一条 | PR-2 |
 | thread 路径 `/card` `/cot` 的前置特判 | 与新话题路径不一致（§3 第 9 层） | 两条路径同一张矩阵 | 收敛；行为上 `/card`/`/cot` 在 thread 里本就不需要会话 | PR-2 |

@@ -1,6 +1,8 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
-  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — Change Codex App reasoning effort for future turns; active-turn updates require explicitly enabling the experimental step_model_switching feature (off by default; levels depend on the current model)',
+  'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — Change Codex reasoning effort: CLI uses its native menu for future turns; App active-turn updates require explicitly enabling the experimental step_model_switching feature (off by default; levels depend on the current model)',
+  'cmd.effort.cli_next_turn': 'This session will use {effort} starting with the next turn; the running turn keeps its original effort.',
+  'cmd.effort.cli_menu_unavailable': 'The Codex CLI model menu cannot be operated safely (a draft, another menu, input operation, or unsupported backend may be present). Keep your draft, close other menus and retry, or use /model manually.',
   'cmd.effort.applied': 'Future turns will use {effort}; the server accepted the active-turn update. If further inference steps occur in this turn, they can use the new setting; requests already issued keep their original parameters.',
   'cmd.effort.future_only': 'Future turns will use {effort}; the active turn update was not confirmed (it may have completed or the API may be unavailable).',
   'cmd.effort.step_model_switching_disabled': 'Future turns will use {effort}; the active turn was not updated because Codex has not enabled the experimental step_model_switching feature (off by default; Botmux does not enable it automatically). See /help and the slash command documentation for prerequisites.',
@@ -1185,6 +1187,7 @@ export const messages: Record<string, string> = {
   'card.effort.ultra': 'Ultra',
   'card.effort.scope': 'This session only · save while idle, apply on next cold start',
   'card.effort.pending': 'Pending · saved for next cold start; current process and services keep running',
+  'card.effort.next_turn': 'Set to {effort} for the next turn; the running turn keeps its original effort',
   'card.effort.saved': 'Session effort saved for next cold start; current services keep running.',
   'card.effort.busy': 'This turn is still running or starting. Try again after it finishes.',
   'card.effort.unsupported': 'This session does not support reasoning changes from cards.',
