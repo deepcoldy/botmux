@@ -20,6 +20,7 @@ import { config } from '../config.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
+import { detectUnusableOwnerEntries } from '../setup/owner-identity.js';
 import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
@@ -29,7 +30,7 @@ import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
-import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { isReservedPerBotEnvKey, nextPerBotEnv, parsePerBotEnvText, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
@@ -157,13 +158,13 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'envPolicy', configKey: 'envPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: '进程环境继承策略 JSON：{"mode":"strict","inherit":["HTTPS_PROXY"]}；默认 inherit 兼容旧行为。仅变量名，不填值；下次 worker 冷启动生效，旧 pane 策略不匹配时拒绝复用；unset 恢复默认' },
   { key: 'sandboxNetworkPolicy', configKey: 'sandboxNetworkPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: 'Linux 本地 PTY oncall 沙箱的公网/内网目标 IP 策略；version=1，public/private 各含 mode: allow|block|allowlist|denylist 和 rules[{cidr,protocol?,ports?}]；不支持域名或宿主 MCP/Unix IPC；下个新会话生效，unset 恢复 sandboxNetwork' },
-  { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
+  { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量，接受 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"}）、{"env":{…}} settings 片段、.env / export KEY=… 行或 exec env 启动脚本（让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY；保留键如 CLAUDE_CONFIG_DIR 会被拒绝）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
   { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"]}；tools 省略=全部。未授权时 lark-cli / bytedcli 一律拒绝（拒绝消息里会附授权链接，点开后重试即可），不会用 bot 或任何人的身份代跑；fallback 字段仅为兼容旧配置保留，当前不再改变行为。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
-  { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
+  { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
   { key: 'remoteRunner', configKey: 'remoteRunner', kind: 'json', effect: 'next-session', clearable: true, hint: '通用 Remote Runner 协议配置 JSON（expectedProvider/requiredCapabilities/handshakeTimeoutMs/operationTimeoutMs）；provider 可执行文件用 cliPathOverride 指定；不得写入凭据；unset 清除' },
 ];
@@ -279,6 +280,35 @@ export type ApplyFieldResult =
 let displayNameRefresher: (() => void) | null = null;
 export function setDisplayNameRefresher(fn: (() => void) | null): void {
   displayNameRefresher = fn;
+}
+
+/**
+ * Dashboard env save. Unlike {@link applyConfigField}, the merged map is
+ * computed INSIDE the bots.json file lock from the on-disk `env`, so two
+ * concurrent merge/remove saves can't lose each other's keys (computing from
+ * an in-memory snapshot first would let the later write resurrect a removed
+ * key or drop a concurrently added one). `incoming` must already be
+ * sanitized (coerceConfigValue). Returns the persisted key names.
+ */
+export async function applyPerBotEnvChange(
+  larkAppId: string,
+  change: { incoming: Record<string, string>; mode: 'replace' | 'merge'; remove?: readonly string[] },
+): Promise<{ ok: true; envKeys: string[] } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<Record<string, string> | null>(larkAppId, (entry) => {
+    const prev = sanitizePerBotEnv(entry.env);
+    const next = nextPerBotEnv({ prev, ...change });
+    if (next) entry.env = next;
+    else delete entry.env;
+    return { write: true, result: next };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  const spec = findConfigField('env')!;
+  const oldText = formatFieldValue(spec, bot.config.env, bot.config);
+  bot.config.env = r.result ?? undefined;
+  logger.info(`[config:${larkAppId}] set env (${change.mode}): ${oldText} -> ${formatFieldValue(spec, bot.config.env, bot.config)}`);
+  return { ok: true, envKeys: r.result ? Object.keys(r.result).sort() : [] };
 }
 
 /**
@@ -580,11 +610,33 @@ export async function setChatFeedbackPolicy(larkAppId: string, chatId: string, p
 }
 
 export type SetAllowedUsersResult =
-  | { ok: true; raw: string[]; resolved: string[] }
+  | {
+    ok: true;
+    raw: string[];
+    resolved: string[];
+    /**
+     * resolver 本次逐条判为 definitive（41050 不可见 / 41012 / code-0 无 user 等）而
+     * 丢弃的 on_ 条目：照常落盘（不会锁死谁），但需提示调用方。取自与热更新同一次
+     * resolve 的 entryStatus，保证告警与实际生效名单一致。
+     */
+    unresolvedUnionIds?: string[];
+  }
+  | { ok: false; reason: 'unusable_owner_entries'; entries: string[] }
   | { ok: false; reason: 'bot_not_registered' | 'bot_not_in_config' | 'self_lockout' | 'empty_resolved' | string };
 
 /**
  * 改 allowedUsers（管理员名单）。这是动信任根的敏感操作，与普通字段分开：
+ *   0. **owner 身份边界**（见 CLAUDE.md「飞书 owner 身份边界」与 setup/owner-identity.ts）：
+ *      ou_ 是 app-scoped，resolver 对它字面透传——另一个应用的 ou_（典型如 managed
+ *      Agent 把 source app 的 BOTMUX_OWNER_OPEN_ID 抄过来）会被原样写进名单却永远
+ *      匹配不上任何发送者。写入前用**本 bot 凭证**对 ou_ 条目过 detectUnusableOwnerEntries：
+ *      - 被目标应用确定性判为不可用 → 拒绝写入（unusable_owner_entries + entries）；
+ *      - 网络/scope/无 secret 等 inconclusive → 不拒绝，fail-closed 仍由 resolver 的
+ *        瞬态路径（缓存兜底 + 后台重试）负责。
+ *      on_ 不在这里硬拒：resolver 会丢弃解析不了的 on_，不会锁死谁（同租户但本应用
+ *      通讯录不可见的合法协作者也走这里）；被 resolver 判 definitive 丢弃的 on_ 以
+ *      unresolvedUnionIds 带回提示（见下方第 4 步之后）。
+ *      发起人自己的 open_id 是本应用事件里观察到的，天然属于本应用，不再探测。
  *   1. 用 bot 凭证把邮箱/on_ 解析成 open_id（与启动期同一路径）。
  *   2. **防自锁**：解析后名单必须仍含发起人的 open_id，否则拒绝——避免把自己踢出管理员。
  *   3. 解析后非空才写。
@@ -600,6 +652,17 @@ export async function setBotAllowedUsers(
 ): Promise<SetAllowedUsersResult> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const openIdEntries = [...new Set(rawEntries.filter(e => e.startsWith('ou_') && e !== senderOpenId))];
+  if (openIdEntries.length > 0) {
+    const unusableOpenIds = await detectUnusableOwnerEntries(
+      larkAppId, bot.config.larkAppSecret, bot.config.brand ?? 'feishu', openIdEntries,
+    );
+    if (unusableOpenIds.length > 0) {
+      logger.warn(`[config:${larkAppId}] allowedUsers set rejected: open_id(s) unusable by this app: ${unusableOpenIds.join(', ')}`);
+      return { ok: false, reason: 'unusable_owner_entries', entries: unusableOpenIds };
+    }
+  }
 
   const { resolved, map, entryStatus } = await resolveAllowedUsersWithMap(larkAppId, rawEntries);
   if (resolved.length === 0) return { ok: false, reason: 'empty_resolved' };
@@ -628,6 +691,7 @@ export async function setBotAllowedUsers(
     if (status === 'definitive') definitiveEntries.push(entry);
     else if (status === 'transient') anyTransient = true;
   }
+  const unresolvedUnionIds = definitiveEntries.filter(e => e.startsWith('on_'));
   writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
     map,
     // sidecar 同时承载 blockedUsers 的缓存：retainKeys 取并集，不得剪掉黑名单条目。
@@ -641,6 +705,10 @@ export async function setBotAllowedUsers(
   // contact API does, instead of silently staying dropped until the next restart.
   if (anyTransient) scheduleAllowedUsersResolveRetryFromMutation(larkAppId);
   logger.info(`[config:${larkAppId}] allowedUsers updated: ${rawEntries.length} entries, ${resolved.length} resolved`);
+  if (unresolvedUnionIds.length > 0) {
+    logger.warn(`[config:${larkAppId}] allowedUsers set: union_id(s) not resolvable by this app (kept, not effective): ${unresolvedUnionIds.join(', ')}`);
+    return { ok: true, raw: rawEntries, resolved, unresolvedUnionIds };
+  }
   return { ok: true, raw: rawEntries, resolved };
 }
 
@@ -790,7 +858,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` };
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -815,6 +883,19 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
   }
   const s = String(raw ?? '').trim();
   if (!s) return { ok: false, reason: 'empty' };
+  if (spec.configKey === 'env') {
+    // JSON object, `{"env":{...}}` settings snippet, or dotenv/shell lines (see
+    // parsePerBotEnvText); sanitize to valid env keys + primitive values.
+    // Reserved keys (CODEX_HOME / GROK_HOME / BOTMUX_* / …) are rejected
+    // visibly — silent drop would hide split-brain configs (CLI gets a
+    // custom home via injectEnv while daemon paths stay on default).
+    // Empty text is handled as "clear" by the caller before coerce.
+    const parsed = parsePerBotEnvText(s);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason === 'invalid_env_line' ? 'invalid_env' : 'invalid_json' };
+    if (Object.keys(parsed.env).some((k) => isReservedPerBotEnvKey(k))) return { ok: false, reason: 'reserved_env' };
+    const sanitized = sanitizePerBotEnv(parsed.env);
+    return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
+  }
   switch (spec.kind) {
     case 'stringList': {
       const arr = (spec.parseList ?? parseCustomPassthroughInput)(s);
@@ -854,19 +935,6 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           catch { return { ok: false, reason: 'invalid_json' }; }
         }
         if (spec.configKey === 'envPolicy') return { ok: true, value: normalizeEnvPolicy(parsed) };
-        if (spec.configKey === 'env') {
-          // Must be a JSON object; sanitize to valid env keys + primitive values.
-          // Reserved keys (CODEX_HOME / GROK_HOME / BOTMUX_* / …) are rejected
-          // visibly — silent drop would hide split-brain configs (CLI gets a
-          // custom home via injectEnv while daemon paths stay on default).
-          // Empty text is handled as "clear" by the caller before coerce.
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
-          const reserved = Object.keys(parsed as Record<string, unknown>)
-            .filter((k) => isReservedPerBotEnvKey(k));
-          if (reserved.length > 0) return { ok: false, reason: 'reserved_env' };
-          const sanitized = sanitizePerBotEnv(parsed);
-          return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
-        }
         if (spec.configKey === 'mojo') {
           // Same SHARED normalizer as the bots.json parser, so the two config
           // doors cannot drift: unknown keys, internal launch-identity keys and

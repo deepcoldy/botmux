@@ -15,6 +15,7 @@ import {
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
+import { traexViewportFooterBusy } from './traex-footer.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -110,8 +111,16 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  * Older local releases had deleted Codex's "esc to interrupt" footer, but
  * TraeX 0.207.x renders it again while a turn is active. Keep it line-anchored
  * with the standalone queue states so quoted prose does not become busy proof.
+ * A live TraeX 0.201.6 turn also renders an `esc to interrupt` activity
+ * footer while retaining the visible composer and context bar. Raw PTY and
+ * 100ms screen captures verified seven rotating glyphs and ordinary activity
+ * labels as well as PreToolUse/PostToolUse/UserPromptSubmit hook-runner rows.
+ * TraeX 0.209.1 (tmux capture) renders the capacity queue in the same shape:
+ * "◆ Queued for capacity (1s • esc to interrupt)" followed by an indented
+ * "└ Too many requests right now. …" child row — neither is caught by the
+ * line-start-anchored queue arms, so the activity-row arm must cover it.
  *
- * Three branches:
+ * Four branches:
  *  1. Spinner-anchored labels: "<braille frame><space><label>". The frame
  *     never appears in transcript prose, so assistant output like
  *     "Working… on the fix" cannot revive a completed card. Covers the
@@ -124,7 +133,13 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  *     so the frame anchor must not be required for it. The line anchor keeps
  *     assistant prose quoting the string mid-sentence ("…says Queued for
  *     capacity whenever…") from registering as busy.
- *  3. (staticBusyPattern below) the same queue evidence as a pre-idle latch
+ *  3. Line-anchored activity rows. These require one of the seven observed
+ *     rotating glyphs, a no-parentheses activity label, and an elapsed-time /
+ *     `esc to interrupt` footer in one pair of parentheses. A closing quote
+ *     immediately after the footer is rejected so `◆ Ran echo "(...)"`
+ *     history cannot revive an already-idle session. Hook-runner rows use the
+ *     same footer shape, so they need no event-name-specific arm.
+ *  4. (staticBusyPattern below) the same queue evidence as a pre-idle latch
  *     inside IdleDetector — see TRAEX_STATIC_BUSY_PATTERN.
  *
  * Both states must be covered: the worker's busy-pattern idle probe marks
@@ -134,7 +149,7 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  */
 const TRAEX_SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 
-const TRAEX_SPINNER_LABELS = [
+export const TRAEX_SPINNER_LABELS = [
   // Set 1 — thinking/working rotation (compiled-in spinner string table).
   'Thinking longer…',
   'Deep in thought…',
@@ -173,10 +188,24 @@ const TRAEX_QUEUE_STATIC_ARMS = [
   "Too many requests right now\\. You're in the queue",
 ];
 
+/** Rotating activity glyphs observed on live TraeX activity rows. */
+const TRAEX_ACTIVITY_GLYPHS = '⋄✧◇✦❖◈◆';
+
+/** TraeX activity footer captured from live 0.201.6 / 0.209.1 TUIs. Keep it
+ *  line- and glyph-anchored: no-alt-screen history can contain the same words.
+ *  The lookahead right after `(` confirms the `esc to interrupt` phrase lives
+ *  inside this same parenthesis before consuming anything: a long near-miss
+ *  line (glyph + parenthesis full of elapsed-time tokens but no footer phrase)
+ *  otherwise backs off quadratically — observed ~18s on a 144K PTY chunk vs
+ *  <1ms with the guard. IdleDetector feeds unbounded chunks here, so the
+ *  pattern must fail fast rather than merely stay rare. */
+const TRAEX_ACTIVITY_PATTERN = String.raw`(?:^|[\n\r])[ \t]*[${TRAEX_ACTIVITY_GLYPHS}][ \t]*[^()\r\n]{0,240}\((?=[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b)[^()\r\n]*\d+(?:h|m|s)(?:[ \t]+\d+(?:m|s))?[^()\r\n]*\besc[ \t]+to[ \t]+interrupt\b[^()\r\n]*\)(?![ \t]*["'\x60])`;
+
 const TRAEX_ACTIVE_BUSY_PATTERN = new RegExp(
   [
     `[${TRAEX_SPINNER_FRAMES}][ \\t]?(?:${TRAEX_SPINNER_LABELS.join('|')})`,
     ...TRAEX_QUEUE_STATIC_ARMS.map((arm) => `(?:^|[\\n\\r])[ \\t]*${arm}`),
+    TRAEX_ACTIVITY_PATTERN,
   ].join('|'),
   'i',
 );
@@ -413,6 +442,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // required.
     busyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
     idleToBusyPattern: TRAEX_ACTIVE_BUSY_PATTERN,
+    // TraeX 0.209's glyph status row is recognisable only by its position
+    // above the composer, which needs the WHOLE viewport (busyPattern sees a
+    // tail region). The worker consults this before busyPattern in both the
+    // prompt-ready veto and the idle probe, and supplies the getter only for
+    // an authoritative screen. See traex-footer.ts.
+    isSessionBusy({ getCurrentScreen }) {
+      try {
+        const screen = getCurrentScreen?.();
+        return !!screen && traexViewportFooterBusy(screen);
+      } catch {
+        return false;
+      }
+    },
     // Pre-idle latch for the static capacity-queue screen — holds the session
     // busy before the first idle on backends (ZMX) where the busyPattern
     // viewport probe is forbidden from mutating state. See the

@@ -46,7 +46,7 @@ import { DASHBOARD_H5_ENV_PREFIX } from './child-env.js';
  *    other credentials — a key belongs here only with a named consumer.
  *  - BOTMUX_DASHBOARD_DEV_RELOAD → dashboard.ts dev-reload switch.
  *  - proxy family → outbound HTTPS from the dashboard itself (npm registry
- *    version/rollback lookups, hd2d asset download) on hosts without direct
+ *    version/rollback lookups, binary self-update download) on hosts without direct
  *    internet. These are forwarded to CLI children by design elsewhere
  *    (PROXY_ENV_KEYS), so allowing them adds no new exposure.
  */

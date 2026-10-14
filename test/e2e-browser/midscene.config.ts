@@ -87,11 +87,15 @@ export default defineTestProject({
       // CI runs the stable Claude/Codex core set (single-chat bot flows). Set
       // FEISHU_E2E_CASES=all (or run locally) to select every migrated case
       // in cases/bot-flows.yaml + cases/messaging.yaml.
+      // FEISHU_E2E_CASES=traex-ambient selects cases-traex/, which needs a
+      // TraeX bot in an ambient-mode group (see feishu-traex-ambient.e2e.ts).
       files: {
         include:
           process.env.FEISHU_E2E_CASES === 'all'
             ? ['cases/**/*.yaml']
-            : ['cases/ci-claude-codex.yaml'],
+            : process.env.FEISHU_E2E_CASES === 'traex-ambient'
+              ? ['cases-traex/*.yaml']
+              : ['cases/ci-claude-codex.yaml'],
       },
       nodes: [
         runScenario,

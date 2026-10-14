@@ -463,8 +463,7 @@ export function decideDashboardAuth(opts: {
       // and every probe it runs is the visitor's own browser calling the same
       // gated APIs under the visitor's own (possibly absent) credentials.
       pathname === '/workbench-doctor' ||
-      pathname.startsWith('/assets/') ||
-      pathname.startsWith('/game/')
+      pathname.startsWith('/assets/')
     );
 
   // P2-1：飞书卡片「打开工作台」按钮的短时票据兑换端点。URL 路径里的票据本身

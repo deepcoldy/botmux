@@ -138,7 +138,7 @@ import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
-import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
+import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, shouldDeferInitialPromptForReattach } from './core/startup-commands.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
@@ -254,7 +254,7 @@ import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUE
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
+import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -386,6 +386,9 @@ import {
   backendSandboxCompatibilityError,
   backendSandboxCompatibilityUserMessage,
   decideBackendGate,
+  persistentReattachBias,
+  reconcileBiasedReattachProbe,
+  resolveTmuxBackendGate,
   retireSupersededRecordedHerdrTarget,
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
@@ -394,6 +397,7 @@ import {
   deriveRiffReposFromDirs,
   deriveRiffRepoFromWorkingDir,
   isValidRiffBaseUrl,
+  isValidRiffJwtHome,
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
@@ -409,6 +413,8 @@ import {
   startOutboxWatcher,
   sandboxEnabled,
   localSandboxApplies,
+  resolveLocalSandboxMode,
+  autoWorktreeFallbackSandboxError,
 } from './adapters/backend/sandbox.js';
 import {
   prepareScratchSandbox,
@@ -421,7 +427,6 @@ import {
   attachMacScratchSession,
 } from './adapters/backend/scratch-sandbox-darwin.js';
 import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
-import { resolveSandboxMode } from './adapters/cli/sandbox-mode.js';
 import { registerScratchView, scratchViewPath, scratchLinuxMappings } from './services/scratch-host-view.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
@@ -7737,11 +7742,13 @@ function codexBridgeStartTimer(): void {
         const attachOk = codexAttachGated
           ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
           : traexAttachGated
-            ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
+            ? (() => { const sid = traexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
             : true;
         if (path && attachOk) {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
-            const discoveredSessionId = codexSessionIdFromRolloutPath(path);
+            const discoveredSessionId = structuredBridgeIsTraex()
+              ? traexSessionIdFromRolloutPath(path)
+              : codexSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
           }
           codexBridgePendingSessionId = undefined;
@@ -8383,8 +8390,10 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     // Already attached — first-attach-wins for most CLIs. Exceptions: TRAE
     // and Grok can rotate their native session in the same process.
     if (structuredBridgeIsTraex()) {
-      const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
-      if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
+      const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+      const sameSession = currentSid?.toLowerCase() === cliSessionId.toLowerCase();
+      const next = resolveFileBridgePath('traex', { sessionId: cliSessionId });
+      if (sameSession && (!next || next === codexBridgeRolloutPath)) return;
       // Ownership gate: the reported id came from the GLOBAL history.jsonl, so a
       // sibling pane's identical text (e.g. a bare adopt-mode reply with no
       // unique <session_id>) could surface a foreign id. Only rotate the bridge
@@ -8394,7 +8403,6 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         log(`Keeping current TRAE bridge ${currentSid ?? '?'} — refusing history-only re-attach to ${cliSessionId}`);
         return;
       }
-      const next = resolveFileBridgePath('traex', { sessionId: cliSessionId });
       // Close any terminal already committed to the retired rollout before
       // switching. A durable turn is a worker HOL barrier, so a legitimate
       // session rotation cannot overtake an unfinished durable delivery.
@@ -8405,11 +8413,13 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         log(`TRAE pre-rotation bridge drain failed: ${err.message}`);
       }
       if (next && next !== codexBridgeRolloutPath) {
-        log(`TRAE session rotated ${currentSid ?? '?'} → ${cliSessionId}; re-attaching bridge to ${next}`);
+        const reason = sameSession ? `rollout segment moved for ${cliSessionId}`
+          : `session rotated ${currentSid ?? '?'} → ${cliSessionId}`;
+        log(`TRAE ${reason}; re-attaching bridge to ${next}`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = undefined;
         codexBridgeAttach(next, 'fresh-empty');
-      } else if (!next) {
+      } else if (!next && !sameSession) {
         log(`TRAE session rotated ${currentSid ?? '?'} → ${cliSessionId}; waiting for rollout`);
         codexBridgeDetachFile();
         codexBridgePendingSessionId = cliSessionId;
@@ -8615,7 +8625,7 @@ function maybeFollowTraexSessionRotationViaPid(): void {
     ?? backend.getChildPid?.()
     ?? codexAdoptPendingPid;
   if (!pid) return;
-  const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
   const observed = findTraexRolloutByPid(pid, currentSid);
   if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
@@ -12147,7 +12157,60 @@ function armPostTerminalInputFence(): void {
     || !backendScreenEvidenceIsAuthoritativeForMutation()
     || currentPostTerminalInputFence()) return;
   postTerminalInputFence = { backend, generation: cliSpawnGeneration };
+  const revokedPublishedReady = isPromptReady;
   isPromptReady = false;
+  // The composer can redraw and go quiet BEFORE the terminal reaches the
+  // rollout: screen-idle already published readiness, so the detector is idle
+  // and the transcript's fireIdle() is a no-op, while the bridge poller only
+  // emits while ready. With a static screen nothing would ever re-check the
+  // fence — no terminal, no prompt-ready, every later message stranded.
+  if (revokedPublishedReady) schedulePostTerminalFenceRecheck('terminal after published prompt-ready');
+}
+
+let postTerminalFenceRecheckPending = false;
+
+/** Re-evaluate the post-terminal fence against the current viewport without
+ * waiting for new PTY output. Publishes the structured terminal first (same
+ * order as the external-idle path), then releases prompt-ready only when the
+ * settled screen shows a composer newer than any busy marker. A held fence
+ * keeps the pre-existing contract: the next PTY redraw re-runs idle. */
+function schedulePostTerminalFenceRecheck(reason: string): void {
+  if (postTerminalFenceRecheckPending) return;
+  postTerminalFenceRecheckPending = true;
+  const target = backend;
+  const generation = cliSpawnGeneration;
+  void (async () => {
+    try {
+      try {
+        await renderer?.writeAndFlush('');
+      } catch (err: any) {
+        log(`${cliName()} post-terminal fence recheck renderer settle failed: ${err.message}`);
+        return;
+      }
+      if (!target || backend !== target || generation !== cliSpawnGeneration
+        || cliRestartInProgress || !currentPostTerminalInputFence()) return;
+      if (bridgeJsonlPath) {
+        try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+      }
+      if (codexBridgeFallbackActive()) {
+        try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+      }
+      if (backend !== target || generation !== cliSpawnGeneration) return;
+      if (postTerminalPromptFenceHolds('external', target)) return;
+      log(`${cliName()} post-terminal composer verified on static screen (${reason})`);
+      // Publish through the detector's idle edge when the fence rejection
+      // reset() it: markIdle re-arms busyTransitionArmed, so a later local
+      // (web-terminal) turn can still flip readiness back to busy. The onIdle
+      // handler re-verifies the composer before marking ready.
+      if (idleDetector && !idleDetector.isIdleNow()) {
+        idleDetector.fireIdle();
+        if (idleDetector.isIdleNow()) return;
+      }
+      markPromptReady();
+    } finally {
+      postTerminalFenceRecheckPending = false;
+    }
+  })();
 }
 
 async function postTerminalInputIsBlocked(target: SessionBackend): Promise<boolean> {
@@ -12888,6 +12951,8 @@ function markPromptReady(): void {
   if (currentPostTerminalInputFence()) {
     log('Ignoring prompt-ready until the post-terminal PTY composer is verified');
     idleDetector?.reset();
+    // May be the last PTY edge; a quiet TUI never redraws to re-run idle.
+    schedulePostTerminalFenceRecheck('prompt-ready deferred by fence');
     return;
   }
   if (isPromptReady) {
@@ -15812,17 +15877,34 @@ async function spawnCli(
   // post-kill re-selection cold-spawns instead of reattaching to the pane it
   // just removed. selectSessionBackend consumes it via hasExistingSession.
   let resolvedZellijSessionProbe: SessionProbe | undefined;
+  // Same frozen tri-state decision for tmux (see resolveTmuxBackendGate): an
+  // indeterminate has-session answer spawns instead of gating AND reattaches
+  // instead of creating, so no pre-spawn fresh-path state is ever built for a
+  // pane that may still be alive. Teardown gates below refresh it to 'missing'.
+  let resolvedTmuxSessionProbe: SessionProbe | undefined;
   {
     let available = true;
     let reason = '';
     let hasExistingSession = false;
     let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
-      hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
-      if (!hasExistingSession) {
-        const probe = probeTmuxFunctionalWithRetry();
-        available = probe.ok;
-        if (!probe.ok) reason = probe.reason;
+      // Tri-state on purpose — `hasSession()` collapses "has-session timed out
+      // under host load" into "no session", which then let the (equally
+      // load-starved) functional probe gate a live pane with the misleading
+      // "tmux 不可用 / install tmux" card. Retry only the indeterminate answer.
+      const tmuxSessionName = TmuxBackend.sessionName(cfg.sessionId);
+      const resolved = resolveTmuxBackendGate({
+        probeSession: () => TmuxBackend.probeSessionWithRetry(tmuxSessionName),
+        binaryOnPath: () => locateExecutable('tmux', tmuxEnv()) !== null,
+        probeFunctional: () => probeTmuxFunctionalWithRetry(),
+      });
+      resolvedTmuxSessionProbe = resolved.probe;
+      available = resolved.available;
+      reason = resolved.reason;
+      hasExistingSession = resolved.hasExistingSession;
+      existingSessionUnknown = resolved.existingSessionUnknown;
+      if (existingSessionUnknown) {
+        log('tmux has-session probe returned no answer but the binary is on PATH (host load); biasing toward reattach instead of gating');
       }
     } else if (effectiveBackend === 'zellij') {
       // Like tmux, zellij's probe is a disposable background session, so a
@@ -16014,6 +16096,9 @@ async function spawnCli(
     if (riffCfg.sandboxCluster !== undefined && !isValidRiffSandboxCluster(riffCfg.sandboxCluster)) {
       throw new Error(`riff sandboxCluster 非法（仅支持 boe/cn，当前: ${JSON.stringify(riffCfg.sandboxCluster)}）——请在 dashboard 的 Riff 配置中重新选择`);
     }
+    if (riffCfg.jwtHome !== undefined && !isValidRiffJwtHome(riffCfg.jwtHome)) {
+      throw new Error(`riff jwtHome 非法（需绝对路径，如 /home/alice，当前: ${JSON.stringify(riffCfg.jwtHome)}）——留空则用 daemon 自身的 HOME`);
+    }
     const sessionEnv: Record<string, string> = {
       BOTMUX_SESSION_ID: cfg.sessionId,
       BOTMUX_CHAT_ID: cfg.chatId,
@@ -16158,13 +16243,19 @@ async function spawnCli(
   // 'scratch' (full-root COW, adapters/backend/scratch-sandbox.ts). The env
   // override is the operator's global force switch; legacy readIsolation
   // implies oncall.
-  const sandboxMode = !riffRemoteBackend
-    ? resolveSandboxMode({
-      configSandbox: cfg.sandbox,
-      readIsolation: cfg.readIsolation === true,
-      envValue: process.env.BOTMUX_SANDBOX,
-    })
-    : 'off' as const;
+  //
+  // Shared with the auto-worktree fail-closed gate (services/default-worktree.ts)
+  // via resolveLocalSandboxMode, so "which local sandbox does this spawn get"
+  // is decided by ONE function on both sides and can never drift again.
+  const sandboxMode = resolveLocalSandboxMode({
+    backendType: effectiveBackendType,
+    mojoConfig: effectiveBackendType === 'mojo'
+      ? (riffBackendConfig as EffectiveMojoConfig | undefined)
+      : undefined,
+    configSandbox: cfg.sandbox,
+    readIsolation: cfg.readIsolation === true,
+    envValue: process.env.BOTMUX_SANDBOX,
+  });
   if (riffRemoteBackend && sandboxMode !== 'off') {
     log(`Sandbox flag set (${sandboxMode}) but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
   }
@@ -16198,6 +16289,15 @@ async function spawnCli(
     codexRpcInput: cfg.codexRpcInput === true,
   })) {
     throw new Error('零注入需要本地 CLI 支持自动获取最终回复；暂不支持远端后端、v3 workflow；Cursor/Antigravity 暂不支持 scratch 全根 COW 沙箱（oncall 沙箱可用），Antigravity 暂不支持 zmx 后端（其静默终态确认依赖视口证据）');
+  }
+  {
+    // The auto-worktree gate's degrade verdict may only be strengthened here.
+    const fallbackError = autoWorktreeFallbackSandboxError({
+      sandboxMode,
+      workingDir: cfg.workingDir,
+      fallbackDir: cfg.autoWorktreeFallbackDir,
+    });
+    if (fallbackError) throw new Error(fallbackError);
   }
   if (cfg.cliLaunchMode === 'forge-traex' && sandboxRequested) {
     throw new Error('Forge x TraeX does not support sandbox/readIsolation yet');
@@ -16348,9 +16448,30 @@ async function spawnCli(
       ? resolvedZmxSessionProbe === 'exists'
       : effectiveBackend === 'zellij'
         ? resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'
-        : undefined,
+        : effectiveBackend === 'tmux'
+          ? persistentReattachBias(resolvedTmuxSessionProbe)
+          : undefined,
     zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
+  // Settle a reattach that rests on an indeterminate existence probe with one
+  // more look BEFORE anything consumes the selection (read-isolation /
+  // mcp-gateway / credential gates, then the predicted outcome that freezes
+  // the fresh boot marker + isolation wrapper, credential stamp,
+  // startupCommands and initial-prompt routing). An authoritative 'missing'
+  // turns a doomed reattach into a proper cold spawn WITH the fresh-path setup;
+  // a still-'unknown' answer keeps the reattach bias, so the backend never
+  // creates over a possibly-live pane (no duplicate-session swallowing).
+  if (effectiveBackend === 'tmux' || effectiveBackend === 'zellij') {
+    const before = effectiveBackend === 'tmux' ? resolvedTmuxSessionProbe : resolvedZellijSessionProbe;
+    const after = reconcileBiasedReattachProbe(before, () => (effectiveBackend === 'tmux'
+      ? TmuxBackend.probeSessionWithRetry(TmuxBackend.sessionName(cfg.sessionId))
+      : ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))));
+    if (after !== before) {
+      log(`${effectiveBackend} existence re-probe before spawn: ${before} → ${after}`);
+      if (effectiveBackend === 'tmux') resolvedTmuxSessionProbe = after;
+      else resolvedZellijSessionProbe = after;
+    }
+  }
   let selectedBackend = selectBackend();
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
@@ -16746,6 +16867,8 @@ async function spawnCli(
           // mcp-gateway gate is laxer (it only rejects a proven-live pane), so
           // its own reset still has to fail closed on 'unknown' explicitly.
           resolvedZellijSessionProbe = 'missing';
+        } else if (effectiveBackendType === 'tmux') {
+          resolvedTmuxSessionProbe = 'missing';
         }
       },
       clearProvenanceVerified: () => {
@@ -16856,6 +16979,15 @@ async function spawnCli(
         `could not verify existing ${effectiveBackendType} pane`,
       );
     }
+    // tmux: same reasoning, but only when the reattach itself rests on an
+    // indeterminate probe (an authoritative 'exists' selection keeps the
+    // pre-existing semantics for a transiently unanswered re-probe here).
+    if (effectiveBackendType === 'tmux' && resolvedTmuxSessionProbe === 'unknown' && paneProbe === 'unknown') {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
     if (effectiveBackendType === 'zmx') {
       resolvedZmxSessionProbe = paneProbe;
     }
@@ -16924,6 +17056,8 @@ async function spawnCli(
         // the re-selection cold-spawns a fresh host instead of reattaching to
         // the pane we just killed. Fail closed to 'missing' unless proven live.
         resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
+      } else if (effectiveBackendType === 'tmux') {
+        resolvedTmuxSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
@@ -16975,6 +17109,8 @@ async function spawnCli(
         resolvedZmxSessionPid = undefined;
       } else if (effectiveBackendType === 'zellij') {
         resolvedZellijSessionProbe = 'missing';
+      } else if (effectiveBackendType === 'tmux') {
+        resolvedTmuxSessionProbe = 'missing';
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
@@ -17306,6 +17442,10 @@ async function spawnCli(
     adoptMode: cfg.adoptMode === true,
     dispatchAttempt: cfg.dispatchAttempt,
     queuedActivationToken: cfg.queuedActivationToken,
+  }) || shouldDeferInitialPromptForReattach({
+    willReattachPersistent,
+    adoptMode: cfg.adoptMode === true,
+    passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true)
     || (!promptArgPreparationChanged && shouldDeferInitialPromptForArgLimit({
       passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,

@@ -97,6 +97,8 @@ interface DashboardSettings {
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
+  /** GitHub Release 下载代理（二进制自更新）；'' = 未配置（读 HTTPS_PROXY / HTTP_PROXY）。 */
+  httpProxy: string;
   scheduleTimeZone: string;
   hostTimeZone: string;
   effectiveScheduleTimeZone: string;
@@ -262,6 +264,7 @@ function parseSettings(s: any): DashboardSettings {
     multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
+    httpProxy: typeof s?.httpProxy === 'string' ? s.httpProxy : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
     hostTimeZone: typeof s?.hostTimeZone === 'string' && s.hostTimeZone ? s.hostTimeZone : 'UTC',
     effectiveScheduleTimeZone:
@@ -1190,6 +1193,15 @@ function SettingsBody(props: {
               />
             </div>
           </div>
+          <HttpProxyRow
+            value={settings.httpProxy}
+            disabled={!canWrite || savingKey === 'httpProxy'}
+            onSave={value => props.onSave(
+              'httpProxy',
+              { httpProxy: value },
+              st => ({ ...st, httpProxy: value }),
+            )}
+          />
         </SettingsBlock>
         <div id="settings-update">{props.updateBlock}</div>
       </SettingsGroup>
@@ -1776,6 +1788,75 @@ export function currentBrowserOrigin(): string {
 
 /** 与服务端 `normalizeOAuthRedirectBase` 同一套判定（http(s) origin，不带路径/
  *  query/fragment），只是提前到前端，避免用户点了保存才吃一个 error code。 */
+/** Mirrors the server's normalizeHttpProxy: `http(s)://[user:pass@]host[:port]`,
+ *  no path / query. */
+export function isValidHttpProxy(raw: string): boolean {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return !!url.hostname && url.pathname === '/' && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+/** Proxy for downloading new botmux binaries from GitHub Releases. */
+export function HttpProxyRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const trimmed = draft.trim().replace(/\/+$/, '');
+  // 空串合法（= 清除配置，退回环境变量）。
+  const valid = trimmed === '' || isValidHttpProxy(trimmed);
+  const dirty = trimmed !== props.value.trim().replace(/\/+$/, '');
+  const submit = () => {
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(trimmed);
+  };
+
+  return (
+    <div className="settings-subfield settings-http-proxy-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.httpProxyHelp')}>{tr('settings.httpProxy')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          data-input="httpProxy"
+          value={draft}
+          placeholder={tr('settings.httpProxyPlaceholder')}
+          disabled={props.disabled}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-http-proxy-hint>
+        {trimmed === ''
+          ? tr('settings.httpProxyUnset')
+          : valid ? tr('settings.httpProxyActive') : tr('settings.httpProxyInvalid')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          data-action="http-proxy-save"
+          disabled={props.disabled || !dirty || !valid}
+          onClick={submit}
+        >
+          {tr('settings.httpProxySave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function isValidOAuthRedirectBase(raw: string): boolean {
   const value = raw.trim();
   if (!/^https?:\/\//i.test(value)) return false;

@@ -123,6 +123,8 @@ export interface ResolvedDashboardSettingsView {
   multiTopic: { enabled: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
+  /** Proxy for binary self-update downloads, null/absent = unset. */
+  httpProxy?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -275,6 +277,7 @@ export type ApplySettingsWriteError =
   | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
   | 'invalid_oauthRedirectBase'
+  | 'invalid_httpProxy'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
@@ -764,6 +767,22 @@ export async function applySettingsWrite(
     }
   }
 
+  if ('httpProxy' in obj) {
+    const v = obj.httpProxy;
+    if (v === null || (typeof v === 'string' && v.trim() === '')) {
+      // 清除 → release-download 退回 HTTPS_PROXY / HTTP_PROXY 环境变量。
+      deps.mergeGlobalConfig({ httpProxy: null });
+      touched = true;
+    } else if (typeof v === 'string') {
+      const normalized = normalizeHttpProxy(v);
+      if (!normalized) return { ok: false, error: 'invalid_httpProxy' };
+      deps.mergeGlobalConfig({ httpProxy: normalized });
+      touched = true;
+    } else {
+      return { ok: false, error: 'invalid_httpProxy' };
+    }
+  }
+
   if ('whiteboard' in obj) {
     const raw = obj.whiteboard;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -844,4 +863,16 @@ export async function applySettingsWrite(
 
   if (!touched) return { ok: false, error: 'empty_patch' };
   return { ok: true, settings: deps.resolveDashboardSettings() };
+}
+
+/** `http(s)://[user:pass@]host[:port]` with no path / query — what
+ *  release-download's CONNECT tunnel accepts. Returns the trimmed value
+ *  without a trailing slash, or null when it is not a proxy URL. */
+export function normalizeHttpProxy(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  let url: URL;
+  try { url = new URL(trimmed); } catch { return null; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (!url.hostname || url.pathname !== '/' || url.search || url.hash) return null;
+  return trimmed;
 }

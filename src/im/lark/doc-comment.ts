@@ -19,6 +19,7 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { logger } from '../../utils/logger.js';
 import { UserTokenMissingError, assertLarkTransport } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
+import { structuredLarkCode } from './lark-errors.js';
 import { getDocSubscription, type CommentTriggerMode } from '../../services/doc-subs-store.js';
 import { compareReplyIds } from '../../core/doc-comment-poller.js';
 import { config } from '../../config.js';
@@ -372,8 +373,7 @@ export class DocSubscriptionPermissionError extends Error {
 
 function getLarkErrorCode(err: unknown): number | undefined {
   if (err instanceof UserTokenForbiddenError) return err.larkCode;
-  const code = (err as any)?.response?.data?.code ?? (err as any)?.code;
-  return typeof code === 'number' ? code : undefined;
+  return structuredLarkCode(err);
 }
 
 function getLarkErrorMessage(err: unknown): string | undefined {

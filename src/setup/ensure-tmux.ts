@@ -162,12 +162,31 @@ export function tmuxVersionAtLeast(version: TmuxVersion | null, major: number, m
   return version.major > major || (version.major === major && version.minor >= minor);
 }
 
+/**
+ * Child-process budgets for the worker-gate capability probe.
+ *
+ * These are fork+exec budgets, not tmux-work budgets: `tmux -V` answers in
+ * ~10ms and `new-session -d` well under a second on an idle host — what eats
+ * the budget is waiting to be scheduled. Measured `new-session -d` at 0.93–4.45s
+ * on a host at load ~4, i.e. already brushing the old 5s budget, and at load ~70
+ * `tmux -V` blew a 3s budget outright, turning a healthy tmux into a false
+ * "tmux 不可用" hard gate. A slower correct answer beats a fast false negative
+ * that refuses the user's session. Kept moderate (not unbounded) because the
+ * gate retries the probe and a genuinely hung tmux (restricted /tmp, broken
+ * install) must still fail in bounded time. The gate only runs this probe after
+ * an AUTHORITATIVE 'missing' existence answer, so these budgets are not on the
+ * load-timeout path for live sessions at all.
+ */
+export const TMUX_VERSION_PROBE_TIMEOUT_MS = 8_000;
+export const TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS = 10_000;
+export const TMUX_PROBE_CLEANUP_TIMEOUT_MS = 5_000;
+
 function probeTmuxVersion(): TmuxVersionProbe {
   try {
     const out = execFileSync('tmux', ['-V'], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 3000,
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
       env: tmuxEnv(),
     });
     return { ok: true, version: out.trim() };
@@ -175,7 +194,7 @@ function probeTmuxVersion(): TmuxVersionProbe {
     const code = err?.code;
     return {
       ok: false,
-      reason: childFailureReason('tmux -V', err, 3000),
+      reason: childFailureReason('tmux -V', err, TMUX_VERSION_PROBE_TIMEOUT_MS),
       // Only ENOENT proves absence. Timeout/EMFILE/EACCES must not be turned
       // into the old, misleading "not on PATH" diagnosis or a startup hard
       // gate; they prove only that this particular probe got no answer.
@@ -349,15 +368,15 @@ export function probeTmuxFunctional(): TmuxFunctionalProbe {
   // startup) and report "ok: false" even on a perfectly healthy install.
   const run = spawnSync('tmux', ['-L', sockName, 'new-session', '-d', '-s', 'probe', 'true'], {
     stdio: ['ignore', 'ignore', 'pipe'],
-    timeout: 5000,
+    timeout: TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS,
     env: tmuxEnv(),
   });
   if (run.status !== 0) {
-    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: TMUX_PROBE_CLEANUP_TIMEOUT_MS, env: tmuxEnv() });
     cleanupTmuxProbeSocket(sockName);
     return {
       ok: false,
-      reason: childFailureReason('tmux new-session', run, 5000),
+      reason: childFailureReason('tmux new-session', run, TMUX_FUNCTIONAL_PROBE_TIMEOUT_MS),
       binaryPresent: true,
       retryable: (run.error as NodeJS.ErrnoException | undefined)?.code !== 'EACCES',
       version,
@@ -366,7 +385,7 @@ export function probeTmuxFunctional(): TmuxFunctionalProbe {
   // Tear down the probe server and remove the socket file. Some platforms leave
   // bmx-probe-* sockets behind after the server exits; thousands of stale
   // entries make later probe storms slower and easier to time out.
-  spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+  spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: TMUX_PROBE_CLEANUP_TIMEOUT_MS, env: tmuxEnv() });
   cleanupTmuxProbeSocket(sockName);
   return { ok: true, version };
 }

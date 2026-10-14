@@ -17,7 +17,7 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -95,6 +95,10 @@ import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
+import {
+  hasScheduleTopicTitleRuntimeTemplate,
+  renderScheduleTopicTitle,
+} from './schedule-topic-title.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
@@ -3987,6 +3991,19 @@ export async function executeScheduledTask(
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
+  const rawTopicTitle = task.topicTitle?.trim();
+  const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
+  const hasDynamicTopicTitle = !!rawTopicTitle
+    && hasScheduleTopicTitleRuntimeTemplate(rawTopicTitle);
+  if (silent && createsOwnTopic && hasDynamicTopicTitle) {
+    throw new Error('topic_title_template_silent_unsupported');
+  }
+  const topicTitle = rawTopicTitle && createsOwnTopic && !silent && hasDynamicTopicTitle
+    ? renderScheduleTopicTitle(rawTopicTitle, {
+        firedAt: new Date(),
+        ownerOpenId: task.ownerOpenId,
+      })
+    : rawTopicTitle;
 
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
@@ -4032,7 +4049,9 @@ export async function executeScheduledTask(
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
-      const topicSeed = task.topicTitle?.trim()
+      // A custom title is the actual text root; without one the localized
+      // task-start notice remains the backwards-compatible seed.
+      const topicSeed = topicTitle
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
@@ -4089,7 +4108,9 @@ export async function executeScheduledTask(
               logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
             });
           }
-          const topicSeed = task.topicTitle?.trim()
+          // Dedicated tasks use the same rendered fire-time title contract as
+          // new-topic runs, but persist this first root for later continuations.
+          const topicSeed = topicTitle
             || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
           const seed = await sendMessage(larkAppId, task.chatId, topicSeed);
           // Write the root straight into the task row (store call, not the
@@ -4441,7 +4462,7 @@ export async function executeScheduledTask(
         taskId: task.id,
         turnId: scheduledTurnId,
         routingAnchor: anchor,
-        ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
+        ...(topicTitle ? { topicTitle } : {}),
         createdAt: new Date(now).toISOString(),
       };
     }
@@ -4790,6 +4811,10 @@ export async function spawnDashboardSession(
   const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
   const registered = await withActiveSessionKeyLock(activeSessions, key, async () => {
+    // Re-check under the key lock: the scan above runs before the banner /
+    // attachment awaits, so a restore can quarantine this anchor in between.
+    // Every other creation path performs this check at registration time.
+    if (findQuarantinedRoutingConflict(key, larkAppId)) return undefined;
     const current = activeSessions.get(key);
     if (current) {
       const protectedOwner = current.worker || current.session.queued || current.pendingRepo

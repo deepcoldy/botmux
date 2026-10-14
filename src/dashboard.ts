@@ -267,7 +267,6 @@ import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/te
 import type { CliId } from './adapters/cli/types.js';
 import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
-import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
   buildSkillInstallAuditSummary,
   installLocalSkillLinks,
@@ -1175,6 +1174,10 @@ interface ResolvedDashboardSettings {
    *  `http://127.0.0.1:9768/callback` 的手工粘贴流程。见 global-config 的
    *  `oauthRedirectBase`。 */
   oauthRedirectBase: string | null;
+  /** Outbound HTTP(S) proxy for botmux's own downloads (binary self-update
+   *  from GitHub Releases), null = unset ⇒ falls back to HTTPS_PROXY /
+   *  HTTP_PROXY. See global-config `httpProxy`. */
+  httpProxy: string | null;
   /** Configured schedule-task timezone override (IANA), or null when unset
    *  ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone: string | null;
@@ -1759,6 +1762,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
+    httpProxy: global.httpProxy ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
     effectiveScheduleTimeZone: scheduleTimeZone(),
@@ -2351,11 +2355,10 @@ const MIME: Record<string, string> = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.wasm': 'application/wasm',
-  '.pck': 'application/octet-stream',
 };
 
-/** Stream an absolute file (used for HD2D cache binaries that live outside
- *  WEB_DIR). Callers pass only vetted paths from `hd2dAssetPath`. */
+/** Stream an absolute file that lives outside WEB_DIR (e.g. plugin dashboard
+ *  assets). Callers must pass only vetted paths. */
 function serveFileAbs(res: ServerResponse, fp: string): boolean {
   let st;
   try { st = statSync(fp); } catch { return false; }
@@ -4366,7 +4369,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
+    // ─── Static frontend (index.html + /assets/* + root icons) ───
     if (
       (req.method === 'GET' || req.method === 'HEAD') &&
       (
@@ -4374,18 +4377,9 @@ const server = createServer(async (req, res) => {
         url.pathname === '/favicon.ico' ||
         url.pathname === '/favicon.png' ||
         url.pathname === '/apple-touch-icon.png' ||
-        url.pathname.startsWith('/assets/') ||
-        url.pathname.startsWith('/game/')
+        url.pathname.startsWith('/assets/')
       )
     ) {
-      // HD2D runtime binaries (index.wasm / index.pck) are NOT shipped — they
-      // are downloaded on demand into the cache dir and served from there.
-      // Everything else under /game/ is the small shell shipped in dist.
-      if (url.pathname === '/game/index.wasm' || url.pathname === '/game/index.pck') {
-        const fp = hd2dAssetPath(url.pathname.slice('/game/'.length));
-        if (fp && serveFileAbs(res, fp)) return;
-        res.writeHead(404); res.end(); return;
-      }
       // Map /assets/foo.js → WEB_DIR/foo.js; /favicon.ico is an alias for the PNG favicon.
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
@@ -4400,26 +4394,6 @@ const server = createServer(async (req, res) => {
           : undefined,
       })) return;
       if (serveMissingDashboardChunkModule(req, res, lookupPath)) return;
-    }
-
-    // ─── HD2D office assets (token-gated: download triggers a ~74MB fetch) ──
-    if (req.method === 'GET' && url.pathname === '/api/game/status') {
-      // `proxy` prefills the office tab's optional proxy input (config value
-      // only; an env-var proxy still works as a silent fallback downstream).
-      return jsonRes(res, 200, { ...hd2dStatus(), proxy: readGlobalConfig().httpProxy ?? '' });
-    }
-    if (req.method === 'POST' && url.pathname === '/api/game/download') {
-      // Optional `proxy` in the body is persisted (so it survives restart) and
-      // takes effect immediately for this download — Node's fetch ignores the
-      // proxy env vars, so hosts behind a proxy set it here.
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch { body = undefined; }
-      if (body && typeof body === 'object' && 'proxy' in body) {
-        const raw = (body as { proxy?: unknown }).proxy;
-        const proxy = typeof raw === 'string' ? raw.trim() : '';
-        mergeGlobalConfig({ httpProxy: proxy || null });
-      }
-      return jsonRes(res, 200, startHd2dDownload());
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────
@@ -4437,7 +4411,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
       // Sessions spawned before a bot config carried a display name store the
       // raw appId as botName — resolve through the live registry so consumers
-      // (dashboard, HD2D office tab) always see the human-facing name.
+      // (dashboard) always see the human-facing name.
       const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
       groupsMatrixSnapshot.warm();
       const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
