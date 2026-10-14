@@ -1,6 +1,6 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import { loadSkillPackage } from './package.js';
@@ -20,6 +20,11 @@ function expandHome(path: string): string {
   if (path === '~') return homedir();
   if (path.startsWith('~/')) return join(homedir(), path.slice(2));
   return path;
+}
+
+function isPathWithin(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 function listSkillDirs(root: string): string[] {
@@ -134,6 +139,12 @@ export function discoverNativeCliSkillGroups(cliIds: readonly CliId[]): NativeCl
 }
 
 export function discoverProjectSkills(workingDir: string): SkillPackage[] {
+  let canonicalWorkingDir: string;
+  try {
+    canonicalWorkingDir = realpathSync(workingDir);
+  } catch {
+    return [];
+  }
   const roots = [
     join(workingDir, '.agents', 'skills'),
     join(workingDir, '.botmux', 'skills'),
@@ -142,7 +153,9 @@ export function discoverProjectSkills(workingDir: string): SkillPackage[] {
   for (const root of roots) {
     for (const dir of listSkillDirs(root)) {
       try {
-        out.push(loadSkillPackage(dir, { source: { type: 'project', root: dir } }));
+        const skill = loadSkillPackage(dir, { source: { type: 'project', root: dir } });
+        if (!isPathWithin(canonicalWorkingDir, skill.rootDir)) continue;
+        out.push(skill);
       } catch {
         // Bad project-local skills should surface through diagnostics later, not break spawn.
       }

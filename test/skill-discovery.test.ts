@@ -39,6 +39,39 @@ describe('skill discovery', () => {
     expect(discoverProjectSkills(repo).map((s) => s.name).sort()).toEqual(['agent-skill', 'botmux-skill']);
   });
 
+  it('keeps project skill symlinks inside the working directory and ignores escapes', () => {
+    const skillsRoot = join(repo, '.agents', 'skills');
+    const internal = join(repo, 'shared-skills', 'internal');
+    const external = mkdtempSync(join(tmpdir(), 'botmux-skill-outside-'));
+    try {
+      write(join(internal, 'SKILL.md'), '---\nname: internal-linked-skill\n---');
+      write(join(external, 'SKILL.md'), '---\nname: external-linked-skill\n---');
+      mkdirSync(skillsRoot, { recursive: true });
+      symlinkSync(internal, join(skillsRoot, 'internal'), 'dir');
+      symlinkSync(external, join(skillsRoot, 'external'), 'dir');
+
+      expect(discoverProjectSkills(repo)).toEqual([
+        expect.objectContaining({
+          name: 'internal-linked-skill',
+          rootDir: realpathSync(internal),
+          source: expect.objectContaining({ type: 'project' }),
+        }),
+      ]);
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores project skill symlinks that target files', () => {
+    const skillsRoot = join(repo, '.botmux', 'skills');
+    const target = join(repo, 'not-a-skill-directory');
+    write(target, '---\nname: linked-file\n---');
+    mkdirSync(skillsRoot, { recursive: true });
+    symlinkSync(target, join(skillsRoot, 'linked-file'));
+
+    expect(discoverProjectSkills(repo)).toEqual([]);
+  });
+
   it('discovers native codex skills from CODEX_HOME', () => {
     const codexHome = mkdtempSync(join(tmpdir(), 'botmux-codex-home-'));
     process.env.CODEX_HOME = codexHome;
