@@ -23308,11 +23308,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
   const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, { source: 'ordinary-feishu' });
-  // Session-group registry: point the group at its (new) resident session so
-  // same-group resume and the async AI title can find it.
-  if (chatType === 'group' && isSessionGroup(chatId)) {
-    touchSessionGroup(chatId, session.sessionId);
-  }
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   const groupChatName = await groupChatNamePromise;
@@ -23444,6 +23439,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
+  // Session-group registry: point the group at its new resident so /dismiss and
+  // the async AI title can find it — only once this row WON the slot. A loser
+  // (e.g. the old session resumed concurrently) is closed and rerouted below.
+  if (registration.accepted && chatType === 'group' && isSessionGroup(chatId)) {
+    touchSessionGroup(chatId, session.sessionId);
+  }
   if (!registration.accepted) {
     if (registration.reason === 'existing_owner'
       && activeSessions.get(registration.key) === registration.owner) {
