@@ -148,6 +148,12 @@ Choice questions require at least two options. Secret inputs and malformed batch
 
 To verify, ask a model in an ordinary Codex App session to use native `request_user_input` for a choice question. Confirm the Lark card appears, then submit and confirm the same turn continues with your answer. Native tool availability still depends on the Codex version and execution mode.
 
+In `codex-app`, `request_user_input_async` messages carrying `delivery: async` and `questions` create standalone Lark ask cards while the model continues independent work. Cards remain answerable after normal turn completion. Answers preserve the native call ID and question index and use the existing session delivery queue to start a follow-up turn in the same native thread. Duplicate events create one card; recommended options require explicit submission.
+
+Async questions accept native nonempty batches, one option, and duplicate labels; answers require submission. Human initiators are frozen when the card registers, unaffected by later speakers or reply-target eviction. Authorized scheduled/autonomous origins use the existing canTalk responder policy; silent schedules never post cards. With concurrent cards, quote the intended card for text answers; unquoted input continues as an ordinary turn with a visible hint. A card batch is submitted atomically (reply to the entire batch when it contains text questions); TUI-style partial per-question submission is not supported. Expiry, card failures and undelivered answers are visible. Pending cards do not survive daemon/runner restart.
+
+Human-origin async cards use the existing canTalk policy for registration, and only the initiating user frozen at registration may answer. Authorized scheduled/autonomous cards may be answered by chat members with canTalk permission; scheduled task creators still require canOperate permission. Choice, text, and mixed batches use the existing Ask interaction; a conversation text reply provides a shared comment for the batch. Requests expire after one hour or cancel on turn failure/interruption, runner exit, session closure, or replacement. They are not restored across daemon restarts and historical questions are not backfilled. Availability depends on the Codex version; this async event bridge applies to `codex-app`.
+
 Card structure preview (rendered locally from actual card JSON; live Lark interaction has not yet been manually verified):
 
 ![Codex native user input card preview](/img/codex-native-user-input-preview.png)

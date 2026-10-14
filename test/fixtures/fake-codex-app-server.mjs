@@ -117,7 +117,17 @@ function reject(id, code, message) {
   write({ id, error: { code, message } });
 }
 
+const startedAgentItems = new Set();
 function notify(method, params) {
+  const key = `${params.turnId}:${params.item?.id ?? params.itemId}`;
+  if (method === 'item/started' && params.item?.type === 'agentMessage') startedAgentItems.add(key);
+  if (method === 'item/agentMessage/delta' && !startedAgentItems.has(key)
+      && !(behavior === 'async-user-input-no-start' && params.itemId === 'call_async_question')) {
+    // Real streams declare delivery before deltas. Keep the no-start async
+    // case explicit so buffering is tested rather than inferred from sleeps.
+    notify('item/started', { threadId: params.threadId, turnId: params.turnId,
+      item: { type: 'agentMessage', id: params.itemId, delivery: null } });
+  }
   write({ method, params });
 }
 
@@ -125,7 +135,7 @@ function completeTurn(request) {
   const threadId = request.params.threadId;
   const turnId = `turn-fake-${turnAttempt}`;
   const responseLast = behavior === 'start-response-last'
-    || behavior === 'start-response-last-goal';
+    || behavior === 'start-response-last-goal' || behavior === 'async-user-input-early';
   if (!responseLast) respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
   // Exercise duplicate pre-response lifecycle notifications: the runner must
@@ -153,6 +163,39 @@ function completeTurn(request) {
       setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
     }
     if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
+    return;
+  }
+  if (behavior.startsWith('async-user-input') && turnAttempt === 1) {
+    const item = { type: 'agentMessage', id: 'call_async_question', delivery: 'async', phase: 'final_answer',
+      text: 'Which environment?\nPPE (Recommended) / Production', questions: [
+        { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
+        { title: 'Which voice?', options: null },
+      ] };
+    if (behavior === 'async-user-input-malformed') item.questions[0].options = [];
+    if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
+    const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
+    if (behavior === 'async-user-input-corrected') notify('item/completed', { threadId, turnId,
+      item: { ...item, questions: [{ title: '', options: null }] } });
+    if (behavior === 'async-user-input-overlap') {
+      const text = `Example: ${item.text} END EXAMPLE\n`;
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'ordinary-example', delta: text });
+      notify('item/completed', { threadId, turnId, item: { type: 'agentMessage', id: 'ordinary-example', text } });
+    }
+    if (behavior !== 'async-user-input-no-start') notify('item/started', { threadId: notificationThread, turnId, item });
+    notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
+    notify('item/completed', { threadId: notificationThread, turnId, item });
+    if (behavior === 'async-user-input-duplicate') notify('item/completed', { threadId, turnId, item });
+    if (behavior === 'async-user-input-limit') {
+      for (let n = 1; n <= 32; n++) notify('item/completed', { threadId, turnId, item: { ...item, id: `call_limit_${n}` } });
+    }
+    if (responseLast) respond(request.id, { turn: { id: turnId } });
+    if (behavior === 'async-user-input-exit') { setTimeout(() => process.exit(1), 400); return; }
+    setTimeout(() => {
+      const status = behavior === 'async-user-input-interrupted' ? 'interrupted' : 'completed';
+      notify('item/completed', { threadId, turnId,
+        item: { type: 'agentMessage', id: 'async-independent-final', phase: behavior === 'async-user-input-overlap' ? 'commentary' : 'final_answer', text: 'Independent work completed' } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status } });
+    }, 400);
     return;
   }
   if (behavior === 'hang-turn-completion') return;

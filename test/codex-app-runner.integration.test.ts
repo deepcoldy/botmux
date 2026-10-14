@@ -18,6 +18,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
+import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
+import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
+import { deliverCodexAsyncAnswer } from '../src/services/codex-async-user-input.js';
+import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
   CodexAppControlLineDecoder,
@@ -476,9 +480,12 @@ function startRunner(
   if (controlBootstrapPath !== null) env.BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP = controlBootstrapPath;
   // argv is assembled as a variable here, so take the loader prefix rather than
   // the spawnTsScript wrapper: Node needs `--import tsx`, Bun needs nothing.
-  const { command: runnerCommand, prefixArgs } = tsRunnerPrefix();
+  const compiledRunner = process.env.BOTMUX_TEST_CODEX_APP_RUNNER_BINARY;
+  const { command: runnerCommand, prefixArgs } = compiledRunner
+    ? { command: compiledRunner, prefixArgs: ['__codex-app-runner'] }
+    : tsRunnerPrefix();
   const runnerArgs = [
-    ...prefixArgs, RUNNER_PATH,
+    ...prefixArgs, ...(compiledRunner ? [] : [RUNNER_PATH]),
     '--session-id', SESSION_ID,
     '--codex-bin', fakeCodex,
     '--cwd', cwd,
@@ -659,6 +666,129 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
+  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap'] as const)(
+    'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
+      resetAskBroker();
+      setCanTalkChecker(() => true);
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-async-user-input-'));
+      const fakeCodex = join(dir, 'fake-codex');
+      const logPath = join(dir, 'requests.jsonl');
+      copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex); chmodSync(fakeCodex, 0o755);
+      const control = new ControlCollector(dir); await control.listen();
+      const cards: PendingAsk[] = [];
+      setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: 'om_async_card' }; } });
+      const posts: any[] = [];
+      const deliveries: string[] = [];
+      let responseClosed = false;
+      let routeError: unknown;
+      let harness!: Harness;
+      const http = createHttpServer((req, res) => {
+        let raw = ''; req.on('data', data => { raw += data; });
+        req.on('end', () => { void (async () => {
+          const body = JSON.parse(raw); posts.push(body);
+          const input = parseAskBody(body);
+          if ('error' in input || !input.asyncUserInput) throw new Error('invalid async ask');
+          res.on('close', () => { responseClosed = true; });
+          if (input.asyncFailure) { res.writeHead(409); res.end('async question could not be displayed'); return; }
+          if (outcome === 'refused') { res.writeHead(400); res.end('refused'); return; }
+          const result = await registerAskForResponse({ ...input, timeoutMs: outcome === 'timedOut' ? 1000 : input.timeoutMs,
+            answererOpenId: 'ou_owner', backendSurvivesRestart: false }, res);
+          if (!res.destroyed) {
+            await deliverCodexAsyncAnswer(input.asyncUserInput, input.questions, result, {
+              isCurrent: () => harness.child.exitCode === null,
+              deliver: async text => {
+                deliveries.push(text);
+                harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(text,
+                  { text, clientUserMessageId: 'async-answer-turn' }, 'async-answer-turn')}\r`);
+                return true;
+              },
+            });
+            res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result));
+          }
+        })().catch(error => { routeError = error; res.writeHead(500); res.end(); }); });
+      });
+      await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+      const port = (http.address() as { port: number }).port;
+      writeFileSync(join(dir, '.botmux-origin-capability.json'), JSON.stringify({
+        sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_async_input', dispatchAttempt: 1, ipcPort: port,
+      }), { mode: 0o600 });
+      harness = startRunner(fakeCodex, dir, logPath, '0.162.1', `async-user-input-${outcome}`, control.bootstrap.path, {
+        env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
+          BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test',
+          BOTMUX_WORKFLOW: outcome === 'workflow' ? '1' : '0' },
+      });
+      try {
+        await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', undefined, 'om_async_input')}\r`);
+        if (outcome === 'limit') {
+          await waitFor(harness, () => posts.some(p => p.asyncFailure === 'limit') && control.finals.length > 0);
+          expect(cards).toHaveLength(32);
+          expect(posts.filter(p => p.asyncFailure === 'limit')).toHaveLength(1);
+          expect(deliveries).toHaveLength(0);
+        } else if (outcome === 'refused') {
+          await waitFor(harness, () => control.finals.length > 0 && harness.stdout.includes('async question call_async_question failed'));
+          expect(cards).toHaveLength(0); expect(deliveries).toHaveLength(0);
+          expect(control.finals[0].content).toBe('Independent work completed');
+        } else if (outcome === 'foreign' || outcome === 'malformed' || outcome === 'workflow') {
+          await waitFor(harness, () => control.finals.length > 0);
+          if (outcome === 'malformed') {
+            await waitFor(harness, () => posts.length === 1);
+            expect(posts[0].asyncFailure).toBe('invalid_questions');
+          } else expect(posts).toHaveLength(0);
+          expect(cards).toHaveLength(0);
+        } else {
+          await waitFor(harness, () => cards.length === 1);
+          await waitFor(harness, () => posts.length === (outcome === 'corrected' ? 2 : 1));
+          expect(posts.filter(p => p.asyncFailure)).toHaveLength(outcome === 'corrected' ? 1 : 0);
+          expect(posts.find(p => !p.asyncFailure)).toMatchObject({ originKind: 'native-user-input-async', requestId: 'call_async_question',
+            originTurnId: 'om_async_input', asyncUserInput: { threadId: 'thread-fake', itemId: 'call_async_question' } });
+          expect(cards[0].replyCardTarget).toBeUndefined();
+          expect(submitCustomReply({ askId: cards[0].askId, by: 'ou_other', text: 'Production' })).toBe('unauthorized');
+          if (outcome === 'exit' || outcome === 'interrupted' || outcome === 'timedOut') {
+            await waitFor(harness, () => responseClosed);
+            expect(submitCustomReply({ askId: cards[0].askId, by: 'ou_owner', text: 'Elia' })).toBe('already_settled');
+            expect(deliveries).toEqual([]);
+          } else {
+            // The model finishes independent work BEFORE the user answers;
+            // the question remains live and did not leak into the final.
+            await waitFor(harness, () => control.finals.length > 0);
+            if (outcome === 'overlap') {
+              expect(control.finals[0].content).toBe('Example: Which environment?\nPPE (Recommended) / Production END EXAMPLE\nIndependent work completed');
+              expect(harness.stdout.match(/END EXAMPLE/g)).toHaveLength(1);
+            } else {
+              expect(control.finals[0].content).toBe('Independent work completed');
+              expect(harness.stdout).not.toContain('PPE (Recommended) / Production');
+            }
+            expect(deliveries).toHaveLength(0);
+            const ask = cards[0];
+            if (outcome === 'selected') {
+              expect(submitAsk({ askId: ask.askId, nonce: ask.nonce, by: 'ou_owner',
+                selections: [['o1'], ['o0']] })).toBe('accepted');
+            } else {
+              expect(submitCustomReply({ askId: ask.askId, by: 'ou_owner', text: 'Use PPE and Elia' })).toBe('accepted');
+            }
+            await waitFor(harness, () => control.finals.length >= 2);
+            expect(deliveries).toHaveLength(1); expect(posts.filter(p => !p.asyncFailure)).toHaveLength(1);
+            const starts = readRequests(logPath).filter(r => r.method === 'turn/start');
+            expect(starts).toHaveLength(2);
+            expect(starts[1].params.threadId).toBe(starts[0].params.threadId);
+            expect(starts[1].params.clientUserMessageId).toBe('async-answer-turn');
+            const reply = starts[1].params.input.find((i: any) => i.type === 'text').text;
+            expect(reply).toContain('send_user_message_question_reply');
+            expect(reply).toContain('call_async_question');
+            expect(reply).toContain(outcome === 'selected' ? 'Production' : 'Use PPE and Elia');
+            expect(control.finals[1].replyTurnId ?? control.finals[1].turnId).toBe('async-answer-turn');
+          }
+        }
+        expect(routeError).toBeUndefined();
+      } finally {
+        await stopChild(harness.child); await control.close(); resetAskBroker();
+        http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.each(['selected', 'string', 'custom', 'text', 'timedOut', 'refused', 'interrupt-error', 'cancelled', 'exit', 'unsupported', 'workflow'] as const)(
     'bridges native user input through the real runner/IPC exchange: %s', async outcome => {
       const dir = mkdtempSync(join(tmpdir(), 'botmux-native-user-input-'));
