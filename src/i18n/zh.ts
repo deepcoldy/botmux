@@ -321,6 +321,7 @@ export const messages: Record<string, string> = {
   'cmd.queue.unsupported': '/queue 暂只支持 Codex App 会话。',
   'cmd.queue.not_ready': '会话尚未就绪，请启动会话后重试 /queue。',
   'cmd.queue.accepted': '已接纳：将在当前任务结束后作为独立一轮执行；空闲时直接开始。',
+  'cmd.queue.identity_window': '等待期间的新消息可能使本轮 bytedcli/lark-cli 身份失效。若提示轮次不匹配，请重新发送任务。',
   'cmd.queue.failed': '消息未能入队，请稍后重试。',
   'cmd.no_active_session': '当前话题没有活跃的会话。',
   'cmd.close.tag_updated': '🏷️ 当前群已移入「{name}」。',

@@ -11434,6 +11434,8 @@ export function sendWorkerInput(
   turnId?: string,
   opts: {
     dispatchAttempt?: number;
+    /** A command handler may own its single rejection reply. */
+    notifyRejection?: false;
     /** Explicit positive steer authorization (plain-human-interactive only).
      * Persisted on the accepted ledger entry and forwarded to the worker so the
      * serial runner may steer this turn into an active one. */
@@ -11454,7 +11456,7 @@ export function sendWorkerInput(
     logger.warn(
       `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`,
     );
-    void callbacks?.sessionReply(
+    if (opts.notifyRejection !== false) void callbacks?.sessionReply(
       sessionAnchorId(ds),
       tr('worker.remote_close_in_progress', { backend: remoteBackend }, localeForBot(ds.larkAppId)),
       'text',

@@ -1770,7 +1770,9 @@ export async function handleCommand(
           break;
         }
         const accepted = await deps.submitQueuedMessage?.(ds, message, text, deps.invocationReplyTarget);
-        await sessionReply(rootId, t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc));
+        await sessionReply(rootId, t(accepted ? 'cmd.queue.accepted' : 'cmd.queue.failed', undefined, loc)
+          + (accepted && getBot(ds.larkAppId).config.triggerUserAuth?.enabled
+            ? '\n' + t('cmd.queue.identity_window', undefined, loc) : ''));
         break;
       }
 
@@ -5981,7 +5983,6 @@ export async function handleCommand(
           t('help.cleanup_wt', undefined, loc),
           t('help.lane', undefined, loc),
           t('help.stop', { cliName }, loc),
-          t('help.queue', undefined, loc),
           t('help.restart', { cliName }, loc),
           t('help.topic', undefined, loc),
           t('help.cd', { cliName }, loc),
@@ -5992,6 +5993,7 @@ export async function handleCommand(
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.retry', undefined, loc),
+          t('help.queue', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
           t('help.term', undefined, loc),

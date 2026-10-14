@@ -322,6 +322,7 @@ export const messages: Record<string, string> = {
   'cmd.queue.unsupported': '/queue currently supports Codex App sessions only.',
   'cmd.queue.not_ready': 'Session is not ready. Start the session before retrying /queue.',
   'cmd.queue.accepted': 'Accepted: runs as a separate turn after the active task, or starts immediately when idle.',
+  'cmd.queue.identity_window': 'Later messages during the wait may invalidate this turn’s bytedcli/lark-cli identity. If a turn mismatch is reported, resend the task.',
   'cmd.queue.failed': 'Message was not queued. Please retry later.',
   'cmd.no_active_session': 'No active session in this topic.',
   'cmd.close.tag_updated': '🏷️ This chat is now in “{name}”.',

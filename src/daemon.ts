@@ -5786,6 +5786,22 @@ async function submitQueuedMessage(
     sessionBackendType: ds.session.backendType,
     promptInjection: sessionPromptInjection(ds), turnId: message.messageId,
   });
+  const previousQuote = { id: ds.session.quoteTargetId, sender: ds.session.quoteTargetSenderOpenId,
+    bot: ds.session.quoteTargetSenderIsBot };
+  const previousTarget = ds.currentReplyTarget;
+  const previousSessionTarget = ds.session.currentReplyTarget;
+  const rollbackReplyContext = () => {
+    delete ds.session.replyTargets?.[message.messageId];
+    delete ds.session.turnReplyContexts?.[message.messageId];
+    if (ds.currentReplyTarget?.turnId === message.messageId) ds.currentReplyTarget = previousTarget;
+    if (ds.session.currentReplyTarget?.turnId === message.messageId) ds.session.currentReplyTarget = previousSessionTarget;
+    if (ds.session.quoteTargetId === message.messageId) {
+      ds.session.quoteTargetId = previousQuote.id;
+      ds.session.quoteTargetSenderOpenId = previousQuote.sender;
+      ds.session.quoteTargetSenderIsBot = previousQuote.bot;
+    }
+    sessionStore.updateSession(ds.session);
+  };
   ds.session.quoteTargetId = message.messageId;
   ds.session.quoteTargetSenderOpenId = message.senderId;
   ds.session.quoteTargetSenderIsBot = senderIsBot === true;
@@ -5797,11 +5813,15 @@ async function submitQueuedMessage(
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
   });
+  await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
+  // Identity refresh and reaction delivery both await external work.
+  if (!isCurrent()) { rollbackReplyContext(); return false; }
   // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
   // and carried across runner recovery; user-written text cannot enable it.
   if (!sendWorkerInput(ds, input, message.messageId, {
+    notifyRejection: false,
     trustedCaller: trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot),
-  })) return false;
+  })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
   beginNewTurn(ds, text, message.messageId);
   rememberLastCliInput(ds, text, input);
