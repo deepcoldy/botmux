@@ -4274,14 +4274,52 @@ type AuthoritativeAbandonResult =
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
+type LocalSessionLifecycleMutation = 'delete' | 'resume' | 'suspend' | 'prune' | 'wake';
+
+/**
+ * PostgreSQL primary coordination makes the durable Session row canonical.
+ * The host CLI still discovers sessions from a Pod-local store, so any local
+ * lifecycle mutation can otherwise create a split state (for example local
+ * `closed` while the canonical row remains `active`). Keep every local CLI
+ * mutation fail-closed until it is routed through the durable session-control
+ * lane with fencing.
+ */
+function primaryLocalLifecycleMutationError(
+  operation: LocalSessionLifecycleMutation,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (env.BOTMUX_COORDINATION_MODE?.trim() !== 'primary') return undefined;
+
+  const action = operation === 'delete'
+    ? '`botmux delete` 关闭'
+    : operation === 'resume'
+      ? '`botmux resume` 恢复'
+      : operation === 'suspend'
+        ? '`botmux suspend` 挂起'
+        : operation === 'prune'
+          ? '`botmux list` 自动清理'
+          : '`botmux list` 唤醒';
+  return `BOTMUX_COORDINATION_MODE=primary 下暂不支持通过本地 CLI ${action}会话；本地 Session store 不是 canonical truth，继续执行可能造成它与 PostgreSQL 状态分裂。请在原话题使用会话卡片执行关闭或恢复；其他生命周期操作需等待 durable session-control 支持。本次未做任何修改。`;
+}
+
+function rejectPrimaryLocalLifecycleMutation(operation: LocalSessionLifecycleMutation): void {
+  const error = primaryLocalLifecycleMutationError(operation);
+  if (!error) return;
+  console.error(`❌ ${error}`);
+  process.exit(1);
+}
+
 async function abandonSessionAuthoritatively(
   session: SessionData,
-  online: DaemonDescriptorLite[] = listOnlineDaemons(),
+  online?: DaemonDescriptorLite[],
 ): Promise<AuthoritativeAbandonResult> {
+  const primaryError = primaryLocalLifecycleMutationError('delete');
+  if (primaryError) return { ok: false, error: primaryError };
+
   if (!session.larkAppId) {
     return { ok: false, error: SESSION_ROW_MISSING_APP_ID };
   }
-  const daemon = online.find(d => d.larkAppId === session.larkAppId);
+  const daemon = (online ?? listOnlineDaemons()).find(d => d.larkAppId === session.larkAppId);
   const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
   const injectedPort = isCurrentSession
     ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
@@ -4341,6 +4379,8 @@ async function abandonSessionAuthoritatively(
 }
 
 async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
+  if (primaryLocalLifecycleMutationError('prune')) return false;
+
   const result = await postOwningDaemonSessionMutation(session, 'prune');
   if (result === 'applied') return true;
   if (result === 'refused' || result === 'forbidden_isolated') return false;
@@ -4730,6 +4770,9 @@ async function requestDormantSessionWake(
   | { ok: true }
   | { ok: false; error: string }
 > {
+  const primaryError = primaryLocalLifecycleMutationError('wake');
+  if (primaryError) return { ok: false, error: primaryError };
+
   const online = listOnlineDaemons();
   const daemon = session.larkAppId
     ? online.find(d => d.larkAppId === session.larkAppId)
@@ -5343,12 +5386,24 @@ async function cmdList(): Promise<void> {
     }
     return closed;
   };
-  // Scratches: close silently — they were placeholders, not dead sessions.
-  await closeNow(prunedScratch, 'scratch');
-  if (pruned.length > 0) {
-    const prunedCount = await closeNow(pruned, 'real');
-    if (prunedCount > 0) {
-      console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+  const primaryMode = process.env.BOTMUX_COORDINATION_MODE?.trim() === 'primary';
+  if (primaryMode) {
+    // Keep `list` read-only in primary mode. These rows come from the Pod-local
+    // store, so even an apparently harmless scratch cleanup could close only
+    // the local row while PostgreSQL keeps the canonical Session active.
+    live.push(...prunedScratch, ...pruned);
+    const skipped = prunedScratch.length + pruned.length;
+    if (skipped > 0) {
+      console.warn(`⚠️ primary coordination 下已跳过 ${skipped} 个本地会话的自动清理；本次仅展示，不修改状态。`);
+    }
+  } else {
+    // Scratches: close silently — they were placeholders, not dead sessions.
+    await closeNow(prunedScratch, 'scratch');
+    if (pruned.length > 0) {
+      const prunedCount = await closeNow(pruned, 'real');
+      if (prunedCount > 0) {
+        console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+      }
     }
   }
 
@@ -5372,6 +5427,8 @@ async function cmdList(): Promise<void> {
 }
 
 async function cmdDelete(): Promise<void> {
+  rejectPrimaryLocalLifecycleMutation('delete');
+
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux delete <session-id|all>');
@@ -5498,6 +5555,8 @@ async function cmdSuspend(): Promise<void> {
     console.error('              下次冷启动由 provisioning 自动同步最新登录凭证）');
     process.exit(1);
   }
+
+  if (!dryRun) rejectPrimaryLocalLifecycleMutation('suspend');
 
   const sessions = loadSessions();
   let matched = [...sessions.values()].filter(s => s.status === 'active');
@@ -6534,6 +6593,8 @@ async function cmdWorkflowGrant(runId: string | undefined, rest: string[]): Prom
 }
 
 async function cmdResume(): Promise<void> {
+  rejectPrimaryLocalLifecycleMutation('resume');
+
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux resume <session-id|prefix>');
