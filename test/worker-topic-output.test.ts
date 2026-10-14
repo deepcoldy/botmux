@@ -183,6 +183,56 @@ describe('worker final-output topic transport', () => {
     expect(JSON.stringify(sent)).not.toMatch(/CONFIDENTIAL|secret\.xlsx|private/);
   });
 
+  it.each([
+    ['partial', true],
+    ['failed', false],
+  ])('lets a normal successful final replace a %s trusted plugin attempt', async (_status, primarySucceeds) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
+      turnResults: { enabled: true }, replyCardMode: 'legacy' });
+    ds.session.turnReplyContexts!.om_turn_old = {
+      target: { mode: 'thread', rootMessageId: 'om_source' },
+      sourceMessageId: 'om_turn_old', senderOpenId: 'ou_requester',
+    };
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    const sent: unknown[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    mocks.reply.mockImplementation(async () => {
+      if (!primarySucceeds) throw new Error('CONFIDENTIAL_PROVIDER_SENTINEL');
+      return { code: 0, data: { message_id: 'om_plugin_partial' } };
+    });
+    mocks.upload.mockReset().mockRejectedValue(new Error('/private/CONFIDENTIAL_FILE_SENTINEL.xlsx'));
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: 'req_recover', sessionId: ds.session.sessionId,
+      pluginId: 'data-mcp', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: 'delivery_20261016', markdown: 'CONFIDENTIAL_BUSINESS_SENTINEL', responseKind: 'final',
+      files: [{ name: 'secret.xlsx', dataBase64: Buffer.from('secret').toString('base64') }],
+    });
+    await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
+
+    mocks.reply.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_fallback_final' } });
+    mocks.upload.mockReset().mockResolvedValue({ file_key: 'unused' });
+    await final({ mode: 'thread', rootMessageId: 'om_source' }, () => true, 'safe fallback answer');
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'om_turn_old', status: 'completed' });
+    await waitFor(() => getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old').status === 'ready');
+    const lookup = getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old');
+    expect(lookup).toMatchObject({
+      status: 'ready',
+      result: {
+        execution: { status: 'completed' },
+        output: { status: 'available', content: 'safe fallback answer', source: 'transcript' },
+        deliveries: [{ status: 'delivered', messages: [{ kind: 'primary', messageId: 'om_fallback_final' }] }],
+      },
+    });
+    expect(JSON.stringify(lookup)).not.toMatch(/CONFIDENTIAL|secret\.xlsx|private|om_plugin_partial/);
+  });
+
   it('keeps ordinary result collection alive when durable delivery is disabled', async () => {
     registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', turnResults: { enabled: true } });
     useOrdinaryOutputDelivery();

@@ -50,6 +50,40 @@ describe('ordinary turn result snapshots', () => {
     });
   });
 
+  it.each(['failed', 'partial'] as const)(
+    'lets a later delivered final replace a provisional %s attempt before terminal',
+    status => {
+      const store = new TurnResultStore();
+      store.begin(binding);
+      store.recordDelivery(binding, { status: 'unavailable', reason: 'trusted_plugin_delivery' }, {
+        ...receipt,
+        status,
+        messages: status === 'partial' ? [{ kind: 'primary', messageId: 'om_plugin_partial' }] : [],
+        reason: 'trusted_plugin_delivery_failed',
+      });
+      expect(store.read(binding.ref)).toEqual({ status: 'not_ready' });
+      store.recordDelivery(binding, output, {
+        ...receipt,
+        messages: [{ kind: 'primary', messageId: 'om_fallback_final' }],
+      });
+      store.recordTerminal(binding, execution);
+      expect(store.read(binding.ref)).toEqual({
+        status: 'ready',
+        result: {
+          version: 1,
+          ref: binding.ref,
+          source: binding.source,
+          execution,
+          output,
+          deliveries: [{
+            ...receipt,
+            messages: [{ kind: 'primary', messageId: 'om_fallback_final' }],
+          }],
+        },
+      });
+    },
+  );
+
   it('isolates bot, turn, attempt and worker generation without selecting latest', () => {
     const store = new TurnResultStore();
     store.begin(binding);

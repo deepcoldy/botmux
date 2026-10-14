@@ -67,6 +67,7 @@ import {
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
+const FROZEN_COMMAND_HOST_CAPABILITY = Symbol('frozen-command-host-capability');
 
 export function resolveGatewayEnvironment(
   env: NodeJS.ProcessEnv = process.env,
@@ -334,13 +335,13 @@ export class PluginMcpGateway {
     opts: {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
-      allowHostOnlyTools?: boolean;
     } = {},
+    hostCapability?: symbol,
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
-    this.allowHostOnlyTools = opts.allowHostOnlyTools === true;
+    this.allowHostOnlyTools = hostCapability === FROZEN_COMMAND_HOST_CAPABILITY;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -878,6 +879,30 @@ export class PluginMcpGateway {
       await Promise.allSettled(this.connections.map(connection => connection.client.sendRootsListChanged()));
     });
   }
+}
+
+/**
+ * Creates the in-process MCP gateway used by the host-owned frozen-command
+ * executor. The unexported capability token keeps host-only tools unavailable
+ * to ordinary session gateways and to the standalone model-facing MCP relay.
+ */
+export function createFrozenCommandPluginGateway(opts: {
+  pluginId: string;
+  env: NodeJS.ProcessEnv;
+  trustedTurnIdentity: GatewayTrustedTurnIdentityProvider;
+}): PluginMcpGateway {
+  const pluginId = opts.pluginId.trim();
+  if (!pluginId
+    || !opts.env.BOTMUX_EXECUTION_ID?.trim()
+    || opts.env.BOTMUX_SESSION_ID?.trim()) {
+    throw new Error('Invalid frozen-command MCP host context');
+  }
+  return new PluginMcpGateway(
+    [pluginId],
+    opts.env,
+    { trustedTurnIdentity: opts.trustedTurnIdentity },
+    FROZEN_COMMAND_HOST_CAPABILITY,
+  );
 }
 
 export async function runMcpGateway(): Promise<void> {

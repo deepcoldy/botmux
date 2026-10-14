@@ -10,6 +10,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import {
   bindGatewayInputLifecycle,
+  createFrozenCommandPluginGateway,
   PluginMcpGateway,
   resolveGatewayEnvironment,
 } from '../src/core/plugins/mcp/gateway.js';
@@ -170,11 +171,11 @@ describe('plugin MCP Gateway', () => {
     await modelClient.close();
     await modelGateway.close();
 
-    const hostGateway = new PluginMcpGateway(
-      ['plugin-hostonly'],
-      { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host' },
-      { trustedTurnIdentity: identity, allowHostOnlyTools: true },
-    );
+    const hostGateway = createFrozenCommandPluginGateway({
+      pluginId: 'plugin-hostonly',
+      env: { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host', BOTMUX_SESSION_ID: undefined },
+      trustedTurnIdentity: identity,
+    });
     const hostClient = new Client({ name: 'host-gateway-test', version: '1.0.0' });
     const [hostClientTransport, hostServerTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([hostGateway.connect(hostServerTransport), hostClient.connect(hostClientTransport)]);
@@ -185,6 +186,26 @@ describe('plugin MCP Gateway', () => {
     expect(text).not.toContain('result_delivery_v1');
     await hostClient.close();
     await hostGateway.close();
+
+    expect(() => createFrozenCommandPluginGateway({
+      pluginId: 'plugin-hostonly',
+      env: { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host', BOTMUX_SESSION_ID: 'session-model' },
+      trustedTurnIdentity: identity,
+    })).toThrow('Invalid frozen-command MCP host context');
+
+    const sessionGateway = new PluginMcpGateway(
+      ['plugin-hostonly'],
+      { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host', BOTMUX_SESSION_ID: 'session-model' },
+      { trustedTurnIdentity: identity },
+    );
+    const sessionClient = new Client({ name: 'session-gateway-test', version: '1.0.0' });
+    const [sessionClientTransport, sessionServerTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([sessionGateway.connect(sessionServerTransport), sessionClient.connect(sessionClientTransport)]);
+    expect((await sessionClient.listTools()).tools.map(tool => tool.name)).toEqual(['echo']);
+    await expect(sessionClient.callTool({ name: 'frozen_query_raw', arguments: {} }))
+      .rejects.toThrow(/No enabled plugin MCP handles/);
+    await sessionClient.close();
+    await sessionGateway.close();
   });
 
   it('isolates a failed downstream server', async () => {
