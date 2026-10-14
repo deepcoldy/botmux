@@ -772,28 +772,6 @@ describe('decideDashboardAuth — public surface', () => {
     expect(d.kind).toBe('deny401');
   });
 
-  it('GET /game/index.html — HD2D office shell allow without any token', () => {
-    const d = decideDashboardAuth({
-      method: 'GET',
-      pathname: '/game/index.html',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('allow');
-  });
-
-  it('POST /api/game/download without token → deny401 (gated: triggers a ~74MB fetch)', () => {
-    const d = decideDashboardAuth({
-      method: 'POST',
-      pathname: '/api/game/download',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('deny401');
-  });
-
   // ─── P2-1：/workbench-ticket/<ticket> 兑换端点 ─────────────────────────
   // 飞书卡片的工作台入口改带短时票据；票据本身就是凭证，处理器自行验票，所以
   // 这条 GET 必须在 token 门禁之外可达。其它方法与残缺路径保持 fail closed。

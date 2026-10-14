@@ -11,6 +11,11 @@ export interface GroupMemberBot extends GroupBot {
   pinStreamingCardMasterEnabled?: boolean;
   pinStreamingCardChatEnabled?: boolean;
   pinStreamingCardEffectiveEnabled?: boolean;
+  /** Bot-level run-process card switch (`!disableStreamingCard`). */
+  streamingCardMasterEnabled?: boolean;
+  /** Chat override: false == `/card off` (chat in `noCardChats`); true inherits the bot. */
+  streamingCardChatEnabled?: boolean;
+  streamingCardEffectiveEnabled?: boolean;
   agentCliId?: string;
   agentModel?: string;
   agentReasoningEffort?: string;

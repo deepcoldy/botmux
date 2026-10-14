@@ -28,6 +28,7 @@ import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForF
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
@@ -1326,7 +1327,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write('\x1b[200~' + sanitizedContent + '\x1b[201~');
+        pty.write(wrapBracketedPaste(sanitizedContent));
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
@@ -1560,5 +1561,3 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     asksViaHook: true,
   };
 }
-
-export const create = createClaudeCodeAdapter;

@@ -7,6 +7,7 @@ import {
 } from 'react';
 import { Cron } from 'croner';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 import { useStoreSelector, useT, useDashboardLocale } from './react-hooks.js';
 import {
   CreateActionButton,
@@ -1732,7 +1733,6 @@ export function ScheduleFormModal(props: {
 }) {
   const { editing, tr, bots, open, scheduleTimeZone } = props;
   const locale = useDashboardLocale();
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const chatPickerRef = useRef<HTMLDivElement | null>(null);
   const chatPickerTriggerRef = useRef<HTMLButtonElement | null>(null);
   const chatSearchRef = useRef<HTMLInputElement | null>(null);
@@ -1806,18 +1806,6 @@ export function ScheduleFormModal(props: {
       .finally(() => { if (!controller.signal.aborted) setCalendarsLoading(false); });
     return () => controller.abort();
   }, [open, larkAppId, calendarsReload]);
-
-  // open 时 showModal + 聚焦首个输入；关闭时 close()（Esc/遮罩点击走 onClose）
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg) return;
-    if (open && !dlg.open) {
-      dlg.showModal();
-      dlg.querySelector<HTMLElement>('input[name="name"]')?.focus();
-    } else if (!open && dlg.open) {
-      dlg.close();
-    }
-  }, [open]);
 
   useEffect(() => {
     if (!open || !chatPickerOpen) return;
@@ -2160,11 +2148,12 @@ export function ScheduleFormModal(props: {
 
   return (
     <>
-    <dialog
-      ref={dialogRef}
+    <ModalDialog
+      open={open}
       className="schedule-form-dialog"
       onClose={props.onClose}
-      onClick={e => { if (e.target === dialogRef.current) props.onClose(); }}
+      // 打开后聚焦首个输入（Esc/遮罩点击走 onClose）
+      onOpen={dialog => dialog.querySelector<HTMLElement>('input[name="name"]')?.focus()}
     >
       <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
       <form onSubmit={handleSubmit} className="schedule-form" noValidate>
@@ -2842,7 +2831,7 @@ export function ScheduleFormModal(props: {
           </button>
         </div>
       </form>
-    </dialog>
+    </ModalDialog>
     <SchedulePreconditionHelpDialog
       open={open && preconditionHelpSource !== null}
       mode={preconditionMode}

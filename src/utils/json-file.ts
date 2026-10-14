@@ -33,6 +33,7 @@
  * 自己的序列化格式 / mode。
  */
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, renameSync, statSync } from 'node:fs';
+import { errorMessage } from './error-message.js';
 import { logger } from './logger.js';
 
 export interface ReadJsonFileSoftOptions<T> {
@@ -54,10 +55,6 @@ export function isJsonObject(v: unknown): v is Record<string, any> {
 
 function errCode(err: unknown): string | undefined {
   return err && typeof err === 'object' && 'code' in err ? String((err as NodeJS.ErrnoException).code) : undefined;
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 /** 隔离目标：`${path}.corrupt-<ms>`；同毫秒已有同名文件时追加 `-<n>`，绝不覆盖先前的隔离文件。 */
@@ -86,7 +83,7 @@ function quarantine(path: string, readIdent: { dev: number; ino: number } | unde
     renameSync(path, dest);
     logger.warn(`[json-file] ${label}: ${path} ${reason}; moved to ${dest}, continuing with fallback`);
   } catch (err) {
-    logger.warn(`[json-file] ${label}: ${path} ${reason}; failed to quarantine (${errCode(err) ?? errMsg(err)}), continuing with fallback — the next write may overwrite it`);
+    logger.warn(`[json-file] ${label}: ${path} ${reason}; failed to quarantine (${errCode(err) ?? errorMessage(err)}), continuing with fallback — the next write may overwrite it`);
   }
 }
 
@@ -109,7 +106,7 @@ export function readJsonFileSoft<T>(path: string, opts: ReadJsonFileSoftOptions<
   } catch (err) {
     const code = errCode(err);
     if (code !== 'ENOENT') {
-      logger.warn(`[json-file] ${opts.label}: cannot read ${path} (${code ?? errMsg(err)}); using fallback without quarantining`);
+      logger.warn(`[json-file] ${opts.label}: cannot read ${path} (${code ?? errorMessage(err)}); using fallback without quarantining`);
     }
     return opts.fallback();
   } finally {
@@ -122,7 +119,7 @@ export function readJsonFileSoft<T>(path: string, opts: ReadJsonFileSoftOptions<
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    quarantine(path, ident, `is not valid JSON (${errMsg(err)})`, opts.label);
+    quarantine(path, ident, `is not valid JSON (${errorMessage(err)})`, opts.label);
     return opts.fallback();
   }
 

@@ -16,11 +16,7 @@ import {
 } from './listener-filters.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
-import {
-  hasExplicitChatRole,
-  summarizeGroupProfileMatches,
-  type EffectiveRoleValue,
-} from './role-profile-match.js';
+import { GroupProfileStatus } from './group-profile-status.js';
 import {
   applyRoleProfile,
   botInChatCount,
@@ -1512,10 +1508,12 @@ function GroupsTree(props: {
                 <div className="roles-group-name">{group.name ?? group.chatId}</div>
                 <div className="roles-group-meta">{roleCount}/{totalInChat} {tr('roles.botsWithRoles')}</div>
                 <GroupProfileStatus
-                  group={group}
+                  className="roles-profile-match"
+                  memberBots={group.memberBots}
                   profiles={props.profiles}
-                  context={props.context}
+                  entriesByProfile={props.context.entriesByProfile}
                   loaded={props.contextLoaded}
+                  roleOf={larkAppId => props.context.effectiveRolesByBot.get(roleKey(larkAppId, group.chatId))}
                   tr={tr}
                 />
               </div>
@@ -1557,36 +1555,6 @@ function GroupsTree(props: {
         );
       })}
     </>
-  );
-}
-
-function GroupProfileStatus(props: {
-  group: GroupInfo;
-  profiles: RoleProfileSummary[];
-  context: RoleProfileContext;
-  loaded: boolean;
-  tr: Translator;
-}) {
-  const { group, profiles, context, loaded, tr } = props;
-  if (!profiles.length || !loaded) return null;
-  const rolesByBot = new Map<string, EffectiveRoleValue>();
-  for (const bot of group.memberBots) {
-    if (!bot.inChat) continue;
-    rolesByBot.set(bot.larkAppId, context.effectiveRolesByBot.get(roleKey(bot.larkAppId, group.chatId)) ?? null);
-  }
-  if (!hasExplicitChatRole(rolesByBot)) return null;
-  const best = summarizeGroupProfileMatches(group.memberBots, profiles, context.entriesByProfile, rolesByBot)[0];
-  if (!best) return <div className="roles-profile-match muted">{tr('groups.profileStatusUnmatched')}</div>;
-  const key = best.kind === 'full' ? 'groups.profileStatusFullChat' : 'groups.profileStatusPartial';
-  return (
-    <div className={`roles-profile-match ${best.kind}`}>
-      {tr(key, {
-        name: best.profileId,
-        matched: best.matched,
-        total: best.total,
-        chat: best.chatMatched,
-      })}
-    </div>
   );
 }
 

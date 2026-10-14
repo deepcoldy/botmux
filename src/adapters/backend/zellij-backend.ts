@@ -11,6 +11,7 @@ import { strictPaneCommand } from './strict-env.js';
 import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
 
 /**
  * ZellijBackend — session backend using zellij for process persistence.
@@ -491,6 +492,7 @@ export function findServerPid(sessionName: string): number | null {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 3000,
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       env: zellijEnv(),
     });
     servers = parseZellijServerProcs(out);
@@ -548,6 +550,7 @@ export function findPaneCliPid(sessionName: string, _binBasename: string): numbe
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 3000,
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       env: zellijEnv(),
     });
     const children: number[] = [];

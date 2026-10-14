@@ -34,6 +34,7 @@ import {
 } from './services/codex-transcript.js';
 import type { CodexServiceTier } from './services/codex-service-tier.js';
 import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
+import { pidIsSignalable } from './utils/process-alive.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
@@ -63,9 +64,7 @@ async function findFreePort(): Promise<number> {
   });
 }
 
-function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
+const isAlive = pidIsSignalable;
 
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */

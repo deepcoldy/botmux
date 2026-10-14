@@ -78,6 +78,7 @@ import {
 import { sanitizePerBotEnv } from './per-bot-env.js';
 import { buildBotWorkerEnv } from './env-policy.js';
 import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import {
   isExistingAppServerSharedAdoptPersistedSession,
   isSharedAdoptPersistedSession,
@@ -143,6 +144,7 @@ import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, 
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
+import type { BotConfig } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -150,6 +152,10 @@ import { cleanupSessionTempDirAfterExit } from './session-temp.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
+import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
+import { TurnResultStore } from '../services/turn-result-store.js';
+import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
+import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observeTurnResultTerminal, observeTurnResultDelivery } from './turn-result-session.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -674,7 +680,7 @@ import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failur
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
-import type { CliId } from '../adapters/cli/types.js';
+import { isCodexAppCliId, type CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
@@ -884,6 +890,7 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
   /** Host-owned return path for zero-injection sub-bots. */
   onZeroPromptFinal?: (ds: DaemonSession, input: {
     turnId: string; content: string; dispatchRoot?: string;
@@ -1015,6 +1022,24 @@ let callbacks: WorkerPoolCallbacks | undefined;
  */
 export function initWorkerPool(cb: WorkerPoolCallbacks): void {
   callbacks = cb;
+  setTurnResultRuntime(createTurnResultRuntime({
+    store: new TurnResultStore(),
+    enabled: turnResultEnabled,
+    eligible: binding => {
+      const session = [...(activeSessionsRegistry?.values() ?? [])].find(current =>
+        current.larkAppId === binding.ref.botId && current.session.sessionId === binding.ref.sessionId);
+      return !!session && session.chatId === binding.source.chatId
+        && turnResultSessionEligible(session, binding.ref.turnId, binding.ref.dispatchAttempt);
+    },
+    owns: binding => {
+      const session = [...(activeSessionsRegistry?.values() ?? [])].find(current =>
+        current.larkAppId === binding.ref.botId && current.session.sessionId === binding.ref.sessionId);
+      return !!session && session.session.workerGeneration === binding.workerGeneration
+        && (session.workerGeneration === undefined || session.workerGeneration === binding.workerGeneration);
+    },
+    onTurnResult: cb.onTurnResult,
+    onObserverError: (ref, code) => logger.warn(`[results] ${code} session=${ref.sessionId} turn=${ref.turnId}`),
+  }));
 }
 
 function requireCallbacks(): WorkerPoolCallbacks {
@@ -1700,6 +1725,15 @@ export function dshRuntimeForSession(ds: DaemonSession): 'official' | 'tui' | un
   }
 }
 
+/** 会话生效的 CLI：`/cli <id>` 的 cliLaunchSnapshot → 会话冻结的 cliId → bot 配置。
+ *
+ *  `/cli` 只在会话尚未启动时生效（有历史 / 已冻结 / 有 live worker 一律拒绝）：它写一个 pending 的
+ *  snapshot，既不动 session.cliId（此时仍为空）也不起 worker；首次 forkWorker 里
+ *  sessionAgentConfig 才把 snapshot resolve 并把 session.cliId 盖成所选 CLI，此后两者恒等。
+ *  所以 snapshot 与 session.cliId 不一致的窗口只有「pending、尚未首次 fork」——此时 snapshot 才是
+ *  会话将要跑的 CLI，session.cliId ?? bot 看到的是 bot 默认 CLI。
+ *
+ *  「是不是 Codex App」统一用 `isCodexAppCliId(sessionCliId(...))`，不要再写 `session.cliId ?? bot.cliId`。 */
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
 }
@@ -9902,7 +9936,9 @@ export function updateCodexAppEffort(
   timeoutMs = 35_000,
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
-  if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex-app'
+  // 优先级 snapshot ?? session.cliId（刻意不回落到 bot 配置）：只对已有 live worker 的
+  // 会话生效，此时 sessionAgentConfig 已把 cliId 冻结到会话上，回落分支不可达。
+  if (!isCodexAppCliId(ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId)
     || !worker || worker.killed || !ds.workerReady || !ds.cliReady
     || ds.session.status !== 'active' || isSessionTransferring(ds)
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) {
@@ -11031,8 +11067,10 @@ function resolvesToHome(p: string): boolean {
 export function codexAppCleanInputAcceptedForSession(ds: DaemonSession): boolean {
   try {
     const botCfg = getBot(ds.larkAppId).config;
-    const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
-    return effectiveCliId === 'codex-app'
+    // 必须含 cliLaunchSnapshot：follower 在首次 fork 之前（snapshot 仍 pending、session.cliId 为空）
+    // 入队时就要冻结 clean-input 决定，此时只有 snapshot 知道会话将跑哪个 CLI。
+    const effectiveCliId = sessionCliId(ds, botCfg);
+    return isCodexAppCliId(effectiveCliId)
       && botCfg.codexAppCleanInput === true
       && !ds.adoptedFrom;
   } catch {
@@ -11136,8 +11174,10 @@ function acceptCodexAppDispatch(
   opts: { persist?: boolean } = {},
 ): string | undefined {
   const botCfg = getBot(ds.larkAppId).config;
-  const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
-  if (effectiveCliId !== 'codex-app' || !turnId) return undefined;
+  // 同上，含 cliLaunchSnapshot，与 sendWorkerInput 的 sessionCliId 同源：promote 在首次 fork 之前
+  // （daemon 重启后 restore 的 tail-only 会话）也会走到这里，ledger 记账不能按 bot 默认 CLI。
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  if (!isCodexAppCliId(effectiveCliId) || !turnId) return undefined;
   const dispatchId = randomUUID();
   const priorLedger = ds.session.codexAppDispatchLedger;
   ds.session.codexAppDispatchLedger = appendAcceptedCodexAppDispatch(
@@ -11598,7 +11638,7 @@ export function sendWorkerInput(
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
-  const effectiveTurnId = turnId ?? (effectiveCliId === 'codex-app'
+  const effectiveTurnId = turnId ?? (isCodexAppCliId(effectiveCliId)
     ? `codex-app-dispatch-${randomUUID()}`
     : undefined);
   const replyTurnId = turnId ? undefined : ds.currentReplyTarget?.turnId;
@@ -12372,8 +12412,10 @@ export function resolveQuarantinedForkPlan(
   // Promotion succeeded: the old head is now the tokened queued activation. Fork
   // THAT, exactly like the daemon's queuedActivation recovery — Codex App through
   // its dispatch ledger (empty prompt), non-Codex by resubmitting the exact input.
+  // 必须与上面刚跑完的 promote（acceptCodexAppDispatch 按 sessionCliId 决定是否开 ledger entry）
+  // 同源：tail-only 的 restore 会话可能从未 fork 过（snapshot 仍 pending），不能按 session.cliId ?? bot。
   const recoverThroughCodexLedger =
-    (ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) === 'codex-app';
+    isCodexAppCliId(sessionCliId(ds, getBot(ds.larkAppId).config));
   return {
     fork: true,
     promptInput: recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
@@ -12383,6 +12425,67 @@ export function resolveQuarantinedForkPlan(
       dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
     },
   };
+}
+
+/**
+ * Freeze the worker's sandbox DECISION on the session record — the SAME fields
+ * forkWorker's SpawnOpts consumes (`sandbox` tri-state + path/network/scratch
+ * options). Called at TWO edges:
+ *   - pending auto-worktree establishment (runAutoWorktreeCommit), BEFORE any
+ *     git / notice await, so the auto-worktree fail-closed gate and the later
+ *     fork consume ONE snapshot; and
+ *   - forkWorker itself, preserving the original "recorded at creation"
+ *     semantics for sessions that never went through a pendingRepo phase.
+ *
+ * Without the early freeze, a dashboard `PUT /api/bot-sandbox` toggle landing
+ * while the worktree build is in flight (that route is next-session-only and
+ * has no active-session fence) made the gate degrade on the OLD value while the
+ * fork adopted the NEW one: the gate allowed the fallback to the real default
+ * dir and the worker engaged the oncall sandbox there — the exact write-escape
+ * the fail-closed gate exists to prevent. Re-reading live config only after
+ * the fallback would still leave the recheck→fork await window, so the
+ * decision is frozen ONCE and both consumers read the session.
+ *
+ * Legacy `readIsolation` is folded into the frozen tri-state (it implies
+ * oncall). The SpawnOpts `readIsolation` flag itself stays live-config driven:
+ * `PUT /api/bot-read-isolation` refuses while ANY session of the bot is active
+ * (a pendingRepo placeholder is registered in activeSessions), so it cannot
+ * flip during a pending worktree build.
+ *
+ * Idempotent: an already-frozen session (`sandbox !== undefined`) keeps its
+ * recorded decision — a historical session is never retroactively re-frozen
+ * from a toggled live flag. A `resume` session with no recorded decision
+ * predates the sandbox feature and stays NOT sandboxed.
+ */
+export function freezeSessionSandboxDecision(
+  ds: DaemonSession,
+  botCfg: Pick<BotConfig, 'sandbox' | 'readIsolation' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'>,
+  opts: { resume?: boolean } = {},
+): void {
+  if (ds.session.sandbox !== undefined) return;
+  if (!opts.resume) {
+    const resolved = botCfg.readIsolation === true ? 'oncall' : normalizeSandboxMode(botCfg.sandbox);
+    ds.session.sandbox = resolved === 'scratch' ? 'scratch' : resolved === 'oncall' ? true : false;
+    ds.session.sandboxPaths = botCfg.sandboxPaths;
+    ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
+    ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
+    ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
+    ds.session.sandboxNetworkPolicy = botCfg.sandboxNetworkPolicy ? structuredClone(botCfg.sandboxNetworkPolicy) : undefined;
+    if (ds.session.sandbox === 'scratch') {
+      ds.session.sandboxScratch = {
+        storage: normalizeScratchStorage(botCfg.scratchStorage),
+        ...(botCfg.scratchTmpfsSizeMb ? { tmpfsSizeMb: botCfg.scratchTmpfsSizeMb } : {}),
+        ...(botCfg.scratchDenyPaths?.length ? { denyPaths: botCfg.scratchDenyPaths } : {}),
+        network: botCfg.sandboxNetwork !== false,
+      };
+    }
+  } else {
+    ds.session.sandbox = 'off';
+    ds.session.sandboxHidePaths = [];
+    ds.session.sandboxReadonlyPaths = [];
+    ds.session.sandboxNetwork = true;
+  }
+  sessionStore.updateSession(ds.session);
 }
 
 /**
@@ -12922,34 +13025,11 @@ export function forkWorker(
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
   // historical session. A brand-new session (resume=false) with no recorded
   // decision adopts the live bot flag; a restore (resume=true) with no recorded
-  // decision predates the sandbox feature → stays NOT sandboxed.
-  if (ds.session.sandbox === undefined) {
-    if (!resume) {
-      {
-        const resolved = botCfg.readIsolation === true ? 'oncall' : normalizeSandboxMode(botCfg.sandbox);
-        ds.session.sandbox = resolved === 'scratch' ? 'scratch' : resolved === 'oncall' ? true : false;
-      }
-      ds.session.sandboxPaths = botCfg.sandboxPaths;
-      ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
-      ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
-      ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
-      ds.session.sandboxNetworkPolicy = botCfg.sandboxNetworkPolicy ? structuredClone(botCfg.sandboxNetworkPolicy) : undefined;
-      if (ds.session.sandbox === 'scratch') {
-        ds.session.sandboxScratch = {
-          storage: normalizeScratchStorage(botCfg.scratchStorage),
-          ...(botCfg.scratchTmpfsSizeMb ? { tmpfsSizeMb: botCfg.scratchTmpfsSizeMb } : {}),
-          ...(botCfg.scratchDenyPaths?.length ? { denyPaths: botCfg.scratchDenyPaths } : {}),
-          network: botCfg.sandboxNetwork !== false,
-        };
-      }
-    } else {
-      ds.session.sandbox = 'off';
-      ds.session.sandboxHidePaths = [];
-      ds.session.sandboxReadonlyPaths = [];
-      ds.session.sandboxNetwork = true;
-    }
-    sessionStore.updateSession(ds.session);
-  }
+  // decision predates the sandbox feature, so it stays NOT sandboxed. A
+  // pendingRepo session was already frozen at its establishment
+  // (runAutoWorktreeCommit), so this is a no-op there and the fork consumes
+  // the SAME snapshot the auto-worktree gate consumed.
+  freezeSessionSandboxDecision(ds, botCfg, { resume });
 
   // Reserve and durably publish the replacement lifetime before killing an
   // existing worker. A failed reservation leaves the old worker untouched;
@@ -12997,7 +13077,7 @@ export function forkWorker(
   if (!isSharedAdoptSession(ds)) reclaimParkedCrashDiagnostic(ds);
 
   agentCfg = sessionAgentConfig(ds, botCfg);
-  if (!initTurnId && prompt.length > 0 && agentCfg.cliId === 'codex-app') {
+  if (!initTurnId && prompt.length > 0 && isCodexAppCliId(agentCfg.cliId)) {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
   }
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
@@ -13130,10 +13210,10 @@ export function forkWorker(
   // catch (pre-init rollback + rethrow) and then the keyed trigger's post-barrier
   // convergence, which durably terminalizes the turn to `failed` (observable,
   // at-most-once) — the correct contract for every fork-failure path.
-  if (agentCfg.cliId === 'codex-app') {
+  if (isCodexAppCliId(agentCfg.cliId)) {
     retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
   }
-  const codexAppRecoveredDispatches = agentCfg.cliId === 'codex-app'
+  const codexAppRecoveredDispatches = isCodexAppCliId(agentCfg.cliId)
     ? (ds.session.codexAppDispatchLedger ?? []).map(entry => ({ ...entry }))
     : [];
   const promptCodexAppInput = initCodexAppInputGateFrozen
@@ -13384,7 +13464,7 @@ export function forkWorker(
     // Codex App no-progress nudge tuning: read live from bot config so
     // /config set noProgressNotify takes effect on the next worker fork
     // without recreating the session (same pattern as turnTimeoutMs).
-    noProgressNotify: agentCfg.cliId === 'codex-app' ? botCfg.noProgressNotify : undefined,
+    noProgressNotify: isCodexAppCliId(agentCfg.cliId) ? botCfg.noProgressNotify : undefined,
     codexBrowser: botCfg.codexBrowser,
     // Existing App Server attachment owns neither an app-server nor a JSON-RPC
     // input channel. It is a normal official remote TUI, so all user input goes
@@ -13458,6 +13538,8 @@ export function forkWorker(
     // frozen from botCfg.sandbox at create time, so "follow local sandbox" holds.
     readIsolation: botCfg.readIsolation === true,
     readDenyExtraPaths: botCfg.readDenyExtraPaths ?? [],
+    // Fork may only strengthen the auto-worktree gate's degrade verdict (worker.ts).
+    autoWorktreeFallbackDir: ds.session.autoWorktreeFallbackDir,
     // Identifies THIS daemon lifetime. Stamped onto isolated panes so the worker
     // can tell a suspend→resume reattach (same boot id, still isolated) from a
     // stale pane surviving a daemon restart (different id → kill + cold-spawn).
@@ -14975,7 +15057,7 @@ function setupWorkerHandlers(
         const identity = runtimeBuildIdentity();
         if (
           ds.worker === worker
-          && effectiveCliId === 'codex-app'
+          && isCodexAppCliId(effectiveCliId)
           && identity.status === 'known'
           && msg.runnerBuildId === identity.id
         ) {
@@ -15953,7 +16035,7 @@ function setupWorkerHandlers(
         // restart in place start with no authority, and crash-loop protection
         // clears this temporary policy-only state before parking below.
         const mayRestartLocalWorker = !(msg.codexAppActiveWriter === true
-          && effectiveCliId === 'codex-app')
+          && isCodexAppCliId(effectiveCliId))
           && !isSharedAdoptSession(ds)
           && !isRemoteBackendSession(ds)
           && !worker.killed;
@@ -16011,7 +16093,7 @@ function setupWorkerHandlers(
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
-        if (msg.codexAppActiveWriter === true && effectiveCliId === 'codex-app') {
+        if (msg.codexAppActiveWriter === true && isCodexAppCliId(effectiveCliId)) {
           // `thread/resume` was explicitly rejected because another Codex
           // app-server currently owns the persisted thread. This is a safe,
           // expected handoff conflict — never spend restart budget or let the
@@ -16627,6 +16709,7 @@ function setupWorkerHandlers(
           break;
         }
         forgetScheduledTurnCaller(ds, msg.turnId);
+        observeTurnResultTerminal(ds, msg, workerGeneration);
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -18550,6 +18633,17 @@ function deliverFinalOutput(
         workerGeneration: ds.session.workerGeneration,
       }) : undefined;
   let topicMessageLookup: TopicMessageLookup | undefined;
+  const resultBinding = turnResultBinding(ds, msg.turnId, msg.dispatchAttempt);
+  const resultTarget = frozenReplyTarget ? { ...frozenReplyTarget } : undefined;
+  let finalPublication: { output: TurnResult['output']; receipt: Pick<TurnDeliveryReceipt, 'status' | 'messages' | 'reason'> } | undefined;
+  const resultReceipt = (status: TurnDeliveryReceipt['status'], messages: TurnDeliveryReceipt['messages'], reason?: string): TurnDeliveryReceipt => ({
+    channel: 'im', status, platform: 'lark', chatId: resultBinding?.source.chatId ?? ds.chatId,
+    ...(resultTarget && resultTarget.mode !== 'plain' ? { parentMessageId: resultTarget.rootMessageId } : {}),
+    messages, ...(reason ? { reason } : {}),
+  });
+  const partialResultMessages = (): TurnDeliveryReceipt['messages'] => {
+    return finalPublication?.receipt.messages ?? [];
+  };
   const scopedReply = (
     content: string,
     msgType?: string,
@@ -19043,7 +19137,8 @@ function deliverFinalOutput(
               ...(feedbackPolicy && feedback ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}),
             }, (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
               frozenReplyTarget ? { uuid, beforeWrite, replyTarget: frozenReplyTarget } : { uuid, beforeWrite }),
-            { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
+            { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned,
+              ...(resultBinding ? { onPublication: publication => { finalPublication = publication; } } : {}) })
           : undefined;
       const sendFinal = (content: string) => scopedReply(
         content,
@@ -19112,10 +19207,24 @@ function deliverFinalOutput(
           explicit ? explicit.feedback?.requesterSubjectId : feedbackRequesterSubjectId,
           getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, explicit ? messageId : undefined);
       }
+      observeTurnResultDelivery(resultBinding, finalPublication?.output ?? (explicit
+        ? { status: 'unavailable', reason: 'explicit_publication_unproven' }
+        : msg.turnFailed
+        ? { status: 'unavailable', reason: 'execution_failed' }
+        : { status: 'available', format: 'markdown', content: safeAssistantText,
+            source: 'transcript' }),
+      resultReceipt(finalPublication?.receipt.status ?? (explicit ? 'unknown' : 'delivered'), finalPublication?.receipt.messages ?? (explicit ? [] : [
+        { kind: 'primary', messageId },
+        ...(unifiedReply?.record.overflowMessageId
+          ? [{ kind: 'attachment' as const, messageId: unifiedReply.record.overflowMessageId }] : []),
+      ]), finalPublication?.receipt.reason));
       onComplete?.(true, messageId);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }
       if (err instanceof ReplyCardWithdrawnError) {
+        const deliveredParts = partialResultMessages();
+        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'message_withdrawn' },
+          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'message_withdrawn'));
         // Withdrawing one answer is not closing the conversation. Preserve the
         // session and consume only this turn's automatic delivery retry.
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
@@ -19123,6 +19232,9 @@ function deliverFinalOutput(
         return;
       }
       if (isLarkContentAuditError(err)) {
+        const deliveredParts = partialResultMessages();
+        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'content_audit_blocked' },
+          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'content_audit_blocked'));
         // The platform PERMANENTLY rejected this payload (tenant DLP / content
         // audit: e.g. an email address or phone number in the answer). Retrying
         // unchanged cannot succeed and only burns 22s of backoff while leaving
@@ -19168,6 +19280,9 @@ function deliverFinalOutput(
         return;
       }
       if (err instanceof TopicSendError && err.code === 'TOPIC_SEND_BLOCKED') {
+        const deliveredParts = partialResultMessages();
+        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'topic_send_blocked' },
+          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'topic_send_blocked'));
         // The original topic cannot receive a notice. Surface the failure on the
         // existing Dashboard attention channel without changing the send route.
         ds.agentAttention = { kind: 'blocked', reason: err.message, at: Date.now() };
@@ -19183,6 +19298,9 @@ function deliverFinalOutput(
         return;
       }
       if (err instanceof MessageWithdrawnError) {
+        const deliveredParts = partialResultMessages();
+        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'message_withdrawn' },
+          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'message_withdrawn'));
         // Withdrawal is permanent for this target, but it is not explicit
         // abandon. Keep an unsettled FIFO owner recoverable; only ledger-empty
         // sessions may commit the dedupe marker and auto-close.
@@ -19199,6 +19317,9 @@ function deliverFinalOutput(
       }
       const next = attempt + 1;
       if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
+        const partialMessages = partialResultMessages();
+        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'delivery_unknown' },
+          resultReceipt(partialMessages.length ? 'partial' : 'unknown', partialMessages, 'delivery_unknown'));
         logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewFailed(msg.turnId, {
@@ -19565,7 +19686,7 @@ export function forkAdoptWorker(
     disableCliBypass: botCfg.disableCliBypass === true,
     // Same live-read pattern as the primary init: adopt re-forks gate on the
     // adopted CLI id.
-    noProgressNotify: adoptedCliId === 'codex-app' ? botCfg.noProgressNotify : undefined,
+    noProgressNotify: isCodexAppCliId(adoptedCliId) ? botCfg.noProgressNotify : undefined,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
     // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited
@@ -19745,7 +19866,7 @@ export function listProcesses(): ProcSnapshot[] {
       return procs;
     }
     // macOS / other POSIX. `-ww` defeats command-column truncation.
-    const raw = execSync('ps -axww -o pid=,ppid=,command=', { encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024 });
+    const raw = execSync('ps -axww -o pid=,ppid=,command=', { encoding: 'utf-8', maxBuffer: PROCESS_TABLE_MAX_BUFFER });
     const procs: ProcSnapshot[] = [];
     for (const line of raw.split('\n')) {
       const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);

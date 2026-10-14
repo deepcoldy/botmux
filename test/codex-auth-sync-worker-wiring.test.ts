@@ -1,11 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { proxyRouteFor, resolveUpstream } from './helpers/daemon-proxy-harness.js';
 
 const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const pool = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
 const types = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8');
 const dashboardIpc = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
-const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 
 describe('codexAuthSync daemon → worker cold-spawn wiring', () => {
   it('fences the instance pane and writes MCP configuration before RPC preparation starts its engine', () => {
@@ -51,8 +51,8 @@ describe('codexAuthSync daemon → worker cold-spawn wiring', () => {
     expect(dashboardIpc).toContain('codexAuthSync,');
     expect(dashboardIpc).toContain("ipcRoute('PUT', '/api/bot-codex-auth-sync'");
     expect(dashboardIpc).toContain("applyConfigField(cachedLarkAppId, spec, body.codexAuthSync)");
-    expect(dashboard).toContain('mBotCodexAuthSync = url.pathname.match(');
-    expect(dashboard).toContain('codex-auth-sync$/');
-    expect(dashboard).toContain("proxyToDaemon(appId, `/api/bot-codex-auth-sync`");
+    const route = proxyRouteFor('PUT', '/api/bots/cli_a/codex-auth-sync');
+    expect(route).toBeDefined();
+    expect(resolveUpstream(route!, '/api/bots/cli_a/codex-auth-sync')).toBe('/api/bot-codex-auth-sync');
   });
 });

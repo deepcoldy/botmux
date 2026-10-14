@@ -3,6 +3,7 @@ import type {
   RoleProfileEntryLike,
 } from './role-profile-match.js';
 import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
+import { readJson } from './dashboard-api.js';
 
 export interface BotInfo {
   larkAppId: string;
@@ -230,10 +231,6 @@ export function filterRoleGroups(groups: GroupInfo[], filter: string): GroupInfo
 export function filterRoleProfiles(profiles: RoleProfileSummary[], filter: string): RoleProfileSummary[] {
   const q = filter.toLowerCase();
   return profiles.filter(profile => !q || profile.profileId.toLowerCase().includes(q));
-}
-
-async function readJson(r: Response): Promise<any> {
-  return r.json().catch(() => ({}));
 }
 
 export async function loadGroups(): Promise<{ groups: GroupInfo[]; bots: DashboardBot[] }> {

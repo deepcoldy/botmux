@@ -9,6 +9,6 @@ describe('Midscene Test Feishu scenario registry', () => {
     await validateFeishuScenarioRegistry();
     // Repeated attempts must register every suite even with a cached module.
     await validateFeishuScenarioRegistry();
-    expect(FEISHU_SCENARIOS).toHaveLength(17);
+    expect(FEISHU_SCENARIOS).toHaveLength(18);
   });
 });

@@ -73,5 +73,3 @@ export function createSeedAdapter(pathOverride?: string): CliAdapter {
     modelChoices: undefined,
   }, bin);
 }
-
-export const create = createSeedAdapter;

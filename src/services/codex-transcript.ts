@@ -43,13 +43,12 @@ import {
   lstatSync,
   openSync,
   opendirSync,
-  readSync,
   statSync,
   type Dirent,
 } from 'node:fs';
 import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
-import { baselineJsonlCursor } from './jsonl-cursor.js';
+import { baselineJsonlCursor, beginJsonlDrain, iterateJsonlLines, scanJsonlBackward, scanJsonlBackwardFd } from './jsonl-cursor.js';
 import type { CodexThreadSettings } from './codex-service-tier.js';
 // cot-subject 与 process-open-files 只用语言/Node 内建，等价于内联，不违反本模块 dependency-free 口径。
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
@@ -113,7 +112,8 @@ export function findCodexRolloutSetByPid(pid: number): Set<string> | undefined {
  *  FAIL CLOSED — a missing set or a non-member id returns false so the caller
  *  never binds the bridge to a session it can't prove the pid owns. Extracted so
  *  the exact predicate the worker's attach entry points use is unit-testable
- *  without a live pid. */
+ *  without a live pid. TRAE's rollouts share this predicate verbatim
+ *  (`traexHistorySidIsOwned` is the same function). */
 export function codexHistorySidIsOwned(
   cliSessionId: string,
   ownedRollouts: Set<string> | undefined,
@@ -618,18 +618,24 @@ export interface CodexDrainState {
   turnStartOffset: number;
 }
 
+/** Model / reasoning-effort pair read from a rollout's `turn_context` record. */
+export interface RolloutRuntimeSnapshot {
+  model?: string;
+  reasoningEffort?: string;
+}
+
 /** Bounded backward-scan cap for the one-shot runtime bootstrap — runtime
  *  identity is advisory and must never synchronously parse a multi-GB rollout
- *  on attach (same guard rationale as usage-side MAX_USAGE_TRANSCRIPT_BYTES).
- *  Mirrors traex-transcript's TRAEX_RUNTIME_SCAN_MAX_BYTES. */
+ *  on attach (same guard rationale as usage-side MAX_USAGE_TRANSCRIPT_BYTES). */
 const CODEX_RUNTIME_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 
-/** Executor-confirmed model / reasoning-effort as recorded in a Codex
+/** Executor-confirmed model / reasoning-effort as recorded in a
  *  `turn_context` event. Codex writes this on every turn (top-level `model`
  *  and `effort`, with a `collaboration_mode.settings` mirror), so it — not the
  *  optional `thread_settings_applied` record — is the reliable in-session
- *  model/effort source. Mirrors traex-transcript's runtimeFromTraexEntry. */
-function runtimeFromCodexEntry(obj: any): { model?: string; reasoningEffort?: string } | undefined {
+ *  model/effort source. TRAE's rollout shares the record shape, so the TRAE
+ *  reader uses this too. */
+export function runtimeFromTurnContext(obj: any): RolloutRuntimeSnapshot | undefined {
   if (obj?.type !== 'turn_context') return undefined;
   const payload = obj.payload;
   if (!payload || typeof payload !== 'object') return undefined;
@@ -739,10 +745,18 @@ const HISTORY_TAIL_BYTES = 4 * 1024 * 1024;
 /** Find the newest Codex session whose history entry includes a botmux
  *  session id. Fresh dashboard rows often only know botmux's UUID; Codex's
  *  rollout filename uses its own UUID, and history.jsonl is the durable bridge
- *  between the two. Only the trailing `maxTailBytes` of the file is scanned. */
+ *  between the two. Only the trailing `maxTailBytes` of the file is scanned
+ *  (default 4 MiB; pass `Infinity` to search the whole file — the scan is
+ *  chunked newest-first, so memory stays bounded either way and a recent hit
+ *  reads only the tail).
+ *
+ *  A history entry that mentions the id but carries no `session_id` ends the
+ *  lookup with `undefined` by default (the newest mention is authoritative).
+ *  `skipUnmapped` instead keeps looking at older mentions — the resume path's
+ *  historical behaviour, where any mapping beats none. */
 export function findCodexSessionIdByBotmuxSessionId(
   botmuxSessionId: string,
-  opts?: { maxTailBytes?: number; codexHome?: string; noFollow?: boolean },
+  opts?: { maxTailBytes?: number; codexHome?: string; noFollow?: boolean; skipUnmapped?: boolean },
 ): string | undefined {
   if (!botmuxSessionId) return undefined;
   const historyPath = opts?.codexHome
@@ -766,30 +780,29 @@ export function findCodexSessionIdByBotmuxSessionId(
     if (!opened.isFile()) return undefined;
     const size = opened.size;
     const maxTailBytes = Math.max(1, opts?.maxTailBytes ?? HISTORY_TAIL_BYTES);
-    const start = Math.max(0, size - maxTailBytes);
-    const length = size - start;
-    const buf = Buffer.alloc(length);
-    readSync(fd, buf, 0, length, start);
-    let text = buf.toString('utf8');
-    if (start > 0) {
-      // The window almost certainly opens mid-line — drop the partial line.
-      const firstNewline = text.indexOf('\n');
-      text = firstNewline === -1 ? '' : text.slice(firstNewline + 1);
-    }
     const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
-    const lines = text.trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]!;
-      if (!line.includes(marker)) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
-          return codexHistoryCliSessionId(parsed);
+    let found: string | undefined;
+    scanJsonlBackwardFd(fd, {
+      endOffset: size,
+      // A tail window almost certainly opens mid-line — drop that partial line.
+      floor: Math.max(0, size - maxTailBytes),
+      dropPartialAtFloor: true,
+      onLine: (lineBytes) => {
+        const line = lineBytes.toString('utf8');
+        if (!line.includes(marker)) return false;
+        try {
+          const parsed = JSON.parse(line);
+          if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
+            found = codexHistoryCliSessionId(parsed);
+            return found !== undefined || !opts?.skipUnmapped;
+          }
+        } catch {
+          // not a JSON history entry — keep looking at older lines
         }
-      } catch {
-        continue;
-      }
-    }
+        return false;
+      },
+    });
+    return found;
   } catch {
     return undefined;
   } finally {
@@ -797,7 +810,6 @@ export function findCodexSessionIdByBotmuxSessionId(
       try { closeSync(fd); } catch { /* already closed / invalid fd */ }
     }
   }
-  return undefined;
 }
 
 /** Concatenate all text blocks of a content array. Codex rollout content
@@ -834,60 +846,46 @@ function isCodexEnvironmentUpdate(metadata: unknown, text: string): boolean {
     && trimmed.indexOf(closing) === trimmed.length - closing.length;
 }
 
-/** Normalise a `turn_aborted.reason` into a stable, bounded error code for the
- *  durable-delivery terminal outcome. Mirrors the traex reader. */
-function codexAbortErrorCode(reason: unknown): string {
+/** Normalise a `turn_aborted.reason` into a stable, bounded error code
+ *  (`<prefix>:<reason>`) for the durable-delivery terminal outcome. `prefix` is
+ *  the CLI's own `*_turn_aborted` namespace; the codex and TRAE readers share
+ *  the normalisation. */
+export function rolloutAbortErrorCode(prefix: string, reason: unknown): string {
   const normalized = (typeof reason === 'string' ? reason : 'unknown')
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 64) || 'unknown';
-  return `codex_turn_aborted:${normalized}`;
+  return `${prefix}:${normalized}`;
+}
+
+function codexAbortErrorCode(reason: unknown): string {
+  return rolloutAbortErrorCode('codex_turn_aborted', reason);
 }
 
 /** Find the byte immediately after the previous completed/aborted turn. An
  * incremental drain can start in the middle of a turn, so this supplies a
  * stable lower bound for the small backward lookups below. */
 function precedingTurnStartOffset(path: string, beforeOffset: number): number {
-  const consider = (line: Buffer, offset: number): number | undefined => {
-    let obj: any;
-    try { obj = JSON.parse(line.toString('utf8')); } catch { return undefined; }
-    const p = obj?.payload;
-    if (obj?.type !== 'event_msg' || (p?.type !== 'task_complete' && p?.type !== 'turn_aborted')) {
-      return undefined;
-    }
-    return Math.min(beforeOffset, offset + line.length + 1);
-  };
-  let fd: number | undefined;
+  let result = 0;
   try {
-    fd = openSync(path, 'r');
-    let end = beforeOffset;
-    let carry = Buffer.alloc(0);
-    while (end > 0) {
-      const start = Math.max(0, end - 64 * 1024);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const found = consider(block.subarray(i + 1, lineEnd), start + i + 1);
-        if (found !== undefined) return found;
-        lineEnd = i;
-        carryEnd = i;
-      }
-      carry = block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) return consider(carry, 0) ?? 0;
+    scanJsonlBackward(path, {
+      endOffset: beforeOffset,
+      onLine: (line, offset) => {
+        let obj: any;
+        try { obj = JSON.parse(line.toString('utf8')); } catch { return false; }
+        const p = obj?.payload;
+        if (obj?.type !== 'event_msg' || (p?.type !== 'task_complete' && p?.type !== 'turn_aborted')) {
+          return false;
+        }
+        result = Math.min(beforeOffset, offset + line.length + 1);
+        return true;
+      },
+    });
   } catch {
     return 0;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
-  return 0;
+  return result;
 }
 
 /** Resolve a custom tool output against the rollout itself. Outputs can land
@@ -917,37 +915,20 @@ function precedingToolCall(
     }
     return undefined;
   };
-  const chunkBytes = 64 * 1024;
-  let fd: number | undefined;
+  let found: { name: string; deferred: boolean } | undefined;
   try {
-    fd = openSync(path, 'r');
-    let end = beforeOffset;
-    let carry = Buffer.alloc(0);
-    while (end > lowerBoundOffset) {
-      const start = Math.max(lowerBoundOffset, end - chunkBytes);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const found = consider(block.subarray(i + 1, lineEnd).toString('utf8'));
-        if (found) return found;
-        lineEnd = i;
-        carryEnd = i;
-      }
-      carry = block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) return consider(carry.toString('utf8'));
+    scanJsonlBackward(path, {
+      endOffset: beforeOffset,
+      floor: lowerBoundOffset,
+      onLine: (line) => {
+        found = consider(line.toString('utf8'));
+        return found !== undefined;
+      },
+    });
   } catch {
     return undefined;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
-  return undefined;
+  return found;
 }
 
 function wrappedToolNames(input: string): string[] {
@@ -1152,20 +1133,11 @@ function terminalExecFallbacks(
 ): CodexBridgeEvent[] {
   const relevant: TerminalExecEntry[] = knownRelevant ?? [];
   if (!knownRelevant) {
-    let fd: number | undefined;
     try {
-      fd = openSync(path, 'r');
-      let end = beforeOffset;
-      let carry = Buffer.alloc(0);
-      while (end > turnStartOffset) {
-        const start = Math.max(turnStartOffset, end - 64 * 1024);
-        const chunk = Buffer.alloc(end - start);
-        readSync(fd, chunk, 0, chunk.length, start);
-        const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-        let lineEnd = block.length;
-        if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-        let carryEnd = lineEnd;
-        const consider = (line: Buffer, offset: number): void => {
+      scanJsonlBackward(path, {
+        endOffset: beforeOffset,
+        floor: turnStartOffset,
+        onLine: (line, offset) => {
           let obj: any;
           try { obj = JSON.parse(line.toString('utf8')); } catch { return; }
           const p = obj?.payload;
@@ -1177,21 +1149,10 @@ function terminalExecFallbacks(
             const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
             relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type });
           }
-        };
-        for (let i = lineEnd - 1; i >= 0; i--) {
-          if (block[i] !== 0x0a) continue;
-          if (lineEnd > i + 1) consider(block.subarray(i + 1, lineEnd), start + i + 1);
-          lineEnd = i;
-          carryEnd = i;
-        }
-        carry = block.subarray(0, carryEnd);
-        end = start;
-        if (start === turnStartOffset && carry.length > 0) consider(carry, turnStartOffset);
-      }
+        },
+      });
     } catch {
       return [];
-    } finally {
-      if (fd !== undefined) closeSync(fd);
     }
   }
 
@@ -1275,31 +1236,20 @@ export function drainCodexRollout(
   fromOffset: number,
   previousState?: CodexDrainState,
 ): CodexDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
-  // Truncated/rotated jsonl — re-read from the top. Codex doesn't normally
-  // rewrite rollouts, but mirror Claude's defensive handling.
-  if (size < start) start = 0;
-  const reusableState = start === fromOffset && previousState?.nextOffset === start
+  // Truncated/rotated jsonl (size < fromOffset) re-reads from the top. Codex
+  // doesn't normally rewrite rollouts, but mirror Claude's defensive handling.
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind === 'skip') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  const start = step.start;
+  const reusableState = !step.reset && previousState?.nextOffset === start
     && previousState.turnStartOffset >= 0
     && previousState.turnStartOffset <= start
     ? previousState
     : undefined;
-  if (size === start) {
+  if (step.kind === 'idle') {
     return { events: [], newOffset: start, pendingTail: '', state: reusableState };
   }
-
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  const newOffset = start + Buffer.byteLength(completeText, 'utf8');
+  const { completeText, pendingTail, newOffset } = step.window;
 
   const events: CodexBridgeEvent[] = [];
   let latestThreadSettings: CodexThreadSettings | undefined;
@@ -1322,17 +1272,9 @@ export function drainCodexRollout(
     return turnStartOffset;
   };
   const turnExecEntries: TerminalExecEntry[] = [];
-  // Track byte offset within the file as we walk lines so synthetic uuids
-  // are stable across re-drains.
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1;  // the \n after an empty line
-      continue;
-    }
-    const lineByteLen = Buffer.byteLength(line, 'utf8') + 1;  // include \n
-    const lineStart = cursor;
-    cursor += lineByteLen;
+  // Walk lines with their byte offsets so synthetic uuids are stable across
+  // re-drains.
+  for (const { line, lineStart, lineEnd } of iterateJsonlLines(completeText, start)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
     const settings = codexThreadSettingsFromEvent(obj);
@@ -1343,7 +1285,7 @@ export function drainCodexRollout(
     // turn_context carries the executor model/effort on every turn (latest-wins,
     // since Codex can change them independently). Published via the same
     // active_runtime channel TRAE uses.
-    const runtime = runtimeFromCodexEntry(obj);
+    const runtime = runtimeFromTurnContext(obj);
     if (runtime) {
       if (runtime.model) latestModel = runtime.model;
       if (runtime.reasoningEffort) latestReasoningEffort = runtime.reasoningEffort;
@@ -1467,7 +1409,7 @@ export function drainCodexRollout(
         } : {}),
         sourceTurnId: p.turn_id,
       });
-      turnStartOffset = cursor;
+      turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
       toolCallDeferralById.clear();
@@ -1498,7 +1440,7 @@ export function drainCodexRollout(
         terminalErrorCode: codexAbortErrorCode(p.reason),
         sourceTurnId: p.turn_id,
       });
-      turnStartOffset = cursor;
+      turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
       toolCallDeferralById.clear();
@@ -1561,59 +1503,37 @@ export function scanCodexThreadSettings(
 ): CodexThreadSettings | undefined {
   if (!existsSync(path)) return undefined;
   const chunkBytes = Math.max(1024, opts.chunkBytes ?? 64 * 1024);
-  let fd: number | undefined;
+  let settings: CodexThreadSettings | undefined;
   try {
     const size = statSync(path).size;
     if (size === 0) return undefined;
-    fd = openSync(path, 'r');
-    let end = size;
-    let carry = Buffer.alloc(0);
-    while (end > 0) {
-      const start = Math.max(0, end - chunkBytes);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const line = block.subarray(i + 1, lineEnd).toString('utf8');
-        lineEnd = i;
-        carryEnd = i;
-        if (!line.includes('thread_settings_applied')) continue;
+    scanJsonlBackward(path, {
+      endOffset: size,
+      chunkBytes,
+      onLine: (lineBytes) => {
+        const line = lineBytes.toString('utf8');
+        if (!line.includes('thread_settings_applied')) return false;
         let obj: any;
-        try { obj = JSON.parse(line); } catch { continue; }
-        const settings = codexThreadSettingsFromEvent(obj);
-        if (settings) return settings;
-      }
-      carry = block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) {
-      let obj: any;
-      try { obj = JSON.parse(carry.toString('utf8')); } catch { return undefined; }
-      return codexThreadSettingsFromEvent(obj);
-    }
+        try { obj = JSON.parse(line); } catch { return false; }
+        settings = codexThreadSettingsFromEvent(obj);
+        return settings !== undefined;
+      },
+    });
   } catch {
     return undefined;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
-  return undefined;
+  return settings;
 }
 
-/** One-shot bootstrap of the current Codex runtime (model / reasoning effort)
- *  from `turn_context` records, for attach/restore paths that cursor straight
- *  to the tail without draining history. Scans BACKWARD in fixed-size chunks
- *  and stops once both fields resolve — the newest `turn_context` sits near the
- *  tail. A hard byte cap bounds the pathological missing-field case. A
+/** One-shot bootstrap of the current runtime (model / reasoning effort) from
+ *  `turn_context` records, for attach/restore paths that cursor straight to
+ *  the tail without draining history. Scans BACKWARD in fixed-size chunks and
+ *  stops once both fields resolve — the newest `turn_context` sits near the
+ *  tail. `scanMaxBytes` bounds the pathological missing-field case. A
  *  non-newline-terminated trailing partial is excluded via baselineJsonlCursor
- *  so a crash mid-write cannot surface a half-written record. Mirrors
- *  traex-transcript's readLatestTraexRuntime. */
-export function readLatestCodexRuntime(
-  path: string,
-): { model?: string; reasoningEffort?: string } {
+ *  so a crash mid-write cannot surface a half-written record. Shared by the
+ *  Codex and TRAE readers (same rollout record shape). */
+export function readLatestRolloutRuntime(path: string, scanMaxBytes: number): RolloutRuntimeSnapshot {
   if (!path || !existsSync(path)) return {};
   let completeEnd: number;
   try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
@@ -1621,14 +1541,16 @@ export function readLatestCodexRuntime(
 
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
-  const emit = (): { model?: string; reasoningEffort?: string } => ({
+  const emit = (): RolloutRuntimeSnapshot => ({
     ...(latestModel ? { model: latestModel } : {}),
     ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
   });
+  // Backward scan keeps the first (newest) value seen for each field; returns
+  // true once both are known so the scan can stop early.
   const consider = (line: string): boolean => {
     if (!line.trim()) return false;
-    let runtime: { model?: string; reasoningEffort?: string } | undefined;
-    try { runtime = runtimeFromCodexEntry(JSON.parse(line)); } catch { return false; }
+    let runtime: RolloutRuntimeSnapshot | undefined;
+    try { runtime = runtimeFromTurnContext(JSON.parse(line)); } catch { return false; }
     if (latestModel === undefined && runtime?.model) latestModel = runtime.model;
     if (latestReasoningEffort === undefined && runtime?.reasoningEffort) {
       latestReasoningEffort = runtime.reasoningEffort;
@@ -1636,38 +1558,21 @@ export function readLatestCodexRuntime(
     return latestModel !== undefined && latestReasoningEffort !== undefined;
   };
 
-  const floor = Math.max(0, completeEnd - CODEX_RUNTIME_SCAN_MAX_BYTES);
-  const chunkBytes = 64 * 1024;
-  let fd: number | undefined;
   try {
-    fd = openSync(path, 'r');
-    let end = completeEnd;
-    let carry = Buffer.alloc(0);
-    while (end > floor) {
-      const start = Math.max(floor, end - chunkBytes);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const line = block.subarray(i + 1, lineEnd).toString('utf8');
-        lineEnd = i;
-        carryEnd = i;
-        if (consider(line)) return emit();
-      }
-      carry = start === floor && floor > 0
-        ? Buffer.alloc(0)
-        : block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) consider(carry.toString('utf8'));
+    // The leading fragment at the byte-cap floor is a truncated historical
+    // partial and is dropped; at true file start it is a complete record.
+    scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - scanMaxBytes),
+      dropPartialAtFloor: true,
+      onLine: (line) => consider(line.toString('utf8')),
+    });
   } catch {
     return emit();
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
   return emit();
+}
+
+export function readLatestCodexRuntime(path: string): RolloutRuntimeSnapshot {
+  return readLatestRolloutRuntime(path, CODEX_RUNTIME_SCAN_MAX_BYTES);
 }

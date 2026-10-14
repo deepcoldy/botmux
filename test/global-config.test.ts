@@ -472,9 +472,9 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
   });
 
-  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
-    // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
-    // proxy persisted by mergeGlobalConfig was never read back by the downloader.
+  it('httpProxy survives a merge→read roundtrip (binary self-update download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so a proxy persisted
+    // by mergeGlobalConfig was never read back by the downloader.
     expect(readGlobalConfig().httpProxy).toBeUndefined();
     mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
     expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');

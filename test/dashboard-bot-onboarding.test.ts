@@ -11,8 +11,17 @@ const { userGetMock, batchGetIdMock } = {
   batchGetIdMock: vi.fn(),
 };
 
+/** SDK generic request() — the no-body GET path (larkGet) — routed to the same user lookup mock. */
+function routeContactGet(req: any) {
+  const m = /^\/open-apis\/contact\/v3\/users\/([^/?]+)$/.exec(req?.url ?? '');
+  if (req?.method !== 'GET' || !m || 'data' in req) throw new Error(`unexpected request ${JSON.stringify(req)}`);
+  return userGetMock({ path: { user_id: decodeURIComponent(m[1]) }, params: req.params });
+}
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class {
+    // detectUnusableOwnerEntries probes via the no-body GET (larkGet → request()).
+    request = (req: unknown) => routeContactGet(req);
     contact = {
       v3: {
         user: {

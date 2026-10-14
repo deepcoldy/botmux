@@ -248,6 +248,21 @@ export async function setIdleCloseForGroup(
   return { status: upstream.status, body: json ?? text };
 }
 
+/**
+ * Persist the run-process card switch (same `noCardChats` state as the in-chat
+ * `/card off|on`) on the named group member bot. Silent: nothing is posted.
+ */
+export async function setCardModeForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-card-mode/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok === true) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
 /** Persist the FIFO switch on the named group member bot. */
 export async function setSerialInputForGroup(
   chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,

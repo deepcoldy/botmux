@@ -96,7 +96,7 @@ ONCALL_SERVICE_SECRET="<service-account-service-secret>"
 
 ## 自动化测试
 
-仓库使用 Bun `1.4.2`，具体约束见 [贡献指南](../CONTRIBUTING.md)。已有共享 `node_modules` 的 worktree 不运行 `bun install`，避免影响正在运行的其它 checkout。
+仓库使用 Bun `1.4.3`，具体约束见 [贡献指南](../CONTRIBUTING.md)。已有共享 `node_modules` 的 worktree 不运行 `bun install`，避免影响正在运行的其它 checkout。
 
 针对 Oncall、凭据隔离、原身份逻辑及 Bun runner 的回归：
 

@@ -607,6 +607,14 @@ describe('session board audience (H5/Workbench identity is not anonymous)', () =
 });
 
 describe('redactSettingsForPublic', () => {
+  it('drops the download proxy, which may embed credentials', () => {
+    const settings = { publicReadOnly: true, httpProxy: 'http://user:secret@proxy.example.com:8080' };
+    const out = redactSettingsForPublic(settings) as any;
+    expect(out.publicReadOnly).toBe(true);
+    expect('httpProxy' in out).toBe(false);
+    expect(JSON.stringify(out)).not.toContain('secret');
+  });
+
   it('removes the complete notifier snapshot from tokenless settings', () => {
     const settings = {
       publicReadOnly: true,

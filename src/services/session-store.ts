@@ -3,6 +3,7 @@ import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:pat
 import { createHash, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { pidExistsEpermAlive } from '../utils/process-alive.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
@@ -694,15 +695,8 @@ export function hostOccupancyLeaseHeld(
   return !!lease && (lease.leaseUntil > now || processAlive(lease.ownerPid));
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM: the process exists but is not ours to signal — still alive.
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
+// EPERM: the process exists but is not ours to signal — still alive.
+const processAlive = pidExistsEpermAlive;
 
 export type OccupancyClaimResult =
   /** This process holds the lease (claimed, taken over, or renewed). */

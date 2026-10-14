@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -485,7 +486,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const send = vi.fn();
-    const harness = new Function('send', `
+    const harness = new Function('send', 'isCodexAppCliId', `
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
       let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt = false;
@@ -515,7 +516,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
         state: () => ({ turnId: currentBotmuxTurnId, attempt: currentBotmuxDispatchAttempt,
           revision: captureRevision, queued: queuedTypeAheadTurns, retired: [...retiredTurnIds], started }),
       };
-    `)(send) as {
+    `)(send, isCodexAppCliId) as {
       enqueue(record: { turnId: string; dispatchAttempt: number }): void;
       acknowledge(turnId: string): void;
       advance(): boolean;

@@ -1,5 +1,6 @@
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
+import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
@@ -1613,6 +1614,7 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
@@ -2565,6 +2567,9 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  if (cfg.turnResults?.enabled !== true || cfg.apiOnly || cfg.readIsolation) {
+    getTurnResultRuntime()?.clearBot(cfg.larkAppId);
+  }
   registerCodexInstanceBot(cfg);
   const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
   const normalizedRuntime = cfg.cliId === 'traex'
@@ -4064,6 +4069,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       envPolicy,
       skills,
       plugins,
+      turnResults: entry.turnResults && typeof entry.turnResults === 'object' && entry.turnResults.enabled === true
+        ? { enabled: true } : undefined,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       skillInjection: entry.skillInjection === 'global' || entry.skillInjection === 'prompt' || entry.skillInjection === 'off'
         ? entry.skillInjection : undefined,

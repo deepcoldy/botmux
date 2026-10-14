@@ -234,7 +234,7 @@ export interface GlobalConfig {
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
-   *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
+   *  binary self-update release asset). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
    *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
   httpProxy?: string;

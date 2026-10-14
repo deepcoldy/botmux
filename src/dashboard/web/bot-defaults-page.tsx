@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
@@ -41,6 +41,8 @@ import {
   type BotDescriptionSnapshot,
 } from './bot-description.js';
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { isReservedPerBotEnvKey, parsePerBotEnvText, sanitizePerBotEnv } from '../../core/per-bot-env.js';
+import { confirm } from './confirm-modal.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { DropdownField, ModelPickerField, type DropdownFieldOption } from './field-controls.js';
@@ -54,6 +56,8 @@ import {
 } from './mode-diagrams.js';
 import { store } from './store.js';
 import { toast } from './toast.js';
+import { sendJson, type DashboardJsonResponse } from './dashboard-api.js';
+import { caughtErrorText, responseErrorText, saveBotField, type StatusMessage } from './bot-defaults-save.js';
 import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
@@ -63,6 +67,7 @@ import {
   LoadingState,
   OverflowText,
   RefreshIconButton,
+  ToggleRow as BaseToggleRow,
   dropdownLabel,
 } from './dashboard-components.js';
 import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
@@ -137,15 +142,10 @@ import {
  *  拉进 bot-registry / node:fs，进不了浏览器 bundle。服务端仍会自己截断兜底。 */
 const MAX_SG_TAG_NAME_LENGTH = 60;
 
-type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
 type CardPrefPatch = Record<string, boolean | string | string[]>;
 
-type JsonResponse = {
-  ok: boolean;
-  status: number;
-  body: any;
-};
+type JsonResponse = DashboardJsonResponse;
 
 type RuntimeMode = 'official' | 'legacy' | 'custom';
 type NativePolicyMode = 'passthrough' | 'custom';
@@ -490,53 +490,9 @@ function FieldTitle(props: { children: ReactNode; help?: ReactNode }) {
   );
 }
 
-function ToggleRow(props: {
-  checked: boolean;
-  disabled?: boolean;
-  title: ReactNode;
-  help: ReactNode;
-  description?: ReactNode;
-  className?: string;
-  dataAction?: string;
-  onChange(checked: boolean): void;
-}) {
-  return (
-    <label className={props.className ? `toggle-row ${props.className}` : 'toggle-row'}>
-      <input
-        type="checkbox"
-        data-action={props.dataAction}
-        checked={props.checked}
-        disabled={props.disabled}
-        onChange={event => props.onChange(event.currentTarget.checked)}
-      />
-      <span className="switch" aria-hidden="true" />
-      <span className="toggle-tx">
-        <strong><FieldTitle help={props.help}>{props.title}</FieldTitle></strong>
-        {props.description ? <small>{props.description}</small> : null}
-      </span>
-    </label>
-  );
-}
-
-async function sendJson(method: string, url: string, body?: unknown): Promise<JsonResponse> {
-  const r = await fetch(url, {
-    method,
-    headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const parsed = await r.json().catch(() => ({}));
-  return { ok: r.ok && parsed?.ok !== false, status: r.status, body: parsed };
-}
-
-function responseErrorText(res: JsonResponse): string {
-  const reason = typeof res.body?.reason === 'string' ? res.body.reason : '';
-  const manual = typeof res.body?.manualCommand === 'string' ? res.body.manualCommand : '';
-  if (reason && manual) return `${reason}（${manual}）`;
-  return String(reason || res.body?.error || res.status);
-}
-
-function caughtErrorText(e: any): string {
-  return e?.message ?? String(e);
+/** bot-defaults 页的开关行：共享 ToggleRow + 本页 `bd-*` 样式的 FieldTitle。 */
+function ToggleRow(props: Omit<ComponentProps<typeof BaseToggleRow>, 'TitleComponent' | 'titleClassName'>) {
+  return <BaseToggleRow {...props} TitleComponent={FieldTitle} />;
 }
 
 function positiveIntegerOrNull(raw: string): number | null | 'invalid' {
@@ -1482,27 +1438,14 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
       setStatus({ text: `✗ ${tr('botDefaults.ownerReminderStatesInvalid')}` });
       return;
     }
-    setBusy(true);
-    setStatus(null);
-    try {
-      const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
-      const res = await sendJson(
-        'PUT',
-        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`,
-        payload,
-      );
-      if (res.ok && res.body.ok) {
-        const next = res.body.sessionOwnerReminder ?? payload;
-        props.patchBot(props.bot.larkAppId, { sessionOwnerReminder: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (error: any) {
-      setStatus({ text: `✗ ${caughtErrorText(error)}` });
-    } finally {
-      setBusy(false);
-    }
+    const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`, payload),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => props.patchBot(props.bot.larkAppId, { sessionOwnerReminder: body.sessionOwnerReminder ?? payload }),
+    });
   }
 
   return (
@@ -2648,21 +2591,13 @@ export function BotAgentSection(props: {
 
   async function saveSkillInjection(next: string): Promise<void> {
     setSkillValue(next);
-    setSkillStatus(null);
-    setSkillBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/skill-injection`, { skillInjection: next });
-      if (res.ok && res.body.ok) {
-        setSkillStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-        patchBot(bot.larkAppId, { skillInjection: res.body.skillInjection ?? null });
-      } else {
-        setSkillStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setSkillStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setSkillBusy(false);
-    }
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/skill-injection`, { skillInjection: next }),
+      setStatus: setSkillStatus,
+      setBusy: setSkillBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => patchBot(bot.larkAppId, { skillInjection: body.skillInjection ?? null }),
+    });
   }
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
@@ -3327,29 +3262,21 @@ function WorkingDirSection(props: {
       return;
     }
     const nextAutoWorktree = mode === 'default' && autoWorktree;
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/working-dir-mode`, {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/working-dir-mode`, {
         mode,
         workingDir: dir,
         autoWorktree: nextAutoWorktree,
-      });
-      if (res.ok && res.body.ok) {
-        const resolvedNote = res.body.resolvedPath ? ` → ${res.body.resolvedPath}` : '';
-        setStatus({ text: `✓ ${tr('botDefaults.workingDirSaved')}${resolvedNote}`, ok: true });
-        patchBot(bot.larkAppId, {
-          defaultOncall: res.body.defaultOncall ?? bot.defaultOncall,
-          defaultWorkingDir: res.body.defaultWorkingDir ?? null,
-          defaultWorkingDirAutoWorktree: res.body.defaultWorkingDirAutoWorktree === true,
-        });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      }),
+      setStatus,
+      setBusy,
+      saved: body => `${tr('botDefaults.workingDirSaved')}${body.resolvedPath ? ` → ${body.resolvedPath}` : ''}`,
+      onSaved: body => patchBot(bot.larkAppId, {
+        defaultOncall: body.defaultOncall ?? bot.defaultOncall,
+        defaultWorkingDir: body.defaultWorkingDir ?? null,
+        defaultWorkingDirAutoWorktree: body.defaultWorkingDirAutoWorktree === true,
+      }),
+    });
   }
 
   const modeOptions: ModeOption<'off' | 'default' | 'oncall'>[] = [
@@ -3456,17 +3383,15 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   ]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
-    setBusy(key);
-    setStatus(null);
     setStatusKey(key);
-    try {
-      const res = await putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${res.body?.error === 'invalid_auto_start_excluded_chats' ? tr('botDefaults.autoStartExcludedChatsInvalid') : responseErrorText(res)}` });
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+    await saveBotField({
+      request: () => putCardPref(patch),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? key : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      errorText: res => res.body?.error === 'invalid_auto_start_excluded_chats' ? tr('botDefaults.autoStartExcludedChatsInvalid') : responseErrorText(res),
+    });
   }
 
   return (
@@ -3632,25 +3557,16 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   async function save(next: BotDefaultsRow['triggerUserAuth']): Promise<void> {
     const previous = policy;
-    setStatus(null);
-    setBusy(true);
     patchBot(bot.larkAppId, { triggerUserAuth: next });
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/trigger-user-auth`, {
         triggerUserAuth: next,
-      });
-      if (res.ok && res.body.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.triggerUserAuthSaved')}`, ok: true });
-      } else {
-        patchBot(bot.larkAppId, { triggerUserAuth: previous });
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      patchBot(bot.larkAppId, { triggerUserAuth: previous });
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.triggerUserAuthSaved'),
+      rollback: () => patchBot(bot.larkAppId, { triggerUserAuth: previous }),
+    });
   }
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
@@ -3728,23 +3644,14 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   async function saveAuthMode(next: 'shared' | 'isolated'): Promise<void> {
     const previous = authMode;
     setAuthMode(next);
-    setAuthStatus(null);
-    setAuthBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/codex-auth-sync`, { codexAuthSync: next });
-      if (res.ok && res.body.ok) {
-        patchBot(bot.larkAppId, { codexAuthSync: next });
-        setAuthStatus({ text: `✓ ${tr('botDefaults.codexAuthSyncSaved')}`, ok: true });
-      } else {
-        setAuthMode(previous);
-        setAuthStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setAuthMode(previous);
-      setAuthStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setAuthBusy(false);
-    }
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/codex-auth-sync`, { codexAuthSync: next }),
+      setStatus: setAuthStatus,
+      setBusy: setAuthBusy,
+      saved: tr('botDefaults.codexAuthSyncSaved'),
+      onSaved: () => patchBot(bot.larkAppId, { codexAuthSync: next }),
+      rollback: () => setAuthMode(previous),
+    });
   }
 
   return (
@@ -3786,30 +3693,21 @@ function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 
   async function save(next: 'off' | 'oncall' | 'scratch', nextStorage: 'tmpfs' | 'disk'): Promise<void> {
     setSelected(next);
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox`, {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox`, {
         mode: next,
         ...(next === 'scratch' ? { scratchStorage: nextStorage } : {}),
-      });
-      if (res.ok && res.body.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.sandboxSaved')}`, ok: true });
-        patchBot(bot.larkAppId, {
-          sandbox: res.body.sandbox === true,
-          sandboxMode: (res.body.mode ?? next) as 'off' | 'oncall' | 'scratch',
-          ...(next === 'scratch' ? { scratchStorage: nextStorage } : {}),
-        });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-        setSelected(mode);
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-      setSelected(mode);
-    } finally {
-      setBusy(false);
-    }
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.sandboxSaved'),
+      onSaved: body => patchBot(bot.larkAppId, {
+        sandbox: body.sandbox === true,
+        sandboxMode: (body.mode ?? next) as 'off' | 'oncall' | 'scratch',
+        ...(next === 'scratch' ? { scratchStorage: nextStorage } : {}),
+      }),
+      rollback: () => setSelected(mode),
+    });
   }
 
   const readIsoSupported = bot.readIsolationSupported === true;
@@ -4019,20 +3917,13 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   }
 
   async function save() {
-    setBusy(true); setStatus(null);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox-paths`, tiers);
-      if (res.ok && res.body.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.sbxPathsSaved')}`, ok: true });
-        patchBot(bot.larkAppId, { sandboxPaths: res.body.sandboxPaths ?? { readWrite: [], readOnly: [], deny: [] } });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox-paths`, tiers),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.sbxPathsSaved'),
+      onSaved: body => patchBot(bot.larkAppId, { sandboxPaths: body.sandboxPaths ?? { readWrite: [], readOnly: [], deny: [] } }),
+    });
   }
 
   const tierBadge = (a: SandboxTier | 'none') =>
@@ -4159,24 +4050,15 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
 
   async function save(next: string): Promise<void> {
     const prev = value;
-    setValue(next);
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/backend-type`, { backendType: next });
-      if (res.ok && res.body.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.backendSaved')}`, ok: true });
-        patchBot(bot.larkAppId, { backendType: typeof res.body.backendType === 'string' ? res.body.backendType : null });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-        setValue(prev);  // revert optimistic selection
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-      setValue(prev);
-    } finally {
-      setBusy(false);
-    }
+    setValue(next);  // optimistic selection
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/backend-type`, { backendType: next }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.backendSaved'),
+      onSaved: body => patchBot(bot.larkAppId, { backendType: typeof body.backendType === 'string' ? body.backendType : null }),
+      rollback: () => setValue(prev),
+    });
   }
 
   return (
@@ -4263,24 +4145,18 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 
   async function putRole(nextRole: string, deleted: boolean, mode: RoleInjectMode = injectMode): Promise<void> {
     if (!loaded) return;
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole, injectMode: mode });
-      if (res.ok && res.body.ok) {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole, injectMode: mode }),
+      setStatus,
+      setBusy,
+      saved: deleted ? tr('botDefaults.roleDeleted') : tr('botDefaults.roleSaved'),
+      onSaved: body => {
         const stored = nextRole.trim();
         setRole(stored);
-        if (res.body.injectMode === 'once' || res.body.injectMode === 'every') setInjectMode(res.body.injectMode);
+        if (body.injectMode === 'once' || body.injectMode === 'every') setInjectMode(body.injectMode);
         patchBot(bot.larkAppId, { teamRole: stored });
-        setStatus({ text: `✓ ${deleted ? tr('botDefaults.roleDeleted') : tr('botDefaults.roleSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+    });
   }
 
   const injectOptions: Array<{ value: RoleInjectMode; label: string }> = [
@@ -4441,22 +4317,14 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
-    setBusy(key);
-    setStatus(null);
-    try {
-      const res = await putCardPref(patch);
-      if (res.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        rollback?.();
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      rollback?.();
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+    await saveBotField({
+      request: () => putCardPref(patch),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? key : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      rollback,
+    });
   }
 
   const usageDisplayOptions: DropdownFieldOption<'streaming' | 'footer' | 'off'>[] = [
@@ -4701,64 +4569,42 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
   async function saveCleanInput(checked: boolean): Promise<void> {
     const previous = cleanInput;
     setCleanInput(checked);
-    setBusy('clean-input');
-    setStatus(null);
-    try {
-      const res = await props.putCardPref({ codexAppCleanInput: checked });
-      if (res.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setCleanInput(previous);
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setCleanInput(previous);
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+    await saveBotField({
+      request: () => props.putCardPref({ codexAppCleanInput: checked }),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? 'clean-input' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      rollback: () => setCleanInput(previous),
+    });
   }
 
   async function saveBrowser(checked: boolean): Promise<void> {
     const previous = browserEnabled;
     setBrowserEnabled(checked);
-    setBusy('browser');
-    setStatus(null);
-    try {
-      const res = await props.putCardPref({ codexBrowser: checked });
-      if (res.ok) {
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setBrowserEnabled(previous);
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setBrowserEnabled(previous);
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+    await saveBotField({
+      request: () => props.putCardPref({ codexBrowser: checked }),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? 'browser' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      rollback: () => setBrowserEnabled(previous),
+    });
   }
 
   async function saveNoProgress(next: { enabled: boolean; timeoutMs?: number } | null): Promise<void> {
-    setBusy('no-progress');
-    setStatus(null);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next });
-      if (res.ok && res.body.ok) {
-        const saved = res.body.noProgressNotify ?? null;
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next }),
+      setStatus,
+      setBusy: on => setBusy(on ? 'no-progress' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const saved = body.noProgressNotify ?? null;
         props.patchBot(props.bot.larkAppId, { noProgressNotify: saved });
         const sec = saved?.timeoutMs != null ? Math.round(saved.timeoutMs / 1000) : null;
         setNudgeInput(sec == null ? '' : String(sec));
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+      },
+    });
   }
 
   function saveNudgeTimeout(): void {
@@ -4840,25 +4686,18 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
   async function save(next: boolean): Promise<void> {
     const previous = auto;
     setAuto(next);
-    setBusy(true);
-    setStatus(null);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/envelope-injection`, { envelopeInjection: next ? 'auto' : 'off' });
-      if (res.ok && res.body.ok) {
-        const saved = res.body.envelopeInjection === 'auto';
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/envelope-injection`, { envelopeInjection: next ? 'auto' : 'off' }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const saved = body.envelopeInjection === 'auto';
         setAuto(saved);
         props.patchBot(props.bot.larkAppId, { envelopeInjection: saved ? 'auto' : 'off' });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setAuto(previous);
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setAuto(previous);
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+      rollback: () => setAuto(previous),
+    });
   }
 
   return (
@@ -4937,25 +4776,18 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   async function save(next: boolean): Promise<void> {
     const previous = transcript;
     setTranscript(next);
-    setBusy(true);
-    setStatus(null);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/reply-delivery`, { replyDelivery: next ? 'transcript' : 'send' });
-      if (res.ok && res.body.ok) {
-        const saved = res.body.replyDelivery === 'transcript';
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/reply-delivery`, { replyDelivery: next ? 'transcript' : 'send' }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const saved = body.replyDelivery === 'transcript';
         setTranscript(saved);
         props.patchBot(props.bot.larkAppId, { replyDelivery: saved ? 'transcript' : 'send' });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setTranscript(previous);
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setTranscript(previous);
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+      rollback: () => setTranscript(previous),
+    });
   }
 
   return (
@@ -4992,23 +4824,15 @@ function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putC
   async function save(next: boolean): Promise<void> {
     const previous = on;
     setOn(next);
-    setBusy(true);
-    setStatus(null);
-    try {
-      const res = await props.putCardPref({ senderTag: next });
-      if (res.ok) {
-        props.patchBot(props.bot.larkAppId, { senderTag: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setOn(previous);
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setOn(previous);
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+    await saveBotField({
+      request: () => props.putCardPref({ senderTag: next }),
+      strict: false,
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: () => props.patchBot(props.bot.larkAppId, { senderTag: next }),
+      rollback: () => setOn(previous),
+    });
   }
 
   return (
@@ -5040,16 +4864,13 @@ function CrossBotSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPr
 
   async function save(next: boolean): Promise<void> {
     setSameDir(next);
-    setBusy(true);
-    setStatus(null);
-    try {
-      const res = await props.putCardPref({ botToBotSameDir: next });
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+    await saveBotField({
+      request: () => props.putCardPref({ botToBotSameDir: next }),
+      strict: false,
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+    });
   }
 
   return (
@@ -5096,27 +4917,22 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       setStatus({ text: `✗ ${tr('botDefaults.summaryNumberInvalid')}` });
       return;
     }
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/summary-range`, {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/summary-range`, {
         limit: nextLimit,
         sinceHours: nextSinceHours,
-      });
-      if (res.ok && res.body.ok) {
-        const next = res.body.summaryRange ?? { limit: nextLimit, sinceHours: nextSinceHours };
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = body.summaryRange ?? { limit: nextLimit, sinceHours: nextSinceHours };
         const normalized = summaryRange({ ...props.bot, summaryRange: next });
         setLimit(String(normalized.limit));
         setSinceHours(String(normalized.sinceHours));
         props.patchBot(props.bot.larkAppId, { summaryRange: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+    });
   }
 
   async function saveMemory(next: boolean, nextPath = memoryPath): Promise<void> {
@@ -5125,29 +4941,23 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     const normalizedPath = normalizeSummaryMemoryPath(nextPath);
     setMemoryOn(next);
     setMemoryPath(normalizedPath);
-    setMemoryStatus(null);
-    setMemoryBusy(true);
-    try {
-      const res = await props.putCardPref({ summaryMemory: next, summaryMemoryPath: normalizedPath });
-      if (res.ok && res.body.ok) {
-        const saved = res.body.summaryMemory === true;
-        const savedPath = summaryMemoryPath({ ...props.bot, summaryMemoryPath: res.body.summaryMemoryPath });
+    await saveBotField({
+      request: () => props.putCardPref({ summaryMemory: next, summaryMemoryPath: normalizedPath }),
+      setStatus: setMemoryStatus,
+      setBusy: setMemoryBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const saved = body.summaryMemory === true;
+        const savedPath = summaryMemoryPath({ ...props.bot, summaryMemoryPath: body.summaryMemoryPath });
         setMemoryOn(saved);
         setMemoryPath(savedPath);
         props.patchBot(props.bot.larkAppId, { summaryMemory: saved, summaryMemoryPath: savedPath });
-        setMemoryStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
+      },
+      rollback: () => {
         setMemoryOn(prev);
         setMemoryPath(prevPath);
-        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setMemoryOn(prev);
-      setMemoryPath(prevPath);
-      setMemoryStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setMemoryBusy(false);
-    }
+      },
+    });
   }
 
   return (
@@ -5236,34 +5046,23 @@ function SessionModeSection(props: {
   async function saveP2p(next: string): Promise<void> {
     const mode = normalizeP2pMode(next);
     setP2p(mode);
-    setBusy('p2p');
-    setP2pStatus(null);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/p2p-mode`, { p2pMode: mode });
-      if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { p2pMode: normalizeP2pMode(res.body.p2pMode) });
-        setP2pStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setP2pStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setP2pStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/p2p-mode`, { p2pMode: mode }),
+      setStatus: setP2pStatus,
+      setBusy: on => setBusy(on ? 'p2p' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => props.patchBot(props.bot.larkAppId, { p2pMode: normalizeP2pMode(body.p2pMode) }),
+    });
   }
 
   async function saveCardMode(key: string, patch: CardPrefPatch, setStatus: (status: StatusMessage) => void): Promise<void> {
-    setBusy(key);
-    setStatus(null);
-    try {
-      const res = await props.putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+    await saveBotField({
+      request: () => props.putCardPref(patch),
+      strict: false,
+      setStatus,
+      setBusy: on => setBusy(on ? key : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+    });
   }
 
   const tags2 = (k1: string, k2: string): string[] => [tr(k1), tr(k2)];
@@ -6817,45 +6616,33 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   }, [props.bot.idleSuspendMinutes]);
 
   async function save(value: number | null): Promise<void> {
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/max-live-workers`, { maxLiveWorkers: value });
-      if (res.ok && res.body.ok) {
-        const next = typeof res.body.maxLiveWorkers === 'number' ? res.body.maxLiveWorkers : null;
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/max-live-workers`, { maxLiveWorkers: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = typeof body.maxLiveWorkers === 'number' ? body.maxLiveWorkers : null;
         setCap(next);
         setInput(next == null ? '' : String(next));
         props.patchBot(props.bot.larkAppId, { maxLiveWorkers: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+    });
   }
 
   async function saveTtl(value: number | null): Promise<void> {
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/idle-suspend-minutes`, { idleSuspendMinutes: value });
-      if (res.ok && res.body.ok) {
-        const next = typeof res.body.idleSuspendMinutes === 'number' ? res.body.idleSuspendMinutes : null;
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/idle-suspend-minutes`, { idleSuspendMinutes: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = typeof body.idleSuspendMinutes === 'number' ? body.idleSuspendMinutes : null;
         setTtl(next);
         setTtlInput(next == null ? '' : String(next));
         props.patchBot(props.bot.larkAppId, { idleSuspendMinutes: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+    });
   }
 
   function saveInput(): void {
@@ -6921,23 +6708,17 @@ function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   useEffect(() => setValue(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : ''), [props.bot.startupCommands]);
 
   async function save(): Promise<void> {
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/startup-commands`, { startupCommands: value });
-      if (res.ok && res.body.ok) {
-        const next = typeof res.body.startupCommands === 'string' ? res.body.startupCommands : '';
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/startup-commands`, { startupCommands: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = typeof body.startupCommands === 'string' ? body.startupCommands : '';
         setValue(next);
         props.patchBot(props.bot.larkAppId, { startupCommands: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+    });
   }
 
   return (
@@ -6979,43 +6760,31 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
   }, [props.bot.canTalkDaemonCommands]);
 
   async function savePassthrough(): Promise<void> {
-    setStatus(null);
-    setBusy('passthrough');
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: passthrough });
-      if (res.ok && res.body.ok) {
-        const next = typeof res.body.customPassthroughCommands === 'string' ? res.body.customPassthroughCommands : '';
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: passthrough }),
+      setStatus,
+      setBusy: on => setBusy(on ? 'passthrough' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = typeof body.customPassthroughCommands === 'string' ? body.customPassthroughCommands : '';
         setPassthrough(next);
         props.patchBot(props.bot.larkAppId, { customPassthroughCommands: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+      },
+    });
   }
 
   async function saveCanTalk(): Promise<void> {
-    setStatus(null);
-    setBusy('cantalk');
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/cantalk-daemon-commands`, { canTalkDaemonCommands: canTalk });
-      if (res.ok && res.body.ok) {
-        const next = typeof res.body.canTalkDaemonCommands === 'string' ? res.body.canTalkDaemonCommands : '';
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/cantalk-daemon-commands`, { canTalkDaemonCommands: canTalk }),
+      setStatus,
+      setBusy: on => setBusy(on ? 'cantalk' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = typeof body.canTalkDaemonCommands === 'string' ? body.canTalkDaemonCommands : '';
         setCanTalk(next);
         props.patchBot(props.bot.larkAppId, { canTalkDaemonCommands: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+      },
+    });
   }
 
   return (
@@ -7063,23 +6832,17 @@ function LaunchShellSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   useEffect(() => setValue(typeof props.bot.launchShell === 'string' ? props.bot.launchShell : ''), [props.bot.launchShell]);
 
   async function save(): Promise<void> {
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/launch-shell`, { launchShell: value });
-      if (res.ok && res.body.ok) {
-        const next = typeof res.body.launchShell === 'string' ? res.body.launchShell : '';
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/launch-shell`, { launchShell: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = typeof body.launchShell === 'string' ? body.launchShell : '';
         setValue(next);
         props.patchBot(props.bot.larkAppId, { launchShell: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+    });
   }
 
   return (
@@ -7135,49 +6898,189 @@ export function EnvPolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBo
   </div>;
 }
 
+type EnvEntryTag = 'new' | 'overwrite' | 'reserved' | 'skipped';
+
+/** Live analysis of the env textarea against the stored names. Names only —
+ *  parsed values never leave this function. */
+function analyzeEnvDraft(text: string, storedKeys: readonly string[], mode: 'merge' | 'replace') {
+  if (!text.trim()) return null;
+  const parsed = parsePerBotEnvText(text);
+  if (!parsed.ok) return { ok: false as const, reason: parsed.reason, line: parsed.line };
+  const sanitized = sanitizePerBotEnv(parsed.env);
+  const stored = new Set(storedKeys);
+  const entries = Object.keys(parsed.env).map((key): { key: string; tag: EnvEntryTag } => ({
+    key,
+    tag: isReservedPerBotEnvKey(key) ? 'reserved'
+      : !(key in sanitized) ? 'skipped'
+      : stored.has(key) ? 'overwrite' : 'new',
+  }));
+  const reserved = entries.filter(e => e.tag === 'reserved').map(e => e.key);
+  const dropped = mode === 'replace' ? storedKeys.filter(k => !(k in sanitized)) : [];
+  return {
+    ok: true as const,
+    format: parsed.format,
+    entries,
+    reserved,
+    dropped,
+    ignoredLines: parsed.ignoredLines,
+    savable: reserved.length === 0 && Object.keys(sanitized).length > 0,
+  };
+}
+
 export function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [value, setValue] = useState('');
+  const [mode, setMode] = useState<'merge' | 'replace'>('merge');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const storedKeys = props.bot.envKeys ?? [];
 
-  useEffect(() => setValue(''), [props.bot.larkAppId]);
+  useEffect(() => { setValue(''); setMode('merge'); setStatus(null); }, [props.bot.larkAppId]);
 
-  async function save(): Promise<void> {
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env`, { env: value });
-      if (res.ok && res.body.ok) {
-        const next = ''; // Never echo stored values, including older daemon responses.
-        setValue(next);
-        props.patchBot(props.bot.larkAppId, { env: next, envKeys: Array.isArray(res.body.envKeys) ? res.body.envKeys : [] });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+  const draft = useMemo(() => analyzeEnvDraft(value, storedKeys, mode), [value, storedKeys, mode]);
+
+  async function put(body: { env: string; mode?: 'merge' | 'replace'; remove?: string[] }): Promise<boolean> {
+    return saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env`, body),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: resBody =>
+        // Never echo stored values, including older daemon responses.
+        props.patchBot(props.bot.larkAppId, { env: '', envKeys: Array.isArray(resBody.envKeys) ? resBody.envKeys : [] }),
+    });
   }
 
+  async function save(): Promise<void> {
+    if (!draft?.ok || !draft.savable) return;
+    if (await put({ env: value, mode })) setValue('');
+  }
+
+  async function removeKey(key: string): Promise<void> {
+    const ok = await confirm({
+      title: tr('botDefaults.envRemoveConfirmTitle'),
+      message: tr('botDefaults.envRemoveConfirm', { key }),
+      danger: true,
+    });
+    if (ok) await put({ env: '', mode: 'merge', remove: [key] });
+  }
+
+  async function clearAll(): Promise<void> {
+    const ok = await confirm({
+      title: tr('botDefaults.envClearConfirmTitle'),
+      message: tr('botDefaults.envClearConfirm', { count: storedKeys.length }),
+      danger: true,
+    });
+    if (ok) await put({ env: '', mode: 'replace' });
+  }
+
+  const parseError = draft && !draft.ok
+    ? draft.reason === 'invalid_json'
+      ? tr('botDefaults.envParseInvalidJson')
+      : draft.line ? tr('botDefaults.envParseInvalidLine', { line: draft.line }) : tr('botDefaults.envParseNoAssignment')
+    : null;
+  const tagLabel: Record<EnvEntryTag, string> = {
+    new: tr('botDefaults.envPreviewNew'),
+    overwrite: tr('botDefaults.envPreviewOverwrite'),
+    reserved: tr('botDefaults.envPreviewReserved'),
+    skipped: tr('botDefaults.envPreviewSkipped'),
+  };
+
   return (
-    <div className="bd-subsection">
+    <div className="bd-subsection bd-env">
       <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.envHelp')}>{tr('botDefaults.sectionEnv')}</FieldTitle></h4>
-      <p>{tr('botDefaults.envStoredNames', { names: (props.bot.envKeys ?? []).join(', ') || '∅' })}</p>
-      <p className="muted">{tr('botDefaults.envWriteOnly')}</p>
+      <div className="bd-env-stored" data-env-stored="">
+        <div className="bd-env-stored-head">
+          <span className="muted">
+            {storedKeys.length ? tr('botDefaults.envStoredLabel', { count: storedKeys.length }) : tr('botDefaults.envStoredEmpty')}
+          </span>
+          {storedKeys.length > 0 && (
+            <button type="button" className="bd-env-clear" data-action="clear-env" disabled={busy} onClick={() => void clearAll()}>
+              {tr('botDefaults.envClearAll')}
+            </button>
+          )}
+        </div>
+        {storedKeys.length > 0 && (
+          <ul className="bd-env-chips">
+            {storedKeys.map(key => (
+              <li key={key} className="bd-env-chip" data-env-key={key}>
+                <code>{key}</code>
+                <button
+                  type="button"
+                  className="bd-env-chip-remove"
+                  data-action="remove-env-key"
+                  aria-label={tr('botDefaults.envRemoveKey', { key })}
+                  title={tr('botDefaults.envRemoveKey', { key })}
+                  disabled={busy}
+                  onClick={() => void removeKey(key)}
+                >×</button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
       <textarea
         data-input="env"
-        rows={5}
+        rows={6}
+        spellCheck={false}
+        autoComplete="off"
         placeholder={tr('botDefaults.envPlaceholder')}
         value={value}
         disabled={busy}
+        aria-invalid={parseError || (draft?.ok && draft.reserved.length) ? true : undefined}
         onChange={event => setValue(event.currentTarget.value)}
       />
+      {parseError && <p className="bd-env-preview is-error" data-env-preview="">{parseError}</p>}
+      {draft?.ok && (
+        <div className="bd-env-preview" data-env-preview="">
+          <div className="bd-env-preview-head">
+            {tr('botDefaults.envPreview', {
+              format: tr(draft.format === 'json' ? 'botDefaults.envFormatJson' : 'botDefaults.envFormatDotenv'),
+              count: draft.entries.length,
+            })}
+          </div>
+          <ul className="bd-env-chips">
+            {draft.entries.map(e => (
+              <li key={e.key} className={`bd-env-chip is-${e.tag}`}>
+                <code>{e.key}</code>
+                <span className="bd-env-chip-tag">{tagLabel[e.tag]}</span>
+              </li>
+            ))}
+          </ul>
+          {draft.reserved.length > 0 && (
+            <p className="is-error">{tr('botDefaults.envReservedBlocked', { keys: draft.reserved.join(', ') })}</p>
+          )}
+          {draft.dropped.length > 0 && (
+            <p className="is-warning">{tr('botDefaults.envPreviewDropped', { count: draft.dropped.length, names: draft.dropped.join(', ') })}</p>
+          )}
+          {draft.ignoredLines.length > 0 && (
+            <p className="muted">{tr('botDefaults.envPreviewIgnored', { lines: draft.ignoredLines.join(', ') })}</p>
+          )}
+        </div>
+      )}
+      <div className="bd-env-mode" role="radiogroup">
+        {(['merge', 'replace'] as const).map(m => (
+          <label key={m}>
+            <input
+              type="radio"
+              name={`bd-env-mode-${props.bot.larkAppId}`}
+              data-input={`envMode-${m}`}
+              checked={mode === m}
+              disabled={busy}
+              onChange={() => setMode(m)}
+            />
+            {tr(m === 'merge' ? 'botDefaults.envModeMerge' : 'botDefaults.envModeReplace')}
+          </label>
+        ))}
+      </div>
       <div className="actions">
-        <button type="button" className="primary" data-action="save-env" disabled={busy} onClick={() => void save()}>{tr('botDefaults.envSave')}</button>
+        <button
+          type="button"
+          className="primary"
+          data-action="save-env"
+          disabled={busy || !draft?.ok || !draft.savable}
+          onClick={() => void save()}
+        >{tr('botDefaults.envSave')}</button>
         <StatusSpan status={status} attr={{ 'data-env-status': '' }} />
       </div>
     </div>
@@ -7352,28 +7255,22 @@ function AskOptionLayoutSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   }));
 
   async function save(): Promise<void> {
-    setStatus(null);
-    setBusy(true);
-    try {
+    await saveBotField({
       // 稀疏存储：compact 即缺省，写 null 让 daemon 从 bots.json 删除该键。
-      const res = await sendJson(
+      request: () => sendJson(
         'PUT',
         `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/ask-option-layout`,
         { askOptionLayout: value === 'vertical' ? 'vertical' : null },
-      );
-      if (!res.ok || !res.body.ok) {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-        return;
-      }
-      const next = (res.body.askOptionLayout ?? null) as AskOptionLayout | null;
-      setValue(next ?? 'compact');
-      props.patchBot(props.bot.larkAppId, { askOptionLayout: next });
-      setStatus({ text: `✓ ${tr('botDefaults.askOptionLayoutSaved')}`, ok: true });
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      ),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.askOptionLayoutSaved'),
+      onSaved: body => {
+        const next = (body.askOptionLayout ?? null) as AskOptionLayout | null;
+        setValue(next ?? 'compact');
+        props.patchBot(props.bot.larkAppId, { askOptionLayout: next });
+      },
+    });
   }
 
   return (
@@ -7420,24 +7317,18 @@ function BrandSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; brandEna
   }, [props.bot.brandLabel]);
 
   async function save(nextBrand: string | null): Promise<void> {
-    setStatus(null);
-    setBusy(true);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/brand-label`, { brandLabel: nextBrand });
-      if (res.ok && res.body.ok) {
-        const next = res.body.brandLabel ?? null;
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/brand-label`, { brandLabel: nextBrand }),
+      setStatus,
+      setBusy,
+      saved: '',
+      onSaved: body => {
+        const next = body.brandLabel ?? null;
         setBrand(next);
         setInput(next ?? '');
         props.patchBot(props.bot.larkAppId, { brandLabel: next });
-        setStatus({ text: '✓', ok: true });
-      } else {
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(false);
-    }
+      },
+    });
   }
 
   return (
@@ -7728,19 +7619,21 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     key: string,
     rollback?: () => void,
   ): Promise<void> {
-    setBusy(key);
-    setStatus(key === 'duration' || key === 'quota'
-      ? { text: tr('botDefaults.grantDefaultsSaving') }
-      : null);
-    try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/grant-prefs`, patch);
-      if (res.ok && res.body.ok) {
-        const nextDuration = typeof res.body.grantDefaultDurationMs === 'number' ? res.body.grantDefaultDurationMs : null;
-        const nextQuota = typeof res.body.messageQuotaDefaultLimit === 'number' ? res.body.messageQuotaDefaultLimit : null;
-        setAutoCard(res.body.autoGrantRequestCards !== false);
-        setOwnerDm(res.body.grantRequestToOwnerDm === true);
-        setRestrict(res.body.restrictGrantCommands === true);
-        setP2pOpen(res.body.p2pOpen === true);
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/grant-prefs`, patch),
+      setStatus,
+      setBusy: on => setBusy(on ? key : null),
+      pendingStatus: key === 'duration' || key === 'quota'
+        ? { text: tr('botDefaults.grantDefaultsSaving') }
+        : null,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const nextDuration = typeof body.grantDefaultDurationMs === 'number' ? body.grantDefaultDurationMs : null;
+        const nextQuota = typeof body.messageQuotaDefaultLimit === 'number' ? body.messageQuotaDefaultLimit : null;
+        setAutoCard(body.autoGrantRequestCards !== false);
+        setOwnerDm(body.grantRequestToOwnerDm === true);
+        setRestrict(body.restrictGrantCommands === true);
+        setP2pOpen(body.p2pOpen === true);
         setDuration(nextDuration);
         setQuota(nextQuota);
         if ('grantDefaultDurationMs' in patch) setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -7748,25 +7641,17 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           setQuotaInput(nextQuota === null ? '' : String(nextQuota));
         }
         props.patchBot(props.bot.larkAppId, {
-          autoGrantRequestCards: res.body.autoGrantRequestCards !== false,
-          grantRequestToOwnerDm: res.body.grantRequestToOwnerDm === true,
-          restrictGrantCommands: res.body.restrictGrantCommands === true,
-          p2pOpen: res.body.p2pOpen === true,
+          autoGrantRequestCards: body.autoGrantRequestCards !== false,
+          grantRequestToOwnerDm: body.grantRequestToOwnerDm === true,
+          restrictGrantCommands: body.restrictGrantCommands === true,
+          p2pOpen: body.p2pOpen === true,
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
         if ('messageQuotaDefaultLimit' in patch) setQuotaError(null);
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        rollback?.();
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      rollback?.();
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setBusy(null);
-    }
+      },
+      rollback,
+    });
   }
 
   function saveDuration(nextInput: string): void {

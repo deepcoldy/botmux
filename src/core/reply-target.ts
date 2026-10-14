@@ -333,7 +333,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string },
 ): void {
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
@@ -350,6 +350,8 @@ export function beginReplyTargetTurn(
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
+    ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
+      ? { sourceMessageId: opts.sourceMessageId } : {}),
     ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
     ...(ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }

@@ -460,6 +460,11 @@ export class IdleDetector {
     this.markIdle('external');
   }
 
+  /** Read-only view of the current cycle's idle edge (no side effects). */
+  isIdleNow(): boolean {
+    return this.isIdle;
+  }
+
   /** Shared by the worker's screen-ready and hard-timeout write paths. */
   isStartupPending(): boolean {
     return this.startupPending && !this.startupComplete;

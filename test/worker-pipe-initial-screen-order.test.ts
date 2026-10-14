@@ -337,13 +337,13 @@ describe('worker pipe initial screen ordering', () => {
     const mark = source.slice(markStart, markEnd);
 
     const livenessGuardIdx = mark.indexOf(
-      "if (lastInitConfig?.cliId === 'codex-app' && !codexAppTurnLiveness.notePrompt())",
+      "if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppTurnLiveness.notePrompt())",
     );
     const proofGuardIdx = mark.indexOf(
-      "if (lastInitConfig?.cliId === 'codex-app' && !codexAppControlProven)",
+      "if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppControlProven)",
     );
     const signedIdleGuardIdx = mark.indexOf(
-      "if (lastInitConfig?.cliId === 'codex-app' && !codexAppReadyAuthority.canPublishPromptReady())",
+      "if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppReadyAuthority.canPublishPromptReady())",
     );
     const readySetIdx = mark.indexOf('isPromptReady = true;');
     const promptReadySendIdx = mark.indexOf("send({ type: 'prompt_ready' });");
@@ -371,7 +371,7 @@ describe('worker pipe initial screen ordering', () => {
     const helperStart = source.indexOf('function codexAppLivenessStatus');
     const helperEnd = source.indexOf('// Per-turn usage-limit state machine', helperStart);
     const helper = source.slice(helperStart, helperEnd);
-    const activityStart = source.indexOf("if (kind === 'activity' && lastInitConfig?.cliId === 'codex-app')");
+    const activityStart = source.indexOf("if (kind === 'activity' && isCodexAppCliId(lastInitConfig?.cliId))");
     const activityEnd = source.indexOf("if (kind === 'final'", activityStart);
     const activity = source.slice(activityStart, activityEnd);
 
@@ -769,8 +769,10 @@ describe('worker pipe initial screen ordering', () => {
     expect(guardStart).toBeGreaterThan(-1);
     expect(guardEnd).toBeGreaterThan(guardStart);
     // A live tmux session is checked before probing so it can reattach (PR#249).
-    expect(guard).toContain('TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId))');
-    expect(guard.indexOf('TmuxBackend.hasSession')).toBeLessThan(guard.indexOf('probeTmuxFunctional'));
+    // Tri-state (PR #833): the existence probe runs first and an indeterminate
+    // answer never reaches the functional probe (see resolveTmuxBackendGate).
+    expect(guard).toContain('TmuxBackend.probeSessionWithRetry(tmuxSessionName)');
+    expect(guard.indexOf('TmuxBackend.probeSessionWithRetry')).toBeLessThan(guard.indexOf('probeTmuxFunctional'));
     // The decision is made by the pure gate helper, and a gate posts an
     // actionable error IPC + throws — it must NOT silently downgrade to pty.
     // The daemon renders WorkerToDaemon.error to Lark, avoiding the old

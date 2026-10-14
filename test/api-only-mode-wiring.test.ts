@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { isCodexFamilyCliId } from '../src/adapters/cli/types.js';
 
 /**
  * Source-lock for PR D · API-only (core-only / headless) bot mode.
@@ -626,10 +627,13 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // WIRING: both Codex cliIds, sandbox-only, explicit value wins, and the
     // worker's own logger carries the writable-bundle warning.
     expect(workerSource).toContain("from './utils/darwin-ca-bundle.js'");
-    // Assert both cliIds are covered, not the exact clause text: swapping the
-    // two sides of `||` is semantically identical and must not fail this.
-    expect(workerSource).toContain("cfg.cliId === 'codex'");
-    expect(workerSource).toContain("cfg.cliId === 'codex-app'");
+    // Both cliIds must be covered. The pair now goes through the single
+    // isCodexFamilyCliId predicate (adapters/cli/types.ts: codex || codex-app) —
+    // assert the call site AND that the predicate still spans both ids.
+    expect(workerSource).toContain('isCodexFamilyCliId(cfg.cliId)');
+    expect(isCodexFamilyCliId('codex')).toBe(true);
+    expect(isCodexFamilyCliId('codex-app')).toBe(true);
+    expect(isCodexFamilyCliId('traex')).toBe(false);
     // Operator precedence: childEnv starts from the daemon env, so an
     // operator-supplied SSL_CERT_FILE is what this guard preserves.
     expect(workerSource).toContain('&& !childEnv.SSL_CERT_FILE');

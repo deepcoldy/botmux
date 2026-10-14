@@ -173,7 +173,7 @@ describe('adopted Codex turn recovery', () => {
   it('documents why wall-clock Date.now() drainers (like Cursor) cannot use timestamp cutoff replay', () => {
     // When a drainer lacks real event timestamps and stamps Date.now(),
     // all replayed events exceed minMarkTime - 5s, putting everything into live.
-    // This verifies why worker explicitly guards cutoff recovery with !codexBridgeIsCursor().
+    // This verifies why worker explicitly guards cutoff recovery with !structuredBridgeIs('cursor').
     const now = 50_000;
     const wallClockEvents = [
       event('user', now, 'historical prompt'),

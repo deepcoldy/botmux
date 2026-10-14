@@ -705,7 +705,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await expect(Promise.resolve().then(() => beforeWrite!()))
       .rejects.toThrow('Reply-card turn no longer owns delivery');
     bot.config.apiOnly = false;
-    expect(onComplete).toHaveBeenCalledWith(true, 'om_reply');
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_reply'));
   });
 
   it('fails closed on an ambiguous durable settlement without falling back to direct delivery', async () => {

@@ -102,8 +102,7 @@ import {
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
-import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
-import { ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES } from './im/lark/ask-option-layout.js';
+import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   projectSessionEventForAudience,
@@ -253,6 +252,7 @@ import {
   setPinStreamingCardForGroup,
   setDefaultModelsForGroup,
   setSerialInputForGroup,
+  setCardModeForGroup,
   setIdleCloseForGroup,
   unbindOncall,
   type GroupsActionDeps,
@@ -267,7 +267,6 @@ import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/te
 import type { CliId } from './adapters/cli/types.js';
 import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
-import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 import {
   buildSkillInstallAuditSummary,
   installLocalSkillLinks,
@@ -1175,6 +1174,10 @@ interface ResolvedDashboardSettings {
    *  `http://127.0.0.1:9768/callback` 的手工粘贴流程。见 global-config 的
    *  `oauthRedirectBase`。 */
   oauthRedirectBase: string | null;
+  /** Outbound HTTP(S) proxy for botmux's own downloads (binary self-update
+   *  from GitHub Releases), null = unset ⇒ falls back to HTTPS_PROXY /
+   *  HTTP_PROXY. See global-config `httpProxy`. */
+  httpProxy: string | null;
   /** Configured schedule-task timezone override (IANA), or null when unset
    *  ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone: string | null;
@@ -1759,6 +1762,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
+    httpProxy: global.httpProxy ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
     hostTimeZone: hostLocalTimeZone(),
     effectiveScheduleTimeZone: scheduleTimeZone(),
@@ -1906,6 +1910,12 @@ async function readJsonBody(req: IncomingMessage, maxBytes?: number): Promise<un
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   return raw ? JSON.parse(raw) : {};
 }
+
+const daemonProxyDeps: DaemonProxyDeps = {
+  proxyToDaemon,
+  readJsonBody,
+  isBodyTooLarge: err => err instanceof DashboardJsonBodyTooLargeError,
+};
 
 /** Fast in-process guard against double-clicks within this dashboard process.
  *  Cross-process serialization against the maintenance auto-update (a different
@@ -2351,11 +2361,10 @@ const MIME: Record<string, string> = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.wasm': 'application/wasm',
-  '.pck': 'application/octet-stream',
 };
 
-/** Stream an absolute file (used for HD2D cache binaries that live outside
- *  WEB_DIR). Callers pass only vetted paths from `hd2dAssetPath`. */
+/** Stream an absolute file that lives outside WEB_DIR (e.g. plugin dashboard
+ *  assets). Callers must pass only vetted paths. */
 function serveFileAbs(res: ServerResponse, fp: string): boolean {
   let st;
   try { st = statSync(fp); } catch { return false; }
@@ -3256,6 +3265,9 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           pinStreamingCardMasterEnabled,
           pinStreamingCardChatEnabled,
           pinStreamingCardEffectiveEnabled,
+          streamingCardMasterEnabled,
+          streamingCardChatEnabled,
+          streamingCardEffectiveEnabled,
           ...chatBase
         } = c;
         const cur = out.get(c.chatId) ?? {
@@ -3282,6 +3294,9 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           pinStreamingCardMasterEnabled: pinStreamingCardMasterEnabled ?? false,
           pinStreamingCardChatEnabled: pinStreamingCardChatEnabled ?? true,
           pinStreamingCardEffectiveEnabled: pinStreamingCardEffectiveEnabled ?? false,
+          streamingCardMasterEnabled: streamingCardMasterEnabled ?? true,
+          streamingCardChatEnabled: streamingCardChatEnabled ?? true,
+          streamingCardEffectiveEnabled: streamingCardEffectiveEnabled ?? true,
         });
         if (typeof firstSeenAt === 'number') {
           cur._firstSeenAt = cur._firstSeenAt === null
@@ -4366,7 +4381,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
+    // ─── Static frontend (index.html + /assets/* + root icons) ───
     if (
       (req.method === 'GET' || req.method === 'HEAD') &&
       (
@@ -4374,18 +4389,9 @@ const server = createServer(async (req, res) => {
         url.pathname === '/favicon.ico' ||
         url.pathname === '/favicon.png' ||
         url.pathname === '/apple-touch-icon.png' ||
-        url.pathname.startsWith('/assets/') ||
-        url.pathname.startsWith('/game/')
+        url.pathname.startsWith('/assets/')
       )
     ) {
-      // HD2D runtime binaries (index.wasm / index.pck) are NOT shipped — they
-      // are downloaded on demand into the cache dir and served from there.
-      // Everything else under /game/ is the small shell shipped in dist.
-      if (url.pathname === '/game/index.wasm' || url.pathname === '/game/index.pck') {
-        const fp = hd2dAssetPath(url.pathname.slice('/game/'.length));
-        if (fp && serveFileAbs(res, fp)) return;
-        res.writeHead(404); res.end(); return;
-      }
       // Map /assets/foo.js → WEB_DIR/foo.js; /favicon.ico is an alias for the PNG favicon.
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
@@ -4400,26 +4406,6 @@ const server = createServer(async (req, res) => {
           : undefined,
       })) return;
       if (serveMissingDashboardChunkModule(req, res, lookupPath)) return;
-    }
-
-    // ─── HD2D office assets (token-gated: download triggers a ~74MB fetch) ──
-    if (req.method === 'GET' && url.pathname === '/api/game/status') {
-      // `proxy` prefills the office tab's optional proxy input (config value
-      // only; an env-var proxy still works as a silent fallback downstream).
-      return jsonRes(res, 200, { ...hd2dStatus(), proxy: readGlobalConfig().httpProxy ?? '' });
-    }
-    if (req.method === 'POST' && url.pathname === '/api/game/download') {
-      // Optional `proxy` in the body is persisted (so it survives restart) and
-      // takes effect immediately for this download — Node's fetch ignores the
-      // proxy env vars, so hosts behind a proxy set it here.
-      let body: unknown;
-      try { body = await readJsonBody(req); } catch { body = undefined; }
-      if (body && typeof body === 'object' && 'proxy' in body) {
-        const raw = (body as { proxy?: unknown }).proxy;
-        const proxy = typeof raw === 'string' ? raw.trim() : '';
-        mergeGlobalConfig({ httpProxy: proxy || null });
-      }
-      return jsonRes(res, 200, startHd2dDownload());
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────
@@ -4437,7 +4423,7 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
       // Sessions spawned before a bot config carried a display name store the
       // raw appId as botName — resolve through the live registry so consumers
-      // (dashboard, HD2D office tab) always see the human-facing name.
+      // (dashboard) always see the human-facing name.
       const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
       groupsMatrixSnapshot.warm();
       const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
@@ -6674,64 +6660,6 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── 成员授权 / 黑名单 / 整群授权（proxy to daemon；管理写路径，不在
-    // PUBLIC_READ_PATHS，非 manager 已在 resolveDashboardRequestGate 被 deny401）───
-    let mBotBlockedUsers: RegExpMatchArray | null;
-    if ((mBotBlockedUsers = url.pathname.match(/^\/api\/bots\/([^/]+)\/blocked-users$/))) {
-      const appId = decodeURIComponent(mBotBlockedUsers[1]);
-      if (req.method === 'GET') {
-        const upstream = await proxyToDaemon(appId, '/api/blocked-users', { method: 'GET' });
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
-      }
-      if (req.method === 'PUT') {
-        const chunks: Buffer[] = [];
-        for await (const c of req) chunks.push(c as Buffer);
-        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-        const upstream = await proxyToDaemon(appId, '/api/blocked-users', {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: raw,
-        });
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
-      }
-    }
-
-    let mBotChatGrant: RegExpMatchArray | null;
-    if (req.method === 'POST' && (mBotChatGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/grants\/chat$/))) {
-      const appId = decodeURIComponent(mBotChatGrant[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, '/api/grants/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    let mBotChatGroupGrant: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotChatGroupGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/chat-group-grant$/))) {
-      const appId = decodeURIComponent(mBotChatGroupGrant[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, '/api/chat-group-grant', {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
     // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────
     // ─── 会议角色预设（私有 API：不在 PUBLIC_READ_PATHS，未认证已被 401） ───
     if (url.pathname === '/api/vc-meeting/consumer-profiles') {
@@ -7046,6 +6974,18 @@ const server = createServer(async (req, res) => {
       return writeHandlerResult(res, result);
     }
 
+    let mCardMode: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mCardMode = url.pathname.match(/^\/api\/groups\/([^/]+)\/card-mode\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setCardModeForGroup(
+        decodeURIComponent(mCardMode[1]), decodeURIComponent(mCardMode[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
+    }
+
     let mSerialInput: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mSerialInput = url.pathname.match(/^\/api\/groups\/([^/]+)\/serial-input\/([^/]+)$/))) {
       let body: unknown;
@@ -7222,361 +7162,14 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    // PUT /api/bots/:appId/working-dir-mode — proxy to that bot's daemon. Body
-    // `{ mode: 'off'|'default'|'oncall', workingDir }` — sets the 3-way
-    // mutually-exclusive default-dir mode (defaultWorkingDir vs defaultOncall).
-    let mBotWdMode: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotWdMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/working-dir-mode$/))) {
-      const appId = decodeURIComponent(mBotWdMode[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-working-dir-mode`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/agent — proxy to that bot's daemon. Body
-    // `{ cliId, model }`; cliId is the dashboard selection key.
-    let mBotAgent: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotAgent = url.pathname.match(/^\/api\/bots\/([^/]+)\/agent$/))) {
-      const appId = decodeURIComponent(mBotAgent[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/skills — proxy to that bot's daemon. Body accepts
-    // `{ action:'attach'|'detach', name }` or `{ action:'set', policy|null }`.
-    let mBotSkills: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotSkills = url.pathname.match(/^\/api\/bots\/([^/]+)\/skills$/))) {
-      const appId = decodeURIComponent(mBotSkills[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-skills`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/brand-label — proxy to that bot's daemon. Body
-    // `{ brandLabel: string | null }` (string '' = off, null = default).
-    let mBotBrand: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotBrand = url.pathname.match(/^\/api\/bots\/([^/]+)\/brand-label$/))) {
-      const appId = decodeURIComponent(mBotBrand[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-brand-label`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/reply-style — proxy the sparse reply-card style
-    // override to the target bot's daemon. The daemon owns validation, atomic
-    // bots.json persistence, and its in-memory config update for future worker
-    // spawns. Running workers intentionally retain their session snapshot.
-    let mBotReplyStyle: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotReplyStyle = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-style$/))) {
-      const appId = decodeURIComponent(mBotReplyStyle[1]);
-      let raw: string;
-      try {
-        raw = JSON.stringify(await readJsonBody(req, REPLY_STYLE_REQUEST_MAX_BYTES));
-      } catch (err) {
-        const status = err instanceof DashboardJsonBodyTooLargeError ? 413 : 400;
-        res.writeHead(status, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'body_too_large' : 'bad_json' }));
-        return;
-      }
-      const upstream = await proxyToDaemon(appId, `/api/bot-reply-style`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/ask-option-layout — proxy the per-bot ask option
-    // layout to the target bot's daemon. The daemon owns validation, atomic
-    // bots.json persistence, and its in-memory config update; ask cards render
-    // in the daemon process, so the change is visible on the next card.
-    let mBotAskOptionLayout: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotAskOptionLayout = url.pathname.match(/^\/api\/bots\/([^/]+)\/ask-option-layout$/))) {
-      const appId = decodeURIComponent(mBotAskOptionLayout[1]);
-      let raw: string;
-      try {
-        raw = JSON.stringify(await readJsonBody(req, ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES));
-      } catch (err) {
-        const status = err instanceof DashboardJsonBodyTooLargeError ? 413 : 400;
-        res.writeHead(status, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'body_too_large' : 'bad_json' }));
-        return;
-      }
-      const upstream = await proxyToDaemon(appId, `/api/bot-ask-option-layout`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/startup-commands — proxy to that bot's daemon. Body
-    // `{ startupCommands: string }` (raw text, comma/newline separated; '' = clear).
-    let mBotStartup: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotStartup = url.pathname.match(/^\/api\/bots\/([^/]+)\/startup-commands$/))) {
-      const appId = decodeURIComponent(mBotStartup[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-startup-commands`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/custom-passthrough — proxy to that bot's daemon. Body
-    // `{ customPassthroughCommands: string }` (raw text, comma/space separated; '' = clear).
-    let mBotPassthrough: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotPassthrough = url.pathname.match(/^\/api\/bots\/([^/]+)\/custom-passthrough$/))) {
-      const appId = decodeURIComponent(mBotPassthrough[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-custom-passthrough`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/cantalk-daemon-commands — proxy to that bot's daemon. Body
-    // `{ canTalkDaemonCommands: string }` (raw text, comma/space separated; '' = clear).
-    let mBotCanTalk: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotCanTalk = url.pathname.match(/^\/api\/bots\/([^/]+)\/cantalk-daemon-commands$/))) {
-      const appId = decodeURIComponent(mBotCanTalk[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-cantalk-daemon-commands`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/launch-shell — proxy to that bot's daemon. Body
-    // `{ launchShell: string }` (shell name or absolute path; '' = clear → $SHELL).
-    let mBotLaunchShell: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotLaunchShell = url.pathname.match(/^\/api\/bots\/([^/]+)\/launch-shell$/))) {
-      const appId = decodeURIComponent(mBotLaunchShell[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-launch-shell`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
+    // 纯转发 `/api/bots/:appId/<x>` → daemon IPC，表驱动（见 dashboard/daemon-proxy-routes.ts）。
+    // 这里是原先那批手写块里最大一簇的起点。原先各块之间穿插着 oncall-service-secret、
+    // /api/fs/list、/api/dsh/profiles、/api/feed-groups/*（以及 blocked-users / grants 三块之后的
+    // vc-meeting、role-profiles、groups/*、GET /api/bots），它们的 path 与表内每一条都互斥，
+    // 所以在此一次性匹配整张表与原先的穿插排布先后等价。新增穿插路由时别让它的 path 与表内条目重叠。
+    if (await handleDaemonProxyRoute(BOT_PROXY_ROUTES, req, res, url, daemonProxyDeps)) return;
 
     if (await handleOncallServiceSecret(req, res, url, { identity: requestIdentity, csrfTokens: controlCsrfTokens })) return;
-
-    const mOncallGroup = url.pathname.match(/^\/api\/bots\/([^/]+)\/oncall-group$/);
-    if (req.method === 'PUT' && mOncallGroup) {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(chunk as Buffer);
-      const upstream = await proxyToDaemon(decodeURIComponent(mOncallGroup[1]), '/api/bot-oncall-group', {
-        method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}',
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    let mBotFeedback: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback$/))) {
-      const appId = decodeURIComponent(mBotFeedback[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-feedback`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    const mChatFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/chats\/([^/]+)\/feedback$/);
-    if (req.method === 'PUT' && mChatFeedback) {
-      const chunks: Buffer[] = []; for await (const c of req) chunks.push(c as Buffer);
-      const upstream = await proxyToDaemon(decodeURIComponent(mChatFeedback[1]), `/api/chat-feedback/${encodeURIComponent(decodeURIComponent(mChatFeedback[2]))}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
-    }
-    const mEffectiveFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback\/effective$/);
-    if (req.method === 'GET' && mEffectiveFeedback) {
-      const upstream = await proxyToDaemon(decodeURIComponent(mEffectiveFeedback[1]), `/api/feedback-effective${url.search}`, { method: 'GET' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
-    }
-
-    // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
-    // `{ env: string }` (raw JSON text; '' = clear).
-    let mBotEnv: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotEnv = url.pathname.match(/^\/api\/bots\/([^/]+)\/env$/))) {
-      const appId = decodeURIComponent(mBotEnv[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-env`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/codex-auth-sync — per-bot Codex credential policy.
-    let mBotEnvPolicy: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotEnvPolicy = url.pathname.match(/^\/api\/bots\/([^/]+)\/env-policy$/))) {
-      const appId = decodeURIComponent(mBotEnvPolicy[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-env-policy`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    let mBotCodexAuthSync: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotCodexAuthSync = url.pathname.match(/^\/api\/bots\/([^/]+)\/codex-auth-sync$/))) {
-      const appId = decodeURIComponent(mBotCodexAuthSync[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-codex-auth-sync`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // Trigger-user CLI auth: per-bot switch + status. Proxied to that bot's
-    // daemon, which owns the shared validation path (/botconfig uses the same).
-    let mBotTriggerUserAuth: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotTriggerUserAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth$/))) {
-      const appId = decodeURIComponent(mBotTriggerUserAuth[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-    let mBotTriggerUserAuthStatus: RegExpMatchArray | null;
-    if (req.method === 'GET' && (mBotTriggerUserAuthStatus = url.pathname.match(/^\/api\/bots\/([^/]+)\/trigger-user-auth-status$/))) {
-      const appId = decodeURIComponent(mBotTriggerUserAuthStatus[1]);
-      const upstream = await proxyToDaemon(appId, `/api/bot-trigger-user-auth-status`, { method: 'GET' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/riff — proxy to that bot's daemon. Body
-    // `{ riff: string }` (raw JSON text; '' = clear).
-    let mBotRiff: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotRiff = url.pathname.match(/^\/api\/bots\/([^/]+)\/riff$/))) {
-      const appId = decodeURIComponent(mBotRiff[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-riff`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    const networkPolicyRoute = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox-network-policy$/);
-    if (req.method === 'PUT' && networkPolicyRoute) {
-      const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
-      const upstream = await proxyToDaemon(decodeURIComponent(networkPolicyRoute[1]), '/api/bot-sandbox-network-policy', {
-        method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8'),
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
-    }
-    // PUT /api/bots/:appId/sandbox-paths — proxy to that bot's daemon.
-    // Body `{ readWrite?: string[]; readOnly?: string[]; deny?: string[] }`.
-    let mBotSandboxPaths: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotSandboxPaths = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox-paths$/))) {
-      const appId = decodeURIComponent(mBotSandboxPaths[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-sandbox-paths`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
 
     // GET /api/fs/list?path=… — read-only directory listing for the sandbox-paths
     // tree picker. Not bot-specific (the filesystem is shared with this host's
@@ -7616,435 +7209,6 @@ const server = createServer(async (req, res) => {
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
       }
-      return;
-    }
-
-    // PUT /api/bots/:appId/sandbox — proxy to that bot's daemon. Body `{ enabled: boolean }`.
-    let mBotSandbox: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotSandbox = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox$/))) {
-      const appId = decodeURIComponent(mBotSandbox[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-sandbox`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/read-isolation — proxy to that bot's daemon. Body `{ enabled: boolean }`.
-    let mBotReadIso: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotReadIso = url.pathname.match(/^\/api\/bots\/([^/]+)\/read-isolation$/))) {
-      const appId = decodeURIComponent(mBotReadIso[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-read-isolation`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/backend-type — proxy to that bot's daemon. Body
-    // `{ backendType: 'pty'|'tmux'|'herdr'|'zellij'|'zmx'|'' }` ('' / 'auto' clears the override).
-    let mBotBackendType: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotBackendType = url.pathname.match(/^\/api\/bots\/([^/]+)\/backend-type$/))) {
-      const appId = decodeURIComponent(mBotBackendType[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-backend-type`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/card-prefs — proxy to that bot's daemon. Body carries
-    // any subset of per-bot behavior booleans / prompt strings.
-    let mBotCardPrefs: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotCardPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/card-prefs$/))) {
-      const appId = decodeURIComponent(mBotCardPrefs[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-card-prefs`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/substitute-mode — proxy to that bot's daemon. Body
-    // carries `{ enabled, targets, disclosure }`.
-    let mBotSubstituteMode: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotSubstituteMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/substitute-mode$/))) {
-      const appId = decodeURIComponent(mBotSubstituteMode[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-substitute-mode`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // POST /api/bots/:appId/substitute-targets/resolve — preview resolution for a
-    // single target without persisting; used for dashboard auto-fill.
-    let mBotSubstituteResolve: RegExpMatchArray | null;
-    if (req.method === 'POST' && (mBotSubstituteResolve = url.pathname.match(/^\/api\/bots\/([^/]+)\/substitute-targets\/resolve$/))) {
-      const appId = decodeURIComponent(mBotSubstituteResolve[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-substitute-targets/resolve`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/summary-range — proxy to that bot's daemon. Body
-    // `{ limit, sinceHours }`; daemon updates the explicit /summary range.
-    let mBotSummaryRange: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotSummaryRange = url.pathname.match(/^\/api\/bots\/([^/]+)\/summary-range$/))) {
-      const appId = decodeURIComponent(mBotSummaryRange[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-summary-range`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // 会话群标签授权（Dashboard 一站式）：GET status / POST auth-link，
-    // 均代理到对应 bot 的 daemon（state 必须驻留在生成链接的进程内）。
-    let mBotTagAuth: RegExpMatchArray | null;
-    if (mBotTagAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-group-tag-(status|auth|config)$/)) {
-      const appId = decodeURIComponent(mBotTagAuth[1]);
-      const kind = mBotTagAuth[2];
-      const methodOk = (kind === 'status' && req.method === 'GET')
-        || (kind === 'auth' && req.method === 'POST')
-        || (kind === 'config' && req.method === 'PUT');
-      if (methodOk) {
-        let body: string | undefined;
-        if (req.method !== 'GET') {
-          const chunks: Buffer[] = [];
-          for await (const c of req) chunks.push(c as Buffer);
-          body = Buffer.concat(chunks).toString('utf8') || '{}';
-        }
-        const upstream = await proxyToDaemon(appId, `/api/session-group-tag-${kind}`, {
-          method: req.method,
-          headers: { 'content-type': 'application/json' },
-          ...(body !== undefined ? { body } : {}),
-        });
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
-      }
-    }
-
-    // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body
-    // `{ p2pMode: 'chat' | 'thread' | 'group' }` ('thread' = per-message DM
-    // session; 'group' = per-message dedicated session group; anything else
-    // clears back to the flat continuous chat default).
-    let mBotP2pMode: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotP2pMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/p2p-mode$/))) {
-      const appId = decodeURIComponent(mBotP2pMode[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-p2p-mode`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/envelope-injection — proxy to that bot's daemon.
-    // Body `{ envelopeInjection: 'auto'|'off'|'' }` (''/other clears back to
-    // the inline default). #794: hook 注入 per-turn 上下文的 per-bot 开关。
-    let mBotEnvelopeInjection: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotEnvelopeInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/envelope-injection$/))) {
-      const appId = decodeURIComponent(mBotEnvelopeInjection[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-envelope-injection`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    let mBotPromptInjection: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotPromptInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/prompt-injection$/))) {
-      const appId = decodeURIComponent(mBotPromptInjection[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const upstream = await proxyToDaemon(appId, '/api/bot-prompt-injection', {
-        method: 'PUT', headers: { 'content-type': 'application/json' },
-        body: Buffer.concat(chunks).toString('utf8') || '{}',
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // Per-bot original-topic policy, proxied through the existing config store.
-    let mBotTopicUnavailablePolicy: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotTopicUnavailablePolicy = url.pathname.match(/^\/api\/bots\/([^/]+)\/topic-unavailable-policy$/))) {
-      const appId = decodeURIComponent(mBotTopicUnavailablePolicy[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-topic-unavailable-policy`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/reply-delivery — proxy to that bot's daemon.
-    // Body `{ replyDelivery: 'transcript'|'send'|'' }` (''/other clears back to
-    // the default send). 最终回复投递方式的 per-bot 开关；'send' 与 'transcript'
-    // 都显式落盘。
-    let mBotReplyDelivery: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotReplyDelivery = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-delivery$/))) {
-      const appId = decodeURIComponent(mBotReplyDelivery[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-reply-delivery`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/skill-injection — proxy to that bot's daemon. Body
-    // `{ skillInjection: 'global'|'prompt'|'off'|'' }` (''/other clears back to
-    // the machine default). Governs how botmux built-in skills reach global-
-    // skillsDir CLIs (codex/gemini/…).
-    let mBotSkillInjection: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotSkillInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/skill-injection$/))) {
-      const appId = decodeURIComponent(mBotSkillInjection[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-skill-injection`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
-    // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
-    // p2pOpen?: boolean, grantRequestToOwnerDm?: boolean, messageQuotaDefaultLimit?: number|null,
-    // grantDefaultDurationMs?: number|null }`.
-    let mBotGrantPrefs: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
-      const appId = decodeURIComponent(mBotGrantPrefs[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-grant-prefs`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/rename — proxy to that bot's daemon. Body
-    // `{ name: string }`. Daemon tries the Open Platform automation first
-    // (really renames the Feishu app + publishes a version); on failure it
-    // falls back to the botmux-side display name and reports `warning`.
-    let mBotRename: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotRename = url.pathname.match(/^\/api\/bots\/([^/]+)\/rename$/))) {
-      const appId = decodeURIComponent(mBotRename[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-rename`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // GET/PUT /api/bots/:appId/description — proxy to that bot's daemon. GET
-    // returns the localized descriptions read straight off the Open Platform;
-    // PUT body `{ descriptions: Record<lang, string> }` republishes them. The
-    // daemon owns all validation/publish/language-set semantics; this proxy only
-    // forwards, bounding the PUT body so a malicious client can't buffer freely.
-    let mBotDescription: RegExpMatchArray | null;
-    if (
-      (req.method === 'GET' || req.method === 'PUT') &&
-      (mBotDescription = url.pathname.match(/^\/api\/bots\/([^/]+)\/description$/))
-    ) {
-      const appId = decodeURIComponent(mBotDescription[1]);
-      if (req.method === 'GET') {
-        const upstream = await proxyToDaemon(appId, `/api/bot-description`, { method: 'GET' });
-        res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
-        return;
-      }
-      const chunks: Buffer[] = [];
-      let received = 0;
-      for await (const c of req) {
-        received += (c as Buffer).length;
-        // Descriptions are tiny (≤20 langs × ≤120 chars); cap before buffering more.
-        if (received > 64 * 1024) {
-          res.writeHead(413, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'body_too_large' }));
-          return;
-        }
-        chunks.push(c as Buffer);
-      }
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-description`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/avatar — proxy to that bot's daemon. Body
-    // `{ imageBase64: string }` (512×512 PNG, canvas-normalized by the web UI).
-    // The daemon runs the Open Platform automation (upload icon + base_info +
-    // publish a version); there is no local fallback — failures return the
-    // structured reason so the UI can prompt for a Feishu web login.
-    let mBotAvatar: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotAvatar = url.pathname.match(/^\/api\/bots\/([^/]+)\/avatar$/))) {
-      const appId = decodeURIComponent(mBotAvatar[1]);
-      const chunks: Buffer[] = [];
-      let received = 0;
-      for await (const c of req) {
-        received += (c as Buffer).length;
-        // base64 of a 512×512 PNG stays well under this; cap before buffering more.
-        if (received > 4_000_000) {
-          res.writeHead(413, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'image_too_large' }));
-          return;
-        }
-        chunks.push(c as Buffer);
-      }
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-avatar`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/max-live-workers — proxy to that bot's daemon. Body
-    // `{ maxLiveWorkers: number | null }` (null = clear → fall back to the
-    // built-in default of 30; a positive integer overrides it).
-    let mBotMaxLive: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotMaxLive = url.pathname.match(/^\/api\/bots\/([^/]+)\/max-live-workers$/))) {
-      const appId = decodeURIComponent(mBotMaxLive[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-max-live-workers`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/no-progress-notify — proxy to that bot's daemon.
-    // Body `{ noProgressNotify: { enabled?: boolean; timeoutMs?: number } | null }`
-    // (null = clear → enabled nudge at the built-in 90s window).
-    let mBotNoProgress: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotNoProgress = url.pathname.match(/^\/api\/bots\/([^/]+)\/no-progress-notify$/))) {
-      const appId = decodeURIComponent(mBotNoProgress[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-no-progress-notify`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-
-    // PUT /api/bots/:appId/idle-suspend-minutes — proxy to that bot's daemon.
-    // Body `{ idleSuspendMinutes: number | null }` (null = clear → idle TTL
-    // disabled; a positive integer sets the minutes threshold).
-    let mBotIdleTtl: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotIdleTtl = url.pathname.match(/^\/api\/bots\/([^/]+)\/idle-suspend-minutes$/))) {
-      const appId = decodeURIComponent(mBotIdleTtl[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-idle-suspend-minutes`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
       return;
     }
 
@@ -8115,24 +7279,6 @@ const server = createServer(async (req, res) => {
         error: loginRequired ? 'user_login_required' : 'feed_group_api_unavailable',
         message: loginRequired ? '尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。' : '没有可用于读取标签的飞书机器人。',
       });
-    }
-
-    // PUT /api/bots/:appId/session-owner-reminder — per-Bot periodic owner
-    // reminder policy. The owning daemon validates, persists, and hot-applies.
-    let mBotOwnerReminder: RegExpMatchArray | null;
-    if (req.method === 'PUT' && (mBotOwnerReminder = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-owner-reminder$/))) {
-      const appId = decodeURIComponent(mBotOwnerReminder[1]);
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
-      const upstream = await proxyToDaemon(appId, `/api/bot-session-owner-reminder`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: raw,
-      });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
     }
 
     // Create a new chat — pick a creator from the user-selected larkAppIds

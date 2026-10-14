@@ -20,9 +20,9 @@ function extract(path: string, names: string[]): string {
 }
 
 const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'cmdDispatch']);
-const clientCode = extract('src/im/lark/client.ts', [
-  'larkRequestDeadline', 'larkGet', 'getMessageDetail', 'getMessageThreadId',
-]);
+// larkGet / larkRequestDeadline live in lark-get.ts (re-exported by client.ts).
+const clientCode = extract('src/im/lark/lark-get.ts', ['larkRequestDeadline', 'larkGet'])
+  + '\n' + extract('src/im/lark/client.ts', ['getMessageDetail', 'getMessageThreadId']);
 const THREAD = 'omt_d4be107c616a';
 type Mode = 'dispatch' | 'standby' | 'into';
 

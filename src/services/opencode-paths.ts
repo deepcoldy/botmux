@@ -1,9 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-
-function expandHome(path: string): string {
-  return path.startsWith('~') ? join(homedir(), path.slice(1)) : path;
-}
+import { expandHomePath as expandHome } from '../utils/working-dir.js';
 
 /** OpenCode 的数据根目录：跟随 XDG_DATA_HOME，默认 ~/.local/share/opencode。
  *  保持动态解析（不在模块加载时固化），测试/子进程改 env 后仍能命中。 */

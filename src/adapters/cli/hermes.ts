@@ -1,5 +1,6 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
@@ -56,7 +57,7 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(`\x1b[200~${content}\x1b[201~`);
+        pty.write(wrapBracketedPaste(content));
         await delay(1000);
         pty.write('\r');
       }
@@ -103,5 +104,3 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
     altScreen: false,
   };
 }
-
-export const create = createHermesAdapter;

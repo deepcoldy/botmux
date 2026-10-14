@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { LoadingState } from './dashboard-components.js';
+import { requestJson } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { confirm } from './confirm-modal.js';
 import { copyText } from './clipboard.js';
@@ -71,13 +72,6 @@ function rel(ts: string): string {
   return `${Math.floor(h / 24)}d 前`;
 }
 
-async function apiJson(url: string, init?: RequestInit): Promise<any> {
-  const r = await fetch(url, init);
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok || body?.ok === false) throw new Error(body?.error || `HTTP ${r.status}`);
-  return body;
-}
-
 // ─── Fragment editor ─────────────────────────────────────────────────────────
 
 function FragmentRow(props: {
@@ -101,7 +95,7 @@ function FragmentRow(props: {
   const save = async (value: string | null) => {
     setBusy(true);
     try {
-      const res = await apiJson('/api/customization/prompt', {
+      const res = await requestJson('/api/customization/prompt', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ locale, key: frag.key, value }),
@@ -118,7 +112,7 @@ function FragmentRow(props: {
   const toggleCond = async (value: boolean | null) => {
     setBusy(true);
     try {
-      const res = await apiJson('/api/customization/condition', {
+      const res = await requestJson('/api/customization/condition', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key: frag.key, value }),
@@ -262,7 +256,7 @@ function SkillRowView(props: {
   const put = async (payload: Record<string, unknown>) => {
     setBusy(true);
     try {
-      const res = await apiJson('/api/customization/skill', {
+      const res = await requestJson('/api/customization/skill', {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: skill.name, ...payload }),
       });
@@ -310,7 +304,7 @@ function ImportModal(props: { onClose: () => void; onApplied: (snap: Customizati
   const doPreview = async (apply: boolean) => {
     setBusy(true);
     try {
-      const res = await apiJson('/api/customization/import', {
+      const res = await requestJson('/api/customization/import', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ json, apply }),
       });
@@ -386,14 +380,14 @@ export function CustomizationPage() {
   const onSaved = useCallback((snap: CustomizationSnapshotPayload) => { setData(snap); flash('已保存 · 下个会话即生效'); }, [flash]);
 
   const load = useCallback(async () => {
-    try { setData(await apiJson('/api/customization')); }
+    try { setData(await requestJson('/api/customization')); }
     catch (e: any) { setLoadErr(e?.message ?? '加载失败'); }
   }, []);
   useEffect(() => { void load(); }, [load]);
 
   const post = async (path: string, body?: unknown) => {
     try {
-      const res = await apiJson(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+      const res = await requestJson(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
       if (res.snapshot) setData(res.snapshot);
       return res;
     } catch (e: any) { onError(e?.message ?? '操作失败'); }
@@ -401,7 +395,7 @@ export function CustomizationPage() {
 
   const setEnabled = async (enabled: boolean) => {
     try {
-      const res = await apiJson('/api/customization/enabled', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+      const res = await requestJson('/api/customization/enabled', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
       setData(res.snapshot);
       flash(enabled ? '自定义已启用' : '自定义已停用（覆盖保留）');
     } catch (e: any) { onError(e?.message ?? '操作失败'); }
@@ -420,7 +414,7 @@ export function CustomizationPage() {
       // daemon is offline, and retain only failed selections for a safe retry.
       for (const bot of bots) {
         try {
-          await apiJson(`/api/bots/${encodeURIComponent(bot.larkAppId)}/prompt-injection`, {
+          await requestJson(`/api/bots/${encodeURIComponent(bot.larkAppId)}/prompt-injection`, {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ promptInjection: zero ? 'none' : 'default' }),
           });

@@ -30,6 +30,8 @@ import {
   takeCodexAppControlLocatorEndpoint,
 } from './utils/codex-app-control.js';
 import { CODEX_APP_NO_PROGRESS_TIMEOUT_MS } from './utils/codex-app-turn-liveness.js';
+import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
+import { createRunnerTerminal } from './runner-common.js';
 import {
   TurnTokenUsageAccumulator,
   parseTokenUsagePair,
@@ -66,13 +68,6 @@ interface Args {
   serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
   browserPluginRoot?: string;
-}
-
-interface PendingRequest {
-  resolve: (value: any) => void;
-  reject: (error: Error) => void;
-  method: string;
-  timer?: NodeJS.Timeout;
 }
 
 interface ActiveTurn {
@@ -176,6 +171,7 @@ interface QueuedInput {
 }
 
 const output = new RunnerControlWriter();
+const { writeLine, prompt } = createRunnerTerminal(output);
 const cotCollector = new CodexAppCotCollector();
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const RECONCILIATION_TIMEOUT_MS = 5_000;
@@ -294,14 +290,6 @@ function parseArgs(argv: string[]): Args {
   return out;
 }
 
-function writeLine(text = ''): void {
-  output.line(text);
-}
-
-function prompt(): void {
-  output.display('› ');
-}
-
 function appDeveloperInstructions(args: Args): string {
   const zh = args.locale === 'zh';
   const identity = [
@@ -341,9 +329,18 @@ function appDeveloperInstructions(args: Args): string {
 
 class AppServerClient {
   private child: ChildProcessWithoutNullStreams;
-  private nextId = 1;
-  private stdoutBuffer = '';
-  private pending = new Map<number, PendingRequest>();
+  /** NDJSON framing + pending table. 'microtask' dispatch keeps a response's
+   *  awaiting continuation ahead of a notification coalesced behind it. */
+  private readonly rpc = new JsonRpcStdioCore({
+    dispatch: 'microtask',
+    mapRpcError: (method, error) => new AppServerRpcError(
+      method,
+      typeof error.code === 'number' ? error.code : undefined,
+      error.data,
+      typeof error.message === 'string' ? error.message : JSON.stringify(error),
+    ),
+    onMessage: msg => this.dispatch(msg),
+  });
   private notificationHandlers: Array<(msg: JsonObject) => void> = [];
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
@@ -362,7 +359,7 @@ class AppServerClient {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    this.child.stdout.on('data', chunk => this.onStdout(chunk.toString('utf8')));
+    this.child.stdout.on('data', chunk => this.rpc.push(chunk.toString('utf8')));
     this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
       const text = chunk.toString('utf8');
@@ -404,30 +401,22 @@ class AppServerClient {
     params: unknown,
     options: { timeoutMs?: number } = {},
   ): Promise<any> {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      const timeoutMs = options.timeoutMs;
-      const pending: PendingRequest = { resolve, reject, method };
-      if (timeoutMs !== undefined) {
-        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-          reject(new AppServerRequestTimeoutError(method, Math.max(0, timeoutMs)));
-          return;
-        }
-        pending.timer = setTimeout(() => {
-          if (!this.pending.delete(id)) return;
-          reject(new AppServerRequestTimeoutError(method, timeoutMs));
-        }, timeoutMs);
-        pending.timer.unref?.();
-      }
-      this.pending.set(id, pending);
-      try {
-        this.write({ jsonrpc: '2.0', id, method, params });
-      } catch (err) {
-        this.pending.delete(id);
-        if (pending.timer) clearTimeout(pending.timer);
-        reject(asError(err));
-      }
+    const id = this.rpc.nextId();
+    const { timeoutMs } = options;
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+      return Promise.reject(new AppServerRequestTimeoutError(method, Math.max(0, timeoutMs)));
+    }
+    const response = this.rpc.track(id, method, {
+      timeoutMs,
+      onTimeout: (m, ms) => new AppServerRequestTimeoutError(m, ms),
+      unrefTimer: true,
     });
+    try {
+      this.write({ jsonrpc: '2.0', id, method, params });
+    } catch (err) {
+      this.rpc.abort(id, asError(err));
+    }
+    return response;
   }
 
   respond(id: number | string, result: unknown): void {
@@ -457,74 +446,11 @@ class AppServerClient {
   private failAll(err: Error): void {
     this.lifetime.abort();
     this.fatalError = this.fatalError ?? err;
-    const fatal = this.fatalError;
-    for (const pending of this.pending.values()) {
-      if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(fatal);
-    }
-    this.pending.clear();
+    this.rpc.failAll(this.fatalError);
   }
 
-  /**
-   * Message ordering must not depend on pipe chunk boundaries. Dispatching
-   * line N+1 synchronously after line N starves the microtask continuations
-   * line N scheduled: a response resolving `await request(...)` runs its
-   * awaiting caller (which records protocol state, e.g. "steer accepted,
-   * group grew") only AFTER the whole synchronous loop — so a notification
-   * coalesced into the same chunk behind its own request's response was
-   * processed against stale state and the turn stalled forever. The kernel
-   * coalesces adjacent writes whenever this reader is scheduled late (routine
-   * on loaded CI runners, possible anywhere), so yield a MICROtask between
-   * lines: already-queued continuations run before the next dispatch, while
-   * anything the runner deliberately defers past the current burst (e.g.
-   * macrotask-deferred publications) still sees the burst as one unit.
-   */
-  private stdoutDraining = false;
-
-  private onStdout(data: string): void {
-    this.stdoutBuffer += data;
-    if (this.stdoutDraining) return;
-    this.stdoutDraining = true;
-    const step = (): void => {
-      const nl = this.stdoutBuffer.indexOf('\n');
-      if (nl < 0) {
-        this.stdoutDraining = false;
-        return;
-      }
-      const line = this.stdoutBuffer.slice(0, nl).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
-      if (line) {
-        let msg: JsonObject | undefined;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          msg = undefined;
-        }
-        if (msg) this.dispatch(msg);
-      }
-      queueMicrotask(step);
-    };
-    step();
-  }
-
+  /** Server requests and notifications; responses are settled by the RPC core. */
   private dispatch(msg: JsonObject): void {
-    if (typeof msg.id === 'number' && (msg.result !== undefined || msg.error !== undefined)) {
-      const pending = this.pending.get(msg.id);
-      if (!pending) return;
-      this.pending.delete(msg.id);
-      if (pending.timer) clearTimeout(pending.timer);
-      if (msg.error) {
-        pending.reject(new AppServerRpcError(
-          pending.method,
-          typeof msg.error.code === 'number' ? msg.error.code : undefined,
-          msg.error.data,
-          typeof msg.error.message === 'string' ? msg.error.message : JSON.stringify(msg.error),
-        ));
-      }
-      else pending.resolve(msg.result);
-      return;
-    }
-
     if ((typeof msg.id === 'number' || typeof msg.id === 'string') && typeof msg.method === 'string') {
       for (const handler of this.requestHandlers) {
         if (handler(msg)) return;

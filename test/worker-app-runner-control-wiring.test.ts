@@ -200,7 +200,7 @@ describe('worker app-runner control-channel wiring', () => {
     const callbackStart = workerSource.lastIndexOf('backend.onExit((code, signal) => {');
     const callbackEnd = workerSource.indexOf('backend.onError(', callbackStart);
     const callback = workerSource.slice(callbackStart, callbackEnd);
-    const fatalIdx = callback.indexOf("lastInitConfig?.cliId === 'codex-app' && codexAppControlFatal");
+    const fatalIdx = callback.indexOf('isCodexAppCliId(lastInitConfig?.cliId) && codexAppControlFatal');
     const fatalReturnIdx = callback.indexOf('return;', fatalIdx);
     const preparedIdx = callback.indexOf('const codexAppPreparedAtExit');
     const failIdx = callback.indexOf('failCodexAppControlGeneration(', preparedIdx);

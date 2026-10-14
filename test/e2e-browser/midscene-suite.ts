@@ -31,6 +31,7 @@ export const FEISHU_SCENARIOS = [
   'private-topic-reply',
   'scheduled-task-thread',
   'web-terminal',
+  'traex-ambient-continuity',
 ] as const;
 
 export type FeishuScenario = (typeof FEISHU_SCENARIOS)[number];
@@ -126,6 +127,11 @@ const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
     module: 'feishu-web-terminal.e2e.ts',
     suite: 'feishu web terminal',
     test: 'web terminal opens from the current streaming card',
+  },
+  'traex-ambient-continuity': {
+    module: 'feishu-traex-ambient.e2e.ts',
+    suite: 'TraeX ambient mode continuity',
+    test: 'answers every un-@ message across consecutive turns without wedging',
   },
 };
 

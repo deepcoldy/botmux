@@ -21,6 +21,7 @@
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
+import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -482,6 +483,75 @@ export function localSandboxApplies(
   return true;
 }
 
+/**
+ * The worker's EFFECTIVE local file-sandbox mode, as ONE shared pure resolver.
+ *
+ * worker.ts resolves `sandboxMode` with this exact call; the auto-worktree
+ * fail-closed gate (services/default-worktree.ts) reuses it so the two can never
+ * drift again — the riff exemption once only existed in the worker (a sandboxed
+ * riff bot then fell back to the real default dir on a worktree failure), and
+ * the mojo backend (#803) repeated the SAME drift for a provably-remote session.
+ *
+ * Shape:
+ *   localSandboxApplies(backend, mojoConfig)
+ *     ? resolveSandboxMode({ configSandbox, readIsolation, envValue })
+ *     : 'off'
+ *
+ * - The REMOTE exemption (riff / remote-runner / provably-remote mojo) wraps the
+ *   WHOLE resolution: a remote backend has no local CLI process, so even
+ *   BOTMUX_SANDBOX=1|scratch must not engage a local sandbox there.
+ * - mojo is NOT exempt by name alone: only a PROVABLY remote mojo session is
+ *   (see localSandboxApplies / isMojoFullyRemote — cloud on, localDaemon off,
+ *   no wrapperCli, no unprovable env). A local mojo session keeps its sandbox.
+ * - There is no no-transport arm: forkWorker does not force-isolate a
+ *   no-transport session (#899 dropped the forced readIsolation).
+ * - Throws exactly where resolveSandboxMode throws (invalid config value or
+ *   BOTMUX_SANDBOX): a typo'd mode must never silently run without isolation.
+ */
+export function resolveLocalSandboxMode(input: {
+  backendType: string;
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
+  configSandbox?: unknown;
+  readIsolation?: boolean;
+  envValue?: string | undefined;
+}): SandboxMode {
+  if (!localSandboxApplies(input.backendType, input.mojoConfig)) return 'off';
+  return resolveSandboxMode({
+    configSandbox: input.configSandbox,
+    readIsolation: input.readIsolation === true,
+    envValue: input.envValue,
+  });
+}
+
+
+/**
+ * Fork-side half of the auto-worktree fail-closed gate. When the gate let a
+ * session degrade to the real default dir (`fallbackDir`), the worker may only
+ * STRENGTHEN that verdict: if the spawn now resolves to the LOCAL oncall
+ * sandbox (which binds workingDir read-write to the host) in that same dir,
+ * refuse instead of running it there. Closes the TOCTOU between the gate (T0,
+ * before the worktree build) and the fork (T1, after it) for every input the
+ * gate cannot freeze — e.g. a mojo remote proof voided mid-build.
+ * scratch / off are fine: scratch leaves the host untouched.
+ */
+export function autoWorktreeFallbackSandboxError(input: {
+  sandboxMode: SandboxMode;
+  workingDir: string | undefined;
+  fallbackDir: string | undefined;
+}): string | undefined {
+  if (input.sandboxMode !== 'oncall' || !input.fallbackDir || !input.workingDir) return undefined;
+  const canon = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
+  if (canon(input.workingDir) !== canon(input.fallbackDir)) return undefined;
+  return `auto-worktree fell back to the real default dir ${input.fallbackDir} because no local sandbox applied when it was decided, `
+    + 'but this spawn now resolves to the local oncall file sandbox (workingDir bound read-write to the real project). '
+    + 'Refusing to start; fix the default dir (git repo) or pick a working dir with /repo.';
+}
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
