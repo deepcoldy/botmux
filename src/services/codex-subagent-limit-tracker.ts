@@ -13,10 +13,19 @@
  *
  * Only sub-agents whose `started` record is live are tracked: the parent
  * baseline (history before the worker attached) is never replayed, and an
- * adopt split-live attach registers only sub-agents started after its cutoff.
+ * adopt split-live / journal-recovery attach registers only sub-agents started
+ * after its cutoff.
  * Within a tracked sub-agent rollout, history inherited from the parent on
  * fork is skipped (see drainCodexSubagentLimits), so a stale limit from an
  * earlier quota window cannot trigger a handoff either way.
+ *
+ * Coverage is best-effort by design: only direct children of the parent rollout
+ * are tracked (a depth>=2 sub-agent's `started` lands in its parent sub-agent's
+ * rollout, not ours), and the oldest entries are evicted past the cap. Both
+ * gaps are backstopped by an ancestor's own terminal: the quota is per account,
+ * so the next model call of the tracked child — or of the parent turn itself —
+ * fails with the same usage_limit_exceeded and goes through the regular
+ * structured limit path.
  */
 import {
   drainCodexSubagentLimits,
@@ -27,7 +36,8 @@ import {
   type CodexSubagentCursor,
 } from './codex-transcript.js';
 
-/** Bound on concurrently tracked sub-agents; the oldest are dropped first. */
+/** Bound on concurrently tracked sub-agents; the oldest are dropped first
+ *  (an evicted one is backstopped by its ancestor's terminal, see above). */
 export const MAX_TRACKED_CODEX_SUBAGENTS = 64;
 /** A sub-agent rollout normally appears within a second of `started`. Stop
  *  listing date directories for one that never shows up. */

@@ -7963,6 +7963,13 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           model: codex.latestModel,
           reasoningEffort: codex.latestReasoningEffort,
         });
+        // Same as split-live: the cursor jumps to EOF, so live-side sub-agents
+        // must be registered from this drain or never at all.
+        codexSubagentLimitTracker.observe(
+          codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
+          Date.now(),
+        );
+        maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
       }
       if (structuredBridgeIs('traex')) {
         const traex = result as TraexDrainResult;

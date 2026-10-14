@@ -337,6 +337,13 @@ describe('worker wiring', () => {
     expect(attach.indexOf('codexSubagentLimitTracker.observe(')).toBeLessThan(attach.indexOf('codexSubagentLimitTracker.poll()'));
   });
 
+  it('registers live-side sub-agents during the baseline-existing journal recovery attach', () => {
+    const start = worker.indexOf("} else if (mode === 'baseline-existing-skip-tail'");
+    const recovered = worker.slice(start, worker.indexOf('Structured bridge baseline-existing recovered:', start));
+    expect(recovered).toContain('codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff)');
+    expect(recovered.indexOf('codexSubagentLimitTracker.observe(')).toBeLessThan(recovered.indexOf('codexSubagentLimitTracker.poll()'));
+  });
+
   it('passes the structured limit kind to the owner notice / fallback state', () => {
     expect(worker).toContain('structuredCodexLimitState(ev.terminalErrorSummary ?? \'429 Too Many Requests\', ev.terminalLimitKind)');
   });
