@@ -9,6 +9,51 @@ import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
 const headlessId = 'hl_11111111-1111-4111-8111-111111111111';
 const headlessChat = `headless_${headlessId}`;
 
+it('a real direct Trae worker pins managed tool PATH after the CLI launcher resets its environment', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'worker-trae-tool-path-')));
+  const dataDir = join(root, 'data'); mkdirSync(dataDir);
+  const output = join(root, 'tool-result.json');
+  const botBin = join(root, 'bot-bin'); mkdirSync(botBin);
+  const node = realpathSync(nodeTsRunnerPrefix().command);
+  const fakeCli = join(root, 'fake-trae');
+  writeFileSync(join(botBin, 'lark-cli'), '#!' + node + '\n' + fakeLarkHelpScript()
+    + 'process.stdout.write(process.env.LARKSUITE_CLI_APP_ID);\n', { mode: 0o755 });
+  const fixture = [
+    '#!' + node,
+    'const fs = require("node:fs"), {spawnSync} = require("node:child_process");',
+    'const explicit = {}; const prefix = "shell_environment_policy.set.";',
+    'for (const a of process.argv.slice(2)) { if (a.startsWith(prefix)) {const i = a.indexOf("="); explicit[a.slice(prefix.length,i)] = JSON.parse(a.slice(i+1));}}',
+    // Native tool runners may rebuild inherited PATH; explicit policy survives.
+    'const env = {...process.env, PATH:"/usr/bin:/bin", ...explicit};',
+    'const result = spawnSync("lark-cli", ["--version"], {env,encoding:"utf8"});',
+    'fs.writeFileSync(' + JSON.stringify(output) + ',JSON.stringify({status:result.status,out:result.stdout,err:result.stderr,path:env.PATH}));',
+    'process.stdout.write("Ready\\n");setInterval(()=>{},1000);',
+  ].join('\n');
+  writeFileSync(fakeCli, fixture, { mode: 0o755 });
+  const env = { ...process.env, HOME: root, USERPROFILE: root, BOTMUX_HOME: join(root, '.botmux'),
+    SESSION_DATA_DIR: dataDir, BOTMUX_NO_CLAIM: '1' };
+  const child = spawnNodeTsScript(resolve('src/worker.ts'), [], { env, cwd: resolve('.'), stdio: ['ignore','pipe','pipe','ipc'] });
+  let logs = ''; child.stdout?.on('data', b => logs += b); child.stderr?.on('data', b => logs += b);
+  const exit = new Promise(done => child.once('exit', done));
+  try {
+    child.send!({ type:'init', sessionId:randomUUID(), chatId:headlessChat, rootMessageId:headlessChat,
+      headless:{id:headlessId,source:'cli'}, workingDir:dataDir, cliId:'traex', cliPathOverride:fakeCli,
+      backendType:'pty', prompt:'', larkAppId:'cli_current_app', larkAppSecret:'', sandbox:false,
+      env:{PATH:botBin + ':' + process.env.PATH} });
+    const deadline = Date.now()+25000;
+    while (!existsSync(output) && child.exitCode === null && Date.now()<deadline) await new Promise(r=>setTimeout(r,50));
+    expect(existsSync(output),logs).toBe(true);
+    const result = JSON.parse(readFileSync(output,'utf8'));
+    expect(result.status,result.err).toBe(0);
+    expect(result.out).toBe('cli_current_app');
+    expect(result.path.split(':')[0]).toContain('cli-identity');
+  } finally {
+    if(child.connected) child.send!({type:'close'});
+    const timer=setTimeout(()=>child.kill('SIGKILL'),5000);
+    await exit;clearTimeout(timer);rmSync(root,{recursive:true,force:true});
+  }
+},35000);
+
 it.each([
   { resume: false, daemonTool: true, headless: false },
   { resume: false, daemonTool: false, headless: false },
