@@ -7,9 +7,9 @@
  * loses. The in-pane relay answers the probe before forwarding the DA1 query.
  * The tmux test below checks that ordering against a real tmux server.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -277,14 +277,18 @@ setTimeout(() => {
 
 describe('OSC 7501 handshake ordering in a real tmux pane', () => {
   let dir = '';
-  const socket = `botmux-osc7501-${process.pid}`;
+  let socket = '';
   const tmux = (...args: string[]) => spawnSync('tmux', ['-L', socket, '-f', '/dev/null', ...args], {
     cwd: REPO_ROOT, encoding: 'utf8', timeout: 10_000,
     env: { ...process.env, TMUX: '' },
   });
+  beforeEach(() => {
+    socket = `botmux-osc7501-${process.pid}-${randomUUID()}`;
+  });
   afterEach(() => {
     tmux('kill-server');
     if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = '';
   });
 
   async function runInPane(paneArgv: string[], resultFile: string): Promise<{ order: string[]; piped: string }> {
