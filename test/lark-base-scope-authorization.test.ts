@@ -53,6 +53,8 @@ describe('Base user scopes are in the catalog', () => {
   it('accepts the exact names Feishu returns for a user-token Base create', () => {
     expect(isKnownLarkUserScope('base:app:create')).toBe(true);
     expect(isKnownLarkUserScope('bitable:app')).toBe(true);
+    expect(isKnownLarkUserScope('base:field:read')).toBe(true);
+    expect(isKnownLarkUserScope('base:record:read')).toBe(true);
   });
 
   it('still rejects a misspelled Base scope', () => {
@@ -73,6 +75,16 @@ describe('auth-request handler — Base scope authorization', () => {
     expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
     const call = vi.mocked(tokens.requestUserAuthorization).mock.calls[0];
     expect(call[3]).toEqual(['base:app:create', 'bitable:app']);
+    expect(call[4]).toBe('ou_sender');
+  });
+
+  it('accepts both read scopes in one request without changing the verified caller', async () => {
+    const scopes = ['base:field:read', 'base:record:read'];
+    const res = await post({ scopes });
+    expect(res.status).toBe(200);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(tokens.requestUserAuthorization).mock.calls[0];
+    expect(call[3]).toEqual(scopes);
     expect(call[4]).toBe('ou_sender');
   });
 

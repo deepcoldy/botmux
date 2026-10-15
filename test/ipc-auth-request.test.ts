@@ -173,15 +173,74 @@ describe('agent authorization', () => {
     });
   });
 
-  it('preserves newer queued credentials and refuses a rotated worker', async () => {
+  it('completes the issued grant after the Agent ends without a wait call', async () => {
+    requestId = (await (await post()).json()).requestId;
+    const isGrantValid = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    session.managedTurnOrigin = undefined;
+    expect(isGrantValid()).toBe(true);
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    await vi.waitFor(() => expect(poll).toHaveBeenCalled(), { timeout: 3_000 });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_sender' };
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
+    expect(await response.json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_next',
+    });
+  });
+
+  it('reuses a pending link across turns without extending its deadline', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const first = await (await post()).json();
+      vi.setSystemTime(Date.now() + 30_000);
+      session.managedTurnOrigin.turnId = 'om_next';
+      const next = await (await post('auth-request', { originTurnId: 'om_next' })).json();
+      expect(next).toMatchObject({ requestId: first.requestId, authUrl: first.authUrl, expiresIn: 570 });
+      expect(tokens.requestUserAuthorization).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not expose another speaker or application grant to the current turn', async () => {
+    requestId = (await (await post()).json()).requestId;
+    session.managedTurnOrigin.callerOpenId = 'ou_other';
+    expect((await post('auth-status', { requestId })).status).toBe(409);
+    session.managedTurnOrigin.callerOpenId = 'ou_sender';
+    session.larkAppId = 'cli_other';
+    expect((await post('auth-status', { requestId })).status).toBe(409);
+    expect(poll).not.toHaveBeenCalled();
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+
+  it.each(['closed', 'replaced', 'secret_changed'])('invalidates an issued grant when the session is %s', async change => {
+    await post();
+    const isGrantValid = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    if (change === 'closed') session.session.status = 'closed';
+    if (change === 'replaced') session = { ...session };
+    if (change === 'secret_changed') vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'new-secret',
+    } } as any);
+    expect(isGrantValid()).toBe(false);
+  });
+
+  it('stops grant completion when the IPC server closes', async () => {
+    await post();
+    const isGrantValid = vi.mocked(tokens.requestUserAuthorization).mock.calls[0][5];
+    await ipc.close();
+    expect(isGrantValid()).toBe(false);
+    expect(poll).not.toHaveBeenCalled();
+  });
+
+  it('preserves newer queued credentials after a worker rotation', async () => {
     requestId = (await (await post()).json()).requestId;
     poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
     vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
     expect((await post('auth-status', { requestId })).status).toBe(409);
     vi.mocked(cliIdentity.refreshSessionIdentity).mockClear();
     session.workerGeneration++;
-    expect((await post('auth-status', { requestId })).status).toBe(409);
-    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(true);
+    expect((await post('auth-status', { requestId })).status).toBe(200);
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledOnce();
   });
 });
 
