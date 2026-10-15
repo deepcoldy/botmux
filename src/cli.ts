@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
+import { parse as parseDotEnv } from 'dotenv';
 import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
@@ -4276,6 +4277,24 @@ type AuthoritativeAbandonResult =
 
 type LocalSessionLifecycleMutation = 'delete' | 'resume' | 'suspend' | 'prune' | 'wake';
 
+/** Resolve the coordination mode for a standalone host CLI invocation.
+ * Daemons dotenv-load ~/.botmux/.env, but `botmux delete|resume|suspend|list`
+ * run directly from the user's shell and otherwise see only exported values.
+ * Match dotenv precedence (process env wins) while reading exactly one
+ * non-secret setting from the file and never mutating process.env. */
+function localCliCoordinationMode(
+  env: NodeJS.ProcessEnv = process.env,
+  envFile = ENV_FILE,
+): string | undefined {
+  const inline = env.BOTMUX_COORDINATION_MODE;
+  if (inline !== undefined) return inline.trim();
+  try {
+    return parseDotEnv(readFileSync(envFile, 'utf8')).BOTMUX_COORDINATION_MODE?.trim();
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * PostgreSQL primary coordination makes the durable Session row canonical.
  * The host CLI still discovers sessions from a Pod-local store, so any local
@@ -4288,7 +4307,7 @@ function primaryLocalLifecycleMutationError(
   operation: LocalSessionLifecycleMutation,
   env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
-  if (env.BOTMUX_COORDINATION_MODE?.trim() !== 'primary') return undefined;
+  if (localCliCoordinationMode(env) !== 'primary') return undefined;
 
   const action = operation === 'delete'
     ? '`botmux delete` 关闭'
@@ -5386,7 +5405,7 @@ async function cmdList(): Promise<void> {
     }
     return closed;
   };
-  const primaryMode = process.env.BOTMUX_COORDINATION_MODE?.trim() === 'primary';
+  const primaryMode = localCliCoordinationMode() === 'primary';
   if (primaryMode) {
     // Keep `list` read-only in primary mode. These rows come from the Pod-local
     // store, so even an apparently harmless scratch cleanup could close only
