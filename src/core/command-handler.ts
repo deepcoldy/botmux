@@ -6712,6 +6712,10 @@ export async function startForkSubtopicSession(
   const p2pAnchorIsForeign = forkInPlaceIsP2p
     && (!!message.threadId || (!!message.rootId && message.rootId !== message.messageId));
   let anchorId: string | undefined;
+  // forkSession 成功后置位：之后任何抛错都不能再走 recallAnchor，否则会把
+  // 一个已经活着的分身话题连同 marker 一起撤掉，留下回复折回扁平、静默
+  // 失联的僵尸子会话。
+  let forked = false;
   // 我们自己发出、失败时可以删除的消息。DM 顶层命令的锚点是用户的消息，
   // 绝不能删；只有「话题内 / 引用形态」时新建的顶层锚点归我们所有。
   let seedMessageId: string | undefined;
@@ -6880,6 +6884,8 @@ export async function startForkSubtopicSession(
       const orphanTopic = !await recallAnchor();
       return { ok: false, error: forkResult.error, orphanTopic };
     }
+    // 提交点：分身会话已注册，后续失败只报错，不再撤话题。
+    forked = true;
 
     if (!parentSession.forkChildSessionIds?.includes(forkResult.childSessionId)) {
       parentSession.forkChildSessionIds = [
@@ -6918,7 +6924,9 @@ export async function startForkSubtopicSession(
     return {
       ok: false,
       error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
-      orphanTopic: anchorId ? !await recallAnchor() : false,
+      // fork 已成功后的抛错绝不撤话题：已注册的分身必须保持可路由，
+      // recall 会删 marker 让其回复折回扁平、静默失联。
+      orphanTopic: forked ? false : (anchorId ? !await recallAnchor() : false),
     };
   }
 }

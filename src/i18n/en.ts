@@ -906,7 +906,7 @@ export const messages: Record<string, string> = {
   'help.introduce': '/introduce          - Register the bots in this chat with each other by open_id for precise collaboration mentions',
   'help.relay': '/relay              - Pick a live session from another chat/topic and relay it into the current chat/topic',
   'help.relay_create': '/relay --create [name] - Create a collaboration group and relay the current session there (mention target bots in a group; in a DM just send it — new group = you + this bot)',
-  'help.fork': '/fork <task>         - Fork a parallel session with full context into a new sub-topic of this topic group; /fork --create <name> keeps the new-group destination',
+  'help.fork': '/fork <task>         - Fork a parallel session with full context into a new topic right here (works in DMs and topic groups); /fork --create <name> keeps the new-group destination',
   'help.forklist': '/forklist           - Re-post the current session\'s forked-task panel with live/closed status and topic links',
   'help.heading_login': '🔐 User OAuth:',
   'help.login': '/login              - Lark user OAuth (lets you download images etc. from third-party cards)',
