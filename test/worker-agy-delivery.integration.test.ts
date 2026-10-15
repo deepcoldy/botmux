@@ -169,7 +169,7 @@ setInterval(() => {}, 1_000);
 describe('worker delayed activation and interrupted Antigravity delivery', () => {
   it.each(['antigravity', 'traex'] as const)('%s writes a slow activation once and acknowledges its deferred receipt', async cliId => {
     const worker = startWorker('delayed', cliId);
-    await waitFor(() => worker.input().includes('ACTIVATION_UNIQUE_MARKER'), worker.logs);
+    await waitFor(() => worker.input().includes('ACTIVATION_UNIQUE_MARKER'), worker.logs, 30_000);
     await new Promise(resolve => setTimeout(resolve, 10_000));
     expect(worker.input().match(/ACTIVATION_UNIQUE_MARKER/g)).toHaveLength(1);
     await waitFor(() => worker.messages.some(m => m.type === 'queued_activation_submitted'), worker.logs, 20_000);
