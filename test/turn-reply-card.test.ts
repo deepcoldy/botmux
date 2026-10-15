@@ -738,6 +738,19 @@ describe('public process and fallback compatibility', () => {
     expect(history).toContain('bun run test\n🔧');
   });
 
+  it('keeps final runtime identity in the footer without duplicating or replacing it on refresh', () => {
+    const finalCard = buildCanonicalFinalReplyCard({ markdown: 'Answer',
+      usage: { context: null, tokens: null, model: 'original-model', reasoningEffort: 'high' },
+    });
+    const card = JSON.parse(buildTurnReplyCard({
+      ...key, ...input, version: 1, phase: 'completed', createdAtMs: 0, progress: [], tools: [], finalCard,
+      usage: { context: null, tokens: null, model: 'later-model', reasoningEffort: 'low' },
+    }, { ...presentation, showLiveUsage: true }));
+    expect(JSON.stringify(card).match(/original-model/g)).toHaveLength(1);
+    expect(JSON.stringify(card)).not.toContain('later-model');
+    expect(card.body.elements.some((e: any) => e.element_id === 'botmux_turn_usage')).toBe(false);
+  });
+
   it('keeps the canonical final card and public progress while hiding tools and their counts', () => {
     const finalCard = buildCanonicalFinalReplyCard({ markdown: '完整答复' });
     const canonical = JSON.parse(finalCard);

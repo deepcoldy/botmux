@@ -7,6 +7,7 @@ import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
+import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
@@ -146,7 +147,7 @@ export async function updateTurnReplyCard(
     } catch { /* missing native usage is omitted */ }
   }
   const transport = {
-    usage,
+    usage: withCardRuntimeIdentity(ds, usage ?? { context: null, tokens: null }, ds.session.cliId ?? cfg.cliId),
     beforeEffect,
     send: async (body, uuid) => {
       const messageId = await send(body, 'interactive', uuid, beforeEffect);

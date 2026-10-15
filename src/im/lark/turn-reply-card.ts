@@ -5,7 +5,7 @@ import {
   replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
-import { buildCardBodyElements, cardUsageFooterSegment, createReplyCard } from './md-card.js';
+import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
 
@@ -269,7 +269,10 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${pendingAsks.length ? '🙋' : phaseIcons[record.phase]} **${title}**` });
   const usage = presentation.showLiveUsage && record.usage
     ? cardUsageFooterSegment(record.usage, presentation.locale, 'streaming') : null;
-  if (usage) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usage });
+  // Final cards already carry their frozen runtime identity in the footer.
+  const runtime = !record.finalCard && record.usage ? cardUsageRuntimeSegment(record.usage) : null;
+  const usageLine = [usage, runtime].filter(Boolean).join(' · ');
+  if (usageLine) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usageLine });
   if (!terminal && !record.finalCard && ['working', 'waiting'].includes(record.phase) && presentation.canStop) {
     card.body.elements.push({ tag: 'column_set', element_id: 'botmux_turn_control_0', columns: [{ tag: 'column', width: 'auto', elements: [{
       tag: 'button', text: { tag: 'plain_text', content: en ? '⏹ Stop' : '⏹ 停止' }, type: 'danger',

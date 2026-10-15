@@ -85,5 +85,9 @@ export function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | 
 
   // statusline 配额段：只在至少一个字段合法时才带 key，保证「无数据 ⇒ 卡片与现状逐字节相同」。
   const quota = normalizeCardUsageQuota(raw.quota);
-  return quota ? { context, tokens, quota } : { context, tokens };
+  const identity: Partial<CardUsageSnapshot> = {};
+  for (const key of ['model', 'reasoningEffort', 'modelBackendVariant'] as const) {
+    if (typeof raw[key] === 'string' && raw[key].trim()) identity[key] = raw[key].trim();
+  }
+  return { context, tokens, ...(quota ? { quota } : {}), ...identity };
 }

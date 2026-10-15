@@ -6133,6 +6133,11 @@ async function readCardUsageSnapshotForSend(
   session: SessionData,
   larkAppId: string,
 ): Promise<CardUsageSnapshot> {
+  const configuredRuntime: CardUsageSnapshot = {
+    context: null, tokens: null,
+    ...(session.model?.trim() ? { model: session.model.trim() } : {}),
+    ...(session.reasoningEffort?.trim() ? { reasoningEffort: session.reasoningEffort.trim() } : {}),
+  };
   let daemonPort: number | undefined;
   try {
     daemonPort =
@@ -6151,7 +6156,7 @@ async function readCardUsageSnapshotForSend(
       if (response.ok) {
         const body = await response.json() as { usage?: unknown };
         const normalized = normalizeCardUsageSnapshot(body.usage);
-        if (normalized) return normalized;
+        if (normalized) return { ...configuredRuntime, ...normalized };
       }
     } catch {
       // No host secret, old daemon, timeout, or transient IPC failure: use the
@@ -6163,9 +6168,9 @@ async function readCardUsageSnapshotForSend(
   // explicitly from the worker because bots.json is intentionally unreadable.
   // This send path renders into the reply-card FOOTER, so only the 'footer'
   // display mode surfaces usage here; 'streaming' shows it on the daemon's live
-  // card (absent on this offline fallback) and 'off' shows nothing.
+  // card (absent on this offline fallback). Runtime identity remains visible.
   if (resolveUsageDisplay(larkAppId) !== 'footer') {
-    return { context: null, tokens: null };
+    return configuredRuntime;
   }
 
   try {
@@ -6186,11 +6191,11 @@ async function readCardUsageSnapshotForSend(
     // 非空才带 key；读取失败不影响 transcript 用量。
     try {
       const quota = toCardQuota(readStatuslineSnapshot(resolveDataDir(), session.sessionId));
-      if (quota) return { ...snapshot, quota };
+      if (quota) return { ...configuredRuntime, ...snapshot, quota };
     } catch { /* best-effort */ }
-    return snapshot;
+    return { ...configuredRuntime, ...snapshot };
   } catch {
-    return { context: null, tokens: null };
+    return configuredRuntime;
   }
 }
 
@@ -12176,7 +12181,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const footer = buildReplyCardFooter({
         brand: footerBrand,
         recipientOpenIds: footerRecipients,
-        usage: usageSnapshot,
+        usage: shouldRenderBrand ? usageSnapshot : { ...usageSnapshot, model: undefined },
         locale: localeForBot(appId),
       });
       // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button

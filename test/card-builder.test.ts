@@ -1090,6 +1090,21 @@ describe('buildStreamingCard', () => {
         && JSON.stringify(element).includes('GPT-5.6-Sol'))).toBe(false);
     });
 
+    it.each([
+      { model: 'claude-opus-5-5-high' },
+      { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    ])('shows runtime identity without native metrics: $model', runtime => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'cursor', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: null, ...runtime },
+      ));
+      const line = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes(runtime.model));
+      expect(line?.content).toContain(`**${runtime.model}**`);
+      if (runtime.reasoningEffort) expect(line.content).toContain('high');
+      expect(line.content).not.toMatch(/Context|Total|↑|↓|null|undefined/);
+    });
+
     it('renders metrics alone (no trailing runtime) when there is no model', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',

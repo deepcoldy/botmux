@@ -6,7 +6,7 @@ vi.mock('../src/bot-registry.js', async importOriginal => ({
   resolveUsageDisplay: () => 'streaming',
 }));
 
-const { getDaemonStreamingCardUsageSnapshot } = await import('../src/core/worker-pool.js');
+const { getDaemonStreamingCardUsageSnapshot, getDaemonReplyCardUsageSnapshot } = await import('../src/core/worker-pool.js');
 
 function remoteSession(generation = 2): DaemonSession {
   return {
@@ -45,6 +45,15 @@ describe('remote runner card usage', () => {
         model: 'GPT-5.4',
         reasoningEffort: 'high',
       });
+  });
+
+  it('keeps the current remote identity in final replies with usage hidden', () => {
+    expect(getDaemonReplyCardUsageSnapshot(remoteSession(), 'remote-runner')).toEqual({
+      context: null, tokens: null, model: 'GPT-5.4', reasoningEffort: 'high',
+    });
+    expect(getDaemonReplyCardUsageSnapshot(remoteSession(1), 'remote-runner')).toEqual({
+      context: null, tokens: null, model: 'configured-model',
+    });
   });
 
   it('ignores a snapshot from a stale remote generation', () => {

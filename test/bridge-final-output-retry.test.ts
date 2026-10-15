@@ -3860,6 +3860,26 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
+  it('freezes the observed model and effort across final reply retries', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    vi.mocked(resolveUsageDisplay).mockReturnValue('off');
+    const ds = makeDs();
+    ds.activeModel = 'observed-model';
+    ds.activeReasoningEffort = 'high';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    ds.activeModel = 'next-turn-model';
+    ds.activeReasoningEffort = 'low';
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(call[1]).toContain('**observed-model** high');
+      expect(call[1]).not.toContain('next-turn-model');
+    }
+  });
+
   it('does not read or render footer usage when this bot is not in footer mode', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -3873,6 +3893,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     vi.mocked(resolveUsageDisplay).mockReturnValue('off');
 
     const ds = makeDs();
+    ds.session.model = 'claude-opus-5-5-high';
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
@@ -3880,6 +3901,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(getSessionUsageSnapshot).not.toHaveBeenCalled();
     const card = sessionReply.mock.calls[0]?.[1] as string;
     expect(card).toContain('[botmux](');
+    expect(card).toContain('**claude-opus-5-5-high**');
     expect(card).not.toContain('上下文');
     expect(card).not.toContain('Token');
   });

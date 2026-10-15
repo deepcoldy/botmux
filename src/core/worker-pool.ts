@@ -135,6 +135,7 @@ import {
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
+import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import {
   isStrongManagedHerdrAgentName,
@@ -467,95 +468,36 @@ export function getDaemonSessionUsageSnapshot(
   }
 }
 
-/** Reply-card (final output / adopt preamble / local-turn) usage. Only the
- * `'footer'` display mode surfaces usage here; `'streaming'` and `'off'` yield a
- * concrete empty snapshot. Keeping the display decision out of the native usage
- * reader leaves accounting and dashboard consumers intact; the concrete empty
- * snapshot (rather than undefined) also freezes "hidden" over final-output
- * retries. */
+/** Reply-card usage is shown only in footer mode. Runtime identity is always
+ * retained, including in the frozen snapshot used by final-output retries. */
 export function getDaemonReplyCardUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
 ): CardUsageSnapshot {
-  try {
-    if (resolveUsageDisplay(ds.larkAppId) !== 'footer') {
-      return { context: null, tokens: null };
-    }
-  } catch {
-    // Missing runtime config → default 'streaming' → no footer usage.
-    return { context: null, tokens: null };
-  }
-  return getDaemonSessionUsageSnapshot(ds, effectiveCliId);
+  let showUsage = false;
+  try { showUsage = resolveUsageDisplay(ds.larkAppId) === 'footer'; } catch { /* default: streaming */ }
+  return withCardRuntimeIdentity(ds, showUsage
+    ? getDaemonSessionUsageSnapshot(ds, effectiveCliId)
+    : { context: null, tokens: null }, effectiveCliId);
 }
 
-/** Streaming-card usage. Only the `'streaming'` display mode (the default)
- * surfaces usage in the live card body; `'footer'` and `'off'` yield empty.
- * Returns a concrete empty snapshot on any config failure so the streaming
- * renderer stays best-effort. `fresh` forces an exact read at meaningful
- * boundaries (turn end / idle); intra-turn ticks leave it false to ride the
- * reader's reparse throttle and stay off the disk. */
+/** Streaming-card metrics obey usageDisplay; known model/effort do not depend
+ * on transcript availability. Hidden metrics must not trigger transcript I/O. */
 export function getDaemonStreamingCardUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
-  // Runtime identity is derived from in-memory fields only, so it is available
-  // without reading the transcript. The disk read (getDaemonSessionUsageSnapshot)
-  // is deferred until we know usage will actually render — a footer/off bot must
-  // not pay a per-tick transcript parse just to throw the tokens away.
-  const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
-  const reasoningEffort = ds.activeReasoningEffort?.trim()
-    || ds.session.reasoningEffort?.trim();
-  const modelBackendVariant = ds.session.modelBackendVariant;
-  // The fallback notice is a warning about which model is answering, not a
-  // usage metric — it rides the snapshot (every buildStreamingCard call site
-  // already forwards one) but must survive the 'off'/'footer' early return.
+  let showUsage = true;
+  try { showUsage = resolveUsageDisplay(ds.larkAppId) === 'streaming'; } catch { /* default: streaming */ }
+  const snapshot = showUsage
+    ? getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: opts?.fresh ?? false })
+    : { context: null, tokens: null };
+  // The fallback warning and effort controls belong to the live status card.
   const modelFallback = ds.modelFallback;
   const reasoningControl = sessionReasoningControl(ds);
-  try {
-    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
-      return {
-        context: null,
-        tokens: null,
-        ...(runtimeModel ? { model: runtimeModel } : {}),
-        ...(reasoningEffort ? { reasoningEffort } : {}),
-        ...(modelBackendVariant ? { modelBackendVariant } : {}),
-        ...(modelFallback ? { modelFallback } : {}),
-        ...(reasoningControl ? { reasoningControl } : {}),
-      };
-    }
-  } catch {
-    // Missing runtime config → default 'streaming' → show usage (best-effort).
-  }
-  const snapshot = getDaemonSessionUsageSnapshot(
-    ds,
-    effectiveCliId,
-    { fresh: opts?.fresh ?? false },
-  );
-  const remoteRunner = (ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner';
-  const remoteModel = remoteRunner ? snapshot.model?.trim() : undefined;
-  const remoteReasoningEffort = remoteRunner ? snapshot.reasoningEffort?.trim() : undefined;
-  const remoteModelBackendVariant = remoteRunner ? snapshot.modelBackendVariant?.trim() : undefined;
-  // Model normally comes from an explicitly-wired executor runtime (TRAE/Codex
-  // set ds.activeModel) or launch config. Grok and MiniMax also expose native,
-  // user-facing model identity in their usage snapshots.
-  // We still never surface snapshot.tokens.model, which can be an internal
-  // routing code for Relay-family CLIs (e.g. `ark/relay-code`).
-  const nativeRuntime = effectiveCliId === 'grok' || effectiveCliId === 'minimax';
-  const nativeModel = nativeRuntime ? snapshot.model?.trim() : undefined;
-  const nativeReasoningEffort = nativeRuntime ? snapshot.reasoningEffort?.trim() : undefined;
   return {
-    ...snapshot,
-    ...(remoteModel ? { model: remoteModel }
-      : effectiveCliId === 'minimax' && nativeModel ? { model: nativeModel }
-      : runtimeModel ? { model: runtimeModel }
-        : nativeModel ? { model: nativeModel } : {}),
-    ...(remoteReasoningEffort ? { reasoningEffort: remoteReasoningEffort }
-      : effectiveCliId === 'minimax' && nativeReasoningEffort ? { reasoningEffort: nativeReasoningEffort }
-      : reasoningEffort ? { reasoningEffort }
-        : nativeReasoningEffort ? { reasoningEffort: nativeReasoningEffort } : {}),
-    ...(remoteModelBackendVariant ? { modelBackendVariant: remoteModelBackendVariant }
-      : modelBackendVariant ? { modelBackendVariant } : {}),
+    ...withCardRuntimeIdentity(ds, snapshot, effectiveCliId),
     ...(modelFallback ? { modelFallback } : {}),
     ...(reasoningControl ? { reasoningControl } : {}),
   };

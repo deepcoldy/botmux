@@ -48,6 +48,18 @@ describe('reply-card runtime eligibility and recovery', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
+  it('shows the selected runtime on unified cards even with usage off', async () => {
+    const ds = session();
+    ds.session.cliId = 'codex';
+    ds.session.model = 'gpt-5.6-sol';
+    ds.activeReasoningEffort = 'high';
+    const send = vi.fn(async (_content: string) => 'om_reply');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    const card = JSON.parse(send.mock.calls[0]![0]);
+    const line = card.body.elements.find((e: any) => e.element_id === 'botmux_turn_usage');
+    expect(line?.content).toBe('**gpt-5.6-sol** high');
+  });
+
   it.each([false, true])('private replies bypass dynamic cards with an existing reservation=%s', async reserved => {
     const ds = session();
     Object.assign(ds.session, { larkAppId: ds.larkAppId, chatType: 'group', scope: 'thread' });
