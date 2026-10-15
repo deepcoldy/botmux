@@ -670,6 +670,7 @@ describe('RemoteRunnerBackend', () => {
 
   it.each([
     ['session-no-outbound', 'unadvertised-outbound'],
+    ['session-no-explicit', 'unadvertised-explicit-mention'],
     ['session-outbound-generation', 'outbound-future-generation'],
     ['session-final-before-result', 'final-before-result'],
   ])('fails closed for outbound protocol guard %s', async (sessionId, content) => {

@@ -175,6 +175,43 @@ describe('remote runner protocol', () => {
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'outbound_message',
+      operationId: 'outbound-explicit',
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'notify another participant',
+      responseKind: 'auxiliary',
+      mention: 'explicit',
+      mentions: ['ou_target:Target', 'target@example.com:Target by email'],
+    }))).toMatchObject({
+      type: 'outbound_message',
+      mention: 'explicit',
+      mentions: ['ou_target:Target', 'target@example.com:Target by email'],
+    });
+    for (const invalidMention of [
+      { mention: 'explicit' },
+      { mention: 'explicit', mentions: [] },
+      { mention: 'none', mentions: ['ou_target:Target'] },
+      { mention: 'requester', mentions: ['ou_target:Target'] },
+      { mention: 'explicit', mentions: [42] },
+      { mention: 'explicit', mentions: ['ou_target\0Target'] },
+      { mention: 'explicit', mentions: ['x'.repeat(33 * 1024)] },
+    ]) {
+      expect(parseRemoteRunnerEventLine(JSON.stringify({
+        protocol: REMOTE_RUNNER_PROTOCOL,
+        version: REMOTE_RUNNER_PROTOCOL_VERSION,
+        type: 'outbound_message',
+        operationId: 'outbound-invalid-mention',
+        turnId: 'turn-1',
+        generation: 3,
+        content: 'invalid mention shape',
+        responseKind: 'auxiliary',
+        ...invalidMention,
+      }))).toBeUndefined();
+    }
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
       operationId: 'outbound-2',
       turnId: 'turn-1',
       generation: 3,

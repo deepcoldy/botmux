@@ -791,14 +791,15 @@ describe('cmdSend hook context wiring', () => {
     expect(remoteGuard).toContain('trustedRelayCtx.sessionId !== sid');
     expect(remoteGuard).toContain("['progress', 'auxiliary']");
     expect(remoteGuard).toContain('sendTopLevel || overrideChatId || sendInto');
-    expect(remoteGuard).toContain('mentionArgs.length > 0');
+    expect(remoteGuard).toContain('Number(mentionArgs.length > 0)');
+    expect(remoteGuard).not.toContain('|| mentionArgs.length > 0');
     expect(remoteGuard).not.toContain('images.length > 0');
     expect(remoteGuard).toContain('files.length > 0');
     expect(cmdSend).toContain('...(remoteRunnerOutbound ? { terminalIndependent: true } : {})');
   });
 
   it.each([
-    ['explicit recipient', ['--no-mention', '--mention', 'ou_forbidden']],
+    ['explicit plus none mention decisions', ['--no-mention', '--mention', 'ou_forbidden']],
     ['two mention decisions', ['--no-mention', '--mention-back']],
   ])('rejects Remote Runner outbound sends with %s through the real CLI', async (_name, mentionArgs) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-guard-'));
@@ -831,7 +832,47 @@ describe('cmdSend hook context wiring', () => {
         BOTMUX_LARK_APP_SECRET: '',
       });
       expect(result.code).toBe(2);
-      expect(result.stderr).toContain('supports only current-session Markdown/images with one none/requester mention decision');
+      expect(result.stderr).toContain('supports only current-session Markdown/images with one none/requester/explicit mention decision');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts one explicit Remote Runner recipient before ordinary content validation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-explicit-'));
+    const dataDir = join(root, 'data');
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'app-a', larkAppSecret: 'test', cliId: 'remote-runner',
+    }]));
+    seedPersistedSessionRows(dataDir, 'app-a', {
+      session: {
+        sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+        title: 'remote', status: 'active', createdAt: new Date(0).toISOString(),
+        larkAppId: 'app-a', cliId: 'remote-runner', pid: process.pid,
+      },
+    });
+    try {
+      const missingContent = join(root, 'missing.md');
+      const result = await runCli([
+        'send', '--remote-runner-outbound', '--response-kind', 'auxiliary',
+        '--session-id', 'session', '--mention', 'ou_target:Target',
+        '--content-file', missingContent,
+      ], {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: join(root, 'bots.json'),
+        BOTMUX_SESSION_ID: 'session',
+        BOTMUX_TURN_ID: 'turn-live',
+        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+        BOTMUX_SEND_RELAY: '',
+        BOTMUX_WORKFLOW: '',
+        BOTMUX_LARK_APP_ID: '',
+        BOTMUX_LARK_APP_SECRET: '',
+      });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain(`文件不存在: ${missingContent}`);
+      expect(result.stderr).not.toContain('--remote-runner-outbound supports only');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

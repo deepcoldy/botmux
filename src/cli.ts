@@ -10162,7 +10162,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // that contract again at the final CLI boundary so a forged flag cannot turn
   // this path into cross-chat delivery or a richer platform side effect.
   if (remoteRunnerOutbound) {
-    const mentionDecisionCount = Number(mentionBack) + Number(noMention);
+    const mentionDecisionCount = Number(mentionBack)
+      + Number(noMention)
+      + Number(mentionArgs.length > 0);
     if (!trustedRelayCtx
       || trustedRelayCtx.sessionId !== sid
       || !currentTurnId
@@ -10177,9 +10179,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined || noQuote
       || customCardRequested || asVoice || isSlashSend || asChoice || replyLayout
       || files.length > 0 || videos.length > 0 || videoCovers.length > 0
-      || mentionArgs.length > 0 || mentionDecisionCount !== 1
+      || mentionDecisionCount !== 1
       || attention.requested || urgent.requested || expectedLinks.length > 0) {
-      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown/images with one none/requester mention decision');
+      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown/images with one none/requester/explicit mention decision');
       process.exit(2);
     }
   }

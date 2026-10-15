@@ -699,6 +699,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       message.content,
       message.responseKind,
       message.mention,
+      message.mentions ?? [],
       message.images ?? [],
     ])).digest('hex');
   }
@@ -706,6 +707,13 @@ export class RemoteRunnerBackend implements SessionBackend {
   private handleOutboundMessage(message: RemoteRunnerOutboundMessage): void {
     if (!this.providerCapabilities.has('outbound_message')) {
       this.failProtocol('remote runner emitted outbound_message without advertising the capability');
+      return;
+    }
+    if (message.mention === 'explicit'
+        && !this.providerCapabilities.has('outbound_message_explicit_mention')) {
+      this.failProtocol(
+        'remote runner emitted explicit outbound mentions without advertising the capability',
+      );
       return;
     }
     if (!this.acceptAcknowledgedTurn(message.turnId)) return;

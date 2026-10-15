@@ -30,6 +30,7 @@ export const REMOTE_RUNNER_TERMINAL_CAPABILITIES = [
  * forced to implement a chat-facing side channel when upgrading BotMux. */
 export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message',
+  'outbound_message_explicit_mention',
 ] as const;
 
 /** Optional provider-to-host access to a small, read-only BotMux session tool
@@ -110,7 +111,7 @@ export interface RemoteRunnerTrustedCaller {
 }
 
 export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
-export type RemoteRunnerOutboundMention = 'none' | 'requester';
+export type RemoteRunnerOutboundMention = 'none' | 'requester' | 'explicit';
 
 export interface RemoteRunnerOutboundImage {
   name: string;
@@ -128,6 +129,7 @@ export interface RemoteRunnerOutboundMessage {
   content: string;
   responseKind: RemoteRunnerOutboundResponseKind;
   mention: RemoteRunnerOutboundMention;
+  mentions?: string[];
   images?: RemoteRunnerOutboundImage[];
 }
 
@@ -288,6 +290,7 @@ export type RemoteRunnerEvent =
       content: string;
       responseKind: RemoteRunnerOutboundResponseKind;
       mention: RemoteRunnerOutboundMention;
+      mentions?: string[];
       images?: RemoteRunnerOutboundImage[];
     })
   | (RemoteRunnerEventBase & {
@@ -728,6 +731,20 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     const operationId = nonEmptyString(raw.operationId, 256);
     const turnId = nonEmptyString(raw.turnId, 256);
     const images = normalizeRemoteRunnerOutboundImages(raw.images);
+    const mentions = raw.mentions === undefined
+      ? []
+      : (Array.isArray(raw.mentions)
+        && raw.mentions.length > 0
+        && raw.mentions.every(value => typeof value === 'string' && !value.includes('\0'))
+        && Buffer.byteLength(raw.mentions.join('\0'), 'utf8')
+          <= MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
+        ? raw.mentions as string[]
+        : undefined);
+    const mention = String(raw.mention);
+    const mentionShapeValid = mention === 'explicit'
+      ? mentions !== undefined && mentions.length > 0
+      : ['none', 'requester'].includes(mention)
+        && raw.mentions === undefined;
     if (!operationId || !ID_RE.test(operationId)
         || !turnId || !ID_RE.test(turnId)
         || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
@@ -735,7 +752,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         || !raw.content.trim()
         || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
         || !['progress', 'auxiliary'].includes(String(raw.responseKind))
-        || !['none', 'requester'].includes(String(raw.mention))
+        || !mentionShapeValid
         || images === undefined) {
       return undefined;
     }
@@ -748,7 +765,8 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       generation: Number(raw.generation),
       content: raw.content,
       responseKind: raw.responseKind as RemoteRunnerOutboundResponseKind,
-      mention: raw.mention as RemoteRunnerOutboundMention,
+      mention: mention as RemoteRunnerOutboundMention,
+      ...(mention === 'explicit' ? { mentions } : {}),
       ...(images.length ? { images } : {}),
     };
   }
