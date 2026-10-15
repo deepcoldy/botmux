@@ -11,6 +11,7 @@ import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
 import { buildTurnTerminalFooterPatch } from '../src/im/lark/card-builder.js';
 import { customFinalCardError } from '../src/im/lark/final-card-sections.js';
+import { extractCardContent } from '../src/im/lark/message-parser.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_custom_final', turnId: 'om_turn' };
@@ -182,23 +183,71 @@ describe('custom schema-2 final uses the canonical reply lifecycle', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('does not swallow native recipient notifications by patching a running card', async () => {
+  it.each([
+    { name: 'body markdown', extracted: true, card: { ...customCard, body: { elements: [
+      { tag: 'markdown', content: 'For <at id=ou_other></at>' },
+    ] } } },
+    { name: 'collapsible panel title', extracted: false, card: { ...customCard, body: { elements: [
+      { tag: 'collapsible_panel', expanded: true,
+        header: { title: { tag: 'markdown', content: 'For <at id=ou_other></at>' } },
+        elements: [{ tag: 'markdown', content: 'Add boundary tests.' }] },
+    ] } } },
+    { name: 'card subtitle', extracted: false, card: { ...customCard, header: { ...customCard.header,
+      subtitle: { tag: 'plain_text', content: 'For <at id=ou_other></at>' },
+    } } },
+  ])('does not swallow native notifications in $name by patching a running card', async ({ card, extracted }) => {
     const { root, dataDir, run } = setup();
     try {
+      // Header-only mentions are absent from extracted text: they specifically
+      // exercise the whole-card payload gate, not the pre-existing text gate.
+      expect(extractCardContent(JSON.stringify(card)).includes('<at')).toBe(extracted);
       const store = new TurnReplyCardStore(dataDir);
       const io = { send: async () => 'om_original_card', patch: async () => {}, beforeEffect: () => {}, isWithdrawn: () => false,
         render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, presentation) };
       await store.prepare(key, { mode: 'unified', chatId: 'oc_test', rootId: 'om_root' });
       await store.update(key, { kind: 'start' }, io);
-      const result = run({ ...customCard, body: { elements: [
-        { tag: 'markdown', content: 'For <at id=ou_other></at>' },
-      ] } });
+      const result = run(card);
       expect(result.status, String(result.stderr)).toBe(0);
       const requests = captured(result.stdout);
       expect(requests).toHaveLength(1);
       expect(requests[0].method).toBe('POST');
       expect(requests[0].body.content).toContain('<at id=ou_other>');
+      expect(store.read(key)?.messageId).toBe('om_original_card');
       expect(store.read(key)?.finalDelivered).not.toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { input: 'false', updateMulti: false, reserved: false },
+    { input: 'omitted', updateMulti: undefined, reserved: false },
+    { input: 'false', updateMulti: false, reserved: true },
+    { input: 'omitted', updateMulti: undefined, reserved: true },
+  ])('forces update_multi when input is $input and reserved=$reserved', async ({ updateMulti, reserved }) => {
+    const { root, dataDir, run } = setup();
+    try {
+      const store = new TurnReplyCardStore(dataDir);
+      const io = { send: async () => 'om_original_card', patch: async () => {}, beforeEffect: () => {}, isWithdrawn: () => false,
+        render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, presentation) };
+      if (reserved) {
+        await store.prepare(key, { mode: 'unified', chatId: 'oc_test', rootId: 'om_root' });
+        await store.update(key, { kind: 'start' }, io);
+      }
+      const result = run({ ...customCard, config: {
+        width_mode: 'fill', ...(updateMulti === undefined ? {} : { update_multi: updateMulti }),
+      } });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = captured(result.stdout);
+      expect(requests).toHaveLength(1);
+      expect(requests[0].method).toBe(reserved ? 'PATCH' : 'POST');
+      const deliveredCard = JSON.parse(requests[0].body.content);
+      expect(deliveredCard.config).toMatchObject({ width_mode: 'fill', update_multi: true });
+      if (reserved) {
+        expect(store.read(key)).toMatchObject({ messageId: 'om_original_card', finalDelivered: true });
+        // Unified cards reveal feedback only when the turn reaches terminal.
+        await store.update(key, { kind: 'terminal', phase: 'completed', durationMs: 1200 }, io);
+        expect(JSON.parse(store.read(key)!.lastCard!).config.update_multi).toBe(true);
+      }
+      expect(reserved ? store.read(key)!.lastCard! : requests[0].body.content).toContain('feedback_submit');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
