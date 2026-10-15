@@ -183,6 +183,9 @@ export interface BuildAppSlashCommandCatalogOptions {
 /**
  * 从 command-schema 推导应用级候选清单：
  * - 只收 botmux 自有命令（COMMANDS）及其别名；`cliId` 限定项仅在 Bot 的 CLI 匹配时收；
+ * - 与 `DAEMON_COMMANDS`（= GLOBAL_COMMANDS）口径一致，排除 `claimWithoutSessionOnly`
+ *   的元命令（如 `/resume`：仅无会话时回收已关闭会话，有会话时透传给 CLI 自带的
+ *   `/resume`——属 #839 的 CLI × 后端透传能力，不进应用级面板）；
  * - `help` 为空的隐藏命令（如 `/cli`）不收——`/help` 都不展示的不该进原生面板；
  * - 命令名不符合 Lark 命名规则的跳过。
  */
@@ -193,6 +196,7 @@ export function buildAppSlashCommandCatalog(
   const byName = new Map<string, AppSlashCommandSpec>();
   for (const spec of COMMANDS) {
     if (spec.cliId && spec.cliId !== options.cliId) continue;
+    if (spec.claimWithoutSessionOnly) continue;
     const zh = describeSpec(spec, 'zh');
     const en = describeSpec(spec, 'en');
     if (!zh || !en) continue;

@@ -1,3 +1,4 @@
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
@@ -17,7 +18,7 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -95,10 +96,15 @@ import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
+import {
+  hasScheduleTopicTitleRuntimeTemplate,
+  renderScheduleTopicTitle,
+} from './schedule-topic-title.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
+import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
@@ -3526,7 +3532,7 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'workspace_retired' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
+| { ok: false; error: 'codex_unarchive_failed' | 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'workspace_retired' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
@@ -3681,6 +3687,20 @@ export async function resumeSession(
     };
   }
 
+  try {
+    await restoreCodexCleanupArchive(session, sessionStore.updateSession, undefined, () => sessionStore.getOwnedSession(sessionId));
+  } catch (error) {
+    logger.warn(`[resume] Codex unarchive failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false as const, error: 'codex_unarchive_failed' as const };
+  }
+  // Recheck after RPC: a concurrent state transition must never be overwritten.
+  if (sessionStore.getSession(sessionId)?.workspaceRetirement) {
+    return { ok: false as const, error: 'workspace_retired' as const };
+  }
+  if (sessionStore.getSession(sessionId)?.status !== 'closed' || activeSessions.has(key)) {
+    return { ok: false as const, error: 'resume_cancelled' as const };
+  }
+
   // Reactivate and abandon any queued/setup ownership in one durable replace.
   // Closed rows created by older releases may still contain a prepared head,
   // tail, or repo picker; generic resume starts a new lifecycle and must never
@@ -3820,6 +3840,19 @@ export async function resumeSession(
     }
   }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
+  // A session group's resident is its chat-scope session. Closing no longer
+  // auto-resumes, so any recovery path (close card, /resume, /adopt <id>, CLI)
+  // may bring back an older resident; keep the registry pointing at it so
+  // /dismiss sees the live resident. No-op for chats that are not session groups.
+  if (scope === 'chat' && isSessionGroup(session.chatId)) touchSessionGroup(session.chatId, sessionId);
+  // Flip connected dashboards back to active for every recovery path (close
+  // card, /resume, /adopt <id>, HTTP, durable control). `null`, not undefined,
+  // so the SSE patch actually clears closedAt. Idempotent with callers that
+  // also publish.
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId, patch: { status: 'active', closedAt: null } },
+  });
   return {
     ok: true,
     ds,
@@ -3987,6 +4020,19 @@ export async function executeScheduledTask(
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
+  const rawTopicTitle = task.topicTitle?.trim();
+  const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
+  const hasDynamicTopicTitle = !!rawTopicTitle
+    && hasScheduleTopicTitleRuntimeTemplate(rawTopicTitle);
+  if (silent && createsOwnTopic && hasDynamicTopicTitle) {
+    throw new Error('topic_title_template_silent_unsupported');
+  }
+  const topicTitle = rawTopicTitle && createsOwnTopic && !silent && hasDynamicTopicTitle
+    ? renderScheduleTopicTitle(rawTopicTitle, {
+        firedAt: new Date(),
+        ownerOpenId: task.ownerOpenId,
+      })
+    : rawTopicTitle;
 
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
@@ -4032,7 +4078,9 @@ export async function executeScheduledTask(
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
-      const topicSeed = task.topicTitle?.trim()
+      // A custom title is the actual text root; without one the localized
+      // task-start notice remains the backwards-compatible seed.
+      const topicSeed = topicTitle
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
@@ -4089,7 +4137,9 @@ export async function executeScheduledTask(
               logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
             });
           }
-          const topicSeed = task.topicTitle?.trim()
+          // Dedicated tasks use the same rendered fire-time title contract as
+          // new-topic runs, but persist this first root for later continuations.
+          const topicSeed = topicTitle
             || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
           const seed = await sendMessage(larkAppId, task.chatId, topicSeed);
           // Write the root straight into the task row (store call, not the
@@ -4441,7 +4491,7 @@ export async function executeScheduledTask(
         taskId: task.id,
         turnId: scheduledTurnId,
         routingAnchor: anchor,
-        ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
+        ...(topicTitle ? { topicTitle } : {}),
         createdAt: new Date(now).toISOString(),
       };
     }
@@ -4790,6 +4840,10 @@ export async function spawnDashboardSession(
   const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
   const registered = await withActiveSessionKeyLock(activeSessions, key, async () => {
+    // Re-check under the key lock: the scan above runs before the banner /
+    // attachment awaits, so a restore can quarantine this anchor in between.
+    // Every other creation path performs this check at registration time.
+    if (findQuarantinedRoutingConflict(key, larkAppId)) return undefined;
     const current = activeSessions.get(key);
     if (current) {
       const protectedOwner = current.worker || current.session.queued || current.pendingRepo

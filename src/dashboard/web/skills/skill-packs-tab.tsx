@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useT } from '../react-hooks.js';
+import { ModalDialog } from '../modal-dialog.js';
 import { SectionHeader } from '../dashboard-components.js';
 import type { SkillPackRow, SkillRow, StatusMessage } from './types.js';
 
@@ -259,17 +260,11 @@ function SkillPackEditor(props: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [skillQuery, setSkillQuery] = useState('');
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const installedSkillNames = useMemo(() => new Set(skills.map(skill => skill.name)), [skills]);
   const missingSelected = useMemo(
     () => [...selected].filter(skillName => !installedSkillNames.has(skillName)).sort(),
     [installedSkillNames, selected],
   );
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (dlg && !dlg.open) dlg.showModal();
-  }, []);
 
   const filteredSkills = useMemo(() => {
     const q = skillQuery.trim().toLowerCase();
@@ -328,7 +323,7 @@ function SkillPackEditor(props: {
   };
 
   return (
-    <dialog className="bd-dialog skills-pack-editor" ref={dialogRef} onClose={props.onClose}>
+    <ModalDialog open backdropClose={false} className="bd-dialog skills-pack-editor" onClose={props.onClose}>
       <form method="dialog" onSubmit={(e) => { e.preventDefault(); void save(); }}>
         <h3>{props.pack ? tr('skills.packEdit') : tr('skills.packCreate')}</h3>
         {error && <p className="hint-warn">{error}</p>}
@@ -399,6 +394,6 @@ function SkillPackEditor(props: {
           </button>
         </div>
       </form>
-    </dialog>
+    </ModalDialog>
   );
 }

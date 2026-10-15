@@ -17,15 +17,23 @@ describe('existing Codex App Server bridge wiring', () => {
   });
 
   it('enables App-side local turn synthesis at the share attach boundary', () => {
+    // The spawn chain is spec-driven now: the codex adapter declares
+    // `spawn.appServerShare`, and the shared attach helper enables App-side local
+    // turn synthesis (and split-live) only for a spec that opted in AND a config
+    // that actually carries an existing App Server endpoint.
     const structuredBridgeComment = workerSource.indexOf('// Structured transcript bridge fallback:');
-    const spawnStart = workerSource.indexOf("} else if (cfg.cliId === 'codex') {", structuredBridgeComment);
-    const spawn = workerSource.slice(spawnStart, workerSource.indexOf("} else if (cfg.cliId === 'traex')", spawnStart));
+    const helperStart = workerSource.indexOf('function attachStructuredBridgeAtSpawn(');
+    const spawn = workerSource.slice(helperStart, workerSource.indexOf('async function setupAdoptTranscriptBridges(', helperStart));
 
     expect(structuredBridgeComment).toBeGreaterThanOrEqual(0);
-    expect(spawn).toContain('if (cfg.existingAppServerEndpoint) {');
+    expect(helperStart).toBeGreaterThanOrEqual(0);
+    expect(spawn).toContain('spawn.appServerShare === true && !!cfg.existingAppServerEndpoint');
+    expect(spawn).toContain('if (sharesAppServer) {');
     expect(spawn).toContain('codexAdoptStartMs = Date.now();');
     expect(spawn).toContain('codexBridgeQueue.setLocalTurns(true, codexAdoptStartMs);');
-    expect(spawn).toContain("cfg.existingAppServerEndpoint\n            ? 'split-live'");
+    expect(spawn).toContain("const mode = sharesAppServer\n      ? 'split-live'");
+    const codexAdapter = readFileSync(new URL('../src/adapters/cli/codex.ts', import.meta.url), 'utf8');
+    expect(codexAdapter).toContain("spawn: { sessionId: 'cli', baseline: 'resume-aware', appServerShare: true }");
   });
 
   it('uses adopt-style forwarding for App-side local turns outside zero-prompt mode', () => {

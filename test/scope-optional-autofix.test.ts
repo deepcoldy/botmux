@@ -202,8 +202,9 @@ describe('checkRequiredScopes — 审核中：提示人工 + 按待审版本节�
 });
 
 describe('checkRequiredScopes — 99991672 chicken-and-egg scope request set', () => {
-  // 截到该分支真正的结尾（发完 self_manage 提示 DM 的那一句），同样不用固定字符宽度。
-  const region = fnRegionUntil('if (infoData.code === 99991672) {', "'self_manage scope (auto-approved) missing'");
+  // 分支入口以具名常量 LARK_CODE_APP_SCOPE_MISSING（= 99991672）为锚；截到该分支真正的结尾
+  // （发完 self_manage 提示 DM 的那一句），同样不用固定字符宽度。
+  const region = fnRegionUntil('if (infoData.code === LARK_CODE_APP_SCOPE_MISSING) {', "'self_manage scope (auto-approved) missing'");
 
   it('asks for every botmux-required scope, not just self_manage', () => {
     // Passing only self_manage used to be cosmetic: the param never reached the

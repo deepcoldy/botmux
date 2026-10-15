@@ -75,10 +75,10 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 
 const CONVERSATION_ID_RE = /^[A-Za-z0-9._-]+$/;
 
@@ -292,11 +292,11 @@ export function drainAntigravityTranscript(
   incomingState: AntigravityTranscriptState = {},
   options: AntigravityDrainOptions = {},
 ): AntigravityDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(incomingState) };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(incomingState) }; }
-  if (size < fromOffset) return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(incomingState) };
-  if (size === fromOffset) {
+  const step = beginJsonlDrain(path, fromOffset, { onShrink: 'hold', missingOffset: 'keep' });
+  if (step.kind === 'skip') {
+    return { events: [], newOffset: step.newOffset, pendingTail: '', state: cloneState(incomingState) };
+  }
+  if (step.kind === 'idle') {
     // Nothing new on disk, but the caller may be releasing a held candidate.
     // Refuse while a background task is still outstanding: its completion
     // SYSTEM_MESSAGE (which clears the flag) has not arrived, so a quiet
@@ -308,27 +308,13 @@ export function drainAntigravityTranscript(
     return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(incomingState) };
   }
 
-  const len = size - fromOffset;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, fromOffset); } finally { closeSync(fd); }
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  let pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  let newOffset = fromOffset + Buffer.byteLength(completeText, 'utf8');
+  const { size, completeText } = step.window;
+  let pendingTail = step.window.pendingTail;
+  let newOffset = step.window.newOffset;
 
   const events: CodexBridgeEvent[] = [];
   let state = cloneState(incomingState);
-  let cursor = fromOffset;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1; // the \n after an empty line
-      continue;
-    }
-    const lineByteLen = Buffer.byteLength(line, 'utf8') + 1; // include \n
-    const lineStart = cursor;
-    cursor += lineByteLen;
+  for (const { line, lineStart } of iterateJsonlLines(completeText, fromOffset)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
     state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state);

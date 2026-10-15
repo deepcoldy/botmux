@@ -1,5 +1,5 @@
 /** Executes the production IPC handler with platform/network seams replaced. */
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
@@ -9,6 +9,11 @@ import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser,
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
+
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { drainTraexRollout } from '../src/services/traex-transcript.js';
+import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const route = source.statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)
@@ -62,7 +67,84 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
 }
 const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_kickoff', waitMs: 0 });
 
+// Run the actual worker screen-ready gate against a real transcript queue.
+// Stop at its release boundary: the remainder only schedules UI/input work.
+const workerSource = ts.createSourceFile('worker.ts', readFileSync('src/worker.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+const readyCode = ts.transpileModule(['hasStructuredLifecycleBlock', 'markPromptReady'].map(name => {
+  const node = workerSource.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  if (!node) throw new Error(`missing worker function ${name}`);
+  return node.getText(workerSource);
+}).join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
+function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
+  const released = Symbol('released');
+  const release = vi.fn(() => { throw released; });
+  const scope = {
+    lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
+    rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
+    idleDetector: { isStartupPending: () => false, reset: vi.fn() },
+    bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
+    currentPostTerminalInputFence: () => false, isPromptReady: false,
+    stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,
+    stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
+    awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
+    freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
+    spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
+    structuredRejectedReadyEvidenceGeneration: undefined, log: vi.fn(),
+    scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
+    durableTurnInFlight: false, preserveActiveTurnAuthorityForReady: false,
+    releaseActiveTurnAuthority: release,
+  };
+  const run = new Function('scope', `with (scope) { ${readyCode}; return markPromptReady; }`)(scope);
+  try { run(); } catch (err) { if (err !== released) throw err; }
+  return release.mock.calls.length > 0;
+}
+
 describe('dispatch user IPC end-to-end identity binding', () => {
+  it.each(['completed', 'failed', 'aborted'] as const)('keeps TRAE human delegation through transient screen-idle until %s', async outcome => {
+    const h = harness({}, true); // sandbox off: host IPC authentication is available
+    const path = join(dataDir, 'rollout.jsonl');
+    const record = (type: string, payload: object) => JSON.stringify({
+      timestamp: '2026-01-01T00:00:01.000Z', type, payload,
+    }) + '\n';
+    writeFileSync(path, record('event_msg', { type: 'user_message', message: 'delegate query', turn_id: 'native_turn' })
+      + record('event_msg', { type: 'agent_message', message: 'I will delegate the query.' })
+      + record('response_item', { type: 'function_call', name: 'Bash', arguments: '{}', call_id: 'call_dispatch' }));
+    const queue = new CodexBridgeQueue();
+    queue.mark('om_human', 'delegate query', Date.parse('2026-01-01T00:00:00.000Z'));
+    const started = drainTraexRollout(path, 0);
+    queue.ingest(started.events);
+    expect(queue.hasBlockingTurn()).toBe(true);
+    // A quiet/redrawn PTY is not a terminal while the transcript is running.
+    expect(screenReady(queue)).toBe(false);
+    expect((await h.run()).status).toBe(200);
+    expect((await read())?.authority.openId).toBe('ou_alice');
+    expect((await read())?.sourceTurnId).toBe('om_human');
+    appendFileSync(path, record('event_msg', outcome === 'aborted'
+      ? { type: 'turn_aborted', turn_id: 'native_turn', reason: 'interrupted' }
+      : { type: 'task_complete', turn_id: 'native_turn', last_agent_message: 'done',
+          ...(outcome === 'failed' ? { error: { message: 'provider failed' } } : {}) }));
+    queue.ingest(drainTraexRollout(path, started.newOffset).events);
+    expect(screenReady(queue)).toBe(true);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_human',
+      ...(outcome !== 'completed' ? { terminalStatus: outcome === 'failed' ? 'failed' : 'ambiguous' } : {}) }]);
+  });
+  it('keeps the existing Codex lifecycle gate and does not turn a bare TRAE mark into permanent busy', () => {
+    const queue = new CodexBridgeQueue();
+    queue.mark('om_human', 'query');
+    expect(screenReady(queue)).toBe(true);
+    queue.confirmPendingTurn('om_human');
+    expect(screenReady(queue)).toBe(false);
+    queue.ingest([{ kind: 'user', text: 'query', uuid: 'u', timestampMs: Date.now() }]);
+    expect(screenReady(queue, 'codex')).toBe(false);
+  });
+  it.each([undefined, { capability: 'p'.repeat(64), policyCapability: 'p'.repeat(64) }])(
+    'rejects host dispatch without live turn authority instead of silently sending without a human', async origin => {
+      const h = harness({}, true);
+      h.ds.managedTurnOrigin = origin;
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'dispatch_turn_unproven' } });
+      expect(h.send).not.toHaveBeenCalled();
+      expect(await read()).toBeUndefined();
+    });
   it.each(['legacy', 'disabled', 'no-tools'])('does not resolve delegation when it is not requested (%s)', async mode => {
     const h = harness(mode === 'legacy' ? { targetAppIds: [], hasLegacyBots: true } : {});
     delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;

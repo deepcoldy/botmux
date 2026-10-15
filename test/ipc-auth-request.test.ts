@@ -138,13 +138,27 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
-  it('refuses to publish credentials when the turn changes during token resolution', async () => {
+  it('hands the granted token to the same human’s live follow-up turn', async () => {
     requestId = (await (await post()).json()).requestId;
-    poll.mockImplementation(async () => {
-      session.managedTurnOrigin.turnId = 'om_next';
-      return { status: 'ready', token: 'test-user-token' };
+    // The follow-up turn is live BEFORE the waiting CLI polls again, and that
+    // CLI presents the new turn tuple — same human, newer turn.
+    session.managedTurnOrigin.turnId = 'om_next';
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, status: 'ready' });
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
+      tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token',
+      turnId: 'om_next', openId: 'ou_sender',
     });
-    const response = await post('auth-status', { requestId });
+  });
+
+  it('refuses to hand the token to a different human’s live turn', async () => {
+    requestId = (await (await post()).json()).requestId;
+    session.managedTurnOrigin.turnId = 'om_next';
+    session.managedTurnOrigin.callerOpenId = 'ou_other';
+    poll.mockResolvedValue({ status: 'ready', token: 'test-user-token' });
+    const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
@@ -170,6 +184,7 @@ describe('agent authorization', () => {
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'test-user-token', turnId: 'om_turn',
+      openId: 'ou_sender',
     });
   });
 
@@ -180,8 +195,11 @@ describe('agent authorization', () => {
     expect((await post('auth-status', { requestId })).status).toBe(409);
     vi.mocked(cliIdentity.refreshSessionIdentity).mockClear();
     session.workerGeneration++;
-    expect((await post('auth-status', { requestId })).status).toBe(409);
-    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    const response = await post('auth-status', { requestId });
+    // Still refused: the live turn file does not line up, so refresh fails
+    // closed and the fresh token is never published to a queued identity.
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
   });
 });
 
@@ -304,6 +322,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'host-session', {
       tool: 'lark-cli', appId: 'cli_test', userAccessToken: 'host-user-token', turnId: 'om_host',
+      openId: 'ou_host',
     });
   });
 });

@@ -148,6 +148,7 @@ describe('mid-transfer literal passthrough', () => {
       type: 'raw_input',
       content: '/model opus',
       turnId: 'om_passthrough_turn',
+      turnCallerOpenId: 'ou_owner',
       trustedController: {
         senderType: 'user',
         requestLarkAppId: 'app-transfer-passthrough',

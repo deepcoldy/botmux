@@ -44,10 +44,13 @@ describe('native Lark slash-command catalog', () => {
     const names = buildAppSlashCommandCatalog().map(command => command.command);
     // Every visible global schema command and alias is a candidate…
     const expected = COMMANDS
-      .filter(spec => !spec.cliId && spec.help.length > 0)
+      .filter(spec => !spec.cliId && !spec.claimWithoutSessionOnly && spec.help.length > 0)
       .flatMap(spec => [spec.name, ...(spec.aliases ?? [])])
       .map(name => name.slice(1));
     expect(names).toEqual(expected);
+    // claimWithoutSessionOnly 元命令（/resume：无会话回收、有会话透传 CLI）与
+    // GLOBAL_COMMANDS/DAEMON_COMMANDS 同口径排除，不进应用级面板。
+    expect(names).not.toContain('resume');
     // …which is exactly DAEMON_COMMANDS minus help-hidden entries (/cli).
     const hidden = new Set(COMMANDS.filter(spec => spec.help.length === 0).flatMap(spec => [spec.name, ...(spec.aliases ?? [])]));
     expect(new Set(names)).toEqual(new Set([...DAEMON_COMMANDS].filter(name => !hidden.has(name)).map(name => name.slice(1))));

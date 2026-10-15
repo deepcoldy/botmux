@@ -40,6 +40,7 @@ import {
   type UsageDisplayMode,
 } from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
+import { dashboardEventBus } from '../core/dashboard-events.js';
 import { normalizeReplyCardMode, type ReplyCardMode } from './turn-reply-card.js';
 import {
   notifyPinStreamingCardChanged,
@@ -424,9 +425,14 @@ async function updateBotCardPrefsInternal(
     bot.config.groupJoinCommand = patch.groupJoinCommand.trim() || undefined;
   }
   if (patch.regularGroupReplyMode !== undefined) {
+    const previousRegularGroupReplyMode = bot.config.regularGroupReplyMode;
     bot.config.regularGroupReplyMode = (patch.regularGroupReplyMode === 'chat' || patch.regularGroupReplyMode === 'new-topic' || patch.regularGroupReplyMode === 'shared')
       ? patch.regularGroupReplyMode
       : undefined;
+    // 所有「继承」群的生效值都由 Bot 默认推导 —— 默认变了，群矩阵快照也要失效。
+    if (previousRegularGroupReplyMode !== bot.config.regularGroupReplyMode) {
+      dashboardEventBus.publish({ type: 'groups.reply-policy.changed', body: {} });
+    }
   }
   if (patch.regularGroupMentionMode !== undefined) {
     bot.config.regularGroupMentionMode = (patch.regularGroupMentionMode === 'topic' || patch.regularGroupMentionMode === 'never' || patch.regularGroupMentionMode === 'ambient')

@@ -70,6 +70,8 @@ vi.mock('../src/services/project-scanner.js', () => ({
 const forkWorkerMock = vi.fn();
 const sendWorkerInputMock = vi.fn();
 const closeWorkerSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false }));
+/** Registration-time quarantine check (the real one scans the session store). */
+const findQuarantinedRoutingConflictMock = vi.fn((_key: string, _appId: string): unknown => undefined);
 const runAutoWorktreeCommitMock = vi.fn(async () => {});
 let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
@@ -83,6 +85,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
+  findQuarantinedRoutingConflict: (...a: [string, string]) => findQuarantinedRoutingConflictMock(...a),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
     if (map.has(k) && map.get(k) !== ds) return false;
     map.set(k, ds);
@@ -1032,6 +1035,27 @@ describe('spawnDashboardSession — guards', () => {
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect([...store.keys()]).toEqual(['quarantined-session']);
     expect(active.size).toBe(0);
+  });
+
+  it('re-checks quarantine under the key lock, after the pre-lock scan', async () => {
+    // A restore can quarantine the anchor while spawn awaits banner /
+    // attachment posts; the pre-lock store scan has already passed by then.
+    findQuarantinedRoutingConflictMock.mockReturnValueOnce({ sessionId: 'quarantined-late' });
+    const active = new Map<string, DaemonSession>();
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: '锁内复查',
+      column: 'in_progress',
+      role: 'solo',
+      postBanner: false,
+    });
+
+    expect(result).toEqual({ ok: false, error: 'session_exists' });
+    expect(store.size).toBe(0);
+    expect(active.size).toBe(0);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
   });
 });
 

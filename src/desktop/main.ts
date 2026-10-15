@@ -7,7 +7,7 @@ import { createRuntimeStateMonitor, registerDesktopIpc } from './main/ipc.js';
 import { resolveDesktopPaths } from './main/paths.js';
 import { resolveBundledRuntimeCandidate } from './main/bundled-runtime.js';
 import { probeShellPathEnv } from './main/external-runtime.js';
-import { listPm2Apps } from './main/pm2-apps.js';
+import { listFleetApps } from './main/fleet-apps.js';
 import { createRuntimeService } from './main/runtime-service.js';
 import { createDesktopTray } from './main/tray.js';
 import { createMainWindow } from './main/window.js';
@@ -80,7 +80,7 @@ async function bootstrap(): Promise<void> {
     // Finder-launched apps inherit launchd's minimal PATH; the daemon needs the
     // user's real shell PATH (zsh/bash, profile+rc) to find per-bot CLIs.
     shellPathEnv: () => probeShellPathEnv(),
-    pm2Apps: async selectedRuntime => listPm2Apps(paths, selectedRuntime, { pathEnv: probeShellPathEnv() }),
+    fleetApps: () => listFleetApps(paths),
   });
 
   const win = createMainWindow(join(desktopDir, 'preload.cjs'), join(desktopDir, 'renderer'));

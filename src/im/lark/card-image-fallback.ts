@@ -1,12 +1,14 @@
 import { omitReplyCardImages } from './md-card.js';
 import { logger } from '../../utils/logger.js';
 import type { ReplyImageState } from './reply-images.js';
+import { LARK_CODE_CARD_CONTENT_REJECTED, messageHasLarkCode } from './lark-errors.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
 }
 
-/** Require the specific card-image rejection, not merely HTTP 400 or 230099.
+/** Require the specific card-image rejection, not merely HTTP 400 or
+ * LARK_CODE_CARD_CONTENT_REJECTED (230099).
  * Accept both the SDK's Axios error and client.ts's flattened SDK error. */
 function isInvalidImageKeyError(error: unknown): boolean {
   if (!isRecord(error)) return false;
@@ -14,7 +16,7 @@ function isInvalidImageKeyError(error: unknown): boolean {
     ? error.response.data : error;
   const message = typeof data.msg === 'string' ? data.msg
     : typeof error.message === 'string' ? error.message : '';
-  return (data.code === 230099 || /\(code:\s*230099\)/.test(message))
+  return (data.code === LARK_CODE_CARD_CONTENT_REJECTED || messageHasLarkCode(message, LARK_CODE_CARD_CONTENT_REJECTED))
     && /\bErrCode:\s*200570\b/.test(message)
     && /card contains invalid image keys/i.test(message);
 }

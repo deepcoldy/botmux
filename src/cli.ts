@@ -4297,6 +4297,8 @@ async function abandonSessionAuthoritatively(
       const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
       const body = await res.json().catch(() => ({} as Record<string, unknown>));
       if (res.ok && (body as { ok?: unknown }).ok) {
+        const archiveError = (body as { archiveError?: unknown }).archiveError;
+        if (archiveError) console.warn(`⚠ Botmux 会话已关闭，Codex 归档失败：${archiveError}`);
         // Shared parser: a body that DECLARES a residual must warn even when the
         // `residual` object is missing/malformed, or a bad payload silently
         // becomes an ordinary success again.
@@ -6627,6 +6629,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ 恢复过程中会话被关闭，本次 resume 已取消。');
   } else if (errCode === 'workspace_retired') {
     console.error('❌ 该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。');
+  } else if (errCode === 'codex_unarchive_failed') {
+    console.error('❌ Codex 解除归档失败，会话保持 closed；请稍后重试恢复。');
   } else if (errCode === 'resume_start_failed') {
     console.error('❌ 远程后端恢复进程未能启动，会话已恢复为 closed；请稍后重试。');
   } else if (errCode === 'resume_reconciliation_required') {
@@ -6928,7 +6932,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --top-level                     在群消息顶层执行（后续会话形态跟随普通群会话模式）
        --topic --root-msg-id <om_...>  固定在指定话题下执行
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
-       --new-topic [--topic-title ...] 每次创建新话题和独立会话
+       --new-topic [--topic-title ...] 每次创建新话题和独立会话；非静默标题按任务时区支持 {{date:-1d}} / {{owner}}
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
   schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
   schedule remove <id>                 删除任务
@@ -8934,7 +8938,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     process.exit(2);
   }
   const allowedFlags = new Set([
-    '--title', '--bot-app', '--chat-id', '--steer',
+    '--title', '--bot-app', '--chat-id', '--into', '--steer',
     '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
   ]);
   const unsupportedFlags = [...new Set(rest
@@ -8952,6 +8956,27 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     }));
     process.exit(2);
   }
+  // `--into` (append to an existing topic) is relayed as ONE bounded `om_` id.
+  // The host re-exec runs the ordinary dispatch path, whose daemon delivery
+  // route re-resolves the root's real chat and refuses it unless it equals the
+  // validated target chat (dispatch_chat_mismatch) — the thread and the chat
+  // are never two independently authorized targets. Reject ambiguity here so
+  // a duplicate cannot be resolved differently on either side of the relay.
+  const intoTokens = rest.filter(token => token === '--into' || token.startsWith('--into='));
+  const parsedRelayArgs = parseDispatchArgs(rest);
+  const intoRoot = parsedRelayArgs.ok ? parsedRelayArgs.value.into?.trim() : undefined;
+  if (intoTokens.length > 1 || (intoTokens.length === 1
+    && (!intoRoot || !/^om_[A-Za-z0-9_-]{1,128}$/.test(intoRoot)))) {
+    console.error(JSON.stringify({
+      success: false,
+      sourceSessionId: sid,
+      transportState: 'failed',
+      acceptanceState: 'not_requested',
+      errorCode: 'INVALID_DISPATCH_ROOT',
+      detail: 'sandbox dispatch --into takes exactly one om_ topic root message id',
+    }));
+    process.exit(2);
+  }
   const briefFile = argValue(rest, '--brief-file');
   let brief = argValue(rest, '--brief') ?? '';
   if (briefFile) {
@@ -8965,6 +8990,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   for (const flag of ['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate'] as const) {
     for (const value of argValues(rest, flag)) flags.push(flag, value);
   }
+  if (intoRoot) flags.push('--into', intoRoot);
   if (rest.includes('--steer')) flags.push('--steer');
   const id = randomBytes(8).toString('hex');
   const contentBase = `${id}.content`;
@@ -16597,6 +16623,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
+  else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the

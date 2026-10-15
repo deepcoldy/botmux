@@ -21,6 +21,7 @@ import {
 import { isSubstituteTurn } from './reply-target.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { privateReplyEnabled } from './private-reply.js';
+import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
 import { isDocNativeSession, larkTransportEnabled, sessionAnchorId, type DaemonSession } from './types.js';
 
 /** Every native write, including overflow files, retains the record owner's gate. */
@@ -89,11 +90,29 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
 
 export async function updateTurnReplyCard(
   ds: DaemonSession, turnId: string, event: TurnReplyCardEvent, send: ReplyCardSender,
-  options: { dispatchAttempt?: number; owns?: () => boolean; forceVisible?: boolean } = {},
+  options: {
+    dispatchAttempt?: number; owns?: () => boolean; forceVisible?: boolean;
+    onPublication?: (publication: {
+      output: TurnResult['output'];
+      receipt: Pick<TurnDeliveryReceipt, 'status' | 'messages' | 'reason'>;
+    }) => void;
+  } = {},
 ) {
   const mode = replyCardModeFor(ds, turnId);
   if (mode === 'legacy') return undefined;
   const key = replyCardKey(ds, turnId, options.dispatchAttempt);
+  const acknowledged = new Map<string, 'primary' | 'attachment'>();
+  const publication = (output: TurnResult['output'], status: TurnDeliveryReceipt['status'], reason?: string): void => {
+    if (event.kind !== 'final') return;
+    try {
+      options.onPublication?.({
+        output,
+        receipt: { status, messages: [...acknowledged].map(([messageId, kind]) => ({ messageId, kind }))
+          .sort((first, second) => first.kind === second.kind ? 0 : first.kind === 'primary' ? -1 : 1),
+          ...(reason ? { reason } : {}) },
+      });
+    } catch {}
+  };
   const store = new TurnReplyCardStore(config.session.dataDir);
   const session = ds.session;
   const chatId = ds.chatId;
@@ -131,13 +150,17 @@ export async function updateTurnReplyCard(
     beforeEffect,
     send: async (body, uuid) => {
       const messageId = await send(body, 'interactive', uuid, beforeEffect);
+      if (messageId) acknowledged.set(messageId, 'primary');
       if (messageId && groupContextAuthorOrigin) await observeAcknowledgedGroupPublication(ds.larkAppId, {
         message_id: messageId, chat_id: ds.chatId, root_id: sessionAnchorId(ds), msg_type: 'interactive', body: { content: body },
       }, groupContextAuthorOrigin);
       return messageId;
     },
-    patch: (messageId, card) => patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, card, sessionAnchorId(ds),
-      groupContextAuthorOrigin, beforeEffect),
+    patch: async (messageId, card) => {
+      await patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, card, sessionAnchorId(ds),
+        groupContextAuthorOrigin, beforeEffect);
+      acknowledged.set(messageId, 'primary');
+    },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     forceVisible: options.forceVisible || ds.cotForced,
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {
@@ -158,6 +181,7 @@ export async function updateTurnReplyCard(
       beforeEffect();
       const content = JSON.stringify({ file_key: fileKey });
       const messageId = await send(content, 'file', uuid, beforeEffect);
+      if (messageId) acknowledged.set(messageId, 'attachment');
       if (messageId && groupContextAuthorOrigin) await observeAcknowledgedGroupPublication(ds.larkAppId, {
         message_id: messageId, chat_id: ds.chatId, root_id: sessionAnchorId(ds), msg_type: 'file', body: { content },
       }, groupContextAuthorOrigin);
@@ -165,8 +189,28 @@ export async function updateTurnReplyCard(
     },
   } satisfies import('../services/turn-reply-card.js').TurnReplyCardTransport;
   for (let attempt = 0; ; attempt++) {
-    try { return await store.update(key, event, transport); }
+    try {
+      const delivered = await store.update(key, event, transport);
+      const complete = event.kind === 'final' && event.source === 'bridge'
+        && delivered.record.finalSource === 'bridge' && delivered.record.finalText === event.text
+        && delivered.record.finalDelivered && !!delivered.messageId
+        && acknowledged.get(delivered.messageId) === 'primary'
+        && (!delivered.record.overflowMessageId || acknowledged.get(delivered.record.overflowMessageId) === 'attachment');
+      if (complete) {
+        publication({
+          status: 'available', format: 'markdown', content: delivered.record.finalText!,
+          source: 'transcript',
+        }, 'delivered');
+      } else {
+        const reason = delivered.record.finalSource === 'explicit' ? 'explicit_publication_unproven' : 'publication_unproven';
+        publication({ status: 'unavailable', reason },
+          acknowledged.size ? 'partial' : 'unknown', reason);
+      }
+      return delivered;
+    }
     catch (error) {
+      publication({ status: 'unavailable', reason: 'delivery_unknown' },
+        acknowledged.size ? 'partial' : 'unknown', 'delivery_unknown');
       if (attempt >= 2 || error instanceof MessageWithdrawnError || store.read(key)?.withdrawn) throw error;
       await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 800 : 2000));
       beforeEffect();

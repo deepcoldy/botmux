@@ -1025,6 +1025,52 @@ describe('applySettingsWrite — oauthRedirectBase', () => {
   }
 });
 
+// httpProxy 是二进制自更新从 GitHub Releases 下载时的出站代理（release-download 用它建
+// CONNECT 隧道，且总是以明文 HTTP 连代理）。只收 http://[user:pass@]host[:port]，凭证允许，
+// https:// / 路径 / query 拒。
+describe('applySettingsWrite — httpProxy', () => {
+  for (const [label, value, stored] of [
+    ['a plain http proxy', 'http://127.0.0.1:7890', 'http://127.0.0.1:7890'],
+    ['embedded credentials', 'http://user:p%40ss@proxy.example.com:8080', 'http://user:p%40ss@proxy.example.com:8080'],
+    ['surrounding whitespace and trailing slashes', '  http://127.0.0.1:7890//  ', 'http://127.0.0.1:7890'],
+  ] as Array<[string, string, string]>) {
+    it(`persists ${label}`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ httpProxy: stored });
+    });
+  }
+
+  for (const value of ['', '   ', null]) {
+    it(`clears the setting on ${JSON.stringify(value)}`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ httpProxy: null });
+    });
+  }
+
+  for (const [label, value] of [
+    ['a bare host without a scheme', '127.0.0.1:7890'],
+    ['a socks scheme (release-download only tunnels over HTTP CONNECT)', 'socks5://127.0.0.1:1080'],
+    ['an https:// proxy (the CONNECT tunnel dials the proxy over plain HTTP)', 'https://proxy.example.com:8443'],
+    ['a path', 'http://127.0.0.1:7890/proxy'],
+    ['a query string', 'http://127.0.0.1:7890?x=1'],
+    ['a scheme with no host', 'http://'],
+    ['a non-string value', 7890],
+  ] as Array<[string, unknown]>) {
+    it(`rejects ${label} → invalid_httpProxy (no write)`, async () => {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ httpProxy: value }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('unreachable');
+      expect(r.error).toBe('invalid_httpProxy');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    });
+  }
+});
+
 describe('applySettingsWrite — IO surface', () => {
   it('does not touch maintenance merge when only dashboard fields are present', async () => {
     const deps = makeDeps();
@@ -1222,5 +1268,20 @@ describe('applySettingsWrite sessionCleanup', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
       sessionCleanup: { intervalMinutes: 90 },
     });
+  });
+});
+
+
+describe('Codex idle cleanup setting', () => {
+  it('accepts a standalone opt-in patch and preserves scheduled cleanup fields', async () => {
+    const deps = makeDeps({ readGlobalConfig: () => ({ sessionCleanup: { enabled: true, olderThanHours: 72 } }) });
+    const r = await applySettingsWrite({ sessionCleanup: { archiveCodex: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ sessionCleanup: { enabled: true, olderThanHours: 72, archiveCodex: true } });
+  });
+  it('rejects nonboolean values', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ sessionCleanup: { archiveCodex: 'true' } }, deps)).toEqual({ ok: false, error: 'invalid_sessionCleanup_archiveCodex' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });

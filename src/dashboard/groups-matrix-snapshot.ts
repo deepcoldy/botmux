@@ -57,6 +57,11 @@ export interface GroupsMatrixSnapshot {
   peekPresentation: () => ReadonlyMap<string, GroupPresentation>;
 }
 
+/** 会让聚合后的群矩阵过期的 daemon SSE 事件（目前只有回复模式策略变化）。 */
+export function dashboardEventInvalidatesGroupsMatrix(event: { type: string }): boolean {
+  return event.type === "groups.reply-policy.changed";
+}
+
 function optionalTrimmedString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }

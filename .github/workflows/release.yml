@@ -65,7 +65,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
@@ -321,7 +321,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       - run: bun install --frozen-lockfile
 
       - name: Upgrade npm for Trusted Publishing
@@ -714,7 +714,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         if: matrix.glibc_baseline == ''
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
       # --frozen-lockfile + the platform's own install compiles node-pty's
       # build/Release/pty.node for THIS OS/arch, which the embed plugin bundles.
       - if: matrix.glibc_baseline == ''
@@ -894,7 +894,7 @@ jobs:
 
               # setup-bun does not support musl, and npm ships musl builds of bun
               # (@oven/bun-linux-{x64,aarch64}-musl), so npm is the way in.
-              npm i -g bun@1.4.2 --loglevel=error
+              npm i -g bun@1.4.3 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the whole point of this job.

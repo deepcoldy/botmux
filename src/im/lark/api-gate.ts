@@ -25,6 +25,15 @@
  * BOTMUX_LARK_GATE_CIRCUIT_PROBE_INTERVAL_MS。
  */
 import { logger } from '../../utils/logger.js';
+import {
+  LARK_CODE_CHAT_RATE_LIMITED,
+  LARK_CODE_FREQUENCY_LIMITED,
+  LARK_CODE_MESSAGE_BEING_SENT,
+  extractLarkBusinessCode,
+} from './lark-errors.js';
+
+// 规范实现已迁到 lark-errors.ts；此处保留再导出，老 import 路径（content-audit、测试）不变。
+export { extractLarkBusinessCode };
 
 export interface LarkGateConfig {
   /** token bucket 填充速率（req/s），默认 15。 */
@@ -66,7 +75,11 @@ export interface LarkGateConfig {
  * official reset window. Plumbing that through AskDispatchError.retryAfterMs is
  * a follow-up (see PR notes); 230049/230020 converge within the short backoff.
  */
-export const TRANSIENT_LARK_CODES: ReadonlySet<number> = new Set([230049, 230020, 99991400]);
+export const TRANSIENT_LARK_CODES: ReadonlySet<number> = new Set([
+  LARK_CODE_MESSAGE_BEING_SENT,
+  LARK_CODE_CHAT_RATE_LIMITED,
+  LARK_CODE_FREQUENCY_LIMITED,
+]);
 
 function positiveFinite(raw: string | undefined, fallback: number): number {
   if (raw == null || raw.trim() === '') return fallback;
@@ -186,21 +199,6 @@ export function __testOnly_resetLarkGate(): void {
 }
 
 // ─── 错误分类（镜像 ask-card.classifyAskDispatchError，自包含） ────────────────
-
-/** 提取 Lark 业务码：axios response.data.code / 顶层 code / 消息尾部 (code: NNN)。
- *  200 + res.code!==0 的抛错只把业务码写进消息字符串，所以尾形必须覆盖。 */
-export function extractLarkBusinessCode(err: unknown): number | undefined {
-  const e = err as {
-    response?: { data?: { code?: number } };
-    code?: unknown;
-    message?: string;
-  } | null | undefined;
-  const structured = e?.response?.data?.code ?? e?.code;
-  if (typeof structured === 'number' && Number.isFinite(structured)) return structured;
-  const message = typeof e?.message === 'string' ? e.message : '';
-  const m = /\(code:\s*(\d+)\)/.exec(message);
-  return m ? Number(m[1]) : undefined;
-}
 
 /**
  * 判断错误是否值得重试：

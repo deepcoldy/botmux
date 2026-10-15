@@ -114,6 +114,13 @@ describe('groups-store wrappers', () => {
     ]);
   });
 
+  it('listChats does not project group_message_type (the list API never returns it; topology is probed per chat)', async () => {
+    chatListItems[0].group_message_type = 'thread';
+    const [chat] = await listChats('appA');
+    expect(chat).not.toHaveProperty('groupMessageType');
+    expect(chat.chatMode).toBe('group');
+  });
+
   it('isInChat returns boolean', async () => {
     expect(await isInChat('appA', 'c1')).toBe(true);
   });

@@ -95,7 +95,7 @@ describe('worker interrupt action integration', () => {
     const region = workerSource.slice(start, end);
     const unsupported = region.indexOf("reason: 'unsupported'");
     const controlWrite = region.indexOf("sendCriticalControlKey('ctrlc'");
-    expect(region).toContain("lastInitConfig?.cliId === 'codex-app'");
+    expect(region).toContain('isCodexAppCliId(lastInitConfig?.cliId)');
     expect(region).toContain('lastInitConfig?.codexRpcInput === true');
     expect(unsupported).toBeGreaterThanOrEqual(0);
     expect(controlWrite).toBeGreaterThan(unsupported);

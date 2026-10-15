@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -450,9 +451,11 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       expect(at, name).toBeGreaterThanOrEqual(0);
       return source.slice(at, source.indexOf('\n}\n', at));
     };
-    expect(bodyOf('deliverRawInput')).toContain('setCaptureIdentity(msg.turnId, undefined)');
-    expect(bodyOf('writeAdoptMessage')).toContain('setCaptureIdentity(turnId, dispatchAttempt)');
-    expect(bodyOf('flushPending')).toContain('setCaptureIdentity(item.turnId, item.dispatchAttempt)');
+    expect(bodyOf('deliverRawInput')).toContain('setCaptureIdentity(msg.turnId, undefined, msg.turnCallerOpenId)');
+    expect(bodyOf('writeAdoptMessage')).toContain('setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId)');
+    const flushBody = bodyOf('flushPending');
+    expect(flushBody).toContain('setCaptureIdentity(');
+    expect(flushBody).toContain('item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId');
     for (const name of ['adoptInitialActiveTurn', 'adoptDisplacedActiveTurn', 'writeCliPidMarker', 'syncQueuedTurnsFromMarkerDisk', 'advanceQueuedTypeAheadTurn']) {
       const at = source.indexOf(`function ${name}(`);
       expect(at, name).toBeGreaterThanOrEqual(0);
@@ -485,7 +488,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const send = vi.fn();
-    const harness = new Function('send', `
+    const harness = new Function('send', 'isCodexAppCliId', `
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
       let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt = false;
@@ -515,7 +518,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
         state: () => ({ turnId: currentBotmuxTurnId, attempt: currentBotmuxDispatchAttempt,
           revision: captureRevision, queued: queuedTypeAheadTurns, retired: [...retiredTurnIds], started }),
       };
-    `)(send) as {
+    `)(send, isCodexAppCliId) as {
       enqueue(record: { turnId: string; dispatchAttempt: number }): void;
       acknowledge(turnId: string): void;
       advance(): boolean;
@@ -704,5 +707,38 @@ describe('R2 turn-only capture acceptance', () => {
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(snapshotToPng).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'new_turn' }));
+  });
+});
+
+describe('turn caller persistence across crash recovery', () => {
+  it('persists the live caller in the PID marker JSON', () => {
+    const at = source.indexOf('function writeCliPidMarker(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {})');
+  });
+
+  it('persists the queued type-ahead caller so a marker replay does not drop it', () => {
+    const at = source.indexOf('function writeCliPidMarker(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain("...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {})");
+  });
+
+  it('restores the caller when adopting the initial active turn, falling back to trusted provenance', () => {
+    const at = source.indexOf('function adoptInitialActiveTurn(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId');
+  });
+
+  it('replays queued-turn callers from the marker back into the type-ahead queue', () => {
+    // Two replay sites: writeCliPidMarker's read-back and syncQueuedTurnsFromMarkerDisk.
+    const occurrences = source.split("...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {})").length - 1
+      + source.split("...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {})").length - 1;
+    expect(occurrences).toBeGreaterThanOrEqual(3);
+  });
+
+  it('advances the marker-synced turn with its persisted or queued caller', () => {
+    const at = source.indexOf('function syncQueuedTurnsFromMarkerDisk(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('parsed.callerOpenId ?? advancedRecord.turnCallerOpenId');
   });
 });

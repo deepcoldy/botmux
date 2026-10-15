@@ -203,5 +203,3 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['genius'],
   };
 }
-
-export const create = createGeniusAdapter;

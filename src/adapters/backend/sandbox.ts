@@ -21,6 +21,7 @@
 import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
+import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -79,6 +80,11 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideFiles: string[];
   readonlyPaths?: string[];
   privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
+  /** Host-owned relay outbox, bound read-WRITE so the confined `botmux send`
+   *  can drop its request for the host watcher. Everything else this flavour
+   *  binds is read-only; see prepareCredentialOnlySandbox for why the relay
+   *  (not an in-pane file proof) is the only sound channel here. */
+  writableOutbox?: string;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -127,6 +133,21 @@ export function buildCredentialOnlySandboxArgs(input: {
   }
   for (const directory of hideDirectories.sort()) args.push('--tmpfs', directory);
   for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
+  // AFTER the masks on purpose: `--tmpfs` over an ancestor of the outbox would
+  // otherwise shadow this bind away and the confined `botmux send` would write
+  // its request into a throwaway tmpfs no host watcher is reading.
+  if (input.writableOutbox !== undefined) {
+    const outbox = assertCredentialIsolationPath(input.writableOutbox, 'writable outbox');
+    args.push('--bind', outbox, outbox);
+    // Deliver the relay path INSIDE the wrapper, exactly like the full sandbox
+    // (prepareDirectSandbox's --setenv). The worker's childEnv alone does not
+    // reach a persistent-terminal pane: tmuxEnv() strips every BOTMUX* key from
+    // the client env and buildBotmuxEnvAssignments() forwards only its
+    // allowlist, which deliberately excludes BOTMUX_SEND_RELAY (a per-session
+    // capability path must never seed a shared server's global env). Being in
+    // this pane's own bwrap argv, it cannot leak to any other session.
+    args.push('--setenv', 'BOTMUX_SEND_RELAY', outbox);
+  }
   args.push(
     '--unshare-user',
     '--unshare-pid',
@@ -213,11 +234,109 @@ export function credentialOnlySandboxAvailable(): boolean {
   return false;
 }
 
+export interface CredentialOnlyRelayOutbox {
+  outbox: string;
+  sessionsRoot: string;
+  cleanup: () => void;
+}
+
+function credentialOnlyRelayPaths(opts: { sessionId: string; dataDir: string }): {
+  sessionsRoot: string;
+  sessionRoot: string;
+  outbox: string;
+} {
+  const sessionsRoot = join(canonical(opts.dataDir), 'sandboxes');
+  const sessionRoot = join(sessionsRoot, opts.sessionId);
+  return { sessionsRoot, sessionRoot, outbox: join(sessionRoot, 'outbox') };
+}
+
+function credentialOnlyRelayHandle(
+  paths: ReturnType<typeof credentialOnlyRelayPaths>,
+): CredentialOnlyRelayOutbox {
+  return {
+    outbox: paths.outbox,
+    // The caller MUST mask this whole root inside the pane (the outbox bind is
+    // emitted after every mask, so its own outbox stays reachable). Every
+    // session's outbox carries its live relay capability leaf, and this flavour
+    // binds `/` — without the mask a pane could read a SIBLING session's token
+    // and drop a forged request into that session's outbox.
+    sessionsRoot: paths.sessionsRoot,
+    // No deny-mask mountpoints are created on this flavour (it masks in-place
+    // with --tmpfs/--ro-bind rather than carving empties), so a plain remove of
+    // the session tree is the whole teardown.
+    cleanup: () => { try { rmSync(paths.sessionRoot, { recursive: true, force: true }); } catch { /* */ } },
+  };
+}
+
+/** Warm-reattach counterpart of {@link prepareCredentialOnlyRelayOutbox}.
+ *
+ * A live credential-only pane holds a bind of the ORIGINAL outbox directory
+ * inode. Transfer/restart teardown keeps that directory (only the capability
+ * leaf is revoked), so a successor worker can re-serve it. This NEVER creates
+ * the directory: a freshly made one would be a different inode the pane cannot
+ * see, so the watcher would service an outbox nobody writes to while every
+ * send in the pane times out. A missing / non-directory / symlinked / foreign
+ * entry returns null and the caller must cold-spawn instead of reattaching. */
+export function attachCredentialOnlyRelayOutbox(opts: {
+  sessionId: string;
+  dataDir: string;
+}): CredentialOnlyRelayOutbox | null {
+  if (process.platform !== 'linux') return null;
+  let paths: ReturnType<typeof credentialOnlyRelayPaths>;
+  try { paths = credentialOnlyRelayPaths(opts); } catch { return null; }
+  try {
+    const stat = lstatSync(paths.outbox);
+    const uid = process.getuid?.();
+    if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) return null;
+  } catch {
+    return null;
+  }
+  return credentialOnlyRelayHandle(paths);
+}
+
+/** Host-owned relay outbox for a credential-only pane, provisioned in the SAME
+ * per-session tree the full sandbox uses so close/exit cleanup and the orphan
+ * sweep already cover it.
+ *
+ * WHY THIS FLAVOUR NEEDS A RELAY AT ALL (all four points MEASURED on bwrap
+ * 0.8.0, and each one independently breaks the in-pane alternative):
+ *
+ *  1. `--unshare-pid` gives the child pid=2/ppid=1 with only 2 visible /proc
+ *     entries, so `findAncestorSessionContext`'s process-tree marker walk can
+ *     NEVER resolve — the marker directory is readable, the host pids simply
+ *     are not in this namespace. `cmdSend` therefore classifies the pane via
+ *     the isolation MARKER arm and demands a data-root locator.
+ *  2. That locator is only written on the `sandboxRequested && darwin` path, so
+ *     it does not exist here.
+ *  3. Writing it does not help: its basename is `.dashboard-secret.origin-root-
+ *     <hash>.json`, which this flavour's own mask enumeration matches, so it is
+ *     ro-bound to /dev/null and reads back as a 0-byte char device (EACCES).
+ *  4. Even past that, the follow-up gate wants the data-root probe to read
+ *     EPERM, but the `--tmpfs` over `read-isolation/` makes it ENOENT.
+ *
+ * And an in-pane proof cannot substitute: with `--unshare-user` the child can
+ * `mount --bind` a writable directory OVER a host ro-bind (measured: succeeds),
+ * so neither "this path is read-only" nor "this file exists" is a trust root
+ * inside the pane. Only a host-side channel is sound — which is exactly the
+ * relay the full sandbox already uses, with the daemon-side watcher performing
+ * the authoritative policy check. */
+export function prepareCredentialOnlyRelayOutbox(opts: {
+  sessionId: string;
+  dataDir: string;
+}): CredentialOnlyRelayOutbox | null {
+  if (process.platform !== 'linux') return null;
+  const paths = credentialOnlyRelayPaths(opts);
+  try { mkdirSync(paths.outbox, { recursive: true, mode: 0o700 }); }
+  catch { return null; }
+  return credentialOnlyRelayHandle(paths);
+}
+
 export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
   privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
+  writableOutbox?: string;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -482,6 +601,75 @@ export function localSandboxApplies(
   return true;
 }
 
+/**
+ * The worker's EFFECTIVE local file-sandbox mode, as ONE shared pure resolver.
+ *
+ * worker.ts resolves `sandboxMode` with this exact call; the auto-worktree
+ * fail-closed gate (services/default-worktree.ts) reuses it so the two can never
+ * drift again — the riff exemption once only existed in the worker (a sandboxed
+ * riff bot then fell back to the real default dir on a worktree failure), and
+ * the mojo backend (#803) repeated the SAME drift for a provably-remote session.
+ *
+ * Shape:
+ *   localSandboxApplies(backend, mojoConfig)
+ *     ? resolveSandboxMode({ configSandbox, readIsolation, envValue })
+ *     : 'off'
+ *
+ * - The REMOTE exemption (riff / remote-runner / provably-remote mojo) wraps the
+ *   WHOLE resolution: a remote backend has no local CLI process, so even
+ *   BOTMUX_SANDBOX=1|scratch must not engage a local sandbox there.
+ * - mojo is NOT exempt by name alone: only a PROVABLY remote mojo session is
+ *   (see localSandboxApplies / isMojoFullyRemote — cloud on, localDaemon off,
+ *   no wrapperCli, no unprovable env). A local mojo session keeps its sandbox.
+ * - There is no no-transport arm: forkWorker does not force-isolate a
+ *   no-transport session (#899 dropped the forced readIsolation).
+ * - Throws exactly where resolveSandboxMode throws (invalid config value or
+ *   BOTMUX_SANDBOX): a typo'd mode must never silently run without isolation.
+ */
+export function resolveLocalSandboxMode(input: {
+  backendType: string;
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
+  configSandbox?: unknown;
+  readIsolation?: boolean;
+  envValue?: string | undefined;
+}): SandboxMode {
+  if (!localSandboxApplies(input.backendType, input.mojoConfig)) return 'off';
+  return resolveSandboxMode({
+    configSandbox: input.configSandbox,
+    readIsolation: input.readIsolation === true,
+    envValue: input.envValue,
+  });
+}
+
+
+/**
+ * Fork-side half of the auto-worktree fail-closed gate. When the gate let a
+ * session degrade to the real default dir (`fallbackDir`), the worker may only
+ * STRENGTHEN that verdict: if the spawn now resolves to the LOCAL oncall
+ * sandbox (which binds workingDir read-write to the host) in that same dir,
+ * refuse instead of running it there. Closes the TOCTOU between the gate (T0,
+ * before the worktree build) and the fork (T1, after it) for every input the
+ * gate cannot freeze — e.g. a mojo remote proof voided mid-build.
+ * scratch / off are fine: scratch leaves the host untouched.
+ */
+export function autoWorktreeFallbackSandboxError(input: {
+  sandboxMode: SandboxMode;
+  workingDir: string | undefined;
+  fallbackDir: string | undefined;
+}): string | undefined {
+  if (input.sandboxMode !== 'oncall' || !input.fallbackDir || !input.workingDir) return undefined;
+  const canon = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
+  if (canon(input.workingDir) !== canon(input.fallbackDir)) return undefined;
+  return `auto-worktree fell back to the real default dir ${input.fallbackDir} because no local sandbox applied when it was decided, `
+    + 'but this spawn now resolves to the local oncall file sandbox (workingDir bound read-write to the real project). '
+    + 'Refusing to start; fix the default dir (git repo) or pick a working dir with /repo.';
+}
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
@@ -1118,10 +1306,10 @@ export interface RelayRequest {
 }
 // Presentation flags plus the plugin id required to authorize a callback card.
 // Path-bearing flags
-// (--content-file/--file(s)/--image(s)/--video(s)), routing flags
+// (--content-file/--file(s)/--image(s)/--video(s)), SEND routing flags
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
-// forced by the worker.
+// forced by the worker. (`dispatch` has its own bounded allowlist below.)
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
@@ -1218,7 +1406,13 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
-  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate']);
+  // `--into` appends to an existing topic. It is safe to relay because the
+  // host re-exec's daemon delivery route re-resolves the root message's real
+  // chat and refuses it unless it equals the validated target chat
+  // (dispatch_chat_mismatch), then applies that chat's dispatch policy. At most
+  // one root, so the request cannot mean different things on either side.
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--into', '--delegate', '--no-delegate']);
+  let dispatchIntoSeen = false;
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
@@ -1234,6 +1428,11 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       }
       if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
         return { ok: false, error: 'dispatch --chat-id is invalid' };
+      }
+      if (f === '--into') {
+        if (dispatchIntoSeen) return { ok: false, error: 'dispatch --into may only be specified once' };
+        if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(v)) return { ok: false, error: 'dispatch --into is invalid' };
+        dispatchIntoSeen = true;
       }
       if ((f === '--delegate' || f === '--no-delegate') && v !== 'schedule:create') {
         return { ok: false, error: `dispatch ${f} only supports schedule:create` };

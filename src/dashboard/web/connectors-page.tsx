@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
 import { copyText } from './clipboard.js';
@@ -295,7 +296,6 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   const tr = useT();
   const mountedRef = useRef(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const createDialogRef = useRef<HTMLDialogElement | null>(null);
   const [bots, setBots] = useState<BotOpt[]>([]);
   const [groups, setGroups] = useState<GroupOpt[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
@@ -439,25 +439,6 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       allowChats: cur.allowChats.filter(id => valid.has(id)),
     }));
   }, [groupsForBot]);
-
-  useEffect(() => {
-    const dialog = createDialogRef.current;
-    if (!dialog) return;
-    if (createOpen) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* dialog already opening */ }
-      }
-      const body = dialog.querySelector<HTMLElement>('.connector-modal-body');
-      if (body) body.scrollTop = 0;
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [createOpen]);
-
-  useEffect(() => () => {
-    const dialog = createDialogRef.current;
-    if (dialog?.open) dialog.close();
-  }, []);
 
   function modeLabel(m: string): string {
     return m === 'fixed'
@@ -738,16 +719,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
 
       {props.tab === 'webhooks' ? (
         <>
-          <dialog
-            ref={createDialogRef}
+          <ModalDialog
+            open={createOpen}
             className="connector-create-modal"
-            onCancel={event => {
-              event.preventDefault();
-              closeCreateModal();
-            }}
             onClose={closeCreateModal}
-            onClick={event => {
-              if (event.target === event.currentTarget) closeCreateModal();
+            onRequestClose={closeCreateModal}
+            onOpen={dialog => {
+              const body = dialog.querySelector<HTMLElement>('.connector-modal-body');
+              if (body) body.scrollTop = 0;
             }}
           >
             <article className="connector-modal-card">
@@ -1127,7 +1106,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                 )}
               </footer>
             </article>
-          </dialog>
+          </ModalDialog>
 
           <section className="overview-block connector-section connector-list-section">
             <div className="card connector-list-card">

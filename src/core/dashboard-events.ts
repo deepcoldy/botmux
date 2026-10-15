@@ -12,6 +12,8 @@ export type DashboardEvent =
   | { type: 'schedule.fired';    body: { id: string; runAt: number; status: 'ok'|'error'|'skipped'; error?: string; calendarCheck?: import('../services/work-calendar.js').CalendarCheck } }
   | { type: 'schedule.timezone'; body: { timezone: string } }
   | { type: 'bots.changed';      body: { signature: string } }
+  /** 普通群回复模式策略变化（群级覆盖或 Bot 默认）；dashboard 据此让群矩阵快照失效。 */
+  | { type: 'groups.reply-policy.changed'; body: { chatId?: string } }
   | { type: 'heartbeat';         body: { ts: number } };
 
 export type Subscriber = (event: DashboardEvent) => void;

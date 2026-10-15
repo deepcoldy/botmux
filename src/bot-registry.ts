@@ -1,5 +1,6 @@
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
+import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
@@ -1397,7 +1398,8 @@ export interface SessionGroupConfig {
   /**
    * What to do with the group when its session is closed:
    * 'keep' (default) — leave the group and registry entry; a later message in
-   * the group resumes the closed session (same-group resume). 'disband' /
+   * the group starts a fresh session (resume explicitly via the close card or
+   * `/resume`). 'disband' /
    * 'archive' are reserved for a follow-up PR and currently behave as 'keep'.
    */
   onClose?: 'keep' | 'disband' | 'archive';
@@ -1613,6 +1615,7 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
@@ -1894,7 +1897,7 @@ export interface BotConfig {
    * Codex flagged in review.
    */
   defaultOncallAutoboundChats?: string[];
-  /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
+  /** Per-chat reply mode override: chat_id → 普通群 @bot 后回复形态。缺省时继承 regularGroupReplyMode；由 /reply-mode 或 dashboard 群管理写入，`/reply-mode inherit` 清除。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
@@ -2565,6 +2568,9 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  if (cfg.turnResults?.enabled !== true || cfg.apiOnly || cfg.readIsolation) {
+    getTurnResultRuntime()?.clearBot(cfg.larkAppId);
+  }
   registerCodexInstanceBot(cfg);
   const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
   const normalizedRuntime = cfg.cliId === 'traex'
@@ -3603,8 +3609,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
-    // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
-    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
+    // new-topic｜shared 都保留解析。显式设置即使与当前 per-bot 默认相同也保留为覆盖；
+    // 只有 clearChatReplyMode（`/reply-mode inherit`）才删除键、恢复继承。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};
@@ -4064,6 +4070,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       envPolicy,
       skills,
       plugins,
+      turnResults: entry.turnResults && typeof entry.turnResults === 'object' && entry.turnResults.enabled === true
+        ? { enabled: true } : undefined,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       skillInjection: entry.skillInjection === 'global' || entry.skillInjection === 'prompt' || entry.skillInjection === 'off'
         ? entry.skillInjection : undefined,

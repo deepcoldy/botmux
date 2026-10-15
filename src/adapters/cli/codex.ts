@@ -4,11 +4,19 @@ import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { DebugModelCapabilities } from './model-catalog-json.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-json.js';
 import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
-import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
+import {
+  drainCodexRollout,
+  findCodexRolloutByPid,
+  findCodexRolloutBySessionId,
+  findCodexRolloutSetByPid,
+  findCodexSessionIdByBotmuxSessionId,
+  type CodexDrainState,
+} from '../../services/codex-transcript.js';
 import { refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -200,37 +208,27 @@ async function waitForHistoryAppend(
 }
 
 function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
-  const historyPath = codexHistoryPath();
-  if (!existsSync(historyPath)) return undefined;
-  try {
-    const size = statSync(historyPath).size;
-    const fd = openSync(historyPath, 'r');
-    const buf = Buffer.alloc(size);
-    try {
-      readSync(fd, buf, 0, size, 0);
-    } finally {
-      closeSync(fd);
-    }
-    const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
-    const lines = buf.toString('utf8').trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]!;
-      if (!line.includes(marker)) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
-          const sid = readCliSessionId(parsed);
-          if (sid) return sid;
-        }
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
+  // Resume must find the mapping however old it is, so no tail cap; the lookup
+  // is a bounded-memory newest-first scan that stops at the first hit, and a
+  // mention without a session_id falls through to an older one.
+  return findCodexSessionIdByBotmuxSessionId(botmuxSessionId, {
+    maxTailBytes: Number.POSITIVE_INFINITY,
+    skipUnmapped: true,
+  });
 }
+
+/** Codex rollout bridge. Spawn attach additionally honours an existing App Server
+ *  share (`split-live`); terminal `/adopt` keeps a dedicated worker branch because
+ *  the thread id comes from a live terminal-session refresh. */
+export const codexBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainCodexRollout(path, offset, ctx.state as CodexDrainState | undefined),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => findCodexRolloutBySessionId(sessionId),
+    byPid: pid => findCodexRolloutByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware', appServerShare: true },
+};
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -252,6 +250,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   };
   return {
     id: 'codex',
+    bridgeSpec: codexBridgeSpec,
     mcpGateway: {
       get configPath(): string { return join(codexHome(), 'config.toml'); },
       format: 'codex-toml',
@@ -540,7 +539,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           pty.pasteText(content);
         } else {
           // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
         }
       } catch {
         return { submitted: false };
@@ -649,10 +648,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     detectModelCapabilities,
 
     async detectModels(): Promise<readonly string[] | null> {
-      const catalog = await detectModelCapabilities();
-      return catalog?.map(model => model.slug) ?? null;
+      return capabilitySlugs(await detectModelCapabilities());
     },
   };
 }
-
-export const create = createCodexAdapter;

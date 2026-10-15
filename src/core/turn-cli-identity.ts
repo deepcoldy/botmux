@@ -197,7 +197,11 @@ async function publishOne(
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
   if (!identity) return await withheld();
 
-  writeSessionIdentity(sessionDataDir, sessionId, { ...identity, ...(turnId ? { turnId } : {}) });
+  writeSessionIdentity(sessionDataDir, sessionId, {
+    ...identity,
+    ...(turnId ? { turnId } : {}),
+    ...(senderOpenId ? { openId: senderOpenId } : {}),
+  });
   return { tool, state: 'user' };
 }
 

@@ -13,6 +13,7 @@ import {
 } from '../src/core/fleet-runtime.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
+import { sessionTempDir } from '../src/core/session-temp.js';
 
 const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-runtime-')); dirs.push(d); return d; }
@@ -234,6 +235,41 @@ describe('resolveFleetDaemonEnv (migration: SESSION_DATA_DIR must survive pm2→
     vi.stubEnv('SESSION_DATA_DIR', '/custom/data/root');
     const env = resolveFleetDaemonEnv(process.env, '');
     expect(env.SESSION_DATA_DIR).toBe('/custom/data/root'); // ambient override wins
+  });
+
+  it('drops a session scratch TMPDIR inherited from a restart run inside a session', () => {
+    // `botmux restart` from a session shell carries that session's scratch as
+    // TMPDIR/TMP/TEMP. Workers pin their Gateway socket root from it, so it
+    // must not reach the fleet or g.sock exceeds macOS's AF_UNIX limit again.
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    const scratch = sessionTempDir(join(home, '.botmux', 'data'), '6c255026-e993-495d-80ec-85d2c3c440dc');
+    const env = resolveFleetDaemonEnv({
+      BOTMUX_SESSION_ID: 'session-1',
+      SESSION_DATA_DIR: '/custom/data/root',
+      TMPDIR: `${scratch}/`,
+      TMP: scratch,
+      TEMP: scratch,
+    }, '');
+
+    expect(env.TMPDIR).toBeUndefined();
+    expect(env.TMP).toBeUndefined();
+    expect(env.TEMP).toBeUndefined();
+  });
+
+  it('keeps an operator-chosen TMPDIR outside the session scratch tree', () => {
+    const home = mkdtempSync(join(tmpdir(), 'fleet-home-'));
+    dirs.push(home);
+    vi.stubEnv('HOME', home);
+    const env = resolveFleetDaemonEnv({
+      SESSION_DATA_DIR: '/custom/data/root',
+      TMPDIR: '/var/tmp/botmux/',
+      TMP: join(home, '.cache', 'botmux', 'session-tmp-other'),
+    }, '');
+
+    expect(env.TMPDIR).toBe('/var/tmp/botmux/');
+    expect(env.TMP).toBe(join(home, '.cache', 'botmux', 'session-tmp-other'));
   });
 
   it('reloads WEB_HOST from .env before a session-origin restart spawns the supervisor', () => {

@@ -3,32 +3,32 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { locateExecutable } from '../../utils/executable.js';
-import type { CliAdapter, CliId } from './types.js';
+import type { CliAdapter, CliId, StructuredBridgeSpec } from './types.js';
 import { createClaudeCodeAdapter } from './claude-code.js';
 import { createSeedAdapter } from './seed.js';
 import { createRelayAdapter } from './relay.js';
 import { createAidenAdapter } from './aiden.js';
-import { createCocoAdapter } from './coco.js';
-import { createCodexAdapter } from './codex.js';
+import { createCocoAdapter, cocoBridgeSpec } from './coco.js';
+import { createCodexAdapter, codexBridgeSpec } from './codex.js';
 import { createCodexAppAdapter } from './codex-app.js';
-import { createCursorAdapter } from './cursor.js';
+import { createCursorAdapter, cursorBridgeSpec } from './cursor.js';
 import { createGeminiAdapter } from './gemini.js';
 import { createGeniusAdapter } from './genius.js';
 import { createOpenCodeAdapter } from './opencode.js';
 import { createOpenCode2Adapter } from './opencode2.js';
 import { createMiMoCodeAdapter } from './mimocode.js';
-import { createAntigravityAdapter } from './antigravity.js';
+import { createAntigravityAdapter, antigravityBridgeSpec } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
 import { createMiraAdapter } from './mira.js';
 import { createMirAdapter } from './mir.js';
-import { createTraexAdapter } from './traex.js';
-import { createPiAdapter } from './pi.js';
+import { createTraexAdapter, traexBridgeSpec } from './traex.js';
+import { createPiAdapter, piBridgeSpec } from './pi.js';
 import { createCopilotAdapter } from './copilot.js';
-import { createOhMyPiAdapter } from './oh-my-pi.js';
-import { createEbsdAdapter } from './ebsd.js';
+import { createOhMyPiAdapter, ompBridgeSpec } from './oh-my-pi.js';
+import { createEbsdAdapter, ebsdBridgeSpec } from './ebsd.js';
 import { createKimiAdapter } from './kimi.js';
-import { createGrokAdapter } from './grok.js';
+import { createGrokAdapter, grokBridgeSpec } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
 import { createReasonixAdapter } from './reasonix.js';
@@ -270,5 +270,31 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'minimax': return createMinimaxAdapter(pathOverride);
     case 'remote-runner': return createRemoteRunnerAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
+  }
+}
+
+/**
+ * Structured-transcript bridge capability of a CLI, WITHOUT constructing its
+ * adapter. Some factories do real work up front (`createPiAdapter` /
+ * `createOhMyPiAdapter` shell out through `resolveCommand`), and the worker asks
+ * on every bridge tick, so this is a plain static lookup — the same specs that
+ * each adapter exposes as `CliAdapter.bridgeSpec`
+ * (`test/structured-bridge-spec.test.ts` pins the two together).
+ *
+ * hermes / mtr deliberately have none: their transcript is a SQLite store with
+ * dedicated attach and ingest paths in the worker.
+ */
+export function bridgeSpecFor(cliId: string | undefined): StructuredBridgeSpec | undefined {
+  switch (cliId) {
+    case 'codex': return codexBridgeSpec;
+    case 'traex': return traexBridgeSpec;
+    case 'coco': return cocoBridgeSpec;
+    case 'cursor': return cursorBridgeSpec;
+    case 'antigravity': return antigravityBridgeSpec;
+    case 'pi': return piBridgeSpec;
+    case 'oh-my-pi': return ompBridgeSpec;
+    case 'ebsd': return ebsdBridgeSpec;
+    case 'grok': return grokBridgeSpec;
+    default: return undefined;
   }
 }

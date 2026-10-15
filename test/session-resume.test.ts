@@ -14,6 +14,11 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
+const archiveRpc = vi.hoisted(() => vi.fn());
+vi.mock('../src/services/codex-app-threads.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/services/codex-app-threads.js')>(),
+  setCodexAppThreadArchived: archiveRpc,
+}));
 let tempDir: string;
 const daemonConfig = vi.hoisted(() => ({ backendType: 'pty' as 'pty' | 'tmux' }));
 
@@ -195,6 +200,8 @@ import type { DaemonSession } from '../src/core/types.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-resume-test-'));
+  archiveRpc.mockReset();
+  archiveRpc.mockResolvedValue(undefined);
   daemonConfig.backendType = 'pty';
   sessionStore.init('app_test');
   wp.registry = null;
@@ -1393,3 +1400,35 @@ describe('resumeSession', () => {
 // promotion failure registers a visible quarantined owner and sets the
 // `quarantinedActivationTailPromotion` flag the guard keys on (see the
 // 'registers a visible quarantined owner …' test above).
+
+
+describe('resuming cleanup-archived Codex rows', () => {
+  function archivedRow() {
+    const row = makeClosedSession({ cliId: 'codex', backendType: 'pty' });
+    const stored = sessionStore.getSession(row.sessionId)!;
+    stored.cliSessionId = 'native';
+    stored.codexCleanupTarget = { threadId: 'native', codexHome: '/tmp/codex-home', codexBin: '/tmp/fake-codex' };
+    stored.codexCleanupArchive = { threadId: 'native', state: 'archived' };
+    sessionStore.updateSession(stored);
+    return stored;
+  }
+  it('unarchives before reactivating the durable row', async () => {
+    const row = archivedRow();
+    archiveRpc.mockImplementation(async () => {
+      expect(sessionStore.getSession(row.sessionId)?.status).toBe('closed');
+    });
+    const result = await resumeSession(row.sessionId, new Map());
+    expect(result.ok).toBe(true);
+    expect(archiveRpc).toHaveBeenCalledWith(expect.objectContaining({ archived: false, threadId: 'native' }));
+    expect(sessionStore.getSession(row.sessionId)?.codexCleanupArchive).toBeUndefined();
+    expect(sessionStore.getSession(row.sessionId)?.status).toBe('active');
+  });
+  it('keeps the row closed and recoverable if unarchive fails', async () => {
+    const row = archivedRow(); const map = new Map<string, DaemonSession>();
+    archiveRpc.mockRejectedValue(new Error('RPC failed'));
+    expect(await resumeSession(row.sessionId, map)).toEqual({ ok: false, error: 'codex_unarchive_failed' });
+    expect(sessionStore.getSession(row.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(row.sessionId)?.codexCleanupArchive?.state).toBe('archived');
+    expect(map.size).toBe(0);
+  });
+});

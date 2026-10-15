@@ -1,30 +1,11 @@
-import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
-import type { DebugModelCapabilities } from './model-catalog-json.js';
+import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-json.js';
 import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
-
-function runnerPath(): string {
-  // Source-level worker integration tests execute through tsx and need the
-  // matching source runner rather than a possibly absent/stale ignored dist
-  // tree. Keep the override strictly test-scoped so production launch
-  // resolution remains canonical and cannot be redirected by ambient env.
-  const testOverride = process.env.NODE_ENV === 'test'
-    ? process.env.BOTMUX_TEST_CODEX_APP_RUNNER_PATH
-    : undefined;
-  if (testOverride) return resolve(testOverride);
-  const here = dirname(fileURLToPath(import.meta.url));
-  const compiledSibling = resolve(here, '..', '..', 'codex-app-runner.js');
-  if (existsSync(compiledSibling)) return compiledSibling;
-  const builtFromSourceTree = resolve(here, '..', '..', '..', 'dist', 'codex-app-runner.js');
-  if (existsSync(builtFromSourceTree)) return builtFromSourceTree;
-  return compiledSibling;
-}
+import { resolveRunnerPath } from './runner-path.js';
 
 function pushOpt(args: string[], key: string, value: string | undefined): void {
   if (value === undefined || value.length === 0) return;
@@ -76,7 +57,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, botOpenId, locale, model, reasoningEffort, serviceTier, codexBrowser }) {
       const args = [
-        runnerArgv0('codex-app-runner', runnerPath()),
+        runnerArgv0('codex-app-runner', resolveRunnerPath('codex-app-runner.js', { testOverrideEnv: 'BOTMUX_TEST_CODEX_APP_RUNNER_PATH' })),
         '--session-id', sessionId,
         // Canonical for the same reason as sandboxExtraExecPaths above — the runner
         // hands this straight to spawn().
@@ -105,8 +86,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     detectModelCapabilities,
 
     async detectModels(): Promise<readonly string[] | null> {
-      const catalog = await detectModelCapabilities();
-      return catalog?.map(model => model.slug) ?? null;
+      return capabilitySlugs(await detectModelCapabilities());
     },
 
     buildResumeCommand() {
@@ -154,5 +134,3 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
     altScreen: false,
   };
 }
-
-export const create = createCodexAppAdapter;

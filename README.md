@@ -20,6 +20,8 @@
   <a href="README.en.md">English</a>
 </p>
 
+https://github.com/user-attachments/assets/2cd97623-6b92-42ea-a9e9-75c6f5434db6
+
 ---
 
 Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话进程，把 AI 编程 CLI / Agent 的输出实时流式回传成飞书卡片，并提供可交互的 Web 终端。它**不重造 Agent 能力**，而是直接桥接你已经在用的工具（**20+ CLI / Agent 适配器**，见 [支持的 CLI / Agent](#支持的-cli--agent)）。

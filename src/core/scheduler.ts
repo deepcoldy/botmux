@@ -13,6 +13,7 @@ import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
 import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
+import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
 
 export interface ScheduleExecutionContext {
   runId: string;
@@ -1001,7 +1002,12 @@ export function addTask(params: {
   if (params.followActive === true && executionPosition !== 'topic') {
     throw new Error('follow_active_requires_topic');
   }
-  const topicTitle = normalizeTopicTitle(params.topicTitle);
+  const topicTitle = normalizeTopicTitle(params.topicTitle, {
+    executionPosition,
+    rootMessageId: executionPosition === 'task' ? undefined : params.rootMessageId,
+    silent: params.silent,
+    ownerOpenId: params.ownerOpenId,
+  });
   // Task position owns a topic (created lazily by its first fire), so the row
   // is thread-scoped like an explicit topic — but the root only exists after
   // the first fire.
@@ -1091,7 +1097,12 @@ export function commitDelegatedTask(input: {
     rootMessageId: position === 'topic' ? params.rootMessageId : undefined,
     scope: position === 'topic' ? 'thread' : 'chat',
     executionPosition: position,
-    topicTitle: normalizeTopicTitle(params.topicTitle),
+    topicTitle: normalizeTopicTitle(params.topicTitle, {
+      executionPosition: position,
+      rootMessageId: position === 'topic' ? params.rootMessageId : undefined,
+      silent: params.silent,
+      ownerOpenId: params.ownerOpenId,
+    }),
     chatType: params.chatType,
     larkAppId: params.larkAppId,
     creatorChatId: params.creatorChatId,
@@ -1128,11 +1139,20 @@ export function commitDelegatedTask(input: {
   return result;
 }
 
-export function normalizeTopicTitle(value: string | undefined): string | undefined {
+export function normalizeTopicTitle(
+  value: string | undefined,
+  options?: {
+    executionPosition?: ScheduleExecutionPosition;
+    rootMessageId?: string;
+    silent?: boolean;
+    ownerOpenId?: string;
+  },
+): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
   const chars = Array.from(trimmed);
   if (chars.length > 200) throw new Error('topic_title_too_long');
+  if (options) assertScheduleTopicTitleTemplateValid(trimmed, options);
   return trimmed;
 }
 
@@ -1312,8 +1332,9 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
  * Cycle a task's execution position: retained topic → group top level → fresh
  * topic per run → the task's own dedicated topic → group top level (a
  * materialized dedicated topic starts from the retained-topic state). Silent
- * tasks skip the fresh-topic state because that state needs a visible seed
- * message. The `deliver` response remains for cached clients.
+ * tasks may use these topic positions with literal titles; dynamic templates
+ * are rejected before the position is persisted. The `deliver` response
+ * remains for cached clients.
  */
 export function toggleDelivery(id: string): {
   ok: boolean;
@@ -1347,6 +1368,16 @@ export function toggleDelivery(id: string): {
   // cycle back into a topic silently — that was the adopt-topic leak.
   else executionPosition = 'top-level';
   if (executionPosition === current) return { ok: false, error: 'topic_root_required' };
+  try {
+    normalizeTopicTitle(task.topicTitle, {
+      executionPosition,
+      rootMessageId: executionPosition === 'task' ? undefined : task.rootMessageId,
+      silent: task.silent,
+      ownerOpenId: task.ownerOpenId,
+    });
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
   // 'topic' is never a toggle target; the dedicated-task position owns a
   // (possibly not-yet-materialized) thread, everything else lands in chat.
   const scope: 'chat' | 'thread' = executionPosition === 'task' ? 'thread' : 'chat';
@@ -1491,6 +1522,15 @@ export function updateTask(
   if (finalExecutionPosition === 'task' && explicitRootMessageId) {
     return { ok: false, error: 'task_root_not_user_settable' };
   }
+  // Validate against the root that will actually remain after this patch, not
+  // the pre-edit root. Entering task position drops any foreign topic root;
+  // moving an already materialized task to another chat drops its old root;
+  // an in-place edit of the same task keeps the root it already owns.
+  const rootAfterPatch = finalExecutionPosition === 'task'
+    ? task.executionPosition === 'task' && !primaryChatChanged
+      ? task.rootMessageId?.trim() || undefined
+      : undefined
+    : nextRootMessageId?.trim() || undefined;
   const nextPosition = finalExecutionPosition;
   const nextFollowActive = updates.followActive ?? task.followActive;
   if (updates.followActive === true && nextPosition !== 'topic') {
@@ -1514,9 +1554,26 @@ export function updateTask(
     // multi-chat array when an edit collapses back to one target.
     eventPatch.chatIds = targets.chatIds ?? null;
   }
-  if (updates.topicTitle !== undefined) {
-    try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }
-    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+  if (
+    updates.topicTitle !== undefined
+    || updates.silent !== undefined
+    || executionPosition !== undefined
+    || targetUpdate
+  ) {
+    try {
+      const normalizedTopicTitle = normalizeTopicTitle(
+        updates.topicTitle !== undefined ? updates.topicTitle : task.topicTitle,
+        {
+          executionPosition: finalExecutionPosition,
+          rootMessageId: rootAfterPatch,
+          silent: updates.silent !== undefined ? updates.silent : task.silent,
+          ownerOpenId: task.ownerOpenId,
+        },
+      );
+      if (updates.topicTitle !== undefined) patch.topicTitle = normalizedTopicTitle;
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
   // A user-supplied root for a task-position task is rejected above when
   // non-empty; an empty/whitespace patch must not be written either — the

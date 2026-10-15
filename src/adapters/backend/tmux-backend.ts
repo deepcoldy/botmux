@@ -6,6 +6,7 @@ import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -98,6 +99,7 @@ export function noTmuxProcessForCurrentUser(): boolean {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 3000,
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
     });
   } catch {
     return false;
@@ -229,6 +231,27 @@ export class TmuxBackend {
    * read as 'missing'.
    */
   static probeSession(name: string): SessionProbe {
+    return TmuxBackend.classifyHasSession(name, false);
+  }
+
+  /**
+   * Launch-selection variant of {@link probeSession} (reattach vs create), used
+   * by the worker's backend gate. Identical except for ONE shape: "error
+   * connecting to <socket> (No such file or directory)" reads 'missing'. For a
+   * launch that is the only honest answer — there is no reachable pane at that
+   * socket to reattach (`pipe-pane` would hit the same connect error), and the
+   * next `new-session` starts a server there. It is exactly what a clean host
+   * / fresh TMUX_TMPDIR reports before any server exists, and treating it as
+   * 'unknown' would bias every first launch toward a doomed reattach.
+   * Destructive/verification callers (kill-verify, restore, read-isolation)
+   * keep {@link probeSession}'s stricter 'unknown' — this is not a liveness
+   * verdict, only "nothing here can be attached to".
+   */
+  static probeSessionForLaunch(name: string): SessionProbe {
+    return TmuxBackend.classifyHasSession(name, true);
+  }
+
+  private static classifyHasSession(name: string, socketMissingIsMissing: boolean): SessionProbe {
     try {
       execFileSync('tmux', ['has-session', '-t', name], {
         stdio: ['ignore', 'ignore', 'pipe'],
@@ -243,11 +266,51 @@ export class TmuxBackend {
       if (isExecTimeoutError(e)) return 'unknown';
       if (e && typeof e.status === 'number' && !e.signal) {
         const stderrText = (e.stderr?.toString?.() ?? '').trim();
+        if (socketMissingIsMissing && isTmuxSocketMissingErrorText(stderrText)) return 'missing';
         if (isTmuxServerLevelErrorText(stderrText)) return 'unknown';
         return 'missing';
       }
       return 'unknown';
     }
+  }
+
+  /**
+   * {@link probeSessionForLaunch} with a short backoff retry on 'unknown' ONLY.
+   *
+   * `has-session` is ~20ms on a healthy host but still needs a fork+exec; under
+   * heavy load the deadline can expire before tmux is ever scheduled. One
+   * timeout must not become the verdict for a launch decision, so the worker's
+   * backend gate retries it. 'exists' / 'missing' are tmux's authoritative
+   * answers and return immediately (no added latency on a cold start). The
+   * per-attempt deadline stays the base probe's, so the worst case is
+   * bounded at `attempts × 3s` plus the backoff.
+   */
+  static probeSessionWithRetry(
+    name: string,
+    opts: {
+      attempts?: number;
+      baseDelayMs?: number;
+      /** Test seams. */
+      probe?: (name: string) => SessionProbe;
+      sleep?: (ms: number) => void;
+    } = {},
+  ): SessionProbe {
+    const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+    const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+    const probe = opts.probe ?? ((n: string) => TmuxBackend.probeSessionForLaunch(n));
+    const sleep = opts.sleep ?? ((ms: number) => {
+      try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+    });
+    let result = probe(name);
+    for (let completed = 1; result === 'unknown' && completed < attempts; completed += 1) {
+      const backoff = baseDelayMs * (2 ** (completed - 1));
+      const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+      sleep(backoff + jitter);
+      result = probe(name);
+    }
+    return result;
   }
 
   /**

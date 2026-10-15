@@ -7,6 +7,11 @@ import { resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { collectSessionLineagePids } from './preview-port-owner.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
+import {
+  PROC_STAT_STARTTIME_INDEX,
+  procStatFieldsAfterComm,
+  procStatStartTimeDigits,
+} from '../utils/proc-stat.js';
 
 const TCP_ESTABLISHED_STATE = '01';
 
@@ -22,11 +27,7 @@ export type LoopbackPeerResolution =
 function readProcStart(pid: number, procRoot: string): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
   try {
-    const raw = readFileSync(join(procRoot, String(pid), 'stat'), 'utf8');
-    const closeParen = raw.lastIndexOf(')');
-    if (closeParen < 0) return undefined;
-    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-    return /^\d+$/.test(fields[19] ?? '') ? fields[19] : undefined;
+    return procStatStartTimeDigits(readFileSync(join(procRoot, String(pid), 'stat'), 'utf8'));
   } catch { /* use the hardened ps fallback below when procfs is unavailable */ }
   if (procRoot !== '/proc') return undefined;
   const ps = ['/usr/bin/ps', '/bin/ps'].find(existsSync);
@@ -141,10 +142,10 @@ function peerBelongsToCurrentTurn(input: {
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
     if (input.trustedRootPids.has(pid)) return true;
     try {
-      const raw = readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8');
-      const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
+      const fields = procStatFieldsAfterComm(readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8'));
+      if (!fields) return false;
       const parent = Number(fields[1]);
-      const started = fields[19];
+      const started = fields[PROC_STAT_STARTTIME_INDEX];
       if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')
         || input.preexistingProcessIdentities.has(`${pid}:${started}`)) return false;
       pid = parent;

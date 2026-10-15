@@ -146,13 +146,77 @@ describe('sandbox dispatch CLI routing', () => {
     expect(readdirSync(outbox).some(name => name.endsWith('.req.json'))).toBe(false);
   });
 
-  it('rejects sandbox --into because its thread is not bound to the validated chat', async () => {
+  it('relays sandbox --into to the host, which binds the root to the validated chat', async () => {
+    // The relay only carries a bounded om_ id; the host re-exec runs the
+    // ordinary dispatch path whose daemon delivery route refuses a root that
+    // is not in the target chat (dispatch_chat_mismatch, covered in
+    // dispatch-user-route.test.ts).
     const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-cli-into-'));
+    roots.push(root);
+    const dataDir = join(root, 'data');
+    const outbox = join(root, 'outbox');
+    mkdirSync(dataDir);
+    mkdirSync(outbox);
+    const capability = 'ef'.repeat(32);
+    replaceManagedOriginCapabilityFile(
+      join(outbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
+      JSON.stringify({ token: capability, turnId: 'turn-live', dispatchAttempt: 1 }),
+    );
+    const fixture = join(root, 'dispatch-host.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      const value = flag => argv[argv.indexOf(flag) + 1];
+      process.stdout.write(JSON.stringify({
+        command: argv[0],
+        sessionId: value('--session-id'),
+        into: value('--into'),
+        intoCount: argv.filter(token => token === '--into').length,
+        targetAppId: value('--bot-app'),
+        brief: readFileSync(value('--brief-file'), 'utf8'),
+      }));
+    `);
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'source-session', {
+      cliPath: fixture,
+      authorize: claim => claim.capability === capability
+        ? { ok: true, origin: { turnId: 'turn-live', dispatchAttempt: 1 } }
+        : { ok: false, error: 'stale capability' },
+    });
+    try {
+      const result = await runCli([
+        'dispatch', '--session-id', 'source-session', '--into', 'om_existing_root',
+        '--bot-app', 'cli_target', '--brief', 'follow-up task',
+      ], {
+        ...process.env,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'source-session',
+        BOTMUX_SEND_RELAY: outbox,
+        BOTMUX_WORKFLOW: '',
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        command: 'dispatch',
+        sessionId: 'source-session',
+        into: 'om_existing_root',
+        intoCount: 1,
+        targetAppId: 'cli_target',
+        brief: 'follow-up task',
+      });
+    } finally {
+      stop();
+    }
+  });
+
+  it.each([
+    ['a malformed root', ['--into', 'oc_not_a_message']],
+    ['two roots', ['--into', 'om_a', '--into', 'om_b']],
+  ])('rejects sandbox --into with %s before writing an outbox request', async (_label, intoArgs) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-cli-into-bad-'));
     roots.push(root);
     const outbox = join(root, 'outbox');
     mkdirSync(outbox);
     const result = await runCli([
-      'dispatch', '--session-id', 'source-session', '--into', 'om_other',
+      'dispatch', '--session-id', 'source-session', ...intoArgs,
       '--bot-app', 'cli_target', '--brief', 'task',
     ], {
       ...process.env,
@@ -164,9 +228,8 @@ describe('sandbox dispatch CLI routing', () => {
     expect(result.code).toBe(2);
     expect(errorReceipt(result.stderr)).toMatchObject({
       success: false,
-      errorCode: 'ROUTING_NOT_SUPPORTED',
+      errorCode: 'INVALID_DISPATCH_ROOT',
     });
-    expect(String(errorReceipt(result.stderr).detail)).toContain('--into');
     expect(readdirSync(outbox).some(name => name.endsWith('.req.json'))).toBe(false);
   });
 

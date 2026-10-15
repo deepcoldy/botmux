@@ -7,6 +7,7 @@ import {
 } from 'react';
 import { Cron } from 'croner';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { ModalDialog } from './modal-dialog.js';
 import { useStoreSelector, useT, useDashboardLocale } from './react-hooks.js';
 import {
   CreateActionButton,
@@ -92,6 +93,7 @@ const SCHEDULE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ul
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
 const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
 const MAX_SCHEDULE_TARGET_CHATS = 5;
+const SCHEDULE_TOPIC_TITLE_RUNTIME_TEMPLATE = /\{\{owner\}\}|\{\{date(?::[+-]\d+d)?\}\}/;
 const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f /srv/my-service/ready.flag; then
   printf '1\n'
 else
@@ -1731,7 +1733,6 @@ export function ScheduleFormModal(props: {
 }) {
   const { editing, tr, bots, open, scheduleTimeZone } = props;
   const locale = useDashboardLocale();
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const chatPickerRef = useRef<HTMLDivElement | null>(null);
   const chatPickerTriggerRef = useRef<HTMLButtonElement | null>(null);
   const chatSearchRef = useRef<HTMLInputElement | null>(null);
@@ -1786,6 +1787,7 @@ export function ScheduleFormModal(props: {
   const [touched, setTouched] = useState(false);
   const [scheduleTouched, setScheduleTouched] = useState(false);
   const localDelivery = editing?.deliver === 'local';
+  const hasDynamicTopicTitle = SCHEDULE_TOPIC_TITLE_RUNTIME_TEMPLATE.test(topicTitle);
 
   useEffect(() => {
     if (!open || !larkAppId) return;
@@ -1804,18 +1806,6 @@ export function ScheduleFormModal(props: {
       .finally(() => { if (!controller.signal.aborted) setCalendarsLoading(false); });
     return () => controller.abort();
   }, [open, larkAppId, calendarsReload]);
-
-  // open 时 showModal + 聚焦首个输入；关闭时 close()（Esc/遮罩点击走 onClose）
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg) return;
-    if (open && !dlg.open) {
-      dlg.showModal();
-      dlg.querySelector<HTMLElement>('input[name="name"]')?.focus();
-    } else if (!open && dlg.open) {
-      dlg.close();
-    }
-  }, [open]);
 
   useEffect(() => {
     if (!open || !chatPickerOpen) return;
@@ -1866,7 +1856,7 @@ export function ScheduleFormModal(props: {
   }, [editing, larkAppId, bots]);
 
   const check = useMemo(
-    () => schedule.trim() ? checkSchedule(schedule, tr, scheduleTimeZone) : null,
+    () => checkSchedule(schedule, tr, scheduleTimeZone),
     [schedule, tr, scheduleTimeZone],
   );
 
@@ -1926,8 +1916,8 @@ export function ScheduleFormModal(props: {
     })
     ?? chatId
   ));
-  const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
-  const schedulePreview = check?.ok ? check.preview : undefined;
+  const scheduleInvalid = scheduleTouched && !check.ok;
+  const schedulePreview = check.ok ? check.preview : undefined;
   const nameMissing = touched && !name.trim();
   const promptMissing = touched && !prompt.trim();
   const chatMissing = touched && !localDelivery && chatIds.length === 0;
@@ -2158,11 +2148,12 @@ export function ScheduleFormModal(props: {
 
   return (
     <>
-    <dialog
-      ref={dialogRef}
+    <ModalDialog
+      open={open}
       className="schedule-form-dialog"
       onClose={props.onClose}
-      onClick={e => { if (e.target === dialogRef.current) props.onClose(); }}
+      // 打开后聚焦首个输入（Esc/遮罩点击走 onClose）
+      onOpen={dialog => dialog.querySelector<HTMLElement>('input[name="name"]')?.focus()}
     >
       <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
       <form onSubmit={handleSubmit} className="schedule-form" noValidate>
@@ -2194,7 +2185,9 @@ export function ScheduleFormModal(props: {
           </div>
         )}
         <label className="schedule-form-field">
-          <span className="schedule-form-label">{tr('schedules.form.name')}</span>
+          <span className="schedule-form-label">
+            {tr('schedules.form.name')} <i className="req" aria-hidden="true">*</i>
+          </span>
           <input
             type="text"
             name="name"
@@ -2209,7 +2202,9 @@ export function ScheduleFormModal(props: {
           ) : null}
         </label>
         <div className="schedule-form-field">
-          <span className="schedule-form-label">{tr('schedules.form.schedule')}</span>
+          <span className="schedule-form-label">
+            {tr('schedules.form.schedule')} <i className="req" aria-hidden="true">*</i>
+          </span>
           <div className="schedule-templates" role="group" aria-label={tr('schedules.form.templates')}>
             {CRON_TEMPLATES.map(t => (
               <button
@@ -2230,7 +2225,7 @@ export function ScheduleFormModal(props: {
             required
             aria-invalid={scheduleInvalid || undefined}
           />
-          {scheduleInvalid && check && !check.ok ? (
+          {scheduleInvalid ? (
             <small className="schedule-form-error-inline">{check.error}</small>
           ) : schedulePreview ? (
             <small className="schedule-form-preview">✓ {tr('schedules.form.nextRun')}：{schedulePreview}</small>
@@ -2754,8 +2749,12 @@ export function ScheduleFormModal(props: {
             <small className="schedule-form-help">{tr('schedules.form.silentHelp')}</small>
           </span>
         </label>
-        {executionPosition === 'new-topic' && silent ? (
-          <p className="schedule-form-help">{tr('schedules.form.silentNewTopicConflict')}</p>
+        {(executionPosition === 'new-topic' || executionPosition === 'task') && silent ? (
+          <p className="schedule-form-help">
+            {tr(hasDynamicTopicTitle
+              ? 'schedules.form.silentDynamicTitleConflict'
+              : 'schedules.form.silentNewTopicConflict')}
+          </p>
         ) : null}
         <fieldset className="schedule-calendar-fields">
           <legend className="schedule-form-label">{tr('schedules.form.calendar')}</legend>
@@ -2836,7 +2835,7 @@ export function ScheduleFormModal(props: {
           </button>
         </div>
       </form>
-    </dialog>
+    </ModalDialog>
     <SchedulePreconditionHelpDialog
       open={open && preconditionHelpSource !== null}
       mode={preconditionMode}

@@ -31,6 +31,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { CodexBridgeEvent, CodexDrainResult } from './codex-transcript.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import {
   encodeGrokCwd, grokSessionsRoot, grokUpdatesPath, grokSummaryPath,
   resolveGrokCwdBucketDir,
@@ -275,22 +276,10 @@ function grokTerminalOutcome(
  * dedups by uuid).
  */
 export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
-  if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
-
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
-
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  const start = step.start;
+  const { completeText, pendingTail } = step.window;
 
   // Pure partial-line window (writer mid-flush, no '\n' yet): never advance.
   // ''.split('\n') yields [''] — treating that as a bare newline would push
@@ -304,29 +293,12 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
   let agentParts: string[] = [];
   let openTurnStartOffset: number | null = null;
   let openTurnSessionId: string | undefined;
-  let cursor = start;
-  let lastFullyConsumedOffset = start;
 
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1; // bare \n
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
-    const lineStart = cursor;
-    const lineBytes = Buffer.byteLength(line, 'utf8') + 1; // + \n
-    cursor += lineBytes;
-
+  for (const { line, lineStart } of iterateJsonlLines(completeText, start)) {
     let obj: any;
-    try { obj = JSON.parse(line); } catch {
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
+    try { obj = JSON.parse(line); } catch { continue; }
     const update = obj?.params?.update ?? obj?.update;
-    if (!update || typeof update !== 'object') {
-      lastFullyConsumedOffset = cursor;
-      continue;
-    }
+    if (!update || typeof update !== 'object') continue;
     const su = update.sessionUpdate as string | undefined;
     const sessionId =
       (typeof obj?.params?.sessionId === 'string' && obj.params.sessionId)
@@ -350,7 +322,6 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
           sourceSessionId: sessionId,
         });
       }
-      lastFullyConsumedOffset = cursor;
       continue;
     }
 
@@ -361,7 +332,7 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
         if (sessionId) openTurnSessionId = sessionId;
         agentParts.push(chunk);
       }
-      // Do not advance lastFullyConsumedOffset past open group — handled at end.
+      // The offset must not move past an open group — handled at the end.
       continue;
     }
 
@@ -392,7 +363,6 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
         ...outcome,
       });
       openTurnSessionId = undefined;
-      lastFullyConsumedOffset = cursor;
       continue;
     }
 
@@ -405,14 +375,13 @@ export function drainGrokUpdates(path: string, fromOffset: number): GrokDrainRes
       openTurnStartOffset = null;
       openTurnSessionId = undefined;
     }
-    lastFullyConsumedOffset = cursor;
   }
 
   // Mid-group at EOF (final reply still streaming): rewind so agent chunks
   // are re-read next tick.
   const newOffset = openTurnStartOffset !== null
     ? openTurnStartOffset
-    : (completeText ? start + Buffer.byteLength(completeText, 'utf8') : lastFullyConsumedOffset);
+    : step.window.newOffset;
 
   return { events, newOffset, pendingTail };
 }

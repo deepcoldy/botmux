@@ -13,7 +13,7 @@
  */
 import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { baselineJsonlCursor } from './jsonl-cursor.js';
+import { baselineJsonlCursor, beginJsonlDrain, scanJsonlBackward } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
@@ -301,38 +301,17 @@ export function readLatestClaudeModelFallback(path: string): {
     return false;
   };
 
-  const floor = Math.max(0, completeEnd - CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES);
-  const chunkBytes = 64 * 1024;
-  let fd: number | undefined;
   try {
-    fd = openSync(path, 'r');
-    let end = completeEnd;
-    let carry = Buffer.alloc(0);
-    while (end > floor) {
-      const start = Math.max(floor, end - chunkBytes);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const line = block.subarray(i + 1, lineEnd).toString('utf8');
-        lineEnd = i;
-        carryEnd = i;
-        if (consider(line)) return emit();
-      }
-      // Drop the leading fragment only at the byte-cap floor (a truncated
-      // historical partial); at true file start it is a complete record.
-      carry = start === floor && floor > 0 ? Buffer.alloc(0) : block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) consider(carry.toString('utf8'));
+    // The leading fragment at the byte-cap floor is a truncated historical
+    // partial and is dropped; at true file start it is a complete record.
+    scanJsonlBackward(path, {
+      endOffset: completeEnd,
+      floor: Math.max(0, completeEnd - CLAUDE_MODEL_FALLBACK_SCAN_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line) => consider(line.toString('utf8')),
+    });
   } catch {
     return emit();
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
   return emit();
 }
@@ -823,64 +802,23 @@ export function drainTranscript(
   path: string,
   fromOffset: number,
 ): DrainResult {
-  if (!existsSync(path)) {
-    return { events: [], newOffset: 0, pendingTail: '' };
-  }
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return { events: [], newOffset: fromOffset, pendingTail: '' };
-  }
-  let start = fromOffset;
-  if (size < start) {
-    // Truncated/rotated — re-read from the top.
-    start = 0;
-  }
-  if (size === start) {
-    return { events: [], newOffset: start, pendingTail: '' };
-  }
-  const len = size - start;
-  const buf = Buffer.alloc(len);
-  let read = 0;
-  const fd = openSync(path, 'r');
-  try {
-    read = readSync(fd, buf, 0, len, start);
-  } finally {
-    closeSync(fd);
-  }
-  const text = buf.subarray(0, read).toString('utf8');
-
-  // Find the last '\n' — anything after it is a partial line we shouldn't
-  // commit yet. Adjust newOffset to exclude the partial tail so the next
-  // drain re-reads it.
-  const lastNl = text.lastIndexOf('\n');
-  let toParse: string;
-  let pendingTail: string;
-  let newOffset: number;
-  if (lastNl < 0) {
-    // No complete line at all — treat the whole buffer as pending.
-    toParse = '';
-    pendingTail = text;
-    newOffset = start;
-  } else {
-    toParse = text.substring(0, lastNl);
-    pendingTail = text.substring(lastNl + 1);
-    newOffset = start + Buffer.byteLength(text.substring(0, lastNl + 1), 'utf8');
-  }
+  // Truncated/rotated (size < fromOffset) re-reads from the top.
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  // Anything after the last '\n' is a partial line we shouldn't commit yet:
+  // it stays out of `newOffset` so the next drain re-reads it.
+  const { completeText, pendingTail, newOffset } = step.window;
 
   const events: TranscriptEvent[] = [];
-  if (toParse) {
-    for (const line of toParse.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const obj = JSON.parse(trimmed);
-        if (obj && typeof obj === 'object') events.push(obj as TranscriptEvent);
-      } catch {
-        // Malformed line — skip silently. Claude Code's writer is atomic per
-        // line, so this means a debug/non-JSON line snuck in; not our concern.
-      }
+  for (const line of completeText.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj && typeof obj === 'object') events.push(obj as TranscriptEvent);
+    } catch {
+      // Malformed line — skip silently. Claude Code's writer is atomic per
+      // line, so this means a debug/non-JSON line snuck in; not our concern.
     }
   }
   return { events, newOffset, pendingTail };

@@ -1,11 +1,8 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleRunTargetResult } from './schedule-run-log-store.js';
+import { errorMessage } from '../utils/error-message.js';
 
 export type ScheduledTaskTargetExecutor = (task: ScheduledTask) => Promise<void>;
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 function taskForTarget(task: ScheduledTask, chatId: string): ScheduledTask {
   const singleTargetTask = { ...task };

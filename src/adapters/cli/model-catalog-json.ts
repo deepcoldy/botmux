@@ -9,6 +9,9 @@ import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js
  * 各适配器的 detectModels 复用本解析，过滤逻辑保持一致。
  */
 
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
 /**
  * 解析 `debug models` 的 JSON 输出为模型能力列表。
  * 过滤：slug 必须为非空字符串，且 visibility === 'list'（隐藏内部模型）。
@@ -79,4 +82,45 @@ export const parseDebugModelCatalogJson = parseDebugModelCapabilitiesJson;
 
 export function parseDebugModelsJson(stdout: string): string[] {
   return parseDebugModelCapabilitiesJson(stdout).map(model => model.slug);
+}
+
+/**
+ * 各适配器 `detectModels` 共用的两种实现。
+ *
+ * 之前 coco / traex（`<bin> debug models`）与 opencode（`<bin> models`）各抄一份「lazy promisify +
+ * execFile + 8s 超时 + 16MB 缓冲 + fail-soft」，codex / codex-app 各抄一份「能力目录 → slug 列表」。
+ */
+
+/**
+ * 执行 `<bin> <args>` 枚举模型：仅 dashboard 在用户选中该 CLI 时按需调用，不在 daemon / worker 启动路径上；
+ * 任何异常（spawn 失败 / 超时 / 输出非法或为空）一律 fail-soft 返回 null，picker 回退到适配器的 modelChoices。
+ * 整包目录可达数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。
+ */
+export async function detectModelsViaExec(
+  bin: string,
+  args: readonly string[],
+  parse: (stdout: string) => string[],
+): Promise<readonly string[] | null> {
+  try {
+    // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+    // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+    // 的 try/catch 兜住（契约：任何异常 → null）。
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync(bin, [...args], {
+      timeout: 8000,
+      maxBuffer: 16 * 1024 * 1024,
+      windowsHide: true,
+    });
+    const models = parse(String(stdout));
+    return models.length > 0 ? models : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 能力目录（`detectModelCapabilities` 的结果）→ `detectModels` 的 slug 列表；目录不可用时为 null。 */
+export function capabilitySlugs(
+  catalog: readonly DebugModelCapabilities[] | null | undefined,
+): readonly string[] | null {
+  return catalog?.map(model => model.slug) ?? null;
 }

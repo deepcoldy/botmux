@@ -16,6 +16,8 @@ import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
 import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
+import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
 const IS_LINUX = platform() === 'linux';
@@ -414,11 +416,10 @@ export function readProcessStartTime(pid: number): number | undefined {
   if (IS_LINUX) {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-      // comm（字段 2）用括号包裹且可能含空格/括号，slice 到最后一个 ')' 之后，
-      // 让后续字段偏移稳定。')' 之后第一个字段是 state（字段 3），所以 starttime
-      // （字段 22）对应这里的下标 19。
-      const afterComm = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/);
-      const starttimeTicks = Number(afterComm[19]);
+      // comm（字段 2）用括号包裹且可能含空格/括号，procStatFieldsAfterComm 在最后一个
+      // ')' 之后切分，让后续字段偏移稳定；starttime（字段 22）对应下标 19。
+      const afterComm = procStatFieldsAfterComm(stat) ?? [];
+      const starttimeTicks = Number(afterComm[PROC_STAT_STARTTIME_INDEX]);
       const btime = readBootTimeSeconds();
       if (Number.isFinite(starttimeTicks) && btime !== undefined) {
         return Math.round((btime + starttimeTicks / clockTicksPerSecond()) * 1000);
@@ -456,6 +457,7 @@ export function getChildPids(pid: number): number[] {
   try {
     const out = execSync('ps -A -o pid= -o ppid=', {
       encoding: 'utf-8',
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const children: number[] = [];
