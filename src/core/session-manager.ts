@@ -1355,7 +1355,19 @@ function buildNewTopicBlocks(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
+  const remoteRunnerSkillCatalog = (cliId === 'remote-runner' || opts?.sessionBackendType === 'remote-runner') && !noTransport;
+  if (remoteRunnerSkillCatalog) {
+    // A Remote Runner executes in an ephemeral environment and has no host
+    // skillsDir/pluginDir to discover. Force only the durable-schedule entry
+    // into its opening catalog; explicit user disable still wins in
+    // builtinSkillEntries, and zero prompt injection returned above.
+    const scheduleEntries = builtinSkillEntries({
+      asksViaHook: adapter.asksViaHook,
+      whiteboardEnabled: whiteboardEnabled(),
+      excludeRoutingCovered: true,
+    }).filter(entry => entry.name === 'botmux-schedule');
+    skillBlock = buildBuiltinSkillCatalogBlock(scheduleEntries, locale, { remoteRunner: true });
+  } else if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
