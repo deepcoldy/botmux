@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lstatSync, mkdirSync, renameSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import type { ChildProcess } from 'node:child_process';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 
 const SAFE_SESSION_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -108,4 +108,24 @@ export function applySessionTempEnv(env: NodeJS.ProcessEnv, path: string): void 
   env.TMPDIR = path;
   env.TMP = path;
   env.TEMP = path;
+}
+
+const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
+
+/**
+ * Drop TMPDIR/TMP/TEMP values that point into the session scratch tree.
+ *
+ * A `botmux restart` run from a session shell inherits that session's scratch
+ * as TMPDIR. Carried into the fleet, every worker would pin it as its Gateway
+ * socket root and g.sock would again exceed the AF_UNIX limit. Only scratch
+ * paths are removed: an operator's own short TMPDIR is kept.
+ */
+export function scrubSessionTempEnv(env: NodeJS.ProcessEnv): void {
+  const root = sessionTempRoot();
+  for (const key of SESSION_TEMP_ENV_KEYS) {
+    const value = env[key]?.trim();
+    if (!value) continue;
+    const path = resolve(value);
+    if (path === root || path.startsWith(`${root}${sep}`)) delete env[key];
+  }
 }

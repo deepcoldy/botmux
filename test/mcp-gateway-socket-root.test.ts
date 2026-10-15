@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -13,15 +13,22 @@ import {
 // (#1592). The Gateway socket must not follow it: that tree is deep enough to
 // push g.sock past macOS's 104-byte sun_path limit (listen EINVAL). The worker
 // pins the inherited root first, exactly as done here.
-describe('MCP Gateway socket root survives the session TMPDIR repoint', () => {
+// The pinned root is an explicit short directory rather than the runner's
+// tmpdir(), which may itself be a deep session scratch (tests run from a bot
+// session shell) and would fail the length assertion for an unrelated reason.
+// Skipped where /tmp is unavailable.
+const shortRoot = existsSync('/tmp') ? mkdtempSync('/tmp/bmcp-root-') : undefined;
+
+describe.skipIf(!shortRoot)('MCP Gateway socket root survives the session TMPDIR repoint', () => {
   const inheritedTmp = process.env.TMPDIR;
-  pinSessionMcpGatewaySocketRoot(tmpdir());
+  if (shortRoot) pinSessionMcpGatewaySocketRoot(shortRoot);
   const cleanup: string[] = [];
   afterEach(() => {
     if (inheritedTmp === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = inheritedTmp;
     for (const p of cleanup.splice(0)) rmSync(p, { recursive: true, force: true });
   });
+  afterAll(() => { if (shortRoot) rmSync(shortRoot, { recursive: true, force: true }); });
 
   function repointTmpdirToSessionScratch(): string {
     const root = mkdtempSync(join(tmpdir(), 'bmcp-root-test-'));

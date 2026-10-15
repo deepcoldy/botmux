@@ -26,21 +26,6 @@ export function sessionMcpGatewayPathRegex(
   return `^${escapeForRegex(root)}/bmcp-${uid}-[^/]+(?:/|$)`;
 }
 
-/** Deterministic per-session Gateway socket directory.
- *
- * The name is a pure function of (dataDir, sessionId) — NO random component —
- * so a replacement worker (daemon restart / upgrade) re-serves the socket at
- * the exact path a surviving persistent pane's relay already holds in its
- * environment, and the relay can simply reconnect instead of the worker having
- * to kill the pane and cold-resume the CLI.
- *
- * Stays under tmpdir (not dataDir) to keep the Unix socket below macOS's short
- * sun_path limit, and keeps the `bmcp-<uid>-` prefix so the existing Seatbelt
- * deny regex (sessionMcpGatewayPathRegex) covers it unchanged. The predictable
- * name is safe because ensurePrivateGatewayDir fails closed unless the
- * directory is a real 0700 directory owned by this uid — a squatter can only
- * DoS session startup, never observe traffic (connections still require the
- * rotating auth token). */
 /** Root for every Gateway socket directory.
  *
  * spawnCli repoints the worker's own TMPDIR at the per-session scratch tree
@@ -58,6 +43,22 @@ export function sessionMcpGatewaySocketRoot(): string {
   return pinnedGatewaySocketRoot ?? tmpdir();
 }
 
+/** Deterministic per-session Gateway socket directory.
+ *
+ * The name is a pure function of (dataDir, sessionId) — NO random component —
+ * so a replacement worker (daemon restart / upgrade) re-serves the socket at
+ * the exact path a surviving persistent pane's relay already holds in its
+ * environment, and the relay can simply reconnect instead of the worker having
+ * to kill the pane and cold-resume the CLI.
+ *
+ * Stays under sessionMcpGatewaySocketRoot() (not dataDir, and not the session
+ * scratch TMPDIR) to keep the Unix socket below macOS's short sun_path limit,
+ * and keeps the `bmcp-<uid>-` prefix so the existing Seatbelt
+ * deny regex (sessionMcpGatewayPathRegex) covers it unchanged. The predictable
+ * name is safe because ensurePrivateGatewayDir fails closed unless the
+ * directory is a real 0700 directory owned by this uid — a squatter can only
+ * DoS session startup, never observe traffic (connections still require the
+ * rotating auth token). */
 export function sessionMcpGatewaySocketDir(sessionId: string, dataDir: string): string {
   const uid = process.getuid?.() ?? 0;
   const sessionKey = createHash('sha256')
