@@ -2597,7 +2597,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
   if (!token) return jsonRes(res, 403, { ok: false, error: delegated
-    ? delegatedError(`the original user's authorization for ${bot.larkAppId} is missing`)
+    ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
     : `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
   return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', credentialType: 'user_access_token', credential: token });
 });
@@ -2661,7 +2661,22 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
     }
-    const callerOpenId = origin.callerOpenId;
+    const cfg = getBot(ds.larkAppId).config;
+    // Only the daemon's verified, turn-bound dispatch can supply a delegated
+    // human. The CLI still cannot choose a user or an application.
+    const requestingUser = (): string | undefined => {
+      const liveOrigin = ds.managedTurnOrigin;
+      if (!liveOrigin?.turnId) return undefined;
+      const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.turnId);
+      if (!grant) return liveOrigin.callerOpenId;
+      if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
+        || !triggerUserAuthApplies(getBot(ds.larkAppId).config.triggerUserAuth, 'lark-cli')) return undefined;
+      return grant.targetOpenId;
+    };
+    const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, origin.turnId);
+    const callerOpenId = requestingUser();
+    if (!callerOpenId) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    const originCallerOpenId = origin.callerOpenId;
     const turnId = origin.turnId;
     const capability = origin.capability;
     const attempt = origin.dispatchAttempt;
@@ -2669,9 +2684,10 @@ for (const action of ['auth-request', 'auth-status']) {
     const generation = ds.workerGeneration;
     const isCurrent = () => findActiveBySessionId(params.sessionId) === ds
       && ds.session.status === 'active' && ds.worker === worker && !worker.killed
-      && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === callerOpenId
+      && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === originCallerOpenId
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
-      && ds.managedTurnOrigin?.dispatchAttempt === attempt;
+      && ds.managedTurnOrigin?.dispatchAttempt === attempt && requestingUser() === callerOpenId
+      && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) === JSON.stringify(delegated);
     // The authorization may outlive the turn that started it: the same human's
     // follow-up message rotates the turn while they are tapping the approval
     // link. Keep polling (and accept the granted token) as long as the session's
@@ -2679,10 +2695,9 @@ for (const action of ['auth-request', 'auth-status']) {
     const samePrincipalActive = (): boolean => {
       const live = findActiveBySessionId(params.sessionId);
       return live === ds && ds.session.status === 'active' && !!ds.worker && !ds.worker.killed
-        && ds.managedTurnOrigin?.callerOpenId === callerOpenId;
+        && requestingUser() === callerOpenId;
     };
     const authorizationCurrent = (): boolean => isCurrent() || samePrincipalActive();
-    const cfg = getBot(ds.larkAppId).config;
     if (!boundTool && !triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
       return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
     }
@@ -2691,6 +2706,11 @@ for (const action of ['auth-request', 'auth-status']) {
       const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
       if (!request || request.sessionId !== params.sessionId) {
         return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
+      }
+      // A different human (including a different human behind the same bot)
+      // must not poll or publish the previous person's grant.
+      if (request.callerOpenId !== callerOpenId) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
       const result = await request.poll();
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
@@ -2715,7 +2735,7 @@ for (const action of ['auth-request', 'auth-status']) {
       const liveOrigin = liveDs === ds ? ds.managedTurnOrigin : liveDs?.managedTurnOrigin;
       const samePrincipalLive = !!liveDs && liveDs.session.status === 'active'
         && !!liveDs.worker && !liveDs.worker.killed
-        && liveOrigin?.callerOpenId === request.callerOpenId && !!liveOrigin.turnId;
+        && liveDs === ds && requestingUser() === request.callerOpenId && !!liveOrigin?.turnId;
       if (!samePrincipalLive) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
       }
@@ -2746,8 +2766,9 @@ for (const action of ['auth-request', 'auth-status']) {
     const scopes = [...new Set(body.scopes as string[])];
     const unknownScopes = scopes.filter(scope => !isKnownLarkUserScope(scope));
     if (unknownScopes.length) return jsonRes(res, 400, { ok: false, error: 'unknown_scopes', scopes: unknownScopes });
-    const cached = getIdentity(ds.larkAppId, callerOpenId);
-    const identity = cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+    const cached = delegated ? undefined : getIdentity(ds.larkAppId, callerOpenId);
+    const identity = delegated ? { type: 'user' as const, openId: callerOpenId }
+      : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
       ? cached
       : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
