@@ -140,9 +140,12 @@ describe('schedule form chat picker', () => {
   it('marks the schedule as required and shows its inline error after an empty submit', async () => {
     const form = await renderForm();
     const tr = createDashboardTranslator('zh');
+    const nameInput = form.root.findByProps({ name: 'name' });
     const scheduleInput = form.root.findByProps({ placeholder: tr('schedules.form.scheduleHelp') });
     const scheduleField = scheduleInput.parent!;
 
+    expect(nameInput.parent!.findByProps({ className: 'schedule-form-label' }).findByType('i').children)
+      .toEqual(['*']);
     expect(scheduleInput.props.required).toBe(true);
     expect(scheduleField.findByProps({ className: 'schedule-form-label' }).findByType('i').children)
       .toEqual(['*']);

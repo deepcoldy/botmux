@@ -2185,7 +2185,9 @@ export function ScheduleFormModal(props: {
           </div>
         )}
         <label className="schedule-form-field">
-          <span className="schedule-form-label">{tr('schedules.form.name')}</span>
+          <span className="schedule-form-label">
+            {tr('schedules.form.name')} <i className="req" aria-hidden="true">*</i>
+          </span>
           <input
             type="text"
             name="name"
@@ -2223,7 +2225,7 @@ export function ScheduleFormModal(props: {
             required
             aria-invalid={scheduleInvalid || undefined}
           />
-          {scheduleInvalid && !check.ok ? (
+          {scheduleInvalid ? (
             <small className="schedule-form-error-inline">{check.error}</small>
           ) : schedulePreview ? (
             <small className="schedule-form-preview">✓ {tr('schedules.form.nextRun')}：{schedulePreview}</small>
