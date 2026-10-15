@@ -12,6 +12,7 @@ import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-car
 import { buildTurnTerminalFooterPatch } from '../src/im/lark/card-builder.js';
 import { customFinalCardError } from '../src/im/lark/final-card-sections.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
+import { normalizeCompletionProposalInput } from '../src/core/completion-proposal.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_custom_final', turnId: 'om_turn' };
@@ -147,12 +148,28 @@ describe('custom schema-2 final uses the canonical reply lifecycle', () => {
     { name: 'callback', card: { ...customCard, body: { elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'fake' }, behaviors: [{ type: 'callback', value: { action: 'feedback_submit' } }] }] } }, args: [] },
     { name: 'top-level', card: customCard, args: ['--top-level'] },
     { name: 'cross-chat', card: customCard, args: ['--chat-id', 'oc_elsewhere'] },
-    { name: 'completion proposal', card: customCard, args: ['--completion-proposal-file', '/nonexistent/proposal.json'] },
   ])('rejects $name without a send', ({ card, args }) => {
     const { root, run } = setup();
     try {
       const result = run(card, 'final', args);
       expect(result.status).not.toBe(0);
+      expect(captured(result.stdout)).toHaveLength(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('rejects a valid completion proposal at the custom-card mutual exclusion gate', () => {
+    const { root, run } = setup();
+    try {
+      const proposal = { title: 'Next step', body: 'Add more boundary tests.',
+        acceptLabel: 'Continue', dismissLabel: 'Not now' };
+      const path = join(root, 'proposal.json');
+      writeFileSync(path, JSON.stringify(proposal));
+      // An absent or invalid file would fail independently of the mutual
+      // exclusion gate and let removal of customCardRequested go undetected.
+      expect(normalizeCompletionProposalInput(JSON.parse(readFileSync(path, 'utf8')))).toEqual(proposal);
+      const result = run(customCard, 'final', ['--completion-proposal-file', path]);
+      expect(result.status, String(result.stderr)).toBe(2);
+      expect(String(result.stderr)).toContain('Completion Proposal 仅支持当前会话内的标准 final 卡');
       expect(captured(result.stdout)).toHaveLength(0);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -251,18 +268,25 @@ describe('custom schema-2 final uses the canonical reply lifecycle', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('keeps the schema-2/current-session boundary when feedback is disabled', () => {
-    for (const [card, args] of [
-      [{ elements: [{ tag: 'markdown', content: 'legacy' }] }, []],
-      [customCard, ['--top-level']],
-    ] as [unknown, string[]][]) {
-      const { root, run } = setup('codex', false);
-      try {
-        const result = run(card, 'final', args);
-        expect(result.status).not.toBe(0);
-        expect(captured(result.stdout)).toHaveLength(0);
-      } finally { rmSync(root, { recursive: true, force: true }); }
-    }
+  it.each([
+    { name: 'schema 1', card: { elements: [{ tag: 'markdown', content: 'legacy' }] }, args: [],
+      error: '自定义 final 卡片必须是 schema 2.0 且包含 body.elements' },
+    { name: 'top-level', card: customCard, args: ['--top-level'],
+      error: '自定义 final 卡片仅支持当前会话内回复' },
+    { name: 'cross-chat', card: customCard, args: ['--chat-id', 'oc_elsewhere'],
+      error: '自定义 final 卡片仅支持当前会话内回复' },
+    { name: 'into another topic', card: customCard, args: ['--into', 'om_elsewhere'],
+      error: '自定义 final 卡片仅支持当前会话内回复' },
+  ])('rejects $name at the custom-final boundary when feedback is disabled', ({ card, args, error }) => {
+    const { root, run } = setup('codex', false);
+    try {
+      // With feedback disabled no feedback-specific guard can mask a missing
+      // custom-final destination check. Assert its diagnostic as well as no IO.
+      const result = run(card, 'final', args);
+      expect(result.status, String(result.stderr)).toBe(2);
+      expect(String(result.stderr)).toContain(error);
+      expect(captured(result.stdout)).toHaveLength(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('rejects nested host IDs but accepts caller layout IDs', () => {
