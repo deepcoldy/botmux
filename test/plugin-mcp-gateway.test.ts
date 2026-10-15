@@ -310,6 +310,7 @@ describe('plugin MCP Gateway', () => {
   it('delivers local plugin results through the trusted host without exposing downstream rows', async () => {
     installFixturePlugin('plugin-delivery', 'delivery');
     const delivered: any[] = [];
+    const validatedMarkdown: any[] = [];
     const gateway = new PluginMcpGateway(
       ['plugin-delivery'],
       { ...process.env, BOTMUX_SESSION_ID: 'session-delivery' },
@@ -332,6 +333,7 @@ describe('plugin MCP Gateway', () => {
             fileCount: input.delivery.files?.length ?? 0,
           };
         },
+        trustedResultMarkdownValidator: input => validatedMarkdown.push(input),
       },
     );
     const client = new Client({ name: 'gateway-delivery-test', version: '1.0.0' });
@@ -344,6 +346,12 @@ describe('plugin MCP Gateway', () => {
     expect(delivered[0].identity.caller.requestUserUnionId).toBe('on_trusted');
     expect(delivered[0].delivery.markdown).toBe('内部模型生成的汇总');
     expect(delivered[0].delivery.files).toHaveLength(1);
+    expect(validatedMarkdown).toHaveLength(1);
+    expect(validatedMarkdown[0]).toMatchObject({
+      pluginId: 'plugin-delivery',
+      markdown: '内部模型生成的汇总',
+      identity: { turnId: 'om_delivery', caller: { requestUserUnionId: 'on_trusted' } },
+    });
     const visible = JSON.stringify(result);
     expect(visible).toContain('delivery_fixture_001');
     expect(visible).not.toContain('PRIVATE_ROWS_MUST_NOT_REACH_CALLER');
@@ -406,6 +414,63 @@ describe('plugin MCP Gateway', () => {
     await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
     await expect(client.callTool({ name: 'echo', arguments: {} }))
       .rejects.toThrow(/trusted_human_identity/);
+    await client.close();
+    await gateway.close();
+  });
+
+  it('rejects a bot-authored trusted identity before invoking host delivery', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered = vi.fn();
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-bot' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_bot', requestUserUnionId: 'on_bot',
+            requestLarkAppId: 'cli_bot', source: 'gateway_meta', senderType: 'bot',
+          },
+          turnId: 'om_bot',
+        }),
+        trustedResultDelivery: delivered,
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-bot-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/trusted_human_identity/);
+    expect(delivered).not.toHaveBeenCalled();
+    await client.close();
+    await gateway.close();
+  });
+
+  it('rejects host delivery from a non-stdio downstream before invoking the host', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered = vi.fn();
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-remote' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
+            requestLarkAppId: 'cli_user', source: 'gateway_meta', senderType: 'user',
+          },
+          turnId: 'om_user',
+        }),
+        trustedResultDelivery: delivered,
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-remote-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await client.listTools();
+    const route = (gateway as any).toolRoutes.get('echo');
+    route.connection.server = { ...route.connection.server, transport: 'streamable-http' };
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/requires_local_stdio/);
+    expect(delivered).not.toHaveBeenCalled();
     await client.close();
     await gateway.close();
   });

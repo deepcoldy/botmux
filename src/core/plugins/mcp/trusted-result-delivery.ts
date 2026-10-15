@@ -142,6 +142,7 @@ export function decodeTrustedResultDeliveryIpcEnvelope(
     files?: unknown;
     responseKind?: unknown;
   },
+  validateMarkdown?: (markdown: string) => void,
 ): DecodedTrustedResultDeliveryIpcEnvelope {
   const deliveryId = typeof value.deliveryId === 'string' ? value.deliveryId.trim() : '';
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(deliveryId)) {
@@ -189,6 +190,9 @@ export function decodeTrustedResultDeliveryIpcEnvelope(
     }
     return { name: raw.name, data };
   });
+  // Run target-card validation only after the complete IPC envelope has been
+  // decoded, but still before the caller can build/send a card or upload a file.
+  if (typeof markdown === 'string' && markdown.trim()) validateMarkdown?.(markdown);
   return {
     deliveryId,
     ...(markdown !== undefined ? { markdown: markdown as string } : {}),
@@ -200,13 +204,14 @@ export function decodeTrustedResultDeliveryIpcEnvelope(
 export async function deliverValidatedTrustedResultDelivery(
   value: Parameters<typeof decodeTrustedResultDeliveryIpcEnvelope>[0],
   effects: {
+    validateMarkdown?(markdown: string): void;
     sendMarkdown(markdown: string): Promise<string>;
     sendFile(file: { name: string; data: Buffer }, index: number): Promise<string>;
   },
 ): Promise<string[]> {
   // Keep this as the first operation. In particular, do not build a card in a
   // callback argument before the complete envelope has passed validation.
-  const envelope = decodeTrustedResultDeliveryIpcEnvelope(value);
+  const envelope = decodeTrustedResultDeliveryIpcEnvelope(value, effects.validateMarkdown);
   const messageIds: string[] = [];
   try {
     if (envelope.markdown?.trim()) {
@@ -240,6 +245,7 @@ export function trustedResultTerminalObservation(
 export function parseTrustedResultDelivery(
   value: unknown,
   pluginHome: string,
+  validateMarkdown?: (markdown: string) => void,
 ): TrustedResultDelivery {
   if (!isRecord(value) || value.schemaVersion !== 1) {
     throw new Error('invalid_host_delivery_schema');
@@ -262,6 +268,9 @@ export function parseTrustedResultDelivery(
     throw new Error('invalid_host_delivery_files');
   }
   if (!markdown?.trim() && rawFiles.length === 0) throw new Error('empty_host_delivery');
+  // Reject an oversized target card before resolving/opening attachments.
+  // This keeps the source artifacts available for a smaller retry.
+  if (typeof markdown === 'string' && markdown.trim()) validateMarkdown?.(markdown);
 
   const realPluginHome = realpathSync(pluginHome);
   const outboundPath = resolve(realPluginHome, 'outbound');

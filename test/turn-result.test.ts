@@ -84,6 +84,29 @@ describe('ordinary turn result snapshots', () => {
     },
   );
 
+  it('keeps the first delivered receipt immutable against a later delivered attempt', () => {
+    const store = new TurnResultStore();
+    store.begin(binding);
+    store.recordDelivery(binding, output, receipt);
+    store.recordDelivery(binding, { ...output, content: 'later output' }, {
+      ...receipt,
+      messages: [{ kind: 'primary', messageId: 'om_later' }],
+    });
+    store.recordTerminal(binding, execution);
+    const lookup = store.read(binding.ref);
+    expect(lookup).toEqual({
+      status: 'ready',
+      result: {
+        version: 1,
+        ref: binding.ref,
+        source: binding.source,
+        execution,
+        output,
+        deliveries: [receipt],
+      },
+    });
+  });
+
   it('isolates bot, turn, attempt and worker generation without selecting latest', () => {
     const store = new TurnResultStore();
     store.begin(binding);

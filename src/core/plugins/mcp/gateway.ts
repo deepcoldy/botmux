@@ -120,6 +120,11 @@ export type GatewayTrustedResultDeliveryHandler = (input: {
   identity: GatewayTrustedTurnIdentity;
   delivery: TrustedResultDelivery;
 }) => Promise<TrustedResultDeliveryReceipt>;
+export type GatewayTrustedResultMarkdownValidator = (input: {
+  pluginId: string;
+  identity: GatewayTrustedTurnIdentity;
+  markdown: string;
+}) => void;
 
 const BOTMUX_META_RESERVED_PREFIX = 'botmux';
 const BOTMUX_TRUSTED_HEADER_PREFIX = 'x-botmux-trusted-';
@@ -316,6 +321,7 @@ export class PluginMcpGateway {
   private readonly env: NodeJS.ProcessEnv;
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  private readonly trustedResultMarkdownValidator?: GatewayTrustedResultMarkdownValidator;
   private readonly allowHostOnlyTools: boolean;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
@@ -335,12 +341,14 @@ export class PluginMcpGateway {
     opts: {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+      trustedResultMarkdownValidator?: GatewayTrustedResultMarkdownValidator;
     } = {},
     hostCapability?: symbol,
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
+    this.trustedResultMarkdownValidator = opts.trustedResultMarkdownValidator;
     this.allowHostOnlyTools = hostCapability === FROZEN_COMMAND_HOST_CAPABILITY;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
@@ -769,6 +777,11 @@ export class PluginMcpGateway {
         const delivery = parseTrustedResultDelivery(
           deliveryValue,
           pluginHome(route.connection.pluginId),
+          markdown => this.trustedResultMarkdownValidator?.({
+            pluginId: route.connection.pluginId,
+            identity,
+            markdown,
+          }),
         );
         const receipt: TrustedResultDeliveryReceipt = await this.trustedResultDelivery!({
           pluginId: route.connection.pluginId,

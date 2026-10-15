@@ -14,6 +14,7 @@ import {
   trustedResultDeliveryIpcFiles,
   trustedResultTerminalObservation,
 } from '../src/core/plugins/mcp/trusted-result-delivery.js';
+import { buildTrustedResultDeliveryCard } from '../src/im/lark/trusted-result-delivery-card.js';
 
 describe('trusted plugin result delivery', () => {
   it('accepts regular files only from the plugin outbound directory', () => {
@@ -109,6 +110,31 @@ describe('trusted plugin result delivery', () => {
     expect(existsSync(source)).toBe(true);
     const after = readdirSync(tmpdir()).filter(name => name.startsWith('botmux-result-delivery-'));
     expect(after.filter(name => !before.has(name))).toEqual([]);
+  });
+
+  it('rejects an oversized rendered card before consuming attachments', () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-delivery-'));
+    const outbound = join(home, 'outbound');
+    mkdirSync(outbound);
+    const source = join(outbound, 'report.xlsx');
+    writeFileSync(source, 'business-result');
+    const markdown = '数据'.repeat(15_000);
+    const validate = (value: string) => buildTrustedResultDeliveryCard({
+      markdown: value,
+      chatId: `oc_${'0'.repeat(32)}`,
+      uuid: 'prd_'.padEnd(50, '0'),
+      recipientOpenId: 'ou_requester',
+      brand: 'botmux',
+      locale: 'zh',
+      workingDir: home,
+    });
+    expect(() => parseTrustedResultDelivery({
+      schemaVersion: 1,
+      deliveryId: 'report_20261026',
+      markdown,
+      files: [{ path: 'report.xlsx' }],
+    }, home, validate)).toThrow('host_delivery_markdown_too_large');
+    expect(existsSync(source)).toBe(true);
   });
 
   it('enforces byte limits before IPC', () => {
@@ -250,6 +276,10 @@ describe('trusted plugin result delivery', () => {
     })).toThrow(/file|base64/);
     expect(() => decodeTrustedResultDeliveryIpcEnvelope({
       ...valid,
+      files: [{ name: 'bad.txt', dataBase64: 'Zh==' }],
+    })).toThrow(/base64/);
+    expect(() => decodeTrustedResultDeliveryIpcEnvelope({
+      ...valid,
       markdown: 'x'.repeat(MAX_TRUSTED_DELIVERY_MARKDOWN_CHARS + 1),
     })).toThrow(/markdown/);
   });
@@ -294,6 +324,30 @@ describe('trusted plugin result delivery', () => {
       await expect(deliverValidatedTrustedResultDelivery(envelope, countedEffects)).rejects.toThrow();
     }
     expect(markdownCalls).toBe(0);
+    expect(uploadCalls).toBe(0);
+  });
+
+  it('rejects an oversized rendered card in the daemon before every side effect', async () => {
+    let cardCalls = 0;
+    let uploadCalls = 0;
+    const markdown = '数据'.repeat(15_000);
+    await expect(deliverValidatedTrustedResultDelivery({
+      deliveryId: 'report_20261027',
+      markdown,
+      responseKind: 'final',
+      files: [{ name: 'result.xlsx', dataBase64: Buffer.from('secret').toString('base64') }],
+    }, {
+      validateMarkdown(value) {
+        buildTrustedResultDeliveryCard({
+          markdown: value,
+          chatId: `oc_${'0'.repeat(32)}`,
+          uuid: 'prd_'.padEnd(50, '0'),
+        });
+      },
+      async sendMarkdown() { cardCalls += 1; return 'om_card'; },
+      async sendFile() { uploadCalls += 1; return 'om_file'; },
+    })).rejects.toThrow('host_delivery_markdown_too_large');
+    expect(cardCalls).toBe(0);
     expect(uploadCalls).toBe(0);
   });
 

@@ -7,6 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   PluginMcpGateway,
   type GatewayTrustedResultDeliveryHandler,
+  type GatewayTrustedResultMarkdownValidator,
   type GatewayTrustedTurnIdentityProvider,
 } from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
@@ -123,6 +124,7 @@ export async function startSessionMcpGatewayHost(opts: {
   dataDir: string;
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
+  trustedResultMarkdownValidator?: GatewayTrustedResultMarkdownValidator;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -156,6 +158,7 @@ export async function startSessionMcpGatewayHost(opts: {
       }, {
         trustedTurnIdentity: opts.trustedTurnIdentity,
         trustedResultDelivery: opts.trustedResultDelivery,
+        trustedResultMarkdownValidator: opts.trustedResultMarkdownValidator,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

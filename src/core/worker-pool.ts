@@ -115,6 +115,7 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from '../im/lark/md-card.js';
+import { buildTrustedResultDeliveryCard } from '../im/lark/trusted-result-delivery-card.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
@@ -16882,15 +16883,30 @@ function setupWorkerHandlers(
           },
         );
         try {
+          let preparedMarkdownCard: string | undefined;
           const messageIds = await deliverValidatedTrustedResultDelivery(msg, {
-            async sendMarkdown(markdown) {
-              const card = buildCanonicalFinalReplyCard({
+            validateMarkdown(markdown) {
+              preparedMarkdownCard = buildTrustedResultDeliveryCard({
                 markdown,
+                chatId: ds.chatId,
+                uuid: deliveryUuid('summary'),
                 recipientOpenId: expectedCaller,
                 brand: resolveBrandLabel(ds.larkAppId),
                 locale: localeForBot(ds.larkAppId),
                 workingDir: cb.getSessionWorkingDir(ds),
               });
+            },
+            async sendMarkdown(markdown) {
+              const card = preparedMarkdownCard
+                ?? buildTrustedResultDeliveryCard({
+                  markdown,
+                  chatId: ds.chatId,
+                  uuid: deliveryUuid('summary'),
+                  recipientOpenId: expectedCaller,
+                  brand: resolveBrandLabel(ds.larkAppId),
+                  locale: localeForBot(ds.larkAppId),
+                  workingDir: cb.getSessionWorkingDir(ds),
+                });
               return scopedReply(card, 'interactive', msg.turnId, {
                 uuid: deliveryUuid('summary'),
                 replyTarget: frozen.target,

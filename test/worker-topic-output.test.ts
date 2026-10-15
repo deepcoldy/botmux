@@ -92,6 +92,43 @@ async function waitFor(check: () => boolean): Promise<void> {
 
 describe('worker final-output topic transport', () => {
   it.each([
+    ['stale_worker', 'stale'],
+    ['delivery_suppressed_for_turn', 'suppressed'],
+    ['trusted_caller_mismatch', 'caller'],
+  ] as const)('rejects trusted delivery with %s before any Lark side effect', async (expected, mode) => {
+    ds.session.turnReplyContexts!.om_turn_old = {
+      target: { mode: 'thread', rootMessageId: 'om_source' },
+      sourceMessageId: 'om_turn_old', senderOpenId: 'ou_requester',
+    };
+    ds.session.replyTargets = { om_turn_old: {
+      rootMessageId: 'om_source', senderOpenId: 'ou_requester', updatedAt: new Date().toISOString(),
+    } };
+    if (mode === 'suppressed') {
+      ds.suppressedFinalOutputTurns = new Map([['om_turn_old', 1]]);
+    }
+    const sent: unknown[] = [];
+    const worker = Object.assign(new EventEmitter(), { pid: process.pid, connected: true,
+      send: (message: unknown) => { sent.push(message); return true; },
+      stdout: new EventEmitter(), stderr: new EventEmitter(), killed: false, kill: () => true });
+    ds.worker = worker as never;
+    __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: `req_${mode}`,
+      sessionId: mode === 'stale' ? 'sid_stale' : ds.session.sessionId,
+      pluginId: 'data-mcp', turnId: 'om_turn_old', dispatchAttempt: 1,
+      callerOpenId: mode === 'caller' ? 'ou_other' : 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: `delivery_${mode}_20261015`, markdown: 'CONFIDENTIAL_SENTINEL', responseKind: 'final',
+    });
+    await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'plugin_result_delivery_result', ok: false, error: expected,
+    }));
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.upload).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['sentinel terminal', 'nothing_to_send' as const],
     ['ordinary terminal', undefined],
   ])('records trusted plugin delivery before the %s result terminal', async (_label, outputDisposition) => {

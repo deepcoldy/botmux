@@ -191,6 +191,7 @@ import {
   trustedResultDeliveryIpcFiles,
   trustedResultTerminalObservation,
 } from './core/plugins/mcp/trusted-result-delivery.js';
+import { buildTrustedResultDeliveryCard } from './im/lark/trusted-result-delivery-card.js';
 import {
   readSessionMcpRuntimeManifest,
   sessionMcpRuntimeHostOnlyPaths,
@@ -313,7 +314,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from './types.js';
 import { normalizeCodexAppCotMarker } from './services/codex-app-cot.js';
-import { t, setDefaultLocale } from './i18n/index.js';
+import { localeForBot, t, setDefaultLocale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import {
@@ -1676,6 +1677,25 @@ const pendingPluginResultDeliveries = new Map<string, {
   reject: (error: Error) => void;
 }>();
 
+function validateTrustedResultMarkdown(input: {
+  identity: { caller?: TrustedCaller };
+  markdown: string;
+}): void {
+  const cfg = lastInitConfig;
+  if (!cfg) throw new Error('host_delivery_unavailable');
+  buildTrustedResultDeliveryCard({
+    markdown: input.markdown,
+    chatId: cfg.chatId,
+    // The production UUID is `prd_` plus 46 hex characters. Only its encoded
+    // length affects request sizing, so a fixed placeholder is deterministic.
+    uuid: 'prd_'.padEnd(50, '0'),
+    recipientOpenId: input.identity.caller?.requestUserOpenId,
+    brand: resolveBrandLabel(cfg.larkAppId),
+    locale: localeForBot(cfg.larkAppId),
+    workingDir: cfg.workingDir,
+  });
+}
+
 const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = async (input) => {
   const { identity, delivery } = input;
   if (!identity.turnId || !identity.caller?.requestUserUnionId) {
@@ -1926,6 +1946,7 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
+    trustedResultMarkdownValidator: validateTrustedResultMarkdown,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
