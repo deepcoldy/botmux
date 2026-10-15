@@ -92,6 +92,9 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     const progress = { protocol, version, type: 'progress', turnId: 'om_turn_survived', content: 'still running' };
     process.stdout.write(JSON.stringify(ready) + '\\n' + JSON.stringify(progress) + '\\n');
     setTimeout(() => emit({ type: 'final', turnId: 'om_turn_survived', content: 'TAKEOVER_OK', state }), 50);
+  } else if (command.type === 'turn') {
+    emit({ type: 'status', requestId: command.requestId, status: 'busy' });
+    emit({ type: 'final', turnId: command.turnId, content: 'FOLLOWUP_OK', state: command.state });
   } else if (command.type === 'cancel') {
     emit({ type: 'status', requestId: command.requestId, status: 'closed' });
   }
@@ -164,11 +167,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
         && message.status === 'completed'),
       () => `remote runner takeover did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
     );
-    const commands = readFileSync(commandsPath, 'utf8')
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line));
-    expect(commands.some(command => command.type === 'turn')).toBe(false);
+    expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
     expect(messages).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'capture_identity',
@@ -186,6 +185,36 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       }),
     ]));
     expect(messages.some(message => message.type === 'error')).toBe(false);
+
+    child.send({
+      type: 'message',
+      content: 'follow up after takeover',
+      turnId: 'om_turn_followup',
+      dispatchAttempt: 9,
+      trustedCaller: {
+        requestUserOpenId: 'ou_remote_user',
+        requestLarkAppId: 'app_remote_takeover',
+        senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_turn_followup'
+        && message.dispatchAttempt === 9
+        && message.status === 'completed'),
+      () => `follow-up after recovered turn did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    const commands = readFileSync(commandsPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    expect(commands.filter(command => command.type === 'turn')).toEqual([
+      expect.objectContaining({
+        turnId: 'om_turn_followup',
+        dispatchAttempt: 9,
+        content: 'follow up after takeover',
+      }),
+    ]);
   });
 
   it('passes persisted provider state to resume after a worker restart', async () => {

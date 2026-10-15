@@ -20455,7 +20455,12 @@ async function spawnCli(
         );
       }
       setCaptureIdentity(turn.turnId, turn.dispatchAttempt);
-      durableTurnInFlight = true;
+      // Only receiver attempts participate in the durable HOL protocol. An
+      // ordinary primary Lark turn has no dispatchAttempt; its recovered-turn
+      // fence below still blocks startup readiness until the provider settles,
+      // but must not arm a latch that only an attempt-bearing terminal can
+      // release.
+      if (turn.dispatchAttempt !== undefined) durableTurnInFlight = true;
       remoteRunnerRecoveredTurnInFlight = true;
       currentTurnSteerPromoted = false;
       markActiveTurnStarted({
@@ -23422,6 +23427,7 @@ function emitTurnTerminal(
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
   });
+  let wakePending = false;
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
     { turnId, dispatchAttempt },
@@ -23431,7 +23437,19 @@ function emitTurnTerminal(
     // fresh process behind the receiver's newer dispatch attempt.
     inflightInputs.onTurnComplete();
     durableTurnInFlight = false;
+    wakePending = true;
+  }
+  if (remoteRunnerRecoveredTurnInFlight
+    && currentBotmuxTurnId === turnId
+    && currentBotmuxDispatchAttempt === dispatchAttempt) {
+    // Recovered ordinary turns intentionally have no dispatch attempt, so the
+    // durable-attempt predicate above cannot release this independent startup
+    // fence. Exact turn identity is sufficient: a later/stale terminal cannot
+    // match after capture attribution advances.
     remoteRunnerRecoveredTurnInFlight = false;
+    wakePending = true;
+  }
+  if (wakePending) {
     // The terminal may be emitted from inside an active flush continuation
     // (for example a synchronous hard-submit failure). Wake after that
     // continuation releases the mutex so queued work cannot remain stranded.
