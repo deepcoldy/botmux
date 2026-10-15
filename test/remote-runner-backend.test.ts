@@ -205,6 +205,18 @@ describe('RemoteRunnerBackend', () => {
       result: expect.objectContaining({ code: 'operation_id_conflict' }),
     }));
     expect(delivery).toHaveBeenCalledTimes(2);
+
+    const mentionConflictFinal = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-mention-conflict', content: 'mention-conflict' });
+    const mentionConflictResults = JSON.parse(await mentionConflictFinal) as Array<{
+      result: { outcome: string; code?: string };
+    }>;
+    expect(mentionConflictResults.map(item => item.result.outcome).sort())
+      .toEqual(['delivered', 'rejected']);
+    expect(mentionConflictResults).toContainEqual(expect.objectContaining({
+      result: expect.objectContaining({ code: 'operation_id_conflict' }),
+    }));
+    expect(delivery).toHaveBeenCalledTimes(3);
   });
 
   it('limits unique outbound messages per turn before invoking the host', async () => {

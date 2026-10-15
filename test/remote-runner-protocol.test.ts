@@ -193,6 +193,9 @@ describe('remote runner protocol', () => {
       { mention: 'none', mentions: ['ou_target:Target'] },
       { mention: 'requester', mentions: ['ou_target:Target'] },
       { mention: 'explicit', mentions: [42] },
+      { mention: 'explicit', mentions: [''] },
+      { mention: 'explicit', mentions: ['   '] },
+      { mention: 'explicit', mentions: ['ou_target:Target', ''] },
       { mention: 'explicit', mentions: ['ou_target\0Target'] },
       { mention: 'explicit', mentions: ['x'.repeat(33 * 1024)] },
     ]) {

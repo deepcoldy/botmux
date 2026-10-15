@@ -735,7 +735,9 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       ? []
       : (Array.isArray(raw.mentions)
         && raw.mentions.length > 0
-        && raw.mentions.every(value => typeof value === 'string' && !value.includes('\0'))
+        && raw.mentions.every(value => (
+          typeof value === 'string' && value.trim() !== '' && !value.includes('\0')
+        ))
         && Buffer.byteLength(raw.mentions.join('\0'), 'utf8')
           <= MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
         ? raw.mentions as string[]
