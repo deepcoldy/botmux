@@ -1856,7 +1856,7 @@ export function ScheduleFormModal(props: {
   }, [editing, larkAppId, bots]);
 
   const check = useMemo(
-    () => schedule.trim() ? checkSchedule(schedule, tr, scheduleTimeZone) : null,
+    () => checkSchedule(schedule, tr, scheduleTimeZone),
     [schedule, tr, scheduleTimeZone],
   );
 
@@ -1916,8 +1916,8 @@ export function ScheduleFormModal(props: {
     })
     ?? chatId
   ));
-  const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
-  const schedulePreview = check?.ok ? check.preview : undefined;
+  const scheduleInvalid = scheduleTouched && !check.ok;
+  const schedulePreview = check.ok ? check.preview : undefined;
   const nameMissing = touched && !name.trim();
   const promptMissing = touched && !prompt.trim();
   const chatMissing = touched && !localDelivery && chatIds.length === 0;
@@ -2200,7 +2200,9 @@ export function ScheduleFormModal(props: {
           ) : null}
         </label>
         <div className="schedule-form-field">
-          <span className="schedule-form-label">{tr('schedules.form.schedule')}</span>
+          <span className="schedule-form-label">
+            {tr('schedules.form.schedule')} <i className="req" aria-hidden="true">*</i>
+          </span>
           <div className="schedule-templates" role="group" aria-label={tr('schedules.form.templates')}>
             {CRON_TEMPLATES.map(t => (
               <button
@@ -2221,7 +2223,7 @@ export function ScheduleFormModal(props: {
             required
             aria-invalid={scheduleInvalid || undefined}
           />
-          {scheduleInvalid && check && !check.ok ? (
+          {scheduleInvalid && !check.ok ? (
             <small className="schedule-form-error-inline">{check.error}</small>
           ) : schedulePreview ? (
             <small className="schedule-form-preview">✓ {tr('schedules.form.nextRun')}：{schedulePreview}</small>
