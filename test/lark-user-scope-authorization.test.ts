@@ -6,13 +6,11 @@ import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
 import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 
-// Regression for the Base-authorization lockout: `botmux auth request --scope
-// 'base:app:create'` (and `bitable:app`) was rejected with `unknown_scopes`
-// before any authorize URL could be minted, because both names were absent from
-// src/setup/lark-scopes.json. Feishu itself names these two as the candidate
-// scopes for a user-token POST /open-apis/bitable/v1/apps (99991679), so a real
-// Base scope must pass the gate; a misspelled one must still be rejected; and
-// the user/turn binding the gate exists to protect must be unchanged either way.
+// Regressions for valid user scopes being rejected with `unknown_scopes` before
+// any authorize URL could be minted because the names were absent from
+// src/setup/lark-scopes.json. Feishu itself names these scopes in 99991679
+// responses, so real user scopes must pass the gate; misspelled ones must still
+// be rejected; and the user/turn binding the gate protects must remain intact.
 
 const CAP = 'ab'.repeat(32);
 let ipc: IpcServerHandle;
@@ -61,7 +59,17 @@ describe('Base user scopes are in the catalog', () => {
   });
 });
 
-describe('auth-request handler — Base scope authorization', () => {
+describe('Contact user search scope is in the catalog', () => {
+  it('accepts the exact scope Feishu requires for contact +search-user', () => {
+    expect(isKnownLarkUserScope('contact:user:search')).toBe(true);
+  });
+
+  it('still rejects a misspelled contact search scope', () => {
+    expect(isKnownLarkUserScope('contact:user:serach')).toBe(false);
+  });
+});
+
+describe('auth-request handler — user scope authorization', () => {
   it('mints an authorize URL for a legal Base scope, bound to the verified caller', async () => {
     const res = await post({ scopes: ['base:app:create', 'bitable:app'] });
     expect(res.status).toBe(200);
@@ -81,6 +89,15 @@ describe('auth-request handler — Base scope authorization', () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ ok: false, error: 'unknown_scopes', scopes: ['base:app:crate'] });
     expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('mints an authorize URL for contact user search instead of rejecting it as unknown', async () => {
+    const res = await post({ scopes: ['contact:user:search'] });
+    expect(res.status).toBe(200);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(tokens.requestUserAuthorization).mock.calls[0];
+    expect(call[3]).toEqual(['contact:user:search']);
+    expect(call[4]).toBe('ou_sender');
   });
 
   it('keeps user/turn binding: a legal Base scope on a stale turn is still 403, no authorization', async () => {

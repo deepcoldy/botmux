@@ -196,6 +196,7 @@
       "comment_sdk:comment_sdk",
       "contact:contact.base:readonly",
       "contact:user.employee_id:readonly",
+      "contact:user:search",
       "docs:component",
       "docs:document.comment:create",
       "docs:document.comment:read",
