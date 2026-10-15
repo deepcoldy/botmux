@@ -16,6 +16,7 @@ import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from 
 import { execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
+import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,7 +26,7 @@ import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
-import { hookCommandFor } from '../adapters/hook-command.js';
+import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
@@ -5532,6 +5533,10 @@ const skillsInstalledCliIds = new Set<string>();
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: CliAdapterOptions): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride, opts);
+  if (cliId === 'cursor') {
+    try { installCursorUsageHook(join(homedir(), '.cursor', 'hooks.json'), cursorUsageHookCommand()); }
+    catch (err) { logger.warn(`[cursor] usage hook install failed: ${String(err)}`); }
+  }
   // Hooks land in the adapter's data root, so each config profile is its own
   // install target: gate per (cli, profile), not per cli.
   const installKey = cliSupportsConfigDir(cliId) && opts?.configDir ? `${cliId}\0${opts.configDir}` : cliId;

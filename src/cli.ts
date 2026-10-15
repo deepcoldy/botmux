@@ -16812,6 +16812,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // prefix keeps the name outside the plugin-command grammar so the v1 default
     // branch's plugin lookup can never match it.
     '__turn-idle-v2',
+    '__cursor-usage-v1', // local, session-scoped usage callback; no messaging
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
@@ -18033,6 +18034,11 @@ switch (command) {
     // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
     // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
     await cmdUserPromptHook();
+    break;
+  }
+  case '__cursor-usage-v1': {
+    const { runCursorUsageHook } = await import('./services/cursor-usage-hook.js');
+    await runCursorUsageHook();
     break;
   }
   case 'statusline': {
