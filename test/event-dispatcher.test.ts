@@ -2117,6 +2117,50 @@ describe('im.message.receive_v1 — p2p chat-mode owned topic routing', () => {
     }));
   });
 
+  it('folds a closed /fork DM topic back flat: missing marker has no /fork-text self-heal', async () => {
+    // Closing a /fork child removes its marker. Unlike /t roots, a /fork root
+    // is never a topic header, so the legacy backfill must NOT re-record it:
+    // post-close replies fold into the flat DM session for good.
+    const chatId = 'oc_dm_closed_fork';
+    const rootId = 'om_closed_fork_root';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: chatId,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '/fork 帮忙排查一下这个问题' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow-up after the fork child was closed' }),
+      messageId: 'om_closed_fork_reply',
+      rootId,
+      threadId: 'omt_closed_fork',
+      chatId,
+      chatType: 'p2p',
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && anchor === chatId
+    ));
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockIsP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    await vi.waitFor(() => {
+      expect(mockGetMessageDetail).toHaveBeenCalledWith(MY_APP_ID, rootId, { userCardContent: false });
+    });
+    // /fork command text is not a topic header: no self-healing backfill.
+    expect(mockRecordP2pForceTopicRoot).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: chatId,
+      replyRootId: rootId,
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
   it('migrates a pre-store /t root after verifying its immutable root message', async () => {
     const chatId = 'oc_dm_legacy_force_topic';
     const rootId = 'om_legacy_force_topic_root';
