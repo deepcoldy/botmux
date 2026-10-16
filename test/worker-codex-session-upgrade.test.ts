@@ -69,6 +69,7 @@ function harness() {
     injectionFlushing: false,
     commandLineWritesPending: 0,
     initialInputOwnershipPending: false,
+    remoteRunnerRecoveredTurnInFlight: false,
     pendingMessages: [], pendingRawInputs: [], pendingInjections: [], pendingAdoptMessages: [],
     sessionRenameInFlight: () => false,
     pendingSessionRename: undefined,

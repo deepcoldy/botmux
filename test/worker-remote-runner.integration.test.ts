@@ -63,6 +63,7 @@ describe('remote runner worker wiring', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-takeover-'));
     tempDirs.push(root);
     const commandsPath = join(root, 'commands.jsonl');
+    const releaseRecoveredFinalPath = join(root, 'release-recovered-final');
     const provider = join(root, 'provider.mjs');
     writeFileSync(provider, `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -91,7 +92,11 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     };
     const progress = { protocol, version, type: 'progress', turnId: 'om_turn_survived', content: 'still running' };
     process.stdout.write(JSON.stringify(ready) + '\\n' + JSON.stringify(progress) + '\\n');
-    setTimeout(() => emit({ type: 'final', turnId: 'om_turn_survived', content: 'TAKEOVER_OK', state }), 50);
+    const releaseTimer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(releaseRecoveredFinalPath)})) return;
+      clearInterval(releaseTimer);
+      emit({ type: 'final', turnId: 'om_turn_survived', content: 'TAKEOVER_OK', state });
+    }, 10);
   } else if (command.type === 'turn') {
     emit({ type: 'status', requestId: command.requestId, status: 'busy' });
     emit({ type: 'final', turnId: command.turnId, content: 'FOLLOWUP_OK', state: command.state });
@@ -161,34 +166,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
-    await waitFor(
-      () => messages.some(message => message.type === 'turn_terminal'
-        && message.turnId === 'om_turn_survived'
-        && message.status === 'completed'),
-      () => `remote runner takeover did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
-    );
-    expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
-    expect(messages).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'capture_identity',
-        turnId: 'om_turn_survived',
-      }),
-      expect.objectContaining({
-        type: 'final_output',
-        turnId: 'om_turn_survived',
-        content: 'TAKEOVER_OK',
-      }),
-      expect.objectContaining({
-        type: 'turn_terminal',
-        turnId: 'om_turn_survived',
-        status: 'completed',
-      }),
-    ]));
-    expect(messages.some(message => message.type === 'error')).toBe(false);
-
+    // A takeover-triggering follow-up can reach the just-forked worker while
+    // its async init is still resuming the provider-owned turn. It must remain
+    // queued across the worker-ready edge until that recovered turn settles.
     child.send({
       type: 'message',
-      content: 'follow up after takeover',
+      content: 'follow up during takeover',
       turnId: 'om_turn_followup',
       dispatchAttempt: 9,
       trustedCaller: {
@@ -197,6 +180,26 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
         senderType: 'user',
       },
     } satisfies DaemonToWorker);
+    await waitFor(
+      () => messages.some(message => message.type === 'ready')
+        && messages.some(message => message.type === 'capture_identity'
+          && message.turnId === 'om_turn_survived'),
+      () => `remote runner takeover did not become ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    // The worker's ordinary 15s first-prompt fallback used to re-arm readiness
+    // and flush this queued successor into the still-active recovered turn.
+    // Hold beyond that edge and prove the provider received no new turn.
+    await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 16_000));
+    expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
+    expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+
+    writeFileSync(releaseRecoveredFinalPath, 'release\n');
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_turn_survived'
+        && message.status === 'completed'),
+      () => `remote runner takeover did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
     await waitFor(
       () => messages.some(message => message.type === 'turn_terminal'
         && message.turnId === 'om_turn_followup'
@@ -212,9 +215,22 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       expect.objectContaining({
         turnId: 'om_turn_followup',
         dispatchAttempt: 9,
-        content: 'follow up after takeover',
+        content: 'follow up during takeover',
       }),
     ]);
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'final_output',
+        turnId: 'om_turn_survived',
+        content: 'TAKEOVER_OK',
+      }),
+      expect.objectContaining({
+        type: 'turn_terminal',
+        turnId: 'om_turn_survived',
+        status: 'completed',
+      }),
+    ]));
+    expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
   it('passes persisted provider state to resume after a worker restart', async () => {

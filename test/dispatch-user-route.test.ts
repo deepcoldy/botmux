@@ -90,6 +90,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
     idleDetector: { isStartupPending: () => false, reset: vi.fn() },
+    remoteRunnerRecoveredTurnInFlight: false,
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
     stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,

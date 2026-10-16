@@ -700,7 +700,7 @@ describe('late bare-shell launch recovery', () => {
   });
 
   it('keeps non-PTY ready sources from stranding a blocked launch', () => {
-    const markReady = caseRegion(workerSrc, 'function markPromptReady(): void', 900);
+    const markReady = caseRegion(workerSrc, 'function markPromptReady(): void', 1300);
     const block = markReady.indexOf('if (bareShellLaunchBlocked)');
     const duplicateReadyGuard = markReady.indexOf('if (isPromptReady) {', block);
     expect(block).toBeGreaterThanOrEqual(0);

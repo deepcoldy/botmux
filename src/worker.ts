@@ -13044,6 +13044,14 @@ function markPromptReady(): void {
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
   if (idleDetector?.isStartupPending()) return;
+  if (remoteRunnerRecoveredTurnInFlight) {
+    // A provider `ready`/startup timeout describes transport readiness, not an
+    // idle turn boundary, while an adopted remote turn is still executing.
+    // Preserve its caller authority and withhold prompt_ready until its exact
+    // final/failure releases the recovered-turn fence.
+    log('Ignoring prompt-ready while a recovered remote turn is still active');
+    return;
+  }
   if (bareShellLaunchBlocked) {
     log('Ignoring non-PTY prompt-ready while bare-shell launch block is active');
     return;
@@ -13941,6 +13949,14 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
+  if (remoteRunnerRecoveredTurnInFlight) {
+    // A resumed provider can report ready while it still owns the recovered
+    // turn. That readiness only completes the transport handshake; it does not
+    // make the provider's serial turn channel available. Keep every successor
+    // queued until emitTurnTerminal() releases this exact recovered-turn fence.
+    log(`Holding ${pendingMessages.length} pending message(s) behind recovered remote turn`);
+    return;
+  }
   if (currentInputDeliveryQuarantine()) {
     log(`Holding ${pendingMessages.length} pending message(s) behind unconfirmed input delivery`);
     return;
