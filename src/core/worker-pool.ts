@@ -11751,6 +11751,10 @@ export function sendWorkerInput(
      * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
+    /** Recovery from a poisoned-history image 400: the worker rewrites the
+     *  session transcript (drops undersized image blocks), respawns with
+     *  --resume, and this turn is delivered only after the fresh CLI is ready. */
+    purgeUndersizedImages?: true;
     trustedCaller?: TrustedCaller;
   } = {},
 ): boolean {
@@ -11902,6 +11906,7 @@ export function sendWorkerInput(
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.purgeUndersizedImages ? { purgeUndersizedImages: true as const } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
