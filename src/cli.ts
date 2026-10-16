@@ -7760,6 +7760,14 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.error('botmux schedule refused: the Remote Runner relay is missing its frozen session/turn');
     process.exit(1);
   }
+  const remoteRunnerControllerOpenId = trustedRemoteRunnerRelay
+    ? process.env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID?.trim()
+    : undefined;
+  if (remoteRunnerControllerOpenId
+      && !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId)) {
+    console.error('botmux schedule refused: Remote Runner controller identity is invalid');
+    process.exit(1);
+  }
   rest = rest.filter(arg => arg !== '--remote-runner-session-tool');
   if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
     console.log(SCHEDULE_UPDATE_USAGE);
@@ -8021,6 +8029,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             larkAppId,
             body: {
               ...(trustedRemoteRunnerRelay ? { remoteRunnerSessionTool: true } : {}),
+              ...(remoteRunnerControllerOpenId ? { remoteRunnerControllerOpenId } : {}),
               task: {
               id: delegatedTaskId,
               name,

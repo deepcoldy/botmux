@@ -117,6 +117,7 @@ fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify({
   sessionId: process.env.BOTMUX_SESSION_ID,
   turnId: process.env.BOTMUX_TURN_ID,
   chatId: process.env.BOTMUX_CHAT_ID,
+  controllerOpenId: process.env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID,
   dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT,
 }));
 process.stdout.write(JSON.stringify({ total: 1 }) + '\\n');
@@ -131,6 +132,7 @@ process.stdout.write(JSON.stringify({ total: 1 }) + '\\n');
       sessionId: 'session-1',
       turnId: 'turn-1',
       chatId: 'oc_current',
+      controllerOpenId: 'ou_developer',
       dispatchAttempt: 4,
       cliPath: fixture,
       env: { PATH: process.env.PATH },
@@ -147,6 +149,7 @@ process.stdout.write(JSON.stringify({ total: 1 }) + '\\n');
       sessionId: 'session-1',
       turnId: 'turn-1',
       chatId: 'oc_current',
+      controllerOpenId: 'ou_developer',
       dispatchAttempt: '4',
     });
   });

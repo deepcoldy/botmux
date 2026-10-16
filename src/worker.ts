@@ -5994,6 +5994,13 @@ async function deliverRemoteRunnerSessionTool(
       message: 'The session tool no longer belongs to the worker\'s active turn.',
     };
   }
+  if (operation.controllerOpenId && authority.caller?.senderType !== 'bot') {
+    return {
+      outcome: 'rejected',
+      code: 'session_tool_controller_forbidden',
+      message: 'A provider-selected schedule controller is only valid for a bot-authored turn.',
+    };
+  }
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -6015,6 +6022,7 @@ async function deliverRemoteRunnerSessionTool(
     sessionId,
     turnId: operation.turnId,
     chatId: lastInitConfig.chatId,
+    ...(operation.controllerOpenId ? { controllerOpenId: operation.controllerOpenId } : {}),
     ...(currentBotmuxDispatchAttempt !== undefined
       ? { dispatchAttempt: currentBotmuxDispatchAttempt }
       : {}),

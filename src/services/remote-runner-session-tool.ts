@@ -25,6 +25,7 @@ export interface RemoteRunnerSessionToolHostContext {
   sessionId: string;
   turnId: string;
   chatId: string;
+  controllerOpenId?: string;
   dispatchAttempt?: number;
   env?: NodeJS.ProcessEnv;
   cliPath?: string;
@@ -197,6 +198,11 @@ export async function runRemoteRunnerSessionTool(
   env.BOTMUX_SESSION_ID = context.sessionId;
   env.BOTMUX_TURN_ID = context.turnId;
   env.BOTMUX_CHAT_ID = context.chatId;
+  if (context.controllerOpenId) {
+    env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID = context.controllerOpenId;
+  } else {
+    delete env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID;
+  }
   if (context.dispatchAttempt !== undefined) {
     env.BOTMUX_DISPATCH_ATTEMPT = String(context.dispatchAttempt);
   } else {

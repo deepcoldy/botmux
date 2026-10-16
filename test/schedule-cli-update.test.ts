@@ -61,6 +61,7 @@ async function managed(
   f: ReturnType<typeof fixture>,
   customize?: (proof: ManagedOriginAttestation, index: number) => void,
   managedTurnId = 'om_live',
+  observedRequests?: Array<Record<string, unknown>>,
 ) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -71,6 +72,7 @@ async function managed(
   const server = createServer(async (req, res) => {
     const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
     if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
+    observedRequests?.push(request);
     const proof: ManagedOriginAttestation = { sessionId: sid, turnId: managedTurnId, callerOpenId: 'ou_owner',
       larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' } };
     calls++;
@@ -231,6 +233,46 @@ describe('schedule CLI prompt updates', () => {
       executionPosition: 'topic',
     });
     expect(calls()).toBe(1);
+  });
+  it('forwards only a host-relayed Remote Runner controller to daemon authorization', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+      BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID: 'ou_developer',
+    });
+    const result = await f.run([
+      'add', '--schedule=10m', '--prompt=remote reminder', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    expect(requests).toContainEqual(expect.objectContaining({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_developer',
+    }));
+  });
+  it('rejects an invalid Remote Runner controller before contacting the daemon', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+      BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID: 'bad value',
+    });
+    const result = await f.run([
+      'add', '--schedule=10m', '--prompt=remote reminder', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('controller identity is invalid');
+    expect(requests).toHaveLength(0);
   });
   it('keeps Remote Runner values opaque and preserves the frozen session scope', async () => {
     const f = fixture(); await managed(f);

@@ -59,6 +59,10 @@ export function normalizeRemoteRunnerConfig(value: unknown): RemoteRunnerConfig 
         && !requiredCapabilities.includes('session_tool')) {
       throw new Error('remoteRunner.requiredCapabilities session_tool_schedule requires session_tool');
     }
+    if (requiredCapabilities.includes('session_tool_schedule_actor')
+        && !requiredCapabilities.includes('session_tool_schedule')) {
+      throw new Error('remoteRunner.requiredCapabilities session_tool_schedule_actor requires session_tool_schedule');
+    }
   }
 
   const handshakeTimeoutMs = optionalTimeout(raw.handshakeTimeoutMs, 'handshakeTimeoutMs');

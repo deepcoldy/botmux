@@ -7456,6 +7456,13 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   if (body?.remoteRunnerSessionTool !== undefined && !remoteRunnerSessionTool) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' });
   }
+  const remoteRunnerControllerOpenId = body?.remoteRunnerControllerOpenId;
+  if (remoteRunnerControllerOpenId !== undefined
+      && (!remoteRunnerSessionTool
+        || typeof remoteRunnerControllerOpenId !== 'string'
+        || !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' });
+  }
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   const trustedHost = isTrustedHostIpcRequest(req);
   const verified = authorizeSessionScopedIpc({
@@ -7536,15 +7543,26 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
   const caller = scheduleCallerForTurn(ds, turnId);
-  const direct = caller?.senderType === 'user'
+  const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
+  const providerActor = caller?.senderType === 'bot'
+    && caller.requestLarkAppId === ds.larkAppId
+    && typeof remoteRunnerControllerOpenId === 'string';
+  if (remoteRunnerControllerOpenId && !providerActor) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
+  }
+  const direct = directHuman || providerActor;
   const capability = ds.managedTurnOrigin.capability;
   try {
-    if (direct) {
-      controlOpenId = caller.requestUserOpenId;
-      controlUnionId = caller.requestUserUnionId
+    if (directHuman) {
+      controlOpenId = caller!.requestUserOpenId;
+      controlUnionId = caller!.requestUserUnionId
         ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
       grantId = `direct:${sessionId}:${turnId}`;
+    } else if (providerActor) {
+      controlOpenId = remoteRunnerControllerOpenId;
+      controlUnionId = await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined;
+      grantId = `provider-actor:${sessionId}:${turnId}`;
     } else {
       if (readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });

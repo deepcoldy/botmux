@@ -210,6 +210,59 @@ describe('RemoteRunnerBackend', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it('accepts a provider-selected schedule Actor only after bilateral capability negotiation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule', 'session_tool_schedule_actor',
+      ],
+    }, 'session-schedule-actor');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-schedule-actor', content: 'schedule-actor' });
+    await final;
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      controllerOpenId: 'ou_developer',
+      request: { tool: 'schedule.add', schedule: '10m', prompt: 'check' },
+    }));
+  });
+
+  it('rejects a provider-selected schedule Actor when the host did not require it', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule',
+      ],
+    }, 'session-schedule-actor-host-disabled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const execute = vi.fn();
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-schedule-actor', content: 'schedule-actor' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('deduplicates one outbound operation id and rejects payload conflicts', async () => {
     const backend = new RemoteRunnerBackend({ expectedProvider: 'outbound-test' }, 'session-outbound-dedupe');
     children.push(backend);

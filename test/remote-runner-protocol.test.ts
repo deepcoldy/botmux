@@ -398,6 +398,7 @@ describe('remote runner protocol', () => {
       operationId: 'session-tool-3',
       turnId: 'turn-1',
       generation: 3,
+      controllerOpenId: 'ou_developer',
       request: {
         tool: 'schedule.add',
         schedule: '10m',
@@ -409,6 +410,7 @@ describe('remote runner protocol', () => {
       },
     }))).toMatchObject({
       type: 'session_tool',
+      controllerOpenId: 'ou_developer',
       request: {
         tool: 'schedule.add',
         schedule: '10m',
@@ -416,6 +418,18 @@ describe('remote runner protocol', () => {
         position: 'topic',
       },
     });
+    for (const controllerOpenId of ['ou_', 'ou_bad value', 'developer', 42]) {
+      expect(parseRemoteRunnerEventLine(JSON.stringify({
+        protocol: REMOTE_RUNNER_PROTOCOL,
+        version: REMOTE_RUNNER_PROTOCOL_VERSION,
+        type: 'session_tool',
+        operationId: 'session-tool-invalid-controller',
+        turnId: 'turn-1',
+        generation: 3,
+        controllerOpenId,
+        request: { tool: 'schedule.add', schedule: '10m', prompt: 'x' },
+      }))).toBeUndefined();
+    }
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,

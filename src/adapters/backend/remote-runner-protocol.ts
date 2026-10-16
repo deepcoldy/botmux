@@ -41,6 +41,7 @@ export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
 export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
   'session_tool',
   'session_tool_schedule',
+  'session_tool_schedule_actor',
 ] as const;
 
 /** Optional recovery of a provider-owned turn that survived the host process. */
@@ -213,6 +214,7 @@ export interface RemoteRunnerSessionToolOperation {
   turnId: string;
   generation: number;
   request: RemoteRunnerSessionToolRequest;
+  controllerOpenId?: string;
 }
 
 export interface RemoteRunnerSessionToolAttachment {
@@ -347,6 +349,9 @@ export type RemoteRunnerEvent =
       turnId: string;
       generation: number;
       request: RemoteRunnerSessionToolRequest;
+      /** Effective human Actor selected by a trusted provider policy for a
+       * bot-authored schedule.add turn. The host freezes all other scope. */
+      controllerOpenId?: string;
     })
   | (RemoteRunnerEventBase & {
       type: 'final';
@@ -632,6 +637,7 @@ function boundedUtf8String(value: unknown, maxBytes: number, trim = false): stri
 }
 
 const SCHEDULE_TASK_ID_RE = /^[0-9a-f]{8}$/;
+const LARK_OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{1,160}$/;
 const SCHEDULE_REASONING_EFFORTS = new Set([
   'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
 ]);
@@ -977,9 +983,14 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     const operationId = nonEmptyString(raw.operationId, 256);
     const turnId = nonEmptyString(raw.turnId, 256);
     const request = normalizeRemoteRunnerSessionToolRequest(raw.request);
+    const controllerOpenId = raw.controllerOpenId === undefined
+      ? undefined
+      : nonEmptyString(raw.controllerOpenId, 163);
     if (!operationId || !ID_RE.test(operationId)
         || !turnId || !ID_RE.test(turnId)
         || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
+        || (raw.controllerOpenId !== undefined
+          && (!controllerOpenId || !LARK_OPEN_ID_RE.test(controllerOpenId)))
         || !request) {
       return undefined;
     }
@@ -991,6 +1002,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       turnId,
       generation: Number(raw.generation),
       request,
+      ...(controllerOpenId ? { controllerOpenId } : {}),
     };
   }
 

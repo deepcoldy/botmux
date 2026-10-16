@@ -25,6 +25,9 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     if (!command.sessionId.includes('no-schedule-capability')) {
       capabilities.push('session_tool_schedule');
     }
+    if (!command.sessionId.includes('no-actor-capability')) {
+      capabilities.push('session_tool_schedule_actor');
+    }
     emit({
       type: 'hello', requestId: command.requestId, provider: 'session-tool-test',
       capabilities,
@@ -45,8 +48,11 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       operationId: 'session-tool-1',
       turnId: command.turnId,
       generation: command.content === 'future-generation' ? 2 : 1,
+      ...(command.content === 'schedule-actor' ? { controllerOpenId: 'ou_developer' } : {}),
       request: command.content === 'schedule-tool'
         ? { tool: 'schedule.list' }
+        : command.content === 'schedule-actor'
+          ? { tool: 'schedule.add', schedule: '10m', prompt: 'check' }
         : { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
     });
     return;
