@@ -1407,6 +1407,18 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
 - \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
+
+## @ 点名（--mention）
+
+ask 卡片是**独立卡片，不像 \`botmux send\` 的回复那样天然 @ 触发者**——不加 \`--mention\` 时卡片不会通知任何人，只能靠对方主动看群。需要指定某人收到通知时显式点名：
+
+\`\`\`bash
+botmux ask buttons --mention ou_xxx --options "yes=继续,no=回滚" "继续发版吗？"
+\`\`\`
+
+- 只接受人类成员的 open_id（\`ou_\` 前缀，也兼容 \`ou_xxx:显示名\` 形态）；@ 机器人会被 daemon 静默剔除（飞书卡片禁止 at bot，违者整卡 100290）
+- 需要点选者作答后再 @ 他：先用 \`--json\` 拿到 \`by\`，再 \`botmux send --mention <by>\`（ask 本身不回发结论）
+- prompt 位置参数就是卡片上「问题 N」下展示的**完整问题正文**，必须自成上下文（背景 + 在问什么），不要写「（选项确认）」这类占位文案——选项 label 不能替代问题本身
 `;
 
 const GOAL_ASK_SKILL = `---

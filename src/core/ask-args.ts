@@ -18,7 +18,8 @@ export class AskArgsError extends Error {
       | 'options_empty_key'
       | 'options_duplicate_key'
       | 'timeout_out_of_range'
-      | 'timeout_not_number',
+      | 'timeout_not_number'
+      | 'mention_not_open_id',
     message: string,
   ) {
     super(message);
@@ -114,6 +115,29 @@ export function parseAskTimeoutSeconds(
     );
   }
   return n * 1000;
+}
+
+/** Parse `--mention <value>` → a human open_id.
+ *
+ *  与 `botmux send --mention` 的入参形态对齐：接受裸 open_id（`ou_xxx`）或
+ *  `open_id:显示名`（显示名仅为可读性，卡片里直接渲染真实 at，不需要它）。
+ *  其它 ID 形态（union_id `on_*`、user_id、邮箱）进了卡片 `<at>` 会被飞书
+ *  整卡拒收，这里直接 fail loud。 */
+export function parseAskMention(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value === '') {
+    throw new AskArgsError('mention_not_open_id', '--mention 需要一个 open_id（ou_ 开头）');
+  }
+  // 第一个冒号前是 open_id（与 send 的 "open_id:Display Name" 约定一致）。
+  const openId = (value.includes(':') ? value.slice(0, value.indexOf(':')) : value).trim();
+  if (!/^ou_[A-Za-z0-9]{6,64}$/.test(openId)) {
+    throw new AskArgsError(
+      'mention_not_open_id',
+      `--mention 只接受人类成员的 open_id（ou_ 开头），收到 "${value}"`,
+    );
+  }
+  return openId;
 }
 
 /** Resolve the `(sub, rest)` pair for `botmux ask`'s top-level dispatch.
