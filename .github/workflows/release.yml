@@ -772,16 +772,20 @@ jobs:
         # botmux-darwin-x64 shipped in v3.40.0 without @napi-rs/canvas's skia native:
         # the cross-built x64 target could not resolve it, and the smoke below runs
         # only the host arch, so nothing ever inspected the x64 file. Bun embeds the
-        # skia .node as raw bytes, so its unique native error string is a cheap
-        # presence check. Fail closed: a darwin binary without it cannot render cards
-        # and must not ship.
+        # skia .node as raw bytes, so a skia-only symbol name is a cheap presence
+        # check. `SkBitmap` (not the generic napi-rs `Create Custom GC
+        # ThreadsafeFunction`, which rolldown/lightningcss also carry, and not
+        # `SkCanvas`/`GrDirectContext`, which are stripped out of the published
+        # .node) is measurably present 3x in the pinned skia and absent from every
+        # other embedded native. Fail closed: a darwin binary without it cannot
+        # render cards and must not ship.
         run: |
           shopt -s nullglob
           found=0
           for f in dist-bin/botmux-darwin-*; do
             case "$f" in *.map|*.sha256) continue;; esac
             found=1
-            if ! grep -aq "Create Custom GC ThreadsafeFunction" "$f"; then
+            if ! grep -aq "SkBitmap" "$f"; then
               echo "::error::skia native missing from $f"
               exit 1
             fi
