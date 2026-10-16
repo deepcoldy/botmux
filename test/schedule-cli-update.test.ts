@@ -217,7 +217,7 @@ describe('schedule CLI prompt updates', () => {
     });
     const before = Object.keys(f.read());
     const result = await f.run([
-      'add', '10m', '--prompt', 'remote reminder', '--topic',
+      'add', '--schedule=10m', '--prompt=remote reminder', '--topic',
       '--remote-runner-session-tool',
     ]);
     expect(result.code, result.output).toBe(0);
@@ -232,12 +232,53 @@ describe('schedule CLI prompt updates', () => {
     });
     expect(calls()).toBe(1);
   });
+  it('keeps Remote Runner values opaque and preserves the frozen session scope', async () => {
+    const f = fixture(); await managed(f);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+    });
+    const before = Object.keys(f.read());
+    const result = await f.run([
+      'add', '--schedule=10m', '--prompt=--workdir=/tmp/evil',
+      '--name=--chat-id=oc_other_group', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    const added = Object.keys(f.read()).filter(id => !before.includes(id));
+    expect(added).toHaveLength(1);
+    expect(f.read()[added[0]]).toMatchObject({
+      prompt: '--workdir=/tmp/evil',
+      name: '--chat-id=oc_other_group',
+      workingDir: f.root,
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      executionPosition: 'topic',
+    });
+  });
   it('rejects the hidden Remote Runner schedule flag without host relay authority', async () => {
     const f = fixture();
     const result = await f.run(['list', '--remote-runner-session-tool']);
     expect(result.code, result.output).not.toBe(0);
     expect(result.output).toContain('requires the owning worker');
   });
+  it.each(['BOTMUX_SESSION_ID', 'BOTMUX_TURN_ID'] as const)(
+    'rejects Remote Runner relay authority without frozen %s', async missing => {
+      const f = fixture();
+      Object.assign(f.env, {
+        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+        BOTMUX_SESSION_ID: sid,
+        BOTMUX_TURN_ID: 'om_live',
+      });
+      delete f.env[missing];
+      const result = await f.run(['list', '--remote-runner-session-tool']);
+      expect(result.code, result.output).not.toBe(0);
+      expect(result.output).toContain('missing its frozen session/turn');
+    },
+  );
   it('keeps the original creator-auth error when delegated add returns non-OK', async () => {
     const f = fixture();
     await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' }; });

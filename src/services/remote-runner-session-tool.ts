@@ -74,28 +74,28 @@ export function remoteRunnerSessionToolArgs(
     case 'schedule.add': {
       const position = request.position ?? 'top-level';
       return [
-        'schedule', 'add', request.schedule,
-        '--prompt', request.prompt,
-        ...(request.name ? ['--name', request.name] : []),
+        'schedule', 'add', `--schedule=${request.schedule}`,
+        `--prompt=${request.prompt}`,
+        ...(request.name ? [`--name=${request.name}`] : []),
         position === 'topic' ? '--topic' : position === 'new-topic' ? '--new-topic' : '--top-level',
         ...(request.followActive ? ['--follow-active'] : []),
-        ...(request.topicTitle ? ['--topic-title', request.topicTitle] : []),
+        ...(request.topicTitle ? [`--topic-title=${request.topicTitle}`] : []),
         ...(request.silent ? ['--silent'] : []),
-        ...(request.model ? ['--model', request.model] : []),
-        ...(request.reasoningEffort ? ['--reasoning-effort', request.reasoningEffort] : []),
-        ...(request.calendar ? ['--calendar', request.calendar] : []),
-        ...(request.calendarDayType ? ['--calendar-day-type', request.calendarDayType] : []),
+        ...(request.model ? [`--model=${request.model}`] : []),
+        ...(request.reasoningEffort ? [`--reasoning-effort=${request.reasoningEffort}`] : []),
+        ...(request.calendar ? [`--calendar=${request.calendar}`] : []),
+        ...(request.calendarDayType ? [`--calendar-day-type=${request.calendarDayType}`] : []),
         '--remote-runner-session-tool',
       ];
     }
     case 'schedule.update':
       return [
         'schedule', 'update', request.taskId,
-        ...(request.prompt !== undefined ? ['--prompt', request.prompt] : []),
+        ...(request.prompt !== undefined ? [`--prompt=${request.prompt}`] : []),
         ...(request.calendar !== undefined
-          ? ['--calendar', request.calendar === null ? 'none' : request.calendar]
+          ? [`--calendar=${request.calendar === null ? 'none' : request.calendar}`]
           : []),
-        ...(request.calendarDayType ? ['--calendar-day-type', request.calendarDayType] : []),
+        ...(request.calendarDayType ? [`--calendar-day-type=${request.calendarDayType}`] : []),
         '--remote-runner-session-tool',
       ];
     case 'schedule.remove':

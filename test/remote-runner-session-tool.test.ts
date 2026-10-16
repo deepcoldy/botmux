@@ -61,9 +61,9 @@ describe('remote runner session tool host bridge', () => {
       model: 'gpt-5.6-sol',
       reasoningEffort: 'high',
     }, 'session-1', 'oc_current')).toEqual([
-      'schedule', 'add', '10m', '--prompt', '提醒我复查构建',
-      '--name', '构建复查', '--topic', '--silent',
-      '--model', 'gpt-5.6-sol', '--reasoning-effort', 'high',
+      'schedule', 'add', '--schedule=10m', '--prompt=提醒我复查构建',
+      '--name=构建复查', '--topic', '--silent',
+      '--model=gpt-5.6-sol', '--reasoning-effort=high',
       '--remote-runner-session-tool',
     ]);
     expect(remoteRunnerSessionToolArgs({
@@ -72,7 +72,7 @@ describe('remote runner session tool host bridge', () => {
       prompt: '新提示',
       calendar: null,
     }, 'session-1', 'oc_current')).toEqual([
-      'schedule', 'update', 'deadbeef', '--prompt', '新提示', '--calendar', 'none',
+      'schedule', 'update', 'deadbeef', '--prompt=新提示', '--calendar=none',
       '--remote-runner-session-tool',
     ]);
     expect(remoteRunnerSessionToolArgs({
@@ -81,6 +81,27 @@ describe('remote runner session tool host bridge', () => {
     }, 'session-1', 'oc_current')).toEqual([
       'schedule', 'remove', 'deadbeef', '--remote-runner-session-tool',
     ]);
+  });
+
+  it('keeps provider strings in opaque argv tokens instead of re-parsing them as flags', () => {
+    const args = remoteRunnerSessionToolArgs({
+      tool: 'schedule.add',
+      schedule: '--workdir=/tmp/schedule',
+      prompt: '--workdir=/tmp/evil',
+      name: '--chat-id=oc_other',
+      position: 'new-topic',
+      topicTitle: '--root-msg-id=om_other',
+      calendar: '--lark-app-id=cli_other',
+    }, 'session-1', 'oc_current');
+    expect(args).toContain('--schedule=--workdir=/tmp/schedule');
+    expect(args).toContain('--prompt=--workdir=/tmp/evil');
+    expect(args).toContain('--name=--chat-id=oc_other');
+    expect(args).toContain('--topic-title=--root-msg-id=om_other');
+    expect(args).toContain('--calendar=--lark-app-id=cli_other');
+    expect(args).not.toContain('--workdir=/tmp/evil');
+    expect(args).not.toContain('--chat-id=oc_other');
+    expect(args).not.toContain('--root-msg-id=om_other');
+    expect(args).not.toContain('--lark-app-id=cli_other');
   });
 
   it('freezes session authority and returns the exact child result', async () => {

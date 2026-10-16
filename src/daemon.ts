@@ -7452,6 +7452,10 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   try { body = await readJsonBody(req, 64 * 1024); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' }); }
   const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const remoteRunnerSessionTool = body?.remoteRunnerSessionTool === true;
+  if (body?.remoteRunnerSessionTool !== undefined && !remoteRunnerSessionTool) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' });
+  }
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   const trustedHost = isTrustedHostIpcRequest(req);
   const verified = authorizeSessionScopedIpc({
@@ -7505,6 +7509,22 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   const reply = pickTurnReplyTarget(ds.session, ds.managedTurnOrigin.turnId);
   const expectedRoot = reply?.rootMessageId
     ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined);
+  if (remoteRunnerSessionTool) {
+    const expectedWorkingDir = ds.workingDir ?? ds.session.workingDir;
+    if (!expectedWorkingDir
+      || task.chatId !== ds.chatId
+      || task.workingDir !== expectedWorkingDir
+      || task.deliver === 'local') {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_scope_invalid' });
+    }
+    if (task.executionPosition === 'topic'
+      && (!expectedRoot || task.rootMessageId !== expectedRoot)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_root_mismatch' });
+    }
+    if (task.executionPosition !== 'topic' && task.rootMessageId !== undefined) {
+      return jsonRes(res, 400, { ok: false, error: 'schedule_session_tool_root_forbidden' });
+    }
+  }
   const turnId = ds.managedTurnOrigin.turnId;
   const generation = ds.workerGeneration;
   let controlOpenId: string | undefined;

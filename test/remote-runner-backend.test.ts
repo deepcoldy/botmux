@@ -181,6 +181,35 @@ describe('RemoteRunnerBackend', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it('rejects a schedule session tool when the host did not require the schedule capability', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool',
+      ],
+    }, 'session-host-read-only');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-schedule-tool', content: 'schedule-tool' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('deduplicates one outbound operation id and rejects payload conflicts', async () => {
     const backend = new RemoteRunnerBackend({ expectedProvider: 'outbound-test' }, 'session-outbound-dedupe');
     children.push(backend);

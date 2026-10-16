@@ -815,6 +815,7 @@ export function normalizeRemoteRunnerSessionToolRequest(
     const resolvedPosition = position ?? 'top-level';
     if (raw.followActive === true && resolvedPosition !== 'topic') return undefined;
     if (topicTitle && resolvedPosition !== 'new-topic') return undefined;
+    if (topicTitle && Array.from(topicTitle).length > 200) return undefined;
     return {
       tool: 'schedule.add',
       schedule,

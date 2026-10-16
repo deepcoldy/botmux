@@ -28,6 +28,7 @@ function harness(overrides: Record<string, unknown> = {}) {
   const turnId = 'om_kickoff';
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
+    workingDir: '/repo',
     session: { sessionId: 'target-session', scope: 'thread', rootMessageId: 'om_root',
       replyTargets: { [turnId]: { rootMessageId: 'om_root' } } },
     workerGeneration: 7,
@@ -209,6 +210,41 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
     } };
     h.ds.session.replyTargets = {};
     expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerUnionId: 'on_active_user' } } });
+  });
+
+  it('accepts a Remote Runner session tool only inside its frozen chat, root, and working directory', async () => {
+    const h = directHumanHarness();
+    h.body.remoteRunnerSessionTool = true;
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = 'om_root';
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      chatId: 'oc_chat', rootMessageId: 'om_root', workingDir: '/repo',
+    } } });
+  });
+
+  it.each([
+    [{ chatId: 'oc_other' }, 'schedule_session_tool_scope_invalid'],
+    [{ workingDir: '/tmp/evil' }, 'schedule_session_tool_scope_invalid'],
+    [{ rootMessageId: 'om_other' }, 'schedule_session_tool_root_mismatch'],
+  ])('rejects Remote Runner direct scope expansion %o', async (patch, error) => {
+    const h = directHumanHarness();
+    h.body.remoteRunnerSessionTool = true;
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = 'om_root';
+    Object.assign(h.body.task, patch);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Remote Runner root outside topic execution', async () => {
+    const h = directHumanHarness();
+    h.body.remoteRunnerSessionTool = true;
+    h.body.task.rootMessageId = 'om_root';
+    expect(await h.run()).toMatchObject({
+      status: 400,
+      value: { error: 'schedule_session_tool_root_forbidden' },
+    });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
   });
 
   it.each([
