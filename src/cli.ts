@@ -31,6 +31,7 @@ import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
  */
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
+import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
@@ -6863,6 +6864,7 @@ const SEND_HELP_BODY = [
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
   '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈与页脚签名',
+  '       --schedule-remove-self          scheduled turn 的 final 成功投递后删除当前任务',
   '       --completion-proposal-file <path>  仅限标准 final；附一个 requester-only 的二选一可选后续动作',
   '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
@@ -8838,7 +8840,7 @@ async function relaySend(
     // the dashboard hand anyway; excluding it would silently send the reason as a
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent', '--schedule-remove-self']);
     content = pos.length > 0
       ? normalizePositionalSendContent(pos.join(' '))
       : await readStdin();
@@ -8921,7 +8923,7 @@ async function relaySend(
   // identity (must match the watcher's allowlist); path,
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self']);
   const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
@@ -9452,7 +9454,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
+    const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--schedule-remove-self']);
     content = pos.length > 0
       ? normalizePositionalSendContent(pos.join(' '))
       : await readStdin();
@@ -9865,6 +9867,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
     process.exit(2);
   }
+  const scheduleRemoveSelfOccurrences = rest.filter(token => token === '--schedule-remove-self').length;
+  if (scheduleRemoveSelfOccurrences > 1) {
+    console.error('botmux send: --schedule-remove-self 只能指定一次');
+    process.exit(2);
+  }
+  const scheduleRemoveSelfRequested = scheduleRemoveSelfOccurrences === 1;
   const asOccurrences = rest.filter(token => token === '--as' || token.startsWith('--as=')).length;
   if (asOccurrences > 1) {
     console.error('botmux send: --as 只能指定一次');
@@ -10152,7 +10160,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
   const turnSendLedger = new TurnSendLedger(resolveDataDir());
-  while (liveMarkerCtx?.markerPid && liveMarkerCtx.turnId && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
+  while (!scheduleRemoveSelfRequested
+    && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
+    && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
     const activeMarkerKey = {
       larkAppId: originSession?.larkAppId ?? s.larkAppId,
       sessionId: originSessionId ?? sid,
@@ -10172,6 +10182,78 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     break;
   }
+
+  const scheduleCleanupPlan = planScheduleFinalCleanup({
+    requested: scheduleRemoveSelfRequested,
+    responseKind,
+    turnId: currentTurnId,
+    incompatible: [
+      ...(sendTopLevel ? ['--top-level'] : []),
+      ...(overrideChatId ? ['--chat-id'] : []),
+      ...(sendInto ? ['--into'] : []),
+      ...(asVoice ? ['--voice'] : []),
+      ...(customCardRequested ? ['--card-file/--card-json'] : []),
+      ...(files.length > 0 ? ['--files'] : []),
+      ...(videoAttachments.length > 0 ? ['--videos'] : []),
+      ...(attention.requested ? ['--attention'] : []),
+      ...(urgent.requested ? ['--urgent'] : []),
+      ...(asChoice ? ['--as'] : []),
+      ...(isSlashSend ? ['--slash'] : []),
+    ],
+  });
+  if (!scheduleCleanupPlan.ok) {
+    console.error(`botmux send: ${scheduleCleanupPlan.error}`);
+    process.exit(2);
+  }
+  const scheduleRemoveSelfTaskId = scheduleCleanupPlan.taskId;
+  let scheduleSelfCleanup: {
+    requested: true;
+    taskId: string;
+    removed: boolean;
+    replay?: boolean;
+    error?: string;
+  } | undefined;
+  const removeScheduleSelfAfterFinal = async (): Promise<typeof scheduleSelfCleanup> => {
+    if (!scheduleRemoveSelfTaskId) return undefined;
+    if (scheduleSelfCleanup) return scheduleSelfCleanup;
+    try {
+      const response = await postCurrentSessionDaemonRoute({
+        path: SCHEDULE_MANAGED_MUTATE_ROUTE,
+        sessionId: sid,
+        larkAppId: s.larkAppId!,
+        body: { action: 'remove', id: scheduleRemoveSelfTaskId },
+      });
+      const body = await response.json().catch(() => ({})) as {
+        ok?: boolean;
+        replay?: boolean;
+        error?: string;
+      };
+      if (!response.ok || body.ok !== true) {
+        throw new Error(body.error ?? `HTTP ${response.status}`);
+      }
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: true,
+        ...(body.replay === true ? { replay: true } : {}),
+      };
+      console.error(body.replay === true
+        ? `✓ 定时任务 ${scheduleRemoveSelfTaskId} 已经删除（幂等回读）`
+        : `✓ 最终答复已投递，定时任务 ${scheduleRemoveSelfTaskId} 已自动删除`);
+    } catch (error) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      console.error(
+        `⚠️ 最终答复已投递，但定时任务 ${scheduleRemoveSelfTaskId} 自动删除失败：${scheduleSelfCleanup.error}`
+        + '；当前 turn 已保留，请原样重试同一命令（不会重复发送 final，只会补做自删）',
+      );
+    }
+    return scheduleSelfCleanup;
+  };
 
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
@@ -10410,6 +10492,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // docCommentTargets entry remains the authoritative origin sink.
   const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
     || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
+  if (scheduleRemoveSelfTaskId && isOriginDocCommentTurn) {
+    console.error('botmux send: --schedule-remove-self 只支持当前会话内的标准 final 卡，不支持文档评论回复');
+    process.exit(2);
+  }
   // A virtual document anchor is never an IM receive_id. Missing, ambiguous,
   // stale, or cross-session origin state must fail before any provider effect.
   if (!isOriginDocCommentTurn
@@ -10458,7 +10544,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound']);
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound', '--schedule-remove-self']);
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -10536,7 +10622,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound', '--schedule-remove-self']);
     if (pos.length > 0) {
       content = normalizePositionalSendContent(pos.join(' '));
     } else {
@@ -10768,6 +10854,14 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    await removeScheduleSelfAfterFinal();
+    if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
+      advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        originTurnId ?? currentTurnId,
+      );
+    }
     console.error(`✓ 已复用本轮最终回答 ${existingTurnPrimary.messageId}`);
     console.log(JSON.stringify({
       success: true,
@@ -10775,6 +10869,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       sessionId: sid,
       turnId: currentTurnId,
       replayed: true,
+      ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
     }));
     return;
   }
@@ -12445,6 +12540,14 @@ async function cmdSend(rest: string[]): Promise<void> {
             : 'standard_reply_card',
         );
       }
+      await removeScheduleSelfAfterFinal();
+      if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
+        advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
+        );
+      }
       console.error(`✓ 已复用本轮最终回答 ${messageId}`);
       console.log(JSON.stringify({
         success: true,
@@ -12452,6 +12555,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         sessionId: sid,
         turnId: currentTurnId,
         replayed: true,
+        ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       }));
       return;
     }
@@ -12578,8 +12682,11 @@ async function cmdSend(rest: string[]): Promise<void> {
           : 'non_patchable',
       );
     }
+    await removeScheduleSelfAfterFinal();
     let advancedNextTurnId: string | undefined;
-    if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+    if (effectiveResponseKind === 'final'
+      && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)
+      && liveMarkerCtx?.markerPid) {
       const advResult = advanceAncestorSessionTurn(
         sendDataDir,
         liveMarkerCtx.markerPid,
@@ -12749,6 +12856,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
+      ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       ...(completionProposalRecord && !completionProposalOmittedReason
         ? { proposalId: completionProposalRecord.proposalId, proposalStatus: completionProposalRecord.status }
         : completionProposalFile !== undefined

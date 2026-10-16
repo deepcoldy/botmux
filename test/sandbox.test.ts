@@ -560,6 +560,18 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag not allowed: --urgent=all' });
   });
 
+  it('allows final schedule self-removal through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--response-kind', 'final', '--schedule-remove-self', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: {
+        flags: ['--response-kind', 'final', '--schedule-remove-self', '--no-mention'],
+      },
+    });
+  });
+
   it('accepts a custom card file as a plain outbox basename', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',

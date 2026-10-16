@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { authorizeDelegatedScheduleRun, authorizeDelegatedScheduleSelfManage } from '../src/core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from '../src/core/schedule-delegated-runtime.js';
 import type { ScheduleAuthorityRecord } from '../src/services/schedule-authority-store.js';
 import type { ScheduledTask } from '../src/types.js';
 
@@ -55,18 +55,78 @@ describe('delegated schedule runtime authorization', () => {
     })).rejects.toThrow('no longer a target chat member');
   });
 
-  it('allows only explicitly enabled self-management after live controller checks', async () => {
-    await expect(authorizeDelegatedScheduleSelfManage(authority, {
+  it('allows only explicitly enabled delegated self-management after live controller checks', async () => {
+    await expect(authorizeScheduleSelfManage(authority, {
       selfManageEnabled: true,
+      targetChatId: 'oc_chat',
       adminOpenIds: ['ou_user_target'],
       resolveTargetOpenId: async () => 'ou_user_target',
       listChatMemberOpenIds: async () => ['ou_user_target'],
     })).resolves.toBeUndefined();
-    await expect(authorizeDelegatedScheduleSelfManage(authority, {
+    await expect(authorizeScheduleSelfManage(authority, {
       selfManageEnabled: false,
+      targetChatId: 'oc_chat',
       adminOpenIds: ['ou_user_target'],
       resolveTargetOpenId: async () => 'ou_user_target',
       listChatMemberOpenIds: async () => ['ou_user_target'],
     })).rejects.toThrow('self-management is not allowed');
+  });
+
+  it('lets a direct task stop itself without the delegation opt-in', async () => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority,
+      kind: 'direct',
+      selfManage: false,
+      credentialOpenId: undefined,
+      runScopes: [],
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_chat',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).resolves.toBeUndefined();
+  });
+
+  it('keeps legacy tasks outside scheduled self-management', async () => {
+    await expect(authorizeScheduleSelfManage({ ...authority, kind: 'legacy' }, {
+      selfManageEnabled: true,
+      targetChatId: 'oc_chat',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).rejects.toThrow('self-management is not allowed');
+  });
+
+  it('allows the exact final live turn to remove a naturally completed task', async () => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority,
+      kind: 'direct',
+      state: 'completed',
+      task: {
+        ...authority.task,
+        enabled: false,
+        disabledReason: 'once_completed',
+      },
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_target',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async chatId => chatId === 'oc_target' ? ['ou_user_target'] : [],
+    })).resolves.toBeUndefined();
+  });
+
+  it('checks self-management against the chat hosting the current scheduled turn', async () => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority,
+      kind: 'direct',
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_other_target',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async chatId => chatId === 'oc_chat' ? ['ou_user_target'] : [],
+    })).rejects.toThrow('no longer a target chat member');
   });
 });

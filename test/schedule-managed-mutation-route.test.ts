@@ -21,7 +21,7 @@ const handler = ${handler.getText(source)}`, {
 
 function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const ds: any = {
-    larkAppId: 'cli_target', session: { sessionId: 's1' },
+    larkAppId: 'cli_target', chatId: 'oc_chat', session: { sessionId: 's1' },
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
       senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_admin',
@@ -33,7 +33,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   };
   const record: any = { kind: 'delegated', state: 'active', selfManage: false,
     task: { id: 'a1b2c3d4', chatId: 'oc_chat' } };
-  const authorizeDelegatedScheduleSelfManage = vi.fn(async () => undefined);
+  const authorizeScheduleSelfManage = vi.fn(async () => undefined);
   const scope: any = {
     readJsonBody: async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
       originTurnId: turnId, action, id, prompt: 'changed' }),
@@ -42,7 +42,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     isTrustedHostIpcRequest: () => false,
     getDashboardAdminOpenIds: () => ['ou_admin'],
     parseScheduledTurnId,
-    authorizeDelegatedScheduleSelfManage,
+    authorizeScheduleSelfManage,
     readGlobalConfig: () => ({ scheduleDelegation: { selfManageEnabled: true } }),
     resolveTargetAppOpenId: async () => ({ status: 'resolved', openId: 'ou_admin' }),
     listChatMemberOpenIds: async () => ['ou_admin'],
@@ -51,7 +51,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
   };
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
-  return { ds, record, scheduler, authorizeDelegatedScheduleSelfManage, run: () => run({}, {}) };
+  return { ds, record, scheduler, authorizeScheduleSelfManage, run: () => run({}, {}) };
 }
 
 describe('managed schedule mutation route', () => {
@@ -79,9 +79,47 @@ describe('managed schedule mutation route', () => {
     h.ds.activeInteractiveTurn.caller.senderType = 'bot';
     h.record.selfManage = true;
     expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
-    expect(h.authorizeDelegatedScheduleSelfManage).toHaveBeenCalledOnce();
+    expect(h.authorizeScheduleSelfManage).toHaveBeenCalledOnce();
     expect(action === 'pause' ? h.scheduler.disableTask : h.scheduler.removeTask)
       .toHaveBeenCalledWith('a1b2c3d4');
+  });
+
+  it.each(['pause', 'remove'] as const)('lets a direct scheduled turn %s only itself', async action => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness(action, turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    h.record.selfManage = false;
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.authorizeScheduleSelfManage).toHaveBeenCalledOnce();
+    expect(action === 'pause' ? h.scheduler.disableTask : h.scheduler.removeTask)
+      .toHaveBeenCalledWith('a1b2c3d4');
+  });
+
+  it('treats exact self-removal of an already revoked task as an idempotent success', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('remove', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    h.record.state = 'revoked';
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true, replay: true } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('lets the still-live final turn remove a naturally completed direct task', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('remove', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    h.record.state = 'completed';
+    h.record.task.enabled = false;
+    h.record.task.disabledReason = 'once_completed';
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.authorizeScheduleSelfManage).toHaveBeenCalledWith(
+      h.record,
+      expect.objectContaining({ targetChatId: 'oc_chat' }),
+    );
+    expect(h.scheduler.removeTask).toHaveBeenCalledWith('a1b2c3d4');
   });
 
   it('does not let a scheduled turn manage another task or force-run itself', async () => {

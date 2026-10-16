@@ -10,11 +10,14 @@ import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
 
-function createFixture(topicUnavailablePolicy?: 'stop', session: Record<string, unknown> = {}) {
+function createFixture(
+  topicUnavailablePolicy?: 'stop',
+  session: Record<string, unknown> = {},
+  turnId = 'om_turn_idempotency',
+) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-turn-idempotency-'));
   const dataDir = join(root, 'data');
   const sessionId = 'sid_turn_idempotency';
-  const turnId = 'om_turn_idempotency';
   mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
   writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId, turnId }));
   writeFileSync(join(root, 'bots.json'), JSON.stringify([{
@@ -278,6 +281,39 @@ describe('botmux send per-turn final idempotency', () => {
       expect(markerAfter.turnId).toBe('om_turn_2');
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
+
+  it('keeps a scheduled turn current when replayed final cleanup cannot reach its daemon', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const f = createFixture(undefined, { scope: 'chat' }, scheduledTurn);
+    try {
+      const first = f.run('final', 'scheduled answer');
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+
+      const markerPath = join(f.dataDir, '.botmux-cli-pids', String(process.pid));
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: f.sessionId,
+        turnId: scheduledTurn,
+        queuedTurns: [{ turnId: 'om_turn_2' }],
+      }));
+
+      const retry = f.run('final', 'scheduled answer', ['--schedule-remove-self']);
+      expect(retry.result.status, String(retry.result.stderr)).toBe(0);
+      expect(retry.requests).toHaveLength(0);
+      expect(String(retry.result.stderr)).toContain('当前 turn 已保留');
+      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+        replayed: true,
+        scheduleSelfCleanup: {
+          requested: true,
+          taskId: 'a1b2c3d4',
+          removed: false,
+        },
+      });
+      const markerAfter = JSON.parse(readFileSync(markerPath, 'utf8'));
+      expect(markerAfter.turnId).toBe(scheduledTurn);
+      expect(markerAfter.queuedTurns).toEqual([{ turnId: 'om_turn_2' }]);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
 
   it('promotes auxiliary to final and quotes queued turn when active turn has delivered final and successor has not', () => {
     const f = createFixture(undefined, {

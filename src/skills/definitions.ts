@@ -83,9 +83,22 @@ botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
 
-委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
-\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+真人当前回合创建的 direct 任务，以及宿主显式启用了 self-management 的委托任务，
+在自己的 scheduled turn 内都可用 \`botmux schedule pause self\` 或
+\`botmux schedule remove self\` 停止自己。
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
+
+如果任务需要先发送最终结果再删除自身，必须把两个动作合并到同一次发送：
+
+\`\`\`bash
+botmux send --response-kind final --schedule-remove-self --no-mention "任务已完成"
+\`\`\`
+
+该命令先确认 final 已成功投递并落账，再让 daemon 删除当前精确 task，最后才推进排队
+turn。不要先发 final、再单独执行 \`schedule remove self\`；final 可能已经把长驻 CLI
+切到下一排队 turn，后续命令会因身份过期而被安全拒绝。如果结构化结果里的
+\`scheduleSelfCleanup.removed\` 为 \`false\`，原样重试同一命令；BotMux 会复用已投递的
+final，只补做自删，不会重复发消息。
 
 ## 典型用法
 
@@ -748,6 +761,7 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 | \`--card-file <path>\` | 直接发送 interactive card JSON 文件（纯展示 + open_url，交互控件被拒） |
 | \`--card-json <json>\` | 直接发送 interactive card JSON 字符串（纯展示 + open_url，交互控件被拒） |
 | \`--response-kind final\` | 声明当前标准回复是最终答案，允许 Core 挂反馈与受约束完成后续 |
+| \`--schedule-remove-self\` | 仅 scheduled turn + 标准 final；投递成功并落账后删除当前精确任务 |
 | \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
 | \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |

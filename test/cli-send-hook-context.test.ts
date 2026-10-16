@@ -131,6 +131,31 @@ describe('cmdSend hook context wiring', () => {
     expect(relaySend).toContain("'--plugin-card-action'");
   });
 
+  it('finishes a scheduled task only after final delivery and before turn advancement', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    const sendStart = cliSource.indexOf('async function cmdSend(');
+    const sendEnd = cliSource.indexOf('\n// ─── Card subcommand', sendStart);
+    const cmdSend = cliSource.slice(sendStart, sendEnd);
+
+    expect(cliSource).toContain('--schedule-remove-self');
+    expect(relaySend).toContain("'--schedule-remove-self'");
+    expect(cmdSend).toContain("responseKind !== 'final'");
+    expect(cmdSend).toContain('planScheduleFinalCleanup({');
+    expect(cmdSend).toContain("action: 'remove', id: scheduleRemoveSelfTaskId");
+    expect(cmdSend).toContain('while (!scheduleRemoveSelfRequested');
+    expect(cmdSend).toContain("...(isSlashSend ? ['--slash'] : [])");
+    expect(cmdSend).toContain('scheduleSelfCleanup?.removed === true');
+    expect(cmdSend).toContain('--schedule-remove-self 只支持当前会话内的标准 final 卡，不支持文档评论回复');
+    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
+    const cleanup = cmdSend.indexOf('await removeScheduleSelfAfterFinal();', primarySend);
+    const advance = cmdSend.indexOf('advanceAncestorSessionTurn(', cleanup);
+    expect(primarySend).toBeGreaterThanOrEqual(0);
+    expect(cleanup).toBeGreaterThan(primarySend);
+    expect(advance).toBeGreaterThan(cleanup);
+  });
+
   it('keeps completion proposals on the canonical final-card and sandbox outbox paths', () => {
     const relayStart = cliSource.indexOf('async function relaySend(');
     const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
