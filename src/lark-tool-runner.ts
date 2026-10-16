@@ -2,6 +2,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
 import { larkToolExecutionArgs } from './core/lark-tool-command.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import { isHeadlessSessionChatId } from './core/types.js';
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -34,7 +35,7 @@ async function main(): Promise<void> {
     identity = { mode: invocation.mode, credential: result.credential };
   }
   if (invocation.showHelp) {
-    process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en')}\n`);
+    process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en', isHeadlessSessionChatId(process.env.BOTMUX_CHAT_ID ?? ''))}\n`);
   }
   const args = larkToolExecutionArgs(invocation);
   const child = spawn(binding.realBinary, args, {

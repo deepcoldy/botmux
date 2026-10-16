@@ -146,6 +146,9 @@ export interface FsPolicyContext {
    *  authPaths (`~/.codex` etc.) are NOT Feishu creds and stay granted readWrite.
    *  Absent/true = normal behavior. */
   larkTransportEnabled?: boolean;
+  /** Worker-verified managed tool binding. Grants only this session's read-only
+   * wrapper/binding subtree; never the bot keystore or chat transport. */
+  larkToolIdentityEnabled?: boolean;
   /** No-transport ONLY: the SECOND botmux authority root to freeze, when the
    *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
    *  (= dirname(dataDir), passed as `botmuxHome`) differs from the default
@@ -869,6 +872,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // anyone whose token it could name.
   if (ctx.sessionId && larkTransport) {
     push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
+  } else if (ctx.sessionId && ctx.larkToolIdentityEnabled === true) {
+    const identity = `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`;
+    // The no-transport exception carries only the managed bot tool. Do not
+    // expose legacy user env/delegation files that may share this identity dir.
+    push([`${identity}/lark-cli`, `${identity}/shell`,
+      `${identity}/.data/lark-tool-binding.json`, `${identity}/.data/lark-config`], 'readOnly', 'internal');
   }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.

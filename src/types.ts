@@ -1910,6 +1910,8 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
         cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
         terminalCardEpoch?: string;
+        /** Daemon-owned durable headless provenance, never taken from CLI env. */
+        headless?: Pick<NonNullable<Session['headless']>, 'id' | 'source'>;
       }
     : Message
   : never;
