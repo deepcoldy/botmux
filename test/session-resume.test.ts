@@ -272,7 +272,6 @@ describe('takeOverDurableActiveRemoteSession', () => {
   it('materializes only the claimed canonical snapshot and reattaches before routing', async () => {
     const canonical = activeRemoteCanonical();
     const map = new Map<string, DaemonSession>();
-    const claimCanonical = vi.fn(async () => structuredClone(canonical));
     vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
       expect(prompt).toBe('');
       expect(resume).toEqual({ resume: true, remoteResumeMode: 'reattach' });
@@ -281,7 +280,7 @@ describe('takeOverDurableActiveRemoteSession', () => {
       return true;
     });
 
-    const result = await takeOverDurableActiveRemoteSession(canonical, map, claimCanonical);
+    const result = await takeOverDurableActiveRemoteSession(canonical, map);
 
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -295,47 +294,17 @@ describe('takeOverDurableActiveRemoteSession', () => {
       expect(result.ds.session.webPort).toBeUndefined();
       expect(result.ds.suppressRecoveryCard).toBe(true);
     }
-    expect(claimCanonical).toHaveBeenCalledOnce();
     expect(forkWorker).toHaveBeenCalledOnce();
     expect(map.get(sessionKey('om_remote_root', 'app_test'))?.session.sessionId)
       .toBe(canonical.sessionId);
     expect(sessionStore.getOwnedSession(canonical.sessionId)?.status).toBe('active');
   });
 
-  it('refreshes the distributed claim even when the exact local runtime already exists', async () => {
-    const canonical = activeRemoteCanonical();
-    const ds = {
-      session: canonical,
-      worker: { killed: false },
-      workerPort: null,
-      workerToken: null,
-      larkAppId: 'app_test',
-      chatId: 'oc_remote',
-      chatType: 'group',
-      scope: 'thread',
-      spawnedAt: Date.now(),
-      cliVersion: 'test',
-      lastMessageAt: Date.now(),
-      hasHistory: true,
-    } as DaemonSession;
-    const map = new Map([[sessionKey('om_remote_root', 'app_test'), ds]]);
-    const claimCanonical = vi.fn(async () => structuredClone(canonical));
-
-    await expect(takeOverDurableActiveRemoteSession(canonical, map, claimCanonical))
-      .resolves.toMatchObject({ ok: true, ds, alreadyLocal: true });
-    expect(claimCanonical).toHaveBeenCalledOnce();
-    expect(forkWorker).not.toHaveBeenCalled();
-  });
-
-  it('rejects non-remote or incomplete canonical state before claiming ownership', async () => {
-    const claimCanonical = vi.fn(async () => activeRemoteCanonical());
-
+  it('rejects non-remote or incomplete canonical state before materialization', async () => {
     await expect(takeOverDurableActiveRemoteSession(
       activeRemoteCanonical({ remoteBackendState: undefined }),
       new Map(),
-      claimCanonical,
     )).resolves.toMatchObject({ ok: false, error: 'unsupported_session' });
-    expect(claimCanonical).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
@@ -350,7 +319,6 @@ describe('takeOverDurableActiveRemoteSession', () => {
     await expect(takeOverDurableActiveRemoteSession(
       canonical,
       map,
-      async () => structuredClone(canonical),
     )).resolves.toMatchObject({ ok: false, error: 'worker_start_failed' });
     expect(map.size).toBe(0);
     expect(sessionStore.getOwnedSession(canonical.sessionId)).toMatchObject({
@@ -359,7 +327,7 @@ describe('takeOverDurableActiveRemoteSession', () => {
     });
   });
 
-  it('does not overwrite an unregistered active local row after claiming', async () => {
+  it('does not overwrite an unregistered active local row', async () => {
     const canonical = activeRemoteCanonical();
     sessionStore.updateSession({
       ...canonical,
@@ -369,18 +337,14 @@ describe('takeOverDurableActiveRemoteSession', () => {
         remoteSessionId: 'possibly-live-local-remote',
       },
     });
-    const claimCanonical = vi.fn(async () => structuredClone(canonical));
-
     await expect(takeOverDurableActiveRemoteSession(
       canonical,
       new Map(),
-      claimCanonical,
     )).resolves.toMatchObject({
       ok: false,
       error: 'materialization_failed',
       detail: expect.stringContaining('unregistered active local Session'),
     });
-    expect(claimCanonical).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
     expect(sessionStore.getOwnedSession(canonical.sessionId)?.pid).toBe(123);
   });

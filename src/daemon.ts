@@ -30119,25 +30119,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             takeOverPrimarySession: async (stableKey, canonical) => {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
               try {
+                const claimed = await claimDurableLarkActiveSession({
+                  facade: primaryRuntime.session,
+                  sessionKey: stableKey,
+                  expectedSessionId: canonical.sessionId,
+                  expectedLarkAppId: cfg.larkAppId,
+                });
+                if (claimed.kind !== 'claimed') {
+                  throw new Error(
+                    claimed.kind === 'occupied'
+                      ? `durable active takeover Session is occupied by ${claimed.ownerId}`
+                      : `durable active takeover claim failed: ${claimed.kind}`,
+                  );
+                }
+                const local = activeSessions.get(stableKey);
+                if (local?.session.sessionId === claimed.session.sessionId
+                    && local.session.status === 'active') {
+                  return local.session;
+                }
                 const takeover = await takeOverDurableActiveRemoteSession(
-                  canonical,
+                  claimed.session,
                   activeSessions,
-                  async () => {
-                    const claimed = await claimDurableLarkActiveSession({
-                      facade: primaryRuntime!.session,
-                      sessionKey: stableKey,
-                      expectedSessionId: canonical.sessionId,
-                      expectedLarkAppId: cfg.larkAppId,
-                    });
-                    if (claimed.kind !== 'claimed') {
-                      throw new Error(
-                        claimed.kind === 'occupied'
-                          ? `durable active takeover Session is occupied by ${claimed.ownerId}`
-                          : `durable active takeover claim failed: ${claimed.kind}`,
-                      );
-                    }
-                    return claimed.session;
-                  },
                 );
                 if (!takeover.ok) {
                   throw new Error(

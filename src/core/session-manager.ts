@@ -3532,7 +3532,7 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 }
 
 export type DurableActiveSessionTakeoverResult =
-  | { ok: true; ds: DaemonSession; alreadyLocal?: true }
+  | { ok: true; ds: DaemonSession }
   | {
       ok: false;
       error:
@@ -3580,27 +3580,24 @@ function activeCanonicalTakeoverUnsupportedReason(session: Session): string | un
 
 /**
  * Materialize one already-active canonical Remote Runner Session on this
- * replica after the caller has acquired its distributed Session lease.
- *
- * `claimCanonical` is intentionally invoked while the local routing-key lock
- * is held.  It must return the post-claim canonical snapshot, so local
- * persistence never starts from the stale pre-lease read used by the router.
+ * replica after the caller has acquired its distributed Session lease. The
+ * input must be the post-claim canonical snapshot, never the router's earlier
+ * read, so local persistence cannot materialize stale state.
  */
 export async function takeOverDurableActiveRemoteSession(
-  expectedCanonical: Session,
+  canonical: Session,
   activeSessions: Map<string, DaemonSession>,
-  claimCanonical: () => Promise<Session>,
 ): Promise<DurableActiveSessionTakeoverResult> {
-  const unsupported = activeCanonicalTakeoverUnsupportedReason(expectedCanonical);
+  const unsupported = activeCanonicalTakeoverUnsupportedReason(canonical);
   if (unsupported) return { ok: false, error: 'unsupported_session', detail: unsupported };
-  const expectedAppId = expectedCanonical.larkAppId!;
-  const expectedSessionId = expectedCanonical.sessionId;
-  const expectedAnchor = storedSessionAnchorId(expectedCanonical);
+  const expectedAppId = canonical.larkAppId!;
+  const expectedSessionId = canonical.sessionId;
+  const expectedAnchor = storedSessionAnchorId(canonical);
   const key = sessionKey(expectedAnchor, expectedAppId);
 
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     const existing = activeSessions.get(key);
-    if (existing && existing.session.sessionId !== expectedSessionId) {
+    if (existing) {
       return {
         ok: false as const,
         error: 'anchor_occupied' as const,
@@ -3608,7 +3605,7 @@ export async function takeOverDurableActiveRemoteSession(
       };
     }
     const sameIdElsewhere = [...activeSessions.values()].find(
-      ds => ds !== existing && ds.session.sessionId === expectedSessionId,
+      ds => ds.session.sessionId === expectedSessionId,
     );
     if (sameIdElsewhere) {
       return {
@@ -3627,42 +3624,12 @@ export async function takeOverDurableActiveRemoteSession(
       };
     }
 
-    const claimed = await claimCanonical();
-    const claimUnsupported = activeCanonicalTakeoverUnsupportedReason(claimed);
-    if (claimUnsupported
-        || claimed.sessionId !== expectedSessionId
-        || claimed.larkAppId !== expectedAppId
-        || storedSessionAnchorId(claimed) !== expectedAnchor) {
-      return {
-        ok: false as const,
-        error: 'canonical_changed' as const,
-        detail: claimUnsupported ?? 'canonical Session identity changed while acquiring ownership',
-      };
-    }
-
-    if (existing?.session.sessionId === expectedSessionId) {
-      return { ok: true, ds: existing, alreadyLocal: true };
-    }
-
-    // The distributed claim awaited provider I/O. A local creator that won in
-    // the meantime remains authoritative; never overwrite or tear it down.
-    const lateExisting = activeSessions.get(key);
-    if (lateExisting) {
-      return lateExisting.session.sessionId === expectedSessionId
-        ? { ok: true as const, ds: lateExisting, alreadyLocal: true as const }
-        : {
-            ok: false as const,
-            error: 'anchor_occupied' as const,
-            activeSessionId: lateExisting.session.sessionId,
-          };
-    }
-
     const localConflict = sessionStore.listSessions().find(session =>
       session.sessionId !== expectedSessionId
       && session.status === 'active'
       && (!session.larkAppId || session.larkAppId === expectedAppId)
       && (session.scope === 'chat' ? 'chat' : 'thread')
-        === (claimed.scope === 'chat' ? 'chat' : 'thread')
+        === (canonical.scope === 'chat' ? 'chat' : 'thread')
       && storedSessionAnchorId(session) === expectedAnchor,
     );
     if (localConflict) {
@@ -3676,7 +3643,7 @@ export async function takeOverDurableActiveRemoteSession(
     // PID, Web Terminal and preview targets are replica-local observations.
     // Keep the logical workerGeneration so reserveWorkerGeneration advances
     // across takeover, but never import another Pod's process handles.
-    const materialized = structuredClone(claimed);
+    const materialized = structuredClone(canonical);
     materialized.pid = undefined;
     materialized.webPort = undefined;
     materialized.previewTarget = undefined;
