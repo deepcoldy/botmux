@@ -3744,8 +3744,6 @@ export async function takeOverDurableActiveRemoteSession(
         activeSessionId: activeSessions.get(key)?.session.sessionId,
       };
     }
-    announceSessionRow(ds);
-
     let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
     let started = false;
     try {
@@ -3769,6 +3767,7 @@ export async function takeOverDurableActiveRemoteSession(
         detail: `worker admission ${admission ?? 'not_reported'}`,
       };
     }
+    announceSessionRow(ds);
     logger.info(
       `[${expectedSessionId.substring(0, 8)}] Took over active canonical Remote Runner Session `
       + `(anchor: ${expectedAnchor.substring(0, 12)})`,
