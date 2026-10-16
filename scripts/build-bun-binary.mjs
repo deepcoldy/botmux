@@ -183,6 +183,13 @@ async function resolveCanvasSkiaNative(platform, arch) {
   if (untar.code !== 0) throw new Error(`extracting ${tgz} failed: ${untar.err}`);
   const skia = join(dir, 'package', skiaName);
   if (!existsSync(skia)) throw new Error(`${pkg}@${version} has no ${skiaName} in its tarball`);
+  // NOTE: `dir` is intentionally NOT removed here. The returned path is handed
+  // to makeNativeEmbedPlugin, which reads it during `Bun.build`; deleting it
+  // before the compile finishes would break the embed. A caller that owns the
+  // whole build (buildOne) would have to rm it after Bun.build resolves — not
+  // done today, so each local `--all` darwin target leaves ~30 MB behind (a CI
+  // runner is torn down anyway). TODO: hoist cleanup to buildOne once that
+  // lifecycle is proven on darwin.
   return skia;
 }
 
@@ -266,13 +273,18 @@ function adhocResignDarwin(outfile) {
 
 async function buildOne({ target, out }) {
   const { platform, arch } = targetToPlatformArch(target);
-  const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch);
-  const skiaNode = platform === 'darwin' ? await resolveCanvasSkiaNative(platform, arch) : null;
 
+  // Checked FIRST: compiling from dist/ is a hard prerequisite, and
+  // resolveCanvasSkiaNative below may download a ~30 MB tarball for darwin —
+  // failing on a missing dist would otherwise pay that cost to report an error
+  // that is knowable before any network I/O.
   const entry = join(REPO_ROOT, 'dist', 'standalone-entry.js');
   if (!existsSync(entry)) {
     throw new Error('dist/standalone-entry.js missing — run `bun run build` first (this bundles from dist/, it does not run tsc).');
   }
+
+  const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch);
+  const skiaNode = platform === 'darwin' ? await resolveCanvasSkiaNative(platform, arch) : null;
 
   const outfile = out ?? join(REPO_ROOT, 'dist-bin', target ? target.replace(/^bun-/, 'botmux-') : 'botmux');
   mkdirSync(dirname(outfile), { recursive: true });
