@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   consumeTrustedResultDeliverySources,
+  awaitTrustedResultDeliveryAck,
   MAX_TRUSTED_DELIVERY_FILE_BYTES,
   parseTrustedResultDelivery,
   sendTrustedDeliveryIpcWithBackpressure,
@@ -97,6 +98,58 @@ describe('trusted plugin result delivery', () => {
     store.revoke(revoked.artifactId);
     expect(() => store.redeem(revoked.viewToken, 'on_owner123')).toThrow('plugin_result_revoked');
     expect(() => store.resolveView(revoked.viewId, 'on_owner123')).toThrow('plugin_result_revoked');
+  });
+
+  it('rejects a view reference that points at an artifact with another view id', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-result-view-binding-'));
+    const store = new PluginResultArtifactStore({ dataDir: root });
+    const create = (deliveryId: string) => store.create({
+      pluginId: 'reference-reporter',
+      delivery: { schemaVersion: 1, deliveryId, markdown: 'private result' },
+      ownerUnionId: 'on_owner123', larkAppId: 'cli_fixture', sessionId: 'session_fixture', turnId: 'om_fixture',
+    });
+    const first = create('delivery_view_first_abcdefgh');
+    const second = create('delivery_view_second_abcdefgh');
+    writeFileSync(
+      join(store.root, 'views', `${first.viewId}.json`),
+      JSON.stringify({ artifactId: second.artifactId }),
+    );
+    expect(() => store.resolveView(first.viewId, 'on_owner123')).toThrow('plugin_result_access_denied');
+  });
+
+  it('revokes on a definite daemon rejection but preserves an artifact on acknowledgement timeout', async () => {
+    const rejectedRevoke = vi.fn();
+    await expect(awaitTrustedResultDeliveryAck(
+      Promise.reject(new Error('plugin_result_delivery_failed')),
+      { revoke: rejectedRevoke, timeoutMs: 50 },
+    )).rejects.toThrow('plugin_result_delivery_failed');
+    expect(rejectedRevoke).toHaveBeenCalledOnce();
+
+    const sameMessageRevoke = vi.fn();
+    await expect(awaitTrustedResultDeliveryAck(
+      Promise.reject(new Error('plugin_result_delivery_timeout')),
+      { revoke: sameMessageRevoke, timeoutMs: 50 },
+    )).rejects.toThrow('plugin_result_delivery_timeout');
+    expect(sameMessageRevoke).toHaveBeenCalledOnce();
+
+    vi.useFakeTimers();
+    try {
+      const timedOutRevoke = vi.fn();
+      const pending = awaitTrustedResultDeliveryAck(
+        new Promise<never>(() => undefined),
+        { revoke: timedOutRevoke, timeoutMs: 50 },
+      );
+      const rejected = expect(pending).rejects.toThrow('plugin_result_delivery_timeout');
+      await vi.advanceTimersByTimeAsync(50);
+      await rejected;
+      expect(timedOutRevoke).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    expect(workerSource).toContain('awaitTrustedResultDeliveryAck(responsePromise');
+    expect(workerSource).toContain('revoke: () => artifactStore.revoke(artifact.artifactId)');
   });
 
   it('sweeps expired and revoked artifacts before enforcing count and byte quotas', () => {

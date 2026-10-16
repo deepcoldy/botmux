@@ -38,6 +38,38 @@ export interface TrustedResultDeliveryReceipt {
   fileCount: number;
 }
 
+export const TRUSTED_RESULT_DELIVERY_ACK_TIMEOUT_MS = 120_000;
+
+/**
+ * Wait for the daemon's authoritative delivery result. A definite daemon
+ * rejection revokes the stored artifact. A local acknowledgement timeout does
+ * not: the provider send may already have succeeded while its reply is late,
+ * and revoking here would leave a visible entry card with a dead link.
+ */
+export async function awaitTrustedResultDeliveryAck<T>(
+  response: Promise<T>,
+  opts: {
+    revoke: () => void;
+    timeoutMs?: number;
+  },
+): Promise<T> {
+  const timeoutMs = opts.timeoutMs ?? TRUSTED_RESULT_DELIVERY_ACK_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutError = new Error('plugin_result_delivery_timeout');
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(timeoutError), timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([response, timeout]);
+  } catch (error) {
+    if (error !== timeoutError) opts.revoke();
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }

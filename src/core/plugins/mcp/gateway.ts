@@ -607,9 +607,7 @@ export class PluginMcpGateway {
     for (const connection of this.capable('tools')) {
       try {
         const tools = await allPages<any>(cursor => connection.client.listTools(cursor ? { cursor } : {}) as any, 'tools');
-        entries.push(...tools
-          .filter(tool => tool?._meta?.botmuxHostOnly !== true)
-          .map(tool => ({ connection, tool })));
+        entries.push(...tools.map(tool => ({ connection, tool })));
         const diagnostic = this.diagnostics.find(item => item.status === 'connected' && item.pluginId === connection.pluginId && item.serverName === connection.server.name);
         if (diagnostic) diagnostic.tools = tools.length;
       } catch (err) {

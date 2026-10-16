@@ -149,28 +149,6 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
-  it('hides host-only tools from ordinary model gateways', async () => {
-    installFixturePlugin('plugin-hostonly', 'hostonly');
-    const identity = () => ({
-      caller: { requestUserOpenId: 'ou_host', requestUserUnionId: 'on_host', senderType: 'user' as const },
-      turnId: 'om_host',
-    });
-
-    const modelGateway = new PluginMcpGateway(
-      ['plugin-hostonly'],
-      { ...process.env, BOTMUX_SESSION_ID: 'session-model' },
-      { trustedTurnIdentity: identity },
-    );
-    const modelClient = new Client({ name: 'model-gateway-test', version: '1.0.0' });
-    const [modelClientTransport, modelServerTransport] = InMemoryTransport.createLinkedPair();
-    await Promise.all([modelGateway.connect(modelServerTransport), modelClient.connect(modelClientTransport)]);
-    expect((await modelClient.listTools()).tools.map(tool => tool.name)).toEqual(['echo']);
-    await expect(modelClient.callTool({ name: 'internal_maintenance', arguments: {} }))
-      .rejects.toThrow(/No enabled plugin MCP handles/);
-    await modelClient.close();
-    await modelGateway.close();
-  });
-
   it('isolates a failed downstream server', async () => {
     const connectSpy = vi.spyOn(Client.prototype, 'connect');
     installFixturePlugin('plugin-a', 'alpha');

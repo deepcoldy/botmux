@@ -1,5 +1,7 @@
 import { createReadStream } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { DashboardAuthIdentity } from './h5-auth.js';
+import type { DashboardRequestIdentity } from './request-identity.js';
 
 import {
   PluginResultArtifactStore,
@@ -12,6 +14,15 @@ const FILE_ROUTE = /^\/plugin-results\/([A-Za-z0-9_-]{20,256})\/files\/(\d{1,4})
 
 export interface PluginResultViewerIdentity {
   principalUnionId?: string;
+}
+
+/** One identity projection shared by the production Dashboard wiring and tests. */
+export function resolvePluginResultViewerIdentity(
+  dashboardIdentity: DashboardRequestIdentity | null,
+  h5Identity: DashboardAuthIdentity | null,
+): PluginResultViewerIdentity | null {
+  if (dashboardIdentity?.principalUnionId) return { principalUnionId: dashboardIdentity.principalUnionId };
+  return h5Identity?.unionId ? { principalUnionId: h5Identity.unionId } : null;
 }
 
 export interface PluginResultAccessDependencies {

@@ -40,7 +40,7 @@ export interface DashboardRequestIdentity extends TerminalDashboardActor {
    * 二者原本是同一个变量，机器协管者要求把它们分开。
    */
   canManageHost: boolean;
-  /** Tenant-stable human identity. Absent for legacy/local-only sessions. */
+  /** Cross-app stable human identity. Absent for legacy/local-only sessions. */
   principalUnionId?: string;
 }
 

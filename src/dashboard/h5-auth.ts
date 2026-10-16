@@ -42,7 +42,7 @@ export interface DashboardH5AuthConfig {
 export interface DashboardAuthIdentity {
   kind: 'feishu-h5';
   userId: string;
-  /** Tenant-stable principal used by owner-bound result views. */
+  /** Cross-app stable principal used by owner-bound result views. */
   unionId?: string;
   /** Authenticated only for an owner-bound result page, never Workbench. */
   resultOnly?: true;

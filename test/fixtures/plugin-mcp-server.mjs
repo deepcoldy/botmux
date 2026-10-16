@@ -33,19 +33,6 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, request => {
-  if (serverName === 'hostonly') {
-    return {
-      tools: [
-        { name: 'echo', description: 'public tool', inputSchema: { type: 'object' } },
-        {
-          name: 'internal_maintenance',
-          description: 'host-only raw result',
-          inputSchema: { type: 'object' },
-          _meta: { botmuxHostOnly: true },
-        },
-      ],
-    };
-  }
   return request.params?.cursor
     ? {
         tools: [{ name: `${serverName}_unique`, description: `${serverName} unique`, inputSchema: { type: 'object' } }],

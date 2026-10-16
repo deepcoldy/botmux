@@ -187,6 +187,7 @@ import {
 } from './core/plugins/mcp/environment.js';
 import type { GatewayTrustedResultDeliveryHandler } from './core/plugins/mcp/gateway.js';
 import {
+  awaitTrustedResultDeliveryAck,
   consumeTrustedResultDeliverySources,
   sendTrustedDeliveryIpcWithBackpressure,
   trustedResultTerminalObservation,
@@ -1720,11 +1721,6 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     fileCount: artifact.fileCount,
     responseKind: delivery.responseKind ?? 'final',
   };
-  const timeout = setTimeout(() => {
-    pendingPluginResultDeliveries.delete(requestId);
-    rejectResponse(new Error('plugin_result_delivery_timeout'));
-  }, 30_000);
-  timeout.unref?.();
   try {
     await sendTrustedDeliveryIpcWithBackpressure({
       get connected() { return process.connected; },
@@ -1734,7 +1730,6 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
       },
     }, payload);
   } catch (error) {
-    clearTimeout(timeout);
     pendingPluginResultDeliveries.delete(requestId);
     artifactStore.revoke(artifact.artifactId);
     rejectResponse(error instanceof Error ? error : new Error(String(error)));
@@ -1742,12 +1737,10 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     await responsePromise.catch(() => undefined);
     throw error;
   }
-  const response = await responsePromise.finally(() => {
-    clearTimeout(timeout);
+  const response = await awaitTrustedResultDeliveryAck(responsePromise, {
+    revoke: () => artifactStore.revoke(artifact.artifactId),
+  }).finally(() => {
     pendingPluginResultDeliveries.delete(requestId);
-  }).catch((error) => {
-    artifactStore.revoke(artifact.artifactId);
-    throw error;
   });
   try {
     consumeTrustedResultDeliverySources(delivery);
