@@ -130,6 +130,9 @@ export function createDurableLarkCanonicalDispatch(
         throw new Error(`durable canonical post-admission output failed: ${mutation.kind}`);
       }
     }
+    if (result.session.status !== 'active') {
+      await options.facade.releaseLease(admitted.lease.sessionKey);
+    }
     return { kind: 'committed', receipt: admitted.receipt };
   };
 }

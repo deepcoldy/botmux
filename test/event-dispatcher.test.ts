@@ -1308,6 +1308,114 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('routes through a newly fenced active canonical takeover before local side effects', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-taken-over',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-takeover-root',
+      scope: 'thread' as const,
+      title: 'Remote takeover',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    let local: typeof canonical | undefined;
+    handlers.resolveDurableSession = vi.fn(() => local);
+    handlers.isSessionOwner = vi.fn(() => local?.sessionId === canonical.sessionId);
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      expect(local?.sessionId).toBe(canonical.sessionId);
+      ctx.ingressAdmission = { admitted: true };
+    });
+    const takeOverPrimarySession = vi.fn(async (sessionKey: string, current: typeof canonical) => {
+      expect(sessionKey).toBe(`msg-primary-takeover-root::${MY_APP_ID}`);
+      expect(current).toEqual(canonical);
+      local = canonical;
+      return canonical;
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-takeover-followup',
+      rootId: 'msg-primary-takeover-root',
+      threadId: 'omt_primary_takeover',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    const result = await processPrimary(runtime, data, 'msg-primary-takeover-followup');
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      kind: 'admitted',
+      session: { sessionId: canonical.sessionId },
+    });
+    runtime.close();
+  });
+
+  it('revalidates the owner lease before routing an already-local active Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-local-owner',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-local-root',
+      scope: 'thread' as const,
+      title: 'Local owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => canonical);
+    handlers.isSessionOwner = vi.fn(() => true);
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.ingressAdmission = { admitted: true };
+    });
+    const takeOverPrimarySession = vi.fn(async () => canonical);
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue' }),
+      messageId: 'msg-primary-local-followup',
+      rootId: 'msg-primary-local-root',
+      threadId: 'omt_primary_local',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-local-followup'))
+      .resolves.toMatchObject({ kind: 'admitted', session: { sessionId: canonical.sessionId } });
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
   it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
     setupBotState({ allowedUsers: [] });
     mockGetChatMode.mockResolvedValue('topic');

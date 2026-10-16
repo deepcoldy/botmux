@@ -75,6 +75,15 @@ export type DurableLarkSessionControlCommitResult =
     }
   | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
 
+export type DurableLarkActiveSessionClaimResult =
+  | {
+      kind: 'claimed';
+      session: Session;
+      lease: SessionLease;
+      record: DurableSessionRecord;
+    }
+  | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
+
 function object(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -383,6 +392,59 @@ export async function admitDurableLarkSession(input: {
       lease: written.lease,
       record: written.record,
     }),
+    lease: written.lease,
+    record: written.record,
+  };
+}
+
+/**
+ * Acquire the canonical Session lease without changing its logical snapshot.
+ *
+ * Active-session materialization is a local side effect, so a replacement
+ * replica must cross the distributed fencing boundary first.  The exact
+ * same-value write deliberately advances the canonical revision: it proves
+ * that the caller acquired the current owner epoch and prevents an expired
+ * owner from presenting an old revision as fresh authority.
+ */
+export async function claimDurableLarkActiveSession(input: {
+  facade: DurableSessionFacade;
+  sessionKey: string;
+  expectedSessionId: string;
+  expectedLarkAppId: string;
+}): Promise<DurableLarkActiveSessionClaimResult> {
+  const expectedSessionId = boundedText(
+    input.expectedSessionId,
+    'durable active takeover sessionId',
+    256,
+  );
+  const expectedLarkAppId = boundedText(
+    input.expectedLarkAppId,
+    'durable active takeover larkAppId',
+    256,
+  );
+  const written = await input.facade.writeExactFromCurrent(input.sessionKey, current => {
+    if (!current) throw new Error('durable active takeover canonical Session is missing');
+    const parsed = parseDurablePrimarySessionRecord(current);
+    if (parsed.session.sessionId !== expectedSessionId
+        || parsed.session.larkAppId !== expectedLarkAppId
+        || parsed.session.status !== 'active') {
+      throw new Error('durable active takeover canonical Session changed before claim');
+    }
+    return current.value;
+  });
+  if (written.kind !== 'written' && written.kind !== 'unchanged') return written;
+  if (written.coalescedCount !== 1) {
+    throw new Error('durable active takeover claim was unexpectedly coalesced');
+  }
+  const claimed = parseDurablePrimarySessionRecord(written.record).session;
+  if (claimed.sessionId !== expectedSessionId
+      || claimed.larkAppId !== expectedLarkAppId
+      || claimed.status !== 'active') {
+    throw new Error('durable active takeover claim returned a mismatched Session');
+  }
+  return {
+    kind: 'claimed',
+    session: claimed,
     lease: written.lease,
     record: written.record,
   };

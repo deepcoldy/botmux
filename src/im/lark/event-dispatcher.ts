@@ -4156,9 +4156,19 @@ export interface LarkEventDispatcherRuntimeOptions {
   authorizePrimaryControl?: (data: unknown) => boolean | Promise<boolean>;
   /**
    * Primary consumer 在执行本地会话副作用前回读权威 Session。若权威 active
-   * Session 属于另一副本，本副本必须抛错并让 Inbox 重试，不能冷启替换它。
+   * Session 属于另一副本，本副本必须先经过 takeOverPrimarySession 的分布式
+   * owner fence；不能直接冷启替换它。
    */
   readPrimarySession?: (sessionKey: string) => Promise<Session | undefined>;
+  /**
+   * Primary-only failover seam. The callback must acquire a fresh canonical
+   * Session owner epoch before it materializes the active runtime locally.
+   * Returning without installing that exact Session keeps the route fenced.
+   */
+  takeOverPrimarySession?: (
+    sessionKey: string,
+    canonical: Session,
+  ) => Promise<Session | undefined>;
 }
 
 interface PrimaryProcessContext {
@@ -4296,14 +4306,19 @@ export function createLarkEventDispatcherRuntime(
   const assertPrimaryRouteOwner = async (
     ctx: RoutingContext,
     primary: PrimaryProcessContext | undefined,
-  ): Promise<void> => {
-    if (!primary || !runtimeOptions.readPrimarySession) return;
+  ): Promise<boolean> => {
+    if (!primary || !runtimeOptions.readPrimarySession) return false;
     const anchor = ctx.runtimeRoutingAnchor ?? ctx.anchor;
     const canonicalKey = sessionKey(anchor, larkAppId);
     const canonical = await runtimeOptions.readPrimarySession(canonicalKey);
-    if (!canonical || canonical.status !== 'active') return;
-    const local = handlers.resolveDurableSession?.(ctx);
-    if (local?.sessionId === canonical.sessionId) return;
+    if (!canonical || canonical.status !== 'active') return false;
+    let local = handlers.resolveDurableSession?.(ctx);
+    if (runtimeOptions.takeOverPrimarySession) {
+      await runtimeOptions.takeOverPrimarySession(canonicalKey, canonical);
+      local = handlers.resolveDurableSession?.(ctx);
+      if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
+    }
+    if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
     throw new Error(
       `durable primary active canonical Session is owned by another replica: ${canonicalKey}`,
     );
@@ -4572,8 +4587,11 @@ export function createLarkEventDispatcherRuntime(
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
               const seedPayload = { data, ctx: seedCtx, ownsSession: false };
               if (primary) {
-                await assertPrimaryRouteOwner(seedCtx, primary);
-                await dispatchHumanMessage(seedPayload);
+                const ownsCanonical = await assertPrimaryRouteOwner(seedCtx, primary);
+                await dispatchHumanMessage({
+                  ...seedPayload,
+                  ownsSession: seedPayload.ownsSession || ownsCanonical,
+                });
                 return primaryResult(seedCtx, primary);
               }
               await dispatchHumanMessage(seedPayload)
@@ -5318,7 +5336,7 @@ export function createLarkEventDispatcherRuntime(
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
-      await assertPrimaryRouteOwner(ctx, primary);
+      ownsSession = (await assertPrimaryRouteOwner(ctx, primary)) || ownsSession;
       // Record explicit DM /t intent before this message releases the raw
       // per-chat routing lane and before handleNewTopic begins its async session
       // registration. A back-to-back root-linked reply can therefore select the

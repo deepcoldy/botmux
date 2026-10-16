@@ -7,7 +7,12 @@ import { sessionKey } from '../src/core/types.js';
 import { durableLarkOutboxMessage } from '../src/services/durable-lark-outbox.js';
 import { enqueueDurableLarkSessionOutput } from '../src/services/durable-lark-session-output.js';
 import { startDurableLarkPrimaryRuntime, type DurableLarkPrimaryRuntime } from '../src/services/durable-lark-primary-runtime.js';
-import { parseDurablePrimarySessionRecord } from '../src/services/durable-session-primary.js';
+import { createDurableSessionFacade } from '../src/services/durable-session-facade.js';
+import {
+  admitDurableLarkSession,
+  claimDurableLarkActiveSession,
+  parseDurablePrimarySessionRecord,
+} from '../src/services/durable-session-primary.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 
 async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
@@ -23,6 +28,63 @@ describe('durable primary horizontal failover', () => {
 
   afterEach(() => {
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  it('fences active Session takeover until the prior replica releases its lease', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'durable-primary-active-takeover-'));
+    roots.push(root);
+    const dbPath = join(root, 'coordination.db');
+    const stores = [
+      new SqliteDurableCoordinationStore(dbPath),
+      new SqliteDurableCoordinationStore(dbPath),
+    ];
+    const owner = createDurableSessionFacade({ store: stores[0], ownerId: 'replica-a' });
+    const contender = createDurableSessionFacade({ store: stores[1], ownerId: 'replica-b' });
+    const active: Session = {
+      sessionId: 'session-active-takeover',
+      chatId: 'oc_takeover',
+      rootMessageId: 'om_takeover',
+      scope: 'thread',
+      title: 'Active takeover',
+      status: 'active',
+      createdAt: '2026-10-16T00:00:00.000Z',
+      larkAppId: 'cli_horizontal',
+    };
+    const inbound = {
+      eventType: 'lark.im.message.receive_v1' as const,
+      eventId: 'im.message.receive_v1:cli_horizontal:om_takeover',
+      partitionKey: 'lark-message-routing:cli_horizontal:oc_takeover',
+      larkAppId: 'cli_horizontal',
+      messageId: 'om_takeover',
+      attempts: 1,
+      data: {},
+    };
+
+    try {
+      await expect(admitDurableLarkSession({ facade: owner, message: inbound, session: active }))
+        .resolves.toMatchObject({ kind: 'committed', lease: { ownerId: 'replica-a', epoch: 1 } });
+      await expect(claimDurableLarkActiveSession({
+        facade: contender,
+        sessionKey: 'om_takeover::cli_horizontal',
+        expectedSessionId: active.sessionId,
+        expectedLarkAppId: 'cli_horizontal',
+      })).resolves.toMatchObject({ kind: 'occupied', ownerId: 'replica-a', epoch: 1 });
+
+      await owner.stop();
+      await expect(claimDurableLarkActiveSession({
+        facade: contender,
+        sessionKey: 'om_takeover::cli_horizontal',
+        expectedSessionId: active.sessionId,
+        expectedLarkAppId: 'cli_horizontal',
+      })).resolves.toMatchObject({
+        kind: 'claimed',
+        lease: { ownerId: 'replica-b', epoch: 2 },
+        record: { revision: 2 },
+      });
+    } finally {
+      await Promise.all([owner.stop(), contender.stop()]);
+      await Promise.all(stores.map(store => store.close()));
+    }
   });
 
   it('admits and delivers 100 independent Sessions across ingress leader failover', async () => {
