@@ -38,7 +38,7 @@ beforeEach(() => {
     rows.set(row.sessionId, row);
   });
   vi.spyOn(store, 'closeSession').mockImplementation(id => { rows.get(id).status = 'closed'; });
-  vi.spyOn(pool, 'closeSession').mockImplementation(async id => {
+  vi.spyOn(pool, 'closeSessionForBackgroundCleanup').mockImplementation(async id => {
     order.push('close'); rows.get(id).status = 'closed'; registry.clear();
     return { ok: true, outcome: 'closed', alreadyClosed: false, known: true } as any;
   });
@@ -84,7 +84,7 @@ describe('controlled failed-turn recovery', () => {
     expect(order.indexOf('persist')).toBeLessThan(order.indexOf('close'));
     expect(order.indexOf('close')).toBeLessThan(order.indexOf('fork'));
     expect(await recoverFailedTurn('old', { ...request, mode: 'fresh' })).toEqual(result);
-    expect(pool.closeSession).toHaveBeenCalledTimes(1);
+    expect(pool.closeSessionForBackgroundCleanup).toHaveBeenCalledTimes(1);
   });
   it.each(['reply', 'clock', 'queue', 'active', 'working', 'native-recovery'])('rejects newer or owned input before any close (%s)', async kind => {
     if (kind === 'reply') ds.currentReplyTarget.turnId = 'om_new';
@@ -94,17 +94,17 @@ describe('controlled failed-turn recovery', () => {
     if (kind === 'working') ds.lastScreenStatus = 'working';
     if (kind === 'native-recovery') ds.session.ordinaryTurnRecovery = { status: 'backoff' };
     expect(await recoverFailedTurn('old', { ...request, mode: 'fresh' })).toEqual({ ok: false, error: 'newer_input' });
-    expect(pool.closeSession).not.toHaveBeenCalled(); expect(pool.forkWorker).not.toHaveBeenCalled();
+    expect(pool.closeSessionForBackgroundCleanup).not.toHaveBeenCalled(); expect(pool.forkWorker).not.toHaveBeenCalled();
   });
   it('cancels an obsolete replay when input arrives while teardown awaits', async () => {
     let release!: () => void;
-    vi.mocked(pool.closeSession).mockImplementation(async () => {
+    vi.mocked(pool.closeSessionForBackgroundCleanup).mockImplementation(async () => {
       await new Promise<void>(resolve => { release = resolve; });
       ds.session.status = 'closed'; registry.clear();
       return { ok: true, outcome: 'closed', alreadyClosed: false, known: true } as any;
     });
     const result = recoverFailedTurn('old', { ...request, mode: 'fresh' });
-    await vi.waitFor(() => expect(pool.closeSession).toHaveBeenCalled());
+    await vi.waitFor(() => expect(pool.closeSessionForBackgroundCleanup).toHaveBeenCalled());
     noteFailedTurnRecoveryInput('cli_app', 'om_root', 'om_new'); release();
     expect(await result).toMatchObject({ ok: true, state: 'cancelled' });
     expect(store.createSession).not.toHaveBeenCalled(); expect(pool.forkWorker).not.toHaveBeenCalled();
@@ -154,10 +154,10 @@ describe('controlled failed-turn recovery', () => {
   it('fails closed before dispatch when the claim cannot be persisted', async () => {
     vi.mocked(store.updateSession).mockImplementation(() => { throw new Error('disk unavailable'); });
     await expect(recoverFailedTurn('old', { ...request, mode: 'fresh' })).rejects.toThrow('disk unavailable');
-    expect(pool.closeSession).not.toHaveBeenCalled(); expect(pool.forkWorker).not.toHaveBeenCalled();
+    expect(pool.closeSessionForBackgroundCleanup).not.toHaveBeenCalled(); expect(pool.forkWorker).not.toHaveBeenCalled();
   });
   it('does not start beside a residual process from a failed close', async () => {
-    vi.mocked(pool.closeSession).mockResolvedValue({ ok: true, outcome: 'closed_with_residual' } as any);
+    vi.mocked(pool.closeSessionForBackgroundCleanup).mockResolvedValue({ ok: true, outcome: 'closed_with_residual' } as any);
     expect(await recoverFailedTurn('old', { ...request, mode: 'fresh' })).toMatchObject({ ok: true, state: 'dispatch_unknown' });
     expect(pool.forkWorker).not.toHaveBeenCalled();
   });

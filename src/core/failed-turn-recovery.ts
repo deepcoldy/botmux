@@ -13,7 +13,7 @@ import { buildFollowUpCliInput, rememberLastCliInput } from './session-manager.j
 import { localeForBot } from '../i18n/index.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
 import {
-  findActiveBySessionId, closeSession, forkWorker, sendWorkerInput,
+  findActiveBySessionId, closeSessionForBackgroundCleanup, forkWorker, sendWorkerInput,
   getActiveSessionsRegistry, setActiveSessionIfActive, prepareFailedTurnRecoveryIdentity,
 } from './worker-pool.js';
 
@@ -169,7 +169,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
       };
       try {
         if (request.mode === 'fresh') {
-          const closed = await closeSession(sessionId);
+          const closed = await closeSessionForBackgroundCleanup(sessionId, 'failed-turn recovery');
           if (!closed.ok || closed.outcome !== 'closed') return setState('dispatch_unknown');
           if (transaction.cancelled) return setState('cancelled');
           const created = store.createSession(ds.chatId, ds.session.rootMessageId, ds.session.title,

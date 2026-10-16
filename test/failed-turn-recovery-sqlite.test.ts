@@ -34,7 +34,7 @@ beforeEach(async () => {
   vi.spyOn(pool, 'prepareFailedTurnRecoveryIdentity').mockResolvedValue(undefined);
   vi.spyOn(pool, 'sendWorkerInput').mockReturnValue(true);
   vi.spyOn(pool, 'forkWorker').mockImplementation((_ds, _input, _options, callbacks) => { callbacks?.onAdmission?.('accepted'); return true; });
-  vi.spyOn(pool, 'closeSession').mockImplementation(async id => {
+  vi.spyOn(pool, 'closeSessionForBackgroundCleanup').mockImplementation(async id => {
     store.closeSession(id); pool.getActiveSessionsRegistry()?.clear();
     return { ok: true, outcome: 'closed' } as any;
   });

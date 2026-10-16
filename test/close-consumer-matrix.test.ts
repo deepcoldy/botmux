@@ -160,6 +160,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'closeSession itself. No user surface at schedule time.',
     count: 2,
   },
+  'core/failed-turn-recovery.ts::recoverFailedTurn::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Host recovery uses the native background wrapper to log refusal and '
+      + 'residual details, and dispatches a replacement only on clean closed. '
+      + 'Any other outcome retains a durable dispatch_unknown fence.',
+  },
   'core/trigger-session.ts::reconcileIdempotencyLeasesOnBoot::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Boot reconcile: wrapper logs refusal and residual with the remote id.',
