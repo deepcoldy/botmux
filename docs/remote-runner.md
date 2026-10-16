@@ -141,9 +141,9 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 主动消息写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`。该 capability 同样不属于默认必需集合，只有显式配置它的部署才会在握手时要求 provider 支持。
 成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
 
-### 可选只读 Session 工具
+### 可选 Session 工具
 
-声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的只读 Session helper。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic 或 Bot；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。
+声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的 Session helper。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。
 
 当前 allowlist：
 
@@ -151,8 +151,11 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 - `quoted`：只接受合法 `om_` message id 和可选 `raw`；下载的附件经宿主 attachments 根校验后，以最多 8 个、合计最多 512 KiB 的有界 payload 回传。
 - `bots.list`：固定为当前群 `chat` scope，不开放跨团队发现或邀请。
 - `skill.list|show|read|resources`：沿用当前 Session 的 skill manifest 和内置技能；resource path 必须是无 `.` / `..` 的安全相对路径。
+- `schedule.list`：宿主强制附带当前 Session 的 Chat 过滤，不允许枚举其他群的任务。
+- `schedule.add`：只接受 schedule、prompt、名称、执行位置、静默、模型、思考强度和工作日历等结构化任务字段；Chat、Topic root、Bot 和工作目录由当前 Session 推导。
+- `schedule.update|remove|pause|resume|run`：只接受合法任务 ID 和各动作的最小字段，并继续通过现有 daemon mutation route 授权；`self` 只允许当前定时执行自行 pause/remove。
 
-不属于 allowlist 的 schedule、ask、handoff、workflow、改名、管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急、attention 或 final 能力。
+不属于 allowlist 的 ask、handoff、workflow、改名、任意管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急、attention 或 final 能力。
 
 ```json
 {

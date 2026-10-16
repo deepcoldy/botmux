@@ -27,7 +27,7 @@ describe('remote runner session tool host bridge', () => {
       limit: 20,
       scope: 'thread',
       withCardJson: true,
-    }, 'session-1')).toEqual([
+    }, 'session-1', 'oc_current')).toEqual([
       'history', '--limit', '20', '--scope', 'thread', '--with-card-json',
       '--session-id', 'session-1',
     ]);
@@ -35,16 +35,51 @@ describe('remote runner session tool host bridge', () => {
       tool: 'skill.read',
       name: 'demo',
       path: 'references/guide.md',
-    }, 'session-1')).toEqual([
+    }, 'session-1', 'oc_current')).toEqual([
       'skill', 'read', 'demo', 'references/guide.md',
     ]);
     expect(remoteRunnerSessionToolArgs({
       tool: 'quoted',
       messageId: 'om_demo',
       raw: true,
-    }, 'session-1')).toEqual([
+    }, 'session-1', 'oc_current')).toEqual([
       'quoted', 'om_demo', '--remote-runner-session-tool', '--raw',
       '--session-id', 'session-1',
+    ]);
+    expect(remoteRunnerSessionToolArgs({
+      tool: 'schedule.list',
+    }, 'session-1', 'oc_current')).toEqual([
+      'schedule', 'list', '--chat-id', 'oc_current', '--remote-runner-session-tool',
+    ]);
+    expect(remoteRunnerSessionToolArgs({
+      tool: 'schedule.add',
+      schedule: '10m',
+      prompt: '提醒我复查构建',
+      name: '构建复查',
+      position: 'topic',
+      silent: true,
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'high',
+    }, 'session-1', 'oc_current')).toEqual([
+      'schedule', 'add', '10m', '--prompt', '提醒我复查构建',
+      '--name', '构建复查', '--topic', '--silent',
+      '--model', 'gpt-5.6-sol', '--reasoning-effort', 'high',
+      '--remote-runner-session-tool',
+    ]);
+    expect(remoteRunnerSessionToolArgs({
+      tool: 'schedule.update',
+      taskId: 'deadbeef',
+      prompt: '新提示',
+      calendar: null,
+    }, 'session-1', 'oc_current')).toEqual([
+      'schedule', 'update', 'deadbeef', '--prompt', '新提示', '--calendar', 'none',
+      '--remote-runner-session-tool',
+    ]);
+    expect(remoteRunnerSessionToolArgs({
+      tool: 'schedule.remove',
+      taskId: 'deadbeef',
+    }, 'session-1', 'oc_current')).toEqual([
+      'schedule', 'remove', 'deadbeef', '--remote-runner-session-tool',
     ]);
   });
 
@@ -60,6 +95,7 @@ fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify({
   authorized: process.env.BOTMUX_HOST_RELAY_AUTHORIZED,
   sessionId: process.env.BOTMUX_SESSION_ID,
   turnId: process.env.BOTMUX_TURN_ID,
+  chatId: process.env.BOTMUX_CHAT_ID,
   dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT,
 }));
 process.stdout.write(JSON.stringify({ total: 1 }) + '\\n');
@@ -73,6 +109,7 @@ process.stdout.write(JSON.stringify({ total: 1 }) + '\\n');
     }, {
       sessionId: 'session-1',
       turnId: 'turn-1',
+      chatId: 'oc_current',
       dispatchAttempt: 4,
       cliPath: fixture,
       env: { PATH: process.env.PATH },
@@ -88,6 +125,7 @@ process.stdout.write(JSON.stringify({ total: 1 }) + '\\n');
       authorized: '1',
       sessionId: 'session-1',
       turnId: 'turn-1',
+      chatId: 'oc_current',
       dispatchAttempt: '4',
     });
   });
@@ -116,6 +154,7 @@ process.stdout.write(JSON.stringify({
     }, {
       sessionId: 'session-1',
       turnId: 'turn-1',
+      chatId: 'oc_current',
       cliPath: fixture,
       env: { PATH: process.env.PATH, SESSION_DATA_DIR: dataDir },
     });

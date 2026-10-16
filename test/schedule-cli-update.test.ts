@@ -206,6 +206,38 @@ describe('schedule CLI prompt updates', () => {
     expect(calls()).toBe(4);
     expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
   });
+  it('lets the worker-owned Remote Runner relay reach daemon authorization without a CLI pid marker', async () => {
+    const f = fixture(); const calls = await managed(f);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+    });
+    const before = Object.keys(f.read());
+    const result = await f.run([
+      'add', '10m', '--prompt', 'remote reminder', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain('已创建定时任务');
+    const added = Object.keys(f.read()).filter(id => !before.includes(id));
+    expect(added).toHaveLength(1);
+    expect(f.read()[added[0]]).toMatchObject({
+      prompt: 'remote reminder',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      executionPosition: 'topic',
+    });
+    expect(calls()).toBe(1);
+  });
+  it('rejects the hidden Remote Runner schedule flag without host relay authority', async () => {
+    const f = fixture();
+    const result = await f.run(['list', '--remote-runner-session-tool']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('requires the owning worker');
+  });
   it('keeps the original creator-auth error when delegated add returns non-OK', async () => {
     const f = fixture();
     await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' }; });

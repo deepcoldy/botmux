@@ -6014,6 +6014,7 @@ async function deliverRemoteRunnerSessionTool(
   return runRemoteRunnerSessionTool(operation.request, {
     sessionId,
     turnId: operation.turnId,
+    chatId: lastInitConfig.chatId,
     ...(currentBotmuxDispatchAttempt !== undefined
       ? { dispatchAttempt: currentBotmuxDispatchAttempt }
       : {}),

@@ -7747,6 +7747,20 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
 }
 
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
+  const remoteRunnerSessionTool = rest.includes('--remote-runner-session-tool');
+  if (remoteRunnerSessionTool && process.env.BOTMUX_HOST_RELAY_AUTHORIZED !== '1') {
+    console.error('botmux schedule refused: --remote-runner-session-tool requires the owning worker\'s live turn authority');
+    process.exit(1);
+  }
+  const trustedRemoteRunnerRelay = remoteRunnerSessionTool
+    && process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+    && !!process.env.BOTMUX_SESSION_ID
+    && !!process.env.BOTMUX_TURN_ID;
+  if (remoteRunnerSessionTool && !trustedRemoteRunnerRelay) {
+    console.error('botmux schedule refused: the Remote Runner relay is missing its frozen session/turn');
+    process.exit(1);
+  }
+  rest = rest.filter(arg => arg !== '--remote-runner-session-tool');
   if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
     console.log(SCHEDULE_UPDATE_USAGE);
     return;
@@ -7855,8 +7869,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
 
     const cur = await detectCurrentSession();
     let creatorAuthError: unknown;
-    try { await detectAuthenticatedCurrentSession(); }
-    catch (error) { creatorAuthError = error; }
+    if (!trustedRemoteRunnerRelay) {
+      try { await detectAuthenticatedCurrentSession(); }
+      catch (error) { creatorAuthError = error; }
+    }
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
       console.error('--id 需要一个 8 位小写十六进制任务 ID。');
@@ -8086,7 +8102,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const scheduledSelfManageCandidate = !!mutationSession?.turnId
     && mutationSession.turnId.startsWith('schedule:')
     && ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
-  if (sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
+  if (!trustedRemoteRunnerRelay
+      && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
     await detectAuthenticatedCurrentSession();
   }
   const managedMutation = async (
@@ -8134,7 +8151,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       // refuses canonical updates for delegated tasks and for tasks bound to a
       // protected precondition (which the CLI cannot rebind).
       const updates = readScheduleUpdate(rest);
-      await detectAuthenticatedCurrentSession();
+      if (!trustedRemoteRunnerRelay) await detectAuthenticatedCurrentSession();
       await managedMutation('update', updates);
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
       break;

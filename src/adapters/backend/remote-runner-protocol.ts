@@ -33,10 +33,11 @@ export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message_explicit_mention',
 ] as const;
 
-/** Optional provider-to-host access to a small, read-only BotMux session tool
- * surface.  The provider contributes structured arguments only; the host
- * freezes the current session/turn and translates them into an allowlisted
- * local CLI invocation. */
+/** Optional provider-to-host access to a small BotMux session tool surface.
+ * The provider contributes structured arguments only; the host freezes the
+ * current session/turn and translates them into an allowlisted local CLI
+ * invocation. Mutating operations remain subject to the daemon's live-turn
+ * authorization. */
 export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
   'session_tool',
 ] as const;
@@ -174,7 +175,37 @@ export type RemoteRunnerSessionToolRequest =
   | { tool: 'skill.list' }
   | { tool: 'skill.show'; name: string }
   | { tool: 'skill.read'; name: string; path: string }
-  | { tool: 'skill.resources'; name: string };
+  | { tool: 'skill.resources'; name: string }
+  | { tool: 'schedule.list' }
+  | {
+      tool: 'schedule.add';
+      schedule: string;
+      prompt: string;
+      name?: string;
+      position?: 'top-level' | 'topic' | 'new-topic';
+      followActive?: boolean;
+      topicTitle?: string;
+      silent?: boolean;
+      model?: string;
+      reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+      calendar?: string;
+      calendarDayType?: 'workday' | 'restday';
+    }
+  | {
+      tool: 'schedule.update';
+      taskId: string;
+      prompt?: string;
+      calendar?: string | null;
+      calendarDayType?: 'workday' | 'restday';
+    }
+  | {
+      tool: 'schedule.remove' | 'schedule.pause';
+      taskId: string;
+    }
+  | {
+      tool: 'schedule.resume' | 'schedule.run';
+      taskId: string;
+    };
 
 export interface RemoteRunnerSessionToolOperation {
   operationId: string;
@@ -592,6 +623,18 @@ function hasExactKeys(raw: Record<string, unknown>, keys: readonly string[]): bo
     && actual.every((key, index) => key === expected[index]);
 }
 
+function boundedUtf8String(value: unknown, maxBytes: number, trim = false): string | undefined {
+  if (typeof value !== 'string' || value.includes('\0')) return undefined;
+  const normalized = trim ? value.trim() : value;
+  if (!normalized.trim() || Buffer.byteLength(normalized, 'utf8') > maxBytes) return undefined;
+  return normalized;
+}
+
+const SCHEDULE_TASK_ID_RE = /^[0-9a-f]{8}$/;
+const SCHEDULE_REASONING_EFFORTS = new Set([
+  'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+]);
+
 const OUTBOUND_IMAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,122}\.(?:png|jpe?g|gif|webp)$/i;
 const OUTBOUND_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set([
   'image/png',
@@ -726,6 +769,103 @@ export function normalizeRemoteRunnerSessionToolRequest(
       return undefined;
     }
     return { tool: 'skill.read', name, path: normalizedPath };
+  }
+
+  if (raw.tool === 'schedule.list') {
+    return hasExactKeys(raw, ['tool']) ? { tool: 'schedule.list' } : undefined;
+  }
+
+  if (raw.tool === 'schedule.add') {
+    const allowed = new Set([
+      'tool', 'schedule', 'prompt', 'name', 'position', 'followActive',
+      'topicTitle', 'silent', 'model', 'reasoningEffort', 'calendar',
+      'calendarDayType',
+    ]);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const schedule = boundedUtf8String(raw.schedule, 512, true);
+    const prompt = boundedUtf8String(raw.prompt, 32 * 1024);
+    const name = raw.name === undefined ? undefined : boundedUtf8String(raw.name, 512, true);
+    const position = raw.position === undefined ? undefined : String(raw.position);
+    const topicTitle = raw.topicTitle === undefined
+      ? undefined
+      : boundedUtf8String(raw.topicTitle, 1024, true);
+    const model = raw.model === undefined ? undefined : boundedUtf8String(raw.model, 256, true);
+    const calendar = raw.calendar === undefined
+      ? undefined
+      : boundedUtf8String(raw.calendar, 256, true);
+    const reasoningEffort = raw.reasoningEffort === undefined
+      ? undefined
+      : String(raw.reasoningEffort);
+    const calendarDayType = raw.calendarDayType === undefined
+      ? undefined
+      : String(raw.calendarDayType);
+    if (!schedule || !prompt
+      || (raw.name !== undefined && !name)
+      || (position !== undefined && !['top-level', 'topic', 'new-topic'].includes(position))
+      || (raw.followActive !== undefined && typeof raw.followActive !== 'boolean')
+      || (raw.topicTitle !== undefined && !topicTitle)
+      || (raw.silent !== undefined && typeof raw.silent !== 'boolean')
+      || (raw.model !== undefined && (!model || !ID_RE.test(model)))
+      || (reasoningEffort !== undefined && !SCHEDULE_REASONING_EFFORTS.has(reasoningEffort))
+      || (raw.calendar !== undefined && !calendar)
+      || (calendarDayType !== undefined && !['workday', 'restday'].includes(calendarDayType))) {
+      return undefined;
+    }
+    const resolvedPosition = position ?? 'top-level';
+    if (raw.followActive === true && resolvedPosition !== 'topic') return undefined;
+    if (topicTitle && resolvedPosition !== 'new-topic') return undefined;
+    return {
+      tool: 'schedule.add',
+      schedule,
+      prompt,
+      ...(name ? { name } : {}),
+      ...(position ? { position: position as 'top-level' | 'topic' | 'new-topic' } : {}),
+      ...(raw.followActive !== undefined ? { followActive: raw.followActive } : {}),
+      ...(topicTitle ? { topicTitle } : {}),
+      ...(raw.silent !== undefined ? { silent: raw.silent } : {}),
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort: reasoningEffort as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } : {}),
+      ...(calendar ? { calendar } : {}),
+      ...(calendarDayType ? { calendarDayType: calendarDayType as 'workday' | 'restday' } : {}),
+    };
+  }
+
+  if (raw.tool === 'schedule.update') {
+    const allowed = new Set(['tool', 'taskId', 'prompt', 'calendar', 'calendarDayType']);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const taskId = boundedUtf8String(raw.taskId, 8, true);
+    const prompt = raw.prompt === undefined ? undefined : boundedUtf8String(raw.prompt, 32 * 1024);
+    const calendar = raw.calendar === undefined || raw.calendar === null
+      ? raw.calendar
+      : boundedUtf8String(raw.calendar, 256, true);
+    const calendarDayType = raw.calendarDayType === undefined
+      ? undefined
+      : String(raw.calendarDayType);
+    if (!taskId || !SCHEDULE_TASK_ID_RE.test(taskId)
+      || (raw.prompt !== undefined && !prompt)
+      || (raw.calendar !== undefined && raw.calendar !== null && !calendar)
+      || (calendarDayType !== undefined && !['workday', 'restday'].includes(calendarDayType))
+      || (prompt === undefined && raw.calendar === undefined && calendarDayType === undefined)) {
+      return undefined;
+    }
+    return {
+      tool: 'schedule.update',
+      taskId,
+      ...(prompt !== undefined ? { prompt } : {}),
+      ...(raw.calendar !== undefined ? { calendar: calendar as string | null } : {}),
+      ...(calendarDayType ? { calendarDayType: calendarDayType as 'workday' | 'restday' } : {}),
+    };
+  }
+
+  if (raw.tool === 'schedule.remove' || raw.tool === 'schedule.pause'
+      || raw.tool === 'schedule.resume' || raw.tool === 'schedule.run') {
+    const taskId = boundedUtf8String(raw.taskId, 8, true);
+    if (!hasExactKeys(raw, ['tool', 'taskId']) || !taskId
+      || (!SCHEDULE_TASK_ID_RE.test(taskId)
+        && !(taskId === 'self' && (raw.tool === 'schedule.remove' || raw.tool === 'schedule.pause')))) {
+      return undefined;
+    }
+    return { tool: raw.tool, taskId };
   }
 
   return undefined;
