@@ -206,3 +206,93 @@ describe('parseAskBody — requestId / originKind (invocation identity)', () => 
     expect('error' in parseAskBody(validBody({ originKind: {} }))).toBe(true);
   });
 });
+
+describe('parseAskBody — mentionedOpenId (--mention)', () => {
+  it('接受合法人类 open_id 并透传', () => {
+    const out = parseAskBody(validBody({ mentionedOpenId: 'ou_humanTarget0001' }));
+    expect('error' in out).toBe(false);
+    if (!('error' in out)) {
+      expect(out.mentionedOpenId).toBe('ou_humanTarget0001');
+    }
+  });
+
+  it('缺省时 mentionedOpenId 为 undefined（旧调用方兼容）', () => {
+    const out = parseAskBody(validBody());
+    if (!('error' in out)) expect(out.mentionedOpenId).toBeUndefined();
+  });
+
+  it.each([
+    ['union_id', 'on_6741d98b6423c1b46e1ef7a5e6dd'],
+    ['裸字符串', 'some-user'],
+    ['空串', ''],
+    ['数字', 12345],
+    ['对象', { id: 'ou_x' }],
+    ['null 视为缺省不报错', null],
+  ])('%s', (_label, value) => {
+    const out = parseAskBody(validBody({ mentionedOpenId: value }));
+    if (value === null) {
+      expect('error' in out).toBe(false);
+    } else {
+      expect('error' in out).toBe(true);
+      if ('error' in out) expect(out.error).toBe('bad_mentionedOpenId');
+    }
+  });
+});
+
+describe('parseAskBody — options[].description 透传', () => {
+  it('新 questions 格式保留合法 description', () => {
+    const out = parseAskBody({
+      sessionId: 's', chatId: 'c', larkAppId: 'a', rootMessageId: null, timeoutMs: 60000,
+      questions: [{
+        prompt: '选哪种发布方式？', multiSelect: false,
+        options: [
+          { key: 'gray', label: '灰度', description: '先放 5% 流量观察 30 分钟' },
+          { key: 'full', label: '全量' },
+        ],
+      }],
+    });
+    expect('error' in out).toBe(false);
+    if (!('error' in out)) {
+      expect(out.questions[0].options[0]).toEqual({ key: 'gray', label: '灰度', description: '先放 5% 流量观察 30 分钟' });
+      expect(out.questions[0].options[1]).toEqual({ key: 'full', label: '全量' });
+    }
+  });
+
+  it('旧 options+prompt 格式同样保留 description', () => {
+    const out = parseAskBody(validBody({
+      options: [
+        { key: 'yes', label: '继续', description: '先灰度 10%' },
+        { key: 'no', label: '停止' },
+      ],
+    }));
+    expect('error' in out).toBe(false);
+    if (!('error' in out)) {
+      expect(out.questions[0].options[0].description).toBe('先灰度 10%');
+      expect(out.questions[0].options[1].description).toBeUndefined();
+    }
+  });
+
+  it('空白 description 归一化为 undefined，非字符串/超长报错', () => {
+    const ok = parseAskBody(validBody({
+      options: [
+        { key: 'yes', label: '继续', description: '   ' },
+        { key: 'no', label: '停止' },
+      ],
+    }));
+    expect('error' in ok).toBe(false);
+    if (!('error' in ok)) expect(ok.questions[0].options[0].description).toBeUndefined();
+
+    expect('error' in parseAskBody(validBody({
+      options: [
+        { key: 'yes', label: '继续', description: 123 },
+        { key: 'no', label: '停止' },
+      ],
+    }))).toBe(true);
+    expect('error' in parseAskBody(validBody({
+      options: [
+        { key: 'yes', label: '继续', description: 'x'.repeat(1001) },
+        { key: 'no', label: '停止' },
+      ],
+    }))).toBe(true);
+  });
+});

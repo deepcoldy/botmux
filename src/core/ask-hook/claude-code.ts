@@ -80,7 +80,11 @@ const claudeCodeAdapter: HookAskAdapter = {
         const label = typeof opt.label === 'string' ? opt.label : String(opt.label ?? '');
         // option 无独立 key 时，用 label 作为 key
         const key = typeof opt.key === 'string' && opt.key.length > 0 ? opt.key : label;
-        return { key, label };
+        // Claude 把选项的详细解释放在 options[].description；不透传就只剩按钮、看不到问题上下文。
+        const description = typeof opt.description === 'string' && opt.description.trim()
+          ? opt.description
+          : undefined;
+        return description ? { key, label, description } : { key, label };
       });
       return { prompt: qText, options, multiSelect };
     });

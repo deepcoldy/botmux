@@ -138,6 +138,56 @@ describe('buildAskCard', () => {
     expect(blob).toContain('"key":"a"');
   });
 
+  it('渲染 options[].description：选项详细解释随卡片展示，无 description 时不多渲染', () => {
+    const withDesc = makePending({
+      questions: [{
+        prompt: '选哪种发布方式？',
+        multiSelect: false,
+        options: [
+          { key: 'gray', label: '灰度', description: '先放 5% 流量观察 30 分钟' },
+          { key: 'full', label: '全量' },
+        ],
+      }],
+    });
+    const blob = JSON.stringify(JSON.parse(buildAskCard(withDesc)));
+    expect(blob).toContain('先放 5% 流量观察 30 分钟');
+    expect(blob).toContain('**灰度**');
+
+    // 无 description 的旧载荷：不出现 label：说明块（按钮仍在）。
+    const plain = makePending({
+      questions: [{ prompt: '继续？', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
+    });
+    const plainBlob = JSON.stringify(JSON.parse(buildAskCard(plain)));
+    expect(plainBlob).not.toContain('**是**：');
+  });
+
+  it('--mention：第一问前注入真实 <at>，无 mention 时不渲染 at', () => {
+    const mentioned = makePending({ mentionedOpenId: 'ou_owner' });
+    const blob = JSON.stringify(JSON.parse(buildAskCard(mentioned)));
+    // 真实 at token 出现在卡片里，且位于问题正文之前
+    expect(blob).toContain('<at id=ou_owner></at>');
+    const atIdx = blob.indexOf('<at id=ou_owner></at>');
+    const promptIdx = blob.indexOf('线上 latency');
+    expect(atIdx).toBeGreaterThanOrEqual(0);
+    expect(promptIdx).toBeGreaterThan(atIdx);
+
+    // 缺省 ask 不带任何 at 注入
+    const plain = makePending();
+    expect(JSON.stringify(JSON.parse(buildAskCard(plain)))).not.toContain('<at id=');
+  });
+
+  it('--mention 多问时只注入一次（第一问前）', () => {
+    const ask = makePending({
+      mentionedOpenId: 'ou_owner',
+      questions: [
+        { prompt: 'q1', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
+        { prompt: 'q2', multiSelect: false, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+    });
+    const blob = JSON.stringify(JSON.parse(buildAskCard(ask)));
+    expect(blob.match(/<at id=ou_owner><\/at>/g)).toHaveLength(1);
+  });
+
   it('单问卡片：渲染 prompt、可答复栏、ask_id、nonce', () => {
     const card = JSON.parse(buildAskCard(makePending()));
     const text = JSON.stringify(card);
