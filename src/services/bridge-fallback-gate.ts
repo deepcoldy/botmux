@@ -229,6 +229,10 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
 }
 
 export interface BridgeGateInput {
+  /** Exact delivery identity, required to suppress a failed-turn diagnostic.
+   * Time-only legacy markers cannot prove that this attempt delivered a final. */
+  turnId?: string;
+  dispatchAttempt?: number;
   /** When the user message was queued — defines the lower bound of the
    *  send window. Undefined for legacy turns; the gate degrades to
    *  "never suppress" in that case. */
@@ -507,29 +511,40 @@ export function shouldEmitFailedBridgeFallback(
   // also reports a failed terminal. Never turn that internal token into visible
   // failure content.
   if (isBridgeNothingToSendFinal(turn.finalText)) return false;
-  // A progress/final send only proves that some user-facing content was already
-  // delivered; it cannot replace the structured terminal failure reason. The
-  // existing delivery path uses the current turn's stable key for deduplication.
+  // Keep the structured failure as an execution fact. The delivery gate below
+  // may suppress its notification after an exact explicit final, but progress
+  // and legacy sends must never replace the terminal failure reason.
   return true;
 }
 
-/** Failure fallbacks are terminal diagnostics, not another model answer. Only
- * bypass marker-based suppression; preserve deliberate silence and the existing
- * local/adopt ownership gates. Non-failure output keeps the ordinary gate. */
+/** Failure fallbacks are terminal diagnostics, not another model answer. Do not
+ * apply the ordinary length/preview heuristic to them: only an acknowledged,
+ * explicit final for this exact turn/attempt can make the notice redundant.
+ * Execution status and retry accounting remain independent of notification. */
 export function shouldSuppressStructuredFallback(
   fallbackKind: StructuredFallbackKind,
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
-  /** failed 走下面的 mode-agnostic 三门禁，用不到它；non-failed 必须透传，
+  /** failed 走下面的 mode-agnostic 门禁，用不到它；non-failed 必须透传，
    *  否则 transcript 下的重复判定会退回 send 缺省的「明显更长才放行」。 */
   replyDelivery: 'send' | 'transcript' = 'send',
 ): boolean {
   if (fallbackKind !== 'failed') {
     return shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery);
   }
-  return adoptMode || Boolean(turn.isLocal) || isBridgeNothingToSendFinal(turn.finalText);
+  if (adoptMode || turn.isLocal || isBridgeNothingToSendFinal(turn.finalText)) return true;
+  if (!turn.turnId || turn.markTimeMs === undefined) return false;
+  const lower = turn.markTimeMs;
+  const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
+  return markers.some(marker => isFinalBridgeSendMarker(marker)
+    && typeof marker.messageId === 'string' && marker.messageId.trim().length > 0
+    && marker.turnId === turn.turnId
+    && marker.dispatchAttempt === turn.dispatchAttempt
+    && marker.sentAtMs >= lower && marker.sentAtMs < upper
+    && marker.terminalIndependent !== true
+    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));
 }
 
 /** Compose a failed-turn diagnostic without replaying partial text that the
@@ -573,8 +588,8 @@ export function structuredFallbackKind(
 ): StructuredFallbackKind {
   const rateLimitHandled = hasDedicatedRateLimitChain
     && turn.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
-  // failed 判定在 #1337 之后是 mode-agnostic 的（恒开，只留 adopt / isLocal /
-  // 裸 sentinel 三道门禁，不读 markers），所以这里不传 replyDelivery。
+  // Failure classification is mode-agnostic. Delivery suppression is a separate
+  // decision below the caller's composition step; do not erase failure facts.
   if (!rateLimitHandled
     && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
     return 'failed';
