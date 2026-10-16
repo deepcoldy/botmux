@@ -122,9 +122,12 @@ describe('controlled failed-turn recovery', () => {
     ds.session.lastFailedTurn.trustedCaller = { ...caller, source: 'schedule_creator', taskId: 'abcdef12' };
     ds.session.lastFailedTurn.silent = true;
     const result = await recoverFailedTurn('old', request);
-    expect(result).toMatchObject({ ok: true, state: 'accepted', turnId: expect.stringMatching(/^schedule:abcdef12:/) });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('scheduled recovery refused');
+    expect(result.state).toBe('accepted');
+    expect(result.turnId).toMatch(/^schedule:abcdef12:/);
     expect(pool.prepareFailedTurnRecoveryIdentity).toHaveBeenCalledWith(ds, expect.stringMatching(/^schedule:abcdef12:/));
-    if (result.ok) expect(isSilentScheduledTurn(ds, result.turnId)).toBe(true);
+    expect(isSilentScheduledTurn(ds, result.turnId)).toBe(true);
     expect(pool.sendWorkerInput).toHaveBeenCalledWith(ds, expect.anything(), expect.anything(), expect.objectContaining({ trustedCaller: { ...caller, source: 'schedule_creator', taskId: 'abcdef12' } }));
   });
   it('preserves clean Codex App task text and local image references on fresh recovery', async () => {
