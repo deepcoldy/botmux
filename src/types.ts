@@ -69,10 +69,12 @@ export interface TrustedCaller {
   /** Where this identity came from. Absent = the ordinary IM path (the sender of
    *  the inbound message that opened this turn). `'schedule_creator'` = a
    *  daemon-fired scheduled turn running as the task's creator; `taskId` names
-   *  the task. Consumers that must distinguish "a human asked just now" from
+   *  the task. `'failed_turn_recovery'` = automatic recovery of a recorded
+   *  failed human turn; it does not prove a new human action. Consumers that must
+   *  distinguish "a human asked just now" from
    *  "someone's scheduled task is running" (audit trails, approval gates) read
    *  this instead of inferring it. */
-  source?: 'schedule_creator';
+  source?: 'schedule_creator' | 'failed_turn_recovery';
   /** Scheduled task id — set only alongside `source: 'schedule_creator'`. */
   taskId?: string;
   /** Type of the sender whose message opened this turn. Absent when no inbound
@@ -265,6 +267,17 @@ export interface FailedTurnRecord {
   status: 'failed' | 'ambiguous';
   retryCount: number;
   lastRetryAt?: string;    // ISO
+  /** Daemon-frozen principal, never supplied by a recovery client. */
+  trustedCaller?: TrustedCaller;
+  originalTurnId?: string;
+  silent?: boolean;
+  recovery?: {
+    requestId: string;
+    mode: 'retry' | 'fresh';
+    turnId: string;
+    sessionId: string;
+    state: 'attempting' | 'accepted' | 'cancelled' | 'dispatch_unknown';
+  };
 }
 
 /** Stable human/bot identity used only for principal-lane routing.  The
@@ -937,6 +950,12 @@ export interface Session {
    *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
    *  只被更新的失败 turn 覆盖。 */
   lastFailedTurn?: FailedTurnRecord;
+  /** Exact automatic recovery turn and its original, daemon-authenticated principal. */
+  failedTurnRecovery?: {
+    originalTurnId: string;
+    turnId: string;
+    caller: TrustedCaller;
+  };
   /** Crash-safe Codex App accepted/prepared FIFO; daemon is the sole writer. */
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   /** Cumulative ACK boundary retained until a fresh runner retires the generation. */

@@ -453,6 +453,7 @@ import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
+import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn-recovery.js';
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
@@ -2170,6 +2171,35 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
       .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
   }
 }
+
+/** Privileged host recovery: worker capabilities and request actor claims do not authorize this route. */
+ipcRoute('GET', '/api/sessions/:sessionId/failure-recovery', (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const row = ds?.session ?? sessionStore.getOwnedSession(params.sessionId);
+  const failure = row?.lastFailedTurn;
+  if (!failure) return jsonRes(res, 404, { ok: false, error: 'failure_not_found' });
+  return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, failure: {
+    turnId: failure.turnId, failedAt: failure.failedAt, errorCode: failure.errorCode,
+    originalTurnId: failure.originalTurnId ?? failure.turnId,
+    actorBound: !!failure.trustedCaller, recovery: failure.recovery,
+  } });
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/failure-recovery', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  let body: unknown;
+  try { body = await readBoundedJsonBody(req, 4096, 1000); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_recovery_request' }); }
+  const request = parseFailedTurnRecoveryRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_recovery_request' });
+  try {
+    const result = await recoverFailedTurn(params.sessionId, request);
+    return jsonRes(res, result.ok ? 200 : 409, result);
+  } catch {
+    return jsonRes(res, 503, { ok: false, error: 'recovery_persistence_unavailable' });
+  }
+});
 
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
   const initial = findActiveBySessionId(params.sessionId);

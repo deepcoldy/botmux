@@ -11731,6 +11731,12 @@ function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined
   if (ds.scheduledTurnCallers.size === 0) ds.scheduledTurnCallers = undefined;
 }
 
+/** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
+export async function prepareFailedTurnRecoveryIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (!callbacks?.prepareRawInputTurn) throw new Error('recovery_identity_preparation_unavailable');
+  await callbacks.prepareRawInputTurn(ds, turnId);
+}
+
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
  * clean-input gate at message acceptance time. This freezes the sidecar onto
  * the IPC item, so later config flips do not mutate an already queued turn. */
@@ -14089,6 +14095,9 @@ function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string |
   // turn id over private IPC; it can never choose which human that id denotes.
   const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
   if (replyTargetCaller) return replyTargetCaller;
+  const recovered = ds.session.failedTurnRecovery;
+  if (recovered?.turnId === turnId && recovered.caller.requestLarkAppId === ds.larkAppId
+      && recovered.caller.senderType === 'user') return recovered.caller.requestUserOpenId;
   const scheduledCaller = ds.scheduledTurnCallers?.get(turnId);
   if (scheduledCaller) {
     // The worker publishes the same turn more than once: first at init, then

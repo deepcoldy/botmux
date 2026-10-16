@@ -128,6 +128,8 @@ import { createDurableLarkSessionControlRuntime } from './services/durable-lark-
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
+import { failedTurnCaller, recordLimitedFailedTurn, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
+import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -3941,7 +3943,9 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   if (!reply) return undefined;
   const active = ds.activeInteractiveTurn;
-  const caller = active?.turnId === turnId ? active.caller : dispatchCallerFromReply(ds.larkAppId, reply);
+  const recoveryCaller = ds.session.failedTurnRecovery?.turnId === turnId
+    ? ds.session.failedTurnRecovery.caller : undefined;
+  const caller = recoveryCaller ?? (active?.turnId === turnId ? active.caller : dispatchCallerFromReply(ds.larkAppId, reply));
   // A positively identified human already has a platform identity. Their turn
   // does not depend on the unrelated delegation store being readable.
   if (caller?.senderType === 'user' && !caller.source
@@ -7375,8 +7379,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     }
     const authority = needsDelegation && turnId ? await authorityForDispatch({
       sourceAppId: ds.larkAppId,
-      caller: active?.turnId === turnId ? active.caller
-        : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
+      caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
+        : active?.turnId === turnId ? active.caller
+          : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
       tools,
       ...(scheduleCreateRequested ? {
@@ -22807,6 +22812,10 @@ async function prepareGroupBackground(data: any, ctx: RoutingContext): Promise<v
 }
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
+  if (!ctx.completionProposalContinuation && !ctx.cascadeBodyReentry) {
+    noteFailedTurnRecoveryInput(ctx.larkAppId, ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.messageId);
+  }
+
   ctx.ingressAdmission ??= { admitted: false };
   if (getBot(ctx.larkAppId).config.codexInstancePool) {
     const deliveryKey = `\u0000thread-delivery:${ctx.larkAppId}:${ctx.scope}:${ctx.anchor}`;
@@ -25142,6 +25151,10 @@ async function handleThreadReply(
   /** 级联推迟重入：首过 preamble 的 parsed + resources。不是 PreparedThreadReply，配额与下载仍重跑。 */
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
 ): Promise<void> {
+
+  if (!ctx.completionProposalContinuation && !ctx.cascadeBodyReentry) {
+    noteFailedTurnRecoveryInput(ctx.larkAppId, ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.messageId);
+  }
   // Admission is bot-wide but intentionally concurrent. Add a narrower FIFO
   // before entering it so two same-anchor deliveries can never invert while
   // quota/resource/sender preparation awaits. Synthetic keys share the same
@@ -29038,6 +29051,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      if (context.status === 'limited') {
+        try { recordLimitedFailedTurn(ds, context.turnId); }
+        catch (error) { logger.error(`[recovery] quota snapshot failed: ${String(error)}`); }
+      }
       return cardRuntimeStatusBridge.publish({
         sessionId: ds.session.sessionId,
         larkAppId: ds.larkAppId,
@@ -29111,6 +29128,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
     async onTurnTerminal(ds, terminal, context) {
+      const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
+      const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native
       // turn confirms that this exact frozen input reached this conversation.
       if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
@@ -29197,6 +29216,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               userPrompt: ds.lastUserPrompt,
               cliInput: ds.lastCliInput,
               codexAppInput: ds.lastCodexAppInput,
+              trustedCaller: originalFailedCaller, silent: originalFailedSilent,
+              originalTurnId: ds.session.failedTurnRecovery?.turnId === terminal.turnId
+                ? ds.session.failedTurnRecovery.originalTurnId : terminal.turnId,
             },
           );
           if (record) {
