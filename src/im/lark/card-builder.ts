@@ -1909,13 +1909,17 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
   const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
-  const adviceKey = o.retryOffer === 'none'
-    ? 'card.turn_failed.no_retry'
-    : !o.retryTurnId
-      ? 'card.turn_failed.no_input'
-      : o.retryOffer === 'safe'
-        ? 'card.turn_failed.retry_safe'
-        : 'card.turn_failed.retry_caveated';
+  // 图片尺寸 400 是会话历史被毒化：任何重试/续跑都会带着同一张图再 400，
+  // 必须优先于通用 no_retry 文案，给出 /clear 恢复指引。
+  const adviceKey = o.errorCode === 'provider_image_too_small'
+    ? 'card.turn_failed.image_too_small'
+    : o.retryOffer === 'none'
+      ? 'card.turn_failed.no_retry'
+      : !o.retryTurnId
+        ? 'card.turn_failed.no_input'
+        : o.retryOffer === 'safe'
+          ? 'card.turn_failed.retry_safe'
+          : 'card.turn_failed.retry_caveated';
   elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
 
   const actions: any[] = [];
@@ -1940,6 +1944,21 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
         // handler 据此决定提交「原话」还是「续跑指令」。渲染与执行读同一个
         // retryOffer，卡上写的语义就是真正会发生的事。
         mode: o.retryOffer === 'safe' ? 'resend' : 'continue',
+        ...actionBase,
+      },
+    });
+  }
+  // 小图毒化：普通「继续」会把同一张图再发一遍、必然再 400。单独给一个
+  // primary 动作——worker 先清洗会话记录再 --resume 重启，随后自动续跑，
+  // 文本上下文保留（无需 /clear）。没有失败轮次凭据（retryTurnId）时不给。
+  if (o.errorCode === 'provider_image_too_small' && o.retryTurnId) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retryTurnId,
         ...actionBase,
       },
     });

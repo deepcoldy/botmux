@@ -1,5 +1,10 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'worker.purge_images_unsupported': '🧹 "Purge tiny images and continue" is only supported for local Claude Code sessions. Use /clear or start a new topic instead.',
+  'worker.purge_images_none': '🧹 No undersized images were found in the current session transcript (the file may have rotated). Forward the full error from the web terminal to the admin, or recover with /clear for now.',
+  'worker.purge_images_failed': '🧹 Failed to purge undersized images: {reason}. You can recover with /clear instead.',
+  'worker.purge_images_restart_failed': '🧹 Images were purged, but the CLI restart failed: {reason}. Send /restart to recover manually (the transcript was cleaned and backed up).',
+  'worker.purge_images_done': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside). Restarting with --resume and continuing automatically; text context is kept.',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — Change Codex App reasoning effort for future turns; active-turn updates require explicitly enabling the experimental step_model_switching feature (off by default; levels depend on the current model)',
   'cmd.effort.applied': 'Future turns will use {effort}; the server accepted the active-turn update. If further inference steps occur in this turn, they can use the new setting; requests already issued keep their original parameters.',
   'cmd.effort.future_only': 'Future turns will use {effort}; the active turn update was not confirmed (it may have completed or the API may be unavailable).',
@@ -1268,8 +1273,12 @@ export const messages: Record<string, string> = {
   'card.turn_failed.retry_safe': 'This turn\'s input never reached the CLI, so **nothing was executed**. Retrying is safe.',
   'card.turn_failed.retry_caveated': '⚠️ This turn **may have partially executed** (edited files, commits, messages sent). Continue does NOT replay it verbatim: the CLI is asked to **inspect the current state first**, work out how far it got, and resume from there — stopping and handing back to you if it cannot tell. Still worth a glance at the Web Terminal.',
   'card.turn_failed.no_retry': 'Re-sending the same input cannot succeed for this error. Check the cause, then send a new message.',
+  'card.turn_failed.image_too_small': '🧹 The session history now contains an image that is too small (e.g. a 1×1 placeholder pixel, usually produced when the CLI reads such an image file). That image is re-sent with every following message, so **any ordinary follow-up gets the same 400 — plain resending does not help**.\n\nRecovery (any of these works):\n1. Tap **Purge tiny images and continue** below: the offending blocks are removed from the session transcript (original file backed up), the CLI restarts with --resume, and the turn continues automatically — **text context is kept**;\n2. Or send `/clear` in this topic to reset the conversation, then resend the task (local action, no model request);\n3. Or start a fresh topic.',
+  'card.btn.purge_images_continue': '🧹 Purge tiny images and continue',
   'card.turn_failed.no_input': 'No re-sendable input was recorded for this turn (it stopped before submission). Send a new message instead.',
 
+  'card.action.purge_images_unsupported': '⚠️ "Purge tiny images and continue" is only available for local Claude Code topic sessions.',
+  'card.action.purge_images_started': 'Purging tiny images and restarting to continue…',
   'card.action.retry_turn_missing': '⚠️ No input record found for this turn, so it cannot be retried. Send a new message instead.',
   'card.action.retry_turn_stale': '⚠️ This card is out of date (the session failed again or was already retried). Use the latest card, or send a new message.',
   'card.action.retry_turn_cooldown': '⏳ Retry is cooling down. Try again in {seconds}s.',

@@ -196,15 +196,15 @@ describe('敏感动作清单', () => {
   // 逐项钉死：漏登记 = 该动作绕过 canOperate、任何人都能点。新增 / 删除必须同步改这里。
   const EXPECTED = [
     'close', 'compact_session', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli', 'open_local_terminal',
-    'quote_confirm', 'refresh_screenshot', 'repo_manual_submit', 'repo_worktree_submit', 'restart', 'resume',
+    'purge_images_continue', 'quote_confirm', 'refresh_screenshot', 'repo_manual_submit', 'repo_worktree_submit', 'restart', 'resume',
     'retry_last_task', 'retry_turn', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
     'toggle_display', 'toggle_stream', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];
 
-  it('清单与重构前的手写数组逐项一致（28 项）', () => {
+  it('清单与重构前的手写数组逐项一致（28 项；本分支另登记本地 purge_images_continue，共 29 项）', () => {
     expect([...SENSITIVE_CARD_ACTIONS.keys()].sort()).toEqual(EXPECTED);
-    expect(SENSITIVE_CARD_ACTIONS.size).toBe(28);
+    expect(SENSITIVE_CARD_ACTIONS.size).toBe(29);
   });
 
   it('wf_approve / wf_reject / wf_cancel 仍过权限门（墓碑排在这道门之后）', () => {

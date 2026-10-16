@@ -3,6 +3,11 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.purge_images_unsupported': '🧹「清理小图并续跑」仅支持本地 Claude Code 会话，当前会话不适用。请改用 /clear 或开新话题恢复。',
+  'worker.purge_images_none': '🧹 未能在当前会话记录中找到尺寸过小的图片（会话文件可能已轮转）。请把网页终端里的完整报错反馈给管理员，或先用 /clear 恢复。',
+  'worker.purge_images_failed': '🧹 清理会话小图失败：{reason}。可改用 /clear 恢复。',
+  'worker.purge_images_restart_failed': '🧹 小图已清理，但 CLI 重启失败：{reason}。可发送 /restart 手动恢复（会话记录已清洗并备份）。',
+  'worker.purge_images_done': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），正在以 --resume 重启并自动续跑，文本上下文保留。',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> — 修改 Codex App 后续轮次推理强度；更新当前轮需显式启用实验特性 step_model_switching（默认关闭，档位以当前模型为准）',
   'cmd.effort.applied': '后续轮次的推理强度已设为 {effort}，服务端已接受当前轮更新。若当前轮还有后续推理步骤，可取用新设置；已经发出的模型请求保持原参数。',
   'cmd.effort.future_only': '后续轮次的推理强度已设为 {effort}；当前轮未确认更新（可能已结束或接口不可用）。',
@@ -1269,8 +1274,16 @@ export const messages: Record<string, string> = {
   // 「跑到一半挂了」——重发会重跑，必须让用户自己判断。
   'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。点「继续」不会原样重跑：会让 CLI **先读取当前现场**，判断做到哪一步，再从上次的进度接着做；判断不了会停下来交回你决定。仍建议先看一眼 Web 终端。',
   'card.turn_failed.no_retry': '当前错误重发同样的输入也无法成功，请检查后发送新的消息。',
+  // 会话历史里混入了尺寸过小（如 1×1）的图片块：通常是 CLI 的读图工具读了占位像素图。
+  // 该图会随之后每一次请求重放，所以继续/重发都必然再次 400。首选一键恢复：worker
+  // 清洗会话记录里的小图块（备份）后 --resume 重启并自动续跑，文本上下文保留；
+  // /clear 是本地操作、不发 API 请求，作为无按钮时的兜底出口（/compact 也会 400）。
+  'card.turn_failed.image_too_small': '🧹 当前会话历史中混入了尺寸过小的图片（如 1×1 占位像素图，通常是 CLI 读取了这类图片文件）。该图片会随后续每一条消息一起发送，所以**继续发任何指令都会得到同样的 400 错误，普通重发无效**。\n\n恢复方法（任选其一）：\n1. 点下方「清理小图并续跑」：自动从会话记录移除这类图片（原文件备份）后重启恢复，**文本上下文保留**；\n2. 或在本话题发送 `/clear` 清空上下文后重发任务（本地操作，不需要请求模型）；\n3. 或直接开一个新话题重新开始。',
+  'card.btn.purge_images_continue': '🧹 清理小图并续跑（保留上下文）',
   'card.turn_failed.no_input': '这一轮没有可重发的输入记录（任务在提交前就中断了），请直接发送新的消息。',
 
+  'card.action.purge_images_unsupported': '⚠️「清理小图并续跑」仅支持本地 Claude Code 话题会话，当前会话不适用。',
+  'card.action.purge_images_started': '正在清理会话小图并重启续跑…',
   'card.action.retry_turn_missing': '⚠️ 找不到这一轮的输入记录，无法重试。请直接发送新的消息。',
   'card.action.retry_turn_stale': '⚠️ 这张卡片已过期（会话后来又失败过或已重试）。请用最新那张卡片，或直接发送新的消息。',
   'card.action.retry_turn_cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
