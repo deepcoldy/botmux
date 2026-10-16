@@ -103,7 +103,23 @@ describe('managed schedule mutation route', () => {
     h.record.kind = 'direct';
     h.record.state = 'revoked';
     expect(await h.run()).toMatchObject({ status: 200, value: { ok: true, replay: true } });
+    expect(h.authorizeScheduleSelfManage).not.toHaveBeenCalled();
     expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('does not extend revoked idempotency from remove to pause', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('pause', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    h.record.state = 'revoked';
+    h.authorizeScheduleSelfManage.mockRejectedValue(new Error('schedule authority state is revoked'));
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_self_manage_denied' },
+    });
+    expect(h.authorizeScheduleSelfManage).toHaveBeenCalledOnce();
+    expect(h.scheduler.disableTask).not.toHaveBeenCalled();
   });
 
   it('lets the still-live final turn remove a naturally completed direct task', async () => {

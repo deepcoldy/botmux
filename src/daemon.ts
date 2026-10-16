@@ -7705,7 +7705,7 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     && (authority.kind === 'direct'
       || (authority.kind === 'delegated' && authority.selfManage));
   if (potentialScheduledSelfManager && !scheduledSelfManager) {
-    return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_self_manage_denied' });
+    return jsonRes(res, 403, { ok: false, error: 'schedule_self_manage_denied' });
   }
   if (scheduledSelfManager) {
     try {
@@ -7722,7 +7722,7 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     } catch (error) {
       return jsonRes(res, 403, {
         ok: false,
-        error: 'delegated_schedule_self_manage_denied',
+        error: 'schedule_self_manage_denied',
         detail: error instanceof Error ? error.message : String(error),
       });
     }

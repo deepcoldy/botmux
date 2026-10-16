@@ -117,6 +117,28 @@ describe('delegated schedule runtime authorization', () => {
     })).resolves.toBeUndefined();
   });
 
+  it.each(['paused', 'revoked'] as const)(
+    'keeps a manually %s direct task outside scheduled self-management',
+    async state => {
+      await expect(authorizeScheduleSelfManage({
+        ...authority,
+        kind: 'direct',
+        state,
+        task: {
+          ...authority.task,
+          enabled: false,
+          disabledReason: 'manual',
+        },
+      }, {
+        selfManageEnabled: false,
+        targetChatId: 'oc_chat',
+        adminOpenIds: ['ou_user_target'],
+        resolveTargetOpenId: async () => 'ou_user_target',
+        listChatMemberOpenIds: async () => ['ou_user_target'],
+      })).rejects.toThrow(`schedule authority state is ${state}`);
+    },
+  );
+
   it('checks self-management against the chat hosting the current scheduled turn', async () => {
     await expect(authorizeScheduleSelfManage({
       ...authority,

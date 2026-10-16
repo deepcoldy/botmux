@@ -282,6 +282,36 @@ describe('botmux send per-turn final idempotency', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
 
+  it('keeps a scheduled turn current when first-final cleanup cannot reach its daemon', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const f = createFixture(undefined, { scope: 'chat' }, scheduledTurn);
+    try {
+      const markerPath = join(f.dataDir, '.botmux-cli-pids', String(process.pid));
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: f.sessionId,
+        turnId: scheduledTurn,
+        queuedTurns: [{ turnId: 'om_turn_2' }],
+      }));
+
+      const first = f.run('final', 'scheduled answer', ['--schedule-remove-self']);
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+      expect(String(first.result.stderr)).toContain('当前 turn 已保留');
+      const receipt = String(first.result.stdout).split('\n')
+        .findLast(line => line.startsWith('{'));
+      expect(JSON.parse(receipt!)).toMatchObject({
+        scheduleSelfCleanup: {
+          requested: true,
+          taskId: 'a1b2c3d4',
+          removed: false,
+        },
+      });
+      const markerAfter = JSON.parse(readFileSync(markerPath, 'utf8'));
+      expect(markerAfter.turnId).toBe(scheduledTurn);
+      expect(markerAfter.queuedTurns).toEqual([{ turnId: 'om_turn_2' }]);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
   it('keeps a scheduled turn current when replayed final cleanup cannot reach its daemon', () => {
     const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
     const f = createFixture(undefined, { scope: 'chat' }, scheduledTurn);
