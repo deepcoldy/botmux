@@ -21,6 +21,8 @@ export interface TrustedResultDeliveryFile {
   name: string;
   /** Host-owned in-memory snapshot. Never serialized back to the plugin/model. */
   data: Buffer;
+  /** Validated source path, consumed only after durable host persistence. */
+  sourcePath: string;
 }
 export interface TrustedResultDelivery {
   schemaVersion: 1;
@@ -34,16 +36,6 @@ export interface TrustedResultDeliveryReceipt {
   delivered: true;
   deliveryId: string;
   fileCount: number;
-}
-
-/** A delivery effect failed after the complete envelope was validated. Only
- * acknowledged message ids cross this boundary; the original content, file
- * names, provider payload, and error details remain out of result storage. */
-export class TrustedResultDeliveryEffectError extends Error {
-  constructor(readonly messageIds: string[]) {
-    super('plugin_result_delivery_effect_failed');
-    this.name = 'TrustedResultDeliveryEffectError';
-  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -65,18 +57,6 @@ function assertNoSymlinkPath(root: string, target: string): void {
   }
 }
 
-export interface TrustedResultDeliveryIpcFile {
-  name: string;
-  dataBase64: string;
-}
-
-export interface DecodedTrustedResultDeliveryIpcEnvelope {
-  deliveryId: string;
-  markdown?: string;
-  files: Array<{ name: string; data: Buffer }>;
-  responseKind: 'final' | 'auxiliary';
-}
-
 /** Serializes the complete host-delivery transaction, including the daemon's
  * final receipt. Queue progress is independent of whether the prior task
  * succeeds or rejects, so daemon rejection and IPC disconnect both release
@@ -89,15 +69,6 @@ export class TrustedResultDeliverySerialQueue {
     this.tail = run.then(() => undefined, () => undefined);
     return run;
   }
-}
-
-export function trustedResultDeliveryIpcFiles(
-  delivery: TrustedResultDelivery,
-): TrustedResultDeliveryIpcFile[] {
-  return (delivery.files ?? []).map(file => ({
-    name: file.name,
-    dataBase64: file.data.toString('base64'),
-  }));
 }
 
 interface IpcSender {
@@ -132,109 +103,24 @@ export function sendTrustedDeliveryIpcWithBackpressure(
   });
 }
 
-/** Validate and decode the entire worker IPC payload before the daemon builds
- * a card, uploads a file, or calls scopedReply. This keeps malformed envelopes
- * at zero external side effects, including failures in the last attachment. */
-export function decodeTrustedResultDeliveryIpcEnvelope(
-  value: {
-    deliveryId?: unknown;
-    markdown?: unknown;
-    files?: unknown;
-    responseKind?: unknown;
-  },
-  validateMarkdown?: (markdown: string) => void,
-): DecodedTrustedResultDeliveryIpcEnvelope {
-  const deliveryId = typeof value.deliveryId === 'string' ? value.deliveryId.trim() : '';
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(deliveryId)) {
-    throw new Error('invalid_plugin_result_delivery_id');
-  }
-  const markdown = value.markdown;
-  if (markdown !== undefined
-    && (typeof markdown !== 'string' || markdown.length > MAX_TRUSTED_DELIVERY_MARKDOWN_CHARS)) {
-    throw new Error('invalid_plugin_result_delivery_markdown');
-  }
-  const responseKind = value.responseKind;
-  if (responseKind !== 'final' && responseKind !== 'auxiliary') {
-    throw new Error('invalid_plugin_result_delivery_response_kind');
-  }
-  const rawFiles = value.files ?? [];
-  if (!Array.isArray(rawFiles) || rawFiles.length > MAX_TRUSTED_DELIVERY_FILES) {
-    throw new Error('invalid_plugin_result_delivery_files');
-  }
-  if (!(typeof markdown === 'string' && markdown.trim()) && rawFiles.length === 0) {
-    throw new Error('empty_plugin_result_delivery');
-  }
-  let totalBytes = 0;
-  const files = rawFiles.map((raw) => {
-    if (!isRecord(raw)
-      || typeof raw.name !== 'string'
-      || raw.name.length < 1
-      || raw.name.length > 180
-      || raw.name === '.'
-      || raw.name === '..'
-      || !/^[A-Za-z0-9._-]+$/.test(raw.name)
-      || typeof raw.dataBase64 !== 'string'
-      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(raw.dataBase64)) {
-      throw new Error('invalid_plugin_result_delivery_file');
-    }
-    const data = Buffer.from(raw.dataBase64, 'base64');
-    if (data.toString('base64') !== raw.dataBase64) {
-      throw new Error('invalid_plugin_result_delivery_base64');
-    }
-    if (data.byteLength > MAX_TRUSTED_DELIVERY_FILE_BYTES) {
-      throw new Error('plugin_result_delivery_file_too_large');
-    }
-    totalBytes += data.byteLength;
-    if (totalBytes > MAX_TRUSTED_DELIVERY_TOTAL_BYTES) {
-      throw new Error('plugin_result_delivery_files_too_large');
-    }
-    return { name: raw.name, data };
-  });
-  // Run target-card validation only after the complete IPC envelope has been
-  // decoded, but still before the caller can build/send a card or upload a file.
-  if (typeof markdown === 'string' && markdown.trim()) validateMarkdown?.(markdown);
-  return {
-    deliveryId,
-    ...(markdown !== undefined ? { markdown: markdown as string } : {}),
-    files,
-    responseKind,
-  };
-}
-
-export async function deliverValidatedTrustedResultDelivery(
-  value: Parameters<typeof decodeTrustedResultDeliveryIpcEnvelope>[0],
-  effects: {
-    validateMarkdown?(markdown: string): void;
-    sendMarkdown(markdown: string): Promise<string>;
-    sendFile(file: { name: string; data: Buffer }, index: number): Promise<string>;
-  },
-): Promise<string[]> {
-  // Keep this as the first operation. In particular, do not build a card in a
-  // callback argument before the complete envelope has passed validation.
-  const envelope = decodeTrustedResultDeliveryIpcEnvelope(value, effects.validateMarkdown);
-  const messageIds: string[] = [];
-  try {
-    if (envelope.markdown?.trim()) {
-      messageIds.push(await effects.sendMarkdown(envelope.markdown));
-    }
-    for (let index = 0; index < envelope.files.length; index += 1) {
-      messageIds.push(await effects.sendFile(envelope.files[index], index));
-    }
-  } catch {
-    throw new TrustedResultDeliveryEffectError([...messageIds]);
-  }
-  return messageIds;
-}
-
 export function trustedResultTerminalObservation(
-  delivery: TrustedResultDelivery,
   messageIds: string[],
-): { messageId?: string; terminalCarrier: 'standard_reply_card' | 'non_patchable' } {
-  const hasMarkdownCard = !!delivery.markdown?.trim();
+): { messageId?: string; terminalCarrier: 'standard_reply_card' } {
   return {
-    messageId: hasMarkdownCard ? messageIds[0] : messageIds.at(-1),
-    terminalCarrier: hasMarkdownCard ? 'standard_reply_card' : 'non_patchable',
+    messageId: messageIds[0],
+    terminalCarrier: 'standard_reply_card',
   };
+}
+
+/** Delete plugin-owned source files only after the host artifact is durable. */
+export function consumeTrustedResultDeliverySources(delivery: TrustedResultDelivery): void {
+  let cleanupError = false;
+  for (const file of delivery.files ?? []) {
+    try { unlinkSync(file.sourcePath); } catch (error: any) {
+      if (error?.code !== 'ENOENT') cleanupError = true;
+    }
+  }
+  if (cleanupError) throw new Error('host_delivery_source_cleanup_failed');
 }
 
 /**
@@ -313,27 +199,17 @@ export function parseTrustedResultDelivery(
       deliveryId,
       ...(markdown !== undefined ? { markdown } : {}),
       ...(opened.length ? {
-        files: opened.map(({ fd, name, size }) => {
+        files: opened.map(({ fd, path, name, size }) => {
           const data = readFileSync(fd);
           if (data.length !== size) throw new Error('host_delivery_file_changed_during_snapshot');
-          return { name, data };
+          return { name, data, sourcePath: path };
         }),
       } : {}),
       ...(responseKind ? { responseKind } : {}),
     };
   } finally {
-    // Consuming the envelope consumes every validated plugin artifact whether
-    // downstream delivery succeeds or fails. The authoritative bytes now live
-    // only in worker memory and cannot be rewritten by the same-UID plugin.
-    let cleanupError: Error | undefined;
     for (const file of opened) {
       try { closeSync(file.fd); } catch { /* already closed */ }
-      try {
-        unlinkSync(file.path);
-      } catch (error: any) {
-        if (error?.code !== 'ENOENT') cleanupError ??= new Error('host_delivery_source_cleanup_failed');
-      }
     }
-    if (cleanupError) throw cleanupError;
   }
 }

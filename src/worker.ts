@@ -187,11 +187,11 @@ import {
 } from './core/plugins/mcp/environment.js';
 import type { GatewayTrustedResultDeliveryHandler } from './core/plugins/mcp/gateway.js';
 import {
+  consumeTrustedResultDeliverySources,
   sendTrustedDeliveryIpcWithBackpressure,
-  trustedResultDeliveryIpcFiles,
   trustedResultTerminalObservation,
 } from './core/plugins/mcp/trusted-result-delivery.js';
-import { buildTrustedResultDeliveryCard } from './im/lark/trusted-result-delivery-card.js';
+import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import {
   readSessionMcpRuntimeManifest,
   sessionMcpRuntimeHostOnlyPaths,
@@ -314,7 +314,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from './types.js';
 import { normalizeCodexAppCotMarker } from './services/codex-app-cot.js';
-import { localeForBot, t, setDefaultLocale } from './i18n/index.js';
+import { t, setDefaultLocale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import {
@@ -1677,30 +1677,23 @@ const pendingPluginResultDeliveries = new Map<string, {
   reject: (error: Error) => void;
 }>();
 
-function validateTrustedResultMarkdown(input: {
-  identity: { caller?: TrustedCaller };
-  markdown: string;
-}): void {
-  const cfg = lastInitConfig;
-  if (!cfg) throw new Error('host_delivery_unavailable');
-  buildTrustedResultDeliveryCard({
-    markdown: input.markdown,
-    chatId: cfg.chatId,
-    // The production UUID is `prd_` plus 46 hex characters. Only its encoded
-    // length affects request sizing, so a fixed placeholder is deterministic.
-    uuid: 'prd_'.padEnd(50, '0'),
-    recipientOpenId: input.identity.caller?.requestUserOpenId,
-    brand: resolveBrandLabel(cfg.larkAppId),
-    locale: localeForBot(cfg.larkAppId),
-    workingDir: cfg.workingDir,
-  });
-}
-
 const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = async (input) => {
   const { identity, delivery } = input;
-  if (!identity.turnId || !identity.caller?.requestUserUnionId) {
+  const cfg = lastInitConfig;
+  if (!cfg || !identity.turnId || !identity.caller?.requestUserUnionId) {
     throw new Error('plugin_result_delivery_missing_identity');
   }
+  const artifactStore = new PluginResultArtifactStore();
+  const artifact = artifactStore.create({
+    pluginId: input.pluginId,
+    delivery,
+    ownerUnionId: identity.caller.requestUserUnionId,
+    ...(identity.caller.requestUserOpenId ? { ownerOpenId: identity.caller.requestUserOpenId } : {}),
+    larkAppId: cfg.larkAppId,
+    sessionId,
+    turnId: identity.turnId,
+    ...(identity.dispatchAttempt !== undefined ? { dispatchAttempt: identity.dispatchAttempt } : {}),
+  });
   const requestId = randomUUID();
   let resolveResponse!: (value: { messageIds: string[] }) => void;
   let rejectResponse!: (error: Error) => void;
@@ -1722,10 +1715,16 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     ...(identity.caller?.requestUserOpenId ? { callerOpenId: identity.caller.requestUserOpenId } : {}),
     callerUnionId: identity.caller!.requestUserUnionId!,
     deliveryId: delivery.deliveryId,
-    ...(delivery.markdown !== undefined ? { markdown: delivery.markdown } : {}),
-    ...(delivery.files ? { files: trustedResultDeliveryIpcFiles(delivery) } : {}),
+    viewToken: artifact.viewToken,
+    expiresAt: artifact.expiresAt,
+    fileCount: artifact.fileCount,
     responseKind: delivery.responseKind ?? 'final',
   };
+  const timeout = setTimeout(() => {
+    pendingPluginResultDeliveries.delete(requestId);
+    rejectResponse(new Error('plugin_result_delivery_timeout'));
+  }, 30_000);
+  timeout.unref?.();
   try {
     await sendTrustedDeliveryIpcWithBackpressure({
       get connected() { return process.connected; },
@@ -1735,17 +1734,31 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
       },
     }, payload);
   } catch (error) {
+    clearTimeout(timeout);
     pendingPluginResultDeliveries.delete(requestId);
+    artifactStore.revoke(artifact.artifactId);
     rejectResponse(error instanceof Error ? error : new Error(String(error)));
     // Observe the rejected promise before rethrowing the enqueue failure.
     await responsePromise.catch(() => undefined);
     throw error;
   }
   const response = await responsePromise.finally(() => {
+    clearTimeout(timeout);
     pendingPluginResultDeliveries.delete(requestId);
+  }).catch((error) => {
+    artifactStore.revoke(artifact.artifactId);
+    throw error;
   });
+  try {
+    consumeTrustedResultDeliverySources(delivery);
+  } catch (error) {
+    // The host snapshot and entry card are already durable. Cleanup failure
+    // must not turn a working result into a broken link; retain the source for
+    // operator cleanup and keep it out of the model-facing receipt.
+    log(`[plugin-result] source cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   if ((delivery.responseKind ?? 'final') === 'final') {
-    const terminal = trustedResultTerminalObservation(delivery, response.messageIds);
+    const terminal = trustedResultTerminalObservation(response.messageIds);
     send({
       type: 'explicit_reply_observed',
       turnId: identity.turnId,
@@ -1946,7 +1959,6 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     dataDir: config.session.dataDir,
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
-    trustedResultMarkdownValidator: validateTrustedResultMarkdown,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving

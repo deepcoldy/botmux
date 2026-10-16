@@ -38,7 +38,7 @@ server.setRequestHandler(ListToolsRequestSchema, request => {
       tools: [
         { name: 'echo', description: 'public tool', inputSchema: { type: 'object' } },
         {
-          name: 'frozen_query_raw',
+          name: 'internal_maintenance',
           description: 'host-only raw result',
           inputSchema: { type: 'object' },
           _meta: { botmuxHostOnly: true },
@@ -68,7 +68,7 @@ server.setRequestHandler(CallToolRequestSchema, request => {
         botmuxHostDelivery: {
           schemaVersion: 1,
           deliveryId: 'delivery_fixture_001',
-          markdown: '内部模型生成的汇总',
+          markdown: '分析摘要',
           files: [{ path: attachment }],
           responseKind: 'final',
         },

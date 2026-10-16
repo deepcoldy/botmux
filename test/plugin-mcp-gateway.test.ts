@@ -10,7 +10,6 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import {
   bindGatewayInputLifecycle,
-  createFrozenCommandPluginGateway,
   PluginMcpGateway,
   resolveGatewayEnvironment,
 } from '../src/core/plugins/mcp/gateway.js';
@@ -150,7 +149,7 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
-  it('hides host-only tools from model gateways and exposes them only with a host capability', async () => {
+  it('hides host-only tools from ordinary model gateways', async () => {
     installFixturePlugin('plugin-hostonly', 'hostonly');
     const identity = () => ({
       caller: { requestUserOpenId: 'ou_host', requestUserUnionId: 'on_host', senderType: 'user' as const },
@@ -166,46 +165,10 @@ describe('plugin MCP Gateway', () => {
     const [modelClientTransport, modelServerTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([modelGateway.connect(modelServerTransport), modelClient.connect(modelClientTransport)]);
     expect((await modelClient.listTools()).tools.map(tool => tool.name)).toEqual(['echo']);
-    await expect(modelClient.callTool({ name: 'frozen_query_raw', arguments: {} }))
+    await expect(modelClient.callTool({ name: 'internal_maintenance', arguments: {} }))
       .rejects.toThrow(/No enabled plugin MCP handles/);
     await modelClient.close();
     await modelGateway.close();
-
-    const hostGateway = createFrozenCommandPluginGateway({
-      pluginId: 'plugin-hostonly',
-      env: { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host', BOTMUX_SESSION_ID: undefined },
-      trustedTurnIdentity: identity,
-    });
-    const hostClient = new Client({ name: 'host-gateway-test', version: '1.0.0' });
-    const [hostClientTransport, hostServerTransport] = InMemoryTransport.createLinkedPair();
-    await Promise.all([hostGateway.connect(hostServerTransport), hostClient.connect(hostClientTransport)]);
-    expect((await hostClient.listTools()).tools.map(tool => tool.name)).toEqual(['echo', 'frozen_query_raw']);
-    const result = await hostClient.callTool({ name: 'frozen_query_raw', arguments: {} });
-    const text = (result.content[0] as any).text;
-    expect(text).toContain('frozen_query_v1');
-    expect(text).not.toContain('result_delivery_v1');
-    await hostClient.close();
-    await hostGateway.close();
-
-    expect(() => createFrozenCommandPluginGateway({
-      pluginId: 'plugin-hostonly',
-      env: { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host', BOTMUX_SESSION_ID: 'session-model' },
-      trustedTurnIdentity: identity,
-    })).toThrow('Invalid frozen-command MCP host context');
-
-    const sessionGateway = new PluginMcpGateway(
-      ['plugin-hostonly'],
-      { ...process.env, BOTMUX_EXECUTION_ID: 'execution-host', BOTMUX_SESSION_ID: 'session-model' },
-      { trustedTurnIdentity: identity },
-    );
-    const sessionClient = new Client({ name: 'session-gateway-test', version: '1.0.0' });
-    const [sessionClientTransport, sessionServerTransport] = InMemoryTransport.createLinkedPair();
-    await Promise.all([sessionGateway.connect(sessionServerTransport), sessionClient.connect(sessionClientTransport)]);
-    expect((await sessionClient.listTools()).tools.map(tool => tool.name)).toEqual(['echo']);
-    await expect(sessionClient.callTool({ name: 'frozen_query_raw', arguments: {} }))
-      .rejects.toThrow(/No enabled plugin MCP handles/);
-    await sessionClient.close();
-    await sessionGateway.close();
   });
 
   it('isolates a failed downstream server', async () => {
@@ -310,7 +273,6 @@ describe('plugin MCP Gateway', () => {
   it('delivers local plugin results through the trusted host without exposing downstream rows', async () => {
     installFixturePlugin('plugin-delivery', 'delivery');
     const delivered: any[] = [];
-    const validatedMarkdown: any[] = [];
     const gateway = new PluginMcpGateway(
       ['plugin-delivery'],
       { ...process.env, BOTMUX_SESSION_ID: 'session-delivery' },
@@ -333,7 +295,6 @@ describe('plugin MCP Gateway', () => {
             fileCount: input.delivery.files?.length ?? 0,
           };
         },
-        trustedResultMarkdownValidator: input => validatedMarkdown.push(input),
       },
     );
     const client = new Client({ name: 'gateway-delivery-test', version: '1.0.0' });
@@ -344,14 +305,8 @@ describe('plugin MCP Gateway', () => {
     expect(delivered).toHaveLength(1);
     expect(delivered[0].pluginId).toBe('plugin-delivery');
     expect(delivered[0].identity.caller.requestUserUnionId).toBe('on_trusted');
-    expect(delivered[0].delivery.markdown).toBe('内部模型生成的汇总');
+    expect(delivered[0].delivery.markdown).toBe('分析摘要');
     expect(delivered[0].delivery.files).toHaveLength(1);
-    expect(validatedMarkdown).toHaveLength(1);
-    expect(validatedMarkdown[0]).toMatchObject({
-      pluginId: 'plugin-delivery',
-      markdown: '内部模型生成的汇总',
-      identity: { turnId: 'om_delivery', caller: { requestUserUnionId: 'on_trusted' } },
-    });
     const visible = JSON.stringify(result);
     expect(visible).toContain('delivery_fixture_001');
     expect(visible).not.toContain('PRIVATE_ROWS_MUST_NOT_REACH_CALLER');

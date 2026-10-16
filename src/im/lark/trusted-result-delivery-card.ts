@@ -1,37 +1,28 @@
-import type { Locale } from '../../i18n/index.js';
-import {
-  buildCanonicalFinalReplyCard,
-  CARD_LATE_CHROME_RESERVE_BYTES,
-} from './md-card.js';
-import {
-  TURN_REPLY_CARD_MAX_BYTES,
-  turnReplyCardRequestBytes,
-} from './turn-reply-card-size.js';
+import { simpleCard, urlButton } from './card-primitives.js';
 
 export interface TrustedResultDeliveryCardOptions {
-  markdown: string;
-  chatId: string;
-  uuid: string;
-  recipientOpenId?: string;
-  brand?: string;
-  locale?: Locale;
-  workingDir?: string;
+  accessUrl: string;
+  expiresAt: string;
 }
 
-/** Build and byte-check the exact card before any source file is consumed. */
+/** Metadata-only entry card. Result text, filenames, counts and internal
+ * handles deliberately never enter the Lark message body. */
 export function buildTrustedResultDeliveryCard(
   opts: TrustedResultDeliveryCardOptions,
 ): string {
-  const card = buildCanonicalFinalReplyCard({
-    markdown: opts.markdown,
-    recipientOpenId: opts.recipientOpenId,
-    brand: opts.brand,
-    locale: opts.locale,
-    workingDir: opts.workingDir,
-  });
-  if (turnReplyCardRequestBytes(card, opts.chatId, opts.uuid)
-    > TURN_REPLY_CARD_MAX_BYTES - CARD_LATE_CHROME_RESERVE_BYTES) {
-    throw new Error('host_delivery_markdown_too_large');
+  const expires = new Date(opts.expiresAt);
+  if (!/^https?:\/\//.test(opts.accessUrl) || !Number.isFinite(expires.getTime())) {
+    throw new Error('invalid_plugin_result_entry');
   }
-  return card;
+  return JSON.stringify(simpleCard({
+    title: '结果已生成',
+    template: 'blue',
+    div: `结果仅限本次请求的发起人查看。入口有效期至 ${expires.toLocaleString('zh-CN', { hour12: false })}。`,
+    buttons: [urlButton('查看或下载', 'primary', {
+      url: opts.accessUrl,
+      pc_url: opts.accessUrl,
+      android_url: opts.accessUrl,
+      ios_url: opts.accessUrl,
+    })],
+  }));
 }

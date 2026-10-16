@@ -67,7 +67,6 @@ import {
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
-const FROZEN_COMMAND_HOST_CAPABILITY = Symbol('frozen-command-host-capability');
 
 export function resolveGatewayEnvironment(
   env: NodeJS.ProcessEnv = process.env,
@@ -120,12 +119,6 @@ export type GatewayTrustedResultDeliveryHandler = (input: {
   identity: GatewayTrustedTurnIdentity;
   delivery: TrustedResultDelivery;
 }) => Promise<TrustedResultDeliveryReceipt>;
-export type GatewayTrustedResultMarkdownValidator = (input: {
-  pluginId: string;
-  identity: GatewayTrustedTurnIdentity;
-  markdown: string;
-}) => void;
-
 const BOTMUX_META_RESERVED_PREFIX = 'botmux';
 const BOTMUX_TRUSTED_HEADER_PREFIX = 'x-botmux-trusted-';
 const BOTMUX_TURN_HEADERS = [
@@ -321,8 +314,6 @@ export class PluginMcpGateway {
   private readonly env: NodeJS.ProcessEnv;
   private readonly trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
   private readonly trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
-  private readonly trustedResultMarkdownValidator?: GatewayTrustedResultMarkdownValidator;
-  private readonly allowHostOnlyTools: boolean;
   private readonly pluginIds: string[];
   private readonly descriptors: GatewayDescriptor[];
   private readonly diagnostics: McpGatewayDiagnostic[] = [];
@@ -341,15 +332,11 @@ export class PluginMcpGateway {
     opts: {
       trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
       trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
-      trustedResultMarkdownValidator?: GatewayTrustedResultMarkdownValidator;
     } = {},
-    hostCapability?: symbol,
   ) {
     this.env = env;
     this.trustedTurnIdentity = opts.trustedTurnIdentity;
     this.trustedResultDelivery = opts.trustedResultDelivery;
-    this.trustedResultMarkdownValidator = opts.trustedResultMarkdownValidator;
-    this.allowHostOnlyTools = hostCapability === FROZEN_COMMAND_HOST_CAPABILITY;
     const runtime = resolveGatewayRuntime(pluginIds, env);
     this.pluginIds = runtime.pluginIds;
     this.descriptors = runtime.descriptors;
@@ -539,10 +526,7 @@ export class PluginMcpGateway {
   private trustedTurnMeta(identity: GatewayTrustedTurnIdentity | undefined): Record<string, unknown> | undefined {
     const caller = identity?.caller;
     if (!caller && !identity?.turnId) return undefined;
-    const hostCapabilities = [
-      ...(this.trustedResultDelivery ? ['result_delivery_v1'] : []),
-      ...(this.allowHostOnlyTools ? ['frozen_query_v1'] : []),
-    ];
+    const hostCapabilities = this.trustedResultDelivery ? ['result_delivery_v1'] : [];
     return {
       ...(caller?.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
       ...(caller?.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
@@ -624,7 +608,7 @@ export class PluginMcpGateway {
       try {
         const tools = await allPages<any>(cursor => connection.client.listTools(cursor ? { cursor } : {}) as any, 'tools');
         entries.push(...tools
-          .filter(tool => this.allowHostOnlyTools || tool?._meta?.botmuxHostOnly !== true)
+          .filter(tool => tool?._meta?.botmuxHostOnly !== true)
           .map(tool => ({ connection, tool })));
         const diagnostic = this.diagnostics.find(item => item.status === 'connected' && item.pluginId === connection.pluginId && item.serverName === connection.server.name);
         if (diagnostic) diagnostic.tools = tools.length;
@@ -772,16 +756,11 @@ export class PluginMcpGateway {
       }
       if (!this.trustedResultDelivery) throw new Error('host_delivery_unavailable');
       return this.trustedResultDeliveryQueue.run(async () => {
-        // Parse inside the serial section: file Buffers and their Base64 IPC
-        // copies are never materialized concurrently within one worker.
+        // Parse inside the serial section so bounded file snapshots are never
+        // materialized concurrently within one worker.
         const delivery = parseTrustedResultDelivery(
           deliveryValue,
           pluginHome(route.connection.pluginId),
-          markdown => this.trustedResultMarkdownValidator?.({
-            pluginId: route.connection.pluginId,
-            identity,
-            markdown,
-          }),
         );
         const receipt: TrustedResultDeliveryReceipt = await this.trustedResultDelivery!({
           pluginId: route.connection.pluginId,
@@ -892,30 +871,6 @@ export class PluginMcpGateway {
       await Promise.allSettled(this.connections.map(connection => connection.client.sendRootsListChanged()));
     });
   }
-}
-
-/**
- * Creates the in-process MCP gateway used by the host-owned frozen-command
- * executor. The unexported capability token keeps host-only tools unavailable
- * to ordinary session gateways and to the standalone model-facing MCP relay.
- */
-export function createFrozenCommandPluginGateway(opts: {
-  pluginId: string;
-  env: NodeJS.ProcessEnv;
-  trustedTurnIdentity: GatewayTrustedTurnIdentityProvider;
-}): PluginMcpGateway {
-  const pluginId = opts.pluginId.trim();
-  if (!pluginId
-    || !opts.env.BOTMUX_EXECUTION_ID?.trim()
-    || opts.env.BOTMUX_SESSION_ID?.trim()) {
-    throw new Error('Invalid frozen-command MCP host context');
-  }
-  return new PluginMcpGateway(
-    [pluginId],
-    opts.env,
-    { trustedTurnIdentity: opts.trustedTurnIdentity },
-    FROZEN_COMMAND_HOST_CAPABILITY,
-  );
 }
 
 export async function runMcpGateway(): Promise<void> {

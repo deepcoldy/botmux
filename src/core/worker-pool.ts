@@ -53,12 +53,8 @@ import {
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import {
-  deliverValidatedTrustedResultDelivery,
-  TrustedResultDeliveryEffectError,
-} from './plugins/mcp/trusted-result-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, uploadFileBuffer, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
@@ -116,6 +112,7 @@ import {
   type LocalHomeLinkMode,
 } from '../im/lark/md-card.js';
 import { buildTrustedResultDeliveryCard } from '../im/lark/trusted-result-delivery-card.js';
+import { resolvePluginResultAccessUrl } from './plugin-result-access-url.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
@@ -16858,13 +16855,10 @@ function setupWorkerHandlers(
         const resultBinding = msg.responseKind === 'final'
           ? turnResultBinding(ds, msg.turnId, msg.dispatchAttempt, workerGeneration)
           : undefined;
-        const resultMessages = (messageIds: string[]): TurnDeliveryReceipt['messages'] => {
-          const hasPrimary = !!msg.markdown?.trim();
-          return messageIds.map((messageId, index) => ({
-            messageId,
-            kind: hasPrimary && index === 0 ? 'primary' : 'attachment',
-          }));
-        };
+        const resultMessages = (messageIds: string[]): TurnDeliveryReceipt['messages'] => messageIds.map(messageId => ({
+          messageId,
+          kind: 'primary',
+        }));
         const observeDelivery = (
           status: TurnDeliveryReceipt['status'],
           messageIds: string[],
@@ -16883,47 +16877,20 @@ function setupWorkerHandlers(
           },
         );
         try {
-          let preparedMarkdownCard: string | undefined;
-          const messageIds = await deliverValidatedTrustedResultDelivery(msg, {
-            validateMarkdown(markdown) {
-              preparedMarkdownCard = buildTrustedResultDeliveryCard({
-                markdown,
-                chatId: ds.chatId,
-                uuid: deliveryUuid('summary'),
-                recipientOpenId: expectedCaller,
-                brand: resolveBrandLabel(ds.larkAppId),
-                locale: localeForBot(ds.larkAppId),
-                workingDir: cb.getSessionWorkingDir(ds),
-              });
-            },
-            async sendMarkdown(markdown) {
-              const card = preparedMarkdownCard
-                ?? buildTrustedResultDeliveryCard({
-                  markdown,
-                  chatId: ds.chatId,
-                  uuid: deliveryUuid('summary'),
-                  recipientOpenId: expectedCaller,
-                  brand: resolveBrandLabel(ds.larkAppId),
-                  locale: localeForBot(ds.larkAppId),
-                  workingDir: cb.getSessionWorkingDir(ds),
-                });
-              return scopedReply(card, 'interactive', msg.turnId, {
-                uuid: deliveryUuid('summary'),
-                replyTarget: frozen.target,
-              });
-            },
-            async sendFile(file, index) {
-              const fileKey = await uploadFileBuffer(
-                ds.larkAppId,
-                file.name,
-                file.data,
-              );
-              return scopedReply(JSON.stringify({ file_key: fileKey }), 'file', msg.turnId, {
-                uuid: deliveryUuid(`file:${index}`),
-                replyTarget: frozen.target,
-              });
-            },
+          if (!/^[A-Za-z0-9_-]{20,256}$/.test(msg.viewToken)
+            || !Number.isFinite(Date.parse(msg.expiresAt))
+            || !Number.isSafeInteger(msg.fileCount)
+            || msg.fileCount < 0) {
+            throw new Error('invalid_plugin_result_entry');
+          }
+          const accessUrl = resolvePluginResultAccessUrl(msg.viewToken);
+          if (!accessUrl) throw new Error('plugin_result_access_url_unavailable');
+          const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: msg.expiresAt });
+          const messageId = await scopedReply(card, 'interactive', msg.turnId, {
+            uuid: deliveryUuid('entry'),
+            replyTarget: frozen.target,
           });
+          const messageIds = [messageId];
           // Persist the delivery fact before acknowledging the worker. Once
           // acknowledged it may immediately emit turn_terminal, so reversing
           // this order creates an empty/not-ready terminal race.
@@ -16935,19 +16902,18 @@ function setupWorkerHandlers(
             messageIds,
           });
         } catch (error) {
-          const messageIds = error instanceof TrustedResultDeliveryEffectError
-            ? error.messageIds
-            : [];
+          const messageIds: string[] = [];
           observeDelivery(
             messageIds.length ? 'partial' : 'failed',
             messageIds,
             'trusted_plugin_delivery_failed',
           );
           logger.error(
-            `[${t}] Plugin result delivery failed plugin=${msg.pluginId}: `
-            + `${error instanceof Error ? error.message : String(error)}`,
+            `[${t}] Plugin result delivery failed plugin=${msg.pluginId}`,
           );
-          reject(error instanceof Error ? error.message : String(error));
+          // Provider errors may contain result text, filenames or paths. Keep
+          // details in host logs and return only a stable non-sensitive code.
+          reject('plugin_result_delivery_failed');
         }
         break;
       }

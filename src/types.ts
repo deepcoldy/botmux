@@ -1989,9 +1989,9 @@ export type WorkerToDaemon =
       callerOpenId?: string;
       callerUnionId: string;
       deliveryId: string;
-      markdown?: string;
-      /** Base64 is bounded to 8 MiB/file and 16 MiB/delivery before IPC. */
-      files?: Array<{ name: string; dataBase64: string }>;
+      viewToken: string;
+      expiresAt: string;
+      fileCount: number;
       responseKind: 'final' | 'auxiliary';
     }
   | {

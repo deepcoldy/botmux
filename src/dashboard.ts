@@ -131,6 +131,8 @@ import {
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
 } from './dashboard/h5-auth.js';
+import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
+import { handlePluginResultAccess } from './dashboard/plugin-result-access.js';
 import { FileControlAuditSink } from './dashboard/control-audit.js';
 import {
   TerminalControlManager,
@@ -460,6 +462,7 @@ const dashboardH5Auth = createDashboardH5AuthController({
   sessions: dashboardSessions,
   audit: dashboardControlAudit,
 });
+const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
 const terminalControl = new TerminalControlManager({
   secret: SECRET,
   audit: dashboardControlAudit,
@@ -3903,6 +3906,26 @@ const server = createServer(async (req, res) => {
     // self-authenticating and must run before the ordinary Dashboard cookie
     // gate; no authorization code or session capability is ever put in a URL.
     if (await dashboardH5Auth.handle(req, res, url)) return;
+
+    // Result entry URLs carry only a short-lived, one-time view token. The
+    // route owns its identity gate because it must be reachable before the
+    // ordinary management-token gate, while still requiring the exact human
+    // principal bound when the artifact was created.
+    if (await handlePluginResultAccess(req, res, url, {
+      store: pluginResultArtifacts,
+      identity(req) {
+        const dashboardIdentity = dashboardRequestIdentity(req);
+        if (dashboardIdentity?.principalUnionId) return dashboardIdentity;
+        const resultIdentity = dashboardH5Auth.resolve(req);
+        return resultIdentity?.unionId ? { principalUnionId: resultIdentity.unionId } : null;
+      },
+      loginUrl(returnTo) {
+        const platformLogin = buildPlatformDashboardLoginUrl(returnTo);
+        if (platformLogin) return platformLogin;
+        if (!dashboardH5AuthConfig.enabled) return undefined;
+        return `${dashboardH5AuthConfig.entryPath}?returnTo=${encodeURIComponent(returnTo)}`;
+      },
+    })) return;
 
     // Session Web preview is an authenticated, same-origin reverse proxy to an
     // agent-registered literal loopback target. It owns its auth gate because

@@ -115,9 +115,10 @@ describe('worker final-output topic transport', () => {
     worker.emit('message', {
       type: 'plugin_result_delivery', requestId: `req_${mode}`,
       sessionId: mode === 'stale' ? 'sid_stale' : ds.session.sessionId,
-      pluginId: 'data-mcp', turnId: 'om_turn_old', dispatchAttempt: 1,
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', dispatchAttempt: 1,
       callerOpenId: mode === 'caller' ? 'ou_other' : 'ou_requester', callerUnionId: 'on_requester',
-      deliveryId: `delivery_${mode}_20261015`, markdown: 'CONFIDENTIAL_SENTINEL', responseKind: 'final',
+      deliveryId: `delivery_${mode}_20261015`, viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
     });
     await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
     expect(sent).toContainEqual(expect.objectContaining({
@@ -153,9 +154,9 @@ describe('worker final-output topic transport', () => {
     __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
     worker.emit('message', {
       type: 'plugin_result_delivery', requestId: 'req_trusted', sessionId: ds.session.sessionId,
-      pluginId: 'data-mcp', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
-      deliveryId: 'delivery_20261014', markdown: 'CONFIDENTIAL_BUSINESS_SENTINEL', responseKind: 'final',
-      files: [{ name: 'result.xlsx', dataBase64: Buffer.from('business-bytes').toString('base64') }],
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: 'delivery_20261014', viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
     });
     await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
     worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId,
@@ -167,14 +168,14 @@ describe('worker final-output topic transport', () => {
     expect(lookup.result.output).toEqual({ status: 'unavailable', reason: 'trusted_plugin_delivery' });
     expect(lookup.result.deliveries).toEqual([{
       channel: 'im', status: 'delivered', platform: 'lark', chatId: 'oc_source', parentMessageId: 'om_source',
-      messages: [{ kind: 'primary', messageId: 'om_primary' }, { kind: 'attachment', messageId: 'om_attachment' }],
+      messages: [{ kind: 'primary', messageId: 'om_primary' }],
     }]);
     expect(JSON.stringify(lookup)).not.toContain('CONFIDENTIAL_BUSINESS_SENTINEL');
     expect(JSON.stringify(lookup)).not.toContain('result.xlsx');
   });
 
   it.each([
-    ['partial', true],
+    ['delivered', true],
     ['failed', false],
   ])('records a non-leaking %s trusted plugin delivery terminal', async (expectedStatus, primarySucceeds) => {
     registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
@@ -199,9 +200,9 @@ describe('worker final-output topic transport', () => {
     __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
     worker.emit('message', {
       type: 'plugin_result_delivery', requestId: 'req_failed', sessionId: ds.session.sessionId,
-      pluginId: 'data-mcp', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
-      deliveryId: 'delivery_20261015', markdown: 'CONFIDENTIAL_BUSINESS_SENTINEL', responseKind: 'final',
-      files: [{ name: 'secret.xlsx', dataBase64: Buffer.from('secret').toString('base64') }],
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: 'delivery_20261015', viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
     });
     await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
     worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId,
@@ -214,14 +215,13 @@ describe('worker final-output topic transport', () => {
     expect(lookup.result.deliveries[0]).toEqual({
       channel: 'im', status: expectedStatus, platform: 'lark', chatId: 'oc_source', parentMessageId: 'om_source',
       messages: primarySucceeds ? [{ kind: 'primary', messageId: 'om_primary' }] : [],
-      reason: 'trusted_plugin_delivery_failed',
+      ...(!primarySucceeds ? { reason: 'trusted_plugin_delivery_failed' } : {}),
     });
     expect(JSON.stringify(lookup)).not.toMatch(/CONFIDENTIAL|secret\.xlsx|private/);
     expect(JSON.stringify(sent)).not.toMatch(/CONFIDENTIAL|secret\.xlsx|private/);
   });
 
   it.each([
-    ['partial', true],
     ['failed', false],
   ])('lets a normal successful final replace a %s trusted plugin attempt', async (_status, primarySucceeds) => {
     registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
@@ -246,9 +246,9 @@ describe('worker final-output topic transport', () => {
     __testOnly_setupWorkerHandlers(ds, ds.worker!, undefined, 1);
     worker.emit('message', {
       type: 'plugin_result_delivery', requestId: 'req_recover', sessionId: ds.session.sessionId,
-      pluginId: 'data-mcp', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
-      deliveryId: 'delivery_20261016', markdown: 'CONFIDENTIAL_BUSINESS_SENTINEL', responseKind: 'final',
-      files: [{ name: 'secret.xlsx', dataBase64: Buffer.from('secret').toString('base64') }],
+      pluginId: 'reference-reporter', turnId: 'om_turn_old', callerOpenId: 'ou_requester', callerUnionId: 'on_requester',
+      deliveryId: 'delivery_20261016', viewToken: 'view_token_abcdefghijklmnopqrstuvwxyz',
+      expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
     });
     await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
 
