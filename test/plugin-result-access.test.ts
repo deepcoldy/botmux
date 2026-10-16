@@ -19,7 +19,7 @@ describe('controlled plugin result page', () => {
     expect(sessions.resolveToken(created.token)?.unionId).toBe('on_owner123');
   });
 
-  it('uses the actual H5 union id in the Dashboard wiring and rejects a different artifact owner', async () => {
+  it('uses the actual H5 union id in the Dashboard wiring for both owner access and cross-user denial', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-result-h5-wiring-'));
     roots.push(root);
     const store = new PluginResultArtifactStore({ dataDir: root });
@@ -28,13 +28,18 @@ describe('controlled plugin result page', () => {
       delivery: { schemaVersion: 1, deliveryId: 'delivery_h5_wiring_20261016', markdown: 'PRIVATE_SENTINEL' },
       ownerUnionId: 'on_owner123', larkAppId: 'cli_fixture', sessionId: 'session_fixture', turnId: 'om_fixture',
     });
-    const sessions = new DashboardSessionStore({ randomToken: () => 'b'.repeat(43) });
-    const h5 = sessions.create('ou_other', 'on_other123', true).identity;
+    const tokens = ['b'.repeat(43), 'c'.repeat(43)];
+    const sessions = new DashboardSessionStore({ randomToken: () => tokens.shift()! });
+    const owner = sessions.create('ou_owner', 'on_owner123', true);
+    const other = sessions.create('ou_other', 'on_other123', true);
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       if (await handlePluginResultAccess(req, res, url, {
         store,
-        identity: () => resolvePluginResultViewerIdentity(null, h5),
+        identity: request => resolvePluginResultViewerIdentity(
+          null,
+          sessions.resolveToken(String(request.headers['x-test-h5-token'] ?? '')),
+        ),
       })) return;
       res.writeHead(404).end();
     });
@@ -42,18 +47,32 @@ describe('controlled plugin result page', () => {
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('server did not bind');
     try {
-      const response = await fetch(`http://127.0.0.1:${address.port}/plugin-result-access/${artifact.viewToken}`, {
-        redirect: 'manual',
+      const origin = `http://127.0.0.1:${address.port}`;
+      const redeemed = await fetch(`${origin}/plugin-result-access/${artifact.viewToken}`, {
+        headers: { 'x-test-h5-token': owner.token }, redirect: 'manual',
       });
-      expect(response.status).toBe(403);
+      expect(redeemed.status).toBe(303);
+      expect(redeemed.headers.get('location')).toBe(`/plugin-results/${artifact.viewId}`);
+
+      const page = await fetch(`${origin}/plugin-results/${artifact.viewId}`, {
+        headers: { 'x-test-h5-token': owner.token },
+      });
+      expect(page.status).toBe(200);
+      expect(await page.text()).toContain('PRIVATE_SENTINEL');
+
+      const crossUser = await fetch(`${origin}/plugin-result-access/${artifact.viewToken}`, {
+        headers: { 'x-test-h5-token': other.token }, redirect: 'manual',
+      });
+      expect(crossUser.status).toBe(403);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
 
     const dashboardSource = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboardSource).toContain('return resolvePluginResultViewerIdentity(');
-    expect(dashboardSource).toContain('dashboardRequestIdentity(req),');
-    expect(dashboardSource).toContain('dashboardH5Auth.resolve(req),');
+    expect(dashboardSource).toContain(`return resolvePluginResultViewerIdentity(
+          dashboardRequestIdentity(req),
+          dashboardH5Auth.resolve(req),
+        );`);
   });
 
   it('requires the bound principal, permits owner revisits, and keeps result bytes out of redirects', async () => {
