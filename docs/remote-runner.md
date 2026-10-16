@@ -141,6 +141,7 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 主动消息写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`。该 capability 同样不属于默认必需集合，只有显式配置它的部署才会在握手时要求 provider 支持。
 成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
+`final.content` 若只包含 Unicode whitespace 或 format controls（例如 U+200B 零宽空格），仍会正常提交 `turn_terminal`，但不会生成没有可见正文的 `final_output` 卡片；一旦存在可见文字则保留原始内容，不改写正文中的连接符或双向控制序列。
 
 ### 可选 Session 工具
 

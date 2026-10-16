@@ -193,9 +193,21 @@ export function stripTrailingBridgeSentinelLine(finalText: string): string {
  *  Shared by emitReadyTurns and emitReadyCodexTurns so the per-mode rule lives in
  *  one place and is unit-tested directly. codex-app does not use adopt and drives
  *  its own strip on the deliverable content path. */
+export function hasUserVisibleText(text: string): boolean {
+  // String.trim() deliberately does not remove Unicode format controls. A
+  // Remote Runner final containing only U+200B therefore used to produce a
+  // footer-only Lark card. Ignore Unicode whitespace and Cf controls for the
+  // visibility predicate, but preserve the original bytes whenever any real
+  // text remains (for example an emoji ZWJ sequence still has visible bases).
+  return String(text ?? '').replace(/[\p{White_Space}\p{Cf}]/gu, '').length > 0;
+}
+
 export function bridgePostText(finalText: string, adoptMode: boolean): string {
   const withoutMemoryCitation = stripTrailingOaiMemoryCitation(finalText);
-  return adoptMode ? withoutMemoryCitation : stripTrailingBridgeSentinelLine(withoutMemoryCitation);
+  const postText = adoptMode
+    ? withoutMemoryCitation
+    : stripTrailingBridgeSentinelLine(withoutMemoryCitation);
+  return hasUserVisibleText(postText) ? postText : '';
 }
 
 export interface BridgeSendMarker {

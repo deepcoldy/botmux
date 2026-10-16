@@ -8,6 +8,7 @@ import {
   buildBridgeSendPreviewText,
   bridgePostText,
   composeFailedBridgeFallbackContent,
+  hasUserVisibleText,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
@@ -282,6 +283,19 @@ describe('bridgePostText (adopt sentinel contract — codex #791 blocker)', () =
     const finalText = `Visible fallback.\n\n${memoryCitation()}`;
     expect(bridgePostText(finalText, false)).toBe('Visible fallback.');
     expect(bridgePostText(finalText, true)).toBe('Visible fallback.');
+  });
+
+  it('treats whitespace and Unicode format controls as visually empty', () => {
+    const invisible = ' \n\t\u200B\u200C\u200D\u200E\u200F\u202E\u2060\u2066\u2069\uFEFF';
+    expect(hasUserVisibleText(invisible)).toBe(false);
+    expect(bridgePostText(invisible, false)).toBe('');
+    expect(bridgePostText(invisible, true)).toBe('');
+  });
+
+  it('preserves content when format controls join otherwise visible text', () => {
+    expect(hasUserVisibleText('👩‍💻')).toBe(true);
+    expect(hasUserVisibleText('\u200Bvisible')).toBe(true);
+    expect(bridgePostText('\u200Bvisible\u200D', false)).toBe('\u200Bvisible\u200D');
   });
 });
 

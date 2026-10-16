@@ -325,6 +325,98 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     }));
   });
 
+  it('completes a visually empty remote final without emitting final_output', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-invisible-final-'));
+    tempDirs.push(root);
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'invisible-provider', generation: 1, remoteSessionId: 'remote-invisible-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'invisible-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status'] });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: '\\u200B', state }), 20);
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_invisible_final',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'invisible-provider' },
+    }]));
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-invisible-final',
+        LARK_APP_ID: 'app_invisible_final',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-invisible-final',
+      chatId: 'oc_invisible_final',
+      rootMessageId: 'om_invisible_final',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'invisible-provider' },
+      prompt: 'return an invisible final',
+      turnId: 'turn-invisible-final',
+      trustedCaller: {
+        requestUserOpenId: 'ou_remote_user',
+        requestLarkAppId: 'app_invisible_final',
+        senderType: 'user',
+      },
+      larkAppId: 'app_invisible_final',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'turn-invisible-final'
+        && message.status === 'completed'),
+      () => `invisible final did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.some(message => message.type === 'final_output'
+      && message.turnId === 'turn-invisible-final')).toBe(false);
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
   it('passes trusted turn input, persists provider state, and projects a terminal screen', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-worker-'));
     tempDirs.push(root);
