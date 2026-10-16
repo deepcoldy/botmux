@@ -22,6 +22,9 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   if (command.type === 'hello') {
     const capabilities = ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status'];
     if (!command.sessionId.includes('no-session-tool')) capabilities.push('session_tool');
+    if (!command.sessionId.includes('no-schedule-capability')) {
+      capabilities.push('session_tool_schedule');
+    }
     emit({
       type: 'hello', requestId: command.requestId, provider: 'session-tool-test',
       capabilities,
@@ -42,7 +45,9 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       operationId: 'session-tool-1',
       turnId: command.turnId,
       generation: command.content === 'future-generation' ? 2 : 1,
-      request: { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
+      request: command.content === 'schedule-tool'
+        ? { tool: 'schedule.list' }
+        : { tool: 'history', limit: 20, scope: 'thread', withCardJson: true },
     });
     return;
   }

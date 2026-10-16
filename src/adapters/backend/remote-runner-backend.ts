@@ -838,6 +838,14 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.failProtocol('remote runner emitted session_tool without advertising the capability');
       return;
     }
+    const scheduleTool = operation.request.tool.startsWith('schedule.');
+    if (scheduleTool && (!this.providerCapabilities.has('session_tool_schedule')
+        || !this.requiredCapabilities.includes('session_tool_schedule'))) {
+      this.failProtocol(
+        'remote runner emitted a schedule session tool without explicit host and provider capability',
+      );
+      return;
+    }
     if (!this.acceptAcknowledgedTurn(operation.turnId)) return;
     if (operation.generation !== this.state?.generation) {
       this.failProtocol('remote runner session tool belongs to another backend generation');

@@ -40,6 +40,7 @@ export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
  * authorization. */
 export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
   'session_tool',
+  'session_tool_schedule',
 ] as const;
 
 /** Optional recovery of a provider-owned turn that survived the host process. */

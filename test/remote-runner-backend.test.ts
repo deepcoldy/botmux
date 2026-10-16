@@ -153,6 +153,7 @@ describe('RemoteRunnerBackend', () => {
 
   it.each([
     ['session-no-session-tool', 'session-tool'],
+    ['session-no-schedule-capability', 'schedule-tool'],
     ['session-session-tool-generation', 'future-generation'],
   ])('fails closed for session tool protocol guard %s', async (sessionId, content) => {
     const backend = new RemoteRunnerBackend(

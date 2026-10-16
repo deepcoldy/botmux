@@ -15,7 +15,8 @@
       "start", "resume", "turn", "cancel", "detach", "reattach", "status",
       "terminal_screen", "terminal_input", "terminal_resize", "outbound_message",
       "outbound_message_explicit_mention",
-      "session_tool"
+      "session_tool",
+      "session_tool_schedule"
     ],
     "handshakeTimeoutMs": 30000,
     "operationTimeoutMs": 20000
@@ -143,7 +144,7 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 ### 可选 Session 工具
 
-声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的 Session helper。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。
+声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的只读 Session helper；持久调度还要求部署的 `requiredCapabilities` 和 provider hello 同时显式声明 `session_tool_schedule`。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。只升级 Host 而未显式要求新 capability 的旧部署保持原只读权限面。
 
 当前 allowlist：
 
