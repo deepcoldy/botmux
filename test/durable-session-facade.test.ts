@@ -116,6 +116,35 @@ describe('durable session facade', () => {
     }
   });
 
+  it('ignores a stale renewal result after a foreground write refreshes the lease', async () => {
+    vi.useFakeTimers();
+    try {
+      const { store } = fakeStore();
+      const delayedRenewal = deferred<Awaited<ReturnType<typeof store.renewSessionLease>>>();
+      vi.mocked(store.renewSessionLease).mockReturnValueOnce(delayedRenewal.promise);
+      const onLeaseLost = vi.fn();
+      const facade = createDurableSessionFacade({
+        store,
+        ownerId: 'renew-race-owner',
+        leaseDurationMs: 1_200,
+        keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+        onLeaseLost,
+      });
+
+      await facade.writeExact('session-renew-race', { status: 'active', revision: 1 });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      await facade.writeExact('session-renew-race', { status: 'active', revision: 2 });
+      delayedRenewal.resolve({ kind: 'stale' });
+      await Promise.resolve();
+
+      expect(onLeaseLost).not.toHaveBeenCalled();
+      await facade.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('orders an explicit lease release after earlier writes on the same lane', async () => {
     const { store } = fakeStore();
     const blockedWrite = deferred<WriteSessionResult>();
