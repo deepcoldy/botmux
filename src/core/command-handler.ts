@@ -6564,13 +6564,16 @@ export const ADOPT_RESUME_LIMIT = 20;
 
 /** Discover the sessions resumable from disk for `cliId`, excluding any whose
  *  CLI-native id is already live in a botmux session (so a session botmux
- *  already runs isn't offered for re-import). Returns [] when the adapter has
- *  no on-disk store. */
+ *  already runs isn't offered for re-import). `extraExclude` adds more ids to
+ *  skip — the /adopt picker passes the session ids of the live panes it lists,
+ *  so a running session doesn't show up a second time as history. Returns []
+ *  when the adapter has no on-disk store. */
 export async function discoverResumableSessionsForBot(
   cliId: CliId,
   cliPathOverride: string | undefined,
   activeSessions: Map<string, DaemonSession>,
   limit = ADOPT_RESUME_LIMIT,
+  extraExclude?: ReadonlySet<string>,
 ): Promise<ResumableSession[]> {
   let adapter: ReturnType<typeof createCliAdapterSync>;
   try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
@@ -6588,7 +6591,13 @@ export async function discoverResumableSessionsForBot(
   for (const ds of activeSessions.values()) {
     if (ds.session.sessionId) exclude.add(ds.session.sessionId);
     if (ds.session.cliSessionId) exclude.add(ds.session.cliSessionId);
+    // An in-progress adopt observes an external CLI whose id lives only in
+    // adoptedFrom (a Claude adopt never sets cliSessionId). Hidden only while
+    // the adopt is active: once it ends the session is offered as history again.
+    const adoptedSessionId = ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId;
+    if (adoptedSessionId) exclude.add(adoptedSessionId);
   }
+  for (const id of extraExclude ?? []) exclude.add(id);
   try {
     return await adapter.listResumableSessions({ limit, exclude });
   } catch {

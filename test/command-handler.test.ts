@@ -463,6 +463,24 @@ vi.mock('../src/core/session-discovery.js', async (importOriginal) => {
   };
 });
 
+// Resume-history tests swap in a fake on-disk store (`resumeStore.list`) so they
+// can see the exclude set the adapter receives; while it is unset every adapter
+// is the real one, so other tests are unaffected.
+const resumeStore = vi.hoisted(() => ({
+  list: undefined as undefined | ((opts: { limit: number; exclude?: ReadonlySet<string> }) => Promise<any[]>),
+}));
+vi.mock('../src/adapters/cli/registry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/adapters/cli/registry.js')>();
+  return {
+    ...actual,
+    createCliAdapterSync: ((...args: Parameters<typeof actual.createCliAdapterSync>) => {
+      const adapter = actual.createCliAdapterSync(...args);
+      if (resumeStore.list) adapter.listResumableSessions = resumeStore.list;
+      return adapter;
+    }) as typeof actual.createCliAdapterSync,
+  };
+});
+
 // /adopt now merges tmux + zellij discovery; mock zellij so tests don't shell
 // out to a real `zellij` on the host (would surface live sessions and flake).
 vi.mock('../src/core/zellij-adopt-discovery.js', () => ({
@@ -621,7 +639,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession, discoverResumableSessionsForBot } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -7406,6 +7424,116 @@ describe('handleCommand', () => {
       expect(forkWorker).not.toHaveBeenCalled();
       expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1])
         .toContain('本话题已共享接入一条 Codex App 对话');
+    });
+
+    describe('resume history dedup', () => {
+      const history = (cliSessionId: string, n: number) => ({
+        cliSessionId, cwd: '/work/demo', title: `示例会话 ${n}`, lastActivityAt: 1_000 - n,
+      });
+      // Mirrors the real adapters: exclusion first, truncation second.
+      function fakeResumeStore(rows: Array<ReturnType<typeof history>>) {
+        const list = vi.fn(async ({ limit, exclude }: { limit: number; exclude?: ReadonlySet<string> }) =>
+          rows.filter(r => !exclude?.has(r.cliSessionId)).slice(0, limit));
+        resumeStore.list = list;
+        return list;
+      }
+      const lastExclude = (list: ReturnType<typeof fakeResumeStore>) => new Set(list.mock.calls.at(-1)![0].exclude);
+
+      afterEach(() => { resumeStore.list = undefined; });
+
+      it('folds extraExclude into the adapter exclude set; without it the set is unchanged', async () => {
+        const list = fakeResumeStore([]);
+        const activeSessions = new Map<string, DaemonSession>([
+          ['k1', makeDaemonSession({ session: makeSession({ sessionId: 'bm-1', cliSessionId: 'cli-1' }) })],
+          ['k2', makeDaemonSession({ session: makeSession({ sessionId: 'bm-2' }) })],
+        ]);
+
+        vi.mocked(sessionStore.collectBotmuxSessionIdentities).mockReturnValueOnce(new Set(['store-1', 'store-2']));
+        await discoverResumableSessionsForBot('claude-code', undefined, activeSessions, 20);
+        expect(list.mock.calls[0][0]).toEqual({
+          limit: 20,
+          exclude: new Set(['store-1', 'store-2', 'bm-1', 'cli-1', 'bm-2']),
+        });
+
+        vi.mocked(sessionStore.collectBotmuxSessionIdentities).mockReturnValueOnce(new Set(['store-1', 'store-2']));
+        await discoverResumableSessionsForBot('claude-code', undefined, activeSessions, 20, new Set(['live-1', 'live-2']));
+        expect(list.mock.calls[1][0]).toEqual({
+          limit: 20,
+          exclude: new Set(['store-1', 'store-2', 'bm-1', 'cli-1', 'bm-2', 'live-1', 'live-2']),
+        });
+      });
+
+      it.each([
+        { where: 'ds.adoptedFrom', dsOverrides: { adoptedFrom: { source: 'herdr' as const, cwd: '/work/demo', sessionId: 'ext-claude-1' } }, sessionOverrides: {} },
+        { where: 'ds.session.adoptedFrom', dsOverrides: {}, sessionOverrides: { adoptedFrom: { source: 'herdr' as const, cwd: '/work/demo', sessionId: 'ext-claude-1' } } },
+      ])('excludes an in-progress adopt by its CLI session id ($where)', async ({ dsOverrides, sessionOverrides }) => {
+        const list = fakeResumeStore([history('ext-claude-1', 1), history('ext-other', 2)]);
+        const adopting = makeDaemonSession({
+          ...dsOverrides,
+          session: makeSession({ sessionId: 'bm-adopt', ...sessionOverrides }),
+        });
+
+        const result = await discoverResumableSessionsForBot('claude-code', undefined, new Map([['k', adopting]]), 20);
+
+        expect(lastExclude(list).has('ext-claude-1')).toBe(true);
+        expect(result.map(r => r.cliSessionId)).toEqual(['ext-other']);
+      });
+
+      it('hides an adopted Claude session only while the adopt is in progress', async () => {
+        const list = fakeResumeStore([history('ext-claude-1', 1), history('ext-other', 2)]);
+        // A Claude adopt records adoptedFrom.sessionId on both objects and never sets cliSessionId.
+        const adoptedFrom = {
+          source: 'herdr' as const, herdrPaneId: 'w1:p1', cwd: '/work/demo',
+          sessionId: 'ext-claude-1', cliId: 'claude-code' as const,
+        };
+        const adopting = makeDaemonSession({
+          adoptedFrom,
+          session: makeSession({ sessionId: 'bm-adopt', adoptedFrom }),
+        });
+        const activeSessions = new Map<string, DaemonSession>([['k', adopting]]);
+        // The real store identity set reads only sessionId / cliSessionId, so the
+        // adopt row contributes just its botmux id (a fresh Set per call, as in prod).
+        vi.mocked(sessionStore.collectBotmuxSessionIdentities).mockImplementation(() => new Set(['bm-adopt']));
+        try {
+          const during = await discoverResumableSessionsForBot('claude-code', undefined, activeSessions, 20);
+          expect(during.map(r => r.cliSessionId)).toEqual(['ext-other']);
+
+          // Disconnected and the CLI exited: the worker leaves activeSessions,
+          // only the closed adopt row stays in the store.
+          activeSessions.delete('k');
+          adopting.session.status = 'closed';
+          const after = await discoverResumableSessionsForBot('claude-code', undefined, activeSessions, 20);
+          expect(lastExclude(list)).toEqual(new Set(['bm-adopt']));
+          expect(after.map(r => r.cliSessionId)).toEqual(['ext-claude-1', 'ext-other']);
+        } finally {
+          vi.mocked(sessionStore.collectBotmuxSessionIdentities).mockImplementation(() => new Set<string>());
+        }
+      });
+
+      it('/adopt <live session id> replies not-found instead of resume-importing the running session', async () => {
+        vi.mocked(discoverAdoptableSessions).mockReturnValueOnce([{
+          source: 'herdr',
+          herdrSessionName: 'default',
+          herdrTarget: 'w1:p2',
+          herdrPaneId: 'w1:p2',
+          herdrAgentName: 'demo-agent',
+          cliId: 'claude-code',
+          cwd: '/work/demo',
+          paneCols: 200,
+          paneRows: 50,
+          sessionId: 'live-sid',
+        }]);
+        // The running session's transcript is also on disk (newest first).
+        fakeResumeStore([history('live-sid', 1), history('ext-other', 2)]);
+        const ds = makeDaemonSession();
+        const deps = makeDeps(ds);
+
+        await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt live-sid'), deps, LARK_APP_ID);
+
+        expect(forkWorker).not.toHaveBeenCalled();
+        expect(ds.session.cliSessionId).toBeUndefined();
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('未找到');
+      });
     });
   });
 
