@@ -9,6 +9,7 @@
  * 独立成模块（不放 cli.ts）：cli.ts 顶层就是命令分发 switch，测试无法直接 import。
  */
 import type { CardUsageSnapshot } from '../im/lark/md-card.js';
+import { MAX_SEGMENTS, MAX_SEGMENT_CHARS } from '../services/card-footer-extension.js';
 import type { StatuslineQuota } from '../services/statusline-snapshot.js';
 
 function nonNegativeFinite(v: unknown): v is number {
@@ -40,6 +41,15 @@ export function normalizeCardUsageQuota(value: unknown): StatuslineQuota | undef
   set('sevenDayPercent', percentField(q.sevenDayPercent));
   set('sevenDayResetsAtMs', resetsAtField(q.sevenDayResetsAtMs));
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** cardFooterExtension 段：只收非空字符串，段数与长度按 daemon 侧上限再截一次。 */
+function normalizeExtensionSegments(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = value
+    .filter((v): v is string => typeof v === 'string' && v.trim().length > 0 && [...v].length <= MAX_SEGMENT_CHARS)
+    .slice(0, MAX_SEGMENTS);
+  return out.length > 0 ? out : undefined;
 }
 
 export function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
@@ -89,5 +99,12 @@ export function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | 
   for (const key of ['model', 'reasoningEffort', 'modelBackendVariant'] as const) {
     if (typeof raw[key] === 'string' && raw[key].trim()) identity[key] = raw[key].trim();
   }
-  return { context, tokens, ...(quota ? { quota } : {}), ...identity };
+  const extensionSegments = normalizeExtensionSegments(raw.extensionSegments);
+  return {
+    context,
+    tokens,
+    ...(quota ? { quota } : {}),
+    ...(extensionSegments ? { extensionSegments } : {}),
+    ...identity,
+  };
 }
