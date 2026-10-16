@@ -2795,7 +2795,11 @@ export interface AdoptPickerEntry {
   kind: AdoptEntryKind;
   cliId?: CliId;
   cliDisplayName?: string;
-  /** resume: first user prompt; live: project (cwd basename). */
+  /** resume: the CLI's native title when the transcript has one, else the
+   *  first real user prompt (see ResumableSession.title); live: backend
+   *  display name (herdr pane label / Claude terminal title, see
+   *  AdoptableSession.title), else project (cwd basename). zellij always uses
+   *  project. */
   title: string;
   /** cwd basename, shown compactly. */
   project: string;
@@ -2853,7 +2857,7 @@ export function buildAdoptEntries(
       kind: 'live' as const,
       cliId: s.cliId,
       ...(customName && s.cliId === resumeCliId ? { cliDisplayName: customName } : {}),
-      title: project,
+      title: (!zellij && s.title) || project,
       project,
       cwd: s.cwd,
       sessionId: s.sessionId,
