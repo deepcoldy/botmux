@@ -22,7 +22,7 @@ function message(): DurableLarkMessageClaim {
   };
 }
 
-function session(): Session {
+function session(overrides: Partial<Session> = {}): Session {
   return {
     sessionId: 'session-1',
     chatId: 'oc_chat',
@@ -32,6 +32,7 @@ function session(): Session {
     status: 'active',
     createdAt: '2026-10-05T00:00:00.000Z',
     larkAppId: 'cli_test',
+    ...overrides,
   };
 }
 
@@ -92,6 +93,32 @@ describe('durable Lark canonical dispatch', () => {
     expect(handle).toHaveBeenCalledWith(message(), expect.objectContaining({ data: message().data }));
     expect(records.has('om_root::cli_test')).toBe(true);
     await facade.stop();
+  });
+
+  it('releases the Session lease after a closed canonical snapshot is committed', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-close-owner' });
+    const releaseLease = vi.spyOn(facade, 'releaseLease');
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async () => ({
+        kind: 'admitted',
+        session: session({
+          status: 'closed',
+          closedAt: '2026-10-16T00:01:00.000Z',
+        }),
+      }),
+    });
+
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toMatchObject({ kind: 'committed' });
+    expect(releaseLease).toHaveBeenCalledWith('om_root::cli_test');
+    expect(store.releaseSessionLease).toHaveBeenCalledOnce();
+    expect(vi.mocked(store.writeSession).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(store.releaseSessionLease).mock.invocationCallOrder[0]!);
+    await facade.stop();
+    expect(store.releaseSessionLease).toHaveBeenCalledOnce();
   });
 
   it('returns explicit ignored results without writing a Session', async () => {
