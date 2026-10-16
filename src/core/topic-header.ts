@@ -244,7 +244,9 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
       // 「用户已经写了头部」才对未知 `/xxx` fail closed。否则这只是今天的
       // `/t <文案>`：`/t /goal 干活`、`/t /close` 等既有冷启动/命令用法必须原样
       // 落到 parseSlashCommandInvocation，不能被解析器提前拒掉（D9 向后兼容）。
-      const claimed = title !== undefined || worktree !== undefined || lifecycle !== undefined || Object.keys(directives).length > 0;
+      // 生命周期变体不算「写了头部」：`/th` 就是 `/t here`，`/th /teach 讲讲实现`
+      // 与 `/t /goal 干活` 同形，紧跟的技能/命令必须照样转给 CLI。
+      const claimed = title !== undefined || worktree !== undefined || Object.keys(directives).length > 0;
       if (claimed && token.text.startsWith('/')) {
         return { ok: false, sentinel, kind: 'unknown_directive', token: token.text };
       }
