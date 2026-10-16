@@ -68,6 +68,9 @@ const CASES: readonly Case[] = [
   ['/api/bot-no-progress-notify', '{"noProgressNotify":{"timeoutMs":5}}', 400, { ok: false, error: expect.stringContaining('invalid_no_progress_notify') }],
   ['/api/bot-feedback', '{"feedback":"{bad"}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-env', '{"env":"{\\"FOO\\":\\"bar\\"}"}', 200, { ok: true, env: '', envKeys: ['FOO'] }, { env: { FOO: 'bar' } }],
+  ['/api/bot-env', '{"mode":"nope"}', 400, { ok: false, error: 'invalid_mode' }],
+  ['/api/bot-env', '{"remove":"FOO"}', 400, { ok: false, error: 'invalid_remove' }],
+  ['/api/bot-env', '{"remove":[1]}', 400, { ok: false, error: 'invalid_remove' }],
   ['/api/bot-max-live-workers', '{"maxLiveWorkers":5}', 200, { ok: true, maxLiveWorkers: 5 }, { maxLiveWorkers: 5 }],
   ['/api/bot-max-live-workers', '{"maxLiveWorkers":0}', 400, { ok: false, error: 'invalid_number' }],
   ['/api/bot-max-live-workers', '[]', 400, { ok: false, error: 'no_valid_fields' }],
@@ -162,6 +165,30 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     if (status !== 200) {
       expect(persistedBot()).toEqual({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' });
     }
+  });
+
+  it('/api/bot-env merges and removes keys, then clears an empty merge result', async () => {
+    const seed = await put('/api/bot-env', JSON.stringify({
+      env: JSON.stringify({ KEEP: 'old', DROP: 'delete', UNTOUCHED: 'same' }),
+    }));
+    expect(seed.status).toBe(200);
+
+    const merge = await put('/api/bot-env', JSON.stringify({
+      mode: 'merge',
+      env: JSON.stringify({ KEEP: 'new', ADDED: 'yes' }),
+      remove: ['DROP'],
+    }));
+    expect(merge.status).toBe(200);
+    expect(await merge.json()).toEqual({ ok: true, env: '', envKeys: ['ADDED', 'KEEP', 'UNTOUCHED'] });
+    expect(persistedBot().env).toEqual({ KEEP: 'new', ADDED: 'yes', UNTOUCHED: 'same' });
+
+    const clear = await put('/api/bot-env', JSON.stringify({
+      mode: 'merge',
+      remove: ['KEEP', 'ADDED', 'UNTOUCHED'],
+    }));
+    expect(clear.status).toBe(200);
+    expect(await clear.json()).toEqual({ ok: true, env: '', envKeys: [] });
+    expect(persistedBot()).not.toHaveProperty('env');
   });
 
   it('never reaches the spec_missing branch: every field key resolves in the config store', async () => {
