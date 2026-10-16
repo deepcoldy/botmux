@@ -12,13 +12,13 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('controlled plugin result page', () => {
-  it('retains the tenant-stable principal in an H5 session', () => {
+  it('retains the cross-app stable principal in an H5 session', () => {
     const sessions = new DashboardSessionStore({ randomToken: () => 'a'.repeat(43) });
     const created = sessions.create('ou_requester', 'on_owner123');
     expect(sessions.resolveToken(created.token)?.unionId).toBe('on_owner123');
   });
 
-  it('requires the bound principal, burns the entry token once, and keeps result bytes out of redirects', async () => {
+  it('requires the bound principal, permits owner revisits, and keeps result bytes out of redirects', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-result-page-'));
     roots.push(root);
     const store = new PluginResultArtifactStore({ dataDir: root });
@@ -57,10 +57,11 @@ describe('controlled plugin result page', () => {
       expect(redeemed.headers.get('location')).toBe(`/plugin-results/${artifact.viewId}`);
       expect(redeemed.headers.get('location')).not.toContain('PRIVATE_SENTINEL');
 
-      const replay = await fetch(`${origin}/plugin-result-access/${artifact.viewToken}`, {
+      const revisit = await fetch(`${origin}/plugin-result-access/${artifact.viewToken}`, {
         headers: { 'x-test-union-id': 'on_owner123' }, redirect: 'manual',
       });
-      expect(replay.status).toBe(403);
+      expect(revisit.status).toBe(303);
+      expect(revisit.headers.get('location')).toBe(`/plugin-results/${artifact.viewId}`);
 
       const page = await fetch(`${origin}/plugin-results/${artifact.viewId}`, {
         headers: { 'x-test-union-id': 'on_owner123' },

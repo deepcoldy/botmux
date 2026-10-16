@@ -463,6 +463,11 @@ const dashboardH5Auth = createDashboardH5AuthController({
   audit: dashboardControlAudit,
 });
 const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+try {
+  pluginResultArtifacts.sweepExpired();
+} catch (error) {
+  logger.warn(`[dashboard] Failed to sweep expired plugin results: ${(error as Error).message}`);
+}
 const terminalControl = new TerminalControlManager({
   secret: SECRET,
   audit: dashboardControlAudit,

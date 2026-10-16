@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -65,7 +65,7 @@ describe('trusted plugin result delivery', () => {
     expect(existsSync(large)).toBe(true);
   });
 
-  it('binds access to the owner, consumes the entry token once, expires and revokes fail closed', () => {
+  it('binds access to the owner, allows owner revisits, expires and revokes fail closed', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-result-store-'));
     let now = Date.parse('2026-10-16T00:00:00.000Z');
     let sequence = 0;
@@ -85,7 +85,7 @@ describe('trusted plugin result delivery', () => {
     const first = make();
     expect(() => store.redeem(first.viewToken, 'on_other123')).toThrow('plugin_result_access_denied');
     expect(store.redeem(first.viewToken, 'on_owner123').viewId).toBe(first.viewId);
-    expect(() => store.redeem(first.viewToken, 'on_owner123')).toThrow('plugin_result_token_replayed');
+    expect(store.redeem(first.viewToken, 'on_owner123').viewId).toBe(first.viewId);
     expect(() => store.resolveView(first.viewId, 'on_other123')).toThrow('plugin_result_access_denied');
 
     const expired = make();
@@ -97,6 +97,49 @@ describe('trusted plugin result delivery', () => {
     store.revoke(revoked.artifactId);
     expect(() => store.redeem(revoked.viewToken, 'on_owner123')).toThrow('plugin_result_revoked');
     expect(() => store.resolveView(revoked.viewId, 'on_owner123')).toThrow('plugin_result_revoked');
+  });
+
+  it('sweeps expired and revoked artifacts before enforcing count and byte quotas', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-result-quota-'));
+    let now = Date.parse('2026-10-16T00:00:00.000Z');
+    let sequence = 0;
+    const store = new PluginResultArtifactStore({
+      dataDir: root,
+      now: () => now,
+      ttlMs: 60_000,
+      maxArtifacts: 1,
+      maxStoreBytes: 4_096,
+      randomId: () => `opaque_quota_${++sequence}_abcdefghijklmnop`,
+      randomToken: () => `view_quota_${++sequence}_abcdefghijklmnopqrstuvwxyz`,
+    });
+    const create = (markdown: string) => store.create({
+      pluginId: 'reference-reporter',
+      delivery: { schemaVersion: 1, deliveryId: `delivery_quota_${sequence}_abcdefgh`, markdown },
+      ownerUnionId: 'on_owner123', larkAppId: 'cli_fixture', sessionId: 'session_fixture', turnId: 'om_fixture',
+    });
+
+    const expired = create('small');
+    expect(() => create('blocked by count')).toThrow('plugin_result_store_artifact_quota_exceeded');
+    now += 60_000;
+    const replacement = create('replacement after expiry');
+    expect(existsSync(join(root, 'plugin-result-artifacts', 'artifacts', expired.artifactId))).toBe(false);
+    expect(store.redeem(replacement.viewToken, 'on_owner123').viewId).toBe(replacement.viewId);
+    store.revoke(replacement.artifactId);
+    const afterRevoke = create('replacement after revoke');
+    expect(store.redeem(afterRevoke.viewToken, 'on_owner123').viewId).toBe(afterRevoke.viewId);
+
+    const byteLimited = new PluginResultArtifactStore({
+      dataDir: join(root, 'byte-limited'),
+      maxStoreBytes: 64,
+      maxArtifacts: 10,
+    });
+    expect(() => byteLimited.create({
+      pluginId: 'reference-reporter',
+      delivery: { schemaVersion: 1, deliveryId: 'delivery_byte_quota_abcdefgh', markdown: 'x'.repeat(128) },
+      ownerUnionId: 'on_owner123', larkAppId: 'cli_fixture', sessionId: 'session_fixture', turnId: 'om_fixture',
+    })).toThrow('plugin_result_store_byte_quota_exceeded');
+    expect(readdirSync(join(byteLimited.root, 'artifacts'))).toEqual([]);
+    expect(readdirSync(join(byteLimited.root, 'tokens')).filter(name => name.endsWith('.json'))).toEqual([]);
   });
 
   it('renders a metadata-only entry card without result content or internal handles', () => {

@@ -86,8 +86,8 @@ export async function handlePluginResultAccess(
     res.end();
     return true;
   }
-  // Link unfurlers commonly probe with HEAD. Never let a preview consume the
-  // one-time entry token before the user opens it.
+  // Link unfurlers commonly probe with HEAD. Do not redirect previews into a
+  // viewer-bound result route; only an authenticated user GET may enter it.
   if (tokenMatch && req.method !== 'GET') {
     res.writeHead(405, { allow: 'GET', 'cache-control': 'no-store' });
     res.end();
