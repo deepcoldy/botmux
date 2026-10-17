@@ -11,6 +11,7 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'readSession',
   'writeSession',
   'enqueueInbox',
+  'enqueueInboxWithLease',
   'claimNextInbox',
   'renewInboxClaim',
   'completeInboxClaim',
@@ -246,6 +247,10 @@ export function validateDurableCoordinationProviderResult(
     }
     case 'enqueueInbox': {
       valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict']);
+      break;
+    }
+    case 'enqueueInboxWithLease': {
+      valid = !!oneOfKinds(value, ['inserted', 'duplicate', 'conflict', 'stale_lease']);
       break;
     }
     case 'claimNextInbox':

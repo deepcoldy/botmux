@@ -40,6 +40,7 @@ function fakeStore() {
     })),
     releaseSessionLease: vi.fn(async released => ({ kind: 'applied', lease: released })),
     enqueueInbox: vi.fn(async () => ({ kind: 'inserted' })),
+    enqueueInboxWithLease: vi.fn(async () => ({ kind: 'inserted' })),
     claimNextInbox: vi.fn(),
     renewInboxClaim: vi.fn(),
     completeInboxClaim: vi.fn(),
@@ -119,14 +120,14 @@ describe('durable Lark primary ingress', () => {
     expect(ingress.status()).toEqual({ kind: 'standby' });
     await expect(ingress.enqueueBeforeAck(message('om_1')))
       .rejects.toBeInstanceOf(DurableLarkIngressNotLeaderError);
-    expect(store.enqueueInbox).not.toHaveBeenCalled();
+    expect(store.enqueueInboxWithLease).not.toHaveBeenCalled();
     await ingress.stop();
   });
 
   it('serializes one partition and assigns strictly increasing timestamps', async () => {
     const store = fakeStore();
     const first = deferred<DurableInsertResult>();
-    vi.mocked(store.enqueueInbox)
+    vi.mocked(store.enqueueInboxWithLease)
       .mockReturnValueOnce(first.promise)
       .mockResolvedValueOnce({ kind: 'duplicate' });
     const ingress = startDurableLarkPrimaryIngress({
@@ -141,13 +142,13 @@ describe('durable Lark primary ingress', () => {
     const n = ingress.enqueueBeforeAck(message('om_1'));
     const nPlusOne = ingress.enqueueBeforeAck(message('om_2'));
     await flushMicrotasks();
-    expect(store.enqueueInbox).toHaveBeenCalledOnce();
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledOnce();
 
     first.resolve({ kind: 'inserted' });
     await expect(n).resolves.toEqual({ kind: 'inserted' });
     await expect(nPlusOne).resolves.toEqual({ kind: 'duplicate' });
-    const firstRow = vi.mocked(store.enqueueInbox).mock.calls[0]![0];
-    const secondRow = vi.mocked(store.enqueueInbox).mock.calls[1]![0];
+    const firstRow = vi.mocked(store.enqueueInboxWithLease).mock.calls[0]![0].event;
+    const secondRow = vi.mocked(store.enqueueInboxWithLease).mock.calls[1]![0].event;
     expect(secondRow.createdAt).toBe(firstRow.createdAt + 1);
     expect(secondRow.visibleAt).toBe(secondRow.createdAt);
     await ingress.stop();
@@ -155,7 +156,7 @@ describe('durable Lark primary ingress', () => {
 
   it('ACKs inserted and duplicate rows but fails closed on a conflicting duplicate', async () => {
     const store = fakeStore();
-    vi.mocked(store.enqueueInbox)
+    vi.mocked(store.enqueueInboxWithLease)
       .mockResolvedValueOnce({ kind: 'inserted' })
       .mockResolvedValueOnce({ kind: 'duplicate' })
       .mockResolvedValueOnce({ kind: 'conflict' });
@@ -180,6 +181,26 @@ describe('durable Lark primary ingress', () => {
     await ingress.stop();
   });
 
+  it('rejects an enqueue atomically fenced by an expired ingress lease', async () => {
+    const store = fakeStore();
+    vi.mocked(store.enqueueInboxWithLease).mockResolvedValueOnce({ kind: 'stale_lease' });
+    const onLeadershipLost = vi.fn();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      onLeadershipLost,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck(message('om_stale')))
+      .rejects.toBeInstanceOf(DurableLarkIngressNotLeaderError);
+    expect(ingress.status()).toEqual({ kind: 'standby' });
+    expect(onLeadershipLost).toHaveBeenCalledOnce();
+    await ingress.stop();
+  });
+
   it('rejects a mismatched event identity before writing the durable inbox', async () => {
     const store = fakeStore();
     const ingress = startDurableLarkPrimaryIngress({
@@ -194,7 +215,7 @@ describe('durable Lark primary ingress', () => {
       ...message('om_payload'),
       eventId: 'im.message.receive_v1:cli_test:om_other',
     })).rejects.toThrow(/message identity/);
-    expect(store.enqueueInbox).not.toHaveBeenCalled();
+    expect(store.enqueueInboxWithLease).not.toHaveBeenCalled();
     expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
     await ingress.stop();
   });
@@ -215,9 +236,12 @@ describe('durable Lark primary ingress', () => {
       partitionKey: 'lark-message-routing:cli_test:oc_chat',
       data: { event_id: 'evt_edit_1', message: { message_id: 'om_1', chat_id: 'oc_chat' } },
     })).resolves.toEqual({ kind: 'inserted' });
-    expect(store.enqueueInbox).toHaveBeenCalledWith(expect.objectContaining({
-      eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
-      payload: expect.objectContaining({ type: 'lark.im.message.updated_v1' }),
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ epoch: 1 }),
+      event: expect.objectContaining({
+        eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
+        payload: expect.objectContaining({ type: 'lark.im.message.updated_v1' }),
+      }),
     }));
     await ingress.stop();
   });
@@ -244,11 +268,14 @@ describe('durable Lark primary ingress', () => {
       partitionKey: 'lark-session-control:cli_test:session-1',
       data,
     })).resolves.toEqual({ kind: 'inserted' });
-    expect(store.enqueueInbox).toHaveBeenCalledWith(expect.objectContaining({
-      eventId: 'card.action.trigger:cli_test:evt_close_1',
-      lane: 'session-control',
-      partitionKey: 'lark-session-control:cli_test:session-1',
-      payload: expect.objectContaining({ type: 'botmux.lark.session-control' }),
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ epoch: 1 }),
+      event: expect.objectContaining({
+        eventId: 'card.action.trigger:cli_test:evt_close_1',
+        lane: 'session-control',
+        partitionKey: 'lark-session-control:cli_test:session-1',
+        payload: expect.objectContaining({ type: 'botmux.lark.session-control' }),
+      }),
     }));
     await ingress.stop();
   });
@@ -256,7 +283,7 @@ describe('durable Lark primary ingress', () => {
   it('keeps a timed-out enqueue in the partition tail so the next event cannot overtake it', async () => {
     const store = fakeStore();
     const first = deferred<DurableInsertResult>();
-    vi.mocked(store.enqueueInbox)
+    vi.mocked(store.enqueueInboxWithLease)
       .mockReturnValueOnce(first.promise)
       .mockResolvedValueOnce({ kind: 'inserted' });
     const ingress = startDurableLarkPrimaryIngress({
@@ -276,21 +303,21 @@ describe('durable Lark primary ingress', () => {
     const nRejected = n.catch(error => error);
     const nPlusOneRejected = nPlusOne.catch(error => error);
     await flushMicrotasks();
-    expect(store.enqueueInbox).toHaveBeenCalledOnce();
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledOnce();
     await expect(nRejected).resolves.toBeInstanceOf(DurableLarkIngressAckTimeoutError);
     await expect(nPlusOneRejected).resolves.toBeInstanceOf(DurableLarkIngressAckTimeoutError);
-    expect(store.enqueueInbox).toHaveBeenCalledOnce();
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledOnce();
 
     first.resolve({ kind: 'inserted' });
     await flushMicrotasks();
-    expect(store.enqueueInbox).toHaveBeenCalledTimes(2);
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledTimes(2);
     expect(ingress.status()).toEqual({ kind: 'leader', epoch: 1 });
     await ingress.stop();
   });
 
   it('drops leadership when a partition enqueue fails', async () => {
     const store = fakeStore();
-    vi.mocked(store.enqueueInbox).mockRejectedValue(new Error('provider unavailable'));
+    vi.mocked(store.enqueueInboxWithLease).mockRejectedValue(new Error('provider unavailable'));
     const onLeadershipLost = vi.fn();
     const ingress = startDurableLarkPrimaryIngress({
       store,
@@ -359,7 +386,7 @@ describe('durable Lark primary ingress', () => {
   it('drains admitted writes before releasing the ingress lease', async () => {
     const store = fakeStore();
     const pending = deferred<DurableInsertResult>();
-    vi.mocked(store.enqueueInbox).mockReturnValue(pending.promise);
+    vi.mocked(store.enqueueInboxWithLease).mockReturnValue(pending.promise);
     const ingress = startDurableLarkPrimaryIngress({
       store,
       larkAppId: 'cli_test',
@@ -447,7 +474,7 @@ describe('durable Lark primary ingress', () => {
     try {
       const store = fakeStore();
       const pending = deferred<DurableInsertResult>();
-      vi.mocked(store.enqueueInbox).mockReturnValue(pending.promise);
+      vi.mocked(store.enqueueInboxWithLease).mockReturnValue(pending.promise);
       const ingress = startDurableLarkPrimaryIngress({
         store,
         larkAppId: 'cli_test',

@@ -31,7 +31,7 @@ afterEach(() => {
 
 describe('SQLite durable coordination contract', () => {
   it('pins the control-operation-aware coordination contract version', () => {
-    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(3);
+    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(4);
   });
 
   it('uses monotonic session epochs and fences stale state writers', async () => {
@@ -168,7 +168,10 @@ describe('SQLite durable coordination contract', () => {
         type: 'lark.im.message.receive_v1',
         larkAppId: 'cli_test',
         event: {
-          message: { message_id: 'om_same', chat_id: 'oc_chat', content: '{"text":"live"}' },
+          message: {
+            message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+            message_type: 'text', content: '{"text":"same"}', create_time: '1',
+          },
           sender: { sender_id: { open_id: 'ou_user', union_id: 'on_user' } },
         },
       },
@@ -183,13 +186,42 @@ describe('SQLite durable coordination contract', () => {
         type: 'lark.im.message.receive_v1',
         larkAppId: 'cli_test',
         event: {
-          message: { message_id: 'om_same', chat_id: 'oc_chat', body: { content: '{"text":"REST"}' } },
+          message: {
+            message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+            msg_type: 'text', body: { content: '{"text":"same"}' }, create_time: '1',
+          },
           sender: { sender_id: { open_id: 'ou_user' } },
         },
       },
       visibleAt: 11,
       createdAt: 11,
     })).toEqual({ kind: 'duplicate' });
+    for (const changed of [
+      { message: { chat_id: 'oc_other' } },
+      { message: { content: '{"text":"/restart"}' } },
+      { sender: { sender_id: { open_id: 'ou_other' } } },
+    ]) {
+      const message = {
+        message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+        message_type: 'text', content: '{"text":"same"}', create_time: '1',
+        ...(changed.message ?? {}),
+      };
+      expect(await store.enqueueInbox({
+        eventId,
+        partitionKey,
+        payload: {
+          version: 1,
+          type: 'lark.im.message.receive_v1',
+          larkAppId: 'cli_test',
+          event: {
+            message,
+            sender: changed.sender ?? { sender_id: { open_id: 'ou_user' } },
+          },
+        },
+        visibleAt: 11,
+        createdAt: 11,
+      })).toEqual({ kind: 'conflict' });
+    }
     expect(await store.enqueueInbox({
       eventId,
       partitionKey,
@@ -202,6 +234,37 @@ describe('SQLite durable coordination contract', () => {
       visibleAt: 12,
       createdAt: 12,
     })).toEqual({ kind: 'conflict' });
+    await store.close();
+  });
+
+  it('atomically fences inbox insertion with the current ingress lease', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'botmux.ingress:lark:cli_test',
+      ownerId: 'ingress-a',
+      leaseDurationMs: 10,
+    }));
+    const event = {
+      eventId: 'im.message.receive_v1:cli_test:om_fenced',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: { message: { message_id: 'om_fenced', chat_id: 'oc_chat' } },
+      },
+      visibleAt: 10,
+      createdAt: 10,
+    } as const;
+
+    await expect(store.enqueueInboxWithLease({ lease, event }))
+      .resolves.toEqual({ kind: 'inserted' });
+    now = 20;
+    await expect(store.enqueueInboxWithLease({ lease, event: { ...event, eventId: 'event-late' } }))
+      .resolves.toEqual({ kind: 'stale_lease' });
+    expect(await store.claimNextInbox({ workerId: 'worker', leaseDurationMs: 10 }))
+      .toMatchObject({ event: { eventId: event.eventId } });
     await store.close();
   });
 

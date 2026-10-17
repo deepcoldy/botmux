@@ -286,6 +286,14 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
     return await this.call('enqueueInbox', event) as unknown as DurableInsertResult;
   }
 
+  async enqueueInboxWithLease(input: {
+    lease: SessionLease;
+    event: DurableInboxEvent;
+  }): Promise<DurableInsertResult | { kind: 'stale_lease' }> {
+    return await this.call('enqueueInboxWithLease', input) as unknown as
+      DurableInsertResult | { kind: 'stale_lease' };
+  }
+
   async claimNextInbox(input: ClaimInboxInput): Promise<InboxClaim | undefined> {
     const result = await this.call('claimNextInbox', input);
     return result === null ? undefined : result as unknown as InboxClaim;

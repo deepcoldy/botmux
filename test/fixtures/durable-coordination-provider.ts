@@ -69,6 +69,10 @@ lines.on('line', line => {
     send({ ...base, type: 'result', result: { kind: 'inserted' } });
     return;
   }
+  if (request.method === 'enqueueInbox' || request.method === 'enqueueInboxWithLease') {
+    send({ ...base, type: 'result', result: { kind: 'inserted' } });
+    return;
+  }
   if (request.method === 'beginControlOperationAttempt') {
     send({
       ...base,

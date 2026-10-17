@@ -7,7 +7,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { startLarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
@@ -2840,6 +2840,10 @@ const PRIMARY_INGRESS_RECOVERY_RETRY_MS = Math.max(
   250,
   Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_RETRY_MS) || 1_000,
 );
+const PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS) || 30_000,
+);
 
 interface PrimaryIngressRecoverySummary {
   chats: number;
@@ -2917,6 +2921,7 @@ async function recoverDurablePrimaryIngressOnce(input: {
         chat.chatId,
         recoveryChatType(chat),
       );
+      data.__durableRecovery = { source: 'lark-history' };
       await input.enqueue({
         eventId: `im.message.receive_v1:${input.larkAppId}:${messageId}`,
         partitionKey: rawMessageIngressAnchor(input.larkAppId, data.message),
@@ -4862,23 +4867,34 @@ export function createLarkEventDispatcherRuntime(
       const senderOpenId = sender?.sender_id?.open_id as string | undefined;
       // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMember）要用。
       let humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
-      // REST history rows used by primary failover recovery normally carry
-      // open_id but omit union_id. Re-resolve that verified sender before the
-      // talk gate so a recovered team member keeps the same authorization as
-      // the realtime event. Failure remains fail-closed in evaluateTalk.
-      if (primary && !humanSenderUnionId && senderOpenId) {
-        humanSenderUnionId = await resolveUnionIdFromOpenId(larkAppId, senderOpenId) ?? undefined;
-        if (humanSenderUnionId && sender?.sender_id) {
-          sender.sender_id.union_id = humanSenderUnionId;
-        }
-      }
       if (primary && isUnsupportedPrimarySessionlessCommand(message, senderOpenId)) {
         return ignoredUnsupportedPrimarySideEffect('sessionless commands');
       }
       await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
-      const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
+      let isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
+      // REST recovery rows omit union_id. Avoid paying a contact lookup when
+      // open_id/chat policy already proves talk access; when union identity is
+      // the only possible grant, transient lookup failures must retry the Inbox
+      // claim instead of permanently completing this recovered message ignored.
+      if (primary && data.__durableRecovery?.source === 'lark-history'
+          && !isAllowed && !humanSenderUnionId && senderOpenId) {
+        const union = await resolveUnionIdFromOpenIdStrict(larkAppId, senderOpenId);
+        if (union.status === 'retryable') throw new Error(union.error);
+        if (union.status === 'resolved') {
+          humanSenderUnionId = union.unionId;
+          if (sender?.sender_id) sender.sender_id.union_id = union.unionId;
+          isAllowed = canTalk(
+            larkAppId,
+            chatId,
+            senderOpenId,
+            undefined,
+            humanSenderUnionId,
+            chatType,
+          );
+        }
+      }
       // Trusted creator metadata affects addressing only. Unauthorized senders
       // must not trigger Lark/registry I/O; operation gates stay unchanged.
       if (isAllowed) {
@@ -6099,10 +6115,10 @@ export function createLarkEventDispatcherRuntime(
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
-  let resolveInitialConnectionReady!: () => void;
-  const initialConnectionReady = new Promise<void>(resolve => {
-    resolveInitialConnectionReady = resolve;
-  });
+  let pendingTransportReady: {
+    leadershipSignal: AbortSignal;
+    resolve: () => void;
+  } | undefined;
 
   const beginPrimaryRecovery = (
     leadershipSignal: AbortSignal,
@@ -6135,7 +6151,12 @@ export function createLarkEventDispatcherRuntime(
             });
             let summary = first;
             if (afterFirstPass) {
-              await afterFirstPass;
+              await runWithAbortDeadline(
+                () => afterFirstPass,
+                PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS,
+                'primary ingress transport ready',
+                controller.signal,
+              );
               controller.signal.throwIfAborted();
               const second = await recoverDurablePrimaryIngressOnce({
                 larkAppId,
@@ -6188,21 +6209,43 @@ export function createLarkEventDispatcherRuntime(
     return ready;
   };
 
+  const armPrimaryTransportRecovery = (leadershipSignal: AbortSignal): Promise<void> => {
+    let resolveTransportReady!: () => void;
+    const transportReady = new Promise<void>(resolve => {
+      resolveTransportReady = resolve;
+    });
+    pendingTransportReady = { leadershipSignal, resolve: resolveTransportReady };
+    return beginPrimaryRecovery(leadershipSignal, transportReady);
+  };
+
+  const settlePrimaryTransportReady = (): void => {
+    const pending = pendingTransportReady;
+    if (!pending || pending.leadershipSignal.aborted
+        || pending.leadershipSignal !== primaryLeadershipSignal) return;
+    pendingTransportReady = undefined;
+    pending.resolve();
+  };
+
+  const restartPrimaryTransportRecovery = (): void => {
+    if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
+        || primaryLeadershipSignal.aborted) return;
+    const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
+    void ready.catch(error => {
+      if (primaryLeadershipSignal?.aborted) return;
+      logger.warn(
+        `[durable-primary:${larkAppId}] reconnect recovery stopped unexpectedly: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  };
+
   const connect = (): Lark.WSClient => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
-      onStarted: resolveInitialConnectionReady,
-      onReconnected: () => {
-        if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
-            || primaryLeadershipSignal.aborted) return;
-        void beginPrimaryRecovery(primaryLeadershipSignal).catch(error => {
-          if (primaryLeadershipSignal?.aborted) return;
-          logger.warn(
-            `[durable-primary:${larkAppId}] reconnect recovery stopped unexpectedly: `
-            + `${error instanceof Error ? error.message : String(error)}`,
-          );
-        });
-      },
+      onReady: settlePrimaryTransportReady,
+      onReconnecting: restartPrimaryTransportRecovery,
+      onReconnected: settlePrimaryTransportReady,
+      onRestarting: restartPrimaryTransportRecovery,
     });
     if (runtimeOptions.enqueuePrimary) return wsClient;
     listenerPollTimer = setInterval(() => {
@@ -6238,7 +6281,7 @@ export function createLarkEventDispatcherRuntime(
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
-    const ready = beginPrimaryRecovery(input.signal, initialConnectionReady);
+    const ready = armPrimaryTransportRecovery(input.signal);
     const client = connect();
     return { client, ready };
   };
@@ -6250,6 +6293,7 @@ export function createLarkEventDispatcherRuntime(
       primaryRecovery?.controller.abort(new Error('Lark event dispatcher closed'));
       primaryRecovery = undefined;
       primaryLeadershipSignal = undefined;
+      pendingTransportReady = undefined;
       if (listenerPollTimer) clearInterval(listenerPollTimer);
       if (initialListenerPollTimer) clearTimeout(initialListenerPollTimer);
       listenerPollTimer = undefined;

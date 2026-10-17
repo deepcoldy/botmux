@@ -105,6 +105,7 @@ const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
 const mockListThreadMessages = vi.fn(async () => [] as any[]);
 const mockGetMessageDetail = vi.fn(async () => ({ items: [] as any[] }));
 const mockResolveUnionIdFromOpenId = vi.fn(async () => null as string | null);
+const mockResolveUnionIdFromOpenIdStrict = vi.fn(async () => ({ status: 'unavailable' as const }));
 // 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
 // 需要模拟真人的用例用 mockResolvedValueOnce(true)。
 const mockIsHumanOpenId = vi.fn(async () => false);
@@ -128,6 +129,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
   getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
   resolveUnionIdFromOpenId: (...args: any[]) => mockResolveUnionIdFromOpenId(...args),
+  resolveUnionIdFromOpenIdStrict: (...args: any[]) => mockResolveUnionIdFromOpenIdStrict(...args),
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
   listChatMessages: (...args: any[]) => mockListChatMessages(...args),
   listChatMessagesUntil: (...args: any[]) => mockListChatMessagesUntil(...args),
@@ -248,6 +250,7 @@ beforeEach(() => {
   mockListThreadMessages.mockReset().mockResolvedValue([]);
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
   mockResolveUnionIdFromOpenId.mockReset().mockResolvedValue(null);
+  mockResolveUnionIdFromOpenIdStrict.mockReset().mockResolvedValue({ status: 'unavailable' });
   mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
   // Generic tests should not accidentally enter the sole-user免@ path. Tests
   // that exercise 1v1 behavior opt in explicitly, so execution order cannot
@@ -1532,6 +1535,34 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('retries a recovered human message when union identity lookup fails transiently', async () => {
+    setupBotState({ allowedUsers: ['ou_someone_else'] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockResolveUnionIdFromOpenIdStrict.mockResolvedValueOnce({
+      status: 'retryable',
+      error: 'temporary contact API failure',
+    });
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = {
+      ...makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA recovered' }),
+        messageId: 'om_primary_recovered_identity',
+        chatId: 'chat-primary',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      }),
+      __durableRecovery: { source: 'lark-history' },
+    };
+
+    await expect(processPrimary(runtime, data, 'om_primary_recovered_identity'))
+      .rejects.toThrow('temporary contact API failure');
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it('suppresses sessionless commands before replying and safely completes the claim', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
@@ -1673,6 +1704,8 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(enqueuePrimary).not.toHaveBeenCalled();
 
     releaseChats([{ chatId: 'chat-primary', chatMode: 'group' }]);
+    await vi.waitFor(() => expect(mockListChatMessagesUntil).toHaveBeenCalledOnce());
+    capturedWsClientOptions?.onReady?.();
     await recovery.ready;
     await liveAck;
 
@@ -1753,6 +1786,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
         { enqueuePrimary },
       );
       const recovery = runtime.connectPrimary({ signal: leadership.signal });
+      capturedWsClientOptions?.onReady?.();
       const live = makeUserMessageEvent({
         senderOpenId: USER_OPEN_ID,
         content: JSON.stringify({ text: '@BotA after retry' }),
@@ -1792,11 +1826,13 @@ describe('Lark event dispatcher — durable primary processor', () => {
       { enqueuePrimary },
     );
     const leadership = new AbortController();
-    await runtime.connectPrimary({ signal: leadership.signal }).ready;
+    const initial = runtime.connectPrimary({ signal: leadership.signal });
+    capturedWsClientOptions?.onReady?.();
+    await initial.ready;
 
     let releaseReconnectScan!: (value: Array<{ chatId: string; chatMode?: string }>) => void;
     mockListChats.mockReturnValueOnce(new Promise(resolve => { releaseReconnectScan = resolve; }));
-    capturedWsClientOptions?.onReconnected?.();
+    capturedWsClientOptions?.onReconnecting?.();
     const live = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@BotA after reconnect' }),
@@ -1809,9 +1845,11 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(enqueuePrimary).not.toHaveBeenCalled();
 
     releaseReconnectScan([]);
+    await vi.waitFor(() => expect(mockListChats).toHaveBeenCalledTimes(3));
+    capturedWsClientOptions?.onReconnected?.();
     await liveAck;
 
-    expect(mockListChats).toHaveBeenCalledTimes(3);
+    expect(mockListChats).toHaveBeenCalledTimes(4);
     expect(enqueuePrimary).toHaveBeenCalledOnce();
     leadership.abort();
     runtime.close();
