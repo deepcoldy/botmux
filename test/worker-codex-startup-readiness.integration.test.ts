@@ -9,7 +9,7 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
-for (const mode of ['banner', 'resume', 'slow-resume', 'tmux-resume', 'coloured-resume']) {
+for (const mode of ['banner', 'resume', 'resumed-context', 'slow-resume', 'tmux-resume', 'coloured-resume']) {
   const backendType = process.env.BOTMUX_TEST_WORKER_BINARY || mode === 'tmux-resume' || mode === 'coloured-resume' ? 'tmux' : 'pty';
   it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
     `holds input during loading, submits once after ${mode}, and commits only after confirmation`,
@@ -64,7 +64,9 @@ const poll = setInterval(() => {
   if (!fs.existsSync(${JSON.stringify(releaseFile)})) return;
   clearInterval(poll);
   process.stdout.write(${JSON.stringify(mode !== 'banner'
-    ? '\x1b[2J\x1b[H Earlier messages are available — press ctrl + t to view the full transcript\r\n' + (mode === 'coloured-resume'
+    ? mode === 'resumed-context'
+      ? '\x1b[2J\x1b[H› Ask Codex to do anything\r\n\r\n  custom-model · /tmp · Context 85% used'
+      : '\x1b[2J\x1b[H Earlier messages are available — press ctrl + t to view the full transcript\r\n' + (mode === 'coloured-resume'
       ? '\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\r\n\x1b[0m\x1b[39m\x1b[49m\r\n  \x1b[36mcustom-model\x1b[0m · \x1b[32m/tmp\x1b[0m'
       : '› Ask Codex to do anything\r\n\r\n  custom-model · /tmp')
     : '\x1b[2J\x1b[H│ model: custom-model /model to change │\r\n│ directory: /tmp │\r\n› Ask Codex to do anything\r\n  custom-model · /tmp')});
@@ -112,6 +114,26 @@ setInterval(() => {}, 1000);
       expect(messages.some(m => m.type === 'turn_input_committed')).toBe(false);
     }
     writeFileSync(releaseFile, 'loaded');
+    if (mode === 'resumed-context') {
+      // 0.154 can resume straight into the composer with a `· Context N%` footer
+      // but WITHOUT the "Earlier messages" restoration marker in the byte stream.
+      // feed()+quiescence cannot clear that hold (startupHistorySeen stays false),
+      // so crossing the 2s screen-idle threshold must still keep the prompt
+      // parked; only the bounded first-prompt recheck loop's history predicate
+      // (first run at FIRST_PROMPT_TIMEOUT_MS=15s) releases it.
+      await new Promise(r => setTimeout(r, 6_000)); // ~9.4s: well past quiescence, before the 15s recheck
+      expect(existsSync(inputFile), logs.join('')).toBe(false);
+      expect(messages.some(m => m.type === 'prompt_ready')).toBe(false);
+      expect(messages.some(m => m.type === 'user_notify')).toBe(false);
+      // The recheck loop flushes the parked prompt via the guarded history
+      // predicate — well before the 90s hard cap, and never with a hold notice.
+      await waitFor(() => {
+        if (!existsSync(inputFile)) return false;
+        const t = readFileSync(inputFile, 'utf8');
+        return t.includes('\x1b[201~') && t.includes('\r');
+      }, 15_000);
+      expect(messages.some(m => m.type === 'user_notify' && m.message.includes('90 秒'))).toBe(false);
+    }
     if (backendType === 'tmux') {
       let viewport = '';
       await waitFor(() => {
