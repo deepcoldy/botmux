@@ -32,6 +32,7 @@ function installGlobals(backend: unknown): void {
     set: (v: boolean) => { trustHandledValue = v; },
   });
   g.dismissAidenCodexUpdateDialog = () => false;
+  g.noticeCodexModelMigrationDialog = () => {};
   g.lastInitConfig = {};
   g.log = () => {};
   g.backend = backend;

@@ -1833,6 +1833,7 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': '外部事件触发',
 
   // Worker-side submit / notify messages
+  'worker.codex_model_migration_unresolved': '⚠️ {cliName} 启动时弹出了模型迁移选择（Try new model / Use existing model），BotMux 已 {attempts} 次自动选择「Use existing model」仍未关闭，已停止自动操作。\n首条消息已暂存，不会被这个菜单吞掉。请打开 Web 终端选择一项；恢复普通输入框后会自动投递。',
   'worker.codex_composer_conflict': '已 adopt 的 Codex 终端输入框里已有未提交的本地草稿。botmux 保留了草稿，没有把这条飞书消息拼到后面。请先提交或清空本地草稿，再重发飞书消息。',
   'worker.transcriptLabel': '会话存储',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',

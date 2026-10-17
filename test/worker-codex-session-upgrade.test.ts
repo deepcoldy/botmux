@@ -76,6 +76,9 @@ function harness() {
     durableTurnInFlight: undefined,
     tuiPromptBlocking: false,
     hookReviewInputHold: false,
+    // Codex model-migration picker renderer barrier (PTY startup only).
+    codexModelMigrationRendererBarrierNeeded: () => false,
+    settleCodexModelMigrationRenderer: async () => {},
     bareShellCheckInProgress: false,
     ambiguousSubmissionRecoveryHold: undefined,
     currentInputDeliveryQuarantine: vi.fn(() => null),

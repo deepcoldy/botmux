@@ -1832,6 +1832,7 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': 'External event',
 
   // Worker-side submit / notify messages
+  'worker.codex_model_migration_unresolved': '⚠️ {cliName} opened its model-migration picker (Try new model / Use existing model) at startup. BotMux selected "Use existing model" {attempts} times but the picker is still open, so automatic handling has stopped.\nThe opening message is held and will not be consumed by this menu. Open the Web terminal and choose an option; it will be delivered once the normal composer returns.',
   'worker.codex_composer_conflict': 'The adopted Codex terminal already has an unsubmitted local draft. botmux left that draft untouched and did not append the Lark message. Submit or clear the local draft, then resend the Lark message.',
   'worker.transcriptLabel': 'conversation store',
   'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
