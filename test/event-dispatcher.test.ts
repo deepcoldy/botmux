@@ -2158,6 +2158,52 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('starts chatless lookups in parallel but consumes their partitions in arrival order', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    let releaseFirst!: (value: unknown) => void;
+    let releaseSecond!: (value: unknown) => void;
+    mockGetMessageDetail
+      .mockReturnValueOnce(new Promise(resolve => { releaseFirst = resolve; }))
+      .mockReturnValueOnce(new Promise(resolve => { releaseSecond = resolve; }));
+    const order: string[] = [];
+    const enqueuePrimary = vi.fn(async (input: any) => {
+      order.push(input.eventId);
+      return { kind: 'inserted' as const };
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+
+    const firstAck = Promise.resolve(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-parallel-a',
+      message: { message_id: 'om_primary_parallel_a' },
+    }));
+    const secondAck = Promise.resolve(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-parallel-b',
+      message: { message_id: 'om_primary_parallel_b' },
+    }));
+    await Promise.resolve();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(2);
+
+    releaseSecond({ items: [{ message_id: 'om_primary_parallel_b', chat_id: 'chat-b' }] });
+    await Promise.resolve();
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+    releaseFirst({ items: [{ message_id: 'om_primary_parallel_a', chat_id: 'chat-a' }] });
+    await Promise.all([firstAck, secondAck]);
+
+    expect(order).toEqual([
+      `im.message.updated_v1:${MY_APP_ID}:evt-primary-parallel-a`,
+      `im.message.updated_v1:${MY_APP_ID}:evt-primary-parallel-b`,
+    ]);
+    runtime.close();
+  });
+
   it('durably admits an edited message that first adds the bot mention', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'new-topic' });
     mockGetChatMode.mockResolvedValue('group');

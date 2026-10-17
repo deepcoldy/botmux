@@ -6157,13 +6157,18 @@ export function createLarkEventDispatcherRuntime(
         // recovered receive row in the real chat partition.  Lookup failure
         // rejects the WS callback and relies on Lark redelivery; never ACK an
         // update whose ordering domain is still unknown.
+        const ingressAnchor = primaryUpdatedMessageIngressAnchor(
+          larkAppId,
+          eventMessage,
+        );
+        // Start independent lookups at frame arrival; the reservation FIFO
+        // consumes their results in order. Attach a handler immediately so a
+        // fast rejection cannot become unhandled while an earlier slot waits.
+        void ingressAnchor.catch(() => undefined);
         return enqueuePrimaryInArrivalOrder(async () => ({
           eventId: eventKey,
           eventType: 'lark.im.message.updated_v1',
-          partitionKey: await primaryUpdatedMessageIngressAnchor(
-            larkAppId,
-            eventMessage,
-          ),
+          partitionKey: await ingressAnchor,
           data,
         })).then(() => undefined);
       }
