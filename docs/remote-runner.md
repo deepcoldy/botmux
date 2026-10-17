@@ -118,7 +118,7 @@ provider 可以额外声明三项通用终端能力：
 ```
 
 - `content` 使用 BotMux Markdown；普通文本是其子集，单条最多 32 KiB。
-- `responseKind` 缺省能力只允许 `progress|auxiliary`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明 `outbound_message_final` 时才允许 `final`；该请求通过普通 `botmux send --response-kind final` 投递并成为本轮唯一 Lark final，随后 provider 仍须发送协议 `final|failure` 收口执行生命周期，但普通 transcript final 不会再次发卡。旧 host/provider 未双边协商时发送 `final` 会 fail-closed。
+- `responseKind` 缺省能力只允许 `progress|auxiliary`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明 `outbound_message_final` 时才允许 `final`；该请求通过普通 `botmux send --response-kind final` 投递并成为本轮唯一 Lark final，随后 provider 仍须发送协议 `final|failure` 收口执行生命周期。Host 收到 `delivered` 回执后会把同 turn 的 provider `final` 仅作为生命周期终态，不再投递其中的 transcript 或空结果兜底；`rejected|unknown` 时则保留 provider final，避免用户无结果。旧 host/provider 未双边协商时发送 `final` 会 fail-closed。
 - `mention` 允许 `none|requester|explicit`。`requester` 仍要通过当前 turn 的精确回复对象与多参与者门禁；`explicit` 必须同时携带非空 `mentions` 字符串数组，并要求 provider 声明 `outbound_message_explicit_mention`。BotMux 把每项原样转为普通 `--mention` 参数：字面 `ou_` 沿用直接透传语义，邮箱、手机号、`union_id` 或姓名是否可解析以及目标群成员校验，完全复用目标 Bot 的 `allowArbitraryMention` 配置，不增加 Remote Runner 专属的“当前话题参与者”限制。
 - `images` 可省略；只允许 PNG/JPEG/GIF/WebP，最多 4 张、解码后合计最多 2 MiB。文件名、MIME、base64 canonical encoding 和文件 magic 都会在协议边界校验；宿主只在私有临时目录物化，并固定转成普通 `botmux send --images`，turn 仍不能发送任意文件、视频或语音。
 - `turnId` 必须等于 active turn，`generation` 必须等于当前 backend state；迟到或跨代事件会 fail-closed。

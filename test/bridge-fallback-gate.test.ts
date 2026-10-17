@@ -400,6 +400,53 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(true);
   });
 
+  it('an exact final marker suppresses a headless provider fallback without a mark-time window', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      turnId: 'turn-headless',
+      dispatchAttempt: 7,
+      responseKind: 'final',
+      contentLength: 12,
+    };
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'provider synthesized an empty-result fallback',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(true);
+
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 8,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'a later durable attempt must stay visible',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'a real final after progress must stay visible',
+      },
+      undefined,
+      [{ ...marker, responseKind: 'progress' }],
+      false,
+    )).toBe(false);
+  });
+
   it('non-adopt: a progress / kind-less marker still defers to the length heuristic', () => {
     const shortSend = 'Working on it.';
     const longFinal = 'Here is the complete, substantive answer that is materially '

@@ -129,15 +129,47 @@ describe('RemoteRunnerBackend', () => {
     spawnBackend(backend, outboundRunner);
     await ready;
 
-    const final = once<string>(cb => backend.onTurnFinal(cb));
+    const final = once<{ text: string; turnId?: string }>(cb => {
+      backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
+    });
     await backend.submitTurn({ turnId: 'turn-final-outbound', content: 'final-outbound' });
-    await final;
+    await expect(final).resolves.toEqual({ text: '', turnId: 'turn-final-outbound' });
     expect(delivery).toHaveBeenCalledWith(expect.objectContaining({
       responseKind: 'final',
       mention: 'explicit',
       mentions: ['ou_target:Target'],
       content: 'final payload',
     }));
+  });
+
+  it('keeps the provider final when a negotiated final outbound delivery is rejected', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message', 'outbound_message_final'],
+    }, 'session-final-outbound-rejected');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.onOutboundMessage(async () => ({
+      outcome: 'rejected',
+      code: 'outbound_rejected',
+      message: 'rejected for test',
+    }));
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-final-rejected', content: 'final-outbound' });
+    const providerFinal = JSON.parse(await final) as Array<{
+      operationId: string;
+      result: { outcome: string; code?: string };
+    }>;
+    expect(providerFinal).toEqual([{
+      operationId: 'final-operation',
+      result: expect.objectContaining({
+        outcome: 'rejected',
+        code: 'outbound_rejected',
+      }),
+    }]);
   });
 
   it('rejects a final outbound message when the host did not require it', async () => {
