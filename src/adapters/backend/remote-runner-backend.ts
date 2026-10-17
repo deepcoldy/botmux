@@ -756,6 +756,14 @@ export class RemoteRunnerBackend implements SessionBackend {
       );
       return;
     }
+    if (message.responseKind === 'final'
+        && (!this.providerCapabilities.has('outbound_message_final')
+          || !this.requiredCapabilities.includes('outbound_message_final'))) {
+      this.failProtocol(
+        'remote runner emitted a final outbound message without explicit host and provider capability',
+      );
+      return;
+    }
     if (!this.acceptAcknowledgedTurn(message.turnId)) return;
     if (message.generation !== this.state?.generation) {
       this.failProtocol('remote runner outbound message belongs to another backend generation');
@@ -848,7 +856,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       return;
     }
     if (operation.controllerOpenId
-        && (operation.request.tool !== 'schedule.add'
+        && (!scheduleTool
           || !this.providerCapabilities.has('session_tool_schedule_actor')
           || !this.requiredCapabilities.includes('session_tool_schedule_actor'))) {
       this.failProtocol(

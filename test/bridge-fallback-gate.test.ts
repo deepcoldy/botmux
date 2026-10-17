@@ -447,6 +447,21 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(false);
   });
 
+  it('lets a negotiated Remote Runner final send own terminal delivery', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      contentLength: normalise('explicit final').length,
+      previewText: 'explicit final',
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: 'provider acknowledgement' },
+      500,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
   it('non-adopt: managed-card final suppresses; managed-card progress/auxiliary does not', () => {
     const fallback = 'A materially different and longer English summary text that the '
       + 'terminal transcription fallback would otherwise double post onto the thread today.';

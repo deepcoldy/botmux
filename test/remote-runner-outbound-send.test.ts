@@ -131,4 +131,40 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_explicit_men
       '--session-id', 'session-explicit',
     ]);
   });
+
+  it('re-enters the ordinary final-send path for a negotiated final message', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-final-test-'));
+    roots.push(root);
+    const observed = join(root, 'observed.json');
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `#!/usr/bin/env node
+import fs from 'node:fs';
+fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify(process.argv.slice(2)));
+process.stdout.write(JSON.stringify({ success: true, messageId: 'om_final' }) + '\\n');
+`);
+    chmodSync(fixture, 0o755);
+
+    await expect(sendRemoteRunnerOutboundMessage({
+      operationId: 'operation-final',
+      turnId: 'turn-final',
+      generation: 2,
+      content: '最终正文',
+      responseKind: 'final',
+      mention: 'explicit',
+      mentions: ['ou_target:Target'],
+    }, {
+      sessionId: 'session-final',
+      turnId: 'turn-final',
+      cliPath: fixture,
+      env: { PATH: process.env.PATH },
+    })).resolves.toEqual({ outcome: 'delivered', messageId: 'om_final' });
+
+    expect(JSON.parse(readFileSync(observed, 'utf8'))).toEqual([
+      'send', '--remote-runner-outbound',
+      '--response-kind', 'final',
+      '--mention', 'ou_target:Target',
+      '--content-file', expect.any(String),
+      '--session-id', 'session-final',
+    ]);
+  });
 });

@@ -21,7 +21,8 @@ const handler = ${handler.getText(source)}`, {
 
 function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   const ds: any = {
-    larkAppId: 'cli_target', chatId: 'oc_chat', session: { sessionId: 's1' },
+    larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group',
+    session: { sessionId: 's1' }, workerGeneration: 7,
     managedTurnOrigin: { capability: 'c'.repeat(64), turnId },
     activeInteractiveTurn: { turnId, caller: {
       senderType: 'user', requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_admin',
@@ -44,6 +45,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     parseScheduledTurnId,
     authorizeScheduleSelfManage,
     readGlobalConfig: () => ({ scheduleDelegation: { selfManageEnabled: true } }),
+    resolveUnionIdFromOpenId: async () => 'on_admin',
     resolveTargetAppOpenId: async () => ({ status: 'resolved', openId: 'ou_admin' }),
     listChatMemberOpenIds: async () => ['ou_admin'],
     scheduleAuthorityStore: { getRecord: () => record },
@@ -51,7 +53,7 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
   };
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
-  return { ds, record, scheduler, authorizeScheduleSelfManage, run: () => run({}, {}) };
+  return { ds, record, scheduler, authorizeScheduleSelfManage, scope, run: () => run({}, {}) };
 }
 
 describe('managed schedule mutation route', () => {
@@ -59,6 +61,82 @@ describe('managed schedule mutation route', () => {
     const h = harness(); h.ds.activeInteractiveTurn.caller.senderType = 'bot';
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
     expect(h.scheduler.disableTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['update', 'remove', 'pause', 'resume', 'run'] as const)(
+    'lets the negotiated provider Actor %s its own direct task in the current chat',
+    async action => {
+      const h = harness(action);
+      h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+      h.record.kind = 'direct';
+      h.record.controlOpenId = 'ou_admin';
+      h.record.controlUnionId = 'on_admin';
+      h.record.task.enabled = true;
+      h.scope.isTrustedHostIpcRequest = () => true;
+      h.scope.readJsonBody = async () => ({
+        sessionId: 's1',
+        originCapability: 'c'.repeat(64),
+        originTurnId: 'om_human',
+        action,
+        id: 'a1b2c3d4',
+        prompt: 'changed',
+        remoteRunnerSessionTool: true,
+        remoteRunnerControllerOpenId: 'ou_admin',
+      });
+
+      expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+      const method = { update: 'updateTask', remove: 'removeTask', pause: 'disableTask',
+        resume: 'enableTask', run: 'runTaskNow' }[action];
+      expect(h.scheduler[method]).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('keeps a provider Actor confined to its own controller and current chat', async () => {
+    const h = harness('remove');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.record.kind = 'direct';
+    h.record.controlOpenId = 'ou_admin';
+    h.record.controlUnionId = 'on_admin';
+    h.record.task.chatId = 'oc_other';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.scope.readJsonBody = async () => ({
+      sessionId: 's1',
+      originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human',
+      action: 'remove',
+      id: 'a1b2c3d4',
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_admin',
+    });
+
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_mutation_operator_denied' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects a provider controller on a human-authored mutation turn', async () => {
+    const h = harness('remove');
+    h.record.kind = 'direct';
+    h.record.controlOpenId = 'ou_admin';
+    h.record.controlUnionId = 'on_admin';
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.scope.readJsonBody = async () => ({
+      sessionId: 's1',
+      originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human',
+      action: 'remove',
+      id: 'a1b2c3d4',
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_admin',
+    });
+
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_session_tool_controller_forbidden' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
   });
 
   it('requires a new authorization to change a delegated task canonical input', async () => {
