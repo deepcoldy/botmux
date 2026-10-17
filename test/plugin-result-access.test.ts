@@ -13,6 +13,39 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('controlled plugin result page', () => {
+  it('drops query parameters from unauthenticated login return paths', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-result-login-return-'));
+    roots.push(root);
+    const store = new PluginResultArtifactStore({ dataDir: root });
+    let returnTo = '';
+    const server = createServer(async (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (await handlePluginResultAccess(req, res, url, {
+        store,
+        identity: () => null,
+        loginUrl: value => {
+          returnTo = value;
+          return `/login?next=${encodeURIComponent(value)}`;
+        },
+      })) return;
+      res.writeHead(404).end();
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('server did not bind');
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${address.port}/plugin-result-access/${'a'.repeat(20)}?x=1`,
+        { redirect: 'manual' },
+      );
+      expect(response.status).toBe(302);
+      expect(returnTo).toBe(`/plugin-result-access/${'a'.repeat(20)}`);
+      expect(response.headers.get('location')).not.toContain('x%3D1');
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
   it('retains the cross-app stable principal in an H5 session', () => {
     const sessions = new DashboardSessionStore({ randomToken: () => 'a'.repeat(43) });
     const created = sessions.create('ou_requester', 'on_owner123');
