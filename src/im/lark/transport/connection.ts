@@ -13,6 +13,7 @@ export function startLarkConnection(
   larkAppSecret: string,
   eventDispatcher: Lark.EventDispatcher,
   brand: Brand = 'feishu',
+  lifecycle: { onStarted?: () => void; onReconnected?: () => void } = {},
 ): Lark.WSClient {
   // Start WSClient
   // Proxy for the long connection: resolved once, logged once, and echoed in
@@ -45,11 +46,21 @@ export function startLarkConnection(
     handshakeTimeoutMs: 15_000,
     // 重连过程打日志，便于事后从 `bun run daemon:logs` 复盘（warn 默认看不到这些）。
     onReconnecting: () => logger.warn(`[ws] ${larkAppId} reconnecting…`),
-    onReconnected: () => logger.info(`[ws] ${larkAppId} reconnected`),
+    onReconnected: () => {
+      logger.info(`[ws] ${larkAppId} reconnected`);
+      lifecycle.onReconnected?.();
+    },
     onError: (err) => logger.error(`[ws] ${larkAppId} terminal error: ${err.message} (proxy=${wsProxyDesc} runtime=${describeWsRuntime()})`),
   });
 
-  wsClient.start({ eventDispatcher });
+  void Promise.resolve(wsClient.start({ eventDispatcher })).then(
+    () => lifecycle.onStarted?.(),
+    error => logger.error(
+      `[ws] ${larkAppId} initial connection failed: `
+      + `${error instanceof Error ? error.message : String(error)} `
+      + `(proxy=${wsProxyDesc} runtime=${describeWsRuntime()})`,
+    ),
+  );
   logger.info('Daemon WSClient started');
 
   // ② SDK 重连耗尽后停在 terminalError（getConnectionStatus().state === 'failed'）并

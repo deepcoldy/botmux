@@ -73,7 +73,9 @@ describe('startLarkConnection — lifecycle', () => {
 
   it('defaults to Feishu, honors DEBUG and retains connection diagnostics', () => {
     vi.stubEnv('DEBUG', '1');
-    startLarkConnection('app-test', 'secret', eventDispatcher);
+    const onStarted = vi.fn();
+    const onReconnected = vi.fn();
+    startLarkConnection('app-test', 'secret', eventDispatcher, 'feishu', { onStarted, onReconnected });
     expect(capturedWsClientOptions?.domain).toBe('https://open.feishu.cn');
     expect(capturedWsClientOptions?.loggerLevel).toBe(Lark.LoggerLevel.info);
     capturedWsClientOptions?.onReconnecting();
@@ -81,6 +83,8 @@ describe('startLarkConnection — lifecycle', () => {
     capturedWsClientOptions?.onError(new Error('offline'));
     expect(logger.warn).toHaveBeenCalledWith('[ws] app-test reconnecting…');
     expect(logger.info).toHaveBeenCalledWith('[ws] app-test reconnected');
+    expect(onReconnected).toHaveBeenCalledOnce();
+    return Promise.resolve().then(() => expect(onStarted).toHaveBeenCalledOnce());
     expect(logger.info).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test connecting domain=https:\/\/open\.feishu\.cn proxy=.+ runtime=.+$/));
     expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test terminal error: offline \(proxy=.+ runtime=.+\)$/));
   });

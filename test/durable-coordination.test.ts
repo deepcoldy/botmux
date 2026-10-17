@@ -156,6 +156,55 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('deduplicates realtime and REST snapshots of one Lark receive event by immutable identity', async () => {
+    const store = makeStore(() => 10);
+    const eventId = 'im.message.receive_v1:cli_test:om_same';
+    const partitionKey = 'lark-message-routing:cli_test:oc_chat';
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          message: { message_id: 'om_same', chat_id: 'oc_chat', content: '{"text":"live"}' },
+          sender: { sender_id: { open_id: 'ou_user', union_id: 'on_user' } },
+        },
+      },
+      visibleAt: 10,
+      createdAt: 10,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          message: { message_id: 'om_same', chat_id: 'oc_chat', body: { content: '{"text":"REST"}' } },
+          sender: { sender_id: { open_id: 'ou_user' } },
+        },
+      },
+      visibleAt: 11,
+      createdAt: 11,
+    })).toEqual({ kind: 'duplicate' });
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: { message: { message_id: 'om_other', chat_id: 'oc_chat' } },
+      },
+      visibleAt: 12,
+      createdAt: 12,
+    })).toEqual({ kind: 'conflict' });
+    await store.close();
+  });
+
   it('isolates inbox lanes and lets an owner claim only its local partitions', async () => {
     const store = makeStore(() => 10);
     await store.enqueueInbox({

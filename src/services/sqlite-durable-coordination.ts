@@ -45,6 +45,7 @@ import type {
   WriteSessionResult,
 } from './durable-coordination.js';
 import { DURABLE_INBOX_LANE_LARK_MESSAGE } from './durable-coordination.js';
+import { durableInboxPayloadsAreEquivalent } from './durable-inbox-idempotency.js';
 
 export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 3;
 
@@ -528,11 +529,21 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
         return { kind: 'inserted' as const };
       }
       const current = this.db.prepare(
-        'SELECT lane, partition_key, payload_hash FROM durable_inbox WHERE event_id = ?',
-      ).get(event.eventId) as { lane: string; partition_key: string; payload_hash: string };
+        'SELECT lane, partition_key, payload_json, payload_hash FROM durable_inbox WHERE event_id = ?',
+      ).get(event.eventId) as {
+        lane: string;
+        partition_key: string;
+        payload_json: string;
+        payload_hash: string;
+      };
       return current.lane === lane
         && current.partition_key === event.partitionKey
-        && current.payload_hash === payload.hash
+        && (current.payload_hash === payload.hash || durableInboxPayloadsAreEquivalent({
+          eventId: event.eventId,
+          lane: current.lane,
+          partitionKey: current.partition_key,
+          payload: parseJson(current.payload_json),
+        }, event))
         ? { kind: 'duplicate' as const }
         : { kind: 'conflict' as const };
     });

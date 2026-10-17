@@ -30261,7 +30261,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               partitionKeyPrefix: durableLarkSessionControlPartitionPrefix(cfg.larkAppId),
               resolve: primaryControlRuntime.resolve,
             },
-            onLeadershipAcquired: () => { eventRuntime.connect(); },
+            onLeadershipAcquired: leadership => {
+              const recovery = eventRuntime.connectPrimary({ signal: leadership.signal });
+              void recovery.ready.catch(error => {
+                if (leadership.signal.aborted) return;
+                logger.warn(
+                  `[durable-primary:${cfg.larkAppId}] ingress recovery stopped unexpectedly: `
+                  + `${error instanceof Error ? error.message : String(error)}`,
+                );
+              });
+            },
             onLeadershipLost: () => { eventRuntime.close(); },
             onSessionLeaseLost: stableKey => {
               const ds = activeSessions.get(stableKey);

@@ -73,7 +73,8 @@ export type WriteSessionResult =
   | { kind: 'stale_lease' };
 
 export interface DurableInboxEvent {
-  /** 平台稳定事件键；同键不同 payload 必须返回 conflict。 */
+  /** 平台稳定事件键。默认同键不同 payload 返回 conflict；Lark receive 事件允许
+   *  WS/REST 两种权威快照按 app/message/partition 语义等价，保留 first writer。 */
   eventId: string;
   /** 隔离不同消费者；同一 lane 内才参与 claim 和 partition FIFO。 */
   lane?: string;
