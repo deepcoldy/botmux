@@ -326,6 +326,11 @@ export function createOhMyPiAdapter(
     // tmux's own DA1 answer to win: tmux pipe-pane carries the reports as-is
     // and the in-pane probe relay (worker, claude-code only) is not needed.
     supportsProgramStatus: true,
+    // omp reports `state=idle` from InteractiveMode.init() before its
+    // session_start hooks run; a first prompt pasted then is dropped. Startup
+    // readiness stays on screen quiescence; reports after the first idle (or
+    // any working/blocked report) are authoritative.
+    programStatusStartupIdleUntrusted: true,
     supportsTypeAhead: true,
     systemHints: [],
     altScreen: true,

@@ -665,6 +665,16 @@ export interface CliAdapter {
    *  and observe authoritative program status events in IdleDetector. */
   readonly supportsProgramStatus?: boolean;
 
+  /** The CLI reports an OSC 7501 terminal state (idle) before its composer
+   *  accepts input: omp 18.10 reports `idle` from `InteractiveMode.init()`
+   *  before its `session_start` hooks run, and a paste + Enter in that window
+   *  is dropped while writeInput still reports success. When true, IdleDetector
+   *  ignores idle/done/error reports until this process has published a first
+   *  idle from other evidence (screen quiescence / transcript) or reported
+   *  `working`/`blocked`; startup readiness stays on the screen heuristics, as
+   *  with program status off. Later reports are authoritative as usual. */
+  readonly programStatusStartupIdleUntrusted?: boolean;
+
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
    *  require fresh composer evidence (`staticBusyClearPattern`, falling back

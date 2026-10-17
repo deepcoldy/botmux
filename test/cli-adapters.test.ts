@@ -3473,6 +3473,12 @@ describe('idleToBusyPattern', () => {
     expect(createOhMyPiAdapter('/bin/omp').supportsProgramStatus).toBe(true);
   });
 
+  it('only oh-my-pi distrusts its startup OSC 7501 idle report (reported before session_start hooks)', () => {
+    expect(createOhMyPiAdapter('/bin/omp').programStatusStartupIdleUntrusted).toBe(true);
+    expect(createPiAdapter('/bin/pi').programStatusStartupIdleUntrusted).toBeUndefined();
+    expect(createClaudeCodeAdapter('/bin/claude').programStatusStartupIdleUntrusted).toBeUndefined();
+  });
+
   it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const busy = adapter.idleToBusyPattern;
