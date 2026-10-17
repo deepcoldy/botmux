@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ipcRoute, jsonRes, readJsonBody, startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
-import { handleMailboxIpc } from '../src/core/mailbox-ipc.js';
+import { handleMailboxIpc, mailboxSessionView } from '../src/core/mailbox-ipc.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
@@ -101,5 +101,19 @@ describe('mailbox real process transport', () => {
     ds.localProcessAttestation!.cliProcStart = 'stale-process';
     expect(await (await send()).json()).toMatchObject({ error: 'host_process_source_unproven' });
     expect(trigger).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('mailbox exact caller type', () => {
+  it('includes only a known human, never an owner or a bot from a later turn', () => {
+    const ds = source();
+    expect(mailboxSessionView(ds).triggeringUserOpenId).toBe('ou_human');
+    ds.session.replyTargets!['current-turn'].participants![0].isBot = true;
+    expect(mailboxSessionView(ds).triggeringUserOpenId).toBeUndefined();
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.session.lastCallerOpenId = 'ou_next';
+    ds.managedTurnOrigin!.callerOpenId = undefined;
+    expect(mailboxSessionView(ds).triggeringUserOpenId).toBeUndefined();
   });
 });

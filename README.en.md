@@ -150,3 +150,5 @@ External applications can use experimental [model proxy mode](docs/model-proxy.m
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
 
 [Group creation options and defaults](docs/guide/group-creation.md)
+
+Same-app sessions can exchange messages with the opt-in `botmux mailbox send/status` commands. See [Mailbox](docs/mailbox.md) for configuration, source attestation, receipts, and current platform limits.
