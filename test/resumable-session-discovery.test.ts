@@ -834,6 +834,117 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       metadataById,
     })).toEqual([]);
   });
+
+  // TraeX ≥0.208 (measured on 0.209.1 / 0.210.1) prepends a user-role item that
+  // is one whole <system-reminder> block (gitStatus / currentDate) before the
+  // <environment_context> item and the real prompt.
+  const traexContextReminder = {
+    type: 'message',
+    role: 'user',
+    content: [{
+      type: 'input_text',
+      text: "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# gitStatus\nCurrent branch: master\n</system-reminder>",
+    }],
+  };
+  const traexEnvironmentContext = {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: '<environment_context>\n  <filesystem></filesystem>\n</environment_context>' }],
+  };
+
+  it('skips the TraeX 0.208+ <system-reminder> context item when inferring the title', async () => {
+    writeRollout('2026/10/17', 'rollout-traex-reminder.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-reminder', cwd: '/root/traex' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [traexContextReminder, traexEnvironmentContext] } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'fix the flaky reconnect test' }] },
+      ] } },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([
+      expect.objectContaining({ cliSessionId: 'traex-reminder', title: 'fix the flaky reconnect test' }),
+    ]);
+  });
+
+  it('still drops a botmux envelope that follows the TraeX <system-reminder> context item', async () => {
+    // Without the reminder skip, the reminder became the first canonical user
+    // turn, decided origin as "external" and early-stopped before the envelope.
+    writeRollout('2026/10/17', 'rollout-traex-reminder-botmux.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-reminder-botmux', cwd: '/root/traex' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [traexContextReminder, traexEnvironmentContext] } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [{
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: '<session_id>botmux-id</session_id>\n<user_message>\nhello\n</user_message>' }],
+      }] } },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([]);
+  });
+
+  it('drops a TraeX session the native index marks botmux-origin even when a later rollout turn is clean', async () => {
+    writeRollout('2026/10/17', 'rollout-traex-index-origin.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-index-origin', cwd: '/root/traex' } },
+      { type: 'history_mutation', payload: { operation: 'replace', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'a later, clean turn after compaction' }] },
+      ] } },
+    ]);
+    const metadataById = new Map([['traex-index-origin', { title: '确认收到消息', botmuxOrigin: true }]]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex', metadataById })).toEqual([]);
+  });
+
+  it('does not list a TraeX session that has a native title but no user turn', async () => {
+    // e.g. a thread renamed right after launch and closed without a prompt:
+    // nothing was origin-checked and there is nothing to resume.
+    writeRollout('2026/10/17', 'rollout-traex-empty.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-empty', cwd: '/tmp' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [traexContextReminder, traexEnvironmentContext] } },
+    ]);
+    const metadataById = new Map([['traex-empty', { title: 'e2e-renamed-only' }]]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex', metadataById })).toEqual([]);
+  });
+
+  it('reads the TraeX 0.201.4 item_completed/UserMessage dialect', async () => {
+    writeRollout('2026/08/29', 'rollout-traex-item-completed.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-item-completed', cwd: '/root/traex' } },
+      { type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'UserMessage', content: [{ type: 'text', text: 'summarise the release notes' }],
+      } } },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([
+      expect.objectContaining({ cliSessionId: 'traex-item-completed', title: 'summarise the release notes' }),
+    ]);
+  });
+
+  describe('TraeX response_item-only rollouts (weak origin)', () => {
+    const botmuxResponseItem = { type: 'response_item', payload: {
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: '<session_id>botmux-id</session_id>\n<user_message>first turn</user_message>' }],
+    } };
+
+    it('drops the session when the first response_item turn is botmux even if a later one is clean', async () => {
+      writeRollout('2026/10/17', 'rollout-traex-weak-later.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-weak-later', cwd: '/root/traex' } },
+        botmuxResponseItem,
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'second turn text' }] } },
+      ]);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([]);
+    });
+
+    it('drops the session when a native title exists but the only user turn is botmux', async () => {
+      writeRollout('2026/10/17', 'rollout-traex-weak-native.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-weak-native', cwd: '/root/traex' } },
+        botmuxResponseItem,
+      ]);
+      const metadataById = new Map([['traex-weak-native', { title: 'Renamed via /rename' }]]);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex', metadataById })).toEqual([]);
+    });
+  });
 });
 
 describe('discoverAntigravitySessions', () => {

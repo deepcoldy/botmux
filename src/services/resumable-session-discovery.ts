@@ -505,9 +505,9 @@ function rolloutResponseItemText(payload: Record<string, unknown>): string {
   return parts.join('').trim();
 }
 
-/** TraeX 0.201.7 persists the canonical conversation stream inside
+/** TraeX 0.201.7+ persists the canonical conversation stream inside
  *  history_mutation.payload.items. Return every user message in one append so
- *  the synthetic startup item can be skipped before the real prompt. */
+ *  the synthetic startup items can be skipped before the real prompt. */
 function rolloutHistoryMutationUserTexts(payload: Record<string, unknown>): string[] {
   if ((payload.operation !== 'append' && payload.operation !== 'replace')
     || !Array.isArray(payload.items)) return [];
@@ -519,6 +519,15 @@ function rolloutHistoryMutationUserTexts(payload: Record<string, unknown>): stri
     if (text) texts.push(text);
   }
   return texts;
+}
+
+/** TraeX ≥0.208 opens every conversation with a user-role item that is one
+ *  whole `<system-reminder>…</system-reminder>` block carrying its own context
+ *  (gitStatus / currentDate), ahead of the real prompt. Taking it as the first
+ *  user turn would title the session "<system-reminder> As you answer…" and —
+ *  worse — let it decide origin before a botmux envelope behind it is seen. */
+function isTraexContextReminder(text: string): boolean {
+  return /^<system-reminder>[\s\S]*<\/system-reminder>$/.test(text);
 }
 
 /** TraeX 0.201.4 mirrors genuine user input as item_completed/UserMessage. */
@@ -536,6 +545,8 @@ function rolloutCompletedUserText(payload: Record<string, unknown>): string {
 export interface RolloutSessionMetadata {
   title?: string;
   firstUserMessage?: string;
+  /** The native index already proved botmux spawned this session. */
+  botmuxOrigin?: boolean;
   cwd?: string;
   lastActivityAt?: number;
 }
@@ -546,7 +557,9 @@ export interface RolloutDiscoveryOptions {
    *  records are only a final compatibility fallback for that dialect. */
   dialect?: 'codex' | 'traex';
   /** Native index metadata keyed by session id. TraeX's state DB title wins
-   *  over a title inferred from the first prompt, preserving /rename. */
+   *  over a title inferred from the first prompt, preserving /rename — but only
+   *  for a session that has a real, non-botmux first prompt: the native title
+   *  decorates an origin-checked session, it never admits one on its own. */
   metadataById?: ReadonlyMap<string, RolloutSessionMetadata>;
 }
 
@@ -579,7 +592,7 @@ async function parseRolloutTranscript(
   let excluded = false;
   let nativeMetadata: RolloutSessionMetadata | undefined;
   const recordCanonicalUserText = (text: string): boolean | undefined => {
-    if (!text || isSyntheticPreamble(text)) return;
+    if (!text || isSyntheticPreamble(text) || isTraexContextReminder(text)) return;
     if (isBotmuxInjected(text)) {
       acc.botmux = true;
       return true;
@@ -596,8 +609,9 @@ async function parseRolloutTranscript(
         // live session so excluded rollouts cost a single line read.
         if (exclude?.has(payload.id)) { excluded = true; return true; }
         nativeMetadata = options.metadataById?.get(payload.id);
+        if (nativeMetadata?.botmuxOrigin) { acc.botmux = true; return true; } // botmux-origin → drop
       }
-      if (typeof payload.cwd === 'string') acc.cwd = nativeMetadata?.cwd || payload.cwd;
+      if (typeof payload.cwd === 'string') acc.cwd = payload.cwd;
       if (nativeMetadata?.firstUserMessage) {
         const stop = recordCanonicalUserText(nativeMetadata.firstUserMessage.trim());
         if (stop) return true;
@@ -642,9 +656,11 @@ async function parseRolloutTranscript(
     return Boolean(acc.id && acc.cwd && acc.title);
   });
   const inferredTitle = acc.title || acc.fallbackTitle || acc.weakTitle;
-  const title = truncateTitle(nativeMetadata?.title ?? inferredTitle);
   const botmux = acc.botmux || (!acc.title && !acc.fallbackTitle && acc.weakBotmux);
-  if (excluded || botmux || !acc.id || !acc.cwd || !title) return null;
+  // No real user turn → nothing was origin-checked (and nothing to resume): a
+  // native title alone must not admit the session.
+  if (excluded || botmux || !acc.id || !acc.cwd || !inferredTitle) return null;
+  const title = truncateTitle(nativeMetadata?.title ?? inferredTitle) || inferredTitle;
   return {
     cliSessionId: acc.id,
     cwd: nativeMetadata?.cwd || acc.cwd,

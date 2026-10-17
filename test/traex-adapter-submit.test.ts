@@ -3,8 +3,8 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'n
 import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
 // TRAE submit verification polls the global submit log history.jsonl (written
@@ -329,7 +329,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
       '',
     ].join('\n'));
 
-    const db = new DatabaseSync(join(traeHome, 'cli', 'state_5.sqlite'));
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
     db.exec([
       'CREATE TABLE threads (',
       '  id TEXT PRIMARY KEY,',
@@ -350,6 +350,50 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
       cwd: '/current/project',
       title: 'Native TraeX title',
       lastActivityAt: 1_787_900_000_000,
+    }]);
+  });
+
+  it('lists 0.210-shaped sessions by native name and hides botmux-origin threads', async () => {
+    // Measured on TraeX 0.210.1: rollouts open with a <system-reminder> context
+    // item; the state DB keeps the display name in `name` and the first prompt
+    // only in `preview` (title / first_user_message stay empty).
+    const sessionsDir = join(traeHome, 'cli', 'sessions', '2026', '10', '17');
+    mkdirSync(sessionsDir, { recursive: true });
+    const reminder = {
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: '<system-reminder>\nAs you answer the user\'s questions, you can use the following context:\n</system-reminder>' }],
+    };
+    const rollout = (sid: string, prompt: string) => [
+      JSON.stringify({ type: 'session_meta', payload: { id: sid, cwd: '/root/project' } }),
+      JSON.stringify({ type: 'history_mutation', payload: { operation: 'append', items: [reminder] } }),
+      JSON.stringify({ type: 'history_mutation', payload: { operation: 'append', items: [{
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }],
+      }] } }),
+      '',
+    ].join('\n');
+    const envelope = '<session_id>4f6c2e1a-1111-4222-8333-944455556666</session_id>\n<user_message>\n收到\n</user_message>';
+    writeFileSync(join(sessionsDir, `rollout-2026-10-17T23-08-59-${SID_1}.jsonl`), rollout(SID_1, '请只回复两个字：收到。'));
+    writeFileSync(join(sessionsDir, `rollout-2026-10-17T23-11-59-${SID_2}.jsonl`), rollout(SID_2, envelope));
+
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, cwd TEXT NOT NULL,',
+      "  title TEXT NOT NULL, first_user_message TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', name TEXT",
+      ');',
+    ].join('\n'));
+    const insert = db.prepare('INSERT INTO threads VALUES (?, ?, 1792249771, ?, ?, ?, ?, ?)');
+    insert.run(SID_1, '/r1.jsonl', '/root/project', '', '', '请只回复两个字：收到。', '回复确认收到');
+    insert.run(SID_2, '/r2.jsonl', '/root/project', '', '', envelope, '确认收到消息');
+    db.close();
+
+    const rows = await createTraexAdapter('/bin/traex').listResumableSessions!({ limit: 10 });
+
+    expect(rows).toEqual([{
+      cliSessionId: SID_1,
+      cwd: '/root/project',
+      title: '回复确认收到',
+      lastActivityAt: 1_792_249_771_000,
     }]);
   });
 });

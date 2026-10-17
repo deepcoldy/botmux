@@ -353,6 +353,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const metadataById = new Map([...nativeMetadata].map(([id, metadata]) => [id, {
         title: metadata.title,
         firstUserMessage: metadata.firstUserMessage,
+        botmuxOrigin: metadata.botmuxOrigin,
         cwd: metadata.cwd,
         lastActivityAt: metadata.updatedAtMs,
       }]));

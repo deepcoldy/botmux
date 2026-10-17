@@ -17,11 +17,11 @@ import { realpathSync } from 'node:fs';
 import type { CliId } from '../adapters/cli/types.js';
 import {
   readComm, readCwd, getChildPids, readClaudeSessionMeta, cliIdFromCommArgv, readCmdline,
-  readProcessStartTime,
+  readProcessStartTime, traexLiveTitle,
 } from './session-discovery.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
-import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
+import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { findServerPid } from '../adapters/backend/zellij-backend.js';
 import {
   listLiveSessions, parseListPanesJson, type ListedPane,
@@ -38,7 +38,9 @@ export interface ZellijAdoptableSession {
   cliPid: number;          // resolved CLI process pid
   cliId: CliId;
   sessionId?: string;      // CLI-native session id (claude/codex/coco)
-  title?: string;          // CLI-native title when available
+  /** CLI-native display name (TraeX only, see traexLiveTitle). Absent →
+   *  callers show the cwd basename. */
+  title?: string;
   cwd: string;             // CLI working directory
   startedAt?: number;      // epoch ms (claude only)
   paneCols: number;
@@ -195,7 +197,7 @@ function resolveSessionId(cliId: CliId, pid: number): { sessionId?: string; titl
     const rollout = findTraexRolloutByPid(pid);
     return {
       sessionId: rollout?.cliSessionId,
-      title: rollout?.cliSessionId ? readTraexThreadTitle(rollout.cliSessionId) : undefined,
+      title: traexLiveTitle(rollout?.cliSessionId),
     };
   }
   return {};
@@ -259,7 +261,7 @@ export function discoverAdoptableZellijSessions(
         cliPid: cli.pid,
         cliId: cli.cliId,
         sessionId,
-        title,
+        ...(title ? { title } : {}),
         cwd: cli.cwd ?? '',
         // Same uptime fallback as the tmux path: only Claude carries startedAt
         // from its session JSON, so derive it from the process for everyone else.
