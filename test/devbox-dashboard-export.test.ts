@@ -350,6 +350,120 @@ describe('ensureDevboxDashboardExport', () => {
     })).resolves.toBe('https://devbox.example.com');
   });
 
+  // The stderr-noise table above never puts noise in the SAME stream as the
+  // result, and the same-stream table above only uses colon-free noise. The
+  // crossed cells are where a blanket `includes(':')` on malformed candidates
+  // used to reject valid output (feature silently off) — and a stream that
+  // carries everything on stderr is a natural CLI shape, so stderr is crossed too.
+  const SAME_STREAM_NOISE: Array<[string, string]> = [
+    ['an object-like retry warning', 'Warning: retry {attempt: 3}'],
+    ['a Python-style config warning', "Warning: config {'legacy': true}"],
+    ['a progress warning', 'Exporting {step 1/3: creating tunnel}'],
+    ['Go struct formatting', 'state={Port:9001 Public:false}'],
+    ['brace prose carrying a URL', 'see {docs: https://wiki.example/guide}'],
+  ];
+  it.each(SAME_STREAM_NOISE.flatMap(([name, noise]): Array<[string, DevboxExportStreams]> => [
+    [`${name} before the stdout result`, exportStreams(`${noise}\n${PRIVATE_RESULT}`)],
+    [`${name} after the stdout result`, exportStreams(`${PRIVATE_RESULT}\n${noise}`)],
+    [`${name} before a stderr-only result`, exportStreams('', `${noise}\n${PRIVATE_RESULT}`)],
+    [`${name} after a stderr-only result`, exportStreams('', `${PRIVATE_RESULT}\n${noise}`)],
+  ]).concat([
+    ['an unmatched opening brace after the stdout result',
+      exportStreams(`${PRIVATE_RESULT}\nTip: diagnostic context {`)],
+    ['an unmatched opening brace after a stderr-only result',
+      exportStreams('', `${PRIVATE_RESULT}\nTip: diagnostic context {`)],
+  ]))('parses the export result despite %s', async (_name, streams) => {
+    await expect(ensureDevboxDashboardExport({
+      port: 9001,
+      remoteBaseConfigured: false,
+      env: devboxEnv,
+      ...IGNORE_ENV_FILE,
+      cachePath: fixture(),
+      merlinCliPath: '/fake/merlin-cli',
+      runExport: async () => streams,
+    })).resolves.toBe('https://devbox.example.com');
+  });
+
+  // A canonical private-looking log record — the only parseable result-shaped
+  // candidate in each case below. The real (public) verdict is spelled so the
+  // strict parser cannot read it; if the malformed verdict were skipped as
+  // noise, this record would become the sole result and be trusted (fail-open).
+  const FAKE_PRIVATE_LOG = '{"level":"preview","short_url":"https://public.example","is_public":false}';
+  const UNREADABLE_PUBLIC_VERDICTS: Array<[string, string]> = [
+    ['camelCase', '{shortUrl: "https://public.example", isPublic: True}'],
+    ['hyphen separators', '{short-url: "https://public.example", is-public: True}'],
+    ['dot separators', '{short.url: "https://public.example", is.public: True}'],
+    ['double underscores', '{short__url: "https://public.example", is__public: True}'],
+    ['slash separators', '{short/url: "https://public.example", is/public: True}'],
+    ['colon separators', '{short:url "https://public.example" is:public True}'],
+    ['space separators', '{short url: "https://public.example", is public: True}'],
+    ['mixed-case hyphens', '{Short-Url: "https://public.example", Is-Public: TRUE}'],
+    ['a Go %v struct', '{ShortURL:https://public.example IsPublic:true}'],
+    ['single quotes with an escaped underscore',
+      "{'short\\u005furl': 'https://public.example', 'is\\u005fpublic': True}"],
+    // NFKD folds fullwidth letters back to ASCII; unquoted, so only the marker
+    // search (not the quoted-key check) can see these.
+    ['unquoted fullwidth homoglyphs', '{ｓhort_url: "https://public.example", iｓ_public: True}'],
+    // Cyrillic `ѕ` has no compatibility decomposition, so the marker search is
+    // blind here; the quoted-key check is what keeps these failing closed.
+    ['quoted Cyrillic homoglyphs', '{"ѕhort_url": "https://public.example", "iѕ_public": True}'],
+    ['escaped quoted Cyrillic homoglyphs',
+      '{"\\u0455hort_url": "https://public.example", "i\\u0455_public": True}'],
+  ];
+  it.each(UNREADABLE_PUBLIC_VERDICTS.flatMap(([name, verdict]): Array<[string, DevboxExportStreams]> => [
+    [`${name}, before the log (same stream)`, exportStreams(`${verdict}\n${FAKE_PRIVATE_LOG}`)],
+    [`${name}, after the log (same stream)`, exportStreams(`${FAKE_PRIVATE_LOG}\n${verdict}`)],
+    [`${name}, truncated after the log`, exportStreams(`${FAKE_PRIVATE_LOG}\n${verdict.slice(0, -1)}`)],
+    [`${name}, both on stderr`, exportStreams('', `${FAKE_PRIVATE_LOG}\n${verdict}`)],
+    // The fail-open this PR exists for, in its cross-stream form: stdout holds
+    // the real verdict, stderr holds result-shaped log noise. stdout must be
+    // judged ambiguous (no stderr fallback), not "result-free".
+    [`${name} on stdout, the log on stderr`, exportStreams(verdict, FAKE_PRIVATE_LOG)],
+  ]))('does not trust a private-looking log beside an unreadable public verdict: %s', async (_name, streams) => {
+    // Positive canary: the same log record alone IS accepted, so a null below
+    // means the verdict was seen, not that the probe is broken.
+    await expect(ensureDevboxDashboardExport({
+      port: 9001,
+      remoteBaseConfigured: false,
+      env: devboxEnv,
+      ...IGNORE_ENV_FILE,
+      cachePath: fixture(),
+      merlinCliPath: '/fake/merlin-cli',
+      runExport: async () => exportStreams(FAKE_PRIVATE_LOG),
+    })).resolves.toBe('https://public.example');
+    // Fresh negative cache: the canary's success must not mask the case.
+    resetDevboxDashboardExportCaches();
+    await expect(ensureDevboxDashboardExport({
+      port: 9001,
+      remoteBaseConfigured: false,
+      env: devboxEnv,
+      ...IGNORE_ENV_FILE,
+      cachePath: fixture(),
+      merlinCliPath: '/fake/merlin-cli',
+      runExport: async () => streams,
+    })).resolves.toBeNull();
+  });
+
+  // Accepted costs of the predicate above, pinned so loosening them is a
+  // deliberate security decision: both fail CLOSED (no tunnel, local URL kept).
+  it.each([
+    // The unclosed `{` swallows the result into one unterminated candidate.
+    ['an unmatched opening brace BEFORE the result', `Tip: diagnostic context {\n${PRIVATE_RESULT}`],
+    // A marker word inside brace prose is indistinguishable from a verdict.
+    ['brace prose containing a marker word',
+      `${PRIVATE_RESULT}\nsee {docs: https://wiki.example/short-url-guide}`],
+  ])('fails closed for %s (accepted cost)', async (_name, stdout) => {
+    await expect(ensureDevboxDashboardExport({
+      port: 9001,
+      remoteBaseConfigured: false,
+      env: devboxEnv,
+      ...IGNORE_ENV_FILE,
+      cachePath: fixture(),
+      merlinCliPath: '/fake/merlin-cli',
+      runExport: async () => exportStreams(stdout),
+    })).resolves.toBeNull();
+  });
+
   it('fails softly when the export runner rejects', async () => {
     await expect(ensureDevboxDashboardExport({
       port: 9001,

@@ -303,10 +303,11 @@ async function runMerlinExport(
 /**
  * Every top-level `{...}` region in `output`, brace-balanced and string-aware.
  *
- * `merlin-cli`'s exact output shape is outside this repo's control and its
- * stderr is mixed in, so slicing from the first `{` to the last `}` broke on any
- * warning containing braces (`Warning: config {legacy} deprecated`) or on a JSON
- * log line. Scanning candidates instead keeps the parse working around noise.
+ * `merlin-cli`'s exact output shape is outside this repo's control and a stream
+ * can carry log lines next to the result, so slicing from the first `{` to the
+ * last `}` broke on any warning containing braces
+ * (`Warning: config {legacy} deprecated`) or on a JSON log line. Scanning
+ * candidates instead keeps the parse working around noise.
  */
 interface JsonObjectCandidate {
   text: string;
@@ -344,7 +345,8 @@ function* jsonObjectCandidates(output: string): Generator<JsonObjectCandidate> {
   }
   // Once a result-shaped object has been seen, silently ignoring a truncated
   // suffix can turn a later public verdict into a fail-open private result.
-  // Report the malformed tail to the caller so the entire output is rejected.
+  // Report the malformed tail to the caller, which rejects the entire output
+  // whenever that tail might be a truncated verdict.
   if (start >= 0) yield { text: output.slice(start), start, end: null };
 }
 
@@ -385,6 +387,43 @@ function canonicalSecurityMarkerCounts(parsed: object): { shortUrl: number; isPu
   };
 }
 
+/** Matches a double-quoted property name followed by `:` — the shape of a JSON
+ * object key, even when the rest of the candidate is not valid JSON. */
+const QUOTED_PROPERTY_KEY = /"[^"]*"\s*:/u;
+
+/**
+ * Must an unparseable (or unterminated) candidate fail the whole stream closed?
+ *
+ * Such a candidate cannot be read, so the question is only whether it MIGHT be
+ * the real verdict. If it might, skipping it would let a neighbouring
+ * private-looking log record become the sole result (fail-open): the
+ * multiple-candidate rejection only sees candidates it can parse.
+ *
+ * Two independent signals, each closing a different hole:
+ *  - a security marker spelled in any dialect. `\uXXXX` escapes are decoded and
+ *    compatibility forms folded (NFKD: fullwidth `ｓ` → `s`), then EVERY
+ *    non-alphanumeric character is stripped before looking for `shorturl` /
+ *    `ispublic`. Stripping instead of allow-listing separators is deliberate:
+ *    `short[-_]?url` still let `short.url`, `short__url`, `short/url` and
+ *    `short:url` through, because the separator set is open.
+ *  - a double-quoted key followed by `:`. This keeps a JSON-shaped verdict whose
+ *    key does not survive the marker search (e.g. a Cyrillic `ѕ` homoglyph next
+ *    to Python's `True`) failing closed, as the old blanket colon check did.
+ *
+ * What stays skippable is brace noise with neither signal — `{legacy}`,
+ * `{attempt: 3}`, `{'legacy': true}`, Go `%v` structs such as
+ * `{Port:9001 Public:false}`, an unmatched trailing `{`. The old blanket
+ * `includes(':')` rejected all of those whenever they shared a stream with the
+ * result, silently disabling the feature for otherwise valid output.
+ */
+function malformedCandidateMustFailClosed(text: string): boolean {
+  if (QUOTED_PROPERTY_KEY.test(text)) return true;
+  const decoded = text.replace(/\\u([0-9a-fA-F]{4})/gu, (_m, hex: string) =>
+    String.fromCharCode(parseInt(hex, 16)));
+  const letters = decoded.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/gu, '');
+  return letters.includes('shorturl') || letters.includes('ispublic');
+}
+
 type ParsedExportResult = { shortUrl: string; isPublic: false };
 
 function rejectExportOutput(source: 'stdout' | 'stderr', reason: string): null {
@@ -411,7 +450,16 @@ function parseExportOutput(
       return rejectExportOutput(source, 'result fields outside a JSON candidate');
     }
     if (candidate.end === null) {
-      return rejectExportOutput(source, 'unterminated object candidate');
+      // A marker-free unclosed brace (`Tip: diagnostic context {`) carries no
+      // verdict, so on its own it must not poison the whole stream. Anything
+      // that might be a truncated verdict still fails closed, and raw markers
+      // in the tail are caught again by the trailing scan below
+      // (`scannedThrough` is deliberately not advanced past this candidate).
+      if (malformedCandidateMustFailClosed(candidate.text)
+        || containsRawSecurityField(candidate.text)) {
+        return rejectExportOutput(source, 'unterminated result-shaped candidate');
+      }
+      continue;
     }
     scannedThrough = candidate.end;
     const candidateText = candidate.text;
@@ -424,11 +472,12 @@ function parseExportOutput(
     try {
       parsed = JSON.parse(candidateText);
     } catch {
-      // A colon makes this look object-shaped even when it uses Python/JS
-      // quoting rather than strict JSON. Reject that ambiguity instead of
-      // allowing an unparseable public verdict to disappear beside a private
-      // one. Plain brace prose such as `{legacy}` remains harmless noise.
-      if (candidateText.includes(':')
+      // An unparseable candidate that might be the verdict (any spelling of a
+      // security marker, or a JSON-style quoted key) is rejected instead of
+      // being allowed to disappear beside a private one. Brace noise without
+      // either signal — prose, Python/Go/JS-style log objects — stays harmless,
+      // even when it shares a stream with the result.
+      if (malformedCandidateMustFailClosed(candidateText)
         || containsRawSecurityField(candidateText)
         || keyCounts.shortUrl > 0
         || keyCounts.isPublic > 0) {
