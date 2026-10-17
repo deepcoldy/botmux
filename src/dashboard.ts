@@ -50,7 +50,7 @@ import {
   injectControlCsrfMeta,
   managementUpgradeOrigin,
 } from './dashboard/control-csrf.js';
-import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
+import { DaemonRegistry, botsRosterSignature, trackRosterFrames } from './dashboard/registry.js';
 import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
@@ -7693,20 +7693,25 @@ const server = createServer(async (req, res) => {
         }
         stream.write(ev.type, { larkAppId: ev.larkAppId, body });
       });
+      // `source: 'dashboard'` 标出这是本流自己的 15s 心跳：各 daemon 的心跳也经上面的
+      // aggregator 转发过来，前端判断「链路是否逐帧实时」只能拿单一来源的节奏来比。
       const hb = setInterval(() => {
-        stream.write('heartbeat', { ts: Date.now() });
+        stream.write('heartbeat', { ts: Date.now(), source: 'dashboard' });
       }, 15_000);
       // Push a bots.changed frame whenever the online bot roster actually
       // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
       // page can auto-refresh without a manual reload. registry.on fires on
       // every 15s poll and 30s heartbeat rewrite, so gate on a roster signature
       // that ignores lastHeartbeat — otherwise we'd spam a frame every poll.
-      let lastRoster = botsRosterSignature(registry.list());
+      // 连上先推一份名册对账摘要（含 daemon 进程代次）：断线 / 后台挂起期间名册若变了，
+      // 或有 bot 重启过（配置可能随之变了），前端据此补发一次 bots.changed；没变就不
+      // 打扰——Bot 配置页重拉会卸掉编辑器、丢掉未保存的草稿。连接期间的帧见
+      // trackRosterFrames。
+      const roster = trackRosterFrames(registry.list());
+      stream.write(roster.connect.event, { body: roster.connect.body });
       const offRoster = registry.on(online => {
-        const sig = botsRosterSignature(online);
-        if (sig === lastRoster) return;
-        lastRoster = sig;
-        stream.write('bots.changed', { body: { signature: sig } });
+        const frame = roster.next(online);
+        if (frame) stream.write(frame.event, { body: frame.body });
       });
       res.on('close', () => { off(); offRoster(); clearInterval(hb); stream.dispose(); });
       return;
