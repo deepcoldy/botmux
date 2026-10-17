@@ -20,13 +20,13 @@ function leaseSnapshot() {
   }));
   return read(dir);
 }
-async function run(extraEnv: Record<string, string> = {}, bot = APP) {
+async function run(extraEnv: Record<string, string> = {}, bot = APP, target = ['--session', SID]) {
   const env = { PATH: process.env.PATH, HOME: join(root, 'home'), USERPROFILE: join(root, 'home'),
     SESSION_DATA_DIR: dataDir, BOTMUX_NO_CLAIM: '1', ...extraEnv };
   try {
     const result = await execute(process.execPath, [
       ...(process.versions.bun ? [] : ['--import', 'tsx']),
-      join(repo, 'src/cli.ts'), 'trigger-registration', '--bot', bot, '--session', SID, '--key', KEY,
+      join(repo, 'src/cli.ts'), 'trigger-registration', '--bot', bot, ...target, '--key', KEY,
     ], { env, cwd: repo, timeout: 20000, maxBuffer: 128 * 1024, encoding: 'utf8' });
     return { code: 0, ...result };
   } catch (e: any) { return { code: e.code, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') }; }
@@ -58,6 +58,25 @@ describe('host trigger registration CLI', () => {
     expect(await run()).toEqual(first);
     expect(leaseSnapshot()).toEqual(before);
   }, 45000);
+  it('reads a routed registration through a real CLI child after IPC restart without dispatch', async () => {
+    const target = { chatId: 'oc_cli', rootMessageId: 'om_original' };
+    const key = JSON.stringify([target.chatId, target.rootMessageId, KEY]);
+    const first = leases.claim({ ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg-routed',
+      key, requestHash: 'sha256:route', ownerBootId: 'old', now: 1000, kind: 'routed_turn' });
+    leases.transition(APP,key,first.record,{state:'attempting',now:2000},'routed_turn');
+    leases.recordTurnInputCommit({ownerLarkAppId:APP,sessionId:SID,triggerId:'trg-routed',key,
+      ownerBootId:'old',workerGeneration:3,observedAt:3000,kind:'routed_turn'});
+    await handle.close();
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    writeFileSync(join(dataDir, 'dashboard-daemons', APP + '.json'), JSON.stringify({
+      larkAppId:APP,ipcPort:handle.port,pid:process.pid,lastHeartbeat:Date.now() }));
+    const before = leaseSnapshot();
+    const result = await run({},APP,['--chat',target.chatId,'--root-message',target.rootMessageId]);
+    expect(result.code,result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({state:'registered',sessionId:SID,target,
+      registration:{triggerId:'trg-routed'},inputCommitted:{state:'observed',workerGeneration:3}});
+    expect(leaseSnapshot()).toEqual(before);
+  },45000);
   it('does not expose a misrouted daemon observation as the requested bot', async () => {
     setLarkAppId('app_other');
     const result = await run();

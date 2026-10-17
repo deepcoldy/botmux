@@ -29,6 +29,9 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export interface PersistedAsyncTriggerResult {
+  /** Receiver ACK, independent of IM reply anchors or an optional dedupe key. */
+  inputCommit?: { workerGeneration: number; observedAt: number };
+
   status: 'pending' | 'completed' | 'failed' | 'interrupted';
   createdAt: number;
   completedAt?: number;
@@ -124,6 +127,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *  fields are likewise type-checked when present. */
 function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
   if (!isPlainObject(value)) return false;
+  if (value.inputCommit !== undefined && (!isPlainObject(value.inputCommit)
+    || !Number.isSafeInteger(value.inputCommit.workerGeneration) || Number(value.inputCommit.workerGeneration) <= 0
+    || typeof value.inputCommit.observedAt !== 'number' || !Number.isFinite(value.inputCommit.observedAt)
+    || !Number.isFinite(new Date(value.inputCommit.observedAt).getTime()))) return false;
   const status = value.status;
   if (status !== 'pending' && status !== 'completed' && status !== 'failed' && status !== 'interrupted') return false;
   if (typeof value.createdAt !== 'number') return false;
@@ -214,6 +221,26 @@ export function recordPending(sessionId: string, triggerId: string, createdAt: n
   save(sessionId, file);
 }
 
+/** Called only after the live Worker's exact input-queue ACK. A missing,
+ * foreign or terminal trigger cannot acquire new acceptance evidence. Preserve
+ * the first generation; a repeated ACK is observation, never another dispatch. */
+export function recordInputCommit(sessionId: string, triggerId: string, ownerLarkAppId: string,
+  workerGeneration: number, observedAt = Date.now()): boolean {
+  if (!ownerLarkAppId || !Number.isSafeInteger(workerGeneration) || workerGeneration <= 0
+    || !Number.isFinite(observedAt) || !Number.isFinite(new Date(observedAt).getTime())) throw new Error('invalid input commit');
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId), prior = file.results[triggerId];
+    if (file.ownerLarkAppId !== ownerLarkAppId || !prior) return false;
+    if (!isValidPersistedResult(prior)) throw new Error('invalid original trigger');
+    if (prior.inputCommit) return prior.inputCommit.workerGeneration === workerGeneration;
+    if (prior.status !== 'pending') return false;
+    file.results[triggerId] = { ...prior, inputCommit: { workerGeneration, observedAt } };
+    saveStrict(sessionId, file);
+    return true;
+  });
+}
+
 /** Mark an async trigger completed with its captured final output.
  *  `ownerLarkAppId` is REQUIRED (see recordPending). `usage` optional per-turn tokens. */
 export function recordCompleted(
@@ -242,6 +269,7 @@ export function recordCompleted(
     file.results[triggerId] = {
       status: 'completed',
       createdAt: prev?.createdAt ?? completedAt,
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       completedAt,
       content,
       ...(usage ? { usage } : {}),
@@ -277,6 +305,7 @@ export function recordSteerParked(
     file.results[triggerId] = {
       status: 'pending',
       createdAt: prev?.createdAt ?? now,
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       steerParkedBy: successorTurnId,
     };
     save(sessionId, file);
@@ -334,6 +363,7 @@ export function supersedePendingTriggerByCompletedSuccessorStrict(
     file.results[predecessorTriggerId] = {
       status: 'failed',
       createdAt: predecessor.createdAt,
+      ...(predecessor.inputCommit ? { inputCommit: predecessor.inputCommit } : {}),
       failedAt: supersededAt,
       errorCode: 'trigger_failed',
       reason: 'turn_terminal',
@@ -392,6 +422,7 @@ export function recordFailedStrict(
     file.results[triggerId] = {
       status: 'failed',
       createdAt: prev?.createdAt ?? failedAt,
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       failedAt,
       errorCode: 'no_output',
       reason,
@@ -428,6 +459,7 @@ export function recordTerminalFailureStrict(
     file.results[triggerId] = {
       status: 'failed',
       createdAt: prev?.createdAt ?? failedAt,
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       failedAt,
       errorCode: 'trigger_failed',
       reason: 'turn_terminal',
@@ -462,6 +494,7 @@ export function recordInterruptedStrict(
     file.results[triggerId] = {
       status: 'interrupted',
       createdAt: prev?.createdAt ?? interruptedAt,
+      ...(prev?.inputCommit ? { inputCommit: prev.inputCommit } : {}),
       interruptedAt,
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;

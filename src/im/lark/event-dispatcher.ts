@@ -5811,7 +5811,8 @@ export function createLarkEventDispatcherRuntime(
       try {
         readback = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
       } catch (err) {
-        logger.warn(`[message-updated:${larkAppId}] 回读消息失败，忽略编辑事件 msg=${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+        logger.warn(`[message-updated:${larkAppId}] 回读消息失败 msg=${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+        if (primary) throw err;
         return;
       }
       const current = readback?.items?.[0] ?? readback?.message;
@@ -5853,6 +5854,24 @@ export function createLarkEventDispatcherRuntime(
       // 只处理人类消息：bot/app 编辑自己的消息（含卡片刷新）不触发任务。
       const senderType = data.sender?.sender_type;
       if (senderType === 'app' || senderType === 'bot') return;
+
+      // The native readback, not the event operator or caller-supplied text,
+      // identifies an edit. Managed captures precede the normal first-mention
+      // shortcut and retain their own durable versioned input responsibility.
+      if (/^[0-9]{1,20}$/.test(String(current.update_time ?? ''))) {
+        data.__captureContentVersion = String(current.update_time);
+        const editorSender = data.sender?.sender_id?.open_id;
+        if (editorSender) {
+          const unionId = await resolveUnionIdFromOpenId(larkAppId, editorSender);
+          if (unionId) data.sender.sender_id.union_id = unionId;
+        }
+        try {
+          if (handlers.captureHumanInput?.(data)) return {kind:'ignored',reason:'managed input edit captured'};
+        } catch (error) {
+          if (!primary || !isInputCaptureTerminalRejection(error)) throw error;
+          return {kind:'ignored',reason:`durable primary input capture rejected: ${error.code}`};
+        }
+      }
 
       // @ 判定依赖本 bot open_id；冷启动窗口先等探测完成，与 receive 路径一致。
       await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });

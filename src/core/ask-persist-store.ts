@@ -51,6 +51,7 @@ export const ASK_STORE_SENTINEL = '.botmux-ask-store';
 export interface PersistedAsk {
   /** Schema version so a future field change can migrate/skip cleanly. */
   v: 2;
+  continuation?: CreateAskInput['continuation'];
   /** Stable cross-restart identity = `${originKind}.${requestId}` (see module doc). */
   askKey: string;
   /** Per-invocation id the hook generates once and reuses across retries. */
@@ -179,7 +180,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         // uncaughtException — the daemon installs no trap for that, and explicit
         // records are exempt from disk reaping below, so it would crash-loop on
         // every restart until the disk recovered. Those writes stay best-effort.
-        if (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered') throw e;
+        if (ask.continuation || ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered') throw e;
         // Persistence is a resilience enhancement, never a correctness gate for
         // the live path: a failed write just means this ask won't survive a
         // restart.
@@ -210,6 +211,11 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         //    HANDOFF_RETENTION_MS from answeredAt so an unclaimed stash (dead
         //    CLI) can't accumulate forever (codex P1-4).
         //  - never-answered records are dropped once past their deadline.
+        if (parsed.continuation) {
+          // Host-owned waits and their input-commit receipts never expire merely
+          // because no process currently holds a blocking HTTP request.
+          out.push(parsed); continue;
+        }
         if (parsed.answeredResult !== undefined) {
           const stashedAt = typeof parsed.answeredAt === 'number' ? parsed.answeredAt : parsed.createdAt;
           if (parsed.originKind !== 'host_explicit' && now - stashedAt > HANDOFF_RETENTION_MS) {

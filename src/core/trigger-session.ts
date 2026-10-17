@@ -1,3 +1,5 @@
+import { routedTurnTarget, routedTurnKey } from '../services/trigger-types.js';
+import { realpathSync } from 'node:fs';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
@@ -410,7 +412,7 @@ export async function reconcileIdempotencyLeasesOnBoot(
     // the async store (so the caller polls `failed` at-most-once) or CAS-remove a
     // provably-pre-dispatch reserved lease — and NEVER touch the session. A
     // genuine I/O failure still throws → fail-closed (aggregated below).
-    if (record.kind === 'turn') {
+    if (record.kind === 'turn' || record.kind === 'routed_turn') {
       try {
         const asyncRec = asyncTriggerStore.lookup(record.sessionId, record.triggerId);
         const outcome = (asyncRec && asyncRec.ownerLarkAppId === ownerLarkAppId) ? asyncRec.result.status : undefined;
@@ -1048,9 +1050,16 @@ async function triggerSessionTurnAdmitted(
   // idempotencyStore and is woven into deliverToExisting's async branch below;
   // here we only do the fast pre-check (reuse/terminal short-circuit).
   const turnIdempotencyKey = req.options?.turnIdempotencyKey?.trim();
+  const routedTarget = turnIdempotencyKey && !req.target.sessionId
+    ? routedTurnTarget(req.target, req.presentation) : undefined;
+  if (turnIdempotencyKey && !req.target.sessionId && (!routedTarget || !req.options?.asyncReturnSessionId
+    || req.options.waitForFinalOutput || dryRun)) {
+    return { ok: false, errorCode: 'bad_request', error: 'keyed chat turns require a stable async route' };
+  }
+  const turnLeaseKind = routedTarget ? 'routed_turn' as const : 'turn' as const;
   const turnLeaseKey = turnIdempotencyKey && req.target.sessionId
     ? `${req.target.sessionId}\u0000${turnIdempotencyKey}`
-    : undefined;
+    : routedTarget && turnIdempotencyKey ? routedTurnKey(routedTarget, turnIdempotencyKey) : undefined;
   // requestHash binds the key to its full business payload (same rule as the
   // fresh-session key): a same-key retry with a DIFFERENT payload is a caller bug
   // (409), not a silent join. Excludes both idempotency keys (lookup keys, not
@@ -1061,8 +1070,8 @@ async function triggerSessionTurnAdmitted(
   const { idempotencyKey: _omitK1, turnIdempotencyKey: _omitK2, ...turnOptionsForHash } = (req.options ?? {}) as Record<string, unknown>;
   const turnRequestHash = turnLeaseKey
     ? computeInputHash({
-        seam: 'turn',
-        sessionId: req.target.sessionId ?? null,
+        ...(routedTarget ? { seam: 'routed_turn', target: routedTarget }
+          : { seam: 'turn', sessionId: req.target.sessionId ?? null }),
         instruction: req.instruction ?? null,
         envelope: req.envelope,
         source: req.source,
@@ -1085,7 +1094,7 @@ async function triggerSessionTurnAdmitted(
     }
     let hit: idempotencyStore.IdempotencyRecord | undefined;
     try {
-      hit = idempotencyStore.lookup(larkAppId, turnLeaseKey, 'turn');
+      hit = idempotencyStore.lookup(larkAppId, turnLeaseKey, turnLeaseKind);
     } catch (err) {
       return { ok: false, errorCode: 'trigger_failed', error: `idempotency lease unreadable: ${(err as Error).message}` };
     }
@@ -1261,7 +1270,15 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+  const workspaceMatches = (directory: string | undefined): boolean => {
+    if (req.options?.expectedWorkingDir === undefined) return true;
+    try { return !!directory && realpathSync(directory) === realpathSync(req.options.expectedWorkingDir); }
+    catch { return false; }
+  };
+  const deliverToExisting = async (target: DaemonSession, openingInput?: CliTurnPayload): Promise<TriggerResponse> => {
+    if (!workspaceMatches(target.workingDir ?? target.session.workingDir)) {
+      return { ok: false, errorCode: 'bad_request', error: 'target session working directory changed' };
+    }
     const prompt = promptForSession(target);
     // Ownership guard (PR #597): the target must still be the live, registered
     // occupant before we dispatch. Validate by object identity at its canonical
@@ -1302,7 +1319,7 @@ async function triggerSessionTurnAdmitted(
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
-    const content = buildExistingSessionContent(
+    const content = openingInput ?? buildExistingSessionContent(
       target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
     );
     const queuedBehindActivation = workerIsLive
@@ -1372,17 +1389,17 @@ async function triggerSessionTurnAdmitted(
       const res = turnIdempotencyTakeover
         ? idempotencyStore.takeover({
             ownerLarkAppId: larkAppId, key: turnLeaseKey, expect: turnIdempotencyTakeover,
-            sessionId: target.session.sessionId, triggerId, requestHash: turnRequestHash, ownerBootId, now: Date.now(), kind: 'turn',
+            sessionId: target.session.sessionId, triggerId, requestHash: turnRequestHash, ownerBootId, now: Date.now(), kind: turnLeaseKind,
           })
         : idempotencyStore.claim({
             ownerLarkAppId: larkAppId, sessionId: target.session.sessionId, triggerId,
-            requestHash: turnRequestHash, ownerBootId, key: turnLeaseKey, now: Date.now(), kind: 'turn',
+            requestHash: turnRequestHash, ownerBootId, key: turnLeaseKey, now: Date.now(), kind: turnLeaseKind,
           });
       if (res.kind === 'existing') return { reuse: reuseWinner(res.record) };
       // Commit-unknown barrier: CAS reserved→attempting durably BEFORE dispatch.
       const attempting = idempotencyStore.transition(larkAppId, turnLeaseKey, res.record, {
         state: 'attempting', now: Date.now(),
-      }, 'turn');
+      }, turnLeaseKind);
       return { lease: attempting };
     };
     // Stamp the idempotent-async-turn descriptor so a worker that dies with no
@@ -1398,7 +1415,7 @@ async function triggerSessionTurnAdmitted(
       (target.idempotentAsyncTurns ??= new Map()).set(triggerId, {
         ownerLarkAppId: larkAppId,
         key: turnLeaseKey,
-        kind: 'turn',
+        kind: turnLeaseKind,
         workerGeneration: dispatchedGeneration,
       });
     };
@@ -1715,6 +1732,9 @@ async function triggerSessionTurnAdmitted(
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }
 
+  if (!workspaceMatches(wd.workingDir)) {
+    return { ok: false, errorCode: 'bad_request', error: 'target route working directory changed' };
+  }
   const bot = getBot(larkAppId);
   const hasReasoningControl = isConfigurableReasoningCliId(bot.config.cliId);
   const effectiveModel = typeof req.options?.model === 'string' && req.options.model.trim()
@@ -1994,6 +2014,14 @@ async function triggerSessionTurnAdmitted(
     newDs.pendingCodexAppApplicationContext = undefined;
     newDs.pendingCodexAppMessageContext = undefined;
   };
+
+  // A stable chat/thread route shares the same dispatch lease and worker
+  // convergence path as an existing-session append. No second opening seam.
+  // No await occurs inside that path between claim and the synchronous fork.
+  if (routedTarget) {
+    releaseInitialReservation();
+    return deliverToExisting(newDs, promptInput);
+  }
 
   // Idempotency claim (fresh async virtual only — validator guarantees this is
   // the asyncReturnSessionId branch). Bind key → this session as a `reserved`

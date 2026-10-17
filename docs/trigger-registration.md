@@ -10,7 +10,7 @@ CLI 使用现有 daemon discovery、host HMAC 和 loopbackFetch；不导入私�
 
     GET /api/sessions/:sessionId/trigger-registration?turnIdempotencyKey=<原键>
 
-适用于 POST /api/trigger 在已有会话上的 options.turnIdempotencyKey。
+适用于 POST /api/trigger 的 options.turnIdempotencyKey，包括已有会话和明确的群/话题路由。
 键按原接口 trim，原始长度上限 200。机器人身份取自服务端，不能通过参数选择。
 接口沿用 host IPC 认证及启动恢复门禁，不在 core-only 的免认证列表中。
 
@@ -38,3 +38,29 @@ generation 不覆盖已有证据；缺少证据不会改变 attempting 屏障。
 客户端应保存原 session、原 key 和请求内容，比较返回的 requestHash。
 unknown / unavailable 不授权换新键重跑；继续查询或进入已有恢复流程。
 接口不推断业务状态，也不生成存储中不存在的 dispatch attempt 身份。
+
+
+## 首次群/话题派发
+
+不知道 sessionId 时，异步 turn 可指定稳定的 `target.chatId`，以及可选的原 `rootMessageId`：
+
+```json
+{
+  "source": {"type":"ui","connectorId":"example","requestId":"original-request"},
+  "target": {"kind":"turn","botId":"APP","chatId":"oc_CHAT","rootMessageId":"om_ROOT"},
+  "instruction":"Execute this bounded task.",
+  "presentation":{"topicMessage":null},
+  "options":{"asyncReturnSessionId":true,"turnIdempotencyKey":"original-request","expectedWorkingDir":"/absolute/task/workspace"}
+}
+```
+
+`topicMessage` 必须显式为 null；创建一条新 IM 话题不包含在这个幂等派发契约中。群路由使用 `routed_turn` namespace，按 `[chatId, rootMessageId或null, 原key]` 保存第一次选定的 sessionId 与 triggerId。请求摘要包含 `seam:routed_turn` 和原 target；已有 session 的 `turn` 摘要保持不变。相同路由/key 改请求内容会冲突，不能借同 key 改投其他会话。
+
+```bash
+botmux trigger-registration --bot APP --chat oc_CHAT --key ORIGINAL_KEY
+botmux trigger-registration --bot APP --chat oc_CHAT --root-message om_ROOT --key ORIGINAL_KEY
+```
+
+对应认证 IPC 为 `GET /api/chats/:chatId/trigger-registration?turnIdempotencyKey=<原key>`，话题路由追加 `rootMessageId=<原root>`。回读由原持久 route/key 解析 session，不能把当前恰好同群的另一个 session 当成原接单。新建会话和复用会话走同一 turn CAS/输入 ACK/结果链；一个 turn 的失败或 boot 对账不关闭可复用的共享会话。
+
+`expectedWorkingDir` 是可选的通用前置条件：派发前比较工作区 realpath，不匹配即拒绝，不修改已有会话或群路由的工作目录。它不授予业务写权限，也不能代替调用方的任务范围校验。

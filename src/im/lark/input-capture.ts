@@ -38,13 +38,16 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
   if (!['text', 'post'].includes(message.message_type) && !attachments.length) return false;
   const text = attachments.length ? extractAuthoredMessageText(message.message_type, message.content, message.mentions) : parsed.content;
   const command = stripLeadingMentions(text.trim(), parsed.mentions).trim();
-  if (!command && !attachments.length || command.startsWith('/') || isCallbackUrl(command)
-    || parseTopicHeader(command) !== null) return false;
+  const managed = runtime.managesChat(message.chat_id);
+  // Explicitly managed sources own commands and topic headers as well. Letting
+  // them fall through would create a second, unmetered Worker input path.
+  if (!command && !attachments.length || !managed && (command.startsWith('/') || isCallbackUrl(command)
+    || parseTopicHeader(command) !== null)) return false;
   const anchor = message.root_id || (message.thread_id ? runtime.resolveThreadAnchor({
     messageId: parsed.messageId, chatId: message.chat_id, senderOpenId: parsed.senderId, threadId: message.thread_id,
-  }) : message.chat_id);
+  }) || (runtime.managesChat(message.chat_id) ? message.message_id : undefined) : message.chat_id);
   if (!anchor) return false;
   return runtime.capture({ messageId: parsed.messageId, chatId: message.chat_id,
     anchor, senderOpenId: parsed.senderId, ...(message.thread_id ? { threadId: message.thread_id } : {}),
-    memberUnionId: parsed.senderUnionId, text, ...(attachments.length ? { attachments } : {}), botSender: false });
+    memberUnionId: parsed.senderUnionId, ...(data.__captureContentVersion?{contentVersion:data.__captureContentVersion}:{}), ...(message.parent_id?{parentId:message.parent_id}:{}), text, ...(attachments.length ? { attachments } : {}), botSender: false });
 }

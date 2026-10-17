@@ -12092,6 +12092,16 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
     };
   }
 
+  it('captures managed edits before the first-mention shortcut using the native readback version and sender', async () => {
+    handlers.captureHumanInput=vi.fn(()=>true);
+    mockGetMessageDetail.mockResolvedValue({items:[{...makeReadbackItem({messageId:'om_managed_edit',text:'revised without mention',mentioned:false}),update_time:'1720000000123'}]});
+    await capturedHandlers['im.message.updated_v1']({...makeUpdatedEvent('om_managed_edit','evt-managed-edit'),operator:{operator_id:{open_id:'ou_forged'}}});
+    await flushEventWork();
+    expect(handlers.captureHumanInput).toHaveBeenCalledWith(expect.objectContaining({__captureContentVersion:'1720000000123',sender:expect.objectContaining({sender_id:expect.objectContaining({open_id:USER_OPEN_ID})})}));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   function grantEvents(messageId: string, inThread = false) {
     const text = '@_bot_a /grant @_target';
     const rootId = inThread ? 'om_grant_topic_root' : undefined;

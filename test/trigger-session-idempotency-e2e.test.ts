@@ -424,3 +424,114 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.status).toBe('pending');
   });
 });
+
+describe('stable real chat route (native dispatch and stores; IM/Worker mocked)', () => {
+  function request(key = 'effect-1'): TriggerRequest {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false, regularGroupReplyMode: 'shared' } } as any);
+    return { source: { type: 'ui', requestId: key },
+      target: { kind: 'turn', botId: 'app-idem', chatId: 'oc_team' },
+      envelope: { format: 'stage', sourceName: 'connector', trusted: false }, instruction: 'Run the admitted task',
+      presentation: { topicMessage: null }, options: { asyncReturnSessionId: true, turnIdempotencyKey: key } };
+  }
+  async function dispatch(r: TriggerRequest, activeSessions: Map<string, any>) {
+    // This test retains the real route admission, CAS lease, and result store.
+    // Only external IM and Worker execution are replaced by the file's fixture.
+    return triggerSessionTurn(r, { larkAppId: r.target.botId!, activeSessions });
+  }
+  function liveFork() {
+    mockForkWorker.mockImplementation((...args: any[]) => { args[0].worker = { killed: false }; });
+  }
+  it('creates one route owner and reuses the original key after a lost response', async () => {
+    liveFork();
+    const r = request(), active = new Map<string, any>();
+    const first = await dispatch(r, active);
+    expect(first.ok, JSON.stringify(first)).toBe(true);
+    const again = await dispatch(r, active);
+    expect(again).toMatchObject({ ok: true, idempotent: true, triggerId: first.triggerId, target: first.target });
+    expect(createdSessions).toHaveLength(1);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    const { readRoutedTurnRegistration } = await import('../src/core/trigger-registration.js');
+    const { routedTurnKey } = await import('../src/services/trigger-types.js');
+    const target = { chatId: 'oc_team' };
+    const leaseKey = routedTurnKey(target, 'effect-1');
+    expect(idempotencyStore.recordTurnInputCommit({ ownerLarkAppId: r.target.botId!, key: leaseKey,
+      sessionId: first.target!.sessionId!, triggerId: first.triggerId!, ownerBootId: 'boot-CURRENT',
+      workerGeneration: 1, observedAt: Date.now(), kind: 'routed_turn' })).toBe(true);
+    expect(readRoutedTurnRegistration(r.target.botId!, target, 'effect-1').body).toMatchObject({
+      state: 'registered', sessionId: first.target!.sessionId, inputCommitted: { state: 'observed', workerGeneration: 1 },
+    });
+    expect((await dispatch({ ...r, instruction: 'Different task' }, active)).errorCode).toBe('idempotency_conflict');
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+  });
+  it('concurrent first callers converge on one dispatch, including the initial reservation window', async () => {
+    liveFork();
+    const r = request(), active = new Map<string, any>();
+    const results = await Promise.all([dispatch(r, active), dispatch(r, active)]);
+    expect(results.some(x => x.ok)).toBe(true);
+    const again = await dispatch(r, active);
+    expect(again.ok).toBe(true);
+    expect(createdSessions).toHaveLength(1);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+  });
+  it('separate keys reuse the shared session without sharing a turn', async () => {
+    liveFork();
+    const active = new Map<string, any>();
+    const a = await dispatch(request('a'), active), b = await dispatch(request('b'), active);
+    expect(a.ok && b.ok).toBe(true);
+    expect(a.target!.sessionId).toBe(b.target!.sessionId);
+    expect(a.triggerId).not.toBe(b.triggerId);
+    expect(createdSessions).toHaveLength(1);
+  });
+  it('post-fork ambiguity terminalizes only the original turn and never dispatches it again', async () => {
+    mockForkWorker.mockImplementation(() => { throw Error('lost fork acknowledgement'); });
+    const r = request(), active = new Map<string, any>();
+    const a = await dispatch(r, active), b = await dispatch(r, active);
+    expect(a.state).toBe('failed');
+    expect(b.state).toBe('failed');
+    expect(a.triggerId).toBe(b.triggerId);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    expect(mockCloseSession).not.toHaveBeenCalled();
+  });
+});
+
+it('boot reconciliation fences routed turns without closing their shared session', async () => {
+  const { reconcileIdempotencyLeasesOnBoot } = await import('../src/core/trigger-session.js');
+  const r = idempotencyStore.claim({ownerLarkAppId:APP,sessionId:'shared',triggerId:'trg-routed-crash',
+    key:'route-original',requestHash:'route-hash',ownerBootId:'old',now:1,kind:'routed_turn'});
+  idempotencyStore.transition(APP,'route-original',r.record,{state:'attempting',now:2},'routed_turn');
+  const result = await reconcileIdempotencyLeasesOnBoot(APP,'boot-CURRENT',() => ({chatId:'oc_group'}));
+  expect(result.size).toBe(0);
+  expect(mockCloseSession).not.toHaveBeenCalled();
+  expect(asyncTriggerStore.lookup('shared','trg-routed-crash')?.result.status).toBe('failed');
+});
+
+it('admits keyed stable async routes but rejects unkeyed topic creation modes', async () => {
+  const {validateTriggerRequest} = await import('../src/services/trigger-types.js');
+  const base:TriggerRequest={source:{type:'ui'},target:{kind:'turn',chatId:'oc_group'},
+    envelope:{format:'text',sourceName:'test',trusted:false},presentation:{topicMessage:null},
+    options:{asyncReturnSessionId:true,turnIdempotencyKey:'key'}};
+  expect(validateTriggerRequest(base).ok).toBe(true);
+  for(const patch of [
+    {presentation:undefined}, {presentation:{topicMessage:'create a topic'}},
+    {options:{turnIdempotencyKey:'key'}}, {target:{kind:'turn',chatId:'http_async_fake'}},
+    {target:{kind:'turn',chatId:'oc_group',rootMessageId:'invalid'}},
+  ]) expect(validateTriggerRequest({...base,...patch}).ok).toBe(false);
+});
+
+it('checks the requested workspace before first and subsequent routed dispatch', async () => {
+  mockGetBot.mockReturnValue({config:{cliId:'codex-app',apiOnly:false,regularGroupReplyMode:'shared'}} as any);
+  mockForkWorker.mockImplementation((...args:any[])=>{args[0].worker={killed:false};});
+  const active=new Map<string,any>();
+  const req:TriggerRequest={source:{type:'ui'},target:{kind:'turn',botId:APP,chatId:'oc_workspace'},
+    envelope:{format:'text',sourceName:'test',trusted:false},presentation:{topicMessage:null},
+    options:{asyncReturnSessionId:true,turnIdempotencyKey:'first',expectedWorkingDir:'/missing-workflow-workspace'}};
+  expect((await triggerSessionTurn(req,{larkAppId:APP,activeSessions:active})).ok).toBe(false);
+  expect(createdSessions).toHaveLength(0);expect(mockForkWorker).not.toHaveBeenCalled();
+  req.options!.expectedWorkingDir='/tmp';
+  expect((await triggerSessionTurn(req,{larkAppId:APP,activeSessions:active})).ok).toBe(true);
+  [...active.values()][0].workingDir='/missing-workflow-workspace';
+  req.options!.turnIdempotencyKey='second';
+  const rejected=await triggerSessionTurn(req,{larkAppId:APP,activeSessions:active});
+  expect(rejected).toMatchObject({ok:false,errorCode:'bad_request',error:'target session working directory changed'});
+  expect(mockForkWorker).toHaveBeenCalledTimes(1);
+});

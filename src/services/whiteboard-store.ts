@@ -1,3 +1,4 @@
+import { readProjectGroup } from './project-group-store.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -387,7 +388,7 @@ function rotateWhiteboardLogIfNeeded(id: string, incomingBytes = 0): void {
   renameSync(fp, join(dir, 'log.1.jsonl'));
 }
 
-export function writeWhiteboard(id: string, content: string, opts?: { actor?: string; kind?: string; expectedUpdatedAt?: string }): WhiteboardMeta {
+export function writeWhiteboard(id: string, content: string, opts?: { actor?: string; kind?: string; expectedUpdatedAt?: string; projectionHash?: string }): WhiteboardMeta {
   if (!whiteboardEnabled()) throw new Error('whiteboard_disabled');
   const clean = safeId(id);
   // Reject empty/whitespace-only content at the store boundary so no caller
@@ -399,6 +400,8 @@ export function writeWhiteboard(id: string, content: string, opts?: { actor?: st
   return withBoardLock(clean, () => {
     const existing = getWhiteboard(clean);
     if (!existing) throw new Error('whiteboard_not_found');
+    const project = existing.chatId ? readProjectGroup(config.session.dataDir, existing.chatId) : undefined;
+    if (project?.projection && opts?.projectionHash !== project.projection.hash) throw new Error('whiteboard_managed_by_provider');
     // Optional compare-and-set: if the caller read the board at updatedAt X
     // and it has since changed, refuse the blind overwrite so the caller can
     // re-read and merge. Wired as a store primitive; CLI opts in later.

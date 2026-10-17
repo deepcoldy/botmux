@@ -1,0 +1,19 @@
+  const askMarker=join(process.env.BOTMUX_TEST_ROOT,`ask-command-${process.env.BOTMUX_SESSION_ID}.json`);
+  const threadId=request.params.threadId,turnId=`turn-fake-${turnAttempt}`;
+  respond(request.id,{turn:{id:turnId}});notify('turn/started',{threadId,turn:{id:turnId}});
+  setTimeout(async()=>{
+    const run=args=>new Promise(resolve=>{
+      const child=spawn(join(process.env.HOME,'.botmux/bin/botmux'),args,{env:process.env,stdio:['ignore','pipe','pipe']});
+      let stdout='',stderr='';child.stdout.on('data',x=>stdout+=x);child.stderr.on('data',x=>stderr+=x);
+      child.on('error',error=>resolve({error:String(error)}));
+      child.on('exit',code=>resolve({code,stdout,stderr}));
+    });
+    const execution=await run(['execution','current','--json']);
+    appendFileSync(join(process.env.BOTMUX_TEST_ROOT,'execution-proofs.jsonl'),JSON.stringify({sessionId:process.env.BOTMUX_SESSION_ID,threadId,turnId,...execution})+'\n');
+    if(!existsSync(askMarker)){
+      const result=await run(['ask','buttons','--request-id','fixture-owner-decision','--options','continue,stop','Continue the isolated runtime task?']);
+      writeFileSync(askMarker,JSON.stringify({...result,mode:process.env.BOTMUX_ASK_DELIVERY_MODE,sessionId:process.env.BOTMUX_SESSION_ID,rootMessageId:process.env.BOTMUX_ROOT_MESSAGE_ID}));
+    }
+    emitTurnCompletion(threadId,turnId,request.params.outputSchema);
+  },150);
+  return;

@@ -10,6 +10,8 @@ export interface InputBinding {
   chatId: string; anchor: string; sourceAnchor: string; ownerOpenId: string; pluginId: string;
   requestId: string; providerRef: string; createdAt: string;
   captureAttachments?: boolean;
+  actorSelector?: 'authorized_humans';
+  requestHash?: string;
   inputThreadId?: string;
 }
 export interface CapturedInput {
@@ -17,10 +19,22 @@ export interface CapturedInput {
   senderOpenId: string; text: string; receivedAt: string;
   attachments?: CaptureAttachment[];
   threadId?: string;
+  anchor?: string;
+  parentId?: string;
+  memberUnionId?: string;
+  contentVersion?: string;
   delivery: 'pending' | 'acknowledged'; acknowledgedAt?: string;
 }
+export interface RegistrationClosure {
+  id: string; sessionId: string; pluginId: string; requestId: string;
+  revision: number; throughSequence: number; intentKey: string; closedAt: string;
+}
+export interface CaptureIntent {
+  intentKey: string; requestHash: string; result: unknown;
+}
 export interface CaptureJournal {
-  schemaVersion: 1 | 2 | 3; larkAppId: string; bindings: InputBinding[]; inputs: CapturedInput[];
+  schemaVersion: 1 | 2 | 3 | 4; larkAppId: string; bindings: InputBinding[]; inputs: CapturedInput[];
+  closures?: RegistrationClosure[]; intents?: CaptureIntent[];
 }
 export interface CaptureSnapshot {
   state: CaptureJournal;
@@ -37,7 +51,7 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
   const empty = (): CaptureJournal => ({ schemaVersion: 1, larkAppId, bindings: [], inputs: [] });
   const readIndexed = (): CaptureSnapshot => {
     const state: CaptureJournal = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : empty();
-    if (![1, 2, 3].includes(state.schemaVersion) || state.larkAppId !== larkAppId
+    if (![1, 2, 3, 4].includes(state.schemaVersion) || state.larkAppId !== larkAppId
       || !Array.isArray(state.bindings) || !Array.isArray(state.inputs)) throw new Error('input_capture_journal_invalid');
     const bindingsById = new Map<string, InputBinding>();
     const threadsByBinding = new Map<string, Set<string>>();
@@ -46,11 +60,12 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
         || !Number.isSafeInteger(b.revision) || b.revision < 1
         || !b.sessionId || !b.chatId || !b.anchor || !b.sourceAnchor || !b.ownerOpenId || !b.pluginId || !b.requestId
         || typeof b.providerRef !== 'string'
+        || b.actorSelector !== undefined && (b.actorSelector !== 'authorized_humans' || state.schemaVersion < 4 || b.anchor !== b.chatId)
         || b.captureAttachments !== undefined && typeof b.captureAttachments !== 'boolean'
         || b.captureAttachments === true && state.schemaVersion < 2
         || b.inputThreadId !== undefined && (typeof b.inputThreadId !== 'string'
           || !/^omt_[A-Za-z0-9_-]{1,196}$/.test(b.inputThreadId) || !/^om_[A-Za-z0-9_-]+$/.test(b.anchor)
-          || state.schemaVersion !== 3)) throw new Error('input_capture_journal_invalid');
+          || state.schemaVersion < 3)) throw new Error('input_capture_journal_invalid');
       bindingsById.set(b.id, b);
       threadsByBinding.set(b.id, new Set(b.inputThreadId ? [b.inputThreadId] : []));
     }
@@ -64,13 +79,28 @@ export function createInputCaptureStore(dataDir: string, larkAppId: string) {
       const attachments = parseCaptureAttachments(input.attachments);
       const binding = bindingsById.get(input.bindingId)!;
       if (input.threadId !== undefined && (typeof input.threadId !== 'string'
-        || !/^omt_[A-Za-z0-9_-]{1,196}$/.test(input.threadId) || !/^om_[A-Za-z0-9_-]+$/.test(binding.anchor)
-        || state.schemaVersion !== 3 || binding.inputThreadId && binding.inputThreadId !== input.threadId)) {
+        || !/^omt_[A-Za-z0-9_-]{1,196}$/.test(input.threadId) || !/^om_[A-Za-z0-9_-]+$/.test(binding.anchor) && binding.actorSelector !== 'authorized_humans'
+        || state.schemaVersion < 3 || binding.inputThreadId && binding.inputThreadId !== input.threadId)) {
         throw new Error('input_capture_journal_invalid');
       }
-      if (input.threadId) threadsByBinding.get(input.bindingId)!.add(input.threadId);
+      if (input.threadId && binding.anchor !== binding.chatId) threadsByBinding.get(input.bindingId)!.add(input.threadId);
       if (attachments.length && binding.captureAttachments !== true) {
         throw new Error('input_capture_journal_invalid');
+      }
+    }
+    if (state.closures || state.intents) {
+      if (state.schemaVersion !== 4 || !Array.isArray(state.closures) || !Array.isArray(state.intents)) throw new Error('input_capture_journal_invalid');
+      const ids = new Set<string>();
+      for (const c of state.closures) {
+        if (c.id !== captureDigest([larkAppId,c.sessionId,c.pluginId,c.requestId]) || ids.has(c.id)
+          || !Number.isSafeInteger(c.revision) || c.revision < 1 || !Number.isSafeInteger(c.throughSequence)
+          || c.throughSequence < 0 || !c.intentKey || bindingsById.get(c.id)?.active) throw new Error('input_capture_journal_invalid');
+        ids.add(c.id);
+      }
+      const keys = new Set<string>();
+      for (const i of state.intents) {
+        if (!i.intentKey || keys.has(i.intentKey) || !/^[a-f0-9]{64}$/.test(i.requestHash) || !i.result) throw new Error('input_capture_journal_invalid');
+        keys.add(i.intentKey);
       }
     }
     const aliases = new Set<string>();

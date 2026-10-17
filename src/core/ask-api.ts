@@ -12,6 +12,7 @@ export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
 
 export interface AskApiBody {
+  deliveryMode?: 'continuation';
   sessionId: string;
   chatId: string;
   larkAppId: string;
@@ -31,6 +32,7 @@ export interface AskApiBody {
 }
 
 export type AskApiBodyError =
+  | 'bad_deliveryMode'
   | 'bad_body'
   | 'unsupported_fields'
   | 'bad_sessionId'
@@ -63,6 +65,8 @@ export type AskApiBodyError =
 export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyError } {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'bad_body' };
   const r = raw as Record<string, unknown>;
+  if (r.deliveryMode !== undefined && r.deliveryMode !== 'continuation') return { error: 'bad_deliveryMode' };
+  if (r.deliveryMode === 'continuation' && (typeof r.requestId !== 'string' || !r.requestId.trim())) return { error: 'bad_requestId' };
 
   if (typeof r.sessionId !== 'string' || !r.sessionId.trim()) return { error: 'bad_sessionId' };
   if (typeof r.chatId !== 'string' || !r.chatId.trim()) return { error: 'bad_chatId' };
@@ -134,6 +138,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   }
 
   const parsed: AskApiBody = {
+    ...(r.deliveryMode === 'continuation' ? { deliveryMode: 'continuation' as const } : {}),
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,

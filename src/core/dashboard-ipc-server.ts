@@ -1,5 +1,5 @@
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
-import { readTurnRegistration } from './trigger-registration.js';
+import { readTurnRegistration, readRoutedTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
@@ -100,6 +100,7 @@ import {
 } from '../cli/current-actor.js';
 import { CURRENT_EXECUTION_ROUTE, CURRENT_EXECUTION_SCHEMA } from '../cli/current-execution.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
+import { projectTriggerInputCommit } from './trigger-input-commit.js';
 import {
   attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
@@ -1547,11 +1548,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/interaction-context', async (req, res
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   const body = await readJsonBodyOrBadJson<unknown>(req, res);
   if (body === BAD_JSON) return;
-  const { observeInteractionContext } = await import('./interaction-context.js');
+  const { observeInteractionContext,configuredGroupContext } = await import('./interaction-context.js');
   const { evaluateAskAnswerTalk } = await import('../im/lark/event-dispatcher.js');
   try {
     const result = observeInteractionContext({ trustedHost: true, daemonAppId: cachedLarkAppId, sessionId: params.sessionId, body }, {
       findActive(id) {
+        const group=configuredGroupContext(cachedLarkAppId,id,chatId=>!!getBot(cachedLarkAppId).config.oncallChats?.some(c=>c.chatId===chatId));
+        if(group)return group;
         const ds = findActiveBySessionId(id);
         return ds ? { ...ds.session, larkAppId: ds.larkAppId, chatType: ds.chatType } : undefined;
       },
@@ -1561,6 +1564,48 @@ ipcRoute('POST', '/api/sessions/:sessionId/interaction-context', async (req, res
   } catch {
     return jsonRes(res, 503, { ok: false, error: 'interaction_context_unavailable' });
   }
+});
+
+// Resolves an App-local user identity; no authority or session ownership is assigned.
+ipcRoute('POST', '/api/interactions/actor', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const { observeInteractionActor } = await import('./interaction-actor.js');
+  const { resolveTargetAppOpenId, resolveUnionIdFromOpenId, listChatMemberOpenIds } = await import('../im/lark/client.js');
+  const { evaluateAskAnswerTalk } = await import('../im/lark/event-dispatcher.js');
+  try {
+    const result = await observeInteractionActor({ trustedHost: true, daemonAppId: cachedLarkAppId, body }, {
+      resolveOpenId: unionId => resolveTargetAppOpenId(cachedLarkAppId, unionId),
+      resolveUnionId: openId => resolveUnionIdFromOpenId(cachedLarkAppId, openId),
+      members: chatId => listChatMemberOpenIds(cachedLarkAppId, chatId),
+      canTalk: evaluateAskAnswerTalk,
+    });
+    return jsonRes(res, result.status, result.body);
+  } catch { return jsonRes(res, 503, { ok: false, error: 'interaction_actor_unavailable' }); }
+});
+
+// External state owners provide display snapshots; native CLI reports cannot change them.
+ipcRoute('POST', '/api/groups/:chatId/project-projection', async (req,res,params)=>{
+  if(!isTrustedHostIpcRequest(req))return jsonRes(res,403,{ok:false,error:'trusted_host_required'});
+  try {
+    const body=await readJsonBody<Record<string,unknown>>(req);
+    const {readGroupCollaborationMode}=await import('../services/group-collaboration-mode-store.js');
+    const mode=readGroupCollaborationMode(config.session.dataDir,params.chatId);
+    if(body.larkAppId!==cachedLarkAppId || mode?.mode!=='project' || mode.coordinatorAppId!==cachedLarkAppId)
+      return jsonRes(res,409,{ok:false,error:'project_projection_coordinator_mismatch'});
+    const {parseProjectProjection}=await import('../services/project-projection.js');
+    const input=parseProjectProjection(body.projection);
+    const {projectCoordinator}=await import('../services/project-coordinator-runtime.js');
+    const {ensureDefaultWhiteboard,readWhiteboard,writeWhiteboard,whiteboardEnabled}=await import('../services/whiteboard-store.js');
+    const project=await projectCoordinator.project({dataDir:config.session.dataDir,chatId:params.chatId,
+      larkAppId:cachedLarkAppId,coordinatorSessionId:''},input,async (snapshot,hash)=>{
+      if(!whiteboardEnabled())return;
+      const board=ensureDefaultWhiteboard({larkAppId:cachedLarkAppId,chatId:params.chatId,workingDir:snapshot.workingDir,title:snapshot.snapshot.title});
+      if(readWhiteboard(board.id)!==snapshot.snapshot.board)writeWhiteboard(board.id,snapshot.snapshot.board,{actor:snapshot.providerId,kind:'projection',projectionHash:hash});
+    });
+    return jsonRes(res,200,{ok:true,projection:project.projection});
+  }catch(error){return jsonRes(res,409,{ok:false,error:error instanceof Error?error.message:'project_projection_unavailable'});}
 });
 
 // Exact host-installed input bindings. Never added to the session relay allowlist.
@@ -1573,7 +1618,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
   if (!runtime) return jsonRes(res, 503, { ok: false, error: 'input_capture_unavailable' });
   try {
     let result: unknown;
-    if (body.operation === 'register') result = runtime.register(params.sessionId, body);
+    if (body.operation === 'capabilities') result = runtime.capabilities();
+    else if (body.operation === 'inspect-registration') result = runtime.inspectRegistration(params.sessionId, body);
+    else if (body.operation === 'reconcile') result = runtime.reconcile(params.sessionId, body);
+    else if (body.operation === 'register') result = runtime.register(params.sessionId, body);
     else if (body.operation === 'revoke-set') result = runtime.revokeSet(params.sessionId, body.bindings);
     else if (typeof body.bindingId === 'string' && /^[a-f0-9]{64}$/.test(body.bindingId)) {
       if (body.operation === 'inspect') result = runtime.inspect(params.sessionId, body.bindingId, { after: body.after, through: body.through });
@@ -1584,9 +1632,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/input-capture', async (req, res, para
     return jsonRes(res, result ? 200 : 404, { ok: !!result, schemaVersion: 1, result });
   } catch (error) {
     const message = error instanceof Error ? error.message : '';
-    const conflict = /^input_capture_(?:identity|anchor|revision|inputs)_conflict$/.test(message);
-    const invalid = ['invalid_input_capture_conditions', 'invalid_input_capture_page'].includes(message);
-    return jsonRes(res, invalid ? 400 : conflict ? 409 : 503, { ok: false, error: invalid || conflict ? message : 'input_capture_unavailable' });
+    const conflict = /^input_capture_(?:identity|anchor|revision|inputs|request_hash)_conflict$/.test(message);
+    const rejected = message === 'input_capture_registration_closed' || message === 'input_capture_session_unavailable' || message === 'input_capture_plugin_unavailable';
+    const invalid = /^invalid_input_capture_/.test(message);
+    return jsonRes(res, invalid ? 400 : conflict ? 409 : rejected ? 422 : 503, { ok: false, error: invalid || conflict || rejected ? message : 'input_capture_unavailable' });
   }
 });
 
@@ -4134,6 +4183,15 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
 });
 
 // Authenticated host API; deliberately outside the core-only public allowlist.
+ipcRoute('GET', '/api/chats/:chatId/trigger-registration', (req, res, params) => {
+  const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const keys = query.getAll('turnIdempotencyKey'), roots = query.getAll('rootMessageId');
+  const result = readRoutedTurnRegistration(cachedLarkAppId,
+    { chatId: params.chatId, ...(roots.length ? { rootMessageId: roots[0] } : {}) },
+    keys.length === 1 && roots.length <= 1 ? keys[0] : null);
+  jsonRes(res, result.status, result.body);
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId/trigger-registration', (req, res, params) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const keys = url.searchParams.getAll('turnIdempotencyKey');
@@ -4148,7 +4206,13 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   // Four-state semantics: the query itself succeeds (HTTP 200) for every
   // resolved state including not_found — task state lives in `result.state`,
   // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
-  jsonRes(res, result.ok ? 200 : 400, result);
+  let inputCommitted: ReturnType<typeof projectTriggerInputCommit> = { schemaVersion: 1, state: 'unknown' };
+  try {
+    inputCommitted = projectTriggerInputCommit({ ownerLarkAppId: cachedLarkAppId,
+      sessionId: params.sessionId, triggerId, session: findOwnedSessionRecord(params.sessionId),
+      persisted: triggerId ? asyncTriggerStore.lookupStrict(params.sessionId, triggerId) : undefined, result });
+  } catch { /* Missing/corrupt evidence cannot prove acceptance or change the result. */ }
+  jsonRes(res, result.ok ? 200 : 400, { ...result, inputCommitted });
 });
 
 /**

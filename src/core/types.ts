@@ -722,7 +722,7 @@ export interface DaemonSession {
     key: string;
     /** Store domain of the lease key (fresh async-virtual vs follow-up turn) so
      *  convergence looks the lease up under the correct unforgeable namespace. */
-    kind: 'fresh' | 'turn';
+    kind: 'fresh' | 'turn' | 'routed_turn';
     /** The worker generation this turn was dispatched on. The exit handler only
      *  converges when the DYING generation is this one (a later generation that
      *  completed and moved on must not be retro-failed). */

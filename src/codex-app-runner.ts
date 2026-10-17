@@ -29,6 +29,9 @@ import {
   parseCodexAppControlWireRecord,
   takeCodexAppControlLocatorEndpoint,
 } from './utils/codex-app-control.js';
+import { findLaunchedCliPid } from './core/session-discovery.js';
+import { readProcessStartIdentity } from './utils/process-identity.js';
+import { captureCodexAppProcessAttestation, type CodexAppProcessAttestation } from './utils/codex-app-process-attestation.js';
 import { CODEX_APP_NO_PROGRESS_TIMEOUT_MS } from './utils/codex-app-turn-liveness.js';
 import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
 import { createRunnerTerminal } from './runner-common.js';
@@ -346,6 +349,8 @@ class AppServerClient {
   private lastStderr = '';
   private fatalError?: Error;
   readonly lifetime = new AbortController();
+  processAttestation: CodexAppProcessAttestation | undefined;
+  private readonly launcherProcStart: string | undefined;
 
   get hasExited(): boolean {
     // 后代可能继续持有 stdio，进程退出不能等到 close 才识别。
@@ -359,6 +364,7 @@ class AppServerClient {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
+    this.launcherProcStart = this.child.pid ? readProcessStartIdentity(this.child.pid) : undefined;
     this.child.stdout.on('data', chunk => this.rpc.push(chunk.toString('utf8')));
     this.child.stdin.on('error', err => this.failAll(new Error(`Codex app-server stdin error: ${err.message}`)));
     this.child.stderr.on('data', chunk => {
@@ -394,6 +400,16 @@ class AppServerClient {
       capabilities: { experimentalApi: true },
     }, { timeoutMs });
     this.notify('initialized');
+    if (process.platform === 'linux') {
+      const pid = this.child.pid;
+      if (!pid || !this.launcherProcStart || readProcessStartIdentity(pid) !== this.launcherProcStart) {
+        throw new Error('Codex App launcher identity changed during initialization');
+      }
+      // npm's resident Node launcher forks the native app-server. Resolve it
+      // after initialize but before thread/start or resume can run model tools.
+      const enginePid = findLaunchedCliPid(pid, 'codex') ?? pid;
+      this.processAttestation = captureCodexAppProcessAttestation(process.pid, enginePid);
+    }
   }
 
   request(
@@ -475,6 +491,7 @@ try {
 
 let controlSeq = 0;
 let controlAckedSeq = 0;
+const processAttestationAcks = new Map<number, () => void>();
 let controlSentThrough = 0;
 const controlQueue: Array<{ seq: number; kind: string; payload: JsonObject }> = [];
 let controlFatal = false;
@@ -590,11 +607,17 @@ function connectControlSocket(): void {
         // The first acceptance happens before app-server initialization; it is
         // not a ready boundary. Re-authentication can publish the live state
         // only after initialization has completed.
-        if (controlAcceptanceCount > 1 && runnerReady) settleRunnerState();
+        if (controlAcceptanceCount > 1 && runnerReady) {
+          emitProcessAttestation();
+          settleRunnerState();
+        }
         flushControlQueue();
       } else if (action.type === 'ack' && controlAccepted) {
         if (action.seq > controlAckedSeq) controlAckedSeq = action.seq;
         while (controlQueue[0] && controlQueue[0].seq <= controlAckedSeq) controlQueue.shift();
+        for (const [seq, resolve] of processAttestationAcks) {
+          if (seq <= controlAckedSeq) resolve();
+        }
       } else {
         socket.destroy(new Error('out-of-order Codex App control response'));
         return;
@@ -622,6 +645,29 @@ function emitMarker(kind: string, payload: JsonObject): void {
   }
   controlQueue.push({ seq: ++controlSeq, kind, payload });
   flushControlQueue();
+}
+
+function emitProcessAttestation(): number | undefined {
+  if (process.platform !== 'linux') return undefined;
+  if (!client?.processAttestation) throw new Error('Codex App process identity unavailable');
+  emitMarker('process_attestation', { ...client.processAttestation });
+  return controlSeq;
+}
+
+async function acknowledgeProcessAttestation(deadlineAtMs: number): Promise<void> {
+  const seq = emitProcessAttestation();
+  if (seq === undefined || controlAckedSeq >= seq) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      processAttestationAcks.delete(seq);
+      reject(new Error('Codex App process attestation was not acknowledged'));
+    }, Math.max(1, deadlineAtMs - Date.now()));
+    processAttestationAcks.set(seq, () => {
+      clearTimeout(timer);
+      processAttestationAcks.delete(seq);
+      resolve();
+    });
+  });
 }
 
 function emitFinalMarker(
@@ -2575,6 +2621,7 @@ async function initializeAppServer(deadlineAtMs: number): Promise<void> {
   });
   try {
     await current.initialize(startupRequestTimeout(deadlineAtMs, 'initialize'));
+    await acknowledgeProcessAttestation(deadlineAtMs);
   } catch (err) {
     current.close();
     throw err;

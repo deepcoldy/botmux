@@ -6270,6 +6270,21 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Management-only snapshots from an external state owner.
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/groups\/([^/]+)\/project-projection$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const larkAppId = body && typeof body === 'object' && !Array.isArray(body)
+        ? (body as Record<string, unknown>).larkAppId : undefined;
+      if (typeof larkAppId !== 'string' || !larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
+      const upstream = await proxyToDaemon(larkAppId, url.pathname, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Test the current unsaved Bash precondition draft on the selected bot's
     // daemon. This remains a management-only mutation route and intentionally
     // has no schedule id, so testing cannot alter any task or dispatch a model.

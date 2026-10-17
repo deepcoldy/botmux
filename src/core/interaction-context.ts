@@ -46,3 +46,13 @@ export function observeInteractionContext(
     actorOpenId, canTalk, observedAt: new Date().toISOString(),
   } } };
 }
+
+/** Host group context is an existing configured IM scope, never a Worker or an
+ * execution grant. Its lifetime is independent of individual conversation turns. */
+export function configuredGroupContext(appId:string,id:string,configured:(chatId:string)=>boolean) {
+  if(!id.startsWith('chat:'))return undefined;
+  const chatId=id.slice(5);
+  if(!/^oc_[A-Za-z0-9_-]+$/.test(chatId)||!configured(chatId))return undefined;
+  return {sessionId:id,larkAppId:appId,chatId,anchor:chatId,rootMessageId:undefined,
+    scope:'chat',chatType:'group',ownerOpenId:'',status:'active',active:true};
+}

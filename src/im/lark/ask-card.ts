@@ -459,7 +459,7 @@ function renderAskCardWithCap(
 ): string {
   const locale = localeForBot(ask.larkAppId);
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
-  const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
+  const deadline = ask.continuation ? (locale === 'en' ? 'Waiting for answer; no expiry' : '等待答复，不自动过期') : new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
 
@@ -480,6 +480,16 @@ function renderAskCardWithCap(
       }, locale),
     }] });
   }
+  if (result?.kind === 'answered' && ask.continuation) {
+    const state = ask.continuation.state;
+    const message = locale === 'en'
+      ? state === 'committed' ? 'Your answer has been delivered to the original task.' : state === 'blocked'
+        ? 'Your answer is saved. The platform is recovering the original task; you do not need to answer again.' : 'Your answer is saved. Resuming the original task.'
+      : state === 'committed' ? '答复已交给原任务执行。' : state === 'blocked'
+        ? '答复已保留，平台正在恢复原任务，无需重复答复。' : '答复已保留，正在接续原任务。';
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: message } });
+  }
+
 
   if (status) {
     // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
