@@ -17943,22 +17943,25 @@ switch (command) {
     // 带子命令（list/add/configure/edit/remove/help）走脚本化非 TUI 模式；空参数 / 纯
     // flag（如 --no-open-platform-auto / --lang en）保持原交互 TUI，向后兼容。
     const setupArgs = process.argv.slice(3);
-    const langFlagIdx = setupArgs.findIndex(a => a === '--lang' || a.startsWith('--lang='));
-    if (langFlagIdx !== -1) {
-      const raw = setupArgs[langFlagIdx].startsWith('--lang=')
-        ? setupArgs[langFlagIdx].slice(7)
-        : setupArgs[langFlagIdx + 1];
-      if (isLocale(raw)) {
-        setGlobalLocale(raw);
-        setDefaultLocale(raw);
-      }
-    }
     const cleanSetupArgs = setupArgs.filter((a, i) => {
       if (a === '--lang' || a.startsWith('--lang=')) return false;
       if (i > 0 && setupArgs[i - 1] === '--lang') return false;
       return true;
     });
-    if (isScriptedSetupInvocation(cleanSetupArgs)) await cmdSetupScripted(setupArgs);
+    const isScripted = isScriptedSetupInvocation(cleanSetupArgs);
+    if (!isScripted) {
+      const langFlagIdx = setupArgs.findIndex(a => a === '--lang' || a.startsWith('--lang='));
+      if (langFlagIdx !== -1) {
+        const raw = setupArgs[langFlagIdx].startsWith('--lang=')
+          ? setupArgs[langFlagIdx].slice(7)
+          : setupArgs[langFlagIdx + 1];
+        if (isLocale(raw)) {
+          setGlobalLocale(raw);
+          setDefaultLocale(raw);
+        }
+      }
+    }
+    if (isScripted) await cmdSetupScripted(setupArgs);
     else await cmdSetup();
     break;
   }

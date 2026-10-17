@@ -143,6 +143,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --allowed-chat-groups <g>  可对话群 chat_id（oc_xxx，逗号分隔）
   --show-in-team <bool>      平台团队页是否展示（默认 true）
   --brand <feishu|lark>      租户类型（仅 add）
+  --lang <zh|en>             Bot 语言（zh | en；edit 传 - 清空以继承全局语言）
 
 通用选项：
   --json                     输出机器可读 JSON（含 ok / error 字段）
