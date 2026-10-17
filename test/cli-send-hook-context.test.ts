@@ -1096,7 +1096,8 @@ describe('cmdSend hook context wiring', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(completionIndex).toBeGreaterThanOrEqual(0);
     const block = cmdSend.slice(completionIndex, cmdSend.indexOf('turn delivery indexing failed after delivery', completionIndex));
     const localWrite = block.indexOf('getSkillFeedbackStore(resolveDataDir())');
     const fallback = block.indexOf('if (indexError !== undefined) {');
