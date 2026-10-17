@@ -1,4 +1,5 @@
 import { execSync, execFileSync } from 'node:child_process';
+import { lstatSync, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
@@ -145,6 +146,45 @@ export function isExecTimeoutError(err: unknown): boolean {
 }
 
 /**
+ * Linux reports ENOENT both on a first boot and after a live server's socket
+ * was unlinked. Only the identity preflight may use this extra cold-start
+ * evidence: an unlinked live socket still owns its pathname in /proc/net/unix.
+ * Liveness/restore probes keep their conservative `unknown` classification.
+ */
+function coldLinuxTmuxEvidence(err: unknown): 'absent' | 'appeared' | null {
+  if (process.platform !== 'linux' || isExecTimeoutError(err)) return null;
+  const failure = err as { status?: number; signal?: string | null; stderr?: Buffer | string } | null;
+  if (failure?.status !== 1 || failure.signal) return null;
+  const match = /^error connecting to (\/[^\r\n]+) \(No such file or directory\)$/.exec(String(failure.stderr ?? '').trim());
+  if (!match) return null;
+  const socketPath = match[1];
+  const pathIsMissing = (): boolean | null => {
+    try { lstatSync(socketPath); return false; }
+    catch (error) { return (error as NodeJS.ErrnoException)?.code === 'ENOENT' ? true : null; }
+  };
+  const initiallyMissing = pathIsMissing();
+  if (initiallyMissing !== true) return initiallyMissing === false ? 'appeared' : null;
+  try {
+    const lines = readFileSync('/proc/net/unix', 'utf8').split('\n');
+    if (!/^Num\s+RefCount\s+Protocol\s+Flags\s+Type\s+St\s+Inode\s+Path\s*$/.test(lines.shift() ?? '')) return null;
+    let bound = false;
+    for (const line of lines) {
+      if (!line) continue;
+      // Preserve the entire pathname, including spaces. Any malformed census
+      // leaves the server state unknown instead of granting a fresh launch.
+      const row = /^[\da-f]+:\s+[\da-f]+\s+[\da-f]+\s+[\da-f]+\s+[\da-f]+\s+[\da-f]+\s+\d+(?:\s+(.*))?$/i.exec(line);
+      if (!row) return null;
+      if (row[1] === socketPath) bound = true;
+    }
+    // A concurrent creator may have bound the path after the first lstat.
+    // Re-probe that server normally; its appearance is not permission to use it.
+    const stillMissing = pathIsMissing();
+    if (stillMissing === false) return 'appeared';
+    return stillMissing === true && !bound ? 'absent' : null;
+  } catch { return null; }
+}
+
+/**
  * TmuxBackend — static tmux session helpers (naming, probes, kill, diagnostics).
  *
  * This class used to be a pty-under-tmux `SessionBackend` instance (node-pty
@@ -192,16 +232,27 @@ export class TmuxBackend {
   }
 
   static assertInstanceIdentity(name: string, expected: string): void {
-    const probe = TmuxBackend.probeSession(name);
-    if (probe === 'missing') return;
-    let actual = '';
-    try {
-      actual = execFileSync('tmux', ['show-environment', '-t', name, 'BOTMUX_CODEX_INSTANCE_BINDING'],
-        { encoding: 'utf8', timeout: 5000, env: tmuxEnv() }).trim();
-    } catch { /* unknown/missing identity is not permission to attach */ }
-    if (actual !== `BOTMUX_CODEX_INSTANCE_BINDING=${expected}`) {
-      throw new Error('Codex instance identity mismatch: existing tmux session preserved; attachment refused');
+    // Only an observed cold-start socket appearance permits one extra normal
+    // check. Unknown/timeout failures never trigger a general retry or bypass.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const probe = TmuxBackend.probeSession(name);
+      if (probe === 'missing') return;
+      let actual = '';
+      try {
+        actual = execFileSync('tmux', ['show-environment', '-t', name, 'BOTMUX_CODEX_INSTANCE_BINDING'],
+          { encoding: 'utf8', timeout: 5000, env: tmuxEnv() }).trim();
+      } catch (error) {
+        if (attempt === 0 && probe === 'unknown') {
+          const evidence = coldLinuxTmuxEvidence(error);
+          if (evidence === 'absent') return;
+          if (evidence === 'appeared') continue;
+        }
+        // Unknown/missing identity is not permission to attach or update MCP.
+      }
+      if (actual === `BOTMUX_CODEX_INSTANCE_BINDING=${expected}`) return;
+      break;
     }
+    throw new Error('Codex instance identity mismatch: existing tmux session preserved; attachment refused');
   }
 
   /**

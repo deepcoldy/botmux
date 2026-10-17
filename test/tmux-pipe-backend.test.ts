@@ -349,6 +349,50 @@ describe('TmuxPipeBackend.spawn', () => {
     expect(() => be.spawn('echo', [], spawnOpts())).toThrow();
     expect(newSessionAttempts).toBe(1);
   });
+
+  it.each(['binding-a', 'binding-b', ''])('checks the actual identity before adopting a duplicate on startup retry: %s', actual => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const be = new TmuxPipeBackend('bmx-bound', { createSession: true, ownsSession: true });
+    let attempts = 0;
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (args[0] === 'new-session') {
+        attempts++;
+        if (attempts === 1) throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT', status: 1 });
+        throw Object.assign(new Error('duplicate'), { status: 1, signal: null, stderr: 'duplicate session: bmx-bound' });
+      }
+      if (args[0] === 'show-environment' && args.includes('BOTMUX_CODEX_INSTANCE_BINDING')) {
+        return actual ? `BOTMUX_CODEX_INSTANCE_BINDING=${actual}` : '';
+      }
+      return '';
+    }) as typeof execFileSync);
+    const opts = { ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' } };
+    try {
+      if (actual === 'binding-a') expect(() => be.spawn('sleep', ['60'], opts)).not.toThrow();
+      else {
+        expect(() => be.spawn('sleep', ['60'], opts)).toThrow(/preserved/);
+        expect(mockedOpenSync).not.toHaveBeenCalled();
+        expect(mockedExecSync.mock.calls.some(([cmd]) => /set-option|pipe-pane/.test(String(cmd)))).toBe(false);
+      }
+      expect(attempts).toBe(2);
+      expect(newSessionArgs().slice(0, newSessionArgs().indexOf('--')))
+        .toEqual(expect.arrayContaining(['-e', 'BOTMUX_CODEX_INSTANCE_BINDING=binding-a']));
+    } finally {
+      be.kill();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('keeps user-owned adopt panes usable without a Botmux identity marker', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    try {
+      expect(() => be.spawn('', [], {
+        ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' },
+      })).not.toThrow();
+      expect(mockedExecFileSync.mock.calls.some(([, args]) => (args as string[]).includes('BOTMUX_CODEX_INSTANCE_BINDING'))).toBe(false);
+    } finally {
+      be.kill();
+    }
+  });
 });
 
 describe('TmuxPipeBackend input addressing', () => {
