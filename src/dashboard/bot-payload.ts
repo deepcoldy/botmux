@@ -44,6 +44,8 @@ export interface DashboardBotDescriptor {
   dshRuntime?: 'official' | 'tui' | null;
   /** dsh profile name; dashboard exposes it for the dsh CLI only. */
   dshProfile?: string | null;
+  /** CLI config profile dir (claude-code: CLAUDE_CONFIG_DIR). */
+  cliConfigDir?: string | null;
 }
 
 /**
@@ -106,6 +108,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
     ...(bot.dshProfile ? { dshProfile: bot.dshProfile } : {}),
+    ...(bot.cliConfigDir ? { cliConfigDir: bot.cliConfigDir } : {}),
     // 「修改 CLI」下拉的当前选中项（cliId+wrapperCli → 选择键），wrapper 网关形态
     // （aiden×claude / ttadk×codex 等）据此才能高亮回对应选项，否则前端回落到裸
     // cliId、丢失 wrapper 语义（重载后下拉复位、再保存会把 wrapper 剥掉）。
@@ -227,6 +230,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // malformed hand edit degrades to null (feature off) instead of reaching
     // form state as a half-shaped policy the toggle would misrender.
     triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
+    larkToolBinding: j?.larkToolBinding !== false,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',

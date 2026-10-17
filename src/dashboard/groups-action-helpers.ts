@@ -236,6 +236,27 @@ export async function unbindOncall(
   return { status: upstream.status, body: json ?? text };
 }
 
+/** Read-only single-chat topology probe through the named member bot's daemon. */
+export async function getChatModeForGroup(
+  chatId: string, appId: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-chat-mode/${encodeURIComponent(chatId)}`, { method: 'GET' });
+  const { text, json } = await parseUpstream(upstream);
+  return { status: upstream.status, body: json ?? text };
+}
+
+/** Persist (or clear with mode=inherit) the regular-group reply mode on the named group member bot. */
+export async function setReplyModeForGroup(
+  chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,
+): Promise<HandlerResult> {
+  const upstream = await deps.proxyToDaemon(appId, `/api/group-reply-mode/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw,
+  });
+  const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok === true) deps.invalidateGroups?.();
+  return { status: upstream.status, body: json ?? text };
+}
+
 /** Persist the inactivity policy on the named group member bot. */
 export async function setIdleCloseForGroup(
   chatId: string, appId: string, bodyRaw: string, deps: GroupsActionDeps,

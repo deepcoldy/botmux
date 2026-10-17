@@ -50,6 +50,21 @@ function jsonResponse(body: unknown): any {
   return { ok: true, status: 200, json: async () => body };
 }
 
+/**
+ * ManageDialog 打开时，「普通群回复模式」区块会发一次只读单群拓扑查询
+ * （GET /api/groups/:chatId/chat-mode/:appId）。这里统一应答它、不让它进入各用例
+ * 自己的 fetch mock：那些 mock 用来断言写请求与调用次数、遇到未预期请求直接抛错，
+ * 这些保护对其余所有请求保持不变。
+ */
+const TOPOLOGY_PROBE = /^\/api\/groups\/[^/]+\/chat-mode\/[^/]+$/;
+function installFetch<T extends (...args: any[]) => any>(mock: T): T {
+  (globalThis as any).fetch = (input: unknown, init?: RequestInit) =>
+    TOPOLOGY_PROBE.test(String(input)) && (init?.method ?? 'GET') === 'GET'
+      ? Promise.resolve(jsonResponse({ ok: true, chatId: 'oc_group', chatMode: 'group' }))
+      : mock(input, init);
+  return mock;
+}
+
 async function waitForRender(assertion: () => void): Promise<void> {
   await vi.waitFor(async () => {
     await act(async () => undefined);
@@ -315,7 +330,7 @@ describe('group manage streaming-card pin rows', () => {
     const refreshResponses = [staleManualResponse, refreshedResponse, missingResponse];
     const refreshRequests = refreshResponses.map(() => deferred<void>());
     let refreshCount = 0;
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? 'GET';
       requests.push(`${method} ${url}`);
@@ -335,7 +350,7 @@ describe('group manage streaming-card pin rows', () => {
         return response.promise;
       }
       throw new Error(`Unexpected request: ${method} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -463,7 +478,7 @@ describe('group manage streaming-card pin rows', () => {
     const manualReloadResponse = deferred<any>();
     const reloadStarted = [deferred<void>(), deferred<void>()];
     let reloadCount = 0;
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       if (url === '/api/role-profiles') return Promise.resolve(jsonResponse({ profiles: [] }));
       if (url === '/api/groups/oc_group/pin-streaming-card/cli_a' && init?.method === 'PUT') {
@@ -475,7 +490,7 @@ describe('group manage streaming-card pin rows', () => {
         return index === 0 ? saveReloadResponse.promise : manualReloadResponse.promise;
       }
       throw new Error(`Unexpected request: ${String(init?.method ?? 'GET')} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -546,7 +561,7 @@ describe('group manage streaming-card pin rows', () => {
       clearInterval: globalThis.clearInterval.bind(globalThis),
       open() {},
     };
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       if (url === '/api/role-profiles') return Promise.resolve(jsonResponse({ profiles: [] }));
       if (url === '/api/feed-groups') {
@@ -559,7 +574,7 @@ describe('group manage streaming-card pin rows', () => {
         return index === 0 ? pollingResponse.promise : manualResponse.promise;
       }
       throw new Error(`Unexpected request: ${String(init?.method ?? 'GET')} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -659,7 +674,7 @@ describe('group manage streaming-card pin rows', () => {
       clearInterval: globalThis.clearInterval.bind(globalThis),
       open() {},
     };
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       if (url === '/api/role-profiles') return Promise.resolve(jsonResponse({ profiles: [] }));
       if (url === '/api/feed-groups') {
@@ -672,7 +687,7 @@ describe('group manage streaming-card pin rows', () => {
         return refreshCount === 1 ? manualResponse.promise : pollingResponse.promise;
       }
       throw new Error(`Unexpected request: ${String(init?.method ?? 'GET')} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -746,7 +761,7 @@ describe('group manage streaming-card pin rows', () => {
     let refreshCount = 0;
 
     primeGroupsSnapshotCache({ chats: [initialChat], bots: [] });
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       if (url === '/api/role-profiles') return Promise.resolve(jsonResponse({ profiles: [] }));
       if (url === '/api/groups?refresh=1') {
@@ -755,7 +770,7 @@ describe('group manage streaming-card pin rows', () => {
         if (refreshCount === 2) return newerResponse.promise;
       }
       throw new Error(`Unexpected request: ${String(init?.method ?? 'GET')} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -805,7 +820,7 @@ describe('group manage streaming-card pin rows', () => {
     let refreshCount = 0;
 
     primeGroupsSnapshotCache({ chats: [initialChat], bots: [] });
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       requests.push(`${String(init?.method ?? 'GET')} ${url}`);
       if (url === '/api/groups?refresh=1') {
@@ -815,7 +830,7 @@ describe('group manage streaming-card pin rows', () => {
       }
       if (url === '/api/role-profiles') return Promise.resolve(jsonResponse({ profiles: [] }));
       throw new Error(`Unexpected request: ${String(init?.method ?? 'GET')} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -853,7 +868,7 @@ describe('group manage streaming-card pin rows', () => {
     const initialMember = makeMember();
     const freshMember = { ...initialMember };
     const saveResponse = deferred<any>();
-    (globalThis as any).fetch = vi.fn(() => saveResponse.promise);
+    installFetch(vi.fn(() => saveResponse.promise));
     const onReloadGroups = vi.fn(async () => { throw new Error('reload_failed'); });
     let renderer!: TestRenderer.ReactTestRenderer;
     const renderDialog = (member: GroupMember) => manageElement(makeChat([member]), onReloadGroups);
@@ -878,7 +893,7 @@ describe('group manage streaming-card pin rows', () => {
   it('applies a fresh post-write member snapshot even when it keeps the old server value', async () => {
     const initialChat = makeChat([makeMember({ botName: 'Claude (stale)' })]);
     const reloadedChat = makeChat([makeMember({ botName: 'Claude (fresh)' })]);
-    (globalThis as any).fetch = vi.fn(async () => jsonResponse({ ok: true }));
+    installFetch(vi.fn(async () => jsonResponse({ ok: true })));
     let renderer!: TestRenderer.ReactTestRenderer;
     const onReloadGroups = vi.fn(async () => {
       renderer.update(manageElement(reloadedChat, onReloadGroups));
@@ -928,7 +943,7 @@ describe('group manage streaming-card pin rows', () => {
   it('locks oncall fields while a save is pending', async () => {
     const saveResponse = deferred<any>();
     const fetchMock = vi.fn(() => saveResponse.promise);
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
     const renderer = renderManage(makeChat([makeMember({
       oncallChat: { workingDir: '/srv/current-repo' },
@@ -974,7 +989,7 @@ describe('group manage streaming-card pin rows', () => {
   it('keeps the submitted oncall working directory when an older snapshot arrives before a failed reload', async () => {
     const saveResponse = deferred<any>();
     const reloadResponse = deferred<any>();
-    (globalThis as any).fetch = vi.fn(() => saveResponse.promise);
+    installFetch(vi.fn(() => saveResponse.promise));
     const onReloadGroups = vi.fn(() => reloadResponse.promise);
     const oldMember = makeMember({ oncallChat: { workingDir: '/srv/old-repo' } });
     const renderer = renderManage(makeChat([oldMember]), onReloadGroups);
@@ -1012,7 +1027,7 @@ describe('group manage streaming-card pin rows', () => {
     const initialMember = makeMember();
     const freshMember = makeMember({ larkAppId: 'cli_b', botName: 'Codex' });
     const fetchMock = vi.fn();
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
     const renderer = renderManage(makeChat([initialMember]), onReloadGroups);
     act(() => {
@@ -1037,7 +1052,7 @@ describe('group manage streaming-card pin rows', () => {
     const confirmation = deferred<boolean>();
     confirmDialog.confirm.mockReturnValueOnce(confirmation.promise);
     const fetchMock = vi.fn();
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
     const renderer = renderManage(makeChat([initialMember]), onReloadGroups);
     act(() => {
@@ -1060,7 +1075,7 @@ describe('group manage streaming-card pin rows', () => {
     const confirmation = deferred<boolean>();
     confirmDialog.confirm.mockReturnValueOnce(confirmation.promise);
     const fetchMock = vi.fn();
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const renderer = renderManage(chat);
     act(() => {
       renderer.root.findByProps({ name: 'leave-bot', value: 'cli_a' })
@@ -1080,7 +1095,7 @@ describe('group manage streaming-card pin rows', () => {
     const confirmation = deferred<boolean>();
     confirmDialog.confirm.mockReturnValueOnce(confirmation.promise);
     const fetchMock = vi.fn();
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const renderer = renderManage(chat);
     act(() => { renderer.root.findByProps({ id: 'g-disband-btn' }).props.onClick(); });
     expect(confirmDialog.confirm).toHaveBeenCalledOnce();
@@ -1101,7 +1116,7 @@ describe('group manage streaming-card pin rows', () => {
     const requests: string[] = [];
     primeGroupsSnapshotCache({ chats: [chat], bots: [] });
     confirmDialog.confirm.mockResolvedValueOnce(true);
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       const method = String(init?.method ?? 'GET');
       requests.push(`${method} ${url}`);
@@ -1114,7 +1129,7 @@ describe('group manage streaming-card pin rows', () => {
         return Promise.resolve(jsonResponse({ chats: [], bots: [] }));
       }
       throw new Error(`Unexpected request: ${method} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -1156,10 +1171,10 @@ describe('group manage streaming-card pin rows', () => {
     const firstDisband = deferred<any>();
     const requests: string[] = [];
     confirmDialog.confirm.mockResolvedValueOnce(true);
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       requests.push(`${String(init?.method ?? 'GET')} ${String(input)} ${String((init?.body as string | undefined) ?? '')}`);
       return firstDisband.promise;
-    });
+    }));
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
     const renderer = renderManage(makeChat([
       makeMember({ larkAppId: 'cli_a', botName: 'Claude' }),
@@ -1194,7 +1209,7 @@ describe('group manage streaming-card pin rows', () => {
     const requests: string[] = [];
     primeGroupsSnapshotCache({ chats: [chatA, chatB], bots: [] });
     confirmDialog.confirm.mockResolvedValueOnce(true);
-    (globalThis as any).fetch = vi.fn((input: string, init?: RequestInit) => {
+    installFetch(vi.fn((input: string, init?: RequestInit) => {
       const url = String(input);
       const method = String(init?.method ?? 'GET');
       requests.push(`${method} ${url}`);
@@ -1202,7 +1217,7 @@ describe('group manage streaming-card pin rows', () => {
       if (url === '/api/groups/oc_group_a/leave' && method === 'POST') return leaveResponse.promise;
       if (url === '/api/groups?refresh=1') return Promise.resolve(jsonResponse({ chats: [chatA, chatB], bots: [] }));
       throw new Error(`Unexpected request: ${method} ${url}`);
-    });
+    }));
 
     renderGroupsPage({} as HTMLElement);
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -1237,7 +1252,7 @@ describe('group manage streaming-card pin rows', () => {
 
   it('shows master-off copy and keeps the row editable without letting the chat force-enable pinning', async () => {
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) })) as any;
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
     let renderer!: TestRenderer.ReactTestRenderer;
 
@@ -1295,7 +1310,7 @@ describe('group manage streaming-card pin rows', () => {
     let resolveFetch!: (value: any) => void;
     const pending = new Promise<any>(resolve => { resolveFetch = resolve; });
     const fetchMock = vi.fn(() => pending) as any;
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
     let renderer!: TestRenderer.ReactTestRenderer;
 
@@ -1348,7 +1363,7 @@ describe('group manage streaming-card pin rows', () => {
 
   it('keeps the saved state when PUT succeeds but the forced reload rejects', async () => {
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) })) as any;
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => { throw new Error('reload_failed'); });
     let renderer!: TestRenderer.ReactTestRenderer;
 
@@ -1390,7 +1405,7 @@ describe('group manage streaming-card pin rows', () => {
 
   it('uses a distinct help id per row and points each checkbox aria-describedby at its own help element', () => {
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) })) as any;
-    (globalThis as any).fetch = fetchMock;
+    installFetch(fetchMock);
     const onReloadGroups = vi.fn(async () => ({ chats: [], bots: [] }));
     let renderer!: TestRenderer.ReactTestRenderer;
 

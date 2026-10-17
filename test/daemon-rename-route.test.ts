@@ -22,7 +22,7 @@
  * Run:  pnpm vitest run test/daemon-rename-route.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -41,8 +41,10 @@ const mocks = vi.hoisted(() => {
   const sessions = new Map<string, any>();
   return {
     dataDir,
+    resolveLarkCliHomeForTurn: vi.fn(async () => `${dataDir}/fixture-lark-home`),
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    isHumanOpenId: vi.fn(async () => true),
     deleteMessage: vi.fn(async () => true),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
@@ -125,6 +127,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    isHumanOpenId: mocks.isHumanOpenId,
     deleteMessage: mocks.deleteMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
@@ -159,6 +162,11 @@ vi.mock('../src/core/worker-pool.js', async () => {
     closeSessionForBackgroundCleanup: (sessionId: string) =>
       mocks.closeWorkerPoolSession(sessionId),
   };
+});
+
+vi.mock('../src/services/lark-cli-auth.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/lark-cli-auth.js');
+  return { ...actual, resolveLarkCliHomeForTurn: mocks.resolveLarkCliHomeForTurn };
 });
 
 vi.mock('../src/core/session-discovery.js', async () => {
@@ -236,6 +244,12 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 
+import { sessionIdentityPath } from '../src/core/cli-identity.js';
+import { _resetForTest as resetAsks, registerAsk, setCardDispatcher, setCanTalkChecker, submitAsk } from '../src/core/ask-broker.js';
+import { startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
+import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
+import type { PendingAsk } from '../src/core/ask-types.js';
+import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
@@ -243,6 +257,81 @@ const PEER = 'ou_peer_bot';
 const PEER_UNION = 'on_peer_bot';
 const NOW = new Date().toISOString();
 const repoFixtureDirs: string[] = [];
+
+describe('document Ask production routing', () => {
+  beforeEach(() => {
+    resetRouteTestState();
+    resetAsks();
+    setActiveSessionsRegistry(activeSessions);
+    mocks.isHumanOpenId.mockResolvedValue(true);
+    setCanTalkChecker((_app, _chat, by) => by === OWNER);
+  });
+  afterEach(() => { resetAsks(); activeSessions.clear(); setActiveSessionsRegistry(undefined); });
+
+  const questions = [{ prompt: 'Rebuild?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }];
+  function seedDocument() {
+    const anchor = 'doc:fixture:comment';
+    const ds = seedThreadSession(anchor, 'document task');
+    ds.chatId = anchor; ds.scope = 'chat'; ds.session.scope = 'chat'; ds.session.chatId = anchor;
+    ds.session.docCommentTargets = {
+      'turn-A': { fileToken: 'fixture', fileType: 'docx', commentId: 'comment', turnId: 'turn-A', replyToOpenId: OWNER },
+    };
+    return ds;
+  }
+
+  it.each(['answer', 'missing-turn', 'unknown-author', 'closed-during-lookup'])(
+    'authenticates the real Ask HTTP route and freezes document delivery: %s', async mode => {
+      const ds = seedDocument();
+      if (mode === 'unknown-author') mocks.isHumanOpenId.mockResolvedValue(false);
+      if (mode === 'closed-during-lookup') mocks.isHumanOpenId.mockImplementation(async () => { ds.session.status = 'closed'; return true; });
+      let card: PendingAsk | undefined;
+      setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_document_card' }; } });
+      const secret = 'document-ask-test-secret';
+      setIpcAuthSecret(secret);
+      const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      try {
+        const path = '/api/asks';
+        const response = fetch(`http://127.0.0.1:${server.port}${path}`, {
+          method: 'POST', headers: daemonIpcAuthHeaders({ secret, port: server.port, method: 'POST', path,
+            headers: { 'content-type': 'application/json' } }),
+          body: JSON.stringify({ sessionId: ds.session.sessionId, larkAppId: 'spoofed-app',
+            chatId: 'oc_spoofed', rootMessageId: 'om_spoofed', questions, timeoutMs: 60_000,
+            originKind: 'native-user-input', originTurnId: mode === 'missing-turn' ? 'missing' : 'turn-A' }),
+        });
+        if (mode === 'answer') {
+          await vi.waitFor(() => expect(card).toBeDefined());
+          expect(card).toMatchObject({ larkAppId: APP, chatId: 'doc:fixture:comment', rootMessageId: null,
+            sessionId: ds.session.sessionId, answererOpenId: OWNER,
+            deliveryTarget: { kind: 'document-author', openId: OWNER, turnId: 'turn-A' } });
+          expect(submitAsk({ askId: card!.askId, nonce: card!.nonce, by: OWNER, selections: [['yes']] })).toBe('accepted');
+          expect(await (await response).json()).toMatchObject({ kind: 'answered', answers: [['yes']] });
+        } else {
+          const result = await response;
+          expect(result.status).toBe(mode === 'closed-during-lookup' ? 409 : 422);
+          expect(card).toBeUndefined();
+        }
+      } finally { await server.close(); }
+    },
+  );
+
+  it.each(['new-topic', 'thread'])('DM %s reply answers the document without starting another CLI', async route => {
+    let card!: PendingAsk;
+    setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_document_card' }; } });
+    const result = registerAsk({ sessionId: 'doc-session', larkAppId: APP, chatId: 'doc:fixture:comment',
+      rootMessageId: null, chatType: 'group', answererOpenId: OWNER, questions, timeoutMs: 60_000,
+      deliveryTarget: { kind: 'document-author', openId: OWNER, turnId: 'turn-A', fileToken: 'fixture', commentId: 'comment' } });
+    await vi.waitFor(() => expect(card).toBeDefined());
+    const data = makeEventData('om_answer', 'Preserve labels', route === 'thread' ? 'om_document_card' : undefined);
+    data.message.parent_id = 'om_document_card';
+    data.message.chat_type = 'p2p';
+    const ctx = { ...makeCtx('om_document_card', 'om_answer'), chatType: 'p2p' };
+    if (route === 'new-topic') await handleNewTopic(data, ctx);
+    else await handleThreadReply(data, ctx);
+    expect(await result).toMatchObject({ kind: 'answered', comment: 'Preserve labels' });
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+});
 
 function makeRepoFixtureDir(): string {
   const root = join(mocks.dataDir, 'repo-fixtures');
@@ -622,6 +711,147 @@ describe('/rename production routing — must not pre-create a session (review P
 
   afterEach(() => {
     rmSync(crossRefPath(), { force: true });
+  });
+
+  it.each([false, true])('/queue missing session creates nothing (reply=%s)', async reply => {
+    const root = 'om_queue_missing';
+    const id = reply ? 'om_queue_missing_reply' : root;
+    const data = makeEventData(id, '/queue later', reply ? root : undefined);
+    if (reply) await handleThreadReply(data, makeCtx(root, id));
+    else await handleNewTopic(data, makeCtx(root, id));
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText()).toContain('没有活跃的会话');
+  });
+
+  it('/queue freezes serial inputs and preserves FIFO IDs, caller, body and reply placement', async () => {
+    const root = 'om_queue_root';
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: [OWNER], codexAppCleanInput: true });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'queue');
+    ds.session.cliId = 'codex-app';
+    ds.session.cliSessionId = 'native-queue-thread';
+    ds.workingDir = '/tmp';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    // Bot config remains Claude: the existing session's frozen CLI wins.
+    for (const [id, text] of [['om_queue_1', 'first <tag>\n/compact is literal text'], ['om_queue_2', 'next']]) {
+      await handleThreadReply(makeEventData(id, `/queue ${text}`, root), makeCtx(root, id));
+    }
+    expect(repliedText()).toContain('已接纳');
+    const turns = send.mock.calls.map(([m]) => m).filter(m => m.type === 'message');
+    expect(turns).toHaveLength(2);
+    expect(turns.map(m => m.turnId)).toEqual(['om_queue_1', 'om_queue_2']);
+    expect(turns.map(m => m.codexAppInput.text)).toEqual(['first <tag>\n/compact is literal text', 'next']);
+    for (const turn of turns) {
+      expect(turn.codexAppSteerable).toBeUndefined();
+      expect(turn.trustedCaller).toMatchObject({ requestUserOpenId: OWNER, senderType: 'user' });
+      expect(turn.content).not.toContain('/queue');
+    }
+    expect(ds.session.codexAppDispatchLedger?.map(e => e.turnId)).toEqual(['om_queue_1', 'om_queue_2']);
+    for (const entry of ds.session.codexAppDispatchLedger ?? []) {
+      expect(entry.codexAppSteerable).toBeUndefined();
+      expect(entry.replyTarget).toEqual({ mode: 'thread', rootMessageId: root });
+    }
+    expect(repliedText()).toContain('已接纳');
+  });
+
+  it.each(['other-cli', 'no-worker', 'killed', 'pending-repo', 'empty', 'post', 'sender-denied'])(
+    '/queue refuses %s without injecting model input', async mode => {
+      const root = 'om_queue_refused';
+      const ds = seedThreadSession(root, 'queue refused');
+      ds.session.cliId = mode === 'other-cli' ? 'claude-code' : 'codex-app';
+      ds.workingDir = '/tmp';
+      const send = vi.fn();
+      ds.worker = mode === 'no-worker' ? null : { killed: mode === 'killed', send } as any;
+      ds.pendingRepo = mode === 'pending-repo';
+      const data = makeEventData('om_queue_refusal', mode === 'empty' ? '/queue' : '/queue later', root);
+      if (mode === 'post') {
+        data.message.message_type = 'post';
+        data.message.content = JSON.stringify({ zh_cn: { title: '', content: [[{ tag: 'text', text: '/queue later' }, { tag: 'img', image_key: 'img_fake' }]] } });
+      }
+      if (mode === 'sender-denied') data.sender.sender_id.open_id = 'ou_unknown';
+      await handleThreadReply(data, makeCtx(root, 'om_queue_refusal'));
+      expect(send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+      expect(ds.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+      expect(repliedText()).not.toContain('已接纳');
+    },
+  );
+
+  it.each(['idle', 'working'] as const)('/queue publishes this turn and caller identity before IPC while %s', async state => {
+    const root = 'om_queue_identity';
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex-app',
+      allowedUsers: [OWNER], triggerUserAuth: { enabled: true, tools: ['lark-cli'], unauthorized: {} } as any });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'identity queue');
+    ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp'; ds.lastScreenStatus = state;
+    mkdirSync(`${mocks.dataDir}/fixture-lark-home`, { recursive: true });
+    const send = vi.fn((message: any) => {
+      if (message.type === 'message') {
+        const env = readFileSync(sessionIdentityPath(mocks.dataDir, ds.session.sessionId, 'lark-cli'), 'utf8');
+        expect(env).toContain("BOTMUX_IDENTITY_TURN='om_queue_identity_reply'");
+        expect(env).toContain('fixture-lark-home');
+      }
+    });
+    ds.worker = { killed: false, send } as any;
+    await handleThreadReply(makeEventData('om_queue_identity_reply', '/queue governed tools', root),
+      makeCtx(root, 'om_queue_identity_reply'));
+    expect(mocks.resolveLarkCliHomeForTurn).toHaveBeenCalledWith(OWNER);
+    expect(send.mock.calls.some(([m]) => m.type === 'message')).toBe(true);
+    expect(repliedText()).toContain('轮次不匹配');
+  });
+
+  it('/queue rolls back reply metadata when IPC cannot accept the input', async () => {
+    const root = 'om_queue_failed';
+    const ds = seedThreadSession(root, 'rejected queue');
+    ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp';
+    ds.session.quoteTargetId = 'om_previous'; ds.session.quoteTargetSenderOpenId = OWNER;
+    ds.worker = { killed: false, send: vi.fn(() => { throw new Error('fixture IPC closed'); }) } as any;
+    await handleThreadReply(makeEventData('om_queue_failed_reply', '/queue later', root),
+      makeCtx(root, 'om_queue_failed_reply'));
+    expect(ds.session.quoteTargetId).toBe('om_previous');
+    expect(ds.session.replyTargets?.om_queue_failed_reply).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.om_queue_failed_reply).toBeUndefined();
+    expect(repliedText()).toContain('未能入队');
+  });
+
+  it('/queue rechecks worker after the reaction await and does not send to its replacement', async () => {
+    const root = 'om_queue_reaction';
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex-app',
+      allowedUsers: [OWNER], disableStreamingCard: true });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(root, 'reaction queue');
+    ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp';
+    const original = vi.fn(), replacement = vi.fn();
+    ds.worker = { killed: false, send: original } as any;
+    mocks.addReaction.mockImplementationOnce(async () => {
+      ds.worker = { killed: false, send: replacement } as any;
+      return 'reaction_received';
+    });
+    await handleThreadReply(makeEventData('om_queue_reaction_reply', '/queue later', root),
+      makeCtx(root, 'om_queue_reaction_reply'));
+    expect(mocks.addReaction).toHaveBeenCalled();
+    expect([...original.mock.calls, ...replacement.mock.calls].some(([m]) => m.type === 'message')).toBe(false);
+    expect(repliedText()).toContain('未能入队');
+  });
+
+  it('/queue refuses a replaced worker after sender lookup without injecting into the replacement', async () => {
+    const root = 'om_queue_replaced';
+    const ds = seedThreadSession(root, 'queue replaced');
+    ds.session.cliId = 'codex-app';
+    ds.workingDir = '/tmp';
+    const original = vi.fn();
+    const replacement = vi.fn();
+    ds.worker = { killed: false, send: original } as any;
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      ds.worker = { killed: false, send: replacement } as any;
+      return { openId: OWNER, type: 'user' };
+    });
+    await handleThreadReply(makeEventData('om_queue_replaced_reply', '/queue later', root),
+      makeCtx(root, 'om_queue_replaced_reply'));
+    expect([...original.mock.calls, ...replacement.mock.calls].filter(([m]) => m.type === 'message')).toHaveLength(0);
+    expect(repliedText()).toContain('未能入队');
   });
 
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
@@ -1312,7 +1542,7 @@ describe('/rename production routing — must not pre-create a session (review P
       larkAppId: APP,
     });
 
-    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId, expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
     expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
     expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
       APP,
@@ -1382,7 +1612,7 @@ describe('/rename production routing — must not pre-create a session (review P
       larkAppId: APP,
     });
 
-    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId, expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
     expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
     expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
       APP,
@@ -1407,7 +1637,7 @@ describe('/rename production routing — must not pre-create a session (review P
       replyRootId: topicRoot,
     });
 
-    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId, expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
     expect(activeSessions.has(sessionKey(topicRoot, APP))).toBe(false);
     expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
       APP,
@@ -2337,6 +2567,7 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/fast',
       turnId: 'om_fast_live',
+      turnCallerOpenId: 'ou_owner',
       trustedController: {
         requestUserOpenId: 'ou_owner',
         requestLarkAppId: APP,
@@ -2429,6 +2660,7 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/model',
       turnId: 'om_model_tui',
+      turnCallerOpenId: 'ou_owner',
       trustedController: {
         requestUserOpenId: 'ou_owner',
         requestLarkAppId: APP,
@@ -2474,6 +2706,7 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/goal',
       turnId: 'om_goal_tui',
+      turnCallerOpenId: 'ou_owner',
       trustedController: {
         requestUserOpenId: 'ou_owner',
         requestLarkAppId: APP,

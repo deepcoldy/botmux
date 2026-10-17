@@ -564,6 +564,14 @@ describe('global sessionCleanup config', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it('strictly reads the opt-in Codex archive flag', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ archiveCodex: true });
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
   it('reads a full sessionCleanup block', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },

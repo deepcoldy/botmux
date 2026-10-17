@@ -490,11 +490,17 @@ function handle(request) {
     respond(request.id, {
       thread: {
         id: request.params.threadId,
+        ...(process.env.FAKE_CODEX_THREAD_PATH ? { path: process.env.FAKE_CODEX_THREAD_PATH } : {}),
         name: currentThreadName ?? null,
         preview: threadReadAttempt > previewDelayReads ? '<botmux_routing> 首条消息预览' : '',
         updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
       },
     });
+    return;
+  }
+  if (request.method === 'thread/archive' || request.method === 'thread/unarchive') {
+    if (behavior === 'archive-error') reject(request.id, -32600, 'archive failed');
+    else if (behavior !== 'hang-archive') respond(request.id, request.method === 'thread/archive' ? {} : { thread: { id: request.params.threadId } });
     return;
   }
   if (request.method === 'thread/name/set') {

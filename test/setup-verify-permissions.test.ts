@@ -47,6 +47,7 @@ import {
   DOC_WATCH_SCOPES,
   VC_MEETING_BOT_EVENTS,
   VC_MEETING_FEATURE_SCOPES,
+  APP_SLASH_COMMAND_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
 import { DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 
@@ -442,6 +443,29 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
       'vc:meeting.message:write',
     ]);
     expect(VC_MEETING_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('native slash-command scopes are optional feature scopes: never required, never auto-imported', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+    const names = APP_SLASH_COMMAND_FEATURE_SCOPES.map(s => s.name).sort();
+
+    expect(names).toEqual([
+      'application:app_slash_command:read',
+      'application:app_slash_command:write',
+    ]);
+    expect(APP_SLASH_COMMAND_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+    // Not in BOTMUX_REQUIRED_SCOPES: the startup self-check would otherwise
+    // silently top them up and publish a new app version for a gated,
+    // Dashboard-only feature.
+    expect(BOTMUX_REQUIRED_SCOPES.filter(s => names.includes(s.name))).toEqual([]);
+    // Not in the default manifest: tenants outside Lark's gated rollout may not
+    // even have these scopes in their catalog.
+    expect(names.filter(name => declared.has(name))).toEqual([]);
   });
 
   it('manifest excludes the scopes the tenant auto-rejects (nothing in botmux calls them)', async () => {

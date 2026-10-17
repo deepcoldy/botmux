@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
+import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, larkToolPassthroughEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
 import { larkToolExecutionArgs } from './core/lark-tool-command.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
 import { isHeadlessSessionChatId } from './core/types.js';
@@ -15,8 +15,9 @@ async function main(): Promise<void> {
       timeout: 5_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     },
   ));
+  const isPassthrough = Boolean(invocation.passthroughProfile);
   let identity: { mode: 'bot' | 'user'; credential: string } | undefined;
-  if (!invocation.offline) {
+  if (!invocation.offline && !isPassthrough) {
     const port = binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
     if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) throw new Error('The bound bot daemon is unavailable');
     const payload = JSON.stringify({ mode: invocation.mode });
@@ -38,8 +39,11 @@ async function main(): Promise<void> {
     process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en', isHeadlessSessionChatId(process.env.BOTMUX_CHAT_ID ?? ''))}\n`);
   }
   const args = larkToolExecutionArgs(invocation);
+  const childEnv = isPassthrough
+    ? larkToolPassthroughEnv(process.env)
+    : larkToolChildEnv(process.env, binding, identity);
   const child = spawn(binding.realBinary, args, {
-    env: larkToolChildEnv(process.env, binding, identity), cwd: process.cwd(), stdio: 'inherit',
+    env: childEnv, cwd: process.cwd(), stdio: 'inherit',
   });
   const forward = (signal: NodeJS.Signals) => { child.kill(signal); };
   const onTerm = () => forward('SIGTERM');

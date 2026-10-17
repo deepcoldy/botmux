@@ -92,7 +92,7 @@ interface DashboardSettings {
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
-  sessionCleanup: { enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  sessionCleanup: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
@@ -253,6 +253,7 @@ function parseSettings(s: any): DashboardSettings {
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     workflow: { enabled: s?.workflow?.enabled === true },
     sessionCleanup: {
+      archiveCodex: s?.sessionCleanup?.archiveCodex === true,
       enabled: s?.sessionCleanup?.enabled === true,
       olderThanHours: (IDLE_CLEANUP_HOUR_OPTIONS as readonly unknown[]).includes(s?.sessionCleanup?.olderThanHours)
         ? s.sessionCleanup.olderThanHours as IdleCleanupHours
@@ -1635,9 +1636,9 @@ const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
 
 /** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
 function SessionCleanupRow(props: {
-  value: { enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  value: { archiveCodex?: boolean; enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   disabled: boolean;
-  onSave(patch: { enabled?: boolean; olderThanHours?: IdleCleanupHours; intervalMinutes?: number }): void;
+  onSave(patch: { archiveCodex?: boolean; enabled?: boolean; olderThanHours?: IdleCleanupHours; intervalMinutes?: number }): void;
 }) {
   const tr = useT();
   const [intervalDraft, setIntervalDraft] = useState(String(props.value.intervalMinutes));
@@ -1649,6 +1650,13 @@ function SessionCleanupRow(props: {
 
   return (
     <div className="settings-session-cleanup">
+      <ToggleRow
+        title={tr('settings.sessionCleanupArchiveCodex')}
+        help={tr('settings.sessionCleanupArchiveCodexHelp')}
+        checked={props.value.archiveCodex === true}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ archiveCodex: value })}
+      />
       <ToggleRow
         title={tr('settings.sessionCleanupEnable')}
         help={tr('settings.sessionCleanupEnableHelp')}

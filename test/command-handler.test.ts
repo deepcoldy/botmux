@@ -363,6 +363,12 @@ vi.mock('../src/services/group-creator.js', () => ({
   })),
 }));
 
+vi.mock('../src/services/p2p-force-topic-store.js', () => ({
+  recordP2pForceTopicRoot: vi.fn(),
+  isP2pForceTopicRoot: vi.fn(() => false),
+  removeP2pForceTopicRoot: vi.fn(),
+}));
+
 vi.mock('../src/utils/logger.js', () => ({
   logger: {
     info: vi.fn(),
@@ -647,6 +653,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
+import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
@@ -850,7 +857,8 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(44);
+    expect(DAEMON_COMMANDS.size).toBe(45);
+    expect(DAEMON_COMMANDS.has('/queue')).toBe(true);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
@@ -1904,6 +1912,21 @@ describe('handleCommand', () => {
       expect(writes).toEqual(['reply']);
       expect(vi.mocked(getMessageDetail).mock.calls.map(([, id]) => id)).toEqual(['msg_001']);
     });
+    it('flat DM parent posts the fork panel flat instead of opening a topic around the /forklist message', async () => {
+      // p2p chat mode: the parent anchor is the DM chatId (oc_) and replying
+      // reply_in_thread to the /forklist command would spawn a brand-new DM
+      // topic just to hold the panel. It must flat-send instead.
+      const ds = makeDaemonSession({
+        chatType: 'p2p',
+        scope: 'chat',
+        session: makeSession({ chatType: 'p2p', scope: 'chat', rootMessageId: CHAT_ID, forkPanelCardId: 'om_old_panel' }),
+      });
+      const deps = makeDeps();
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      await handleCommand('/forklist', CHAT_ID, makeLarkMessage('/forklist'), deps, LARK_APP_ID);
+      expect(writes).toEqual(['send']);
+      expect(replyMessage).not.toHaveBeenCalled();
+    });
     it.each(['', CHAT_ID])('refuses a thread with invalid source root %s', async root => {
       const ds = parent(); ds.session.rootMessageId = root;
       await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
@@ -2133,6 +2156,237 @@ describe('handleCommand', () => {
 
       expect(result).toEqual({ ok: false, error: 'fork_subtopic_failed', orphanTopic: false });
       expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
+    });
+
+    it('flat DM (p2p chat mode): /fork <task> forks in place without the chat_mode API', async () => {
+      const ds = makeDaemonSession({
+        chatType: 'p2p',
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({
+          chatType: 'p2p',
+          scope: 'chat',
+          rootMessageId: CHAT_ID,
+          ownerOpenId: 'ou_sender',
+          cliSessionId: 'cli-parent-1',
+        }),
+      });
+      // Flat DM sessions are keyed by chatId, not by a topic root.
+      const deps = makeDeps();
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      const task = '私聊里原地分身';
+
+      await handleCommand(
+        '/fork',
+        CHAT_ID,
+        // Genuine DM top-level command: no root_id / thread_id.
+        makeLarkMessage(`/fork ${task}`, { rootId: '' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      // DM has no chat_mode concept — the topic-group gate API must never fire.
+      expect(getChatModeStrict).not.toHaveBeenCalled();
+      // (b): the user's command message IS the topic root; the seed is posted
+      // via reply_in_thread into it. No new top-level post is sent (the flat
+      // /forklist panel later goes out as an interactive flat send).
+      expect(vi.mocked(sendMessage).mock.calls.filter(([, , , msgType]) => msgType === 'post'))
+        .toHaveLength(0);
+      const seedReplies = vi.mocked(replyMessage).mock.calls.filter(([, , , msgType]) => msgType === 'post');
+      expect(seedReplies.map(([, target, , msgType]) => [target, msgType])).toEqual([
+        ['msg_001', 'post'],
+      ]);
+      expect(seedReplies[0][2]).toEqual(expect.stringContaining(task));
+      expect(seedReplies[0][4]).toBe(true);
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        CHAT_ID,
+        'msg_001',
+        'p2p',
+        'thread',
+        expect.any(Object),
+      );
+      // Marker is recorded on the command message id AFTER the seed reply
+      // returned (a marker without a materialized topic opens an ownerless
+      // window). Assert ordering, not just the args.
+      expect(recordP2pForceTopicRoot).toHaveBeenCalledWith(LARK_APP_ID, 'msg_001', CHAT_ID);
+      const seedCallOrder = vi.mocked(replyMessage).mock.invocationCallOrder.at(-1)!;
+      const recordCallOrder = vi.mocked(recordP2pForceTopicRoot).mock.invocationCallOrder.at(-1)!;
+      expect(seedCallOrder).toBeLessThan(recordCallOrder);
+      // The flat parent's chatId anchor is not a message id and must not be
+      // handed to getMessageDetail; only the anchor itself is resolved.
+      expect(vi.mocked(getMessageThreadId).mock.calls.map(([, id]) => id)).toEqual(['msg_001']);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        CHAT_ID,
+        expect.stringContaining('omt_child'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('flat DM fork failure deletes only the seed reply and drops the marker (never the user message)', async () => {
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: false, error: 'worker_busy' });
+      const ds = makeDaemonSession({
+        chatType: 'p2p',
+        scope: 'chat',
+        session: makeSession({
+          chatType: 'p2p',
+          scope: 'chat',
+          rootMessageId: CHAT_ID,
+          cliSessionId: 'cli-parent-1',
+        }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '失败也要清理',
+        ds,
+        makeLarkMessage('/fork 失败也要清理', { rootId: '' }),
+        LARK_APP_ID,
+      );
+
+      expect(result).toMatchObject({ ok: false, error: 'worker_busy' });
+      // Seed reply is ours and gets deleted; the user's command message must
+      // never be touched by recall.
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'picker-card-msg-id');
+      expect(deleteMessage).not.toHaveBeenCalledWith(LARK_APP_ID, 'msg_001');
+      expect(removeP2pForceTopicRoot).toHaveBeenCalledWith(LARK_APP_ID, 'msg_001', CHAT_ID);
+    });
+
+    it('DM /fork issued inside an existing /t topic opens a NEW top-level anchor (topics cannot nest)', async () => {
+      const ds = makeDaemonSession({
+        chatType: 'p2p',
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({
+          chatType: 'p2p',
+          scope: 'thread',
+          rootMessageId: 'om_topic_root',
+          ownerOpenId: 'ou_sender',
+          cliSessionId: 'cli-parent-1',
+        }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '话题里再分身',
+        ds,
+        makeLarkMessage('/fork 话题里再分身', {
+          rootId: 'om_topic_root',
+          threadId: 'omt_existing',
+        }),
+        LARK_APP_ID,
+      );
+
+      expect(result.ok).toBe(true);
+      // (a): a fresh top-level post becomes the owned anchor...
+      expect(sendMessage).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, expect.any(String), 'post');
+      // ...and the seed opens the new topic by replying into that anchor,
+      // NOT into the command message (which would land in the parent topic).
+      // The fork panel later replies an interactive card to the command
+      // message in the parent topic — that is expected; scope this to posts.
+      const seedReplies = vi.mocked(replyMessage).mock.calls.filter(([, , , msgType]) => msgType === 'post');
+      expect(seedReplies.map(([, target, , msgType, inThread]) => [target, msgType, inThread])).toEqual([
+        ['card-msg-id', 'post', true],
+      ]);
+      expect(seedReplies[0][2]).toEqual(expect.stringContaining('话题里再分身'));
+      // Anchor AND marker must both be the new top-level id: pinning only the
+      // fork root lets a marker-on-command-id regression pass green while
+      // promotion silently misses.
+      expect(vi.mocked(forkSession).mock.calls.at(-1)?.slice(0, 5)).toEqual([
+        'sess-001', CHAT_ID, 'card-msg-id', 'p2p', 'thread',
+      ]);
+      expect(recordP2pForceTopicRoot).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id', CHAT_ID);
+      expect(recordP2pForceTopicRoot).not.toHaveBeenCalledWith(LARK_APP_ID, 'msg_001', expect.anything());
+    });
+
+    it('DM top-level /fork carrying a quote bubble also uses a new top-level anchor (quote-as-root is unverified)', async () => {
+      const ds = makeDaemonSession({
+        chatType: 'p2p',
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({
+          chatType: 'p2p',
+          scope: 'chat',
+          rootMessageId: CHAT_ID,
+          ownerOpenId: 'ou_sender',
+          cliSessionId: 'cli-parent-1',
+        }),
+      });
+
+      // root_id present WITHOUT thread_id = a quote bubble, treated as
+      // top-level by routing but deliberately NOT trusted as a topic root.
+      const result = await startForkSubtopicSession(
+        '引用着消息分身',
+        ds,
+        makeLarkMessage('/fork 引用着消息分身', { rootId: 'om_quoted_msg' }),
+        LARK_APP_ID,
+      );
+
+      expect(result.ok).toBe(true);
+      // Paired pin: the fork root and the marker are the new owned top-level id.
+      expect(vi.mocked(forkSession).mock.calls.at(-1)?.slice(0, 5)).toEqual([
+        'sess-001', CHAT_ID, 'card-msg-id', 'p2p', 'thread',
+      ]);
+      expect(recordP2pForceTopicRoot).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id', CHAT_ID);
+      expect(recordP2pForceTopicRoot).not.toHaveBeenCalledWith(LARK_APP_ID, 'msg_001', expect.anything());
+      expect(replyMessage).toHaveBeenCalledWith(
+        LARK_APP_ID, 'card-msg-id', expect.any(String), 'post', true,
+      );
+    });
+
+    it('DM fallback-(a) fork failure deletes the owned anchor and seed and drops the marker', async () => {
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: false, error: 'worker_busy' });
+      const ds = makeDaemonSession({
+        chatType: 'p2p',
+        scope: 'thread',
+        session: makeSession({
+          chatType: 'p2p',
+          scope: 'thread',
+          rootMessageId: 'om_topic_root',
+          cliSessionId: 'cli-parent-1',
+        }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '失败也要撤干净',
+        ds,
+        makeLarkMessage('/fork 失败也要撤干净', {
+          rootId: 'om_topic_root',
+          threadId: 'omt_existing',
+        }),
+        LARK_APP_ID,
+      );
+
+      expect(result).toMatchObject({ ok: false, error: 'worker_busy' });
+      // Both bot-owned messages are recalled; the user's command is untouched.
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'picker-card-msg-id');
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
+      expect(deleteMessage).not.toHaveBeenCalledWith(LARK_APP_ID, 'msg_001');
+      expect(removeP2pForceTopicRoot).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id', CHAT_ID);
+    });
+
+    it('group fork keeps using the group chat type and does not touch the DM marker store', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        session: makeSession({ cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '群话题分身',
+        ds,
+        makeLarkMessage('/fork 群话题分身', { threadId: 'omt_parent' }),
+        LARK_APP_ID,
+      );
+
+      expect(result.ok).toBe(true);
+      expect(vi.mocked(forkSession).mock.calls.at(-1)?.slice(0, 5)).toEqual([
+        'sess-001', CHAT_ID, 'card-msg-id', 'group', 'thread',
+      ]);
+      // Group path posts the seed top-level; never opens a topic via reply seed.
+      expect(vi.mocked(replyMessage).mock.calls.filter(([, , , msgType]) => msgType === 'post'))
+        .toHaveLength(0);
+      expect(recordP2pForceTopicRoot).not.toHaveBeenCalled();
+      expect(removeP2pForceTopicRoot).not.toHaveBeenCalled();
     });
   });
 
@@ -2752,7 +3006,7 @@ describe('handleCommand', () => {
         '/home/testuser/project-wt-principal',
         'wt/principal-lane-b',
       );
-      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b');
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       expect(sessionStore.retirePrincipalLane).toHaveBeenNthCalledWith(1, expect.objectContaining({ dryRun: true }));
       expect(sessionStore.retirePrincipalLane).toHaveBeenNthCalledWith(2, expect.not.objectContaining({ dryRun: true }));
       expect(removeRepoWorktree).toHaveBeenCalledWith(
@@ -2833,7 +3087,7 @@ describe('handleCommand', () => {
       );
 
       expect(pushWorktreeBranch).toHaveBeenCalledTimes(1);
-      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b');
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       expect(sessionStore.retirePrincipalLane).toHaveBeenCalledTimes(1);
       expect(sessionStore.retirePrincipalLane).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
       expect(removeRepoWorktree).not.toHaveBeenCalled();
@@ -3020,7 +3274,7 @@ describe('handleCommand', () => {
         unsubscribe();
       }
 
-      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(closeSession).toHaveBeenCalledWith('sess-001', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       // The command must not bypass closeSession's verified ZMX teardown by
       // mutating worker/store state directly.
       expect(killWorker).not.toHaveBeenCalled();
@@ -3169,7 +3423,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId)}`), deps, LARK_APP_ID);
 
-      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId, expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(replies).toContain('额外关闭 0 个同 worktree 会话');
@@ -3326,8 +3580,8 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-1'])}`), deps, LARK_APP_ID);
 
-      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
-      expect(closeSession).toHaveBeenCalledWith('sibling-1');
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId, expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
+      expect(closeSession).toHaveBeenCalledWith('sibling-1', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       expect(removeRepoWorktree).toHaveBeenCalledWith('/home/testuser/project', '/home/testuser/project-wt-task');
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(replies).toContain('额外关闭 1 个同 worktree 会话');
@@ -3369,7 +3623,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, [], 'clean-state')}`), deps, LARK_APP_ID);
 
-      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(closeSession).toHaveBeenCalledWith(ds.session.sessionId, expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       expect(removeRepoWorktree).not.toHaveBeenCalled();
       expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
         worktreeDir: '/home/testuser/project-wt-task',
@@ -3396,7 +3650,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage(`/close wt --yes --state=${closeWorktreeState(ds.session.sessionId, ['sibling-1'])}`), deps, LARK_APP_ID);
 
-      expect(closeSession).toHaveBeenCalledWith('sibling-1');
+      expect(closeSession).toHaveBeenCalledWith('sibling-1', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       expect(removeRepoWorktree).not.toHaveBeenCalled();
       const replies = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
       expect(replies).toContain('其他 1 个会话未能关闭');
@@ -3500,7 +3754,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
 
-      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(closeSession).toHaveBeenCalledWith('sess-001', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(ds);
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.closeSession).not.toHaveBeenCalled();
@@ -3534,7 +3788,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
 
-      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(closeSession).toHaveBeenCalledWith('sess-001', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) }));
       // Active record kept so the close is retryable.
       expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(ds);
       // The "session closed" card must NOT be delivered.
@@ -3596,7 +3850,7 @@ describe('handleCommand', () => {
       }));
 
       const closing = handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
-      await vi.waitFor(() => expect(closeSession).toHaveBeenCalledWith('sess-001'));
+      await vi.waitFor(() => expect(closeSession).toHaveBeenCalledWith('sess-001', expect.objectContaining({ explicitClose: true, onArchiveError: expect.any(Function) })));
 
       const replacement = makeDaemonSession();
       replacement.session = {
@@ -6158,6 +6412,55 @@ describe('handleCommand', () => {
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope'), deps, LARK_APP_ID);
         expect(generateAuthUrl).not.toHaveBeenCalled();
         expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login --scope');
+      });
+
+      it('allows an uncataloged but syntactically valid scope when --force is specified', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID, makeLarkMessage('/login --force --scope uncataloged:custom:scope'), deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['uncataloged:custom:scope'], 'ou_sender',
+        );
+      });
+
+      it('handles multiple adjacent --force flags without leaving leftover tokens', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID, makeLarkMessage('/login --force --force --scope uncataloged:custom:scope'), deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['uncataloged:custom:scope'], 'ou_sender',
+        );
+      });
+
+      it('handles mixed --scope and --force order with multiple --scope tokens', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID,
+          makeLarkMessage('/login --scope docx:document:readonly --force --scope uncataloged:custom:scope'),
+          deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['docx:document:readonly', 'uncataloged:custom:scope'], 'ou_sender',
+        );
+      });
+
+      it('explains itself when --force is provided without any scopes', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --force'), deps, LARK_APP_ID);
+        expect(generateAuthUrl).not.toHaveBeenCalled();
+        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('/login --scope');
+      });
+
+      it('accepts new Base v3 block and appmode scopes without --force', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand(
+          '/login', ROOT_ID, makeLarkMessage('/login --scope base:appmode:read base:block:read'), deps, LARK_APP_ID,
+        );
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['base:appmode:read', 'base:block:read'], 'ou_sender',
+        );
       });
     });
 

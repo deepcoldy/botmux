@@ -1270,3 +1270,18 @@ describe('applySettingsWrite sessionCleanup', () => {
     });
   });
 });
+
+
+describe('Codex idle cleanup setting', () => {
+  it('accepts a standalone opt-in patch and preserves scheduled cleanup fields', async () => {
+    const deps = makeDeps({ readGlobalConfig: () => ({ sessionCleanup: { enabled: true, olderThanHours: 72 } }) });
+    const r = await applySettingsWrite({ sessionCleanup: { archiveCodex: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ sessionCleanup: { enabled: true, olderThanHours: 72, archiveCodex: true } });
+  });
+  it('rejects nonboolean values', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ sessionCleanup: { archiveCodex: 'true' } }, deps)).toEqual({ ok: false, error: 'invalid_sessionCleanup_archiveCodex' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+});

@@ -11,6 +11,13 @@ export interface DashboardRoute {
   load(): DashboardRouteLoadResult;
 }
 
+/** 当前 hash 路由上的查询参数（`#/page?key=value`）；无参数或非浏览器环境返回 null。 */
+export function hashQueryParam(name: string, hash = typeof location === 'undefined' ? '' : location.hash): string | null {
+  const queryIndex = hash.indexOf('?');
+  if (queryIndex < 0) return null;
+  return new URLSearchParams(hash.slice(queryIndex + 1)).get(name) || null;
+}
+
 function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof T & string>(
   id: string,
   routePrefix: string,
@@ -55,6 +62,8 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('groups', '#/groups', () => import('./groups-page.js'), 'renderGroupsPage'),
   pageRoute('settings', '#/settings', () => import('./settings-page.js'), 'renderSettingsPage'),
   pageRoute('bot-defaults', '#/bot-defaults', () => import('./bot-defaults-page.js'), 'renderBotDefaultsPage'),
+  // `#/agents`（复数）：`#/agent` 会被 startsWith 匹配吞掉 `#/agent-workbench`。
+  pageRoute('agents', '#/agents', () => import('./agents-page.js'), 'renderAgentsPage'),
   pageRoute('skills', '#/skills', () => import('./skills-page.js'), 'renderSkillsPage'),
   pageRoute('customization', '#/customization', () => import('./customization-page.js'), 'renderCustomizationPage'),
   pageRoute('message-listeners', '#/message-listeners', () => import('./message-listeners-page.js'), 'renderMessageListenersPage'),

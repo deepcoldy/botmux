@@ -20,9 +20,7 @@
   <a href="README.en.md">English</a>
 </p>
 
-<p align="center">
-  <a href="https://deepcoldy.github.io/botmux/img/botmux-promo.mp4"><img src="docs/assets/botmux-promo-cover.jpg" alt="1 分钟了解 botmux（点击播放视频）" width="760"></a>
-</p>
+https://github.com/user-attachments/assets/2cd97623-6b92-42ea-a9e9-75c6f5434db6
 
 ---
 

@@ -32,8 +32,15 @@ const cwd = process.cwd();
 const fill = text => text.replaceAll('{{CWD}}', cwd).replaceAll('{{HOME}}', process.env.HOME ?? '');
 
 // eslint-disable-next-line no-control-regex
-const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[78]/g;
-const isBlink = data => /^[◆─\s]*$/.test(data.replace(ANSI, ''));
+const CONTROL = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\](\d*;?)([^\x07\x1b]*)(\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[ -/]*[0-Z\\^-~]/g;
+// eslint-disable-next-line no-control-regex
+const SCREEN_MUTATION = /\x1b\[[0-9;?]*[JKLMPSTX@]|\x1b[MDEc]|\n/;
+/** Same rule as isIdleRepaintChunk in scripts/traex-tape-redaction.ts: logo
+ *  eyes (≤4 ◆/─ glyphs), cursor moves, cursor shape, sync brackets and titles
+ *  loop while idle; anything that erases, scrolls or feeds lines does not —
+ *  the post-turn redraw starts with "\x1b[23;1H\x1b[J", and looping it would
+ *  wipe the composer off the replayed screen. Chunk-split repaints qualify. */
+const isBlink = data => !SCREEN_MUTATION.test(data) && /^[◆─]{0,4}$/.test(data.replace(CONTROL, ''));
 
 const submits = tape.events.filter(e => e.kind === 'submit');
 const startup = tape.events.filter(e => e.t < submits[0].t);
@@ -58,7 +65,31 @@ function receipt(text) {
 }
 // Idle blink: recorded logo-only chunks after the first turn settled.
 const lastTurnEnd = turns[0].events.findLast(e => e.kind === 'rollout' && e.record?.payload?.type === 'task_complete')?.t ?? 0;
-const blinkChunks = turns[0].events.filter(e => e.kind === 'pty' && e.t > lastTurnEnd && isBlink(e.data));
+// node-pty splits callbacks anywhere, even inside a control sequence
+// ("\x1b[23;1H\x1b[" + "J"). Only a chunk whose both edges sit on sequence
+// boundaries of the joined stream may loop; a fragment would replay a cursor
+// move without the rest of its redraw.
+function sequenceAlignedChunks(chunks) {
+  const joined = chunks.map(e => e.data).join('');
+  const inside = new Uint8Array(joined.length + 1);
+  for (const m of joined.matchAll(CONTROL)) {
+    for (let i = m.index + 1; i < m.index + m[0].length; i += 1) inside[i] = 1;
+  }
+  const trailingEsc = joined.lastIndexOf('\x1b');
+  if (trailingEsc >= 0 && !inside[trailingEsc + 1] && !CONTROL.test(joined.slice(trailingEsc))) {
+    for (let i = trailingEsc + 1; i <= joined.length; i += 1) inside[i] = 1;
+  }
+  CONTROL.lastIndex = 0;
+  let offset = 0;
+  return chunks.filter(e => {
+    const start = offset;
+    offset += e.data.length;
+    return !inside[start] && !inside[offset];
+  });
+}
+const blinkChunks = sequenceAlignedChunks(
+  turns[0].events.filter(e => e.kind === 'pty' && e.t > lastTurnEnd),
+).filter(e => isBlink(e.data));
 
 const timers = new Set();
 function at(ms, fn) {

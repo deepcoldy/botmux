@@ -728,9 +728,9 @@ botmux dispatch --chat-id oc_xxxxxxxxxxxx --bot-app cli_xxxxxxxxxxxx \\
   --title "子任务" --brief "任务内容"
 \`\`\`
 
-sandbox dispatch 暂不支持
-\`--into\`；需要追加既有话题时由宿主侧会话执行，避免把已校验群与实际
-\`om_\` 线程拆成两个独立授权目标。
+sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加：宿主侧会
+重新查询该根消息实际所在的群，必须与目标群（默认当前会话群，或
+\`--chat-id\` 指定的群）一致才会投递，否则返回 \`dispatch_chat_mismatch\`。
 
 \`--top-level\` 模式下不会附加"发送给：@xxx / cc：xxx" 那行 footer（顶层广播没有特定收件人）。oncall 寻址也会跳过。
 

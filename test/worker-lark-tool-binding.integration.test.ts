@@ -55,13 +55,16 @@ it('a real direct Trae worker pins managed tool PATH after the CLI launcher rese
 },35000);
 
 it.each([
-  { resume: false, daemonTool: true, headless: false },
-  { resume: false, daemonTool: false, headless: false },
-  { resume: true, daemonTool: true, headless: false },
-  { resume: false, daemonTool: true, headless: true },
-  { resume: false, daemonTool: false, headless: true },
-  { resume: true, daemonTool: true, headless: true },
-])('a real worker resolves the configured PATH (resume=$resume, daemonTool=$daemonTool, headless=$headless)', async ({ resume, daemonTool, headless }) => {
+  { resume: false, daemonTool: true, headless: false, larkToolBinding: undefined },
+  { resume: false, daemonTool: true, headless: false, larkToolBinding: true },
+  { resume: false, daemonTool: false, headless: false, larkToolBinding: true },
+  { resume: true, daemonTool: true, headless: false, larkToolBinding: true },
+  { resume: false, daemonTool: true, headless: false, larkToolBinding: false },
+  { resume: false, daemonTool: true, headless: true, larkToolBinding: undefined },
+  { resume: false, daemonTool: false, headless: true, larkToolBinding: true },
+  { resume: true, daemonTool: true, headless: true, larkToolBinding: true },
+  { resume: false, daemonTool: true, headless: true, larkToolBinding: false },
+])('a real worker resolves the configured PATH (resume=$resume, daemonTool=$daemonTool, headless=$headless, larkToolBinding=$larkToolBinding)', async ({ resume, daemonTool, headless, larkToolBinding }) => {
   const root = mkdtempSync(join(tmpdir(), 'worker-lark-binding-'));
   const dataDir = join(root, 'data'); mkdirSync(dataDir);
   const output = join(root, 'tool-result.json');
@@ -92,15 +95,16 @@ setInterval(()=>{},1000);
       headless: headless ? { id: headlessId, source: 'cli' } : undefined,
       resume,
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
-      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret',
+      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', larkToolBinding,
       env: { PATH: `${botBin}:${process.env.PATH}`, LARKSUITE_CLI_APP_ID: 'cli_wrong' } });
     const deadline = Date.now() + 25_000;
     while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
     expect(existsSync(output), logs).toBe(true);
     const result = JSON.parse(readFileSync(output, 'utf8'));
     expect(result.status, result.err).toBe(0);
-    expect(result.out).toBe(resume ? 'cli_wrong' : 'cli_current_app');
-    expect(result.path.split(':')[0].includes('cli-identity')).toBe(!resume);
+    const isBound = larkToolBinding !== false;
+    expect(result.out).toBe(isBound ? 'cli_current_app' : 'cli_wrong');
+    expect(result.path.split(':')[0].includes('cli-identity')).toBe(isBound);
     if (headless) {
       expect(result.hasAppSecret).toBe(false);
       expect(result.hasUserToken).toBe(false);
@@ -136,7 +140,7 @@ setInterval(()=>{},1000);
       rootMessageId: headless ? headlessChat : 'om_root',
       headless: headless ? { id: headlessId, source: 'cli' } : undefined,
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
-      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', locale: 'zh',
+      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', locale: 'zh', larkToolBinding: true,
       triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' },
       env: { PATH: `${botBin}:${process.env.PATH}` } });
     const deadline = Date.now() + 25_000;
@@ -209,7 +213,7 @@ process.stdout.write('Ready\\n'); setInterval(()=>{},1000);
       chatId: headless ? headlessChat : 'oc_test', rootMessageId: headless ? headlessChat : 'om_root',
       headless: headless ? { id: headlessId, source: 'cli' } : undefined,
       workingDir: join(root, 'work'), cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
-      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', sandbox: true,
+      larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', sandbox: true, larkToolBinding: true,
       sandboxPaths: { readOnly: [join(root, 'bot-bin')] },
       env: { PATH: `${join(root, 'bot-bin')}:${process.env.PATH}`, LARKSUITE_CLI_APP_ID: 'cli_wrong' } });
     const deadline = Date.now() + 25_000;

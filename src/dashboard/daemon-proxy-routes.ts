@@ -111,6 +111,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('codex-auth-sync'),
   // Trigger-user CLI auth：开关（PUT）+ 状态（GET），校验路径由 daemon 统一持有。
   putBotConfig('trigger-user-auth'),
+  putBotConfig('lark-tool-binding'),
   {
     method: 'GET',
     path: botPath('trigger-user-auth-status'),

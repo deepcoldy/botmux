@@ -179,7 +179,7 @@ describe('worker raw_input delivery', () => {
     const callbackIdx = region.indexOf('() => {', sendIdx);
     // V3: the capture identity is bound through the single writer
     // setCaptureIdentity (which assigns currentBotmuxTurnId) at the same point.
-    const bindIdx = region.indexOf('setCaptureIdentity(msg.turnId, undefined)');
+    const bindIdx = region.indexOf('setCaptureIdentity(msg.turnId, undefined, msg.turnCallerOpenId)');
     const markerIdx = region.indexOf('writeCliPidMarker()');
     const capabilityIdx = region.indexOf('publishSandboxRelayCapability()');
     expect(sendIdx).toBeGreaterThanOrEqual(0);

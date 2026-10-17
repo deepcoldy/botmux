@@ -5885,7 +5885,7 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',

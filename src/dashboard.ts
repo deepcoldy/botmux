@@ -59,6 +59,7 @@ import {
   compactGroupsMatrix,
   groupsNamesMatrix,
   createGroupsMatrixSnapshot,
+  dashboardEventInvalidatesGroupsMatrix,
   enrichSessionsWithGroupNames,
   roleWriteShouldInvalidate,
   type GroupsMatrix,
@@ -103,7 +104,9 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
+import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
 import {
   projectSessionEventForAudience,
   projectSessionsForAudience,
@@ -254,6 +257,8 @@ import {
   setSerialInputForGroup,
   setCardModeForGroup,
   setIdleCloseForGroup,
+  setReplyModeForGroup,
+  getChatModeForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -886,6 +891,11 @@ registry.on((online) => {
 // `git rev-parse` per session per turn, bounded by the resolver's concurrency
 // cap, NOT a slow background poll.
 aggregator.on(sessionPresentation.onEvent);
+// 回复模式改动可能来自飞书里的 `/reply-mode`（daemon 进程内写），dashboard 侧
+// 只能经 daemon SSE 得知 —— 收到就让群矩阵快照失效，避免 TTL 内展示旧的继承/覆盖状态。
+aggregator.on(ev => {
+  if (dashboardEventInvalidatesGroupsMatrix(ev)) groupsMatrixSnapshot.invalidate();
+});
 
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
@@ -1161,6 +1171,7 @@ interface ResolvedDashboardSettings {
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退）。 */
   sessionCleanup: {
+    archiveCodex?: boolean;
     enabled: boolean;
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
@@ -1755,6 +1766,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled === true }, // default OFF
     sessionCleanup: {
+      archiveCodex: global.sessionCleanup?.archiveCodex === true,
       enabled: global.sessionCleanup?.enabled === true, // default OFF
       olderThanHours: resolveCleanupHours(global.sessionCleanup),
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
@@ -2925,7 +2937,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2944,6 +2956,7 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       turnTimeoutMs: b.turnTimeoutMs,
       dshRuntime: b.dshRuntime,
       dshProfile: b.dshProfile,
+      cliConfigDir: b.cliConfigDir,
     }]));
   } catch {
     return new Map();
@@ -2993,6 +3006,7 @@ async function configuredBotDefaultsRecoveryRows(
           turnTimeoutMs: bot.turnTimeoutMs,
           dshRuntime: bot.dshRuntime,
           dshProfile: bot.dshProfile,
+          cliConfigDir: bot.cliConfigDir,
         }, {
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
@@ -3014,12 +3028,12 @@ async function configuredBotDefaultsRecoveryRows(
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }>(
   bot: T,
   ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier'] }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -3035,6 +3049,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
     dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
     dshProfile: bot.dshProfile ?? fallback?.dshProfile,
+    cliConfigDir: bot.cliConfigDir ?? fallback?.cliConfigDir,
   };
 }
 
@@ -3257,7 +3272,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
-          defaultModels, serialInput, idleClose, agentCliId, agentModel, agentReasoningEffort,
+          defaultModels, serialInput, idleClose, replyMode, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3288,6 +3303,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           defaultModels: defaultModels ?? {},
           serialInput: serialInput === true,
           idleClose,
+          ...(replyMode ? { replyMode } : {}),
           agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
@@ -4508,7 +4524,7 @@ const server = createServer(async (req, res) => {
           const upstream = await proxyToDaemon(
             s.larkAppId as string,
             `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-            { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
+            { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ idleCleanup: true, idleCleanupSource: 'manual' }), signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
           );
           const text = await upstream.text();
           let parsed: any = null;
@@ -4524,6 +4540,7 @@ const server = createServer(async (req, res) => {
           return {
             sessionId: s.sessionId,
             ok,
+            archiveError: parsed?.archiveError,
             ...(residual ? { residual } : {}),
             error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
           };
@@ -5567,6 +5584,15 @@ const server = createServer(async (req, res) => {
     }
 
     if (await handleConnectorApi(req, res, url)) {
+      return;
+    }
+
+    // ─── Agent 配置模板（agents.json）─────────────────────────────────────────
+    // 不在 PUBLIC_READ_PATHS ⟹ 未认证已被 401；写操作在 handler 内另要 canManageHost。
+    if (await handleAgentProfilesApi(req, res, url, {
+      canManageHost: authed,
+      knownBotIds: () => new Set(monitorBotConfigs().map(bot => bot.larkAppId)),
+    })) {
       return;
     }
 
@@ -6962,6 +6988,27 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // 只读单群拓扑（不在 PUBLIC_READ_PATHS，匿名访问已被全局 gate 401）。
+    let mChatMode: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mChatMode = url.pathname.match(/^\/api\/groups\/([^/]+)\/chat-mode\/([^/]+)$/))) {
+      const result = await getChatModeForGroup(
+        decodeURIComponent(mChatMode[1]), decodeURIComponent(mChatMode[2]), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
+    }
+
+    let mReplyMode: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mReplyMode = url.pathname.match(/^\/api\/groups\/([^/]+)\/reply-mode\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setReplyModeForGroup(
+        decodeURIComponent(mReplyMode[1]), decodeURIComponent(mReplyMode[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
+    }
+
     let mIdleClose: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mIdleClose = url.pathname.match(/^\/api\/groups\/([^/]+)\/idle-close\/([^/]+)$/))) {
       let body: unknown;
@@ -7168,6 +7215,16 @@ const server = createServer(async (req, res) => {
     // vc-meeting、role-profiles、groups/*、GET /api/bots），它们的 path 与表内每一条都互斥，
     // 所以在此一次性匹配整张表与原先的穿插排布先后等价。新增穿插路由时别让它的 path 与表内条目重叠。
     if (await handleDaemonProxyRoute(BOT_PROXY_ROUTES, req, res, url, daemonProxyDeps)) return;
+
+    // GET  /api/bots/:appId/slash-commands — native Lark slash-command catalog.
+    // POST /api/bots/:appId/slash-commands/{sync,sync-one,delete} — writes go
+    // through the P1-11 control gate (same-origin + session-bound CSRF ticket).
+    // 不走纯转发表：写操作必须挂控制类门禁，path 与表内条目互斥。
+    if (await handleNativeSlashCommandsProxy(req, res, url, {
+      identity: requestIdentity,
+      csrfTokens: controlCsrfTokens,
+      proxy: proxyToDaemon,
+    })) return;
 
     if (await handleOncallServiceSecret(req, res, url, { identity: requestIdentity, csrfTokens: controlCsrfTokens })) return;
 
@@ -7785,7 +7842,7 @@ listenWithProbe({
         const upstream = await proxyToDaemon(
           s.larkAppId ?? '',
           `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-          { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
+          { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ idleCleanup: true, idleCleanupSource: 'scheduled' }), signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
         );
         const text = await upstream.text();
         let parsed: any = null;
@@ -7795,6 +7852,7 @@ listenWithProbe({
         return {
           sessionId: s.sessionId,
           ok,
+          archiveError: parsed?.archiveError,
           ...(residual ? { residual } : {}),
           error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
         };

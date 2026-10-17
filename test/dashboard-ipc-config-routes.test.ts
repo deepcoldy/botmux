@@ -36,6 +36,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-riff', LEGACY],
   ['/api/bot-skills', LEGACY],
   ['/api/bot-sandbox-network-policy', LEGACY],
+  ['/api/bot-lark-tool-binding', LEGACY],
 ];
 
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
@@ -93,6 +94,13 @@ const CASES: readonly Case[] = [
   ['/api/bot-skills', '{"action":"x"}', 400, { ok: false, error: 'invalid_action' }],
   ['/api/bot-skills', '{"action":"attach"}', 400, { ok: false, error: 'name_required' }],
   ['/api/bot-skills', '[]', 400, { ok: false, error: 'bad_json' }],
+  ['/api/bot-lark-tool-binding', '{"enabled":true}', 200, { ok: true, larkToolBinding: true }, { larkToolBinding: undefined }],
+  ['/api/bot-lark-tool-binding', '{"enabled":false}', 200, { ok: true, larkToolBinding: false }, { larkToolBinding: false }],
+  ['/api/bot-lark-tool-binding', '{"larkToolBinding":true}', 200, { ok: true, larkToolBinding: true }, { larkToolBinding: undefined }],
+  ['/api/bot-lark-tool-binding', '{"larkToolBinding":false}', 200, { ok: true, larkToolBinding: false }, { larkToolBinding: false }],
+  ['/api/bot-lark-tool-binding', 'null', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-tool-binding', '[]', 400, { ok: false, error: 'no_valid_fields' }],
+  ['/api/bot-lark-tool-binding', '"not_an_object"', 400, { ok: false, error: 'no_valid_fields' }],
 ];
 
 describe('config-field PUT routes (botConfigPutRoute)', () => {

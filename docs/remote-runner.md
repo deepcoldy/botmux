@@ -14,6 +14,7 @@
     "requiredCapabilities": [
       "start", "resume", "turn", "cancel", "detach", "reattach", "status",
       "terminal_screen", "terminal_input", "terminal_resize", "outbound_message",
+      "outbound_message_explicit_mention",
       "session_tool"
     ],
     "handshakeTimeoutMs": 30000,
@@ -94,7 +95,7 @@ provider 可以额外声明三项通用终端能力：
 
 ### 可选主动消息
 
-声明 `outbound_message` 后，provider 可以在一个仍为 active 的 turn 内请求 BotMux 向该 turn 的当前会话位置发送非终态正文和有界图片。该能力只表达内容、图片字节和寻址意图，不接受 chat、topic root、Bot 身份或任意用户 ID；真实路由、mention 门禁、图片上传、卡片渲染、hook 和平台调用继续由 BotMux 的普通 `send` 链路负责。
+声明 `outbound_message` 后，provider 可以在一个仍为 active 的 turn 内请求 BotMux 向该 turn 的当前会话位置发送非终态正文和有界图片。该能力只表达内容、图片字节和寻址意图，不接受 chat、topic root 或 Bot 身份；真实路由、mention 门禁、图片上传、卡片渲染、hook 和平台调用继续由 BotMux 的普通 `send` 链路负责。provider 额外声明 `outbound_message_explicit_mention` 后，可以提交与普通 `botmux send --mention` 相同的原始 mention 参数，仍由宿主应用目标 Bot 的既有配置和校验规则。
 
 ```json
 {
@@ -117,7 +118,7 @@ provider 可以额外声明三项通用终端能力：
 
 - `content` 使用 BotMux Markdown；普通文本是其子集，单条最多 32 KiB。
 - `responseKind` 仅允许 `progress|auxiliary`，不能借此声明 turn 最终完成；`final|failure` 仍是唯一终态。
-- `mention` 仅允许 `none|requester`。`requester` 仍要通过当前 turn 的精确回复对象与多参与者门禁，provider 不能提供 open_id。
+- `mention` 允许 `none|requester|explicit`。`requester` 仍要通过当前 turn 的精确回复对象与多参与者门禁；`explicit` 必须同时携带非空 `mentions` 字符串数组，并要求 provider 声明 `outbound_message_explicit_mention`。BotMux 把每项原样转为普通 `--mention` 参数：字面 `ou_` 沿用直接透传语义，邮箱、手机号、`union_id` 或姓名是否可解析以及目标群成员校验，完全复用目标 Bot 的 `allowArbitraryMention` 配置，不增加 Remote Runner 专属的“当前话题参与者”限制。
 - `images` 可省略；只允许 PNG/JPEG/GIF/WebP，最多 4 张、解码后合计最多 2 MiB。文件名、MIME、base64 canonical encoding 和文件 magic 都会在协议边界校验；宿主只在私有临时目录物化，并固定转成普通 `botmux send --images`，turn 仍不能发送任意文件、视频或语音。
 - `turnId` 必须等于 active turn，`generation` 必须等于当前 backend state；迟到或跨代事件会 fail-closed。
 - `operationId` 在单 turn 内幂等：同 key 同 payload 复用第一次结果，同 key 不同 payload 被拒绝；每 turn 最多接受 10 个不同 operation。

@@ -30,7 +30,8 @@ describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
   });
 
   it('suppresses the shared-login seed and copies the source outside the best-effort block', () => {
-    expect(worker).toContain('const fresh = claudeCredFromSource ? null : freshestClaudeCred();');
+    // A config profile (cliConfigDir) seeds from its own login, never the shared one.
+    expect(worker).toMatch(/const fresh = claudeCredFromSource\s*\? null\s*: claudeProfileDir \? readClaudeCredFile\(join\(claudeProfileDir, '\.credentials\.json'\)\) : freshestClaudeCred\(\);/);
     const gate = worker.indexOf('if (willRedirectCliData) {', worker.indexOf('const credentialSourcePlan'));
     const provision = worker.indexOf('provisionIsolatedBotHome(', gate);
     const provisionEnd = worker.indexOf(');', provision);

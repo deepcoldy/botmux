@@ -1914,6 +1914,213 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
   });
 });
 
+describe('native Lark slash-command routes — optional scope degradation', () => {
+  async function withBot(
+    run: (base: string, request: ReturnType<typeof vi.fn>) => Promise<void>,
+    extraConfig: Record<string, unknown> = {},
+  ): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-native-slash-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-native-slash-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', ...extraConfig }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      const request = vi.fn();
+      if (extraConfig.apiOnly !== true) (botRegistry.getBotClient(appId) as any).request = request;
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`, request);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('answers 200 + available:false (not an error) when the read scope is missing', async () => {
+    await withBot(async (base, request) => {
+      request.mockRejectedValue({ response: { status: 400, data: { code: 99991672, msg: 'Access denied' } } });
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        ok: true,
+        available: false,
+        reason: 'missing_scope',
+        missingScopes: ['application:app_slash_command:read'],
+      });
+      expect(body.permissionUrls.read).toContain('application%3Aapp_slash_command%3Aread');
+      // The schema-derived catalog is still returned, read-only.
+      expect(body.commands.length).toBeGreaterThan(0);
+      expect(body.commands.every((c: any) => c.status === 'unknown' && c.source === 'botmux')).toBe(true);
+
+      const sync = await fetch(`${base}/api/bot-slash-commands/sync`, { method: 'POST' });
+      expect(sync.status).toBe(200);
+      expect(await sync.json()).toMatchObject({ ok: false, available: false, reason: 'missing_scope' });
+    });
+  });
+
+  it('reports not_enabled when the OpenAPI is absent for this tenant', async () => {
+    await withBot(async (base, request) => {
+      request.mockRejectedValue({ response: { status: 404, data: '404 page not found' } });
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, available: false, reason: 'not_enabled', missingScopes: [] });
+    });
+  });
+
+  it('surfaces a write-scope denial on sync-one as missing_scope, and rejects commands outside the catalog', async () => {
+    await withBot(async (base, request) => {
+      request.mockImplementation(async (payload: { method: string }) => (
+        payload.method === 'GET'
+          ? { code: 0, msg: 'success', data: { items: [] } }
+          : Promise.reject({ response: { status: 400, data: { code: 99991672, msg: 'Access denied' } } })
+      ));
+      const res = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/help' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: false,
+        available: true,
+        error: 'missing_scope',
+        missingScopes: ['application:app_slash_command:write'],
+      });
+
+      const outside = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/compact' }),
+      });
+      expect(outside.status).toBe(400);
+      expect(await outside.json()).toMatchObject({ ok: false, error: 'slash_command_not_in_catalog' });
+    });
+  });
+
+  it('core-only (apiOnly) bot: read-only core_only state, never resolves a Lark client, writes refused', async () => {
+    await withBot(async base => {
+      const clientSpy = vi.spyOn(botRegistry, 'getBotClient');
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: true, available: false, reason: 'core_only', missingScopes: [] });
+      expect(body.permissionUrls).toBeUndefined();
+      expect(body.commands.length).toBeGreaterThan(0);
+      expect(body.commands.every((c: any) => c.status === 'unknown')).toBe(true);
+
+      for (const [path, init] of [
+        ['/api/bot-slash-commands/sync', { method: 'POST' }],
+        ['/api/bot-slash-commands/sync-one', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ command: '/help' }) }],
+        ['/api/bot-slash-commands/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ command: '/help' }) }],
+      ] as const) {
+        const write = await fetch(`${base}${path}`, init as RequestInit);
+        expect(write.status).toBe(200);
+        expect(await write.json()).toMatchObject({ ok: false, available: false, reason: 'core_only' });
+      }
+      expect(clientSpy).not.toHaveBeenCalled();
+      clientSpy.mockRestore();
+    }, { apiOnly: true });
+  });
+
+  it('degrades on the v7 "lacks permission" envelope (99991640) for both query and write', async () => {
+    await withBot(async (base, request) => {
+      request.mockResolvedValue({ code: 99991640, msg: 'lacks permission' });
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, available: false, reason: 'missing_scope' });
+
+      request.mockImplementation(async (payload: { method: string }) => (
+        payload.method === 'GET'
+          ? { code: 0, msg: 'success', data: { items: [] } }
+          : { code: 99991640, msg: 'lacks permission' }
+      ));
+      const write = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/help' }),
+      });
+      expect(write.status).toBe(200);
+      expect(await write.json()).toMatchObject({
+        ok: false,
+        error: 'missing_scope',
+        missingScopes: ['application:app_slash_command:write'],
+      });
+    });
+  });
+
+  it('maps bare HTTP 403/404 write rejections to missing_scope / not_enabled', async () => {
+    await withBot(async (base, request) => {
+      for (const [status, reason] of [[403, 'missing_scope'], [404, 'not_enabled']] as const) {
+        request.mockImplementation(async (payload: { method: string }) => {
+          if (payload.method === 'GET') return { code: 0, msg: 'success', data: { items: [] } };
+          throw Object.assign(new Error(`Request failed with status code ${status}`), { response: { status, data: 'nope' } });
+        });
+        const res = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ command: '/help' }),
+        });
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body).toMatchObject({ ok: false, error: reason, reason });
+        expect(body.report.outcomes[0]).toMatchObject({ ok: false, httpStatus: status });
+        expect(body.report.outcomes[0].uncertain).toBeUndefined();
+      }
+    });
+  });
+
+  it('keeps a confirmed write ok and exposes refreshError separately when the post-write refresh fails', async () => {
+    await withBot(async (base, request) => {
+      let wrote = false;
+      request.mockImplementation(async (payload: { method: string }) => {
+        if (payload.method === 'GET') {
+          if (wrote) throw new Error('refresh ETIMEDOUT');
+          return { code: 0, msg: 'success', data: { items: [] } };
+        }
+        wrote = true;
+        return { code: 0, msg: 'success' };
+      });
+      const res = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/help' }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: true, available: true, report: { created: 1, failed: 0 } });
+      expect(body.refreshError).toContain('refresh ETIMEDOUT');
+      expect(body.error).toBeUndefined();
+    });
+  });
+
+  it('a thrown write mid-batch returns the accumulated report (not a read-failure 502)', async () => {
+    await withBot(async (base, request) => {
+      let posts = 0;
+      request.mockImplementation(async (payload: { method: string }) => {
+        if (payload.method === 'GET') return { code: 0, msg: 'success', data: { items: [] } };
+        posts += 1;
+        if (posts === 2) throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+        return { code: 0, msg: 'success' };
+      });
+      const res = await fetch(`${base}/api/bot-slash-commands/sync`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ok).toBe(false);
+      expect(body.available).toBe(true);
+      expect(body.report.failed).toBe(1);
+      expect(body.report.created).toBe(posts - 1);
+      expect(posts).toBeGreaterThan(2);
+      expect(body.report.outcomes.filter((o: any) => o.uncertain)).toHaveLength(1);
+    });
+  });
+});
+
 describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   it('is default-off and persists explicit on/off changes immediately', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-clean-'));
@@ -9509,6 +9716,7 @@ describe('GET /api/groups (Phase B)', () => {
       oncallChat: null,
       serialInput: false,
       idleClose: { enabled: false, duration: 1, unit: 'days' },
+      replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
@@ -9551,6 +9759,7 @@ describe('GET /api/groups (Phase B)', () => {
         oncallChat: null,
         serialInput: false,
         idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9599,6 +9808,7 @@ describe('GET /api/groups (Phase B)', () => {
         oncallChat: null,
         serialInput: false,
         idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9637,6 +9847,7 @@ describe('GET /api/groups (Phase B)', () => {
         oncallChat: null,
         serialInput: false,
         idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9688,6 +9899,7 @@ describe('GET /api/groups (Phase B)', () => {
           oncallChat: null,
           serialInput: false,
           idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9706,6 +9918,7 @@ describe('GET /api/groups (Phase B)', () => {
           oncallChat: null,
           serialInput: false,
           idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9724,6 +9937,7 @@ describe('GET /api/groups (Phase B)', () => {
           oncallChat: null,
           serialInput: false,
           idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,

@@ -88,6 +88,20 @@ export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string)
 }
 
 /**
+ * The live turn id (first line) from the active-turn file, or undefined when
+ * absent/empty. Shared by every TS consumer so the file's two-line layout
+ * (turn, then caller) is parsed in exactly one place.
+ */
+export function readActiveTurnLine(sessionDataDir: string, sessionId: string): string | undefined {
+  try {
+    const first = readFileSync(sessionActiveTurnPath(sessionDataDir, sessionId), 'utf8').split('\n', 1)[0]!;
+    return first.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Machine-readable companion to {@link sessionActiveTurnPath}:
  * `{"turnId":…,"dispatchAttempt":…}` (one JSON object, 0600).
  *
@@ -117,11 +131,23 @@ export function publishActiveTurn(
   sessionId: string,
   turnId: string | undefined,
   dispatchAttempt?: number,
+  callerOpenId?: string,
 ): void {
-  const path = sessionActiveTurnPath(sessionDataDir, sessionId);
+  const dir = sessionIdentityDataDir(sessionDataDir, sessionId);
   try {
-    mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
-    atomicWriteFileSync(path, `${turnId ?? ''}\n`, { mode: 0o600 });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // turn + caller live in ONE file so the wrapper reads them in a single
+    // open: two separate files cannot be updated atomically together, and a
+    // reader landing between the two writes would see a turn from one
+    // generation with a caller from another (a cross-principal misattribution).
+    // Line 1 = the turn the CLI is executing now; line 2 = the open id of the
+    // human whose turn it is. Both may be empty (unknown turn / absent
+    // principal), which the wrapper treats as a refusal, never an allowance.
+    atomicWriteFileSync(
+      sessionActiveTurnPath(sessionDataDir, sessionId),
+      `${turnId ?? ''}\n${callerOpenId ?? ''}\n`,
+      { mode: 0o600 },
+    );
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
   try {
     atomicWriteFileSync(
@@ -129,6 +155,7 @@ export function publishActiveTurn(
       `${JSON.stringify({
         turnId: turnId ?? null,
         dispatchAttempt: dispatchAttempt ?? null,
+        ...(callerOpenId ? { callerOpenId } : {}),
       })}\n`,
       { mode: 0o600 },
     );
@@ -177,6 +204,10 @@ export interface LarkCliIdentity extends TurnBound {
   tool: 'lark-cli';
   appId: string;
   userAccessToken: string;
+  /** Open id this token acts for. Lets the wrapper keep a turn-mismatched but
+   *  same-principal credential usable — a person's own follow-up turn must not
+   *  be denied while their previous turn is still draining. */
+  openId?: string;
 }
 
 /**
@@ -193,6 +224,8 @@ export interface LarkCliHomeIdentity extends TurnBound {
   mode: 'user-home';
   /** Absolute per-person HOME the child lark-cli sees. */
   home: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
 }
 
 export interface BytedCliIdentity extends TurnBound {
@@ -200,6 +233,8 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
+  /** See {@link LarkCliIdentity.openId}. */
+  openId?: string;
 }
 
 /**
@@ -248,6 +283,9 @@ const DENY_MSG_VAR = 'BOTMUX_IDENTITY_DENY_MSG';
 /** The turn these credentials belong to; compared against the worker's live
  *  turn file before they may be used. */
 const TURN_VAR = 'BOTMUX_IDENTITY_TURN';
+/** Open id these credentials act for. Compared with the worker's live-turn
+ *  caller when the turn ids disagree: equal principals keep the credential. */
+const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
 /** Per-person HOME for the device-code lark-cli identity. Scoped to the child
  *  exec only — the wrapper sets it inline, never inheriting a parent value. */
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
@@ -295,6 +333,7 @@ export function renderIdentityEnv(identity: CliIdentity): string {
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
+  if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
   const header = '# botmux trigger-user identity — rewritten each turn, do not edit\n';
   return header + pairs.map(([k, v]) => `${k}=${quoteFor(k, v)}`).join('\n') + '\n';
 }
@@ -335,11 +374,23 @@ export function refreshSessionIdentity(
   identity: CliIdentity & { turnId: string },
 ): boolean {
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
-  const turnPath = sessionActiveTurnPath(sessionDataDir, sessionId);
-  const suffix = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}\n`;
+  const turnLine = `${TURN_VAR}=${quoteFor(TURN_VAR, identity.turnId)}`;
+  const openId = 'openId' in identity ? identity.openId : undefined;
   try {
-    if (!readFileSync(path, 'utf8').endsWith(suffix)
-      || readFileSync(turnPath, 'utf8').trim() !== identity.turnId) return false;
+    // Match the TURN line by line, not by suffix: renderIdentityEnv appends the
+    // OPEN_ID line after TURN for every principal-stamped identity, so
+    // `endsWith(TURN=…)` is false for exactly the files this feature produces.
+    const lines = readFileSync(path, 'utf8').split('\n');
+    if (!lines.includes(turnLine)) return false;
+    // Incidental consistency: a file already stamped for one principal must not
+    // be refreshed into another principal's token. An UNSTAMPED file (the
+    // first-authorization denial, or a pre-binding credential) is not evidence
+    // of a mismatch and is allowed through — that is the path that just
+    // completed the device grant.
+    const stamped = lines.find(line => line.startsWith(`${OPEN_ID_VAR}=`));
+    if (stamped && stamped !== `${OPEN_ID_VAR}=${quoteFor(OPEN_ID_VAR, openId ?? '')}`) return false;
+    // The active-turn file is two lines (turn, caller); compare only the turn.
+    if (readActiveTurnLine(sessionDataDir, sessionId) !== identity.turnId) return false;
   } catch {
     return false;
   }
@@ -434,6 +485,12 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '# would hand it the machine account\'s login, not the bot\'s.',
     `${MODE_VAR}=`,
     `${DENY_MSG_VAR}=`,
+    // Clear inherited copies before sourcing: a parent process that exports a
+    // forged OPEN_ID/TURN could otherwise flip a cross-principal refusal into
+    // the same-principal allowance. Depths of defence only — the values are
+    // re-set from the credential file below when it carries them.
+    `${TURN_VAR}=`,
+    `${OPEN_ID_VAR}=`,
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
     `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/${tool}.env"`,
     '  if [ -f "$__botmux_cred" ]; then',
@@ -447,21 +504,35 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     // replaced by a newer message's credentials while this turn is still
     // running, so these are somebody else's.
     '__botmux_live=',
+    '__botmux_live_caller=',
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    '  __botmux_turnf="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/turn"',
-    '  if [ -f "$__botmux_turnf" ]; then',
-    '    read -r __botmux_live < "$__botmux_turnf" || __botmux_live=',
+    '  __botmux_d="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data"',
+    // ONE open, two reads: the file is (turn, caller) written by a single
+    // atomic rename, so this pair is always from one generation. Two separate
+    // reads could interleave with a rewrite and mix generations.
+    '  if [ -f "$__botmux_d/turn" ]; then',
+    '    { read -r __botmux_live; read -r __botmux_live_caller; } < "$__botmux_d/turn" || true',
     '  fi',
-    '  unset __botmux_turnf',
+    '  unset __botmux_d',
     'fi',
     // Only enforced when both sides state a turn. An identity published without
     // one predates turn binding; a session with no live turn file has nothing to
     // contradict. Neither is evidence of a mismatch, so neither refuses here.
     `if [ -n "$${TURN_VAR}" ] && [ -n "$__botmux_live" ] \\`,
     `   && [ "$${TURN_VAR}" != "$__botmux_live" ]; then`,
+    `  __botmux_published_mode=$${MODE_VAR}`,
     `  ${MODE_VAR}=turn-mismatch`,
+    // Same human across consecutive turns (their follow-up was accepted while
+    // the previous turn is still draining): the credential acts for exactly the
+    // person the worker is now executing, so keep it. Only a NAMED match on both
+    // sides relaxes; anything missing stays a refusal. Restore the published
+    // mode (user/user-home/bot) so the case dispatch below runs normally.
+    `  if [ -n "$${OPEN_ID_VAR}" ] && [ -n "$__botmux_live_caller" ] \\`,
+    `     && [ "$${OPEN_ID_VAR}" = "$__botmux_live_caller" ]; then`,
+    `    ${MODE_VAR}=$__botmux_published_mode`,
+    '  fi',
     'fi',
-    'unset __botmux_live',
+    'unset __botmux_live __botmux_live_caller __botmux_published_mode',
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
@@ -477,7 +548,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `      printf '%s\\n' 'botmux: ${tool} 的按人身份目录缺失，命令未执行。请重新发送 /login 完成授权后重试。' >&2`,
     `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    fi',
-    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR}`,
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR}`,
     `    HOME="$${HOME_VAR}" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '    ;;',
     '  turn-mismatch)',
@@ -496,7 +567,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     'esac',
-    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
+    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');

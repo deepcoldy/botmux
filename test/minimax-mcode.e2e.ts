@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { runMcodeExec } from '../src/services/mcode-exec.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { collectNativePrint } from '../src/services/constrained-invocation/print-process.js';
 import * as pty from '../src/utils/pty.js';
 import { applySessionOwnerEnv } from '../src/utils/child-env.js';
@@ -32,8 +33,9 @@ it.skipIf(!executable)('real mcode: executes a shell tool, preserves owner and r
   const readonlyRoots = adapter.sandboxReadonlyPaths?.() ?? [];
   let cleanupSandbox: (() => void) | undefined;
   const server = createServer(async (req, res) => {
-    let raw = ''; for await (const chunk of req) raw += chunk;
-    const body = JSON.parse(raw); requests.push(body);
+    const body = await readRequestBodyJson<any>(req);
+    if (!body) { res.writeHead(400).end(); return; }
+    requests.push(body);
     if (!body.stream) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'fixture', object: 'chat.completion', model: 'fixture-model',

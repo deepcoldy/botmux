@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
@@ -769,6 +769,25 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       errorCode: 'codex_output_limit_exceeded',
     })]);
     engine.stop();
+  }, 20_000);
+
+  it('classifies a native capacity failure independently of a generic error code', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-capacity',
+      env: { ...process.env, FAKE_TURN_STATUS: 'failed', FAKE_TURN_ERROR_CODE: 'generic_turn_failed',
+        FAKE_TURN_ERROR_MESSAGE: 'Selected model is at capacity. Please try a different model.' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    try {
+      await engine.start();
+      await engine.startThread();
+      await engine.sendTurn('continue task', owner('turn-capacity', 7));
+      await vi.waitFor(() => expect(terminals).toEqual([expect.objectContaining({
+        identity: { turnId: 'turn-capacity', dispatchAttempt: 7 },
+        status: 'failed', errorCode: 'codex_capacity_exceeded',
+      })]));
+    } finally { engine.stop(); }
   }, 20_000);
 
   it('P1-1 sendFirstTurn: dispatched, no ack, NO rollout evidence → ambiguous (never downgraded to safe)', async () => {

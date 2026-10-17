@@ -359,6 +359,12 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_AIDEN_CODEX_PARENT_PATH',
   'BOTMUX_AIDEN_CODEX_REAL_BIN',
   'BOTMUX_AIDEN_CODEX_REASONING_EFFORT',
+  // Path to the per-launch file holding the Codex shell_environment_policy
+  // overrides the aiden-codex PATH shim re-injects past Aiden's argv gate.
+  // Scrub like the other shim keys: the path embeds the session data dir and
+  // a stale value in a co-tenant pane would point the shim at another
+  // session's identity file.
+  'BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
   // botmux ask/hooks use these to locate the daemon and route back to the
@@ -547,8 +553,10 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   '__OWNER_OPEN_ID',
   // Unguessable pane/profile authority channel (daemon-rotated capability).
   'BOTMUX_ORIGIN_CHANNEL_ID',
-  // Sandbox send-relay directory — a per-session capability path.
+  // Sandbox send-relay directory — a per-session capability path — and the
+  // credential-only "relay serves `send` only" scope marker that rides with it.
   'BOTMUX_SEND_RELAY',
+  'BOTMUX_SEND_RELAY_SCOPE',
   // Session-scoped MCP gateway capability + fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',

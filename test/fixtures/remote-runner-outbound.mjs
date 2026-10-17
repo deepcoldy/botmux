@@ -14,7 +14,7 @@ function emit(event) {
   process.stdout.write(`${JSON.stringify({ protocol, version, ...event })}\n`);
 }
 
-function outbound(operationId, turnId, content) {
+function outbound(operationId, turnId, content, mention = 'none', mentions = undefined) {
   emit({
     type: 'outbound_message',
     operationId,
@@ -22,7 +22,8 @@ function outbound(operationId, turnId, content) {
     generation: 1,
     content,
     responseKind: 'progress',
-    mention: 'none',
+    mention,
+    ...(mentions ? { mentions } : {}),
   });
 }
 
@@ -31,7 +32,10 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   if (command.type === 'hello') {
     emit({
       type: 'hello', requestId: command.requestId, provider: 'outbound-test',
-      capabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'outbound_message'],
+      capabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'outbound_message', 'outbound_message_explicit_mention',
+      ],
     });
     return;
   }
@@ -53,6 +57,10 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       expectedResults = 2;
       outbound('same-operation', command.turnId, 'first payload');
       outbound('same-operation', command.turnId, 'changed payload');
+    } else if (command.content === 'mention-conflict') {
+      expectedResults = 2;
+      outbound('same-operation', command.turnId, 'same payload', 'explicit', ['ou_first:First']);
+      outbound('same-operation', command.turnId, 'same payload', 'explicit', ['ou_second:Second']);
     } else if (command.content === 'rate') {
       expectedResults = 11;
       for (let index = 0; index < expectedResults; index++) {

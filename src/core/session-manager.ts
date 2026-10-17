@@ -1,3 +1,4 @@
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
@@ -103,6 +104,7 @@ import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
+import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
@@ -1198,6 +1200,7 @@ function managedLarkToolAppIdForPrompt(
       adoptMode: !!session?.adoptedFrom,
       existingAppServerEndpoint: session?.existingAppServerEndpoint,
       backendType: session?.backendType ?? botConfig.backendType ?? config.daemon.backendType,
+      larkToolBinding: botConfig.larkToolBinding,
     }, config.session.dataDir, process.env.BOTMUX_WORKFLOW === '1')
       ? larkAppId
       : undefined;
@@ -1355,7 +1358,19 @@ function buildNewTopicBlocks(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
+  const remoteRunnerSkillCatalog = (cliId === 'remote-runner' || opts?.sessionBackendType === 'remote-runner') && !noTransport;
+  if (remoteRunnerSkillCatalog) {
+    // A Remote Runner executes in an ephemeral environment and has no host
+    // skillsDir/pluginDir to discover. Force only the durable-schedule entry
+    // into its opening catalog; explicit user disable still wins in
+    // builtinSkillEntries, and zero prompt injection returned above.
+    const scheduleEntries = builtinSkillEntries({
+      asksViaHook: adapter.asksViaHook,
+      whiteboardEnabled: whiteboardEnabled(),
+      excludeRoutingCovered: true,
+    }).filter(entry => entry.name === 'botmux-schedule');
+    skillBlock = buildBuiltinSkillCatalogBlock(scheduleEntries, locale, { remoteRunner: true });
+  } else if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
@@ -2746,6 +2761,9 @@ export async function restoreActiveSessions(
       if (adoptSandboxBlocked(adoptBotCfg, session)) {
         logger.warn(`[${session.sessionId.substring(0, 8)}] isolated/no-transport session persisted as adopt — converting to cold-start (a sandbox / apiOnly bot can't wrap a live external CLI)`);
         session.adoptedFrom = undefined;
+        // The cold start resumes the external CLI's transcript, which lives on the
+        // default data root: drop any profile an older build froze onto the adopt row.
+        session.cliConfigDir = undefined;
         if (session.title?.startsWith('Adopt:')) {
           const project = session.title.slice('Adopt:'.length).trim();
           session.title = project || 'Session';
@@ -3234,11 +3252,19 @@ export async function restoreActiveSessions(
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
-    ensureOrdinaryTurnRecoveryAttached(ds);
-    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
-    if (!restoredLeaseId
-      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
-      ensureReadonlyTaskContinuationAttached(ds);
+    try {
+      ensureOrdinaryTurnRecoveryAttached(ds);
+      const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+      if (!restoredLeaseId
+        || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+        ensureReadonlyTaskContinuationAttached(ds);
+      }
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Isolated recovery re-arm failure; `
+        + `durable row retained and daemon startup continuing: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -3540,7 +3566,7 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'workspace_retired' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
+| { ok: false; error: 'codex_unarchive_failed' | 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'workspace_retired' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
@@ -3695,6 +3721,20 @@ export async function resumeSession(
     };
   }
 
+  try {
+    await restoreCodexCleanupArchive(session, sessionStore.updateSession, undefined, () => sessionStore.getOwnedSession(sessionId));
+  } catch (error) {
+    logger.warn(`[resume] Codex unarchive failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false as const, error: 'codex_unarchive_failed' as const };
+  }
+  // Recheck after RPC: a concurrent state transition must never be overwritten.
+  if (sessionStore.getSession(sessionId)?.workspaceRetirement) {
+    return { ok: false as const, error: 'workspace_retired' as const };
+  }
+  if (sessionStore.getSession(sessionId)?.status !== 'closed' || activeSessions.has(key)) {
+    return { ok: false as const, error: 'resume_cancelled' as const };
+  }
+
   // Reactivate and abandon any queued/setup ownership in one durable replace.
   // Closed rows created by older releases may still contain a prepared head,
   // tail, or repo picker; generic resume starts a new lifecycle and must never
@@ -3834,6 +3874,19 @@ export async function resumeSession(
     }
   }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
+  // A session group's resident is its chat-scope session. Closing no longer
+  // auto-resumes, so any recovery path (close card, /resume, /adopt <id>, CLI)
+  // may bring back an older resident; keep the registry pointing at it so
+  // /dismiss sees the live resident. No-op for chats that are not session groups.
+  if (scope === 'chat' && isSessionGroup(session.chatId)) touchSessionGroup(session.chatId, sessionId);
+  // Flip connected dashboards back to active for every recovery path (close
+  // card, /resume, /adopt <id>, HTTP, durable control). `null`, not undefined,
+  // so the SSE patch actually clears closedAt. Idempotent with callers that
+  // also publish.
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId, patch: { status: 'active', closedAt: null } },
+  });
   return {
     ok: true,
     ds,

@@ -15,6 +15,7 @@ import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
+import { herdrPaneGrid } from '../utils/herdr-pane-grid.js';
 import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
@@ -875,6 +876,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       const claudeMeta = cliId === 'claude-code'
         ? (cliPid ? readClaudeSessionMeta(cliPid) : undefined) ?? findUniqueClaudeSessionByCwd(cwd)
         : undefined;
+      const grid = herdrPaneGrid(rawInfo);
       discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
@@ -888,8 +890,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         sessionId: sessionId ?? claudeMeta?.sessionId,
         cwd,
         startedAt: claudeMeta?.startedAt ?? (cliPid ? readProcessStartTime(cliPid) : undefined),
-        paneCols: 200,
-        paneRows: 50,
+        // Herdr's CLI reports no terminal width; the pane PTY is the source.
+        paneCols: grid?.cols ?? 200,
+        paneRows: grid?.rows ?? 50,
       });
     }
 
@@ -913,6 +916,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       else if (process.cliId === 'codex') sessionId = findCodexRolloutByPid(process.pid)?.cliSessionId;
       else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
       const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
+      const grid = herdrPaneGrid(rawInfo);
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -925,8 +929,8 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         sessionId: sessionId ?? claudeMeta?.sessionId,
         cwd,
         startedAt: claudeMeta?.startedAt ?? readProcessStartTime(process.pid),
-        paneCols: 200,
-        paneRows: 50,
+        paneCols: grid?.cols ?? 200,
+        paneRows: grid?.rows ?? 50,
       });
     }
   }

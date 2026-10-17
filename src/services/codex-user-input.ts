@@ -64,6 +64,9 @@ export function codexUserInputAnswer(
   questions: ReturnType<typeof parseCodexUserInputQuestions>,
   result: AskResult,
 ): CodexUserInputAnswer {
+  if (result.kind === 'invalidated' && result.failureCode === 'card_delivery_failed') {
+    throw new Error(`Confirmation card could not be delivered: ${result.reason}`);
+  }
   if (result.kind !== 'answered') {
     throw new Error(`ask not answered (${result.kind}${result.kind === 'invalidated' ? `: ${result.reason}` : ''})`);
   }
@@ -136,7 +139,16 @@ export async function bridgeCodexUserInput(
   const response = claim
     ? await loopbackFetch(`http://127.0.0.1:${port}/api/asks`, init)
     : await fetchDaemonIpc(port, '/api/asks', init);
-  if (!response.ok) throw new Error(`ask broker HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  if (!response.ok) {
+    const text = await response.text();
+    let failure: { error?: string; detail?: string } | undefined;
+    try { failure = JSON.parse(text); } catch { /* Non-JSON daemon/proxy errors keep the HTTP fallback. */ }
+    if (failure?.error === 'card_delivery_failed') {
+      const detail = typeof failure.detail === 'string' ? failure.detail.slice(0, 200) : 'recipient unavailable';
+      throw new Error(`Confirmation card could not be delivered: ${detail}`);
+    }
+    throw new Error(`ask broker HTTP ${response.status}: ${text.slice(0, 200)}`);
+  }
   const result = await response.json() as AskResult;
   signal?.throwIfAborted();
   return codexUserInputAnswer(questions, result);

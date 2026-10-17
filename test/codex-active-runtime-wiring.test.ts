@@ -71,6 +71,6 @@ describe('Codex active-runtime wiring (source lock)', () => {
       'import { normalizeBrand }',
     );
     expect(fn).not.toContain('snapshot.tokens?.model');
-    expect(fn).toContain('ds.activeModel?.trim() || ds.session.model?.trim()');
+    expect(fn).toContain('withCardRuntimeIdentity(ds, snapshot, effectiveCliId)');
   });
 });

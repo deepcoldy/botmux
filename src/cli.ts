@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
+import { parse as parseDotEnv } from 'dotenv';
 import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
@@ -4274,14 +4275,70 @@ type AuthoritativeAbandonResult =
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
+type LocalSessionLifecycleMutation = 'delete' | 'resume' | 'suspend' | 'prune' | 'wake';
+
+/** Resolve the coordination mode for a standalone host CLI invocation.
+ * Daemons dotenv-load ~/.botmux/.env, but `botmux delete|resume|suspend|list`
+ * run directly from the user's shell and otherwise see only exported values.
+ * Match dotenv precedence (process env wins) while reading exactly one
+ * non-secret setting from the file and never mutating process.env. */
+function localCliCoordinationMode(
+  env: NodeJS.ProcessEnv = process.env,
+  envFile = ENV_FILE,
+): string | undefined {
+  const inline = env.BOTMUX_COORDINATION_MODE;
+  if (inline !== undefined) return inline.trim();
+  try {
+    return parseDotEnv(readFileSync(envFile, 'utf8')).BOTMUX_COORDINATION_MODE?.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * PostgreSQL primary coordination makes the durable Session row canonical.
+ * The host CLI still discovers sessions from a Pod-local store, so any local
+ * lifecycle mutation can otherwise create a split state (for example local
+ * `closed` while the canonical row remains `active`). Keep every local CLI
+ * mutation fail-closed until it is routed through the durable session-control
+ * lane with fencing.
+ */
+function primaryLocalLifecycleMutationError(
+  operation: LocalSessionLifecycleMutation,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (localCliCoordinationMode(env) !== 'primary') return undefined;
+
+  const action = operation === 'delete'
+    ? '`botmux delete` 关闭'
+    : operation === 'resume'
+      ? '`botmux resume` 恢复'
+      : operation === 'suspend'
+        ? '`botmux suspend` 挂起'
+        : operation === 'prune'
+          ? '`botmux list` 自动清理'
+          : '`botmux list` 唤醒';
+  return `BOTMUX_COORDINATION_MODE=primary 下暂不支持通过本地 CLI ${action}会话；本地 Session store 不是 canonical truth，继续执行可能造成它与 PostgreSQL 状态分裂。请在原话题使用会话卡片执行关闭或恢复；其他生命周期操作需等待 durable session-control 支持。本次未做任何修改。`;
+}
+
+function rejectPrimaryLocalLifecycleMutation(operation: LocalSessionLifecycleMutation): void {
+  const error = primaryLocalLifecycleMutationError(operation);
+  if (!error) return;
+  console.error(`❌ ${error}`);
+  process.exit(1);
+}
+
 async function abandonSessionAuthoritatively(
   session: SessionData,
-  online: DaemonDescriptorLite[] = listOnlineDaemons(),
+  online?: DaemonDescriptorLite[],
 ): Promise<AuthoritativeAbandonResult> {
+  const primaryError = primaryLocalLifecycleMutationError('delete');
+  if (primaryError) return { ok: false, error: primaryError };
+
   if (!session.larkAppId) {
     return { ok: false, error: SESSION_ROW_MISSING_APP_ID };
   }
-  const daemon = online.find(d => d.larkAppId === session.larkAppId);
+  const daemon = (online ?? listOnlineDaemons()).find(d => d.larkAppId === session.larkAppId);
   const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
   const injectedPort = isCurrentSession
     ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
@@ -4297,6 +4354,8 @@ async function abandonSessionAuthoritatively(
       const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
       const body = await res.json().catch(() => ({} as Record<string, unknown>));
       if (res.ok && (body as { ok?: unknown }).ok) {
+        const archiveError = (body as { archiveError?: unknown }).archiveError;
+        if (archiveError) console.warn(`⚠ Botmux 会话已关闭，Codex 归档失败：${archiveError}`);
         // Shared parser: a body that DECLARES a residual must warn even when the
         // `residual` object is missing/malformed, or a bad payload silently
         // becomes an ordinary success again.
@@ -4341,6 +4400,8 @@ async function abandonSessionAuthoritatively(
 }
 
 async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
+  if (primaryLocalLifecycleMutationError('prune')) return false;
+
   const result = await postOwningDaemonSessionMutation(session, 'prune');
   if (result === 'applied') return true;
   if (result === 'refused' || result === 'forbidden_isolated') return false;
@@ -4730,6 +4791,9 @@ async function requestDormantSessionWake(
   | { ok: true }
   | { ok: false; error: string }
 > {
+  const primaryError = primaryLocalLifecycleMutationError('wake');
+  if (primaryError) return { ok: false, error: primaryError };
+
   const online = listOnlineDaemons();
   const daemon = session.larkAppId
     ? online.find(d => d.larkAppId === session.larkAppId)
@@ -5343,12 +5407,24 @@ async function cmdList(): Promise<void> {
     }
     return closed;
   };
-  // Scratches: close silently — they were placeholders, not dead sessions.
-  await closeNow(prunedScratch, 'scratch');
-  if (pruned.length > 0) {
-    const prunedCount = await closeNow(pruned, 'real');
-    if (prunedCount > 0) {
-      console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+  const primaryMode = localCliCoordinationMode() === 'primary';
+  if (primaryMode) {
+    // Keep `list` read-only in primary mode. These rows come from the Pod-local
+    // store, so even an apparently harmless scratch cleanup could close only
+    // the local row while PostgreSQL keeps the canonical Session active.
+    live.push(...prunedScratch, ...pruned);
+    const skipped = prunedScratch.length + pruned.length;
+    if (skipped > 0) {
+      console.warn(`⚠️ primary coordination 下已跳过 ${skipped} 个本地会话的自动清理；本次仅展示，不修改状态。`);
+    }
+  } else {
+    // Scratches: close silently — they were placeholders, not dead sessions.
+    await closeNow(prunedScratch, 'scratch');
+    if (pruned.length > 0) {
+      const prunedCount = await closeNow(pruned, 'real');
+      if (prunedCount > 0) {
+        console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+      }
     }
   }
 
@@ -5372,6 +5448,8 @@ async function cmdList(): Promise<void> {
 }
 
 async function cmdDelete(): Promise<void> {
+  rejectPrimaryLocalLifecycleMutation('delete');
+
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux delete <session-id|all>');
@@ -5498,6 +5576,8 @@ async function cmdSuspend(): Promise<void> {
     console.error('              下次冷启动由 provisioning 自动同步最新登录凭证）');
     process.exit(1);
   }
+
+  if (!dryRun) rejectPrimaryLocalLifecycleMutation('suspend');
 
   const sessions = loadSessions();
   let matched = [...sessions.values()].filter(s => s.status === 'active');
@@ -5665,7 +5745,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -6131,6 +6211,11 @@ async function readCardUsageSnapshotForSend(
   session: SessionData,
   larkAppId: string,
 ): Promise<CardUsageSnapshot> {
+  const configuredRuntime: CardUsageSnapshot = {
+    context: null, tokens: null,
+    ...(session.model?.trim() ? { model: session.model.trim() } : {}),
+    ...(session.reasoningEffort?.trim() ? { reasoningEffort: session.reasoningEffort.trim() } : {}),
+  };
   let daemonPort: number | undefined;
   try {
     daemonPort =
@@ -6149,7 +6234,7 @@ async function readCardUsageSnapshotForSend(
       if (response.ok) {
         const body = await response.json() as { usage?: unknown };
         const normalized = normalizeCardUsageSnapshot(body.usage);
-        if (normalized) return normalized;
+        if (normalized) return { ...configuredRuntime, ...normalized };
       }
     } catch {
       // No host secret, old daemon, timeout, or transient IPC failure: use the
@@ -6161,9 +6246,9 @@ async function readCardUsageSnapshotForSend(
   // explicitly from the worker because bots.json is intentionally unreadable.
   // This send path renders into the reply-card FOOTER, so only the 'footer'
   // display mode surfaces usage here; 'streaming' shows it on the daemon's live
-  // card (absent on this offline fallback) and 'off' shows nothing.
+  // card (absent on this offline fallback). Runtime identity remains visible.
   if (resolveUsageDisplay(larkAppId) !== 'footer') {
-    return { context: null, tokens: null };
+    return configuredRuntime;
   }
 
   try {
@@ -6184,11 +6269,11 @@ async function readCardUsageSnapshotForSend(
     // 非空才带 key；读取失败不影响 transcript 用量。
     try {
       const quota = toCardQuota(readStatuslineSnapshot(resolveDataDir(), session.sessionId));
-      if (quota) return { ...snapshot, quota };
+      if (quota) return { ...configuredRuntime, ...snapshot, quota };
     } catch { /* best-effort */ }
-    return snapshot;
+    return { ...configuredRuntime, ...snapshot };
   } catch {
-    return { context: null, tokens: null };
+    return configuredRuntime;
   }
 }
 
@@ -6534,6 +6619,8 @@ async function cmdWorkflowGrant(runId: string | undefined, rest: string[]): Prom
 }
 
 async function cmdResume(): Promise<void> {
+  rejectPrimaryLocalLifecycleMutation('resume');
+
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux resume <session-id|prefix>');
@@ -6627,6 +6714,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ 恢复过程中会话被关闭，本次 resume 已取消。');
   } else if (errCode === 'workspace_retired') {
     console.error('❌ 该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。');
+  } else if (errCode === 'codex_unarchive_failed') {
+    console.error('❌ Codex 解除归档失败，会话保持 closed；请稍后重试恢复。');
   } else if (errCode === 'resume_start_failed') {
     console.error('❌ 远程后端恢复进程未能启动，会话已恢复为 closed；请稍后重试。');
   } else if (errCode === 'resume_reconciliation_required') {
@@ -8934,7 +9023,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     process.exit(2);
   }
   const allowedFlags = new Set([
-    '--title', '--bot-app', '--chat-id', '--steer',
+    '--title', '--bot-app', '--chat-id', '--into', '--steer',
     '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
   ]);
   const unsupportedFlags = [...new Set(rest
@@ -8952,6 +9041,27 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     }));
     process.exit(2);
   }
+  // `--into` (append to an existing topic) is relayed as ONE bounded `om_` id.
+  // The host re-exec runs the ordinary dispatch path, whose daemon delivery
+  // route re-resolves the root's real chat and refuses it unless it equals the
+  // validated target chat (dispatch_chat_mismatch) — the thread and the chat
+  // are never two independently authorized targets. Reject ambiguity here so
+  // a duplicate cannot be resolved differently on either side of the relay.
+  const intoTokens = rest.filter(token => token === '--into' || token.startsWith('--into='));
+  const parsedRelayArgs = parseDispatchArgs(rest);
+  const intoRoot = parsedRelayArgs.ok ? parsedRelayArgs.value.into?.trim() : undefined;
+  if (intoTokens.length > 1 || (intoTokens.length === 1
+    && (!intoRoot || !/^om_[A-Za-z0-9_-]{1,128}$/.test(intoRoot)))) {
+    console.error(JSON.stringify({
+      success: false,
+      sourceSessionId: sid,
+      transportState: 'failed',
+      acceptanceState: 'not_requested',
+      errorCode: 'INVALID_DISPATCH_ROOT',
+      detail: 'sandbox dispatch --into takes exactly one om_ topic root message id',
+    }));
+    process.exit(2);
+  }
   const briefFile = argValue(rest, '--brief-file');
   let brief = argValue(rest, '--brief') ?? '';
   if (briefFile) {
@@ -8965,6 +9075,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   for (const flag of ['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate'] as const) {
     for (const value of argValues(rest, flag)) flags.push(flag, value);
   }
+  if (intoRoot) flags.push('--into', intoRoot);
   if (rest.includes('--steer')) flags.push('--steer');
   const id = randomBytes(8).toString('hex');
   const contentBase = `${id}.content`;
@@ -10136,7 +10247,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // that contract again at the final CLI boundary so a forged flag cannot turn
   // this path into cross-chat delivery or a richer platform side effect.
   if (remoteRunnerOutbound) {
-    const mentionDecisionCount = Number(mentionBack) + Number(noMention);
+    const mentionDecisionCount = Number(mentionBack)
+      + Number(noMention)
+      + Number(mentionArgs.length > 0);
     if (!trustedRelayCtx
       || trustedRelayCtx.sessionId !== sid
       || !currentTurnId
@@ -10151,9 +10264,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined || noQuote
       || customCardRequested || asVoice || isSlashSend || asChoice || replyLayout
       || files.length > 0 || videos.length > 0 || videoCovers.length > 0
-      || mentionArgs.length > 0 || mentionDecisionCount !== 1
+      || mentionDecisionCount !== 1
       || attention.requested || urgent.requested || expectedLinks.length > 0) {
-      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown/images with one none/requester mention decision');
+      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown/images with one none/requester/explicit mention decision');
       process.exit(2);
     }
   }
@@ -12150,7 +12263,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const footer = buildReplyCardFooter({
         brand: footerBrand,
         recipientOpenIds: footerRecipients,
-        usage: usageSnapshot,
+        usage: shouldRenderBrand ? usageSnapshot : { ...usageSnapshot, model: undefined },
         locale: localeForBot(appId),
       });
       // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
@@ -12363,6 +12476,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
+      let indexError: unknown;
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
@@ -12395,8 +12509,39 @@ async function cmdSend(rest: string[]): Promise<void> {
           context: { ...(resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) } : {}) },
         });
       } catch (error) {
+        indexError = error;
+      }
+      if (indexError !== undefined) {
+        // An isolated CLI (bwrap relay / macOS read isolation) cannot open the
+        // shared feedback store — it holds every bot's rows — so hand the row
+        // to the daemon, which derives it from the live session. Same test as
+        // postSessionCliIpc: a relay env or no readable host secret.
+        let isolated = !!process.env.BOTMUX_SEND_RELAY;
+        if (!isolated) {
+          try { loadDaemonIpcSecret(); } catch { isolated = true; }
+        }
+        const deliveryIpcPort = isolated
+          ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+          : undefined;
+        // The daemon binds the row to the capability's turn and the session's
+        // own chat; an unbound turn or a cross-chat publish has nothing there
+        // to correlate against.
+        if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId) {
+          try {
+            const res = await postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text });
+            if (!res.ok) {
+              const detail = await res.json().catch(() => undefined) as { error?: string } | undefined;
+              throw new Error(detail?.error ?? `HTTP ${res.status}`);
+            }
+            indexError = undefined;
+          } catch (error) {
+            indexError = error;
+          }
+        }
+      }
+      if (indexError !== undefined) {
         console.error(
-          `botmux send: turn delivery indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
+          `botmux send: turn delivery indexing failed after delivery: ${indexError instanceof Error ? indexError.message : String(indexError)}`,
         );
       }
     }
@@ -12958,7 +13103,9 @@ async function cmdAuth(rest: string[]): Promise<void> {
         process.exitCode = 1;
         return;
       }
-      const authBody = parsed.command === 'request' ? { scopes: parsed.scopes } : { requestId: parsed.requestId };
+      const authBody = parsed.command === 'request'
+        ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
+        : { requestId: parsed.requestId };
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {
@@ -13004,7 +13151,9 @@ async function postCurrentSessionDaemonRoute(input: {
   sessionId: string;
   larkAppId: string;
   body: Record<string, unknown>;
-  originClaim?: ManagedOriginCapabilityClaim;
+  /** A caller-frozen origin claim. `null` = frozen as "no claim" (never re-read);
+   *  omitted = read the current capability for this request (legacy callers). */
+  originClaim?: ManagedOriginCapabilityClaim | null;
   signal?: AbortSignal;
 }): Promise<Response> {
   const relayDir = process.env.BOTMUX_SEND_RELAY;
@@ -13024,12 +13173,14 @@ async function postCurrentSessionDaemonRoute(input: {
       signal: input.signal,
     }, hostSecret);
   }
-  const originClaim = input.originClaim ?? readManagedOriginCapability(
-    resolveDataDir(),
-    input.sessionId,
-    relayDir,
-    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-  );
+  const originClaim = input.originClaim !== undefined
+    ? input.originClaim ?? undefined
+    : readManagedOriginCapability(
+        resolveDataDir(),
+        input.sessionId,
+        relayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      );
   return loopbackFetch(`http://127.0.0.1:${port}${input.path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -13048,6 +13199,7 @@ async function trySyncProjectDispatch(input: {
   sessionId: string;
   larkAppId: string;
   action: ReturnType<typeof buildProjectDispatchSyncAction>;
+  originClaim?: ManagedOriginCapabilityClaim | null;
 }): Promise<boolean> {
   try {
     const response = await postCurrentSessionDaemonRoute({
@@ -13055,6 +13207,7 @@ async function trySyncProjectDispatch(input: {
       sessionId: input.sessionId,
       larkAppId: input.larkAppId,
       body: { ...input.action },
+      ...(input.originClaim !== undefined ? { originClaim: input.originClaim } : {}),
     });
     const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
     if (response.ok && body.ok) return true;
@@ -13074,6 +13227,7 @@ async function assertProjectDispatchPolicy(input: {
   hasLegacyBots: boolean;
   title: string;
   existingDispatch: boolean;
+  originClaim?: ManagedOriginCapabilityClaim | null;
 }): Promise<void> {
   const response = await postCurrentSessionDaemonRoute({
     path: `/api/sessions/${encodeURIComponent(input.sessionId)}/project-dispatch-policy`,
@@ -13086,6 +13240,7 @@ async function assertProjectDispatchPolicy(input: {
       title: input.title,
       existingDispatch: input.existingDispatch,
     },
+    ...(input.originClaim !== undefined ? { originClaim: input.originClaim } : {}),
   });
   const body = await response.json().catch(() => ({})) as {
     ok?: boolean;
@@ -13110,6 +13265,36 @@ async function resolveDispatchThreadId(larkAppId: string, rootMessageId: string)
   } catch {
     return null;
   }
+}
+
+/** Immutable snapshot of the caller's managed-origin claim (null for a host
+ *  caller, which has no channel/relay and authenticates as trusted host). */
+function freezeDispatchOriginClaim(sessionId: string): ManagedOriginCapabilityClaim | null {
+  const claim = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  );
+  return claim ? Object.freeze({ ...claim }) : null;
+}
+
+/** Dispatch options the host relay deliberately refuses (see relayDispatch's
+ *  allowlist). In a credential-only pane these select the direct path. */
+function credentialOnlyDirectDispatchOptions(args: {
+  bots: readonly string[];
+  repo?: string;
+  standby: boolean;
+  model?: string;
+  reasoningEffort?: string;
+}): string[] {
+  return [
+    ...(args.bots.length > 0 ? ['--bot'] : []),
+    ...(args.repo !== undefined ? ['--repo'] : []),
+    ...(args.standby ? ['--standby'] : []),
+    ...(args.model !== undefined ? ['--model'] : []),
+    ...(args.reasoningEffort !== undefined ? ['--reasoning-effort'] : []),
+  ];
 }
 
 async function cmdDispatch(rest: string[]): Promise<void> {
@@ -13173,6 +13358,33 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       detail: '多话题协作已关闭，不能新建子项目话题。可在 Dashboard 设置中开启，或使用 botmux dispatch --into <话题根消息id> 追加到已有话题。',
     }));
     process.exit(2);
+  }
+  // A credential-only pane (BOTMUX_SEND_RELAY_SCOPE=send, set by its own bwrap
+  // wrapper) has two partial dispatch paths, so route by shape:
+  //  · relay — the host re-exec holds the dashboard secret and sets up the
+  //    talk-only chat grants `--bot-app` needs (`.dashboard-secret` is masked
+  //    in this pane, so a direct `--bot-app` dies in ensureLocalBotCollaboration);
+  //  · direct — the relay deliberately refuses the legacy/governed options
+  //    (--bot, --repo, --standby, --model, --reasoning-effort); their direct
+  //    path needs no masked secret (bots.json + the managed-origin capability
+  //    are readable here) and is exactly the pre-relay behaviour.
+  // `--bot-app` mixed with a direct-only option fits neither, so refuse it
+  // explicitly instead of failing deep inside the grant step. The full sandbox
+  // never sets the scope marker and keeps its relay-only dispatch unchanged.
+  if (process.env.BOTMUX_SEND_RELAY_SCOPE === 'send' && process.env.BOTMUX_SEND_RELAY) {
+    const directOnly = credentialOnlyDirectDispatchOptions(dispatchArgs);
+    if (directOnly.length > 0 && dispatchArgs.botApps.length > 0) {
+      console.error(JSON.stringify({
+        success: false,
+        transportState: 'failed',
+        acceptanceState: 'not_requested',
+        errorCode: 'ROUTING_NOT_SUPPORTED',
+        detail: `credential-only dispatch: --bot-app is relayed to the host, which does not accept ${directOnly.join(', ')}; `
+          + 'use either --bot-app (stable App ID) or the legacy --bot form, not both',
+      }));
+      process.exit(2);
+    }
+    if (directOnly.length > 0) delete process.env.BOTMUX_SEND_RELAY;
   }
   const dispatchRelayDir = process.env.BOTMUX_SEND_RELAY;
   if (dispatchRelayDir) {
@@ -13291,6 +13503,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
   }
+  // Freeze ONE origin claim for this whole dispatch BEFORE its first await. An
+  // isolated caller authenticates every daemon request with it; re-reading the
+  // rotating capability per request would let a dispatch that straddles a turn
+  // interruption register its seed as turn N and then deliver the kickoff as
+  // turn N+1 (with N+1's output sink). With the claim frozen, the daemon
+  // refuses every request after a rotation (claim ≠ live capability). Hosts
+  // read no claim (null) and keep their trusted-host authentication.
+  const dispatchOriginClaim = freezeDispatchOriginClaim(sid);
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
@@ -13312,12 +13532,35 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     rootMessageId: dispatchOrigin.rootMessageId, replyTargetRootId: dispatchTurn?.rootMessageId,
     replyTargetTurnId: dispatchTurn?.turnId, replyTargetQuoteOnly: dispatchTurn?.quoteOnly, currentTurnId: dispatchTurnId,
   });
+  // Origin-revocation fence for this CLI's OWN provider write (the `/repo`
+  // prime goes straight to Lark): an isolated caller re-presents the SAME frozen
+  // claim to the daemon right before writing. A rotated/revoked capability or a
+  // settled turn (output-sink rule) refuses the write. Host callers: no-op.
+  const assertDispatchOriginLive = async (): Promise<void> => {
+    if (!dispatchOriginClaim) return;
+    try {
+      await assertProjectDispatchPolicy({
+        sessionId: sid,
+        larkAppId: s.larkAppId!,
+        targetChatId,
+        targetAppIds: parsedBotApps.map(item => item.appId),
+        hasLegacyBots: legacyBots.length > 0,
+        title: title.trim(),
+        existingDispatch: !!intoRoot,
+        originClaim: dispatchOriginClaim,
+      });
+    } catch (error) {
+      throw new Error(`dispatch origin changed before provider effect: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const dispatchWriteOptions = { beforeWrite: async () => {
+    await assertDispatchOriginLive();
     const { getBot } = await import('./bot-registry.js');
     if (getBot(dispatchSourceAppId).config.topicUnavailablePolicy !== 'stop' || dispatchSource.mode === 'plain') return;
     const { getMessageDetail } = await import('./im/lark/client.js');
     await assertMessageTopicAvailable(dispatchSourceAppId, dispatchSource.rootMessageId,
       (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+    await assertDispatchOriginLive();
   } };
 
   const targetChatId = overrideChatId ?? s.chatId;
@@ -13380,6 +13623,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       hasLegacyBots: legacyBots.length > 0,
       title: title.trim(),
       existingDispatch: !!intoRoot,
+      originClaim: dispatchOriginClaim,
     });
   } catch (error) {
     console.error(`dispatch 不符合当前群的协作模式: ${error instanceof Error ? error.message : String(error)}`);
@@ -13528,7 +13772,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const deliverKickoff = async (rootId: string, content: string): Promise<string> => {
     const response = await postCurrentSessionDaemonRoute({
-      path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId,
+      path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId, originClaim: dispatchOriginClaim,
       body: { rootId, chatId: targetChatId, content,
         targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0,
         ...(delegateScheduleCreate ? { delegateScheduleCreate: true } : {}),
@@ -13575,6 +13819,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         missingBotAppIds: acceptance?.missingBotAppIds,
       });
       const projectSynced = await trySyncProjectDispatch({
+        originClaim: dispatchOriginClaim,
         sessionId: sid,
         larkAppId: s.larkAppId,
         action: buildProjectDispatchSyncAction({
@@ -13616,6 +13861,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       path: DISPATCH_REPORT_REGISTER_ROUTE,
       sessionId: sid,
       larkAppId: s.larkAppId,
+      originClaim: dispatchOriginClaim,
       body: {
         seedText: built.seedText,
         targetChatId,
@@ -13701,6 +13947,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       missingBotAppIds: acceptance?.missingBotAppIds,
     });
     const projectSynced = await trySyncProjectDispatch({
+        originClaim: dispatchOriginClaim,
       sessionId: sid,
       larkAppId: s.larkAppId,
       action: buildProjectDispatchSyncAction({
@@ -13758,6 +14005,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         errorCode: 'TRANSPORT_FAILED',
       });
       await trySyncProjectDispatch({
+        originClaim: dispatchOriginClaim,
         sessionId: sid,
         larkAppId: s.larkAppId,
         action: buildProjectDispatchSyncAction({
@@ -16597,6 +16845,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
+  else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the

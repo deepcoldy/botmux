@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows, readPersistedSessionRows } from './helpers/session-store-disk.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from '../src/core/managed-origin-capability.js';
 import { MANAGED_ORIGIN_PROOF_DOMAIN, writeManagedOriginAttestationProof, type ManagedOriginAttestation } from '../src/core/managed-origin-attestation.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
@@ -68,8 +69,8 @@ async function managed(
   } });
   let calls = 0;
   const server = createServer(async (req, res) => {
-    let body = ''; for await (const chunk of req) body += chunk;
-    const request = JSON.parse(body);
+    const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+    if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
     const proof: ManagedOriginAttestation = { sessionId: sid, turnId: managedTurnId, callerOpenId: 'ou_owner',
       larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' } };
     calls++;

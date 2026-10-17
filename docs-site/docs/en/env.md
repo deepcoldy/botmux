@@ -16,6 +16,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 | `SESSION_DATA_DIR` | `~/.botmux/data` | Session and queue storage directory |
 | `BACKEND_TYPE` | _(default tmux)_ | Explicitly set `pty` to fall back to a pure pty backend (the default is always tmux — no auto-fallback to pty; an unavailable tmux hard-gates with a card). pty doesn't survive daemon restarts |
 | `BOTMUX_FORWARD_FOLLOWUP_WAIT_MS` | `1500` | Milliseconds to hold a new topic for a root-linked clarification from the same user in the same chat; `0` disables it, maximum `10000` |
+| `BOTMUX_ALLOW_UNKNOWN_SCOPES` | _(unset)_ | Set to `1` to allow requesting Feishu scopes not yet included in `lark-scopes.json` (syntax validation only). Serves as an escape hatch when Feishu adds new scopes before a new botmux release. |
 | `DEBUG` | _(unset)_ | Set to `1` to enable debug logging |
 | `GITHUB_TOKEN` | _(unset)_ | Auth token for GitHub Releases API requests made by botmux itself, including dashboard changelog, update checks, and restart-report. Takes precedence over `GH_TOKEN`. |
 | `GH_TOKEN` | _(unset)_ | Fallback auth token for GitHub Releases API requests. Used only when `GITHUB_TOKEN` is unset. |

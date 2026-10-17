@@ -16,6 +16,10 @@ export interface PendingCliInput {
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  /** Open id of the human whose turn this is. The worker publishes it beside
+   *  the live-turn marker so the identity wrapper can keep a same-principal
+   *  credential across consecutive turns. */
+  turnCallerOpenId?: string;
   codexAppDispatchId?: string;
   /** Explicit positive steer authorization copied from the daemon ledger entry
    * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */

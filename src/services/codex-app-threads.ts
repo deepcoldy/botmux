@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from '../adapters/cli/registry.js';
 import { JsonRpcStdioCore } from '../utils/jsonrpc-stdio.js';
 
@@ -715,4 +715,35 @@ export async function readCodexAppThreadMetadata(
   } finally {
     client.close();
   }
+}
+
+/** Official app-server lifecycle RPC. Read the persisted path first to make
+ * retries idempotent and to prove the exact storage scope before mutation. */
+export async function setCodexAppThreadArchived(opts: {
+  threadId: string; codexHome: string; codexBin: string; archived: boolean;
+  env?: NodeJS.ProcessEnv; timeoutMs?: number;
+}): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 3000;
+  const client = new CodexAppServerProbe(resolveCommand(opts.codexBin), opts.codexHome,
+    { ...opts.env, CODEX_HOME: opts.codexHome });
+  try {
+    await client.initialize(timeoutMs);
+    const result = await client.withTimeout(client.request('thread/read', {
+      threadId: opts.threadId, includeTurns: false,
+    }), timeoutMs, 'thread/read');
+    if (result?.thread?.id !== opts.threadId || typeof result.thread.path !== 'string') {
+      throw new Error('Codex thread identity/path unavailable');
+    }
+    const home = realpathSync(opts.codexHome);
+    const path = realpathSync(result.thread.path);
+    const inside = (name: string): boolean => {
+      const rel = relative(join(home, name), path);
+      return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+    };
+    const archived = inside('archived_sessions');
+    if (!archived && !inside('sessions')) throw new Error('Codex thread is outside the frozen session home');
+    if (archived === opts.archived) return;
+    const method = opts.archived ? 'thread/archive' : 'thread/unarchive';
+    await client.withTimeout(client.request(method, { threadId: opts.threadId }), timeoutMs, method);
+  } finally { client.close(); }
 }

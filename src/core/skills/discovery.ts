@@ -1,9 +1,9 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import type { CliId } from '../../adapters/cli/types.js';
-import { loadSkillPackage } from './package.js';
+import { isPathWithin, loadSkillPackage } from './package.js';
 import type { SkillPackage } from './types.js';
 
 export interface NativeCliSkillGroup {
@@ -134,6 +134,12 @@ export function discoverNativeCliSkillGroups(cliIds: readonly CliId[]): NativeCl
 }
 
 export function discoverProjectSkills(workingDir: string): SkillPackage[] {
+  let projectRoot: string;
+  try {
+    projectRoot = realpathSync(workingDir);
+  } catch {
+    return [];
+  }
   const roots = [
     join(workingDir, '.agents', 'skills'),
     join(workingDir, '.botmux', 'skills'),
@@ -142,7 +148,9 @@ export function discoverProjectSkills(workingDir: string): SkillPackage[] {
   for (const root of roots) {
     for (const dir of listSkillDirs(root)) {
       try {
-        out.push(loadSkillPackage(dir, { source: { type: 'project', root: dir } }));
+        const skill = loadSkillPackage(dir, { source: { type: 'project', root: dir } });
+        if (!isPathWithin(projectRoot, skill.rootDir)) continue;
+        out.push(skill);
       } catch {
         // Bad project-local skills should surface through diagnostics later, not break spawn.
       }

@@ -60,6 +60,7 @@
 | `envPolicy` | 显式进程继承策略：默认 inherit；strict 只保留运行基线、获准名称和本 bot env（见下文）。 |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
+| `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`，详见下方说明 |
 

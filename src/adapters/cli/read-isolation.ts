@@ -168,7 +168,17 @@ export type CredentialOnlyIsolationGate =
   | { required: true; mode: 'blocked'; failClosedReason: string };
 
 /** Mandatory device-credential isolation is independent of the optional bot
- * sandbox toggle: once enrolled, every local child must be confined. */
+ * sandbox toggle: once enrolled, every local child must be confined.
+ *
+ * Threat model / known boundary: this isolation (credential-only included)
+ * keeps an agent from INADVERTENTLY reading device credentials. It is not a
+ * code-integrity boundary against a malicious agent. A credential-only pane
+ * has `/` writable, so it can modify this install's built CLI (`dist/cli.js`)
+ * and its dependencies; the host relay watcher re-executes that CLI outside
+ * the pane, and the daemon executes the same files on its next worker/CLI
+ * spawn. That held before the relay existed — the relay adds no capability.
+ * Code-integrity needs the full file sandbox (read-only install tree) or a
+ * remote backend. See docs/file-sandbox.md「仅凭据隔离」. */
 export function evaluateCredentialOnlyIsolationGate(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
@@ -365,7 +375,18 @@ export function buildSeatbeltProfile(
 // Linux. Warm reattach would retain the old lexical env/mount namespace split.
 // 15 adds an inherited Linux seccomp isolation probe. Existing processes cannot
 // acquire it on warm reattach and must cold-spawn under the new contract.
-export const ISOLATION_PANE_MARKER_VERSION = 15;
+// 16 gives a Linux credential-only pane a read-WRITE relay outbox bind plus
+// BOTMUX_SEND_RELAY in its startup env. Inside that flavour `botmux send` had no
+// satisfiable authority: the inherited seccomp probe (and `--unshare-pid`) force
+// the read-isolated arm, whose data-root locator is never written on Linux AND
+// would be masked to /dev/null by this flavour's own `.dashboard-secret.*`
+// enumeration. A v15 pane carries neither the mount nor the env, so a warm
+// reattach would keep failing every send; it must cold-spawn once.
+// 17 adds BOTMUX_SEND_RELAY_SCOPE=send to the credential-only pane's wrapper env
+// (cmdDispatch routes by shape on it). A v16 pane never got it, so a warm
+// reattach would keep refusing the legacy --bot / --repo / --standby dispatch
+// forms; it must cold-spawn once.
+export const ISOLATION_PANE_MARKER_VERSION = 17;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

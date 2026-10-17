@@ -15,6 +15,7 @@ import {
   orderedFooterRecipients,
   pickBotEntryByName,
   stripCodeSpans,
+  codeSpanRanges,
 } from '../src/utils/bot-routing.js';
 
 type Entry = { larkAppId: string; botName: string | null };
@@ -305,5 +306,33 @@ describe('stripCodeSpans', () => {
 
   it('leaves an unbalanced stray backtick harmless (name still in prose)', () => {
     expect(hasAt('这里有个 ` 未闭合，@Codex 仍要 @', 'Codex')).toBe(true);
+  });
+
+  // Previous two-regex form of stripCodeSpans; the range-based one must agree.
+  const legacyStrip = (text: string) => text
+    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
+    .replace(/(`+)[\s\S]*?\1/g, ' ');
+
+  it('keeps stripCodeSpans identical to the previous two-pass regex form', () => {
+    for (const text of [
+      '',
+      'plain @Codex',
+      '`a` b ``c`` d',
+      '```\nx\n``` y `z`',
+      '~~~\n@C\n~~~ ~~strike~~',
+      'stray ` then ```\nfence\n``` and ` again',
+      '`` ` `` and ```js\n`inner`\n```',
+      'open ``` never closed `x`',
+      '```\nx\n```' + '`y`' + '`z`',
+    ]) {
+      expect(stripCodeSpans(text)).toBe(legacyStrip(text));
+    }
+  });
+});
+
+describe('codeSpanRanges', () => {
+  it('returns sorted [start, end) offsets for inline spans and fences', () => {
+    const text = 'a `x` b\n```\ny\n```\nc';
+    expect(codeSpanRanges(text)).toEqual([[2, 5], [8, 17]]);
   });
 });

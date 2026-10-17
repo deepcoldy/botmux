@@ -206,6 +206,18 @@ describe('built-in skill catalog', () => {
     expect(entries.find((e) => e.name === 'botmux-send')?.description).toContain('向飞书话题发送消息');
   });
 
+  it('adds the persistent-schedule boundary only to Remote Runner catalogs', () => {
+    const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: false });
+    const remote = buildBuiltinSkillCatalogBlock(entries, 'en', { remoteRunner: true });
+    const local = buildBuiltinSkillCatalogBlock(entries, 'en');
+
+    expect(remote).toContain('temporary Remote Runner environment');
+    expect(remote).toContain('MUST use the persistent `botmux schedule`');
+    expect(remote).toContain('cron_create');
+    expect(local).not.toContain('temporary Remote Runner environment');
+    expect(local).not.toContain('cron_create');
+  });
+
   it('keeps catalog prose as escaped text instead of nested XML-like tags', () => {
     for (const locale of [undefined, 'en'] as const) {
       const block = buildBuiltinSkillCatalogBlock([{
@@ -268,6 +280,11 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
   });
 
   const prompt = () => buildNewTopicPrompt('hi', 'sess-1', 'codex');
+  const remotePrompt = () => buildNewTopicPrompt(
+    'hi', 'sess-remote', 'remote-runner', undefined, undefined, undefined, undefined, undefined,
+    { name: 'Bot', openId: 'ou_bot' }, 'en', undefined,
+    { larkAppId: APP, chatId: 'oc_remote', sessionBackendType: 'remote-runner' },
+  );
 
   it('prompt mode (default) inlines complex send discovery plus additional skills', () => {
     const p = prompt();
@@ -304,6 +321,18 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
     expect(p).not.toContain('botmux --help');
     expect(p).not.toContain('- botmux-send:');
   });
+
+  it.each(['off', 'global'] as const)(
+    'Remote Runner forces only the schedule metadata even when builtin injection is %s',
+    mode => {
+      writeConfig({ skills: { builtinInjection: mode } });
+      const p = remotePrompt();
+      expect(p).toContain('- botmux-schedule:');
+      expect(p).toContain('temporary Remote Runner environment');
+      expect(p).not.toContain('- botmux-send:');
+      expect(p).not.toContain('- botmux-ask:');
+    },
+  );
 });
 
 describe('botmux skills injection (machine-wide setter)', () => {

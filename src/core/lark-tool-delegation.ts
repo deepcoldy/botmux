@@ -1,9 +1,20 @@
 import type { DelegatedCliIdentity } from './turn-cli-identity.js';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 // Daemon-local references to identities already verified by the existing
 // signed-dispatch flow. No credentials or CLI-provided identity enter here.
 const sessions = new Map<string, Map<string, DelegatedCliIdentity>>();
-const sessionKey = (dataDir: string, sessionId: string) => JSON.stringify([dataDir, sessionId]);
+
+function canonicalDataDir(dir: string): string {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return resolve(dir);
+  }
+}
+
+const sessionKey = (dataDir: string, sessionId: string) => JSON.stringify([canonicalDataDir(dataDir), sessionId]);
 
 export function rememberLarkToolDelegation(
   dataDir: string, sessionId: string, turnId: string | undefined, identity?: DelegatedCliIdentity,
