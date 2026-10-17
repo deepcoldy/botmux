@@ -56,3 +56,6 @@ test-bots.json
 
 # tmux 客户端调试日志（曾被误提交）
 tmux-client-*.log
+botmux-local
+botmux-local.map
+botmux-test

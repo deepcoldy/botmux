@@ -697,6 +697,7 @@ export function buildReplyCardFooter(opts: {
   executionDurationMs?: number;
   waitingDurationMs?: number;
   locale?: Locale;
+  hideSentTo?: boolean;
 }): ReplyCardFooter | null {
   const parts: string[] = [];
   const brandSeg = brandFooterSegment(opts.brand);
@@ -719,7 +720,7 @@ export function buildReplyCardFooter(opts: {
     parts.push(t('card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
   }
   const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
-  const hasRecipient = recipientOpenIds.length > 0;
+  const hasRecipient = recipientOpenIds.length > 0 && !opts.hideSentTo;
   if (hasRecipient) {
     parts.push(
       `${t('card.sent_to', undefined, opts.locale)}`
@@ -1574,6 +1575,7 @@ export function buildCanonicalFinalReplyCard(opts: {
   usage?: CardUsageSnapshot;
   executionDurationMs?: number;
   waitingDurationMs?: number;
+  hideSentTo?: boolean;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1585,6 +1587,7 @@ export function buildCanonicalFinalReplyCard(opts: {
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
+    hideSentTo: opts.hideSentTo,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
   const card = createReplyCard(elements);
@@ -1636,6 +1639,7 @@ export function buildContextualReplyCard(opts: {
   executionDurationMs?: number;
   waitingDurationMs?: number;
   feedback?: { policy: FeedbackPolicy };
+  hideSentTo?: boolean;
 }): string {
   const {
     title,
@@ -1685,6 +1689,7 @@ export function buildContextualReplyCard(opts: {
     locale,
     executionDurationMs: opts.executionDurationMs,
     waitingDurationMs: opts.waitingDurationMs,
+    hideSentTo: opts.hideSentTo,
   });
   if (footer) {
     elements.push({ tag: 'hr' });

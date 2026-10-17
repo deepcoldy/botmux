@@ -61,6 +61,8 @@ export interface BotCardPrefs {
   hiddenStreamingCardButtons: StreamingCardButtonId[];
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
+  /** Hide the "发送给：@xxx" recipient line from the reply card footer. Default false. */
+  hideSentToFooter: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
    * legacy full-prompt UserMessage; true moves Botmux metadata to hidden
    * app-server context for newly dispatched turns. */
@@ -128,6 +130,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
+      hideSentToFooter: c.hideSentToFooter === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
       codexBrowser: c.codexBrowser?.enabled === true,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
@@ -160,6 +163,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       hiddenStreamingCardButtons: [],
       pinStreamingCard: false,
       silentTurnReactions: false,
+      hideSentToFooter: false,
       codexAppCleanInput: false,
       codexBrowser: false,
       thinkingCardToolResult: true,
@@ -279,6 +283,7 @@ async function updateBotCardPrefsInternal(
     applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
+    apply(entry, 'hideSentToFooter', patch.hideSentToFooter);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'codexBrowser', patch.codexBrowser);
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
@@ -315,6 +320,7 @@ async function updateBotCardPrefsInternal(
         hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
+        hideSentToFooter: entry.hideSentToFooter === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
         codexBrowser: entry.codexBrowser === true
           || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),

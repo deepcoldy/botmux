@@ -173,6 +173,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
+    hideSentToFooter: j?.hideSentToFooter === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
     codexBrowser: j?.codexBrowser === true
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),

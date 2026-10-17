@@ -2100,6 +2100,13 @@ export interface BotConfig {
   usageDisplay?: UsageDisplayMode;
   /** Show per-turn waiting and native execution time on final reply cards. Default off. */
   showReplyTiming?: boolean;
+  /**
+   * When true, hide the "发送给：@xxx" recipient line from the reply card footer.
+   * The footer may still show brand, usage, or timing if configured. If all
+   * remaining parts are empty the entire footer (including the HR separator)
+   * is omitted. Default (undefined/false) shows the recipient line.
+   */
+  hideSentToFooter?: boolean;
   tuiSlashAllow?: string[];
   /**
    * When true, suppress the live streaming session card entirely. The web
@@ -4121,6 +4128,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? undefined
         : normalizeUsageDisplay(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
+      hideSentToFooter: entry.hideSentToFooter === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
