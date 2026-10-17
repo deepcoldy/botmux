@@ -137,13 +137,34 @@ function mentionsCompatible(left: CanonicalMention[], right: CanonicalMention[])
   });
 }
 
+const LARK_CARD_UPGRADE_FALLBACK = '请升级至最新版本客户端';
+
+function messageContentsCompatible(
+  left: Pick<CanonicalLarkReceive, 'messageType' | 'content'>,
+  right: Pick<CanonicalLarkReceive, 'messageType' | 'content'>,
+): boolean {
+  if (left.content === right.content) return true;
+  return left.messageType === 'interactive'
+    && right.messageType === 'interactive'
+    && (left.content?.includes(LARK_CARD_UPGRADE_FALLBACK) === true
+      || right.content?.includes(LARK_CARD_UPGRADE_FALLBACK) === true);
+}
+
 function receivePayloadsAreEquivalent(
   left: CanonicalLarkReceive,
   right: CanonicalLarkReceive,
 ): boolean {
-  const { sender: leftSender, mentions: leftMentions, ...leftMessage } = left;
-  const { sender: rightSender, mentions: rightMentions, ...rightMessage } = right;
+  const {
+    sender: leftSender, mentions: leftMentions, content: leftContent, ...leftMessage
+  } = left;
+  const {
+    sender: rightSender, mentions: rightMentions, content: rightContent, ...rightMessage
+  } = right;
   return JSON.stringify(leftMessage) === JSON.stringify(rightMessage)
+    && messageContentsCompatible(
+      { messageType: left.messageType, content: leftContent },
+      { messageType: right.messageType, content: rightContent },
+    )
     && identitiesCompatible(leftSender, rightSender)
     && mentionsCompatible(leftMentions, rightMentions);
 }

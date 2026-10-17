@@ -297,6 +297,77 @@ describe('SQLite durable coordination contract', () => {
       visibleAt: 13,
       createdAt: 13,
     })).toEqual({ kind: 'duplicate' });
+    const cardEventId = 'im.message.receive_v1:cli_test:om_card';
+    const card = {
+      ...mentioned,
+      event: {
+        ...mentioned.event,
+        message: {
+          ...mentioned.event.message,
+          message_id: 'om_card',
+          message_type: 'interactive',
+          content: '{"title":null,"elements":[[{"tag":"text","text":"请升级至最新版本客户端，以查看内容"}]]}',
+        },
+      },
+    };
+    expect(await store.enqueueInbox({
+      eventId: cardEventId,
+      partitionKey,
+      payload: card,
+      visibleAt: 14,
+      createdAt: 14,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: cardEventId,
+      partitionKey,
+      payload: {
+        ...card,
+        event: {
+          ...card.event,
+          message: {
+            ...card.event.message,
+            content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"same card"}]}}',
+          },
+        },
+      },
+      visibleAt: 15,
+      createdAt: 15,
+    })).toEqual({ kind: 'duplicate' });
+    const fullCardEventId = 'im.message.receive_v1:cli_test:om_full_card';
+    const fullCard = {
+      ...card,
+      event: {
+        ...card.event,
+        message: {
+          ...card.event.message,
+          message_id: 'om_full_card',
+          content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"first"}]}}',
+        },
+      },
+    };
+    expect(await store.enqueueInbox({
+      eventId: fullCardEventId,
+      partitionKey,
+      payload: fullCard,
+      visibleAt: 16,
+      createdAt: 16,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: fullCardEventId,
+      partitionKey,
+      payload: {
+        ...fullCard,
+        event: {
+          ...fullCard.event,
+          message: {
+            ...fullCard.event.message,
+            content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"changed"}]}}',
+          },
+        },
+      },
+      visibleAt: 17,
+      createdAt: 17,
+    })).toEqual({ kind: 'conflict' });
     expect(await store.enqueueInbox({
       eventId,
       partitionKey,
