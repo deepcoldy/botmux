@@ -1654,6 +1654,55 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('replays a granted message through the normal route outside durable primary', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA hello after grant' }),
+      messageId: 'msg-grant-replay',
+      chatId: 'chat-grant-replay',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.replayMessageEvent!(data);
+    await vi.waitFor(() => expect(handlers.handleNewTopic).toHaveBeenCalledOnce());
+    runtime.close();
+  });
+
+  it('does not replay a granted message around the durable inbox under durable primary', async () => {
+    // 授权卡落盘后能跨重启恢复：在 disabled/shadow 下发出的卡，daemon 以 primary 重启后被点「授权」，
+    // 重放不能绕过 durable Inbox / canonical Session 所有权直接本地派发。
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary, primaryRecoverySettleMs: 0 },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA hello after grant' }),
+      messageId: 'msg-grant-replay-primary',
+      chatId: 'chat-grant-replay',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.replayMessageEvent!(data);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it('backfills the failover window before releasing realtime primary messages', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();

@@ -145,6 +145,7 @@ export const messages: Record<string, string> = {
   'card.grant.note': 'Access is revoked when either limit is reached. Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (bot admins).',
   'card.grant.toast_owner_only': 'Only a bot admin can do this',
   'card.grant.toast_expired': 'This request has expired',
+  'card.grant.toast_unsaved': 'Could not save the request state; nothing was changed. Please try again later',
   'card.grant.toast_bad_limit': 'Invalid grant limit',
   'card.grant.toast_bad_quota': 'Enter a whole-number message quota from 1 to 1000, or leave it blank for unlimited',
   'card.grant.toast_limit_staged': 'Limit updated; it takes effect after you grant access',

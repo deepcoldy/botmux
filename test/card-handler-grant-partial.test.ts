@@ -52,6 +52,7 @@ async function fresh() {
   const registry = await import('../src/bot-registry.js');
   const pending = await import('../src/im/lark/grant-pending.js');
   const handler = await import('../src/im/lark/card-handler.js');
+  pending._resetForTest(); // grant-pending 落盘：新模块图会读到上个用例的文件
   const bot = registry.registerBot({ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] });
   bot.botOpenId = 'ou_bot';
   bot.resolvedAllowedUsers = ['ou_owner'];

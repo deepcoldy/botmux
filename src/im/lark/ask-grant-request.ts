@@ -14,7 +14,8 @@
  * ACK 预算：card.action.trigger 只有 3s（botmux 用 2500ms 抢答，见 event-dispatcher
  * 的 CARD_ACTION_ACK_TIMEOUT_MS），超时飞书会自己弹「未在线/超时未响应」盖掉我们的
  * toast。所以本模块**同步决策、异步发卡**：判定（配置/owner/节流）和 openPending 都是
- * 纯内存同步操作，取名字 + 发卡走 fire-and-forget，调用方拿到结论立刻 ACK。
+ * 同步操作（至多一次 grant-pending 小文件读写），取名字 + 发卡走 fire-and-forget，调用方
+ * 拿到结论立刻 ACK。卡发出去后 markPendingDelivered，授权卡才扛得过 daemon 重启。
  */
 import { getBot, getOwnerOpenId } from '../../bot-registry.js';
 import { config } from '../../config.js';
@@ -27,7 +28,7 @@ import { listObservedBots } from '../../services/observed-bots-store.js';
 import { logger } from '../../utils/logger.js';
 import { buildGrantCard } from './card-builder.js';
 import { getUserProfile, replyMessage, sendMessage } from './client.js';
-import { clearPending, openPending, throttleReason } from './grant-pending.js';
+import { clearPending, markPendingDelivered, openPending, throttleReason } from './grant-pending.js';
 import { resolveGrantApprover } from './grant-owner.js';
 import { evaluateTalk } from './event-dispatcher.js';
 
@@ -59,6 +60,7 @@ export interface AskGrantRequestDeps {
   throttleReason?: typeof throttleReason;
   openPending?: typeof openPending;
   clearPending?: typeof clearPending;
+  markPendingDelivered?: typeof markPendingDelivered;
   /** 读 bot 配置（额度/有效期默认值 + autoGrantRequestCards 开关）。 */
   getBotConfig?: (larkAppId: string) => {
     autoGrantRequestCards?: boolean;
@@ -95,6 +97,7 @@ export function requestGrantForAskClicker(
   const reasonOf = deps.throttleReason ?? throttleReason;
   const open = deps.openPending ?? openPending;
   const clear = deps.clearPending ?? clearPending;
+  const markDelivered = deps.markPendingDelivered ?? markPendingDelivered;
   const readConfig = deps.getBotConfig ?? ((appId: string) => getBot(appId).config);
   const resolveName = deps.resolveTargetName ?? defaultResolveTargetName;
   const deliver = deps.deliverCard ?? defaultDeliverCard;
@@ -152,7 +155,9 @@ export function requestGrantForAskClicker(
       } catch (err) {
         clear(larkAppId, chatId, clickerOpenId);
         logger.debug(`ask grant request card send failed: ${err}`);
+        return;
       }
+      markDelivered(larkAppId, chatId, [clickerOpenId], nonce);
     })();
 
     return 'sent';
