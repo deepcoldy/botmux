@@ -114,6 +114,85 @@ describe('RemoteRunnerBackend', () => {
     }]);
   });
 
+  it('accepts a final outbound message only after bilateral capability negotiation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message', 'outbound_message_final'],
+    }, 'session-final-outbound');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const delivery = vi.fn(async () => ({
+      outcome: 'delivered' as const,
+      messageId: 'om_final_outbound',
+    }));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<{ text: string; turnId?: string }>(cb => {
+      backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
+    });
+    await backend.submitTurn({ turnId: 'turn-final-outbound', content: 'final-outbound' });
+    await expect(final).resolves.toEqual({ text: '', turnId: 'turn-final-outbound' });
+    expect(delivery).toHaveBeenCalledWith(expect.objectContaining({
+      responseKind: 'final',
+      mention: 'explicit',
+      mentions: ['ou_target:Target'],
+      content: 'final payload',
+    }));
+  });
+
+  it('keeps the provider final when a negotiated final outbound delivery is rejected', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message', 'outbound_message_final'],
+    }, 'session-final-outbound-rejected');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.onOutboundMessage(async () => ({
+      outcome: 'rejected',
+      code: 'outbound_rejected',
+      message: 'rejected for test',
+    }));
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-final-rejected', content: 'final-outbound' });
+    const providerFinal = JSON.parse(await final) as Array<{
+      operationId: string;
+      result: { outcome: string; code?: string };
+    }>;
+    expect(providerFinal).toEqual([{
+      operationId: 'final-operation',
+      result: expect.objectContaining({
+        outcome: 'rejected',
+        code: 'outbound_rejected',
+      }),
+    }]);
+  });
+
+  it('rejects a final outbound message when the host did not require it', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message'],
+    }, 'session-final-outbound-host-disabled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const delivery = vi.fn();
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-final-outbound', content: 'final-outbound' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(delivery).not.toHaveBeenCalled();
+  });
+
   it('returns a host-governed result for a read-only session tool', async () => {
     const backend = new RemoteRunnerBackend(
       { expectedProvider: 'session-tool-test' },
@@ -236,6 +315,35 @@ describe('RemoteRunnerBackend', () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({
       controllerOpenId: 'ou_developer',
       request: { tool: 'schedule.add', schedule: '10m', prompt: 'check' },
+    }));
+  });
+
+  it('accepts the negotiated schedule Actor on a structured mutation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule', 'session_tool_schedule_actor',
+      ],
+    }, 'session-schedule-actor-mutation');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-schedule-actor-mutation', content: 'schedule-actor-mutate' });
+    await final;
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      controllerOpenId: 'ou_developer',
+      request: { tool: 'schedule.remove', taskId: 'a1b2c3d4' },
     }));
   });
 

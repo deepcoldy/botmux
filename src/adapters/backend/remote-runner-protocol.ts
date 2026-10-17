@@ -31,6 +31,7 @@ export const REMOTE_RUNNER_TERMINAL_CAPABILITIES = [
 export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message',
   'outbound_message_explicit_mention',
+  'outbound_message_final',
 ] as const;
 
 /** Optional provider-to-host access to a small BotMux session tool surface.
@@ -127,7 +128,7 @@ export interface RemoteRunnerRecoveredTurn {
   trustedCaller?: RemoteRunnerTrustedCaller;
 }
 
-export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
+export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary' | 'final';
 export type RemoteRunnerOutboundMention = 'none' | 'requester' | 'explicit';
 
 export interface RemoteRunnerOutboundImage {
@@ -136,9 +137,10 @@ export interface RemoteRunnerOutboundImage {
   dataBase64: string;
 }
 
-/** A non-terminal message request emitted by a provider for the active turn.
- * Routing is intentionally absent: BotMux derives the only legal destination
- * from the authenticated session/turn that owns the backend. */
+/** A message request emitted by a provider for the active turn. Routing is
+ * intentionally absent: BotMux derives the only legal destination from the
+ * authenticated session/turn that owns the backend. `final` additionally
+ * requires bilateral `outbound_message_final` negotiation. */
 export interface RemoteRunnerOutboundMessage {
   operationId: string;
   turnId: string;
@@ -350,7 +352,7 @@ export type RemoteRunnerEvent =
       generation: number;
       request: RemoteRunnerSessionToolRequest;
       /** Effective human Actor selected by a trusted provider policy for a
-       * bot-authored schedule.add turn. The host freezes all other scope. */
+       * bot-authored schedule mutation. The host freezes all other scope. */
       controllerOpenId?: string;
     })
   | (RemoteRunnerEventBase & {
@@ -959,7 +961,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         || typeof raw.content !== 'string'
         || !raw.content.trim()
         || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
-        || !['progress', 'auxiliary'].includes(String(raw.responseKind))
+        || !['progress', 'auxiliary', 'final'].includes(String(raw.responseKind))
         || !mentionShapeValid
         || images === undefined) {
       return undefined;

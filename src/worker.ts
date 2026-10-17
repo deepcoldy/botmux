@@ -6010,6 +6010,8 @@ function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
   const adoptMode = lastInitConfig?.adoptMode === true;
   const markers = adoptMode ? [] : readSendMarkers();
   const gateInput = {
+    turnId,
+    dispatchAttempt,
     markTimeMs: mark?.markTimeMs,
     isLocal: false,
     finalText: text,
