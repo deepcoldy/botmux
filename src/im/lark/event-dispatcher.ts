@@ -5854,6 +5854,37 @@ export function createLarkEventDispatcherRuntime(
     });
   };
 
+  type PrimaryIngressInput = Parameters<
+    NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>
+  >[0];
+  let primaryIngressReservationTail = Promise.resolve();
+  const enqueuePrimaryInArrivalOrder = (
+    buildInput: () => PrimaryIngressInput | Promise<PrimaryIngressInput>,
+  ): Promise<unknown> => {
+    let resolveAck!: (value: unknown) => void;
+    let rejectAck!: (error: unknown) => void;
+    const ack = new Promise<unknown>((resolve, reject) => {
+      resolveAck = resolve;
+      rejectAck = reject;
+    });
+    const reservation = primaryIngressReservationTail
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const input = await buildInput();
+          // Register the recovery continuation or concrete partition tail
+          // before releasing the app-wide arrival slot. The durable write is
+          // still awaited only by this event's ACK, so different chats retain
+          // their normal database concurrency.
+          void enqueuePrimaryAfterRecovery(input).then(resolveAck, rejectAck);
+        } catch (error) {
+          rejectAck(error);
+        }
+      });
+    primaryIngressReservationTail = reservation.then(() => undefined, () => undefined);
+    return ack;
+  };
+
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
     // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
@@ -6048,11 +6079,11 @@ export function createLarkEventDispatcherRuntime(
       const rawMessage = data?.message;
       const ingressAnchor = rawMessageIngressAnchor(larkAppId, rawMessage);
       if (runtimeOptions.enqueuePrimary) {
-        return enqueuePrimaryAfterRecovery({
+        return enqueuePrimaryInArrivalOrder(() => ({
           eventId: eventKey,
           partitionKey: ingressAnchor,
           data,
-        }).then(() => undefined);
+        })).then(() => undefined);
       }
       let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
       // Reserve the app/chat ingress lane before any routing await. Canonical
@@ -6126,16 +6157,15 @@ export function createLarkEventDispatcherRuntime(
         // recovered receive row in the real chat partition.  Lookup failure
         // rejects the WS callback and relies on Lark redelivery; never ACK an
         // update whose ordering domain is still unknown.
-        const ingressAnchor = await primaryUpdatedMessageIngressAnchor(
-          larkAppId,
-          eventMessage,
-        );
-        return enqueuePrimaryAfterRecovery({
+        return enqueuePrimaryInArrivalOrder(async () => ({
           eventId: eventKey,
           eventType: 'lark.im.message.updated_v1',
-          partitionKey: ingressAnchor,
+          partitionKey: await primaryUpdatedMessageIngressAnchor(
+            larkAppId,
+            eventMessage,
+          ),
           data,
-        }).then(() => undefined);
+        })).then(() => undefined);
       }
       const ingressAnchor = rawMessageIngressAnchor(larkAppId, eventMessage);
       // 事件常不带 chat_id（字段不可靠）；缺时 rawMessageIngressAnchor 收敛到 __chatless__

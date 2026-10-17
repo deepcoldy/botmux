@@ -1639,7 +1639,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     let acked = false;
     const callback = Promise.resolve(capturedHandlers['im.message.receive_v1']?.(data))
       .then(() => { acked = true; });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
     expect(acked).toBe(false);
     expect(enqueuePrimary).toHaveBeenCalledWith({
       eventId: `im.message.receive_v1:${MY_APP_ID}:msg-primary-ack`,
@@ -2099,6 +2099,62 @@ describe('Lark event dispatcher — durable primary processor', () => {
       message: { message_id: 'om_primary_chatless_missing' },
     })).rejects.toThrow(/no authoritative chat_id/);
     expect(enqueuePrimary).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('reserves arrival order before a chatless update awaits its partition readback', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    let releaseLookup!: (value: unknown) => void;
+    mockGetMessageDetail.mockReturnValueOnce(new Promise(resolve => {
+      releaseLookup = resolve;
+    }));
+    const order: string[] = [];
+    const enqueuePrimary = vi.fn(async (input: any) => {
+      order.push(input.eventId);
+      return { kind: 'inserted' as const };
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const updated = {
+      event_id: 'evt-primary-order-edit',
+      message: { message_id: 'om_primary_order_edit' },
+    };
+    const receive = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA later receive' }),
+      messageId: 'om_primary_order_receive',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+
+    const updateAck = Promise.resolve(capturedHandlers['im.message.updated_v1'](updated));
+    const receiveAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](receive));
+    await Promise.resolve();
+    expect(enqueuePrimary).not.toHaveBeenCalled();
+
+    releaseLookup({ items: [{
+      message_id: 'om_primary_order_edit',
+      chat_id: 'chat-primary',
+    }] });
+    await Promise.all([updateAck, receiveAck]);
+
+    expect(order).toEqual([
+      `im.message.updated_v1:${MY_APP_ID}:evt-primary-order-edit`,
+      `im.message.receive_v1:${MY_APP_ID}:om_primary_order_receive`,
+    ]);
+    expect(enqueuePrimary).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+    }));
+    expect(enqueuePrimary).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+    }));
     runtime.close();
   });
 
