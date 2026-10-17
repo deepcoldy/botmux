@@ -344,6 +344,10 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendEphemeralCard: vi.fn(async () => 'eph_picker_msg_id'),
 }));
 
+vi.mock('../src/services/group-auto-title.js', () => ({
+  registerGroupAutoTitle: vi.fn(),
+}));
+
 vi.mock('../src/services/group-creator.js', () => ({
   createGroupWithBots: vi.fn(async (opts: any) => ({
     ok: true,
@@ -674,6 +678,7 @@ import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotM
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
+import { registerGroupAutoTitle } from '../src/services/group-auto-title.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
@@ -7814,6 +7819,84 @@ describe('handleCommand', () => {
       expect(name.length).toBeLessThanOrEqual(51);
       expect(name).toBe(`AI讨论·${'😀'.repeat(22)}…`);
       expect(name).not.toContain('\uFFFD');
+    });
+
+    it('/g without a name registers the placeholder for AI titling as soon as the chat exists', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), deps, LARK_APP_ID);
+
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.name).toMatch(/^AI·新会话 \d{2}\/\d{2} \d{2}:\d{2}$/);
+      // Session-group logo by default, like the DM 专属群.
+      expect(opts.customization).toEqual({ tag: undefined, avatar: 'logo', userOpenId: 'ou_sender' });
+      // Registration rides the chat.create boundary, not the end of the call.
+      expect(registerGroupAutoTitle).not.toHaveBeenCalled();
+      opts.onChatCreated!('oc_new_group');
+      expect(registerGroupAutoTitle).toHaveBeenCalledWith(LARK_APP_ID, 'oc_new_group', {
+        placeholderName: opts.name, namePrefix: 'AI·', nameAvatar: undefined,
+      }, expect.any(Promise));
+      // The decoration gate settles once createGroupWithBots has returned.
+      await expect(vi.mocked(registerGroupAutoTitle).mock.calls[0][3]).resolves.toBeUndefined();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('自动更新');
+    });
+
+    it('/g with a name keeps it and does not register AI titling', async () => {
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 支付排障'), deps, LARK_APP_ID);
+
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.name).toBe('支付排障');
+      expect(opts.customization?.avatar).toBe('logo');
+      expect(opts.onChatCreated).toBeUndefined();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('自动更新');
+    });
+
+    it('a configured name avatar is re-rendered after titling', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { avatar: 'name' } } };
+      }) as any);
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), makeDeps(), LARK_APP_ID);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.customization?.avatar).toBe('name');
+      opts.onChatCreated!('oc_new_group');
+      expect(registerGroupAutoTitle).toHaveBeenCalledWith(LARK_APP_ID, 'oc_new_group', expect.objectContaining({ nameAvatar: true }), expect.any(Promise));
+    });
+
+    it('a CLI without a one-shot mode silently keeps the placeholder', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, cliId: 'aiden' } };
+      }) as any);
+      const deps = makeDeps();
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].onChatCreated).toBeUndefined();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('自动更新');
+    });
+
+    it('a sandboxed bot keeps the placeholder: the one-shot title would run outside its sandbox', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, sandbox: true } };
+      }) as any);
+      const deps = makeDeps();
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].onChatCreated).toBeUndefined();
+      expect(mockedCreate.mock.calls[0][0].customization?.avatar).toBe('logo');
+    });
+
+    it('/g --avatar off keeps Feishu\'s default avatar', async () => {
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --avatar off'), makeDeps(), LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0].customization).toBeUndefined();
     });
 
     it('passes /group --role-profile through and strips it from the group name', async () => {

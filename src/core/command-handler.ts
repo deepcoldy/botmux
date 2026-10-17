@@ -1,4 +1,4 @@
-import { parseGroupCreationArgs, resolveGroupCreationAgents, type GroupCreationArgs } from '../services/group-creation-options.js';
+import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
@@ -162,24 +162,6 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * that pollutes the dashboard's session list. Handle them without a session.
  */
 export { SESSIONLESS_DAEMON_COMMANDS } from './command-schema.js';
-
-const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
-
-/** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
- *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
- *  iterating by code point keeps that limit without slicing an emoji's
- *  surrogate pair. */
-export function formatSlashGroupName(name: string, prefix = ''): string {
-  const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
-  if (prefixed.length <= SLASH_GROUP_NAME_MAX_UTF16_LENGTH) return prefixed;
-
-  let truncated = '';
-  for (const character of prefixed) {
-    if (truncated.length + character.length > SLASH_GROUP_NAME_MAX_UTF16_LENGTH) break;
-    truncated += character;
-  }
-  return `${truncated}…`;
-}
 
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
@@ -5005,7 +4987,15 @@ export async function handleCommand(
           const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
           baseGroupName = t('cmd.group.empty_fallback', { ts }, loc);
         }
-        const groupName = formatSlashGroupName(baseGroupName, readGlobalConfig().groupNamePrefix);
+        const namePrefix = readGlobalConfig().groupNamePrefix;
+        const groupName = formatSlashGroupName(baseGroupName, namePrefix);
+        // Unnamed groups are AI-titled from their first message, as session
+        // groups are. The title needs a one-shot print mode of this bot's CLI
+        // and an unsandboxed bot (the call runs on the host); otherwise the
+        // placeholder simply stays (same silent degrade).
+        const decorations = resolveGroupDecorations(groupArgs);
+        const { oneShotTitleAllowed } = await import('../services/session-group-title.js');
+        const autoTitle = decorations.autoTitle && oneShotTitleAllowed(getBot(creatorAppId).config);
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
@@ -5013,6 +5003,11 @@ export async function handleCommand(
 
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
+          const { registerGroupAutoTitle } = await import('../services/group-auto-title.js');
+          // Settles when createGroupWithBots returns or throws, i.e. after its
+          // initial avatar; a fast AI title waits on it before re-rendering.
+          let settleDecorations!: () => void;
+          const decorationsSettled = new Promise<void>(resolve => { settleDecorations = resolve; });
           const result = await createGroupWithBots({
             creatorLarkAppId: creatorAppId,
             larkAppIds: larkAppIdsForGroup,
@@ -5021,10 +5016,19 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
-            ...((groupArgs.tag || groupArgs.avatar === 'name') ? {
-              customization: { tag: groupArgs.tag, avatar: groupArgs.avatar, userOpenId: senderOpenId },
+            ...((groupArgs.tag || decorations.avatar) ? {
+              customization: { tag: groupArgs.tag, avatar: decorations.avatar, userOpenId: senderOpenId },
             } : {}),
-          });
+            // Register as soon as the chat exists: the invited sender can type
+            // in it while invites / owner transfer are still running.
+            ...(autoTitle ? {
+              onChatCreated: (chatId: string) => registerGroupAutoTitle(creatorAppId, chatId, {
+                placeholderName: groupName,
+                namePrefix: namePrefix || undefined,
+                nameAvatar: decorations.avatar === 'name' || undefined,
+              }, decorationsSettled),
+            } : {}),
+          }).finally(settleDecorations);
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
           const applink = chatAppLink(result.chatId, normalizeBrand(getBot(creatorAppId).config.brand));
@@ -5032,6 +5036,7 @@ export async function handleCommand(
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
           const hints: string[] = [];
+          if (autoTitle) hints.push(t('cmd.group.auto_title_pending', undefined, loc));
           if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
           if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
           if (result.invalidUserIds.includes(senderOpenId)) {
@@ -5066,7 +5071,7 @@ export async function handleCommand(
           }
           const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
           await sessionReply(rootId, t('cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
-          logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId}`);
+          logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId} autoTitle=${autoTitle} avatar=${decorations.avatar ?? '-'}`);
           // Intentionally NO auto-bootstrap (repo-select card / chat-scope
           // session) here: the group name rarely carries enough context to seed
           // a useful prompt. The user starts a real conversation with the bot in
