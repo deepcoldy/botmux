@@ -5626,7 +5626,8 @@ export async function handleCommand(
       case '/fork': {
         // Session fork (Bot 分身): non-destructive copy of a running session
         // into a SECOND independent session at a new anchor; source untouched.
-        // `/fork <task>` hosts it in a new sub-topic of the same topic group;
+        // `/fork <task>` hosts it in a new sibling topic of the same chat;
+        // both topic groups and native topics inside regular groups are valid.
         // `/fork --create <name>` keeps the existing new-group destination.
         const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
         const forkAppId = larkAppId ?? ds?.larkAppId;
@@ -5714,26 +5715,16 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
             break;
           }
-          // 私聊（p2pMode chat/thread 均可）与话题群支持原地子话题分身。
-          // 私聊走 chatType 判定，不调 getChatModeStrict：DM 没有 chat_mode
-          // 概念，且该接口偶发 500，隐私敏感路径才用它（见本文件上方注释）。
+          // 私聊（p2pMode chat/thread 均可）、话题群与普通群里已有独立会话的
+          // 原生话题都支持原地分身。私聊走 chatType 判定，不调 getChatModeStrict：
+          // DM 没有 chat_mode 概念，且该接口偶发 500。群聊只要求源是 thread-scope
+          // 会话（有真实 om_ 根消息）——群类型不是会话隔离边界；普通群顶层的
+          // chat-scope 连续会话仍拒绝，改用 /fork --create。
           const forkInPlaceIsP2p = ds.chatType === 'p2p';
-          if (!forkInPlaceIsP2p) {
-            if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
-              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-              break;
-            }
-            let chatMode: string | undefined;
-            try {
-              chatMode = await getChatModeStrict(forkAppId, ds.chatId);
-            } catch {
-              // Treat an unknown mode as unsupported: sending a top-level message
-              // to a regular group would not create the isolated topic we promise.
-            }
-            if (chatMode !== 'topic') {
-              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-              break;
-            }
+          if (!forkInPlaceIsP2p
+            && (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_'))) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+            break;
           }
 
           const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId);
@@ -6683,7 +6674,8 @@ type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
 
-/** Fork the current session into a new sub-topic of the same topic group.
+/** Fork the current thread-scoped session into a new sibling topic of the same
+ *  chat. This works for both topic groups and native topics in regular groups.
  *  The session copy itself stays in worker-pool's generic `forkSession()`;
  *  this layer only creates the Lark destination, supplies the first task turn,
  *  and records display-only lineage for the parent panel. */
@@ -6731,6 +6723,10 @@ export async function startForkSubtopicSession(
   // 绝不能删；只有「话题内 / 引用形态」时新建的顶层锚点归我们所有。
   let seedMessageId: string | undefined;
   let anchorOwnedByBot = false;
+  // 普通群显式开话题用的 reply_in_thread 回复（bot 自有，失败时与锚点一起撤）。
+  let groupTopicReplyId: string | undefined;
+  // 普通群「锚点已发、话题尚未确认开出」的窗口：此间抛错仍归 topic_creation_failed。
+  let groupTopicPending = false;
 
   const recallAnchor = async (): Promise<boolean> => {
     if (forkInPlaceIsP2p) {
@@ -6753,15 +6749,21 @@ export async function startForkSubtopicSession(
       return results.every(Boolean);
     }
     if (!anchorId) return true;
-    try {
-      return await deleteMessage(appId, anchorId);
-    } catch (err) {
-      logger.warn(
-        `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
+    // 先撤话题内回复、再撤锚点；任一失败都算留下了孤儿话题。
+    let allRecalled = true;
+    for (const id of [groupTopicReplyId, anchorId]) {
+      if (!id) continue;
+      try {
+        if (!await deleteMessage(appId, id)) allRecalled = false;
+      } catch (err) {
+        logger.warn(
+          `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+        allRecalled = false;
+      }
     }
+    return allRecalled;
   };
 
   try {
@@ -6808,6 +6810,7 @@ export async function startForkSubtopicSession(
         content: [[{ tag: 'text', text: t('cmd.fork.seed_anchor_line', undefined, loc) }]],
       },
     });
+    let childThreadId: string | undefined;
     if (forkInPlaceIsP2p && !p2pAnchorIsForeign) {
       // (b) 命令在 DM 顶层：锚点就是用户的命令消息，reply_in_thread 开出
       // 新话题（与 /t 同构）。锚点归用户所有，失败时绝不删除。
@@ -6826,10 +6829,31 @@ export async function startForkSubtopicSession(
         ? await replyMessage(appId, anchorId, seedPost, 'post', true, undefined, undefined, sourceOptions)
         : await replyMessage(appId, anchorId, seedPost, 'post', true);
     } else {
-      // 群聊：顶层 post 本身就是话题锚点，无单独 seed。
+      // 群聊：顶层 post 作分身话题锚点。话题群里顶层消息自动成为话题，
+      // 不多发任何消息（原路径）；普通群的顶层消息保持顶层（client.ts
+      // ChatMode 注释），必须对锚点 reply_in_thread 才会显式开出原生话题。
+      // 群类型确认不了（'unknown'）时按普通群处理：多一条话题内回复无害，
+      // 但赌它是话题群会退化成「ok 却没有话题」。
+      const groupChatMode = await getChatModeStrict(appId, chatId);
       anchorId = sourceOptions
         ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
         : await sendMessage(appId, chatId, seedPost, 'post');
+      if (groupChatMode !== 'topic') {
+        groupTopicPending = true;
+        const topicReplyText = t('cmd.fork.seed_topic_reply', undefined, loc);
+        groupTopicReplyId = sourceOptions
+          ? await replyMessage(appId, anchorId, topicReplyText, 'text', true, undefined, undefined, sourceOptions)
+          : await replyMessage(appId, anchorId, topicReplyText, 'text', true);
+        // 从话题内回复取 thread_id：reply_in_thread 的回复必然带 omt_，根消息
+        // 未必立刻回填。拿不到真实 omt_ 就 fail closed——撤回锚点与回复并报错，
+        // 不能返回 ok 再配一个退化成「打开本群」的链接。
+        childThreadId = (await getMessageThreadId(appId, groupTopicReplyId)) ?? undefined;
+        if (!childThreadId?.startsWith('omt_')) {
+          const orphanTopic = !await recallAnchor();
+          return { ok: false, error: 'topic_creation_failed', orphanTopic };
+        }
+        groupTopicPending = false;
+      }
     }
     // 私聊锚点必须登记 /t 同款溯源：扁平 DM 路由默认把 root_id+thread_id
     // 回复折进 chat-scope 会话，只有命中 marker 才会 promote 到锚点的分身
@@ -6840,7 +6864,7 @@ export async function startForkSubtopicSession(
       const { recordP2pForceTopicRoot } = await import('../services/p2p-force-topic-store.js');
       recordP2pForceTopicRoot(appId, anchorId, chatId);
     }
-    const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+    childThreadId ??= (await getMessageThreadId(appId, anchorId)) ?? undefined;
 
     const childIntro = t('cmd.fork.child_intro', {
       parentTitle: parentSession.title || '',
@@ -6934,7 +6958,7 @@ export async function startForkSubtopicSession(
     );
     return {
       ok: false,
-      error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
+      error: anchorId && !groupTopicPending ? 'fork_subtopic_failed' : 'topic_creation_failed',
       // fork 已成功后的抛错绝不撤话题：已注册的分身必须保持可路由，
       // recall 会删 marker 让其回复折回扁平、静默失联。
       orphanTopic: forked ? false : (anchorId ? !await recallAnchor() : false),
