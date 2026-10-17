@@ -4457,7 +4457,7 @@ export interface LarkEventDispatcherRuntimeOptions {
   takeOverPrimarySession?: (
     sessionKey: string,
     canonical: Session,
-  ) => Promise<Session | undefined>;
+  ) => Promise<Session | { kind: 'retry'; reason: string } | undefined>;
   /** Test seam; production defaults to a 2s post-ready REST quiet period. */
   primaryRecoverySettleMs?: number;
 }
@@ -4613,19 +4613,24 @@ export function createLarkEventDispatcherRuntime(
   const assertPrimaryRouteOwner = async (
     ctx: RoutingContext,
     primary: PrimaryProcessContext | undefined,
-  ): Promise<boolean> => {
-    if (!primary || !runtimeOptions.readPrimarySession) return false;
+  ): Promise<'none' | 'owned' | 'retry'> => {
+    if (!primary || !runtimeOptions.readPrimarySession) return 'none';
     const anchor = ctx.runtimeRoutingAnchor ?? ctx.anchor;
     const canonicalKey = sessionKey(anchor, larkAppId);
     const canonical = await runtimeOptions.readPrimarySession(canonicalKey);
-    if (!canonical || canonical.status !== 'active') return false;
+    if (!canonical || canonical.status !== 'active') return 'none';
     let local = handlers.resolveDurableSession?.(ctx);
     if (runtimeOptions.takeOverPrimarySession) {
-      await runtimeOptions.takeOverPrimarySession(canonicalKey, canonical);
+      const takeover = await runtimeOptions.takeOverPrimarySession(canonicalKey, canonical);
+      if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
+        ctx.ingressAdmission ??= { admitted: false };
+        ctx.ingressAdmission.retryReason = takeover.reason;
+        return 'retry';
+      }
       local = handlers.resolveDurableSession?.(ctx);
-      if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
+      if (local?.sessionId === canonical.sessionId && local.status === 'active') return 'owned';
     }
-    if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
+    if (local?.sessionId === canonical.sessionId && local.status === 'active') return 'owned';
     throw new Error(
       `durable primary active canonical Session is owned by another replica: ${canonicalKey}`,
     );
@@ -4905,10 +4910,11 @@ export function createLarkEventDispatcherRuntime(
               const seedPayload = { data, ctx: seedCtx, ownsSession: false };
               if (primary) {
                 preparePrimaryRoutingContext(seedCtx, primary);
-                const ownsCanonical = await assertPrimaryRouteOwner(seedCtx, primary);
+                const owner = await assertPrimaryRouteOwner(seedCtx, primary);
+                if (owner === 'retry') return primaryResult(seedCtx, primary);
                 await dispatchHumanMessage({
                   ...seedPayload,
-                  ownsSession: seedPayload.ownsSession || ownsCanonical,
+                  ownsSession: seedPayload.ownsSession || owner === 'owned',
                 });
                 return primaryResult(seedCtx, primary);
               }
@@ -5015,7 +5021,9 @@ export function createLarkEventDispatcherRuntime(
         // back-to-back into this thread must be handled in order, not raced.
         if (primary) {
           preparePrimaryRoutingContext(routedCtx, primary);
-          await assertPrimaryRouteOwner(routedCtx, primary);
+          if (await assertPrimaryRouteOwner(routedCtx, primary) === 'retry') {
+            return primaryResult(routedCtx, primary);
+          }
           await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
           return primaryResult(routedCtx, primary);
         }
@@ -5676,7 +5684,9 @@ export function createLarkEventDispatcherRuntime(
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
-      ownsSession = (await assertPrimaryRouteOwner(ctx, primary)) || ownsSession;
+      const primaryOwner = await assertPrimaryRouteOwner(ctx, primary);
+      if (primaryOwner === 'retry') return primaryResult(ctx, primary!);
+      ownsSession = primaryOwner === 'owned' || ownsSession;
       // Record explicit DM /t intent before this message releases the raw
       // per-chat routing lane and before handleNewTopic begins its async session
       // registration. A back-to-back root-linked reply can therefore select the

@@ -30382,11 +30382,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   expectedLarkAppId: cfg.larkAppId,
                 });
                 if (claimed.kind !== 'claimed') {
-                  throw new Error(
-                    claimed.kind === 'occupied'
-                      ? `durable active takeover Session is occupied by ${claimed.ownerId}`
-                      : `durable active takeover claim failed: ${claimed.kind}`,
-                  );
+                  return {
+                    kind: 'retry' as const,
+                    reason: claimed.kind === 'occupied'
+                      ? `active Session lease is still owned by ${claimed.ownerId}`
+                      : `active Session takeover is not ready: ${claimed.kind}`,
+                  };
                 }
                 const local = activeSessions.get(stableKey);
                 if (local?.session.sessionId === claimed.session.sessionId
