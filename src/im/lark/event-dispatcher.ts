@@ -2587,7 +2587,9 @@ export interface RoutingContext {
    *  （`{ ...ctx, scope, anchor }`），box 引用随拷贝共享，接纳发生在拷贝之后
    *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
-  ingressAdmission?: { admitted: boolean };
+  ingressAdmission?: { admitted: boolean; retryReason?: string };
+  /** Ephemeral durable-primary claim identity; never persisted in Session. */
+  durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
 }
@@ -4582,6 +4584,8 @@ export function createLarkEventDispatcherRuntime(
     ctx: RoutingContext,
     primary: PrimaryProcessContext,
   ): DurableLarkCanonicalHandlerResult => {
+    const retryReason = ctx.ingressAdmission?.retryReason?.trim();
+    if (retryReason) return { kind: 'retry', reason: retryReason };
     if (!ctx.ingressAdmission?.admitted) {
       return { kind: 'ignored', reason: 'canonical handler completed without task admission' };
     }
@@ -4590,6 +4594,20 @@ export function createLarkEventDispatcherRuntime(
       throw new Error(`durable canonical Session is unavailable for ${primary.message.eventId}`);
     }
     return { kind: 'admitted', session };
+  };
+
+  const preparePrimaryRoutingContext = (
+    ctx: RoutingContext,
+    primary: PrimaryProcessContext,
+  ): void => {
+    ctx.ingressAdmission ??= { admitted: false };
+    ctx.durablePrimaryDispatch = {
+      attempt: primary.context.claim.attempts,
+      signal: primary.context.signal,
+    };
+    if (typeof primary.context.queuePostAdmissionOutput === 'function') {
+      ctx.queuePostAdmissionOutput = primary.context.queuePostAdmissionOutput;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
@@ -4737,6 +4755,7 @@ export function createLarkEventDispatcherRuntime(
           // (e.g. dispatch's /repo prime + brief kickoff) don't interleave with
           // the first's async session-spawn. See anchor-serializer.ts.
           if (primary) {
+            preparePrimaryRoutingContext(routedCtx, primary);
             await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
             return primaryResult(routedCtx, primary);
           }
@@ -4786,6 +4805,7 @@ export function createLarkEventDispatcherRuntime(
             larkAppId,
           });
           if (primary) {
+            preparePrimaryRoutingContext(listenerPayload.ctx, primary);
             await dispatchHumanMessage(listenerPayload);
             return primaryResult(listenerPayload.ctx, primary);
           }
@@ -4884,6 +4904,7 @@ export function createLarkEventDispatcherRuntime(
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
               const seedPayload = { data, ctx: seedCtx, ownsSession: false };
               if (primary) {
+                preparePrimaryRoutingContext(seedCtx, primary);
                 const ownsCanonical = await assertPrimaryRouteOwner(seedCtx, primary);
                 await dispatchHumanMessage({
                   ...seedPayload,
@@ -4993,6 +5014,7 @@ export function createLarkEventDispatcherRuntime(
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
         // back-to-back into this thread must be handled in order, not raced.
         if (primary) {
+          preparePrimaryRoutingContext(routedCtx, primary);
           await assertPrimaryRouteOwner(routedCtx, primary);
           await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
           return primaryResult(routedCtx, primary);
@@ -5754,6 +5776,7 @@ export function createLarkEventDispatcherRuntime(
       // concurrently. Same-anchor handlers remain strictly serialized by
       // dispatchHumanMessage's canonical queue.
       if (primary) {
+        preparePrimaryRoutingContext(ctx, primary);
         await dispatchHumanMessage(payload);
         return primaryResult(ctx, primary);
       }

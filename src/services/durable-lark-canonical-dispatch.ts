@@ -24,7 +24,8 @@ export interface DurableLarkPostAdmissionOutput {
 
 export type DurableLarkCanonicalHandlerResult =
   | { kind: 'admitted'; session: Session }
-  | { kind: 'ignored'; reason: string };
+  | { kind: 'ignored'; reason: string }
+  | { kind: 'retry'; reason: string };
 
 export interface DurableLarkCanonicalHandlerContext extends DurableInboxPrimaryDispatchContext {
   /** Raw event data after the durable envelope identity has been validated. */
@@ -88,6 +89,16 @@ export function createDurableLarkCanonicalDispatch(
       acceptingOutputs = false;
     }
     if (context.signal.aborted) throw abortError(context.signal);
+    if (result.kind === 'retry') {
+      if (outputs.length > 0) {
+        throw new Error('durable canonical retry result cannot publish post-admission output');
+      }
+      const reason = result.reason.trim();
+      if (!reason || reason.length > 512) {
+        throw new Error('durable canonical retry result requires a bounded reason');
+      }
+      return { kind: 'retry', reason };
+    }
     if (result.kind === 'ignored') {
       if (outputs.length > 0) {
         throw new Error('durable canonical ignored result cannot publish post-admission output');

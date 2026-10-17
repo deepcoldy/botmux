@@ -1426,6 +1426,55 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('returns an explicit retry when the canonical handler defers a busy Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-primary-busy',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-busy-root',
+      scope: 'thread' as const,
+      title: 'Busy owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => canonical);
+    handlers.isSessionOwner = vi.fn(() => true);
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      expect(ctx.durablePrimaryDispatch).toMatchObject({ attempt: 1 });
+      expect(ctx.durablePrimaryDispatch.signal).toBeInstanceOf(AbortSignal);
+      ctx.ingressAdmission.retryReason = 'session has an unfinished turn';
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession: async () => canonical,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA queued follow-up' }),
+      messageId: 'msg-primary-busy-followup',
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_busy',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-busy-followup'))
+      .resolves.toEqual({ kind: 'retry', reason: 'session has an unfinished turn' });
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
   it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
     setupBotState({ allowedUsers: [] });
     mockGetChatMode.mockResolvedValue('topic');

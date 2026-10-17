@@ -193,7 +193,7 @@ import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
-import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
+import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
 
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
@@ -438,6 +438,10 @@ import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-c
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
+import {
+  appendDurablePrimaryInputCommit,
+  durablePrimaryExistingTurnDisposition,
+} from './services/durable-primary-turn-admission.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
 import { parseScheduledTurnId, trustedCallerForScheduledTask } from './core/scheduled-turn-provenance.js';
@@ -22689,6 +22693,105 @@ function markIngressAdmitted(ctx: RoutingContext): void {
   else ctx.ingressAdmission = { admitted: true };
 }
 
+const DURABLE_PRIMARY_INPUT_COMMIT_LIMIT = 64;
+const DURABLE_PRIMARY_INPUT_COMMIT_TIMEOUT_MS = 60_000;
+type DurablePrimaryInputCommitWaiter = {
+  resolve(): void;
+  reject(error: Error): void;
+  timer: NodeJS.Timeout;
+  signal: AbortSignal;
+  onAbort(): void;
+};
+const durablePrimaryInputCommitWaiters = new Map<
+  string,
+  Set<DurablePrimaryInputCommitWaiter>
+>();
+
+function durablePrimaryInputCommitKey(sessionId: string, turnId: string): string {
+  return `${sessionId}:${turnId}`;
+}
+
+function hasDurablePrimaryInputCommit(ds: DaemonSession, turnId: string): boolean {
+  return ds.session.durablePrimaryInputCommits?.some(item => item.turnId === turnId) === true;
+}
+
+function retryDurablePrimaryIngress(ctx: RoutingContext, reason: string): boolean {
+  if (!ctx.durablePrimaryDispatch) return false;
+  ctx.ingressAdmission ??= { admitted: false };
+  ctx.ingressAdmission.retryReason = reason;
+  return true;
+}
+
+function recordDurablePrimaryInputCommit(
+  ds: DaemonSession,
+  receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
+  workerGeneration: number,
+): void {
+  if (!receipt.durablePrimaryInbox) return;
+  const previous = ds.session.durablePrimaryInputCommits ?? [];
+  const appended = appendDurablePrimaryInputCommit(previous, {
+    turnId: receipt.turnId,
+    workerGeneration,
+    committedAt: new Date().toISOString(),
+    ...(receipt.dispatchAttempt !== undefined
+      ? { dispatchAttempt: receipt.dispatchAttempt }
+      : {}),
+  }, DURABLE_PRIMARY_INPUT_COMMIT_LIMIT);
+  if (appended.added) {
+    ds.session.durablePrimaryInputCommits = appended.history;
+    sessionStore.updateSession(ds.session);
+  }
+  const key = durablePrimaryInputCommitKey(ds.session.sessionId, receipt.turnId);
+  const waiters = durablePrimaryInputCommitWaiters.get(key);
+  if (!waiters) return;
+  durablePrimaryInputCommitWaiters.delete(key);
+  for (const waiter of waiters) {
+    clearTimeout(waiter.timer);
+    waiter.signal.removeEventListener('abort', waiter.onAbort);
+    waiter.resolve();
+  }
+}
+
+function waitForDurablePrimaryInputCommit(
+  ds: DaemonSession,
+  turnId: string,
+  signal: AbortSignal,
+): Promise<void> {
+  if (hasDurablePrimaryInputCommit(ds, turnId)) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const key = durablePrimaryInputCommitKey(ds.session.sessionId, turnId);
+    const settle = (): void => {
+      const waiters = durablePrimaryInputCommitWaiters.get(key);
+      waiters?.delete(waiter);
+      if (waiters?.size === 0) durablePrimaryInputCommitWaiters.delete(key);
+      clearTimeout(waiter.timer);
+      signal.removeEventListener('abort', waiter.onAbort);
+    };
+    const waiter: DurablePrimaryInputCommitWaiter = {
+      resolve() { settle(); resolve(); },
+      reject(error) { settle(); reject(error); },
+      timer: setTimeout(() => {
+        waiter.reject(new Error(`durable primary provider submit receipt timed out for ${turnId}`));
+      }, DURABLE_PRIMARY_INPUT_COMMIT_TIMEOUT_MS),
+      signal,
+      onAbort() {
+        waiter.reject(signal.reason instanceof Error
+          ? signal.reason
+          : new Error('durable primary Inbox claim was aborted'));
+      },
+    };
+    waiter.timer.unref?.();
+    const waiters = durablePrimaryInputCommitWaiters.get(key) ?? new Set();
+    waiters.add(waiter);
+    durablePrimaryInputCommitWaiters.set(key, waiters);
+    if (signal.aborted) waiter.onAbort();
+    else signal.addEventListener('abort', waiter.onAbort, { once: true });
+    // An IPC callback may have persisted the marker between the first check
+    // and waiter registration. Re-check after publication to close that race.
+    if (hasDurablePrimaryInputCommit(ds, turnId)) waiter.resolve();
+  });
+}
+
 function durableOutboxTargetForTurn(ds: DaemonSession, turnId: string): DurableLarkOutboxTarget {
   const target = frozenReplyContextForTurn(ds, turnId).target;
   return target.mode === 'plain'
@@ -25668,6 +25771,62 @@ async function handleThreadReplyAdmitted(
     markIngressAdmitted(ctx);
     return;
   }
+  // Durable-primary rows remain the authoritative FIFO while another turn is
+  // active. Do this before native-topic mutation, quota/resource awaits,
+  // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
+  // retry must be a pure claim-state transition.
+  if (ds && ctx.durablePrimaryDispatch) {
+    const disposition = durablePrimaryExistingTurnDisposition(ds, parsed.messageId);
+    if (disposition === 'committed') {
+      const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
+      markSessionActivity(ds, Date.now(), {
+        human: parsed.senderType === 'user' && !isForeignBot,
+      });
+      fillNativeTopicId(ds.session, scope, parsed.threadId);
+      if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
+      ds.session.quoteTargetSenderOpenId = callerOpenId;
+      ds.session.quoteTargetSenderIsBot = isForeignBot;
+      const substituteReplyMode = substituteTrigger
+        ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
+        : 'thread';
+      const postAt = prepared?.postParticipantMentions
+        ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
+      const window = buildTurnParticipants(
+        larkAppId,
+        callerOpenId,
+        senderIsBotTriState(parsed.senderType, isForeignBot),
+        parsed.mentions,
+        undefined,
+        postAt,
+      );
+      beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
+        quoteOnly: substituteReplyMode === 'quote',
+        substitute: !!substituteTrigger,
+        senderOpenId: callerOpenId,
+        participants: window.participants,
+        participantsIncomplete: window.incomplete,
+        inThread: !!parsed.threadId,
+        foldedRootId: ctx.foldedRootId,
+        sourceMessageId: parsed.messageId,
+      });
+      if (callerOpenId) ds.session.lastCallerOpenId = callerOpenId;
+      sessionStore.updateSession(ds.session);
+      markIngressAdmitted(ctx);
+      logger.info(
+        `[${tag(ds)}] Reused durable-primary provider submit proof for `
+        + `${parsed.messageId.slice(0, 12)}`,
+      );
+      return;
+    }
+    if (disposition === 'retry') {
+      retryDurablePrimaryIngress(ctx, 'session has an unfinished turn');
+      logger.info(
+        `[${tag(ds)}] Requeued durable-primary turn ${parsed.messageId.slice(0, 12)} `
+        + 'behind the active session turn',
+      );
+      return;
+    }
+  }
   if (ds && fillNativeTopicId(ds.session, scope, parsed.threadId)) {
     sessionStore.updateSession(ds.session);
     publishNativeTopicLinkPatch(ds);
@@ -26618,6 +26777,12 @@ async function handleThreadReplyAdmitted(
       }
       accepted = sendWorkerInput(ds, cliInput, parsed.messageId,
         {
+          ...(ctx.durablePrimaryDispatch
+            ? {
+                dispatchAttempt: ctx.durablePrimaryDispatch.attempt,
+                durablePrimaryInbox: true as const,
+              }
+            : {}),
           ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
           ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
@@ -26641,6 +26806,24 @@ async function handleThreadReplyAdmitted(
           );
         }
         rememberLastCliInput(ds, promptContent, cliInput);
+        if (ctx.durablePrimaryDispatch) {
+          try {
+            await waitForDurablePrimaryInputCommit(
+              ds,
+              parsed.messageId,
+              ctx.durablePrimaryDispatch.signal,
+            );
+          } catch (error) {
+            if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
+            retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending');
+            logger.warn(
+              `[${tag(ds)}] Durable-primary turn ${parsed.messageId.slice(0, 12)} `
+              + `will retry after provider submit receipt wait failed: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+            return;
+          }
+        }
       }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
     } finally {
@@ -29181,6 +29364,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         proposer,
         message: envelope,
       });
+    },
+    onTurnInputCommitted(ds, receipt, context) {
+      // A recovered Remote Runner turn can conservatively classify an
+      // attempt-bearing Lark message as durable-primary. Keep that recovery
+      // hint entirely inert for disabled/shadow/default deployments.
+      if (durableCoordinationRuntime?.mode !== 'primary'
+          || !durablePrimaryRuntimeByApp.has(ds.larkAppId)) return;
+      if (ds.session.workerGeneration !== context.workerGeneration) return;
+      recordDurablePrimaryInputCommit(ds, receipt, context.workerGeneration);
     },
     onNativeInputConsumed(ds, receipt, context) {
       // The worker proved this exact input entered its native conversation.
