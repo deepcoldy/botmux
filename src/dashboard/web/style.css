@@ -3077,6 +3077,33 @@ button.primary {
   min-width: 0;
 }
 
+.sessions-scroll-host-contents { display: contents; }
+.sessions-table-scroll-host { position: relative; min-width: 0; min-height: 0; }
+.sessions-table-scroll-host > .sessions-view-stage { height: 100%; }
+@media (max-width: 720px) {
+  .sessions-table-scroll-host > .sessions-view-stage { height: auto; }
+}
+.session-horizontal-scrollbar {
+  position: absolute;
+  height: 6px;
+  z-index: 1;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+  cursor: ew-resize;
+  touch-action: none;
+  user-select: none;
+}
+:where(.sessions-table-scroll-host:hover) .session-horizontal-scrollbar:not([hidden]),
+.session-horizontal-scrollbar:not([hidden]).is-visible { opacity: .54; pointer-events: auto; }
+.session-horizontal-scrollbar:not([hidden]).is-active { opacity: .78; }
+.session-horizontal-scrollbar.is-dragging { transition: none; }
+.session-horizontal-scrollbar .floating-scrollbar-thumb { height: 100%; }
+.session-horizontal-scrollbar:hover .floating-scrollbar-thumb,
+.session-horizontal-scrollbar.is-active .floating-scrollbar-thumb { background: var(--scrollbar-thumb-hover); }
+[inert] .session-horizontal-scrollbar { visibility: hidden; pointer-events: none; }
+.sessions-view-stage[inert] ~ .session-horizontal-scrollbar { visibility: hidden; pointer-events: none; }
+
 .sessions-view-stage-enter {
   animation: dashboard-page-enter 0.35s ease both;
 }
