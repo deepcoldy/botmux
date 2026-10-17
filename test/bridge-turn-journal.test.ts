@@ -194,6 +194,33 @@ describe('planBridgeTurnRecovery', () => {
     });
   });
 
+  it('uses the earliest offset across multiple pending turns', () => {
+    expect(planBridgeTurnRecovery([
+      entry({ turnId: 'later', offsetAtMark: 9_000 }),
+      entry({ turnId: 'earlier', offsetAtMark: 1_000 }),
+    ], 10_000, 9_000)).toEqual({
+      kind: 'recover',
+      fromOffset: 1_000,
+      recoveryBytes: 9_000,
+    });
+  });
+
+  it('accepts a range exactly at the byte budget and skips the next byte', () => {
+    const atBoundary = entry({ offsetAtMark: 1_000 });
+    expect(planBridgeTurnRecovery([atBoundary], 2_000, 1_000)).toMatchObject({
+      kind: 'recover', recoveryBytes: 1_000,
+    });
+    expect(planBridgeTurnRecovery([atBoundary], 2_001, 1_000)).toMatchObject({
+      kind: 'skip', reason: 'range-too-large', recoveryBytes: 1_001,
+    });
+  });
+
+  it.each([Number.NaN, -1])('fails closed on invalid file size %s', fileSize => {
+    expect(planBridgeTurnRecovery([entry()], fileSize)).toMatchObject({
+      kind: 'skip', reason: 'invalid-file-size', recoveryBytes: 0,
+    });
+  });
+
   it('fails closed on offsets beyond a truncated rollout', () => {
     expect(planBridgeTurnRecovery([entry({ offsetAtMark: 101 })], 100)).toEqual({
       kind: 'skip',

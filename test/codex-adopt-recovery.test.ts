@@ -40,11 +40,14 @@ function restore(input: readonly CodexBridgeEvent[], now = 20_000, file = rollou
 describe('adopted Codex turn recovery', () => {
   it('persists the mark-time rollout offset and never advances it on later checkpoints', () => {
     const queue = new CodexBridgeQueue(() => 10_000);
-    queue.mark('om_original', start.text, 10_000);
-    checkpointCodexAdoptTurns(path, rollout, queue, 1_234);
+    queue.mark('om_original', start.text, 10_000, undefined, {
+      jsonlPath: rollout,
+      offsetAtMark: 1_234,
+    });
+    checkpointCodexAdoptTurns(path, rollout, queue, 9_999);
     expect(readBridgeTurnJournal(path)).toMatchObject([{ turnId: 'om_original', offsetAtMark: 1_234 }]);
 
-    checkpointCodexAdoptTurns(path, rollout, queue, 9_999);
+    checkpointCodexAdoptTurns(path, rollout, queue, 19_999);
     expect(readBridgeTurnJournal(path)).toMatchObject([{ turnId: 'om_original', offsetAtMark: 1_234 }]);
   });
 

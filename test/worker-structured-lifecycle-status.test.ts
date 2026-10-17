@@ -35,6 +35,8 @@ describe('worker structured-turn status wiring', () => {
     expect(scope).toContain('codexBridgeFallbackActive()');
     expect(scope).toContain('.structured');
     const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
+    expect(mark.indexOf('structuredBridgeRecoveryCursorAtMark()')).toBeLessThan(mark.indexOf('codexBridgeQueue.mark('));
+    expect(mark).toContain('recoveryCursorAtMark');
     expect(mark.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
     const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
     expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(emit.indexOf('drainEmittable()'));
@@ -48,6 +50,9 @@ describe('worker structured-turn status wiring', () => {
     expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
     expect(attach).toContain('planBridgeTurnRecovery(restorable, rolloutSize)');
     expect(attach).toContain('Structured bridge recovery skipped');
+    const claudeRestore = functionSlice('tryRestoreInterruptedBridgeTurns', 'startBridgeWatcher');
+    expect(claudeRestore).toContain('planBridgeTurnRecovery(restorable, transcriptSize)');
+    expect(claudeRestore).toContain('Bridge recovery skipped');
   });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');

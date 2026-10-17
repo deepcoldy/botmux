@@ -60,6 +60,18 @@ function emitDecisions(
 }
 
 describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
+  it('keeps the exact rollout cursor captured when the pending turn is marked', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'prompt', 100, undefined, {
+      jsonlPath: '/rollout.jsonl',
+      offsetAtMark: 12_345,
+    });
+    expect(q.peek()[0]).toMatchObject({
+      recoveryJsonlPathAtMark: '/rollout.jsonl',
+      recoveryOffsetAtMark: 12_345,
+    });
+  });
+
   it('rejects CoT from a different native provider turn', () => {
     const q = new CodexBridgeQueue();
     const seen: string[] = [];

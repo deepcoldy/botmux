@@ -23,9 +23,14 @@ export function checkpointCodexAdoptTurns(
     const prior = previous.find(entry => entry.turnId === turn.turnId
       && entry.dispatchAttempt === turn.dispatchAttempt
       && entry.jsonlPath === rolloutPath);
+    const capturedOffset = turn.recoveryJsonlPathAtMark === rolloutPath
+      && Number.isSafeInteger(turn.recoveryOffsetAtMark)
+      && turn.recoveryOffsetAtMark! >= 0
+      ? turn.recoveryOffsetAtMark
+      : undefined;
     return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
-      offsetAtMark: prior?.offsetAtMark ?? safeOffsetAtMark }];
+      offsetAtMark: prior?.offsetAtMark ?? capturedOffset ?? safeOffsetAtMark }];
   });
   if (JSON.stringify(previous) === JSON.stringify(entries)) return;
   if (entries.length === 0) clearBridgeTurnJournal(path);
