@@ -1880,7 +1880,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     }
   });
 
-  it('keeps the acquisition cutoff fixed while an unstable post-ready scan retries', async () => {
+  it('keeps the acquisition cutoff fixed and the gate closed while settle fingerprints change', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-17T04:00:00.000Z'));
     const leadership = new AbortController();
@@ -1898,7 +1898,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       mockListChatMessagesUntil
         .mockResolvedValueOnce([])
         .mockResolvedValueOnce([])
-        .mockRejectedValueOnce(new Error('history replica lagged'))
+        .mockResolvedValueOnce([recovered])
         .mockResolvedValue([recovered]);
       const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
       const runtime = createLarkEventDispatcherRuntime(
@@ -1912,13 +1912,14 @@ describe('Lark event dispatcher — durable primary processor', () => {
       const recovery = runtime.connectPrimary({ signal: leadership.signal });
       capturedWsClientOptions?.onReady?.();
       await vi.waitFor(() => expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(3));
+      expect(enqueuePrimary).toHaveBeenCalledOnce();
 
       vi.setSystemTime(new Date(gapCreatedAt + 3 * 60_000));
       await vi.advanceTimersByTimeAsync(1_000);
       await recovery.ready;
 
       expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(6);
-      expect(enqueuePrimary).toHaveBeenCalledTimes(3);
+      expect(enqueuePrimary).toHaveBeenCalledTimes(4);
       expect(enqueuePrimary).toHaveBeenCalledWith(expect.objectContaining({
         eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_delayed_history`,
       }));

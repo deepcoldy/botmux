@@ -145,6 +145,121 @@ describe('durable session facade', () => {
     }
   });
 
+  it('keeps a live lease renewing after a Session write throws', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-session-renew-error-'));
+    const databasePath = join(dir, 'coordination.db');
+    const ownerStore = new SqliteDurableCoordinationStore(databasePath, { now: () => Date.now() });
+    const peerStore = new SqliteDurableCoordinationStore(databasePath, { now: () => Date.now() });
+    const renew = vi.spyOn(ownerStore, 'renewSessionLease');
+    const write = vi.spyOn(ownerStore, 'writeSession');
+    const facade = createDurableSessionFacade({
+      store: ownerStore,
+      ownerId: 'renew-after-error-owner',
+      leaseDurationMs: 1_200,
+      keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+    });
+    try {
+      await expect(facade.writeExact('session-renew-after-error', { status: 'active', revision: 1 }))
+        .resolves.toMatchObject({ kind: 'written' });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(renew).toHaveBeenCalledOnce();
+
+      write.mockRejectedValueOnce(new Error('transient Session write failure'));
+      await expect(facade.writeExact(
+        'session-renew-after-error',
+        { status: 'active', revision: 2 },
+      )).rejects.toThrow('transient Session write failure');
+
+      await vi.advanceTimersByTimeAsync(1_600);
+      expect(renew.mock.calls.length).toBeGreaterThan(1);
+      await expect(peerStore.acquireSessionLease({
+        sessionKey: 'session-renew-after-error',
+        ownerId: 'renew-after-error-peer',
+        leaseDurationMs: 1_200,
+      })).resolves.toMatchObject({ kind: 'occupied', ownerId: 'renew-after-error-owner' });
+    } finally {
+      await facade.stop();
+      await ownerStore.close();
+      await peerStore.close();
+      rmSync(dir, { recursive: true, force: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a live lease renewing after a conflicting Session write', async () => {
+    vi.useFakeTimers();
+    try {
+      const { store } = fakeStore();
+      vi.mocked(store.writeSession).mockResolvedValue({
+        kind: 'conflict',
+        current: {
+          sessionKey: 'session-live-conflict',
+          revision: 2,
+          value: { status: 'active' },
+          updatedAt: 2,
+        },
+      });
+      vi.mocked(store.renewSessionLease).mockImplementation(async input => ({
+        kind: 'applied',
+        lease: { ...input.lease, leaseUntil: input.lease.leaseUntil + input.leaseDurationMs },
+      }));
+      const facade = createDurableSessionFacade({
+        store,
+        ownerId: 'live-conflict-owner',
+        leaseDurationMs: 1_200,
+        keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+      });
+
+      await expect(facade.writeExact('session-live-conflict', { status: 'active' }))
+        .resolves.toMatchObject({ kind: 'conflict' });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(store.renewSessionLease).toHaveBeenCalledOnce();
+      await facade.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports lease loss when a live Session write returns stale lease', async () => {
+    const { store } = fakeStore();
+    vi.mocked(store.writeSession).mockResolvedValue({ kind: 'stale_lease' });
+    const onLeaseLost = vi.fn();
+    const facade = createDurableSessionFacade({
+      store,
+      ownerId: 'live-stale-write-owner',
+      keepLeaseAlive: value => (value as { status?: string }).status === 'active',
+      onLeaseLost,
+    });
+
+    await expect(facade.writeExact('session-live-stale-write', { status: 'active' }))
+      .resolves.toEqual({ kind: 'stale_lease', coalescedCount: 1 });
+    expect(onLeaseLost).toHaveBeenCalledOnce();
+    expect(onLeaseLost).toHaveBeenCalledWith(
+      'session-live-stale-write',
+      expect.objectContaining({
+        message: expect.stringContaining('lease was stale when committing the Session write'),
+      }),
+    );
+    await facade.stop();
+  });
+
+  it('releases a write-scoped lease when a Session read throws', async () => {
+    const { store } = fakeStore();
+    vi.mocked(store.readSession).mockRejectedValueOnce(new Error('transient Session read failure'));
+    const facade = createDurableSessionFacade({ store, ownerId: 'release-after-error-owner' });
+
+    await expect(facade.writeExact('session-release-after-error', { status: 'active' }))
+      .rejects.toThrow('transient Session read failure');
+    expect(store.releaseSessionLease).toHaveBeenCalledOnce();
+    expect(store.releaseSessionLease).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: 'session-release-after-error',
+      ownerId: 'release-after-error-owner',
+    }));
+    await facade.stop();
+  });
+
   it('orders an explicit lease release after earlier writes on the same lane', async () => {
     const { store } = fakeStore();
     const blockedWrite = deferred<WriteSessionResult>();

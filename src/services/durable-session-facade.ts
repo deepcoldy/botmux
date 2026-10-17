@@ -283,13 +283,21 @@ export function createDurableSessionFacade(
         return { kind: 'written', lease: acquired.lease, record: written.record, coalescedCount };
       }
       if (written.kind === 'conflict') {
+        if (keepLeaseAlive) armLaneRenewal(lane, acquired.lease);
+        else clearLaneRenewal(lane);
         return { kind: 'conflict', current: written.current, coalescedCount };
       }
-      clearLaneRenewal(lane);
+      if (keepLeaseAlive) {
+        reportLeaseLoss(lane, 'lease was stale when committing the Session write');
+      } else {
+        clearLaneRenewal(lane);
+      }
       lane.lease = undefined;
       return { kind: 'stale_lease', coalescedCount };
     } catch (error) {
       if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
+      if (options.keepLeaseAlive) armLaneRenewal(lane, acquired.lease);
+      else await releaseLaneLease(lane, acquired.lease);
       throw error;
     }
   };
