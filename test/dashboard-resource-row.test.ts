@@ -12,6 +12,36 @@ import {
 } from '../src/core/dashboard-rows.js';
 
 describe('dashboard resource row fields', () => {
+  it('透传 active、closed 和 persisted-active 会话的原生 CLI session id', () => {
+    const session = {
+      sessionId: 's_native',
+      cliSessionId: 'trae-native-session-id',
+      larkAppId: 'app',
+      cliId: 'traex',
+      status: 'active',
+      createdAt: '2026-07-09T00:00:00.000Z',
+      chatId: 'oc_1',
+      rootMessageId: 'om_1',
+    };
+    const active = composeRowFromActive({
+      session,
+      larkAppId: 'app',
+      chatId: 'oc_1',
+      chatType: 'group',
+      scope: 'thread',
+      workerPort: null,
+      workerToken: null,
+      spawnedAt: 1,
+      lastMessageAt: 2,
+    } as unknown as DaemonSession);
+
+    expect(active.cliSessionId).toBe('trae-native-session-id');
+    expect(composeRowFromClosed({ ...session, status: 'closed' } as never).cliSessionId)
+      .toBe('trae-native-session-id');
+    expect(composeRowFromPersistedActive(session as never).cliSessionId)
+      .toBe('trae-native-session-id');
+  });
+
   it('exposes active worker and adopted CLI pids', () => {
     const ds = {
       session: {

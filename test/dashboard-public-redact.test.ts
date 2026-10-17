@@ -350,6 +350,7 @@ describe('session presentation redaction', () => {
     const runtimeSession = {
       sessionId: 's-runtime',
       cliId: 'codex',
+      cliSessionId: 'native-session-id',
       runtimeId: 'internal-vendor-codex',
       runtimeDisplayName: 'Internal Vendor Codex',
       status: 'working',

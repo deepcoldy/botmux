@@ -616,6 +616,46 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
       expect(terminalBtn.multi_url?.url).toBeDefined();
     });
 
+    it('Trae terminal button shows the native CLI id but routes with the BotMux session id', () => {
+      const cliSessionId = '01a14781-2cab-7df0-b22e-54b10b459501';
+      const detail = detailFor({
+        sessionId: 'botmux-route-id',
+        cliId: 'traex',
+        cliSessionId,
+        status: 'idle',
+      });
+      const terminalUrl = 'http://host:7891/s/botmux-route-id';
+      const json = buildSessionsDetailCard(detail, { ...baseOpts, terminalUrl });
+      const parsed = JSON.parse(json);
+      const terminalBtn = (parsed.elements as any[]).find(
+        (e: any) => e.tag === 'action',
+      ).actions[1];
+
+      expect(detail.cliSessionId).toBe(cliSessionId);
+      expect(terminalBtn.text.content).toBe(`🌐 终端 · ${cliSessionId}`);
+      expect(terminalBtn.multi_url.url).toBe(terminalUrl);
+      expect(terminalBtn.multi_url.url).not.toContain(cliSessionId);
+    });
+
+    it('dashboard terminal label falls back for non-Trae CLIs', () => {
+      const detail = detailFor({
+        sessionId: 'sess_codex',
+        cliId: 'codex',
+        cliSessionId: 'codex-native-id',
+        status: 'idle',
+      });
+      const json = buildSessionsDetailCard(detail, {
+        ...baseOpts,
+        terminalUrl: 'http://host:7891/s/sess_codex',
+      });
+      const parsed = JSON.parse(json);
+      const terminalBtn = (parsed.elements as any[]).find(
+        (e: any) => e.tag === 'action',
+      ).actions[1];
+
+      expect(terminalBtn.text.content).toBe('🌐 终端');
+    });
+
     it('locate (chat-scope) → multi_url to feishuChatLink, NO callback', () => {
       const detail = detailFor({ sessionId: 'sess_chat', status: 'idle', scope: 'chat' });
       expect(detail.actions.locateMode).toBe('openChat');

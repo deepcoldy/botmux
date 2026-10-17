@@ -71,6 +71,7 @@ export interface SessionDetailDto {
   title: string;
   chatId: string;
   cliId: string;
+  cliSessionId?: string;
   workingDir?: string;
   webPort: number | null;
   scope?: 'thread' | 'chat';
@@ -277,6 +278,7 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
     title: row.title && row.title.trim().length > 0 ? row.title : row.sessionId,
     chatId: row.chatId,
     cliId: String(row.cliId),
+    cliSessionId: row.cliSessionId,
     workingDir: row.workingDir,
     webPort: row.webPort,
     scope: row.scope,

@@ -672,6 +672,30 @@ describe('buildSessionCard', () => {
       expect(terminalBtn.multi_url.ios_url).toBe(URL);
     });
 
+    it('shows the full Trae CLI session id without changing the Web Terminal link', () => {
+      const cliSessionId = '01a14781-2cab-7df0-b22e-54b10b459501';
+      const card = parse(buildSessionCard(
+        SID, ROOT, URL, TITLE, 'traex', false, false, 'zh', false, undefined, cliSessionId,
+      ));
+      const terminalBtn = findActions(card)[0];
+
+      expect(terminalBtn.text.content).toBe(`🖥️ 打开 Web 终端 · ${cliSessionId}`);
+      expectDirectUrl(terminalBtn.multi_url.url, URL);
+      expect(terminalBtn.multi_url.android_url).toBe(URL);
+    });
+
+    it('keeps the original terminal label for non-Trae CLIs or an undiscovered native id', () => {
+      const codex = parse(buildSessionCard(
+        SID, ROOT, URL, TITLE, 'codex', false, false, 'zh', false, undefined, 'codex-native-id',
+      ));
+      const traexWithoutId = parse(buildSessionCard(
+        SID, ROOT, URL, TITLE, 'traex', false, false, 'zh', false, undefined, '   ',
+      ));
+
+      expect(findActions(codex)[0].text.content).toBe('🖥️ 打开 Web 终端');
+      expect(findActions(traexWithoutId)[0].text.content).toBe('🖥️ 打开 Web 终端');
+    });
+
     it('wraps the terminal link in the Feishu sidebar when openTerminalInFeishu is on', () => {
       enableOpenTerminalInFeishu();
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE));
@@ -1435,6 +1459,20 @@ describe('buildStreamingCard', () => {
       expect(termBtn.multi_url.android_url).toBe(URL);
       expect(termBtn.multi_url.ios_url).toBe(URL);
       expect(termBtn.type).toBe('primary');
+    });
+
+    it('keeps the streaming Web Terminal clickable while showing the Trae CLI session id', () => {
+      const cliSessionId = '01a14781-2cab-7df0-b22e-54b10b459501';
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        undefined, undefined, undefined, undefined, undefined, [], false, cliSessionId,
+      ));
+      const terminalBtn = findActions(card).find((a: any) => a.multi_url);
+
+      expect(terminalBtn.text.content).toBe(`🖥️ Open Web Terminal · ${cliSessionId}`);
+      expectDirectUrl(terminalBtn.multi_url.url, URL);
+      expect(terminalBtn.multi_url.android_url).toBe(URL);
     });
 
     it('should include get_write_link button', () => {

@@ -28,7 +28,7 @@ import { formatUrlHost } from '../../core/dashboard-url.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
 
-import { terminalMultiUrl } from './card-builder.js';
+import { terminalButtonLabel, terminalMultiUrl } from './card-builder.js';
 import type { CardActionData } from './card-handler.js';
 import { BACK_TO_OVERVIEW_ACTION, DASH_PAGE_SIZE, JUMP_PAGE_MAX_OPTIONS, ackToast, errorToast, escapeLarkMd, type DashCardHandlerResult } from './dash-card-common.js';
 
@@ -436,7 +436,15 @@ export function buildSessionsDetailCard(
     && opts.terminalUrl.length > 0;
   const terminalButton: Record<string, unknown> = {
     tag: 'button',
-    text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.terminal', undefined, opts.locale) },
+    text: {
+      tag: 'plain_text',
+      content: terminalButtonLabel(
+        'card.dashboard.sessions.btn.terminal',
+        detail.cliId,
+        detail.cliSessionId,
+        opts.locale,
+      ),
+    },
     type: 'default',
   };
   if (terminalEnabled) {

@@ -1192,7 +1192,11 @@ export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
 }
 
 function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
-  if (!isLocalCliOpenEnabled() || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const hasVisibleTraeSessionId = effectiveCliId === 'traex' && !!ds.session.cliSessionId?.trim();
+  if ((!isLocalCliOpenEnabled() && !hasVisibleTraeSessionId)
+    || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingLocalCliButtonRefresh = undefined;
     return;
   }
@@ -1202,8 +1206,6 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   }
   if (!ds.streamCardId || !workerHasInitialized(ds)) return;
   ds.pendingLocalCliButtonRefresh = undefined;
-  const botCfg = getBot(ds.larkAppId).config;
-  const effectiveCliId = sessionCliId(ds, botCfg);
   const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -1228,6 +1230,8 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1284,6 +1288,8 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   return scheduleCardPatch(ds, cardJson);
 }
@@ -1473,6 +1479,8 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1554,6 +1562,8 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1639,6 +1649,8 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1808,6 +1820,7 @@ function buildSessionTurnFailedCard(
     ...(failedTurn ? { retryTurnId: failedTurn.turnId } : {}),
     ...(mentionOpenId ? { mentionOpenId } : {}),
     terminalUrl: readableTerminalUrlFor(ds),
+    cliSessionId: ds.session.cliSessionId,
     locale: localeForBot(ds.larkAppId),
   });
 }
@@ -3029,6 +3042,8 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -4554,6 +4569,8 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -4671,6 +4688,8 @@ async function postTurnStartingStatusCard(
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
 
   ds.streamCardNonce = nonce;
@@ -4824,6 +4843,8 @@ export async function postFreshStreamingCard(
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -4963,6 +4984,7 @@ export async function postPrivateSnapshotCard(
     readUrl, title, status, effectiveCliId, ds.currentImageKey, ds.lastScreenContent ?? '',
     ds.session.sessionId, sessionAnchorId(ds), localeForBot(ds.larkAppId), cardUsageLimit(ds),
     sessionRuntimeDisplayName(ds, botCfg),
+    ds.session.cliSessionId,
   );
 
   let sent = 0;
@@ -5062,6 +5084,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
+      ds.session.cliSessionId,
     );
   }
   const port = ds.workerPort ?? ds.session.webPort;
@@ -5079,6 +5102,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    ds.session.cliSessionId,
   );
 }
 
@@ -5168,6 +5192,7 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    ds.session.cliSessionId,
   );
 }
 
@@ -8442,6 +8467,8 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    ds.session.cliSessionId,
   );
 }
 
@@ -14876,6 +14903,8 @@ function setupWorkerHandlers(
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              ds.session.cliSessionId,
             );
             if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             await updateMessage(restoredAppId, restoredCardId, streamCardJson, { beforeWrite: () => {
@@ -15002,6 +15031,8 @@ function setupWorkerHandlers(
             idleCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            ds.session.cliSessionId,
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) break;
           const readyPost = scopedReplyTo(
@@ -15102,6 +15133,7 @@ function setupWorkerHandlers(
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
+              ds.session.cliSessionId,
             );
             const fallbackPost = scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
               'interactive', cardReplyTarget.turnId, { replyTarget: cardReplyTarget.target, beforeWrite: beforeFallbackWrite });
@@ -15124,6 +15156,7 @@ function setupWorkerHandlers(
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
+                ds.session.cliSessionId,
               );
               try {
                 await updateMessage(postingAppId, fallbackCardId, readyCardJson, { beforeWrite: beforeFallbackWrite });
@@ -15287,8 +15320,8 @@ function setupWorkerHandlers(
         // before its first positive-delta record exists.
         recordOwnershipForDaemonSession(ds);
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
-          && !wasLocalCliOpenReady
-          && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
+          && (effectiveCliId === 'traex'
+            || (!wasLocalCliOpenReady && isLocalCliOpenReady(ds, { cliId: effectiveCliId })))) {
           scheduleLocalCliOpenReadinessPatch(ds);
         }
         break;
@@ -15710,6 +15743,8 @@ function setupWorkerHandlers(
             idleCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            ds.session.cliSessionId,
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -15840,6 +15875,8 @@ function setupWorkerHandlers(
             idleCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            ds.session.cliSessionId,
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -15942,6 +15979,8 @@ function setupWorkerHandlers(
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          ds.session.cliSessionId,
         );
         scheduleCardPatch(ds, cardJson, msg.turnId);
         break;
@@ -16326,6 +16365,8 @@ function setupWorkerHandlers(
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              ds.session.cliSessionId,
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -16411,6 +16452,8 @@ function setupWorkerHandlers(
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              ds.session.cliSessionId,
             );
             scheduleCardPatch(ds, frozenCard);
           }

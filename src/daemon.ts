@@ -5650,6 +5650,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       previousIdleLabel,
       dshRuntimeForSession(ds),
       resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+      false,
+      ds.session.cliSessionId,
     );
     scheduleCardPatch(ds, frozenCard);
 

@@ -33,6 +33,8 @@ export interface SessionRow extends SessionMessagePreview {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
+  /** Agent CLI 原生会话 ID，仅用于展示；终端路由仍使用 BotMux `sessionId`。 */
+  cliSessionId?: string;
   requestedLaunch?: NonNullable<Session['dispatchLaunchSpec']>['requested'];
   /** Only populated once the worker has actually observed the runtime (i.e. the
    *  session carries dispatchLaunchSpec.effectiveRuntime). No synthetic
@@ -299,6 +301,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    cliSessionId: ds.session.cliSessionId,
     ...(ds.session.dispatchLaunchSpec ? {
       requestedLaunch: ds.session.dispatchLaunchSpec.requested,
       ...(ds.session.dispatchLaunchSpec.effectiveRuntime
@@ -382,6 +385,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliSessionId: s.cliSessionId,
     ...(s.dispatchLaunchSpec ? {
       requestedLaunch: s.dispatchLaunchSpec.requested,
       ...(s.dispatchLaunchSpec.effectiveRuntime
@@ -443,6 +447,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliSessionId: s.cliSessionId,
     ...(s.dispatchLaunchSpec ? {
       requestedLaunch: s.dispatchLaunchSpec.requested,
       ...(s.dispatchLaunchSpec.effectiveRuntime

@@ -36,6 +36,24 @@ export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
 
 export type TurnTerminalReceiptKind = 'completed' | 'silent';
 
+type TerminalButtonLabelKey =
+  | 'card.btn.open_terminal'
+  | 'card.btn.open_writable_terminal'
+  | 'card.dashboard.sessions.btn.terminal';
+
+/** 保留各 CLI 原有的终端按钮文案；worker 发现 TraeX 原生会话 ID 后再追加展示。
+ *  链接仍按 BotMux session id 路由，此 helper 只改变可见文案。 */
+export function terminalButtonLabel(
+  key: TerminalButtonLabelKey,
+  cliId: string | undefined,
+  cliSessionId: string | undefined,
+  locale?: Locale,
+): string {
+  const base = t(key, undefined, locale);
+  const nativeId = cliId === 'traex' ? cliSessionId?.trim() : undefined;
+  return nativeId ? `${base} · ${nativeId}` : base;
+}
+
 /** Independent, low-visual-weight terminal marker used when auto mode cannot
  * patch the last visible carrier (for example a file, voice, or custom card).
  * It is deliberately headerless and action-free: the answer/progress messages
@@ -471,6 +489,7 @@ export function buildSessionCard(
   locale?: Locale,
   localCliReady = false,
   runtimeDisplayName?: string,
+  cliSessionId?: string,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -478,7 +497,12 @@ export function buildSessionCard(
   const actions: any[] = [];
   if (terminalUrl) {
     actions.push(urlButton(
-      t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale),
+      terminalButtonLabel(
+        showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal',
+        effectiveCliId,
+        cliSessionId,
+        locale,
+      ),
       'primary',
       terminalMultiUrl(terminalUrl),
     ));
@@ -980,6 +1004,7 @@ export function buildStreamingCard(
   /** Screenshot mode with no image: render "no screenshot available" instead
    *  of "waiting for first screenshot". Ignored when `imageKey` is present. */
   screenshotUnavailable = false,
+  cliSessionId?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1031,7 +1056,11 @@ export function buildStreamingCard(
     }
   }
   if (terminalUrl && !hidden.has('terminal')) {
-    headerActions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)));
+    headerActions.push(urlButton(
+      terminalButtonLabel('card.btn.open_terminal', effectiveCliId, cliSessionId, locale),
+      'primary',
+      terminalMultiUrl(terminalUrl),
+    ));
   }
   const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
   if (localBtn) headerActions.push(localBtn);
@@ -1218,6 +1247,7 @@ export function buildPrivateSnapshotCard(
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
   runtimeDisplayName?: string,
+  cliSessionId?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1255,7 +1285,11 @@ export function buildPrivateSnapshotCard(
   const actions: any[] = [];
   if (terminalUrl) {
     actions.push(
-      urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)),
+      urlButton(
+        terminalButtonLabel('card.btn.open_terminal', effectiveCliId, cliSessionId, locale),
+        'primary',
+        terminalMultiUrl(terminalUrl),
+      ),
       callbackButton(
         t('card.btn.get_write_link', undefined, locale),
         'default',
@@ -1846,6 +1880,7 @@ export interface TurnFailedCardOpts {
   /** Human to @-mention in the body. Omitted → no mention (never @ a bot). */
   mentionOpenId?: string;
   terminalUrl?: string;
+  cliSessionId?: string;
   locale?: Locale;
 }
 
@@ -1945,7 +1980,11 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
     });
   }
   if (o.terminalUrl) {
-    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
+    actions.push(urlButton(
+      terminalButtonLabel('card.btn.open_terminal', o.cliId, o.cliSessionId, locale),
+      'default',
+      terminalMultiUrl(o.terminalUrl),
+    ));
   }
   if (actions.length > 0) elements.push({ tag: 'action', actions });
 

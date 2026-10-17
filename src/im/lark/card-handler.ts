@@ -3303,6 +3303,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          ds.session.cliSessionId,
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -3743,6 +3745,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
+          ds.session.cliSessionId,
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -3904,6 +3907,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           unavailable,
+          ds.session.cliSessionId,
         );
         return { cardJson, unavailable };
       };
@@ -4098,6 +4102,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          ds.session.cliSessionId,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -4176,6 +4182,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          ds.session.cliSessionId,
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -4268,6 +4276,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          ds.session.cliSessionId,
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

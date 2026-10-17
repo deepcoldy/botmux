@@ -58,8 +58,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     status: args[5],
     localCliReady: args[15] === true,
     // Signature tail after the master merge: 15 localCliReady, 16 usage,
-    // 17 runtimeDisplayName, 18 serviceTierBadge.
+    // 17 runtimeDisplayName, 18 serviceTierBadge, 23 cliSessionId.
     serviceTierBadge: args[18],
+    cliSessionId: args[23],
   })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
@@ -171,10 +172,12 @@ import {
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
+import { isLocalCliOpenEnabled } from '../src/services/local-cli-opener.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
+const isLocalCliOpenEnabledMock = isLocalCliOpenEnabled as ReturnType<typeof vi.fn>;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1466,7 +1469,34 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.session.adoptedFrom.sessionId).toBe('trae-native-ready');
     expect(updateMessageMock).toHaveBeenCalledTimes(1);
     expect(updateMessageMock.mock.calls[0][1]).toBe('om_existing_card');
-    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({ localCliReady: true });
+    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({
+      localCliReady: true,
+      cliSessionId: 'trae-native-ready',
+    });
+  });
+
+  it('Trae 原生 session id 到达时即使关闭本地 CLI 入口也会刷新卡片', async () => {
+    isLocalCliOpenEnabledMock.mockReturnValueOnce(false);
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_existing_card',
+      workingDir: '/tmp',
+    });
+    activate(ds);
+    ds.session.cliId = 'traex';
+    ds.session.cliSessionId = undefined;
+    ds.session.workingDir = '/tmp';
+
+    setupActiveWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'cli_session_id', cliSessionId: 'trae-native-ready' });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(updateMessageMock.mock.calls[0][2])).toMatchObject({
+      cliSessionId: 'trae-native-ready',
+    });
   });
 
   it('defers the readiness patch until an in-flight card POST has a message id', async () => {

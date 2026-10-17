@@ -162,9 +162,9 @@ const PRIVATE_SESSION_FIELDS = new Set([
   'workspace',
   'gitBranch',
   'riffAccessUrl',
-  // Concrete distribution identity is operator configuration, not anonymous
-  // watch-board data. Public rows retain protocol-level `cliId`, which is
-  // sufficient for the existing fallback label.
+  // 原生会话 ID 与具体运行时发行身份都是操作侧信息，不属于匿名看板数据。
+  // 匿名行仍保留协议级 `cliId`，足以渲染现有回退文案。
+  'cliSessionId',
   'runtimeId',
   'runtimeDisplayName',
   'previewUserText',
