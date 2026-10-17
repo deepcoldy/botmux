@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { createHash } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
@@ -2844,6 +2845,10 @@ const PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS = Math.max(
   5_000,
   Number(process.env.BOTMUX_PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS) || 30_000,
 );
+const PRIMARY_INGRESS_RECOVERY_SETTLE_MS = Math.min(30_000, Math.max(
+  250,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_SETTLE_MS) || 2_000,
+));
 const PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS = Math.min(400, Math.max(
   100,
   Number(process.env.BOTMUX_PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS) || 400,
@@ -2853,6 +2858,7 @@ interface PrimaryIngressRecoverySummary {
   chats: number;
   scanned: number;
   enqueued: number;
+  fingerprint: string;
 }
 
 function recoveryChatType(chat: ChatBrief): 'group' | 'p2p' {
@@ -2891,6 +2897,7 @@ async function recoverDurablePrimaryIngressOnce(input: {
   enqueue: NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>;
   signal: AbortSignal;
   now?: number;
+  until?: number;
 }): Promise<PrimaryIngressRecoverySummary> {
   const startedAt = input.now ?? Date.now();
   const cutoff = startedAt - PRIMARY_INGRESS_RECOVERY_WINDOW_MS;
@@ -2905,6 +2912,7 @@ async function recoverDurablePrimaryIngressOnce(input: {
   let nextChat = 0;
   let scanned = 0;
   let enqueued = 0;
+  const recoveredEventIds: string[] = [];
 
   const recoverChat = async (chat: ChatBrief, signal: AbortSignal): Promise<void> => {
     let stoppedAtCutoff = false;
@@ -2946,7 +2954,9 @@ async function recoverDurablePrimaryIngressOnce(input: {
         throw new Error(`primary ingress recovery message ${messageId} has no create_time`);
       }
       if ((createdAt as number) < cutoff) continue;
+      if (input.until !== undefined && (createdAt as number) > input.until) continue;
       scanned += 1;
+      recoveredEventIds.push(`${chat.chatId}:${messageId}`);
       const data = larkReceiveEventFromHistoryMessage(
         message,
         chat.chatId,
@@ -2977,7 +2987,30 @@ async function recoverDurablePrimaryIngressOnce(input: {
     await Promise.all(workers);
   }, PRIMARY_INGRESS_RECOVERY_RUN_TIMEOUT_MS, 'primary ingress recovery', input.signal);
 
-  return { chats: uniqueChats.length, scanned, enqueued };
+  recoveredEventIds.sort();
+  return {
+    chats: uniqueChats.length,
+    scanned,
+    enqueued,
+    fingerprint: createHash('sha256').update(recoveredEventIds.join('\n')).digest('hex'),
+  };
+}
+
+function waitForPrimaryRecoverySettle(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('durable primary ingress recovery aborted'));
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export async function __recoverDurablePrimaryIngressOnceForTest(input: {
@@ -4322,7 +4355,6 @@ export interface LarkEventDispatcherRuntime {
     client: Lark.WSClient;
     ready: Promise<void>;
   };
-  releasePrimary(reason?: unknown): void;
   close(): void;
   processDurableMessage(
     message: DurableLarkMessageClaim,
@@ -4359,6 +4391,8 @@ export interface LarkEventDispatcherRuntimeOptions {
     sessionKey: string,
     canonical: Session,
   ) => Promise<Session | undefined>;
+  /** Test seam; production defaults to a 2s post-ready REST quiet period. */
+  primaryRecoverySettleMs?: number;
 }
 
 interface PrimaryProcessContext {
@@ -5800,6 +5834,10 @@ export function createLarkEventDispatcherRuntime(
   }
   let primaryRecovery: PrimaryRecoveryState | undefined;
   let primaryLeadershipSignal: AbortSignal | undefined;
+  const primaryRecoverySettleMs = Math.min(30_000, Math.max(
+    0,
+    runtimeOptions.primaryRecoverySettleMs ?? PRIMARY_INGRESS_RECOVERY_SETTLE_MS,
+  ));
 
   const enqueuePrimaryAfterRecovery = (
     input: Parameters<NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>>[0],
@@ -6156,7 +6194,6 @@ export function createLarkEventDispatcherRuntime(
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
-  let primaryTransportReady = false;
   let pendingTransportReady: {
     leadershipSignal: AbortSignal;
     resolve: () => void;
@@ -6182,6 +6219,8 @@ export function createLarkEventDispatcherRuntime(
     void ready.catch(() => undefined);
     const recovery: PrimaryRecoveryState = { controller, ready };
     primaryRecovery = recovery;
+    const recoveryStartedAt = Date.now();
+    let recoveryUpperBound: number | undefined;
     void (async () => {
       try {
         while (!controller.signal.aborted && primaryRecovery === recovery) {
@@ -6190,6 +6229,8 @@ export function createLarkEventDispatcherRuntime(
               larkAppId,
               enqueue,
               signal: controller.signal,
+              now: recoveryStartedAt,
+              ...(recoveryUpperBound === undefined ? {} : { until: recoveryUpperBound }),
             });
             let summary = first;
             if (afterFirstPass) {
@@ -6200,15 +6241,33 @@ export function createLarkEventDispatcherRuntime(
                 controller.signal,
               );
               controller.signal.throwIfAborted();
+              recoveryUpperBound ??= Date.now();
               const second = await recoverDurablePrimaryIngressOnce({
                 larkAppId,
                 enqueue,
                 signal: controller.signal,
+                now: recoveryStartedAt,
+                until: recoveryUpperBound,
               });
+              await waitForPrimaryRecoverySettle(
+                primaryRecoverySettleMs,
+                controller.signal,
+              );
+              const settled = await recoverDurablePrimaryIngressOnce({
+                larkAppId,
+                enqueue,
+                signal: controller.signal,
+                now: recoveryStartedAt,
+                until: recoveryUpperBound,
+              });
+              if (second.fingerprint !== settled.fingerprint) {
+                throw new Error('primary ingress recovery history changed during settle window');
+              }
               summary = {
-                chats: Math.max(first.chats, second.chats),
-                scanned: first.scanned + second.scanned,
-                enqueued: first.enqueued + second.enqueued,
+                chats: Math.max(first.chats, second.chats, settled.chats),
+                scanned: first.scanned + second.scanned + settled.scanned,
+                enqueued: first.enqueued + second.enqueued + settled.enqueued,
+                fingerprint: settled.fingerprint,
               };
             }
             if (controller.signal.aborted || primaryRecovery !== recovery) {
@@ -6284,22 +6343,10 @@ export function createLarkEventDispatcherRuntime(
   const connect = (): Lark.WSClient => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
-      onReady: () => {
-        primaryTransportReady = true;
-        settlePrimaryTransportReady();
-      },
-      onReconnecting: () => {
-        primaryTransportReady = false;
-        restartPrimaryTransportRecovery();
-      },
-      onReconnected: () => {
-        primaryTransportReady = true;
-        settlePrimaryTransportReady();
-      },
-      onRestarting: () => {
-        primaryTransportReady = false;
-        restartPrimaryTransportRecovery();
-      },
+      onReady: settlePrimaryTransportReady,
+      onReconnecting: restartPrimaryTransportRecovery,
+      onReconnected: settlePrimaryTransportReady,
+      onRestarting: restartPrimaryTransportRecovery,
     });
     if (runtimeOptions.enqueuePrimary) return wsClient;
     listenerPollTimer = setInterval(() => {
@@ -6335,29 +6382,19 @@ export function createLarkEventDispatcherRuntime(
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
-    const ready = primaryTransportReady
-      ? beginPrimaryRecovery(input.signal)
-      : armPrimaryTransportRecovery(input.signal);
+    const ready = armPrimaryTransportRecovery(input.signal);
     const client = connect();
     return { client, ready };
-  };
-
-  const releasePrimary = (
-    reason: unknown = new Error('Lark ingress leadership released'),
-  ): void => {
-    primaryRecovery?.controller.abort(reason);
-    primaryRecovery = undefined;
-    primaryLeadershipSignal = undefined;
-    pendingTransportReady = undefined;
   };
 
   return {
     connect,
     connectPrimary,
-    releasePrimary,
     close: () => {
-      releasePrimary(new Error('Lark event dispatcher closed'));
-      primaryTransportReady = false;
+      primaryRecovery?.controller.abort(new Error('Lark event dispatcher closed'));
+      primaryRecovery = undefined;
+      primaryLeadershipSignal = undefined;
+      pendingTransportReady = undefined;
       if (listenerPollTimer) clearInterval(listenerPollTimer);
       if (initialListenerPollTimer) clearTimeout(initialListenerPollTimer);
       listenerPollTimer = undefined;
