@@ -2204,6 +2204,84 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('releases the arrival reservation after a partition lookup rejects', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+
+    const rejected = Promise.resolve(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-failed-lookup',
+      message: { message_id: 'om_primary_failed_lookup' },
+    }));
+    const receive = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA after failed lookup' }),
+      messageId: 'om_primary_after_failed_lookup',
+      chatId: 'chat-primary',
+      chatType: 'group',
+    });
+    const admitted = Promise.resolve(capturedHandlers['im.message.receive_v1'](receive));
+
+    await expect(rejected).rejects.toThrow(/no authoritative chat_id/);
+    await expect(admitted).resolves.toBeUndefined();
+    expect(enqueuePrimary).toHaveBeenCalledOnce();
+    expect(enqueuePrimary).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_after_failed_lookup`,
+    }));
+    runtime.close();
+  });
+
+  it('releases the arrival slot after partition registration without serializing DB writes', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    let releaseFirst!: (value: { kind: 'inserted' }) => void;
+    const firstWrite = new Promise<{ kind: 'inserted' }>(resolve => {
+      releaseFirst = resolve;
+    });
+    const enqueuePrimary = vi.fn()
+      .mockReturnValueOnce(firstWrite)
+      .mockResolvedValueOnce({ kind: 'inserted' as const });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const first = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA chat A' }),
+      messageId: 'om_primary_parallel_write_a',
+      chatId: 'chat-a',
+      chatType: 'group',
+    });
+    const second = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA chat B' }),
+      messageId: 'om_primary_parallel_write_b',
+      chatId: 'chat-b',
+      chatType: 'group',
+    });
+
+    const firstAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](first));
+    const secondAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](second));
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledTimes(2));
+    await expect(secondAck).resolves.toBeUndefined();
+    releaseFirst({ kind: 'inserted' });
+    await expect(firstAck).resolves.toBeUndefined();
+    runtime.close();
+  });
+
   it('durably admits an edited message that first adds the bot mention', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'new-topic' });
     mockGetChatMode.mockResolvedValue('group');
