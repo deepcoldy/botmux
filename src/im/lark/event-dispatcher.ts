@@ -2587,7 +2587,9 @@ export interface RoutingContext {
    *  （`{ ...ctx, scope, anchor }`），box 引用随拷贝共享，接纳发生在拷贝之后
    *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
-  ingressAdmission?: { admitted: boolean };
+  ingressAdmission?: { admitted: boolean; retryReason?: string };
+  /** Ephemeral durable-primary claim identity; never persisted in Session. */
+  durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
 }
@@ -4455,7 +4457,7 @@ export interface LarkEventDispatcherRuntimeOptions {
   takeOverPrimarySession?: (
     sessionKey: string,
     canonical: Session,
-  ) => Promise<Session | undefined>;
+  ) => Promise<Session | { kind: 'retry'; reason: string } | undefined>;
   /** Test seam; production defaults to a 2s post-ready REST quiet period. */
   primaryRecoverySettleMs?: number;
 }
@@ -4582,6 +4584,8 @@ export function createLarkEventDispatcherRuntime(
     ctx: RoutingContext,
     primary: PrimaryProcessContext,
   ): DurableLarkCanonicalHandlerResult => {
+    const retryReason = ctx.ingressAdmission?.retryReason?.trim();
+    if (retryReason) return { kind: 'retry', reason: retryReason };
     if (!ctx.ingressAdmission?.admitted) {
       return { kind: 'ignored', reason: 'canonical handler completed without task admission' };
     }
@@ -4592,22 +4596,41 @@ export function createLarkEventDispatcherRuntime(
     return { kind: 'admitted', session };
   };
 
+  const preparePrimaryRoutingContext = (
+    ctx: RoutingContext,
+    primary: PrimaryProcessContext,
+  ): void => {
+    ctx.ingressAdmission ??= { admitted: false };
+    ctx.durablePrimaryDispatch = {
+      attempt: primary.context.claim.attempts,
+      signal: primary.context.signal,
+    };
+    if (typeof primary.context.queuePostAdmissionOutput === 'function') {
+      ctx.queuePostAdmissionOutput = primary.context.queuePostAdmissionOutput;
+    }
+  };
+
   const assertPrimaryRouteOwner = async (
     ctx: RoutingContext,
     primary: PrimaryProcessContext | undefined,
-  ): Promise<boolean> => {
-    if (!primary || !runtimeOptions.readPrimarySession) return false;
+  ): Promise<'none' | 'owned' | 'retry'> => {
+    if (!primary || !runtimeOptions.readPrimarySession) return 'none';
     const anchor = ctx.runtimeRoutingAnchor ?? ctx.anchor;
     const canonicalKey = sessionKey(anchor, larkAppId);
     const canonical = await runtimeOptions.readPrimarySession(canonicalKey);
-    if (!canonical || canonical.status !== 'active') return false;
+    if (!canonical || canonical.status !== 'active') return 'none';
     let local = handlers.resolveDurableSession?.(ctx);
     if (runtimeOptions.takeOverPrimarySession) {
-      await runtimeOptions.takeOverPrimarySession(canonicalKey, canonical);
+      const takeover = await runtimeOptions.takeOverPrimarySession(canonicalKey, canonical);
+      if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
+        ctx.ingressAdmission ??= { admitted: false };
+        ctx.ingressAdmission.retryReason = takeover.reason;
+        return 'retry';
+      }
       local = handlers.resolveDurableSession?.(ctx);
-      if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
+      if (local?.sessionId === canonical.sessionId && local.status === 'active') return 'owned';
     }
-    if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
+    if (local?.sessionId === canonical.sessionId && local.status === 'active') return 'owned';
     throw new Error(
       `durable primary active canonical Session is owned by another replica: ${canonicalKey}`,
     );
@@ -4737,6 +4760,7 @@ export function createLarkEventDispatcherRuntime(
           // (e.g. dispatch's /repo prime + brief kickoff) don't interleave with
           // the first's async session-spawn. See anchor-serializer.ts.
           if (primary) {
+            preparePrimaryRoutingContext(routedCtx, primary);
             await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
             return primaryResult(routedCtx, primary);
           }
@@ -4786,6 +4810,7 @@ export function createLarkEventDispatcherRuntime(
             larkAppId,
           });
           if (primary) {
+            preparePrimaryRoutingContext(listenerPayload.ctx, primary);
             await dispatchHumanMessage(listenerPayload);
             return primaryResult(listenerPayload.ctx, primary);
           }
@@ -4884,10 +4909,12 @@ export function createLarkEventDispatcherRuntime(
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
               const seedPayload = { data, ctx: seedCtx, ownsSession: false };
               if (primary) {
-                const ownsCanonical = await assertPrimaryRouteOwner(seedCtx, primary);
+                preparePrimaryRoutingContext(seedCtx, primary);
+                const owner = await assertPrimaryRouteOwner(seedCtx, primary);
+                if (owner === 'retry') return primaryResult(seedCtx, primary);
                 await dispatchHumanMessage({
                   ...seedPayload,
-                  ownsSession: seedPayload.ownsSession || ownsCanonical,
+                  ownsSession: seedPayload.ownsSession || owner === 'owned',
                 });
                 return primaryResult(seedCtx, primary);
               }
@@ -4993,7 +5020,10 @@ export function createLarkEventDispatcherRuntime(
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
         // back-to-back into this thread must be handled in order, not raced.
         if (primary) {
-          await assertPrimaryRouteOwner(routedCtx, primary);
+          preparePrimaryRoutingContext(routedCtx, primary);
+          if (await assertPrimaryRouteOwner(routedCtx, primary) === 'retry') {
+            return primaryResult(routedCtx, primary);
+          }
           await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
           return primaryResult(routedCtx, primary);
         }
@@ -5654,7 +5684,9 @@ export function createLarkEventDispatcherRuntime(
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
-      ownsSession = (await assertPrimaryRouteOwner(ctx, primary)) || ownsSession;
+      const primaryOwner = await assertPrimaryRouteOwner(ctx, primary);
+      if (primaryOwner === 'retry') return primaryResult(ctx, primary!);
+      ownsSession = primaryOwner === 'owned' || ownsSession;
       // Record explicit DM /t intent before this message releases the raw
       // per-chat routing lane and before handleNewTopic begins its async session
       // registration. A back-to-back root-linked reply can therefore select the
@@ -5754,6 +5786,7 @@ export function createLarkEventDispatcherRuntime(
       // concurrently. Same-anchor handlers remain strictly serialized by
       // dispatchHumanMessage's canonical queue.
       if (primary) {
+        preparePrimaryRoutingContext(ctx, primary);
         await dispatchHumanMessage(payload);
         return primaryResult(ctx, primary);
       }

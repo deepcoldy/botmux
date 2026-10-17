@@ -1377,6 +1377,59 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('retries without running local handlers while the canonical Session lease is occupied', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-owned-by-peer',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-peer-root',
+      scope: 'thread' as const,
+      title: 'Peer owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    handlers.isSessionOwner = vi.fn(() => false);
+    const takeOverPrimarySession = vi.fn(async () => ({
+      kind: 'retry' as const,
+      reason: 'active Session lease is still owned by replica-a',
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA wait for owner' }),
+      messageId: 'msg-primary-peer-followup',
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_peer',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-peer-followup'))
+      .resolves.toEqual({
+        kind: 'retry',
+        reason: 'active Session lease is still owned by replica-a',
+      });
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
   it('revalidates the owner lease before routing an already-local active Session', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('topic');
@@ -1426,6 +1479,55 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('returns an explicit retry when the canonical handler defers a busy Session', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    const canonical = {
+      sessionId: 'session-primary-busy',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-busy-root',
+      scope: 'thread' as const,
+      title: 'Busy owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    handlers.resolveDurableSession = vi.fn(() => canonical);
+    handlers.isSessionOwner = vi.fn(() => true);
+    handlers.handleThreadReply.mockImplementation(async (_data: any, ctx: any) => {
+      expect(ctx.durablePrimaryDispatch).toMatchObject({ attempt: 1 });
+      expect(ctx.durablePrimaryDispatch.signal).toBeInstanceOf(AbortSignal);
+      ctx.ingressAdmission.retryReason = 'session has an unfinished turn';
+    });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession: async () => canonical,
+      },
+    );
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA queued follow-up' }),
+      messageId: 'msg-primary-busy-followup',
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_busy',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-busy-followup'))
+      .resolves.toEqual({ kind: 'retry', reason: 'session has an unfinished turn' });
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
   it('applies the active canonical owner fence to bot-to-bot follow-ups', async () => {
     setupBotState({ allowedUsers: [] });
     mockGetChatMode.mockResolvedValue('topic');
@@ -1464,6 +1566,57 @@ describe('Lark event dispatcher — durable primary processor', () => {
       .rejects.toThrow(/active canonical Session is owned by another replica/);
     expect(readPrimarySession).toHaveBeenCalledWith(`msg-primary-root-bot::${MY_APP_ID}`);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('keeps a bot-to-bot follow-up retryable while the prior owner lease is occupied', async () => {
+    setupBotState({ allowedUsers: [] });
+    mockGetChatMode.mockResolvedValue('topic');
+    const handlers = makeHandlers();
+    handlers.resolveDurableSession = vi.fn(() => undefined);
+    const canonical = {
+      sessionId: 'session-bot-owned-by-peer',
+      chatId: 'chat-primary',
+      rootMessageId: 'msg-primary-bot-peer-root',
+      scope: 'thread' as const,
+      title: 'Remote bot owner',
+      status: 'active' as const,
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    };
+    const takeOverPrimarySession = vi.fn(async () => ({
+      kind: 'retry' as const,
+      reason: 'active Session lease is still owned by replica-a',
+    }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      {
+        readPrimarySession: async () => canonical,
+        takeOverPrimarySession,
+      },
+    );
+    const data = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA wait for owner' }),
+      messageId: 'msg-primary-bot-peer-followup',
+      rootId: canonical.rootMessageId,
+      threadId: 'omt_primary_bot_peer',
+      chatId: canonical.chatId,
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'msg-primary-bot-peer-followup'))
+      .resolves.toEqual({
+        kind: 'retry',
+        reason: 'active Session lease is still owned by replica-a',
+      });
+    expect(takeOverPrimarySession).toHaveBeenCalledOnce();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     runtime.close();
   });

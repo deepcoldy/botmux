@@ -85,6 +85,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       protocol, version, type: 'ready', requestId: command.requestId, state,
       recoveredTurn: {
         turnId: 'om_turn_survived', generation: state.generation, startedAtMs: 1000,
+        dispatchAttempt: 8,
         trustedCaller: {
           requestUserOpenId: 'ou_remote_user', requestLarkAppId: 'app_remote_takeover', senderType: 'user',
         },
@@ -174,6 +175,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       content: 'follow up during takeover',
       turnId: 'om_turn_followup',
       dispatchAttempt: 9,
+      durablePrimaryInbox: true,
       trustedCaller: {
         requestUserOpenId: 'ou_remote_user',
         requestLarkAppId: 'app_remote_takeover',
@@ -192,6 +194,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 16_000));
     expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
     expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'turn_input_committed',
+      turnId: 'om_turn_survived',
+      dispatchAttempt: 8,
+      durablePrimaryInbox: true,
+    }));
 
     writeFileSync(releaseRecoveredFinalPath, 'release\n');
     await waitFor(
@@ -219,6 +227,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       }),
     ]);
     expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'turn_input_committed',
+        turnId: 'om_turn_followup',
+        dispatchAttempt: 9,
+        durablePrimaryInbox: true,
+      }),
       expect.objectContaining({
         type: 'final_output',
         turnId: 'om_turn_survived',
