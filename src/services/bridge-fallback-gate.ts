@@ -511,15 +511,18 @@ export function shouldEmitFailedBridgeFallback(
   // also reports a failed terminal. Never turn that internal token into visible
   // failure content.
   if (isBridgeNothingToSendFinal(turn.finalText)) return false;
-  // Keep the structured failure as an execution fact. The delivery gate below
-  // may suppress its notification after an exact explicit final, but progress
-  // and legacy sends must never replace the terminal failure reason.
+  // Keep the structured failure as an execution fact. The opt-in delivery gate
+  // below may suppress its notification after an exact explicit final, but
+  // progress and legacy sends must never replace the terminal failure reason.
   return true;
 }
 
 /** Failure fallbacks are terminal diagnostics, not another model answer. Do not
- * apply the ordinary length/preview heuristic to them: only an acknowledged,
- * explicit final for this exact turn/attempt can make the notice redundant.
+ * apply the ordinary length/preview heuristic to them. By default only the
+ * adopt / isLocal / bare-sentinel gates apply. The experimental opt-in
+ * additionally treats an acknowledged, explicit final for this exact
+ * turn/attempt as making the notice redundant; it trusts that final and does
+ * not compare it with later transcript text.
  * Execution status and retry accounting remain independent of notification. */
 export function shouldSuppressStructuredFallback(
   fallbackKind: StructuredFallbackKind,
@@ -530,11 +533,15 @@ export function shouldSuppressStructuredFallback(
   /** failed 走下面的 mode-agnostic 门禁，用不到它；non-failed 必须透传，
    *  否则 transcript 下的重复判定会退回 send 缺省的「明显更长才放行」。 */
   replyDelivery: 'send' | 'transcript' = 'send',
+  /** 实验性、默认关闭（per-bot `suppressDeliveredFinalFailureNotice`）。只有显式
+   *  true 才启用下面的「已送达 final」门禁；缺省与旧行为逐字一致。 */
+  suppressDeliveredFinalFailureNotice = false,
 ): boolean {
   if (fallbackKind !== 'failed') {
     return shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery);
   }
   if (adoptMode || turn.isLocal || isBridgeNothingToSendFinal(turn.finalText)) return true;
+  if (suppressDeliveredFinalFailureNotice !== true) return false;
   if (!turn.turnId || turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;

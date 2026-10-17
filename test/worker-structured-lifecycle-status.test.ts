@@ -753,3 +753,16 @@ describe('worker structured-turn status wiring', () => {
     expect(adopt).toContain('dropFailedBridgeMark(adoptStructuredBridgeTurnId, dispatchAttempt)');
   });
 });
+
+describe('delivered-final failure-notice opt-in worker wiring', () => {
+  it('reads only an explicit init true and passes it to both structured fallback gates', () => {
+    const reader = functionSlice('deliveredFinalFailureNoticeSuppressed', 'zeroPromptTerminalSync');
+    expect(reader).toContain('lastInitConfig?.suppressDeliveredFinalFailureNotice === true');
+    const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
+    const calls = emit.split('shouldSuppressStructuredFallback(').slice(1);
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.split('\n')[0]).toContain('replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())');
+    }
+  });
+});

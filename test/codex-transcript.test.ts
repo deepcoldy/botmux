@@ -86,10 +86,12 @@ describe('post-delivery provider failure notification', () => {
       terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE });
     const gate = { ...ready, markTimeMs: ready.markTimeMs, isLocal: ready.isLocal };
     const kind = structuredFallbackKind(gate, undefined, [delivered], false, true);
-    expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false)).toBe(true);
+    // Default (experimental opt-in absent): the legacy failure notice is unchanged.
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false)).toBe(false);
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false, 'send', true)).toBe(true);
     // Progress is not a final: the same real provider failure still reaches the user.
     expect(shouldSuppressStructuredFallback(kind, gate, undefined,
-      [{ ...delivered, responseKind: 'progress' }], false)).toBe(false);
+      [{ ...delivered, responseKind: 'progress' }], false, 'send', true)).toBe(false);
     expect(ready.terminalStatus).toBe('failed');
   });
 });

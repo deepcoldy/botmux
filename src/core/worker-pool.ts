@@ -13753,6 +13753,9 @@ export function forkWorker(
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
     replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId, sessionPromptInjection(ds)),
+    // 实验性、默认关闭：只有显式 true 才下发，worker 读不到即保持旧的失败通知。
+    // adopt init 不带它：adopt 的失败兜底本就由 adoptMode 门禁抑制。
+    ...(botCfg.suppressDeliveredFinalFailureNotice === true ? { suppressDeliveredFinalFailureNotice: true } : {}),
     promptInjection: sessionPromptInjection(ds),
     solo: ds.soloSession === true,
     feedback: feedbackPolicy,
