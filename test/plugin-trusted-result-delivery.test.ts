@@ -132,20 +132,14 @@ describe('trusted plugin result delivery', () => {
     )).rejects.toThrow('plugin_result_delivery_timeout');
     expect(sameMessageRevoke).toHaveBeenCalledOnce();
 
-    vi.useFakeTimers();
-    try {
-      const timedOutRevoke = vi.fn();
-      const pending = awaitTrustedResultDeliveryAck(
-        new Promise<never>(() => undefined),
-        { revoke: timedOutRevoke, timeoutMs: 50 },
-      );
-      const rejected = expect(pending).rejects.toThrow('plugin_result_delivery_timeout');
-      await vi.advanceTimersByTimeAsync(50);
-      await rejected;
-      expect(timedOutRevoke).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
+    // Real timers on purpose: the bun-test leg's fake-timer shim does not drive
+    // this Promise.race timeout, so a fake-timer version hangs under bun test.
+    const timedOutRevoke = vi.fn();
+    await expect(awaitTrustedResultDeliveryAck(
+      new Promise<never>(() => undefined),
+      { revoke: timedOutRevoke, timeoutMs: 20 },
+    )).rejects.toThrow('plugin_result_delivery_timeout');
+    expect(timedOutRevoke).not.toHaveBeenCalled();
 
     const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     expect(workerSource).toContain('awaitTrustedResultDeliveryAck(responsePromise');
