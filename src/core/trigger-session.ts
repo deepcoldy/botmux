@@ -50,6 +50,9 @@ export interface TriggerSessionDeps {
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
   stableTurnId?: string;
+  /** Daemon-derived provenance and escaped data; never accepted from HTTP. */
+  applicationContext?: string;
+  eventDataContext?: string;
   /** A loud idempotent relay must not be replayed by worker crash recovery. */
   atMostOnce?: boolean;
   /** Synchronous write-ahead hook invoked immediately before worker IPC/fork.
@@ -930,7 +933,9 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
+  const promptForSession = (target?: DaemonSession) => internal?.eventDataContext
+    ? `${internal.applicationContext ?? ''}\n\n${internal.eventDataContext}`
+    : zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
     ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
     : buildUntrustedEventPrompt(req, triggerId);
@@ -939,8 +944,8 @@ async function triggerSessionTurnAdmitted(
   const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
     && req.presentation.topicMessage.trim().length > 0;
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
-  const codexAppApplicationContext = buildExternalEventApplicationContext(req);
-  const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
+  const codexAppApplicationContext = internal?.applicationContext ?? buildExternalEventApplicationContext(req);
+  const codexAppMessageContext = internal?.eventDataContext ?? buildExternalEventDataContext(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
   // ── Idempotency (fresh async virtual only — validator guarantees the shape) ──
