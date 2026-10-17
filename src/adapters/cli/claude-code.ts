@@ -749,7 +749,15 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
 function findJsonlAcrossProjectsRoot(
   searchPath: string,
   fingerprint: string,
-  options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
+  options: {
+    minMtimeMs?: number;
+    minEventTimestampMs?: number;
+    includeQueueOperations?: boolean;
+    /** Include Task/Agent subagent transcripts (<sid>/subagents/*.jsonl).
+     *  Only safe for boolean "did the prompt land" checks: the matched
+     *  subagent path must NOT be pinned as the watched session jsonl. */
+    includeSubagentTranscripts?: boolean;
+  },
 ): string | null {
   if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
   const primaryDir = dirname(searchPath);
@@ -1511,12 +1519,17 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // drift like worker thinking `-foo-bar/` while Claude actually appends
         // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
         // fallback so a stale historical match can't suppress the warning.
+        // Subagent transcripts are included here (boolean use only — the
+        // matched path is never pinned): a prompt delivered while a Task tool
+        // agent is running lands in <sid>/subagents/*.jsonl, and the session
+        // jsonl gains no user event until the agent reports back.
         const searchPath = currentPath ?? pty.claudeJsonlPath;
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
           minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
+          includeSubagentTranscripts: true,
         });
         return !!matched;
       };
