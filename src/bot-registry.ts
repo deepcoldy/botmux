@@ -1596,6 +1596,11 @@ export interface BotConfig {
   /** Opt-in Codex model-capacity continuation. Missing/false is off. Each
    * admitted task may inject up to two recovery inputs into native history. */
   codexCapacityRecovery?: boolean;
+  /** Experimental, off by default. When true, a structured-bridge failure
+   * notice is not posted if this exact turn/attempt already delivered an
+   * acknowledged explicit final. It trusts that final and does not compare it
+   * with later transcript text. Missing/false keeps the legacy notice. */
+  suppressDeliveredFinalFailureNotice?: boolean;
   /**
    * Codex App only: tune or mute the once-per-turn "no observable progress"
    * nudge (#1162). `enabled: false` silences just the Lark push — the worker
@@ -3932,6 +3937,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         }
       })(),
       codexCapacityRecovery: entry.codexCapacityRecovery === true || undefined,
+      suppressDeliveredFinalFailureNotice: entry.suppressDeliveredFinalFailureNotice === true || undefined,
       noProgressNotify: entry.noProgressNotify === undefined ? undefined : normalizeNoProgressNotifyPolicy(entry.noProgressNotify),
       feedback: entry.feedback === undefined
         ? undefined

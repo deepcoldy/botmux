@@ -1933,6 +1933,9 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
         cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
         terminalCardEpoch?: string;
+        /** Experimental, off by default: only an explicit true lets the worker
+         *  suppress a failure notice after an exact acknowledged final. */
+        suppressDeliveredFinalFailureNotice?: boolean;
       }
     : Message
   : never;

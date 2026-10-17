@@ -2550,6 +2550,13 @@ function replyDeliveryMode(): 'send' | 'transcript' {
   return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
 }
 
+/** 实验性、默认关闭：daemon 在 init 上冻结 per-bot 开关。只有显式 true 时，
+ *  失败兜底才信任本轮本次尝试已带回执的显式 final 而不再补发；读不到一律
+ *  false——等于历史行为。 */
+function deliveredFinalFailureNoticeSuppressed(): boolean {
+  return lastInitConfig?.suppressDeliveredFinalFailureNotice === true;
+}
+
 function zeroPromptTerminalSync(): boolean {
   return lastInitConfig?.promptInjection === 'none' && !lastInitConfig.adoptMode
     && !lastInitConfig.apiOnly;
@@ -9524,6 +9531,8 @@ function emitReadyCodexTurns(): void {
     const sourceHermesSessionId = structuredBridgeIs('hermes') ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
+      turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt,
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
       forwardLocalFinal: zeroPromptTerminalSync(),
@@ -9568,12 +9577,13 @@ function emitReadyCodexTurns(): void {
         turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
       ),
     );
-    if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+    if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
     if (!content) continue;
-    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
-      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
+    if (shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode(), deliveredFinalFailureNoticeSuppressed())) {
+      log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`
+        + (fallbackKind === 'failed' ? `; execution remains failed (${turn.terminalErrorCode ?? 'worker_turn_failed'})` : ''));
       // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
       // no send) from other suppression reasons (already `botmux send`-ed this
       // turn, local-typed). Only the former is positive evidence that the model

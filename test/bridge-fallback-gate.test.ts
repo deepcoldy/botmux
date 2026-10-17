@@ -1105,6 +1105,129 @@ describe('shouldSuppressStructuredFallback', () => {
     expect(shouldSuppressStructuredFallback('final', turn(100), 200, progress, false)).toBe(true);
     expect(shouldSuppressStructuredFallback('empty_completed', turn(100), 200, progress, false)).toBe(true);
   });
+
+  describe('a final delivery followed by a provider failure', () => {
+    const exactTurn = { ...failed, turnId: 'turn-a', dispatchAttempt: 2 };
+    const delivered: BridgeSendMarker = {
+      sentAtMs: 150, messageId: 'om_delivered', responseKind: 'final',
+      turnId: 'turn-a', dispatchAttempt: 2,
+    };
+    const OPT_IN = true;
+
+    function replayEmpty527() {
+      const queue = new CodexBridgeQueue();
+      queue.mark('turn-a', 'run the read-only probe', 100, 2);
+      queue.ingest([
+        { uuid: 'user-a', kind: 'user', timestampMs: 110, text: 'run the read-only probe' },
+        { uuid: 'failed-a', kind: 'assistant_final', timestampMs: 190, text: '',
+          terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE,
+          terminalErrorSummary: 'unexpected status 527: empty provider response' },
+      ]);
+      const [ready] = queue.drainEmittable();
+      expect(ready).toMatchObject({ turnId: 'turn-a', dispatchAttempt: 2,
+        terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE });
+      const gate = { ...ready, markTimeMs: ready.markTimeMs, isLocal: ready.isLocal };
+      return { queue, ready, gate };
+    }
+
+    describe('experimental opt-in is off by default', () => {
+      it.each(['send', 'transcript'] as const)('still posts the failure after an exact final when the opt-in is absent (%s)', mode => {
+        expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [delivered], false, mode)).toBe(false);
+        expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [delivered], false, mode, undefined)).toBe(false);
+        expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [delivered], false, mode, false)).toBe(false);
+      });
+
+      it('requires an explicit boolean true; truthy persisted values do not enable it', () => {
+        for (const value of ['true', 1, {}] as unknown as boolean[]) {
+          expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [delivered], false, 'send', value)).toBe(false);
+        }
+      });
+
+      it('keeps the legacy notice for the empty 527 replay unless explicitly enabled', () => {
+        const { gate } = replayEmpty527();
+        const kind = structuredFallbackKind(gate, undefined, [delivered], false, true);
+        expect(kind).toBe('failed');
+        expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false)).toBe(false);
+        expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false, 'send', false)).toBe(false);
+        expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false, 'send', OPT_IN)).toBe(true);
+      });
+
+      it('keeps the adopt / isLocal / bare-sentinel gates independent of the opt-in', () => {
+        for (const optIn of [false, OPT_IN]) {
+          expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [], true, 'send', optIn)).toBe(true);
+          expect(shouldSuppressStructuredFallback('failed', { ...exactTurn, isLocal: true }, 200, [], false, 'send', optIn)).toBe(true);
+          expect(shouldSuppressStructuredFallback('failed', { ...exactTurn, finalText: 'BOTMUX_NOTHING_TO_SEND' }, 200,
+            [], false, 'send', optIn)).toBe(true);
+          expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [], false, 'send', optIn)).toBe(false);
+        }
+      });
+
+      it('does not change non-failure dedup', () => {
+        for (const optIn of [false, OPT_IN]) {
+          expect(shouldSuppressStructuredFallback('final', turn(100), 200, progress, false, 'send', optIn)).toBe(true);
+          expect(shouldSuppressStructuredFallback('empty_completed', turn(100), 200, progress, false, 'send', optIn)).toBe(true);
+        }
+      });
+    });
+
+    it.each(['send', 'transcript'] as const)('does not post another failure after a successful final when enabled (%s)', mode => {
+      expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [delivered], false, mode, OPT_IN)).toBe(true);
+      // Notification suppression must not turn an execution failure into success.
+      expect(exactTurn.terminalStatus).toBe('failed');
+    });
+
+    it('supports ordinary turns and managed final cards, without requiring body text', () => {
+      expect(shouldSuppressStructuredFallback('failed', { ...exactTurn, dispatchAttempt: undefined }, 200,
+        [{ ...delivered, dispatchAttempt: undefined, replyCardResponseKind: 'final' }], false, 'send', OPT_IN)).toBe(true);
+    });
+
+    it.each([
+      ['progress', { responseKind: 'progress' }],
+      ['auxiliary', { responseKind: 'auxiliary' }],
+      ['legacy unclassified send', { responseKind: undefined }],
+      ['managed progress', { replyCardResponseKind: 'progress' }],
+      ['independent side effect', { terminalIndependent: true }],
+      ['unacknowledged delivery', { messageId: undefined }],
+      ['empty delivery id', { messageId: '' }],
+      ['another turn in the same time window', { turnId: 'turn-b' }],
+      ['legacy unattributed send', { turnId: undefined }],
+      ['previous attempt', { dispatchAttempt: 1 }],
+      ['unknown attempt', { dispatchAttempt: undefined }],
+      ['before this turn', { sentAtMs: 99 }],
+      ['next turn boundary', { sentAtMs: 200 }],
+    ] as const)('keeps the failure visible for %s even when enabled', (_label, override) => {
+      expect(shouldSuppressStructuredFallback('failed', exactTurn, 200,
+        [{ ...delivered, ...override }], false, 'send', OPT_IN)).toBe(false);
+    });
+
+    it('does not borrow exact final credit when the turn identity or time window is unknown', () => {
+      expect(shouldSuppressStructuredFallback('failed', failed, 200, [delivered], false, 'send', OPT_IN)).toBe(false);
+      expect(shouldSuppressStructuredFallback('failed', { ...exactTurn, markTimeMs: undefined }, 200,
+        [delivered], false, 'send', OPT_IN)).toBe(false);
+      expect(shouldSuppressStructuredFallback('failed', { ...exactTurn, dispatchAttempt: undefined }, 200,
+        [delivered], false, 'send', OPT_IN)).toBe(false);
+    });
+
+    it('fails open for a malformed persisted delivery id instead of crashing the worker', () => {
+      const malformed = { ...delivered, messageId: 42 } as unknown as BridgeSendMarker;
+      expect(shouldSuppressStructuredFallback('failed', exactTurn, 200, [malformed], false, 'send', OPT_IN)).toBe(false);
+    });
+
+    it('uses an inclusive lower bound and keeps exact attempt matching without a successor', () => {
+      expect(shouldSuppressStructuredFallback('failed', exactTurn, undefined,
+        [{ ...delivered, sentAtMs: 100 }], false, 'send', OPT_IN)).toBe(true);
+    });
+
+    it('replays final-send then empty 527 terminal through the real queue without losing the failure fact', () => {
+      const { queue, ready, gate } = replayEmpty527();
+      const kind = structuredFallbackKind(gate, undefined, [delivered], false, true);
+      expect(kind).toBe('failed');
+      expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false, 'send', OPT_IN)).toBe(true);
+      // The provider diagnostic still exists for turn_terminal/logs and does not get rewritten.
+      expect(ready.terminalErrorSummary).toContain('527');
+      expect(queue.drainEmittable()).toEqual([]);
+    });
+  });
 });
 
 describe('composeFailedBridgeFallbackContent', () => {
