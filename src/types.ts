@@ -2192,6 +2192,16 @@ export type WorkerToDaemon =
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */
   | { type: 'steer_accepted'; appTurnId: string; turnId: string }
+  /** Claude Code `/btw` side answer, read from its overlay (never in the
+   *  transcript). `turnId` is the `/btw` passthrough's turn. */
+  | {
+    type: 'btw_answer';
+    question: string;
+    answer: string;
+    /** `screen`: read from the viewport, so a long answer may be cut off. */
+    source: 'clipboard' | 'screen';
+    turnId?: string;
+  }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */

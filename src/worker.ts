@@ -120,6 +120,12 @@ import {
 } from './services/web-terminal-settings-store.js';
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
+import {
+  ClaudeBtwCaptureGuard,
+  claudeBtwOverlayVisible,
+  claudeBtwQuestion,
+  parseClaudeBtwOverlay,
+} from './utils/claude-btw-overlay.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
 import {
@@ -3353,6 +3359,10 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // a dialog that renders during the acceptance wait is not missed. Bare
         // `/effort` opens a level picker (unknown target) and is left alone.
         if (isEffortLevelCommand(msg.content)) armEffortConfirm();
+        // `/btw <question>` answers in an overlay that never reaches the
+        // transcript; arm the capture before the bytes land.
+        const btwQuestion = claudeBtwQuestion(msg.content);
+        if (btwQuestion) armBtwCapture(btwQuestion, msg.turnId);
       });
       sent = true;
       if (fence && !adoptWriteFenceIsCurrent(fence)) {
@@ -3367,6 +3377,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         ? err.recoveryFailureReason
         : undefined;
       disarmEffortConfirm();
+      disarmBtwCapture();
       // Do not send a bundled follow-up or another queued command against a
       // backend whose literal command write failed.
       log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
@@ -11476,6 +11487,132 @@ function armEffortConfirm(): void {
     effortConfirmTimer = null;
     effortConfirmGuard.disarm();
   }, EFFORT_CONFIRM_WINDOW_MS);
+  effortConfirmTimer.unref?.();
+}
+
+// Relay Claude Code's `/btw` side answer to the IM thread: watch the screen
+// for our overlay to finish, press `c`, forward the OSC 52 payload. Armed
+// only by botmux's own `/btw <question>` passthrough; see claude-btw-overlay.ts.
+const btwCaptureGuard = new ClaudeBtwCaptureGuard();
+let btwCaptureTurnId: string | undefined;
+let btwCaptureTimer: ReturnType<typeof setTimeout> | null = null;
+let btwCopyTimer: ReturnType<typeof setTimeout> | null = null;
+let btwScreenCheckTimer: ReturnType<typeof setTimeout> | null = null;
+let btwCopyAttempts = 0;
+let btwCaptureGeneration = 0;
+// A side question is answered without tools; give slow models room but never
+// leave the guard armed indefinitely.
+const BTW_ANSWER_WINDOW_MS = 180_000;
+// The OSC 52 payload follows the `c` keypress almost immediately.
+const BTW_COPY_WINDOW_MS = 3_000;
+// Screen reads are throttled, not debounced: a busy main turn repaints its
+// spinner continuously, so a quiet window may never come.
+const BTW_SCREEN_CHECK_MS = 150;
+const BTW_MAX_COPY_ATTEMPTS = 3;
+
+function disarmBtwCapture(): void {
+  if (btwCaptureTimer) clearTimeout(btwCaptureTimer);
+  if (btwCopyTimer) clearTimeout(btwCopyTimer);
+  if (btwScreenCheckTimer) clearTimeout(btwScreenCheckTimer);
+  btwCaptureTimer = btwCopyTimer = btwScreenCheckTimer = null;
+  btwCopyAttempts = 0;
+  btwCaptureGuard.disarm();
+  btwCaptureTurnId = undefined;
+}
+
+function armBtwCapture(question: string, turnId: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
+  // Remote runners deliver screens, not a byte stream with OSC 52.
+  if (isRemoteBackendType(effectiveBackendType)) return;
+  disarmBtwCapture();
+  btwCaptureGeneration += 1;
+  btwCaptureGuard.arm(question);
+  btwCaptureTurnId = turnId;
+  btwCaptureTimer = setTimeout(() => {
+    btwCaptureTimer = null;
+    log('/btw answer not captured within the answer window; giving up');
+    giveUpBtwCapture();
+  }, BTW_ANSWER_WINDOW_MS);
+  btwCaptureTimer.unref?.();
+}
+
+/** The live renderer (fed every PTY chunk) rather than lastAnalyzerSnapshot,
+ *  which refreshes at most every 2s; with preserveFormatting so indentation
+ *  (question vs. answer, nested lists) survives. */
+function btwOverlayScreen(): string {
+  return renderer?.rawSnapshot({ preserveFormatting: true }) || lastAnalyzerSnapshot || '';
+}
+
+/** Close the overlay, which otherwise swallows the next keystrokes botmux
+ *  types (`f` forks, `x` clears history). Only while the freshest screen
+ *  shows it: with the overlay gone, Esc would interrupt the running turn.
+ *  The headless renderer parses asynchronously, so the repaint that came
+ *  with the triggering chunk (e.g. "Copied to clipboard") may be half
+ *  applied right now; look again a few times before concluding it is gone. */
+const BTW_CLOSE_CHECKS_MS = [100, 300, 700];
+
+function closeBtwOverlayIfVisible(attempt = 0, generation = btwCaptureGeneration): void {
+  const timer = setTimeout(() => {
+    // A newer `/btw` owns whatever overlay is on screen now.
+    if (!backend || generation !== btwCaptureGeneration) return;
+    if (claudeBtwOverlayVisible(btwOverlayScreen())) {
+      log('/btw overlay still open; closing it');
+      sendTermActionOnce(backend, 'esc');
+    } else if (attempt + 1 < BTW_CLOSE_CHECKS_MS.length) {
+      closeBtwOverlayIfVisible(attempt + 1, generation);
+    }
+  }, BTW_CLOSE_CHECKS_MS[attempt] - (BTW_CLOSE_CHECKS_MS[attempt - 1] ?? 0));
+  timer.unref?.();
+}
+
+function giveUpBtwCapture(): void {
+  closeBtwOverlayIfVisible();
+  disarmBtwCapture();
+}
+
+function deliverBtwAnswer(question: string, answer: string, source: 'clipboard' | 'screen'): void {
+  const turnId = btwCaptureTurnId;
+  disarmBtwCapture();
+  log(`/btw answer captured from ${source} (${answer.length} chars)`);
+  send({ type: 'btw_answer', question, answer, source, ...(turnId ? { turnId } : {}) });
+  closeBtwOverlayIfVisible();
+}
+
+function scheduleBtwScreenCheck(): void {
+  if (btwScreenCheckTimer) return;
+  btwScreenCheckTimer = setTimeout(checkBtwOverlayScreen, BTW_SCREEN_CHECK_MS);
+  btwScreenCheckTimer.unref?.();
+}
+
+function checkBtwOverlayScreen(): void {
+  btwScreenCheckTimer = null;
+  if (!backend || btwCaptureGuard.inspectScreen(btwOverlayScreen()).kind !== 'copy') return;
+  btwCopyAttempts += 1;
+  btwCaptureGuard.markCopyRequested();
+  backend.write('c');
+  btwCopyTimer = setTimeout(finishBtwCaptureFromScreen, BTW_COPY_WINDOW_MS);
+  btwCopyTimer.unref?.();
+}
+
+/** No OSC 52 arrived after `c`: read the answer from the rendered overlay
+ *  (viewport only, so the daemon marks it as possibly partial). If the
+ *  overlay is still answering, wait for the finished footer again. */
+function finishBtwCaptureFromScreen(): void {
+  btwCopyTimer = null;
+  if (!btwCaptureGuard.isCopying()) return;
+  const overlay = parseClaudeBtwOverlay(btwOverlayScreen());
+  if (overlay?.state === 'done' && overlay.answer) {
+    deliverBtwAnswer(btwCaptureGuard.question, overlay.answer, 'screen');
+    return;
+  }
+  if (overlay?.state === 'answering' && btwCopyAttempts < BTW_MAX_COPY_ATTEMPTS) {
+    log('/btw overlay still answering after the copy request; waiting for it to finish');
+    btwCaptureGuard.revertToAnswering();
+    scheduleBtwScreenCheck();
+    return;
+  }
+  log('/btw answer finished but neither the clipboard nor the screen yielded it');
+  giveUpBtwCapture();
 }
 
 /**
@@ -12816,6 +12953,17 @@ function handlePtyDataChunk(data: string): void {
       backend?.write('\r');
     }
     return;
+  }
+
+  // `/btw` side answer relay. Armed only by our own `/btw <question>`
+  // passthrough. The keypresses here target the overlay, not the composer.
+  if (btwCaptureGuard.isArmed()) {
+    const action = btwCaptureGuard.inspectData(data);
+    if (action.kind === 'answer') {
+      deliverBtwAnswer(action.question, action.text, 'clipboard');
+    } else if (!btwCaptureGuard.isCopying()) {
+      scheduleBtwScreenCheck();
+    }
   }
 
   // Track last PTY output time for the ready-gate quiescence settle (see
@@ -21209,6 +21357,7 @@ function killCli(opts: {
   aidenCodexUpdateAttempts = 0;
   aidenCodexUpdateLimitNotified = false;
   disarmEffortConfirm();
+  disarmBtwCapture();
   appRunnerControlDecoder.reset();
 }
 

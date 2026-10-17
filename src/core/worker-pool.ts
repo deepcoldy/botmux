@@ -769,6 +769,8 @@ const CLOSE_FENCE_WARN_MS = 8_000;
 // the leader already reported failure (split-brain; see the busy-refuse comment
 // in transferSession). In-process callers have no such ceiling.
 const TRANSFER_DETACH_FENCE_MS = 3_500;
+// Claude Code `/btw` answers are capped before rendering (see 'btw_answer').
+const BTW_ANSWER_MAX_CHARS = 6_000;
 // In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
 // above it — its card ACK already degrades to a background "处理中" toast at 2.5s
 // and the real result is delivered as a visible message. So it can afford a
@@ -18027,6 +18029,36 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'btw_answer': {
+        // Claude Code `/btw` side answer captured from its overlay. Rendered
+        // like the adopt preamble (question + Markdown answer) and replied
+        // under the `/btw` turn.
+        if (managedAuxUiSuppressed(msg.turnId)) break;
+        if (!msg.answer.trim()) break;
+        const loc = localeForBot(ds.larkAppId);
+        // Feishu cards cap at ~30KB; a side answer is short, so a plain
+        // character cap (CJK is 3 bytes) is enough instead of a file fallback.
+        let btwAnswer = msg.answer.length > BTW_ANSWER_MAX_CHARS
+          ? `${msg.answer.slice(0, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
+          : msg.answer;
+        if (msg.source === 'screen') btwAnswer += `\n\n${tr('card.btw_answer_from_screen', undefined, loc)}`;
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        const cardJson = buildContextualReplyCard({
+          title: tr('card.btw_answer', undefined, loc),
+          userText: msg.question,
+          assistantText: repairReplyMarkdown(btwAnswer),
+          assistantLabel: sessionCliDisplayName(ds, botCfg),
+          recipientOpenId,
+          brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+          locale: loc,
+          workingDir: ds.workingDir,
+          localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
+        });
+        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: unknown) => {
+          logger.error(`[${t}] Failed to deliver /btw answer: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        break;
+      }
       case 'adopt_preamble': {
         // Adopt-bridge: surface the last completed user/assistant exchange
         // from the adopted CLI session so the Lark thread has context to
