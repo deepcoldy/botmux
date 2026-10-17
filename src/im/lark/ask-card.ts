@@ -422,6 +422,12 @@ function capPrompt(prompt: string, cap: number, locale?: Locale): string {
   return `${head}…\n\n${t('card.ask.prompt_truncated', undefined, locale)}`;
 }
 
+/** 选项说明的展示层长度兜底，与 prompt 的 30KB 字节预算相互独立。 */
+function truncate(s: string, maxChars: number, locale?: Locale): string {
+  if (s.length <= maxChars) return s || t('common.empty_paren', undefined, locale);
+  return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
+}
+
 /** 完整问题正文（附件内容）。 */
 export function askPromptAttachmentText(ask: PendingAsk): string {
   const locale = localeForBot(ask.larkAppId);
@@ -511,6 +517,12 @@ function renderAskCardWithCap(
       const q = ask.questions[i]!;
       const prompt = capPrompt(questionPrompt(ask, i), promptCap, locale);
 
+      // 显式 `botmux ask --mention <open_id>` 的点名：卡片不像回复消息天然带 @，
+      // daemon 已保证这里的 open_id 是人类（bot 会触发 100290 被剔除），故可安全
+      // 注入真实 `<at>`。只在第一问前注入一次即可触达通知。
+      const mentionPrefix = i === 0 && ask.mentionedOpenId
+        ? `<at id=${ask.mentionedOpenId}></at>\n`
+        : '';
       // 问题标题。问题正文完整渲染：审批按钮的效力取决于完整信息，展示层截断
       // 会让批准人在信息不全的情况下做决定。空 prompt 已在 ask-api 归一化时以
       // bad_question_shape 拒绝。整卡超飞书 30KB 请求体上限时由 renderAskCard 的
@@ -519,7 +531,7 @@ function renderAskCardWithCap(
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
+          content: `${mentionPrefix}**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
         },
       });
 
@@ -548,6 +560,22 @@ function renderAskCardWithCap(
             },
       }));
       appendActionRows(elements, optionButtons, optionLayout);
+
+      // 选项的详细说明（Claude Code AskUserQuestion 的 options[].description）。
+      // 不进按钮（飞书按钮无副标题），在按钮行下方以小字列出 label → description，
+      // 缺省时整块不渲染，老调用方渲染结果不变。
+      const described = q.options.filter((opt) => opt.description?.trim());
+      if (described.length > 0) {
+        elements.push({
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: described
+              .map((opt) => `**${escapeMd(truncate(opt.label, 120, locale))}**：${escapeMd(truncate(opt.description!.trim(), 400, locale))}`)
+              .join('\n'),
+          },
+        });
+      }
     }
 
     if (requiresSubmit && !textReplyRequired) {
