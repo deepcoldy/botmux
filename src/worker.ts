@@ -156,6 +156,7 @@ import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
   clearBridgeTurnJournal,
+  planBridgeTurnRecovery,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
   selectRestorableBridgeTurns,
@@ -5814,14 +5815,14 @@ function checkpointCodexAdoptRecovery(): void {
   // The first attach must consume the previous generation's journal before a
   // new pre-path input or an early empty drain can replace it.
   if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
-  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue); }
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
   catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
 function checkpointStructuredBridgeRecovery(): void {
   const path = structuredBridgeJournalPath();
   if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
-  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue); }
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue, codexBridgeOffset); }
   catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
@@ -6344,6 +6345,30 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
     try { writeBridgeTurnJournal(journalPath, restorable); } catch { /* best-effort */ }
   }
   if (restorable.length === 0) return false;
+  let transcriptSize = Number.NaN;
+  try { transcriptSize = statSync(bridgeJsonlPath).size; } catch { /* plan fails closed below */ }
+  const recoveryPlan = planBridgeTurnRecovery(restorable, transcriptSize);
+  const skipRecovery = (reason: string): true => {
+    const cursor = baselineJsonlCursor(bridgeJsonlPath!);
+    bridgeOffset = cursor.newOffset;
+    bridgeBaselineDone = true;
+    clearBridgeTurnJournal(journalPath);
+    log(`Bridge recovery skipped ${restorable.length} pending turn(s): ${reason}; baselined at offset=${bridgeOffset}`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ BotMux 跳过了 ${restorable.length} 条中断回合的历史输出补投，因为可恢复历史范围无效、过大或读取失败。原 CLI 输入没有重放；请先核对终端或已有回复，再按需重发。`,
+    });
+    return true;
+  };
+  if (recoveryPlan.kind === 'skip') {
+    return skipRecovery(`${recoveryPlan.reason} range=${recoveryPlan.recoveryBytes} max=${recoveryPlan.maxBytes}`);
+  }
+  let drained: ReturnType<typeof drainTranscript>;
+  try {
+    drained = drainTranscript(bridgeJsonlPath, recoveryPlan.fromOffset);
+  } catch (error) {
+    return skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   for (const entry of restorable) {
     bridgeQueue.mark(
       entry.turnId,
@@ -6354,8 +6379,6 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
       { restoredFromJournal: true },
     );
   }
-  const fromOffset = Math.min(...restorable.map(entry => entry.offsetAtMark));
-  const drained = drainTranscript(bridgeJsonlPath, fromOffset);
   bridgeOffset = drained.newOffset;
   const cutoffMs = Math.min(...restorable.map(entry => entry.markTimeMs)) - 5_000;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
@@ -6363,7 +6386,7 @@ function tryRestoreInterruptedBridgeTurns(): boolean {
   if (live.length > 0) bridgeQueue.ingest(live, bridgeJsonlPath);
   observeModelFallbackEvents(bridgeJsonlPath, drained.events);
   bridgeBaselineDone = true;
-  log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
+  log(`Bridge restored ${restorable.length} interrupted turn(s) from journal (drain ${recoveryPlan.fromOffset}→${bridgeOffset}, absorbed=${history.length}, live=${live.length})`);
   return true;
 }
 
@@ -8144,43 +8167,65 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const restorable = canRecover ? selectRestorableBridgeTurns(readBridgeTurnJournal(journalPath), { currentJsonlPath: rolloutPath }) : [];
     if (journalPath) structuredBridgeRecoveryAttempted = true;
     if (restorable.length > 0 && journalPath) {
-      const result = structuredBridgeIngestPath(rolloutPath, 0);
-      const minMarkTime = Math.min(...restorable.map(e => e.markTimeMs));
-      const cutoff = minMarkTime - 5_000;
-      const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
-      codexBridgeQueue.absorb(history);
-      codexBridgeQueue.ingest(live);
-      if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
-      emitReadyCodexTurns();
-      if (live.some(event => event.kind === 'assistant_final')) {
-        idleDetector?.fireIdle();
-      }
-      codexBridgeOffset = result.newOffset;
-      codexBridgePendingTail = result.pendingTail;
-      codexBridgeBaselineDone = true;
-      if (structuredBridgeIs('codex')) {
-        const codex = result as CodexDrainResult;
-        codexServiceTierTracker.observe(rolloutPath, codex.latestThreadSettings);
-        publishActiveRuntime({
-          model: codex.latestModel,
-          reasoningEffort: codex.latestReasoningEffort,
+      let rolloutSize = Number.NaN;
+      try { rolloutSize = statSync(rolloutPath).size; } catch { /* plan fails closed below */ }
+      const recoveryPlan = planBridgeTurnRecovery(restorable, rolloutSize);
+      const skipRecovery = (reason: string): void => {
+        const cursor = baselineJsonlCursor(rolloutPath);
+        codexBridgeOffset = cursor.newOffset;
+        codexBridgePendingTail = cursor.pendingTail;
+        codexBridgeBaselineDone = true;
+        log(`Structured bridge recovery skipped ${restorable.length} pending turn(s): ${reason}; baselined at offset=${codexBridgeOffset}`);
+        send({
+          type: 'user_notify',
+          message: `⚠️ BotMux 跳过了 ${restorable.length} 条中断回合的历史输出补投，因为可恢复历史范围无效、过大或读取失败。原 CLI 输入没有重放；请先核对终端或已有回复，再按需重发。`,
         });
-        // Same as split-live: the cursor jumps to EOF, so live-side sub-agents
-        // must be registered from this drain or never at all.
-        codexSubagentLimitTracker.observe(
-          codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
-          Date.now(),
-        );
-        maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
+      };
+      if (recoveryPlan.kind === 'skip') {
+        skipRecovery(`${recoveryPlan.reason} range=${recoveryPlan.recoveryBytes} max=${recoveryPlan.maxBytes}`);
+      } else {
+        try {
+          const result = structuredBridgeIngestPath(rolloutPath, recoveryPlan.fromOffset);
+          const minMarkTime = Math.min(...restorable.map(e => e.markTimeMs));
+          const cutoff = minMarkTime - 5_000;
+          const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
+          codexBridgeQueue.absorb(history);
+          codexBridgeQueue.ingest(live);
+          if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
+          emitReadyCodexTurns();
+          if (live.some(event => event.kind === 'assistant_final')) {
+            idleDetector?.fireIdle();
+          }
+          codexBridgeOffset = result.newOffset;
+          codexBridgePendingTail = result.pendingTail;
+          codexBridgeBaselineDone = true;
+          if (structuredBridgeIs('codex')) {
+            const codex = result as CodexDrainResult;
+            codexServiceTierTracker.observe(rolloutPath, codex.latestThreadSettings);
+            publishActiveRuntime({
+              model: codex.latestModel,
+              reasoningEffort: codex.latestReasoningEffort,
+            });
+            // Same as split-live: the cursor jumps to EOF, so live-side sub-agents
+            // must be registered from this drain or never at all.
+            codexSubagentLimitTracker.observe(
+              codex.spawnedSubagents?.filter(sub => sub.startedAtMs >= cutoff),
+              Date.now(),
+            );
+            maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
+          }
+          if (structuredBridgeIs('traex')) {
+            const traex = result as TraexDrainResult;
+            publishActiveRuntime({
+              model: traex.latestModel,
+              reasoningEffort: traex.latestReasoningEffort,
+            });
+          }
+          log(`Structured bridge baseline-existing recovered: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
+        } catch (error) {
+          skipRecovery(`drain-failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
-      if (structuredBridgeIs('traex')) {
-        const traex = result as TraexDrainResult;
-        publishActiveRuntime({
-          model: traex.latestModel,
-          reasoningEffort: traex.latestReasoningEffort,
-        });
-      }
-      log(`Structured bridge baseline-existing recovered: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
     } else {
       const cursor = baselineJsonlCursor(rolloutPath);
       codexBridgeOffset = cursor.newOffset;
@@ -9065,6 +9110,26 @@ function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]):
 /** Mark a pending Lark turn for Codex. Crucially this works even before a
  *  rollout path is known — the queue is path-agnostic, and ingest after
  *  late-attach picks up the user_message and matches the fingerprint. */
+function structuredBridgeRecoveryCursorAtMark(): { jsonlPath: string; offsetAtMark: number } | undefined {
+  if (codexBridgeRolloutPath) {
+    return { jsonlPath: codexBridgeRolloutPath, offsetAtMark: codexBridgeOffset };
+  }
+  const cliId = lastInitConfig?.cliId;
+  const spec = bridgeSpecFor(cliId);
+  const sessionIdAtMark = codexBridgePendingSessionId
+    ?? lastSpawnEffectiveCliSessionId
+    ?? (spec?.spawn?.sessionId === 'cli-or-adapter' ? lastSpawnEffectiveAdapterSessionId : undefined)
+    ?? lastInitConfig?.cliSessionId;
+  if (!sessionIdAtMark) return undefined;
+  const jsonlPath = resolveFileBridgePath(cliId, {
+    sessionId: sessionIdAtMark,
+    cwd: lastInitConfig?.workingDir,
+  });
+  if (!jsonlPath) return undefined;
+  const cursor = baselineJsonlCursor(jsonlPath);
+  return { jsonlPath, offsetAtMark: cursor.newOffset };
+}
+
 function codexBridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
@@ -9073,7 +9138,8 @@ function codexBridgeMarkPendingTurn(
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
-  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt);
+  const recoveryCursorAtMark = structuredBridgeRecoveryCursorAtMark();
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt, recoveryCursorAtMark);
   checkpointCodexAdoptRecovery();
   checkpointStructuredBridgeRecovery();
   return turnId;
