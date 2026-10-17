@@ -88,6 +88,36 @@ describe('mailbox real process transport', () => {
     expect(context.applicationContext).not.toContain('forged');
     expect(context.eventDataContext).not.toContain('<botmux_delivery_source>');
   }, 30000);
+  it.skipIf(process.platform !== 'linux')('rejects a real sibling host process despite a valid key and copied source capability', async () => {
+    const engine = spawnTsEvalWithRepoImports("process.stdout.write('ready\\n'); setInterval(() => {}, 1000);", {
+      env: { ...process.env, BOTMUX_NO_CLAIM: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('fixture engine not ready')), 5000);
+        engine.stdout!.once('data', () => { clearTimeout(timer); resolve(); });
+        engine.once('error', e => { clearTimeout(timer); reject(e); });
+      });
+      const ds = source();
+      const started = readProcessStartIdentity(engine.pid!);
+      ds.localProcessAttestation!.cliPid = engine.pid!;
+      ds.localProcessAttestation!.cliProcStart = started;
+      ds.managedTurnOrigin!.preexistingProcessIdentities = [`${engine.pid}:${started}`];
+      const { trigger } = await setup(() => true, ds);
+      const response = await fetchDaemonIpc(ipc!.port, '/api/mailbox/send', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'source', target: { sessionId: 'target' }, idempotencyKey: 'sibling',
+          content: 'x', originCapability: ds.managedTurnOrigin!.capability }),
+      }, 'mailbox-test-secret');
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: 'host_process_source_unproven' });
+      expect(trigger).not.toHaveBeenCalled();
+    } finally {
+      const closed = new Promise<void>(resolve => engine.once('close', () => resolve()));
+      engine.kill('SIGTERM');
+      await closed;
+    }
+  });
   it('refuses disabled bots and valid host HMAC with copied capability/forged session', async () => {
     let enabled = false;
     const { ds, trigger } = await setup(() => enabled);
