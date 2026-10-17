@@ -145,12 +145,10 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
   if (input.reviewers !== undefined) {
     reviewers = validateReviewerEntries(input.reviewers);
   }
-  // `reviewers` audience is meaningless without at least one reviewer, and a
-  // silently-empty allowlist would render an un-clickable control. Fail closed
-  // at config time instead of shipping a dead button.
-  if (audience === 'reviewers' && reviewers.length === 0) {
-    throw new Error('feedback.audience "reviewers" requires a non-empty feedback.reviewers allowlist');
-  }
+  // An empty reviewers allowlist is intentional: keep the feedback control
+  // visible, but let the callback identity gate reject every operator. This
+  // surfaces the configured feedback affordance without widening access when
+  // the trusted reviewer list has not been filled in yet.
   // A reviewers allowlist only has meaning under the reviewers audience; reject
   // the combination rather than silently ignoring it (a requester-only or
   // everyone card must never appear to have carried an allowlist).
@@ -238,8 +236,9 @@ function isResolvableReviewerEntry(entry: string): boolean {
  *  - a resolver that maps an email to an `ou_` replaces that entry;
  *  - an unresolved email is DROPPED (never shipped as a dead entry that
  *    silently gates nothing, and never left as raw text the callback can't
- *    match). If every entry drops, the caller sees an empty allowlist and must
- *    fail closed (no clickable control) rather than emitting an open card.
+ *    match). If every entry drops, the caller sees an empty allowlist and the
+ *    callback remains fail closed: the control stays visible, but nobody can
+ *    submit feedback until a reviewer can be verified.
  *
  * `resolve` receives the raw email entries and returns a map from the
  * raw entry to a resolved `ou_` (missing key = unresolved). It is only called
@@ -259,8 +258,8 @@ export async function materializeFeedbackReviewers(
   } catch {
     // A transient resolver failure must not silently widen or dead-gate the
     // card. Drop the unresolved entries; keep any literal ids that need no
-    // lookup. An all-dropped result yields an empty allowlist (caller fails
-    // closed), never an open one.
+    // lookup. An all-dropped result yields an empty allowlist (the callback
+    // rejects every operator), never an open one.
     map = new Map();
   }
   const seen = new Set<string>();
