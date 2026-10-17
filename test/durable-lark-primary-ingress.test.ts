@@ -246,6 +246,26 @@ describe('durable Lark primary ingress', () => {
     await ingress.stop();
   });
 
+  it('rejects a chatless update before it can escape the receive partition', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck({
+      eventType: 'lark.im.message.updated_v1',
+      eventId: 'im.message.updated_v1:cli_test:evt_chatless',
+      partitionKey: 'lark-message-routing:cli_test:__chatless__',
+      data: { event_id: 'evt_chatless', message: { message_id: 'om_1' } },
+    })).rejects.toThrow(/message identity/);
+    expect(store.enqueueInboxWithLease).not.toHaveBeenCalled();
+    await ingress.stop();
+  });
+
   it('persists stable close/resume interactions in the isolated session-control lane', async () => {
     const store = fakeStore();
     const ingress = startDurableLarkPrimaryIngress({

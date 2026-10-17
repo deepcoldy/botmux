@@ -2844,6 +2844,10 @@ const PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS = Math.max(
   5_000,
   Number(process.env.BOTMUX_PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS) || 30_000,
 );
+const PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS = Math.min(400, Math.max(
+  100,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS) || 400,
+));
 
 interface PrimaryIngressRecoverySummary {
   chats: number;
@@ -2853,6 +2857,33 @@ interface PrimaryIngressRecoverySummary {
 
 function recoveryChatType(chat: ChatBrief): 'group' | 'p2p' {
   return chat.chatMode === 'p2p' ? 'p2p' : 'group';
+}
+
+async function primaryUpdatedMessageIngressAnchor(
+  larkAppId: string,
+  message: any,
+): Promise<string> {
+  if (typeof message?.chat_id === 'string' && message.chat_id.trim()) {
+    return rawMessageIngressAnchor(larkAppId, message);
+  }
+  const messageId = typeof message?.message_id === 'string' ? message.message_id : '';
+  if (!messageId.startsWith('om_')) {
+    throw new Error('durable primary update has no message identity');
+  }
+  const detail = await runWithAbortDeadline(
+    signal => getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      timeoutMs: PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS,
+      signal,
+    }),
+    PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS,
+    `primary ingress resolve update chat ${messageId.substring(0, 12)}`,
+  );
+  const chatId = detail?.items?.[0]?.chat_id ?? detail?.message?.chat_id ?? detail?.chat_id;
+  if (typeof chatId !== 'string' || !chatId.trim()) {
+    throw new Error(`durable primary update ${messageId} has no authoritative chat_id`);
+  }
+  return rawMessageIngressAnchor(larkAppId, { ...message, chat_id: chatId.trim() });
 }
 
 async function recoverDurablePrimaryIngressOnce(input: {
@@ -4291,6 +4322,7 @@ export interface LarkEventDispatcherRuntime {
     client: Lark.WSClient;
     ready: Promise<void>;
   };
+  releasePrimary(reason?: unknown): void;
   close(): void;
   processDurableMessage(
     message: DurableLarkMessageClaim,
@@ -6047,11 +6079,19 @@ export function createLarkEventDispatcherRuntime(
         recallTime: ev?.recall_time,
       });
     },
-    'im.message.updated_v1': (data: any) => {
+    'im.message.updated_v1': async (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;
       const eventKey = `im.message.updated_v1:${larkAppId}:${eventIdForKey(data) ?? eventMessage?.message_id ?? unkeyableEventKey()}`;
-      const ingressAnchor = rawMessageIngressAnchor(larkAppId, eventMessage);
       if (runtimeOptions.enqueuePrimary) {
+        // updated_v1 frequently omits chat_id.  Resolve it before durable
+        // enqueue so an edit cannot escape to __chatless__ and overtake the
+        // recovered receive row in the real chat partition.  Lookup failure
+        // rejects the WS callback and relies on Lark redelivery; never ACK an
+        // update whose ordering domain is still unknown.
+        const ingressAnchor = await primaryUpdatedMessageIngressAnchor(
+          larkAppId,
+          eventMessage,
+        );
         return enqueuePrimaryAfterRecovery({
           eventId: eventKey,
           eventType: 'lark.im.message.updated_v1',
@@ -6059,6 +6099,7 @@ export function createLarkEventDispatcherRuntime(
           data,
         }).then(() => undefined);
       }
+      const ingressAnchor = rawMessageIngressAnchor(larkAppId, eventMessage);
       // 事件常不带 chat_id（字段不可靠）；缺时 rawMessageIngressAnchor 收敛到 __chatless__
       // 全局泳道，读回权威消息后再在 processMessageEvent 内按真实 anchor 串行。
       scheduleAckSafeEvent(
@@ -6115,6 +6156,7 @@ export function createLarkEventDispatcherRuntime(
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
+  let primaryTransportReady = false;
   let pendingTransportReady: {
     leadershipSignal: AbortSignal;
     resolve: () => void;
@@ -6242,10 +6284,22 @@ export function createLarkEventDispatcherRuntime(
   const connect = (): Lark.WSClient => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
-      onReady: settlePrimaryTransportReady,
-      onReconnecting: restartPrimaryTransportRecovery,
-      onReconnected: settlePrimaryTransportReady,
-      onRestarting: restartPrimaryTransportRecovery,
+      onReady: () => {
+        primaryTransportReady = true;
+        settlePrimaryTransportReady();
+      },
+      onReconnecting: () => {
+        primaryTransportReady = false;
+        restartPrimaryTransportRecovery();
+      },
+      onReconnected: () => {
+        primaryTransportReady = true;
+        settlePrimaryTransportReady();
+      },
+      onRestarting: () => {
+        primaryTransportReady = false;
+        restartPrimaryTransportRecovery();
+      },
     });
     if (runtimeOptions.enqueuePrimary) return wsClient;
     listenerPollTimer = setInterval(() => {
@@ -6281,19 +6335,29 @@ export function createLarkEventDispatcherRuntime(
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
-    const ready = armPrimaryTransportRecovery(input.signal);
+    const ready = primaryTransportReady
+      ? beginPrimaryRecovery(input.signal)
+      : armPrimaryTransportRecovery(input.signal);
     const client = connect();
     return { client, ready };
+  };
+
+  const releasePrimary = (
+    reason: unknown = new Error('Lark ingress leadership released'),
+  ): void => {
+    primaryRecovery?.controller.abort(reason);
+    primaryRecovery = undefined;
+    primaryLeadershipSignal = undefined;
+    pendingTransportReady = undefined;
   };
 
   return {
     connect,
     connectPrimary,
+    releasePrimary,
     close: () => {
-      primaryRecovery?.controller.abort(new Error('Lark event dispatcher closed'));
-      primaryRecovery = undefined;
-      primaryLeadershipSignal = undefined;
-      pendingTransportReady = undefined;
+      releasePrimary(new Error('Lark event dispatcher closed'));
+      primaryTransportReady = false;
       if (listenerPollTimer) clearInterval(listenerPollTimer);
       if (initialListenerPollTimer) clearTimeout(initialListenerPollTimer);
       listenerPollTimer = undefined;

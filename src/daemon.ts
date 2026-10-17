@@ -686,7 +686,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -28473,6 +28473,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     { allowPrimary: true },
   );
   const durablePrimaryRuntimes: DurableLarkPrimaryRuntime[] = [];
+  const durablePrimaryEventRuntimes: LarkEventDispatcherRuntime[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
@@ -30271,7 +30272,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 );
               });
             },
-            onLeadershipLost: () => { eventRuntime.close(); },
+            // Every replica keeps a hot WS connection. A standby rejects the
+            // callback before ACK because its ingress lease is absent, so Lark
+            // retains/retries even for first-ever p2p messages that no REST
+            // chat inventory can enumerate. Losing leadership therefore only
+            // cancels recovery; closing the socket would recreate the gap.
+            onLeadershipLost: reason => { eventRuntime.releasePrimary(reason); },
             onSessionLeaseLost: stableKey => {
               const ds = activeSessions.get(stableKey);
               if (!ds || ds.larkAppId !== cfg.larkAppId) return;
@@ -30291,7 +30297,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ),
           });
           durablePrimaryRuntimes.push(primaryRuntime);
+          durablePrimaryEventRuntimes.push(eventRuntime);
           durablePrimaryRuntimeByApp.set(cfg.larkAppId, primaryRuntime);
+          eventRuntime.connect();
           void primaryRuntime.ready.then(() => {
             logger.info(`[durable-primary:${cfg.larkAppId}] runtime ready`);
           });
@@ -31333,6 +31341,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         logger.warn('[durable-primary] runtime stop timed out');
       }
     }
+    for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
     await durableInboxShadowConsumer?.stop(remainingBudget());
@@ -31407,6 +31416,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
+    for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();
     if (durableSessionShadowFacade === durableSessionFacade) {

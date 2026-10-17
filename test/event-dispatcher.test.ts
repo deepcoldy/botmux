@@ -1736,6 +1736,59 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
+  it('starts leadership recovery immediately when the hot-standby transport is already ready', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockListChats.mockResolvedValue([]);
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary: vi.fn(async () => ({ kind: 'inserted' as const })) },
+    );
+    runtime.connect();
+    capturedWsClientOptions?.onReady?.();
+    const leadership = new AbortController();
+
+    await runtime.connectPrimary({ signal: leadership.signal }).ready;
+
+    expect(mockListChats).toHaveBeenCalledOnce();
+    leadership.abort();
+    runtime.releasePrimary();
+    runtime.close();
+  });
+
+  it('keeps a standby WS callback unacknowledged until that replica owns ingress', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const notLeader = new Error('this process is not the current Lark ingress leader');
+    const enqueuePrimary = vi.fn(async () => { throw notLeader; });
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    capturedWsClientOptions?.onReady?.();
+    runtime.releasePrimary();
+    const directMessage = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'first DM during failover' }),
+      messageId: 'om_primary_p2p_retry',
+      chatId: 'oc_primary_p2p',
+      chatType: 'p2p',
+    });
+
+    await expect(
+      capturedHandlers['im.message.receive_v1'](directMessage),
+    ).rejects.toBe(notLeader);
+    expect(enqueuePrimary).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
   it('does not run the legacy listener poller in durable primary mode', async () => {
     vi.useFakeTimers();
     try {
@@ -1990,6 +2043,65 @@ describe('Lark event dispatcher — durable primary processor', () => {
     });
     expect(mockGetMessageDetail).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('resolves a chatless primary update into the receive chat partition before ACK', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetMessageDetail.mockResolvedValue({ items: [{
+      message_id: 'om_primary_chatless_edit',
+      chat_id: 'chat-primary',
+    }] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const data = {
+      event_id: 'evt-primary-chatless-edit',
+      message: { message_id: 'om_primary_chatless_edit' },
+    };
+
+    await capturedHandlers['im.message.updated_v1'](data);
+
+    expect(mockGetMessageDetail).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'om_primary_chatless_edit',
+      expect.objectContaining({ userCardContent: false }),
+    );
+    expect(enqueuePrimary).toHaveBeenCalledWith({
+      eventId: `im.message.updated_v1:${MY_APP_ID}:evt-primary-chatless-edit`,
+      eventType: 'lark.im.message.updated_v1',
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+      data,
+    });
+    runtime.close();
+  });
+
+  it('does not ACK a chatless primary update when its ordering partition is unavailable', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetMessageDetail.mockResolvedValue({ items: [] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+
+    await expect(capturedHandlers['im.message.updated_v1']({
+      event_id: 'evt-primary-chatless-missing',
+      message: { message_id: 'om_primary_chatless_missing' },
+    })).rejects.toThrow(/no authoritative chat_id/);
+    expect(enqueuePrimary).not.toHaveBeenCalled();
     runtime.close();
   });
 

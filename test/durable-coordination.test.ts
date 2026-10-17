@@ -200,6 +200,7 @@ describe('SQLite durable coordination contract', () => {
       { message: { chat_id: 'oc_other' } },
       { message: { content: '{"text":"/restart"}' } },
       { sender: { sender_id: { open_id: 'ou_other' } } },
+      { sender: { sender_id: { open_id: 'ou_user', union_id: 'on_other' } } },
     ]) {
       const message = {
         message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
@@ -222,6 +223,64 @@ describe('SQLite durable coordination contract', () => {
         createdAt: 11,
       })).toEqual({ kind: 'conflict' });
     }
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          event: {
+            message: {
+              message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+              message_type: 'text', content: '{"text":"same"}', create_time: '1',
+            },
+            sender: { sender_id: { open_id: 'ou_nested_other' } },
+          },
+        },
+      },
+      visibleAt: 11,
+      createdAt: 11,
+    })).toEqual({ kind: 'conflict' });
+
+    const mentionedEventId = 'im.message.receive_v1:cli_test:om_mentioned';
+    const mentioned = {
+      version: 1,
+      type: 'lark.im.message.receive_v1',
+      larkAppId: 'cli_test',
+      event: {
+        message: {
+          message_id: 'om_mentioned', chat_id: 'oc_chat', chat_type: 'group',
+          message_type: 'text', content: '{"text":"@user hi"}', create_time: '2',
+          mentions: [{ key: '@_user_1', name: 'User', id: { open_id: 'ou_mentioned', union_id: 'on_a' } }],
+        },
+        sender: { sender_id: { open_id: 'ou_user' } },
+      },
+    } as const;
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: mentioned,
+      visibleAt: 12,
+      createdAt: 12,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: {
+        ...mentioned,
+        event: {
+          ...mentioned.event,
+          message: {
+            ...mentioned.event.message,
+            mentions: [{ key: '@_user_1', name: 'User', id: { open_id: 'ou_mentioned', union_id: 'on_b' } }],
+          },
+        },
+      },
+      visibleAt: 13,
+      createdAt: 13,
+    })).toEqual({ kind: 'conflict' });
     expect(await store.enqueueInbox({
       eventId,
       partitionKey,

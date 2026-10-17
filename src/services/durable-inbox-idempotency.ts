@@ -10,24 +10,61 @@ function text(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined;
 }
 
-function canonicalMention(value: unknown): Record<string, string> | undefined {
+interface CanonicalIdentity {
+  openId?: string;
+  unionId?: string;
+  userId?: string;
+  appId?: string;
+}
+
+interface CanonicalMention extends CanonicalIdentity {
+  key?: string;
+  name?: string;
+}
+
+interface CanonicalLarkReceive {
+  larkAppId: string;
+  messageId: string;
+  chatId: string;
+  chatType?: string;
+  rootId?: string;
+  threadId?: string;
+  parentId?: string;
+  messageType?: string;
+  content?: string;
+  createTime?: string;
+  senderType?: string;
+  sender: CanonicalIdentity;
+  mentions: CanonicalMention[];
+}
+
+function canonicalIdentity(value: unknown, rawIdType?: unknown): CanonicalIdentity {
+  const id = record(value);
+  const idType = text(rawIdType);
+  const rawId = typeof value === 'string' ? value : undefined;
+  return {
+    ...(text(id?.open_id) ?? (rawId && (!idType || idType === 'open_id') ? rawId : undefined)
+      ? { openId: text(id?.open_id) ?? rawId! }
+      : {}),
+    ...(text(id?.union_id) ?? (rawId && idType === 'union_id' ? rawId : undefined)
+      ? { unionId: text(id?.union_id) ?? rawId! }
+      : {}),
+    ...(text(id?.user_id) ?? (rawId && idType === 'user_id' ? rawId : undefined)
+      ? { userId: text(id?.user_id) ?? rawId! }
+      : {}),
+    ...(text(id?.app_id) ?? (rawId && idType === 'app_id' ? rawId : undefined)
+      ? { appId: text(id?.app_id) ?? rawId! }
+      : {}),
+  };
+}
+
+function canonicalMention(value: unknown): CanonicalMention | undefined {
   const mention = record(value);
   if (!mention) return undefined;
-  const rawId = mention.id;
-  const id = record(rawId);
-  const idType = text(mention.id_type) ?? text(mention.idType);
-  const openId = text(id?.open_id)
-    ?? (typeof rawId === 'string' && (!idType || idType === 'open_id') ? rawId : undefined);
-  const appId = text(id?.app_id)
-    ?? (typeof rawId === 'string' && idType === 'app_id' ? rawId : undefined);
-  const userId = text(id?.user_id)
-    ?? (typeof rawId === 'string' && idType === 'user_id' ? rawId : undefined);
   return {
     ...(text(mention.key) ? { key: text(mention.key)! } : {}),
     ...(text(mention.name) ? { name: text(mention.name)! } : {}),
-    ...(openId ? { openId } : {}),
-    ...(!openId && appId ? { appId } : {}),
-    ...(!openId && !appId && userId ? { userId } : {}),
+    ...canonicalIdentity(mention.id, text(mention.id_type) ?? text(mention.idType)),
   };
 }
 
@@ -36,7 +73,7 @@ function canonicalLarkReceive(input: {
   lane?: string;
   partitionKey: string;
   payload: DurableJson;
-}): string | undefined {
+}): CanonicalLarkReceive | undefined {
   if ((input.lane ?? 'lark-message') !== 'lark-message') return undefined;
   const payload = record(input.payload);
   if (payload?.version !== 1 || payload.type !== 'lark.im.message.receive_v1') return undefined;
@@ -49,14 +86,13 @@ function canonicalLarkReceive(input: {
   if (!larkAppId?.startsWith('cli_') || !messageId?.startsWith('om_') || !chatId) return undefined;
   if (input.eventId !== `im.message.receive_v1:${larkAppId}:${messageId}`) return undefined;
   if (input.partitionKey !== `lark-message-routing:${larkAppId}:${chatId}`) return undefined;
-  const sender = record(event?.sender);
+  const sender = record(event?.sender ?? nested?.sender);
   const senderId = record(sender?.sender_id);
   const senderType = text(sender?.sender_type);
-  const senderOpenId = text(senderId?.open_id);
   const mentions = Array.isArray(message?.mentions)
-    ? message.mentions.map(canonicalMention).filter((item): item is Record<string, string> => !!item)
+    ? message.mentions.map(canonicalMention).filter((item): item is CanonicalMention => !!item)
     : [];
-  return JSON.stringify({
+  return {
     larkAppId,
     messageId,
     chatId,
@@ -68,10 +104,48 @@ function canonicalLarkReceive(input: {
     content: text(message?.content) ?? text(record(message?.body)?.content),
     createTime: text(message?.create_time),
     senderType: senderType === 'app' || senderType === 'bot' ? 'bot' : senderType,
-    senderOpenId,
-    senderAppId: senderOpenId ? undefined : text(senderId?.app_id),
+    sender: canonicalIdentity(senderId),
     mentions,
+  };
+}
+
+function identitiesCompatible(left: CanonicalIdentity, right: CanonicalIdentity): boolean {
+  const keys: Array<keyof CanonicalIdentity> = ['openId', 'unionId', 'userId', 'appId'];
+  let leftHasIdentity = false;
+  let rightHasIdentity = false;
+  let sharedIdentity = false;
+  for (const key of keys) {
+    const leftValue = left[key];
+    const rightValue = right[key];
+    if (leftValue) leftHasIdentity = true;
+    if (rightValue) rightHasIdentity = true;
+    if (leftValue && rightValue) {
+      if (leftValue !== rightValue) return false;
+      sharedIdentity = true;
+    }
+  }
+  return (!leftHasIdentity && !rightHasIdentity) || sharedIdentity;
+}
+
+function mentionsCompatible(left: CanonicalMention[], right: CanonicalMention[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((mention, index) => {
+    const other = right[index]!;
+    return mention.key === other.key
+      && mention.name === other.name
+      && identitiesCompatible(mention, other);
   });
+}
+
+function receivePayloadsAreEquivalent(
+  left: CanonicalLarkReceive,
+  right: CanonicalLarkReceive,
+): boolean {
+  const { sender: leftSender, mentions: leftMentions, ...leftMessage } = left;
+  const { sender: rightSender, mentions: rightMentions, ...rightMessage } = right;
+  return JSON.stringify(leftMessage) === JSON.stringify(rightMessage)
+    && identitiesCompatible(leftSender, rightSender)
+    && mentionsCompatible(leftMentions, rightMentions);
 }
 
 /**
@@ -89,7 +163,8 @@ export function durableInboxSemanticKey(input: {
   partitionKey: string;
   payload: DurableJson;
 }): string | undefined {
-  return canonicalLarkReceive(input);
+  const canonical = canonicalLarkReceive(input);
+  return canonical ? JSON.stringify(canonical) : undefined;
 }
 
 export function durableInboxPayloadsAreEquivalent(
@@ -100,5 +175,10 @@ export function durableInboxPayloadsAreEquivalent(
       || (existing.lane ?? 'lark-message') !== (incoming.lane ?? 'lark-message')
       || existing.partitionKey !== incoming.partitionKey) return false;
   const existingKey = durableInboxSemanticKey(existing);
-  return existingKey !== undefined && existingKey === durableInboxSemanticKey(incoming);
+  const existingCanonical = canonicalLarkReceive(existing);
+  const incomingCanonical = canonicalLarkReceive(incoming);
+  return existingKey !== undefined
+    && incomingCanonical !== undefined
+    && existingCanonical !== undefined
+    && receivePayloadsAreEquivalent(existingCanonical, incomingCanonical);
 }

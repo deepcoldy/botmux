@@ -352,7 +352,9 @@ export function startDurableLarkPrimaryIngress(
           || (eventType === 'lark.im.message.receive_v1' && eventId !== expectedReceiveEventId)
           || (eventType === 'lark.im.message.updated_v1'
             && (!eventId.startsWith(expectedUpdatedPrefix)
-              || eventId.length === expectedUpdatedPrefix.length))) {
+              || eventId.length === expectedUpdatedPrefix.length))
+          || (eventType === 'lark.im.message.updated_v1'
+            && partitionKey === `lark-message-routing:${larkAppId}:__chatless__`)) {
         throw new Error('durable Lark ingress event does not match the application message identity');
       }
       const wallNow = now();
