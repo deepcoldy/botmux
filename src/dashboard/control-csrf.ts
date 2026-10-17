@@ -174,7 +174,8 @@ function publicUrlAuthority(): string | undefined {
  * `devboxDashboardBaseUrl()` 用 cache / 实际端口 / 设置文件的元数据指纹校验进程内
  * memo，所以这条控制类请求热路径（每次控制请求 / WS 升级，被判跨站时还会再走一次
  * warnForeignOrigin）只付较轻的 stat，不会每次重读并解析 secure-file；文件一变，
- * 下一次请求立即重算，不把旧隧道留在可信 authority 里。
+ * 下一次请求立即重算，不把旧隧道留在可信 authority 里。指纹本身有时间戳精度
+ * 的盲区：刚改过的文件不复用 memo，且一次完整读取最多被复用 5s，陈旧上界有限。
  */
 function devboxUrlAuthority(): string | undefined {
   const raw = devboxDashboardBaseUrl();

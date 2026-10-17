@@ -20,6 +20,18 @@ const DASHBOARD_PORT_PATH = join(CONFIG_DIR, '.dashboard-port');
 const DEFAULT_DASHBOARD_PORT = 7891;
 const EXPORT_TIMEOUT_MS = 5_000;
 const AUTO_EXPORT_ENV_KEY = 'BOTMUX_DEVBOX_AUTO_EXPORT';
+/** Read-side memo max age. `devboxDashboardBaseUrl()` sits on the CSRF hot path
+ *  (every control request / WS upgrade). File fingerprints let a cross-process
+ *  export or port rebind show up on the very next call, but a fingerprint can in
+ *  principle collide; this caps how long ONE full read may be served regardless,
+ *  so staleness is bounded instead of lasting until the next write. */
+const BASE_URL_MEMO_MAX_AGE_MS = 5_000;
+/** A file changed this close to the moment its fingerprint was taken may change
+ *  again without changing the fingerprint: mtime/ctime have filesystem
+ *  granularity (~1ms on ext4 — measured 227/300 collisions for same-size
+ *  in-place rewrites — and 1–2s elsewhere). Such a fingerprint cannot prove
+ *  freshness, so the entry is not reused (the "racy git" rule). */
+const FINGERPRINT_RACY_WINDOW_MS = 2_000;
 /** Negative cache for a failed export: `merlin-cli` hanging must not make every
  *  later call in the same process pay the full timeout again. */
 const EXPORT_FAILURE_TTL_MS = 60_000;
@@ -62,12 +74,25 @@ export interface DevboxDashboardBaseUrlOptions {
   portFilePath?: string;
 }
 
-let baseUrlMemo: { key: string; url: string | null } | null = null;
+interface BaseUrlMemo {
+  /** Inputs that cost no syscall: port, env values, paths. */
+  key: string;
+  /** Metadata of the files the URL was computed from, taken BEFORE reading them. */
+  fingerprint: string;
+  /** When the URL was last computed from the files. Only a full recompute sets
+   *  it — never a memo hit — so even a continuously busy process re-reads. */
+  computedAt: number;
+  /** False when a fingerprinted file was changed inside the racy window. */
+  reusable: boolean;
+  url: string | null;
+}
+
+let baseUrlMemo: BaseUrlMemo | null = null;
 let exportFailure: { key: string; at: number } | null = null;
 
 /** Drop the in-process read-side memo and the export negative cache. A successful
  *  same-process export calls this directly; cross-process writes are detected by
- *  the file fingerprints folded into the memo key below. */
+ *  the file fingerprints checked in {@link devboxDashboardBaseUrl}. */
 export function resetDevboxDashboardExportCaches(): void {
   baseUrlMemo = null;
   exportFailure = null;
@@ -197,35 +222,56 @@ function computeDevboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions): str
   return cached.shortUrl;
 }
 
+interface FilesFingerprint {
+  text: string;
+  /** Latest mtime/ctime among the files that exist; -Infinity when none do. */
+  newestChangeMs: number;
+}
+
 /** Cheap metadata fingerprint used to validate the hot-path memo without
  * reopening and reparsing secure files on every control request. Atomic writes
- * change the inode; in-place writes change size/mtime/ctime. A missing file has
- * its own stable fingerprint and is invalidated as soon as the file appears. */
-function fileFingerprint(path: string): string {
-  try {
-    const stat = statSync(path);
-    return `${path}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
-  } catch {
-    return `${path}:missing`;
+ * change the inode; in-place writes change size/mtime/ctime — except within the
+ * timestamp granularity, which is why the newest change time is reported too
+ * (see FINGERPRINT_RACY_WINDOW_MS). A missing file has its own stable
+ * fingerprint and is invalidated as soon as the file appears. */
+function filesFingerprint(paths: ReadonlyArray<string | null>): FilesFingerprint {
+  const parts: string[] = [];
+  let newestChangeMs = -Infinity;
+  for (const path of paths) {
+    if (path === null) { parts.push('-'); continue; }
+    try {
+      const stat = statSync(path);
+      parts.push(`${path}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`);
+      newestChangeMs = Math.max(newestChangeMs, stat.mtimeMs, stat.ctimeMs);
+    } catch {
+      parts.push(`${path}:missing`);
+    }
   }
+  return { text: JSON.stringify(parts), newestChangeMs };
 }
 
 function baseUrlMemoKey(opts: DevboxDashboardBaseUrlOptions): string {
   const env = opts.env ?? process.env;
-  const cachePath = opts.cachePath ?? CACHE_PATH;
-  const portFilePath = opts.portFilePath ?? DASHBOARD_PORT_PATH;
-  const envFilePath = resolveEnvFilePath(opts.envFileMode, opts.envFilePath);
   return JSON.stringify([
     opts.port ?? null,
     env.ARNOLD_WORKSPACE_ID ?? null,
     env.PORT_LIST ?? null,
     env.BOTMUX_DASHBOARD_PORT ?? null,
     env[AUTO_EXPORT_ENV_KEY] ?? null,
-    fileFingerprint(cachePath),
-    opts.port === undefined ? fileFingerprint(portFilePath) : null,
-    env[AUTO_EXPORT_ENV_KEY] === undefined && envFilePath !== null
-      ? fileFingerprint(envFilePath)
-      : null,
+    opts.cachePath ?? null,
+    opts.portFilePath ?? null,
+    opts.envFileMode ?? null,
+    opts.envFilePath ?? null,
+  ]);
+}
+
+function baseUrlFingerprint(opts: DevboxDashboardBaseUrlOptions): FilesFingerprint {
+  const env = opts.env ?? process.env;
+  const envFilePath = resolveEnvFilePath(opts.envFileMode, opts.envFilePath);
+  return filesFingerprint([
+    opts.cachePath ?? CACHE_PATH,
+    opts.port === undefined ? opts.portFilePath ?? DASHBOARD_PORT_PATH : null,
+    env[AUTO_EXPORT_ENV_KEY] === undefined ? envFilePath : null,
   ]);
 }
 
@@ -245,13 +291,33 @@ export function devboxDashboardBaseUrl(opts: DevboxDashboardBaseUrlOptions = {})
   if (!workspaceId || !env.PORT_LIST || inlineSetting === '0' || inlineSetting === 'false') {
     return null;
   }
-  // The key includes the cache, bound-port, and settings-file fingerprints.
-  // This keeps the expensive secure read/JSON parse off the CSRF hot path while
-  // making a cross-process export or port rebind visible on the very next call.
+  // Fingerprint-checked on EVERY call (≤3 stats), not just after a TTL: the
+  // CLI exports in its own process and then immediately re-reads
+  // `/__cli/current` from the dashboard, so an entry served blindly for a TTL
+  // would hand that re-read the pre-export answer. The expensive part — the
+  // secure-file read and JSON parse — is what the memo keeps off the hot path.
+  // Taken BEFORE the read: a write racing the read then leaves a mismatching
+  // fingerprint behind (re-read next call) rather than a matching stale one.
   const key = baseUrlMemoKey(opts);
-  if (baseUrlMemo?.key === key) return baseUrlMemo.url;
+  const now = Date.now();
+  const fingerprint = baseUrlFingerprint(opts);
+  if (baseUrlMemo
+    && baseUrlMemo.reusable
+    && baseUrlMemo.key === key
+    && baseUrlMemo.fingerprint === fingerprint.text
+    && now - baseUrlMemo.computedAt < BASE_URL_MEMO_MAX_AGE_MS) {
+    return baseUrlMemo.url;
+  }
   const url = computeDevboxDashboardBaseUrl(opts);
-  baseUrlMemo = { key, url };
+  baseUrlMemo = {
+    key,
+    fingerprint: fingerprint.text,
+    computedAt: now,
+    // A change at/after `now - window` (including a clock-skewed future mtime)
+    // could be followed by another one the fingerprint cannot see.
+    reusable: fingerprint.newestChangeMs < now - FINGERPRINT_RACY_WINDOW_MS,
+    url,
+  };
   return url;
 }
 

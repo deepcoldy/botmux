@@ -1,18 +1,25 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import realFs, { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Counting settings-file reads is the only way to pin the gate ORDER: on an
 // ordinary host the verdict is null either way, so only the syscall is
 // observable. Wraps the real implementation — nothing is stubbed out.
+// `statSync` is wrapped the same way so the memo tests can force a fingerprint
+// collision deterministically (a real one depends on timestamp granularity).
 vi.mock('node:fs', () => {
   // `require` inside the factory, not the vitest-only `importOriginal` argument
   // (bun passes none) and not a top-level import (vitest hoists this call above
   // the imports, so a top-level namespace would be read before initialisation).
   const actual = require('node:fs') as typeof import('node:fs');
-  return { ...actual, default: actual, readFileSync: vi.fn(actual.readFileSync) };
+  return {
+    ...actual,
+    default: actual,
+    readFileSync: vi.fn(actual.readFileSync),
+    statSync: vi.fn(actual.statSync),
+  };
 });
 
 import {
@@ -25,6 +32,7 @@ import { logger } from '../src/utils/logger.js';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const readSpy = vi.mocked(readFileSync);
+const statSpy = vi.mocked(statSync);
 
 function tmpDir() {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-devbox-export-'));
@@ -52,6 +60,11 @@ const devboxEnv = {
 beforeEach(() => {
   // The read-side memo and the export negative cache are process-wide.
   resetDevboxDashboardExportCaches();
+});
+
+afterEach(() => {
+  // `default` is the untouched module (see the factory above).
+  statSpy.mockImplementation(realFs.statSync);
 });
 
 describe('ensureDevboxDashboardExport', () => {
@@ -680,6 +693,91 @@ describe('devboxDashboardBaseUrl', () => {
     writeFileSync(portFilePath, '9002\n');
     expect(devboxDashboardBaseUrl({ cachePath, env: devboxEnv, ...IGNORE_ENV_FILE, portFilePath }))
       .toBeNull();
+  });
+
+  // The case above used to flake ~50%: a same-size in-place rewrite within the
+  // filesystem's timestamp granularity left the stat fingerprint unchanged, and
+  // a pure-fingerprint memo served the old port. Hammer exactly that shape.
+  it('never serves a stale port across back-to-back same-size in-place rewrites', async () => {
+    const cachePath = await seedCache(9001);
+    const portFilePath = join(tmpDir(), '.dashboard-port');
+    const read = () => devboxDashboardBaseUrl({ cachePath, env: devboxEnv, ...IGNORE_ENV_FILE, portFilePath });
+    for (let i = 0; i < 50; i++) {
+      writeFileSync(portFilePath, '9001\n');
+      expect(read()).toBe('https://tunnel-for-9001.example.com');
+      writeFileSync(portFilePath, '9002\n');
+      expect(read()).toBeNull();
+    }
+  });
+
+  describe('read-side memo', () => {
+    async function memoFixture() {
+      const cachePath = await seedCache(9001);
+      const portFilePath = join(tmpDir(), '.dashboard-port');
+      writeFileSync(portFilePath, '9001\n');
+      const read = () => devboxDashboardBaseUrl({ cachePath, env: devboxEnv, ...IGNORE_ENV_FILE, portFilePath });
+      const portReads = () => readSpy.mock.calls.filter(([p]) => p === portFilePath).length;
+      return { cachePath, portFilePath, read, portReads };
+    }
+
+    /** Make every later stat of `path` report what it reports now — the shape of
+     *  a timestamp-granularity collision, without depending on timing. */
+    function freezeStat(path: string) {
+      const frozen = realFs.statSync(path);
+      statSpy.mockImplementation(((p: Parameters<typeof statSync>[0], ...rest: unknown[]) => (
+        p === path ? frozen : (realFs.statSync as (...args: unknown[]) => unknown)(p, ...rest)
+      )) as typeof statSync);
+    }
+
+    it('re-reads a file changed inside the racy window even when its fingerprint collides', async () => {
+      const { portFilePath, read } = await memoFixture();
+      freezeStat(portFilePath);
+      // Real clock: the port file was written moments ago.
+      expect(read()).toBe('https://tunnel-for-9001.example.com');
+      writeFileSync(portFilePath, '9002\n');
+      expect(read()).toBeNull();
+    });
+
+    it('serves a settled read from the memo, but never longer than the max age', async () => {
+      const { portFilePath, read, portReads } = await memoFixture();
+      freezeStat(portFilePath);
+      // Every fixture file is now a minute old: outside the racy window.
+      let clock = Date.now() + 60_000;
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+      try {
+        expect(read()).toBe('https://tunnel-for-9001.example.com');
+        const readsAfterFirst = portReads();
+        // A rewrite the fingerprint cannot see: only the max age can surface it.
+        writeFileSync(portFilePath, '9002\n');
+        // Hot hits — one per second — must neither re-read the files nor renew
+        // the entry; a renewal here would let a busy process stay stale forever.
+        for (let i = 0; i < 4; i++) {
+          clock += 1_000;
+          expect(read()).toBe('https://tunnel-for-9001.example.com');
+        }
+        expect(portReads()).toBe(readsAfterFirst);
+        clock += 1_000; // 5s after the last FULL read
+        expect(read()).toBeNull();
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('checks the fingerprint on every call, so a settled entry sees an atomic replace at once', async () => {
+      const { portFilePath, read } = await memoFixture();
+      const clock = Date.now() + 60_000;
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+      try {
+        expect(read()).toBe('https://tunnel-for-9001.example.com');
+        // Same instant, so no max age can be what invalidates it: the CLI
+        // exports in its own process and re-reads `/__cli/current` right away.
+        writeFileSync(`${portFilePath}.next`, '9002\n');
+        renameSync(`${portFilePath}.next`, portFilePath);
+        expect(read()).toBeNull();
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
   });
 
   it('falls back to BOTMUX_DASHBOARD_PORT when no port file exists', async () => {
