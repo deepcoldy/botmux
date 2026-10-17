@@ -6723,6 +6723,10 @@ export async function startForkSubtopicSession(
   // 绝不能删；只有「话题内 / 引用形态」时新建的顶层锚点归我们所有。
   let seedMessageId: string | undefined;
   let anchorOwnedByBot = false;
+  // 普通群显式开话题用的 reply_in_thread 回复（bot 自有，失败时与锚点一起撤）。
+  let groupTopicReplyId: string | undefined;
+  // 普通群「锚点已发、话题尚未确认开出」的窗口：此间抛错仍归 topic_creation_failed。
+  let groupTopicPending = false;
 
   const recallAnchor = async (): Promise<boolean> => {
     if (forkInPlaceIsP2p) {
@@ -6745,15 +6749,21 @@ export async function startForkSubtopicSession(
       return results.every(Boolean);
     }
     if (!anchorId) return true;
-    try {
-      return await deleteMessage(appId, anchorId);
-    } catch (err) {
-      logger.warn(
-        `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
+    // 先撤话题内回复、再撤锚点；任一失败都算留下了孤儿话题。
+    let allRecalled = true;
+    for (const id of [groupTopicReplyId, anchorId]) {
+      if (!id) continue;
+      try {
+        if (!await deleteMessage(appId, id)) allRecalled = false;
+      } catch (err) {
+        logger.warn(
+          `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+        allRecalled = false;
+      }
     }
+    return allRecalled;
   };
 
   try {
@@ -6800,7 +6810,7 @@ export async function startForkSubtopicSession(
         content: [[{ tag: 'text', text: t('cmd.fork.seed_anchor_line', undefined, loc) }]],
       },
     });
-    let groupChildThreadId: string | undefined;
+    let childThreadId: string | undefined;
     if (forkInPlaceIsP2p && !p2pAnchorIsForeign) {
       // (b) 命令在 DM 顶层：锚点就是用户的命令消息，reply_in_thread 开出
       // 新话题（与 /t 同构）。锚点归用户所有，失败时绝不删除。
@@ -6819,21 +6829,30 @@ export async function startForkSubtopicSession(
         ? await replyMessage(appId, anchorId, seedPost, 'post', true, undefined, undefined, sourceOptions)
         : await replyMessage(appId, anchorId, seedPost, 'post', true);
     } else {
+      // 群聊：顶层 post 作分身话题锚点。话题群里顶层消息自动成为话题，
+      // 不多发任何消息（原路径）；普通群的顶层消息保持顶层（client.ts
+      // ChatMode 注释），必须对锚点 reply_in_thread 才会显式开出原生话题。
+      // 群类型确认不了（'unknown'）时按普通群处理：多一条话题内回复无害，
+      // 但赌它是话题群会退化成「ok 却没有话题」。
+      const groupChatMode = await getChatModeStrict(appId, chatId);
       anchorId = sourceOptions
         ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
         : await sendMessage(appId, chatId, seedPost, 'post');
-      // A top-level post becomes a topic automatically only in topic-mode chats.
-      // In a regular group, explicitly replying in-thread materializes a native
-      // topic under the seed. Resolve the thread from that reply because the root
-      // message may not expose its new thread_id immediately.
-      const topicReplyText = t('cmd.fork.seed_topic_reply', undefined, loc);
-      const topicReplyId = sourceOptions
-        ? await replyMessage(appId, anchorId, topicReplyText, 'text', true, undefined, undefined, sourceOptions)
-        : await replyMessage(appId, anchorId, topicReplyText, 'text', true);
-      groupChildThreadId = (await getMessageThreadId(appId, topicReplyId)) ?? undefined;
-      if (!groupChildThreadId?.startsWith('omt_')) {
-        const orphanTopic = !await recallAnchor();
-        return { ok: false, error: 'topic_creation_failed', orphanTopic };
+      if (groupChatMode !== 'topic') {
+        groupTopicPending = true;
+        const topicReplyText = t('cmd.fork.seed_topic_reply', undefined, loc);
+        groupTopicReplyId = sourceOptions
+          ? await replyMessage(appId, anchorId, topicReplyText, 'text', true, undefined, undefined, sourceOptions)
+          : await replyMessage(appId, anchorId, topicReplyText, 'text', true);
+        // 从话题内回复取 thread_id：reply_in_thread 的回复必然带 omt_，根消息
+        // 未必立刻回填。拿不到真实 omt_ 就 fail closed——撤回锚点与回复并报错，
+        // 不能返回 ok 再配一个退化成「打开本群」的链接。
+        childThreadId = (await getMessageThreadId(appId, groupTopicReplyId)) ?? undefined;
+        if (!childThreadId?.startsWith('omt_')) {
+          const orphanTopic = !await recallAnchor();
+          return { ok: false, error: 'topic_creation_failed', orphanTopic };
+        }
+        groupTopicPending = false;
       }
     }
     // 私聊锚点必须登记 /t 同款溯源：扁平 DM 路由默认把 root_id+thread_id
@@ -6845,9 +6864,7 @@ export async function startForkSubtopicSession(
       const { recordP2pForceTopicRoot } = await import('../services/p2p-force-topic-store.js');
       recordP2pForceTopicRoot(appId, anchorId, chatId);
     }
-    const childThreadId = forkInPlaceIsP2p
-      ? (await getMessageThreadId(appId, anchorId)) ?? undefined
-      : groupChildThreadId;
+    childThreadId ??= (await getMessageThreadId(appId, anchorId)) ?? undefined;
 
     const childIntro = t('cmd.fork.child_intro', {
       parentTitle: parentSession.title || '',
@@ -6941,7 +6958,7 @@ export async function startForkSubtopicSession(
     );
     return {
       ok: false,
-      error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
+      error: anchorId && !groupTopicPending ? 'fork_subtopic_failed' : 'topic_creation_failed',
       // fork 已成功后的抛错绝不撤话题：已注册的分身必须保持可路由，
       // recall 会删 marker 让其回复折回扁平、静默失联。
       orphanTopic: forked ? false : (anchorId ? !await recallAnchor() : false),
