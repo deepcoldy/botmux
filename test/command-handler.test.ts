@@ -9153,6 +9153,32 @@ describe('/card — operator / canOperate gate', () => {
     vi.mocked(setChatStreamingCardPin).mockResolvedValue({ ok: true, changed: true } as any);
   });
 
+  it.each([
+    { frozen: 'grok', stale: 'gemini', mode: 'unified', managed: true },
+    { frozen: 'gemini', stale: 'grok', mode: 'unified', managed: false },
+    { frozen: undefined, stale: 'grok', mode: 'unified', managed: true },
+    { frozen: undefined, stale: undefined, mode: 'unified', managed: true },
+    { frozen: 'grok', stale: 'grok', mode: 'legacy', managed: false },
+  ] as const)('describes the effective reply mode for /card on and off: %j', async ({ frozen, stale, mode, managed }) => {
+    vi.mocked(getBot).mockImplementation(((id: string = LARK_APP_ID) => ({
+      config: { larkAppId: id, cliId: 'grok', replyCardMode: mode },
+    })) as any);
+    const ds = stale ? makeDaemonSession({ session: makeSession({ cliId: stale,
+      cliLaunchSnapshot: frozen ? {
+        version: 1, state: 'resolved', entryId: frozen, cliId: frozen, cliRuntime: null,
+        cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+      } : undefined,
+    }) }) : undefined;
+    const deps = makeDeps(ds);
+    for (const sub of ['on', 'off']) {
+      await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', `/card ${sub}`, deps);
+      expect(setCardMode).toHaveBeenLastCalledWith(LARK_APP_ID, CHAT_ID, sub === 'off');
+      const reply = vi.mocked(deps.sessionReply).mock.calls.at(-1)![1];
+      expect(reply.includes('动态答复卡')).toBe(managed);
+      if (sub === 'off') expect(reply.includes('答案仍作为新消息发送')).toBe(!managed);
+    }
+  });
+
   it('rejects a non-operator (canOperate=false): operator_only notice, no mode change', async () => {
     vi.mocked(canOperate).mockReturnValue(false);
     const deps = makeDeps();

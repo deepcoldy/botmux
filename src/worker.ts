@@ -5617,17 +5617,20 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
   observeCotEntries(entries, turn);
 });
 codexBridgeQueue.setCotSupersededObserver((turn) => {
-  if (!sessionId || turn.isLocal || thinkingTurn?.turnId !== turn.turnId
-    || thinkingTurn.dispatchAttempt !== turn.dispatchAttempt) return;
+  if (!sessionId || turn.isLocal) return;
+  const ownsThinking = thinkingTurn?.turnId === turn.turnId
+    && thinkingTurn.dispatchAttempt === turn.dispatchAttempt;
   // A successor may answer without ever producing CoT. Flush and close the
   // retired timeline at the queue's confirmed steer edge, not its successor's
   // first update/terminal. Never synthesize a durable terminal for this UI.
-  flushThinkingUpdate();
+  // A dynamic reply card can exist before any activity was observed.
+  // Still retire that card, without flushing/resetting another turn's CoT.
+  if (ownsThinking) flushThinkingUpdate();
   send({
     type: 'thinking_superseded', sessionId, turnId: turn.turnId,
     ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
   });
-  resetThinkingChannel();
+  if (ownsThinking) resetThinkingChannel();
 });
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;

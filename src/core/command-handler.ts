@@ -1482,7 +1482,7 @@ export async function handleCardCommand(
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
   const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
-    && ['claude-code', 'codex'].includes(ds?.session.cliId ?? botConfig.cliId);
+    && ['claude-code', 'codex', 'grok'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
