@@ -1,3 +1,4 @@
+import { normalizeMailboxPolicy } from './core/mailbox-policy.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
@@ -1452,6 +1453,8 @@ export interface BotConfig {
   apiOnly?: boolean;
   /** Internal, opt-in target policy for dispatch launch IPC. Absent/disabled fails closed. */
   dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
+  /** Same-app mailbox transport. Absent/invalid policy is disabled. */
+  mailboxPolicy?: import('./core/mailbox-policy.js').MailboxPolicy;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
   oncallGroup?: OncallGroupPolicy;
@@ -3919,6 +3922,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       apiOnly: entry.apiOnly === true || undefined,
       groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
+      mailboxPolicy: (() => {
+        if (entry.mailboxPolicy === undefined) return undefined;
+        try { return normalizeMailboxPolicy(entry.mailboxPolicy); }
+        catch (error) {
+          logger.warn(`[bot-registry:${entry.larkAppId}] ignoring invalid mailboxPolicy: ${String(error)}`);
+          return undefined;
+        }
+      })(),
       dispatchLaunchPolicy: (() => {
         if (!entry.dispatchLaunchPolicy || typeof entry.dispatchLaunchPolicy !== 'object') return undefined;
         try {

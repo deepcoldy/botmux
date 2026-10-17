@@ -20,6 +20,8 @@ import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
+import { MAILBOX_STATUS_ROUTE } from './mailbox-ipc.js';
+import { SAME_BOT_DELIVERY_ROUTE } from './same-bot-delivery.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
 import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
@@ -1058,6 +1060,8 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // validates the current session's rotating capability, binds the dispatch
   // root server-side, then lets the trusted daemon relay to the orchestrator.
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
+  // Mailbox handlers prove the live socket peer even for host-signed calls.
+  if (method === 'POST' && (pathname === SAME_BOT_DELIVERY_ROUTE || pathname === MAILBOX_STATUS_ROUTE)) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_USER_DELIVERY_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;

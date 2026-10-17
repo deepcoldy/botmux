@@ -18533,6 +18533,15 @@ switch (command) {
   case 'project':  await cmdProject(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
+  case 'mailbox': {
+    const { MAILBOX_USAGE, runMailboxCommand } = await import('./cli/mailbox.js');
+    const args = process.argv.slice(3);
+    if (args.includes('--help') || args.includes('-h')) { console.log(MAILBOX_USAGE); break; }
+    const result = await runMailboxCommand(args);
+    console.log(JSON.stringify(result.body));
+    process.exitCode = result.exitCode;
+    break;
+  }
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;

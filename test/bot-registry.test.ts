@@ -2842,3 +2842,19 @@ describe('network policy configuration loading', () => {
     expect(config.sandboxNetworkPolicy!.public.rules![0]!.cidr).toBe('8.8.8.8/32');
   });
 });
+
+
+describe('mailbox policy loading', () => {
+  it('defaults off and only retains strict versioned opt-in per bot', async () => {
+    const mod = await freshImport();
+    const configs = mod.parseBotConfigsFromText(JSON.stringify([
+      makeCfg({ larkAppId: 'cli_default' }),
+      makeCfg({ larkAppId: 'cli_on', mailboxPolicy: { schemaVersion: 1, enabled: true } }),
+      makeCfg({ larkAppId: 'cli_off', mailboxPolicy: { schemaVersion: 1, enabled: false } }),
+      makeCfg({ larkAppId: 'cli_bad', mailboxPolicy: { schemaVersion: 1, enabled: 'true' } }),
+    ]));
+    expect(configs.map(c => c.mailboxPolicy)).toEqual([
+      undefined, { schemaVersion: 1, enabled: true }, { schemaVersion: 1, enabled: false }, undefined,
+    ]);
+  });
+});
