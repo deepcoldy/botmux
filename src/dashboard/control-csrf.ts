@@ -21,12 +21,12 @@
  *     即使第 1 道被某个浏览器的 Fetch-Metadata 实现绕过，无 body 的表单攻击也
  *     依然打不进来。
  *
- * WebSocket 升级（terminal `/s/*`、debug-terminal）走 {@link managementUpgradeOrigin}：
+ * WebSocket 升级（会话终端 `/s/*`、宿主终端 `/host-terminal/*`）走 {@link managementUpgradeOrigin}：
  * upgrade 不经 HTTP 门禁，浏览器对 WS 握手 **一定** 带 `Origin`，所以「带了但对
  * 不上（含 `null`）」一律拒；完全不带 Origin 的是非浏览器客户端（本身就拿不到
  * 浏览器 cookie，不构成 CSRF），放行以免打断本机 CLI / 探针。
  * 两条升级路径的可信来源**不一样宽**，先用 {@link classifyManagementUpgrade} 按 path
- * 分流再判：`/s/*` 认平台 `m-`+`t-`，`/debug-terminal/*` 只认 management 档。
+ * 分流再判：`/s/*` 认平台 `m-`+`t-`，`/host-terminal/*` 只认 management 档。
  * 注意 Preview 自身的 WS 是不透明来源（`Origin: null`），它走 preview 专用路径
  * 的路径内凭据校验，**不能**用本函数误杀——调用方必须在 preview 分支之后再调。
  */
@@ -281,7 +281,7 @@ export function refererMatchesHost(headers: ControlRequestHeadersLike): boolean 
 }
 
 /** 本进程会受理的两类管理类 WS 升级，外加「都不是」。 */
-export type ManagementUpgradeRoute = 'session-terminal' | 'debug-terminal' | 'unknown';
+export type ManagementUpgradeRoute = 'session-terminal' | 'host-terminal' | 'unknown';
 
 export interface ManagementUpgradeClassification {
   route: ManagementUpgradeRoute;
@@ -297,9 +297,9 @@ export interface ManagementUpgradeClassification {
  *    它的握手 Origin 就是 `t-`，所以这一档必须认 `m-` + `t-`（#933/#960 修的正是
  *    这条，缺了它平台浏览器终端整片 disconnected）。写权限另有 `?token=` 与 worker
  *    侧的 write-auth 把关，认这条 Origin 不等于给写。
- *  - `/debug-terminal/<id>/ws`：**宿主裸 bash**，只有本机管理壳页会开它。它的可信
- *    来源就该跟 `/api/debug-terminal` 的 HTTP 门禁一样窄——management 档（`m-` /
- *    本机 Host / `BOTMUX_PUBLIC_URL`），`t-` 一律不算。
+ *  - `/host-terminal/<id>/ws`：**宿主 shell**（管理 → 终端），只有本机管理壳页会开它。
+ *    它的可信来源就该跟 `/api/host-terminal` 的 HTTP 门禁一样窄——management 档
+ *    （`m-` / 本机 Host / `BOTMUX_PUBLIC_URL`），`t-` 一律不算。
  *
  * 未识别的路径落窄档并标 `unknown`：调用方本来就会把它 destroy，这里只是保证
  * 「漏加一条前缀」的失败方向是「连不上」，而不是静默把 `t-` 认成同源。
@@ -309,14 +309,14 @@ export function classifyManagementUpgrade(rawUrl: string): ManagementUpgradeClas
   if (pathname === '/s' || pathname.startsWith('/s/')) {
     return { route: 'session-terminal', surface: 'terminal-upgrade' };
   }
-  if (pathname.startsWith('/debug-terminal/')) {
-    return { route: 'debug-terminal', surface: 'management' };
+  if (pathname.startsWith('/host-terminal/')) {
+    return { route: 'host-terminal', surface: 'management' };
   }
   return { route: 'unknown', surface: 'management' };
 }
 
 /**
- * 管理类 WebSocket 升级的 Origin 判定（terminal / debug-terminal）。
+ * 管理类 WebSocket 升级的 Origin 判定（session terminal / host terminal）。
  * 带 Origin 就必须同源（`null` 也算带了，直接拒）；不带 Origin 视为非浏览器客
  * 户端放行。Preview 自身的 WS 不走这里，见文件头注释。
  *

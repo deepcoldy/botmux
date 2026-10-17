@@ -123,7 +123,7 @@ import {
   type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
-import { confirm, promptText } from './confirm-modal.js';
+import { confirm } from './confirm-modal.js';
 import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
@@ -3802,34 +3802,6 @@ function SessionsPage(): React.JSX.Element {
     }
   }, []);
 
-  // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
-  // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
-  const openDebugTerminal = useCallback(async (): Promise<void> => {
-    const input = await promptText({ title: t('sessions.debugTerminal'), message: t('sessions.debugTerminalPrompt') });
-    if (input === null) return; // 用户取消
-    const workingDir = input.trim();
-    const tab = window.open('about:blank', '_blank');
-    if (tab) tab.opener = null;
-    try {
-      const r = await fetch('/api/debug-terminal', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(workingDir ? { workingDir } : {}),
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false || !body?.url) {
-        tab?.close();
-        if (r.status !== 401) toast(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
-        return;
-      }
-      if (tab) tab.location.href = body.url;
-      else window.open(body.url, '_blank', 'noopener');
-    } catch (e) {
-      tab?.close();
-      toast(`${t('sessions.debugTerminalFail')}: ${e}`, { kind: 'error' });
-    }
-  }, []);
-
   useEffect(() => {
     const maybeOpenFromEntry = () => {
       if (consumePendingCreateSession() && ui.authed) void openCreateSession();
@@ -3918,16 +3890,6 @@ function SessionsPage(): React.JSX.Element {
           {dashboardShellAllowsWebTerminal() ? (
             <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
               {t('sessions.monitorRoom')}
-            </button>
-          ) : null}
-          {ui.authed ? (
-            <button
-              type="button"
-              className="debug-terminal-btn"
-              title={t('sessions.debugTerminalHint')}
-              onClick={() => void openDebugTerminal()}
-            >
-              {t('sessions.debugTerminal')}
             </button>
           ) : null}
           {ui.authed ? (

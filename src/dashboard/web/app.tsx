@@ -120,6 +120,7 @@ const MANAGE_ROUTES = [
   'insights',
   'feedback',
   'whiteboards',
+  'terminal',
 ];
 
 const NAV_ITEMS: NavItem[] = [
@@ -195,6 +196,8 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'plugins', href: '#/plugins', label: '插件', manage: true, icon: <><path d="M6.4 1.8h3.2v3h2.8v3.2H9.6v2.8H6.4V8H3.6V4.8h2.8z" /><path d="M2.2 11.8h11.6v2.4H2.2z" /></> },
   { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
   { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
+  // 宿主网页终端：本机 shell / tmux / herdr。只给本机 owner（ui.hostTerminal），客户端壳里不出现。
+  { id: 'terminal', href: '#/terminal', labelKey: 'nav.terminal', manage: true, icon: <><rect x="1.8" y="2.6" width="12.4" height="10.8" rx="1.8" /><path d="M4.4 6.2l2.2 1.8-2.2 1.8M8 10.6h3.4" /></> },
   { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><path d="M8 1.75 9.35 2.05 10 3.28l1.38.3 1.04-.96.96.96-.96 1.04.3 1.38 1.23.65L14.25 8l-.3 1.35-1.23.65-.3 1.38.96 1.04-.96.96-1.04-.96-1.38.3-.65 1.23L8 14.25l-1.35-.3L6 12.72l-1.38-.3-1.04.96-.96-.96.96-1.04-.3-1.38-1.23-.65L1.75 8l.3-1.35 1.23-.65.3-1.38-.96-1.04.96-.96 1.04.96 1.38-.3.65-1.23z" /><circle cx="8" cy="8" r="2" /></> },
 ];
 
@@ -209,7 +212,7 @@ const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults', 'agents'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
-  { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
+  { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
 ];
 
 let pinnedPluginNavItems: NavItem[] = [];
@@ -261,9 +264,13 @@ function isActiveNav(item: NavItem, hash: string): boolean {
 }
 
 function sidebarNavItems(): NavItem[] {
-  const builtInItems = readDashboardClientShell()
-    ? NAV_ITEMS.filter(item => item.id !== 'workflows')
-    : NAV_ITEMS;
+  const clientShell = readDashboardClientShell();
+  const builtInItems = NAV_ITEMS.filter(item => {
+    if (clientShell && item.id === 'workflows') return false;
+    // 网页终端在 Desktop/Mobile 客户端壳里归原生会话面管（见 dashboardShellAllowsWebTerminal）。
+    if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
+    return true;
+  });
   if (pinnedPluginNavItems.length === 0) return builtInItems;
   const pluginIndex = builtInItems.findIndex(item => item.id === 'plugins');
   if (pluginIndex < 0) return [...builtInItems, ...pinnedPluginNavItems];
@@ -1615,6 +1622,7 @@ async function loadAuthState(): Promise<void> {
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
       ui.workbenchAuthed = isAuthed;
+      ui.hostTerminal = isAuthed && j.hostTerminal === true;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
@@ -1625,12 +1633,14 @@ async function loadAuthState(): Promise<void> {
       isAuthed = false;
       ui.authed = false;
       ui.workbenchAuthed = true;
+      ui.hostTerminal = false;
       publicReadOnly = false;
       ui.publicReadOnly = false;
     } else if (r.status === 401) {
       isAuthed = false;
       ui.authed = false;
       ui.workbenchAuthed = false;
+      ui.hostTerminal = false;
       const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
       showAuthExpiredOverlay(loginUrl);
     }

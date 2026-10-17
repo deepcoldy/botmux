@@ -66,9 +66,12 @@ describe('dashboard client shell', () => {
     expect(isWorkflowDashboardHash('#/settings?tab=runtime')).toBe(false);
   });
 
-  it('recognizes Monitor Room as a web-terminal surface', () => {
+  it('recognizes Monitor Room and the host Terminal page as web-terminal surfaces', () => {
     expect(isWebTerminalDashboardHash('#/monitor-room')).toBe(true);
     expect(isWebTerminalDashboardHash('#/monitor-room/session-1?focus=1')).toBe(true);
+    expect(isWebTerminalDashboardHash('#/terminal')).toBe(true);
+    expect(isWebTerminalDashboardHash('#/terminal?tab=1')).toBe(true);
+    expect(isWebTerminalDashboardHash('#/terminals')).toBe(false);
     expect(isWebTerminalDashboardHash('#/sessions')).toBe(false);
   });
 
@@ -93,6 +96,8 @@ describe('dashboard client shell', () => {
       '?botmuxClientShell=desktop',
     )).toBeNull();
     expect(dashboardClientShellRedirect('#/monitor-room', '')).toBeNull();
+    expect(dashboardClientShellRedirect('#/terminal', '?botmuxClientShell=desktop')).toBe('#/sessions');
+    expect(dashboardClientShellRedirect('#/terminal', '')).toBeNull();
   });
 });
 
