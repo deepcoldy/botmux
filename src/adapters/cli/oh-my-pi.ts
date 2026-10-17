@@ -322,6 +322,9 @@ export function createOhMyPiAdapter(
     // unprompted on a TTY. Without reports (older omp, or
     // `terminal.programStatus` off, which sends state=clear) the detector
     // stays on the screen patterns above.
+    // omp never sends the `ESC]7501;?` probe, so there is no handshake for
+    // tmux's own DA1 answer to win: tmux pipe-pane carries the reports as-is
+    // and the in-pane probe relay (worker, claude-code only) is not needed.
     supportsProgramStatus: true,
     supportsTypeAhead: true,
     systemHints: [],
