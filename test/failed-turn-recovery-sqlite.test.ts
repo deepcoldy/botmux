@@ -56,6 +56,24 @@ async function post(mode: 'retry' | 'fresh') {
   expect(response.status).toBe(200); return response.json();
 }
 describe('HTTP recovery with real SQLite persistence', () => {
+  it('persists the clean session app, routing and frozen sandbox/profile through reload', async () => {
+    Object.assign(ds.session, { cliConfigDir: '/tmp/frozen-cli', modelBackendVariant: 'max',
+      larkThreadId: 'omt_original', creatorOpenId: 'ou_creator', lastCallerOpenId: 'ou_last',
+      sandbox: 'scratch', sandboxScratch: { storage: 'tmpfs', tmpfsSizeMb: 96, denyPaths: ['/secret'] },
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'block' } },
+      sandboxHidePaths: ['/hidden'], sandboxReadonlyPaths: ['/readonly'] });
+    store.updateSession(ds.session);
+    const first = await post('fresh');
+    store.init('cli_fixture');
+    const child = store.getSessionFresh(first.sessionId)!;
+    expect(child).toMatchObject({ larkAppId: 'cli_fixture', cliConfigDir: '/tmp/frozen-cli',
+      modelBackendVariant: 'max', larkThreadId: 'omt_original', creatorOpenId: 'ou_creator',
+      lastCallerOpenId: 'ou_last', sandbox: 'scratch',
+      sandboxScratch: { storage: 'tmpfs', tmpfsSizeMb: 96, denyPaths: ['/secret'] },
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'block' } },
+      sandboxHidePaths: ['/hidden'], sandboxReadonlyPaths: ['/readonly'] });
+    expect(child.cliSessionId).toBeUndefined();
+  });
   it.each(['retry', 'fresh'] as const)('persists %s acceptance and deduplicates after store reload', async mode => {
     const id = ds.session.sessionId;
     const first = await post(mode);
@@ -63,6 +81,7 @@ describe('HTTP recovery with real SQLite persistence', () => {
     const durable = store.getSessionFresh(id)!;
     expect(durable.lastFailedTurn?.recovery).toMatchObject({ state: 'accepted', sessionId: first.sessionId });
     expect(store.getSessionFresh(first.sessionId)?.failedTurnRecovery?.caller).toEqual(caller);
+    if (mode === 'fresh') expect(store.getSessionFresh(first.sessionId)?.larkAppId).toBe('cli_fixture');
     store.init('cli_fixture');
     expect(await post(mode)).toEqual(first);
     expect(mode === 'retry' ? pool.sendWorkerInput : pool.forkWorker).toHaveBeenCalledTimes(1);

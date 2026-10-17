@@ -271,6 +271,9 @@ export interface FailedTurnRecord {
   trustedCaller?: TrustedCaller;
   originalTurnId?: string;
   silent?: boolean;
+  /** Provisional native quota observation, not a failed terminal. Unclaimed
+   * snapshots expire when the CLI leaves limited or completes this turn. */
+  limitedSnapshot?: true;
   recovery?: {
     requestId: string;
     mode: 'retry' | 'fresh';

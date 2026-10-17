@@ -9,6 +9,7 @@ import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signa
 import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
+import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
 import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
@@ -11045,62 +11046,12 @@ async function forkFromSource(
     // bug in a multi-bot fleet), and destabilises sandbox transcript/BOT_HOME
     // location.
     childSession.larkAppId = ds.larkAppId;
-    // Frozen launch posture — inherit the source's RECORDED decisions wholesale
-    // rather than letting forkWorker re-derive them for a brand-new row. Two
-    // reasons this is mandatory, not cosmetic:
-    //   • sandbox*: a fresh child row has sandbox===undefined, and forkWorker's
-    //     cold-spawn runs with resume=true → it hits the "resume + no recorded
-    //     decision → sandbox=false" branch meant for pre-sandbox-era legacy
-    //     sessions. A fork of a sandboxed session would therefore run UNSANDBOXED
-    //     (bwrap credential seal — bots.json deny / sibling appsecrets /
-    //     master.key / network deny — silently dropped). This is a security
-    //     escape, so copy the recorded decision and its path lists verbatim.
-    //   • reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
-    //     without these the child's sessionAgentConfig() sees !agentFrozen and
-    //     re-freezes from the CURRENT bot config, silently dropping any per-session
-    //     /effort override the source carried (reasoningEffort has no botCfg
-    //     fallback at all → drops to undefined). Copying the frozen tuple keeps
-    //     the clone's launch identity == the source's. `model` is no longer a
-    //     FROZEN value — it resolves from the live bot config at every spawn — but
-    //     the record of what the source last launched with still has to travel:
-    //     when the source is pinned to a CLI the bot no longer runs, that record is
-    //     the only thing keeping either session off the CLI default (rule 3 in
-    //     resolveSessionLaunchModel). Copying it cannot resurrect the old frozen
-    //     bug, because the live bot model outranks it whenever the CLIs match.
-    //     An explicit per-trigger override rides on the runtime childDs below.
-    // readIsolation is intentionally NOT copied: it is not a persisted Session
-    // field (forkWorker derives it from botCfg at spawn), and the child runs the
-    // SAME bot, so it is preserved automatically. persistentBackendTarget is also
-    // intentionally NOT inherited — that is the parent's specific pane/Herdr
-    // affinity; the child cold-spawns its own fresh backing.
-    childSession.sandbox = ds.session.sandbox;
-    childSession.sandboxPaths = ds.session.sandboxPaths;
-    childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
-    childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
-    childSession.sandboxNetwork = ds.session.sandboxNetwork;
-    childSession.sandboxNetworkPolicy = ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined;
-    childSession.reasoningEffort = ds.session.reasoningEffort;
-    childSession.modelBackendVariant = ds.session.modelBackendVariant;
-    childSession.model = ds.session.model;
-    childSession.cliLaunchSnapshot = ds.session.cliLaunchSnapshot
-      ? {
-          ...ds.session.cliLaunchSnapshot,
-          cliRuntime: ds.session.cliLaunchSnapshot.cliRuntime
-            ? { ...ds.session.cliLaunchSnapshot.cliRuntime, update: { ...ds.session.cliLaunchSnapshot.cliRuntime.update } }
-            : null,
-          startupCommands: [...ds.session.cliLaunchSnapshot.startupCommands],
-        }
-      : undefined;
-    childSession.cliRuntime = ds.session.cliRuntime
-      ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
-      : undefined;
-    childSession.cliPathOverride = ds.session.cliPathOverride;
-    // The fork resumes from the source's transcript, which lives under the source's
-    // frozen profile; with agentFrozen copied, sessionAgentConfig would never fill it.
-    childSession.cliConfigDir = ds.session.cliConfigDir;
-    childSession.wrapperCli = ds.session.wrapperCli;
-    childSession.cliLaunchMode = ds.session.cliLaunchMode;
-    childSession.agentFrozen = ds.session.agentFrozen;
+    // Both native fork and clean failed-turn recovery inherit one recorded
+    // launch posture. Never re-derive sandbox/CLI profile from the live bot:
+    // a missing sandbox stamp on resume can silently disable isolation.
+    // Model remains a launch record; current matching-CLI settings still win
+    // in resolveSessionLaunchModel. Native pane/conversation IDs are separate.
+    inheritSessionLaunchConfiguration(ds.session, childSession);
     childSession.promptInjection = sessionPromptInjection(ds);
     childSession.nativeSessionTitle = childTitle;
     childSession.nativeSessionTitleUserDefined = true;

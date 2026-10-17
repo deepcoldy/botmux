@@ -127,8 +127,7 @@ import { parseDurablePrimarySessionRecord } from './services/durable-session-pri
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
-import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
-import { failedTurnCaller, recordLimitedFailedTurn, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
+import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -29051,10 +29050,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
-      if (context.status === 'limited') {
-        try { recordLimitedFailedTurn(ds, context.turnId); }
-        catch (error) { logger.error(`[recovery] quota snapshot failed: ${String(error)}`); }
-      }
+      try {
+        if (context.status === 'limited') recordLimitedFailedTurn(ds, context.turnId);
+        else if (context.prevStatus === 'limited') clearLimitedFailedTurn(ds);
+      } catch (error) { logger.error(`[recovery] quota snapshot failed: ${String(error)}`); }
       return cardRuntimeStatusBridge.publish({
         sessionId: ds.session.sessionId,
         larkAppId: ds.larkAppId,
@@ -29204,28 +29203,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // turn-completion enqueue above). The reply-target guard skips type-ahead
       // scenarios where a newer turn already owns the captured prompt.
       try {
-        // shouldRecordFailedTurn guarantees failed/ambiguous; re-narrow to the
-        // typed builder (property narrowing does not propagate to the argument).
-        const failedStatus = terminal.status === 'failed' || terminal.status === 'ambiguous'
-          ? terminal.status
-          : undefined;
-        if (failedStatus && shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)) {
-          const record = buildFailedTurnRecord(
-            { turnId: terminal.turnId, status: failedStatus, errorCode: terminal.errorCode },
-            {
-              userPrompt: ds.lastUserPrompt,
-              cliInput: ds.lastCliInput,
-              codexAppInput: ds.lastCodexAppInput,
-              trustedCaller: originalFailedCaller, silent: originalFailedSilent,
-              originalTurnId: ds.session.failedTurnRecovery?.turnId === terminal.turnId
-                ? ds.session.failedTurnRecovery.originalTurnId : terminal.turnId,
-            },
-          );
-          if (record) {
-            ds.session.lastFailedTurn = record;
-            sessionStore.updateSession(ds.session);
-          }
-        }
+        recordFailedTurnTerminal(ds, terminal, { workerGeneration: context.workerGeneration,
+          caller: originalFailedCaller, silent: originalFailedSilent });
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }

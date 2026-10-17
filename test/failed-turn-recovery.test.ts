@@ -4,7 +4,7 @@ import * as store from '../src/services/session-store.js';
 import * as permissions from '../src/im/lark/event-dispatcher.js';
 import * as manager from '../src/core/session-manager.js';
 import { recoverFailedTurn, parseFailedTurnRecoveryRequest, noteFailedTurnRecoveryInput,
-  failedTurnCaller, recordLimitedFailedTurn } from '../src/core/failed-turn-recovery.js';
+  failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal } from '../src/core/failed-turn-recovery.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 
@@ -17,7 +17,7 @@ let order: string[];
 
 beforeEach(() => {
   order = [];
-  ds = { session: { sessionId: 'old', status: 'active', cliId: 'codex', chatId: 'oc_chat',
+  ds = { session: { sessionId: 'old', larkAppId: 'cli_app', status: 'active', cliId: 'codex', chatId: 'oc_chat',
     rootMessageId: 'om_root', scope: 'thread', title: 'task', ownerOpenId: 'ou_owner_b',
     replyTargets: { om_failed: { senderOpenId: 'ou_user_a', participants: [{ openId: 'ou_user_a', isBot: false }], updatedAt: request.failedAt } },
     lastFailedTurn: { turnId: request.turnId, failedAt: request.failedAt, status: 'failed',
@@ -78,6 +78,7 @@ describe('controlled failed-turn recovery', () => {
     const target = [...registry.values()][0];
     expect(target.session.cliSessionId).toBeUndefined();
     expect(target.session.rootMessageId).toBe('om_root');
+    expect(target.session.larkAppId).toBe('cli_app');
     expect(target.session.ownerOpenId).toBe('ou_owner_b');
     expect(target.session.failedTurnRecovery?.caller.requestUserOpenId).toBe('ou_user_a');
     expect(pool.forkWorker).toHaveBeenCalledWith(target, { content: 'new:original task' }, expect.objectContaining({ resume: false, atMostOnce: true }), expect.anything());
@@ -86,6 +87,130 @@ describe('controlled failed-turn recovery', () => {
     expect(await recoverFailedTurn('old', { ...request, mode: 'fresh' })).toEqual(result);
     expect(pool.closeSessionForBackgroundCleanup).toHaveBeenCalledTimes(1);
   });
+  it('preserves the frozen CLI, sandbox and routing posture without sharing mutable configuration', async () => {
+    const posture = {
+      cliId: 'claude-code', cliConfigDir: '/tmp/claude-profile', agentFrozen: true,
+      cliRuntime: { id: 'test', update: { mode: 'manual' } }, cliPathOverride: '/tmp/cli',
+      wrapperCli: 'claude-code', cliLaunchMode: 'code', backendType: 'tmux',
+      model: 'recorded-model', modelBackendVariant: 'max', reasoningEffort: 'medium',
+      serviceTier: 'priority', sandbox: 'scratch', autoWorktreeFallbackDir: '/tmp/work',
+      sandboxScratch: { storage: 'tmpfs', tmpfsSizeMb: 128, denyPaths: ['/private'], network: false },
+      sandboxPaths: { readWrite: ['/tmp/work'], deny: ['/secret'] },
+      sandboxHidePaths: ['/hidden'], sandboxReadonlyPaths: ['/readonly'], sandboxNetwork: false,
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'block' } },
+    };
+    Object.assign(ds.session, structuredClone(posture), {
+      larkThreadId: 'omt_original', creatorOpenId: 'ou_creator', lastCallerOpenId: 'ou_last_caller',
+    });
+    await recoverFailedTurn('old', { ...request, mode: 'fresh' });
+    const child = [...registry.values()][0].session;
+    expect(child).toMatchObject(posture);
+    expect(child).toMatchObject({ larkAppId: 'cli_app', larkThreadId: 'omt_original',
+      creatorOpenId: 'ou_creator', lastCallerOpenId: 'ou_last_caller' });
+    for (const field of ['cliRuntime', 'sandboxScratch', 'sandboxPaths', 'sandboxNetworkPolicy']) {
+      expect(child[field]).not.toBe(ds.session[field]);
+    }
+    expect(child.cliSessionId).toBeUndefined();
+  });
+  it.each(['adopt', 'adopt-mode', 'remote', 'principal-lane', 'retired-workspace'])(
+    'refuses unsupported lifecycle ownership before close or dispatch (%s)', async kind => {
+      if (kind === 'adopt') ds.adoptedFrom = { tmuxTarget: 'other-pane' };
+      if (kind === 'adopt-mode') ds.initConfig = { adoptMode: true };
+      if (kind === 'remote') ds.session.backendType = 'mojo';
+      if (kind === 'principal-lane') ds.session.principalLane = { principalKey: 'other' };
+      if (kind === 'retired-workspace') ds.session.workspaceRetirement = { state: 'retiring' };
+      expect(await recoverFailedTurn('old', { ...request, mode: 'fresh' }))
+        .toEqual({ ok: false, error: 'recovery_unsupported' });
+      expect(pool.closeSessionForBackgroundCleanup).not.toHaveBeenCalled();
+      expect(pool.forkWorker).not.toHaveBeenCalled();
+      expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+    });
+  it('rejects a failure frozen under another app without closing or dispatching', async () => {
+    ds.session.lastFailedTurn.trustedCaller = { ...caller, requestLarkAppId: 'cli_other' };
+    expect(await recoverFailedTurn('old', { ...request, mode: 'fresh' }))
+      .toEqual({ ok: false, error: 'original_actor_unavailable' });
+    expect(pool.closeSessionForBackgroundCleanup).not.toHaveBeenCalled();
+    expect(pool.forkWorker).not.toHaveBeenCalled();
+  });
+  it.each(['quota-cleared', 'not-limited', 'screen-recovered'])(
+    'does not replay a temporary quota snapshot after native self-recovery (%s)', async kind => {
+      ds.session.lastFailedTurn.limitedSnapshot = true;
+      ds.usageLimit = { limited: true, kind: 'rate' };
+      ds.lastScreenStatus = 'limited';
+      if (kind === 'quota-cleared') ds.usageLimit = undefined;
+      if (kind === 'not-limited') ds.usageLimit.limited = false;
+      if (kind === 'screen-recovered') ds.lastScreenStatus = 'idle';
+      expect(await recoverFailedTurn('old', request)).toEqual({ ok: false, error: 'failure_changed' });
+      expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+      expect(pool.closeSessionForBackgroundCleanup).not.toHaveBeenCalled();
+    });
+  it('still admits a currently limited snapshot, and retains its receipt after the limit clears', async () => {
+    ds.session.lastFailedTurn.limitedSnapshot = true;
+    ds.usageLimit = { limited: true, kind: 'rate' }; ds.lastScreenStatus = 'limited';
+    const accepted = await recoverFailedTurn('old', request);
+    expect(accepted).toMatchObject({ ok: true, state: 'accepted' });
+    ds.usageLimit = undefined; ds.lastScreenStatus = 'idle';
+    expect(await recoverFailedTurn('old', request)).toEqual(accepted);
+    expect(pool.sendWorkerInput).toHaveBeenCalledTimes(1);
+  });
+  it('removes an unclaimed quota snapshot when the native screen recovers', async () => {
+    ds.session.lastFailedTurn.limitedSnapshot = true;
+    clearLimitedFailedTurn(ds);
+    expect(ds.session.lastFailedTurn).toBeUndefined();
+    expect(rows.get('old').lastFailedTurn).toBeUndefined();
+    expect(await recoverFailedTurn('old', request)).toEqual({ ok: false, error: 'failure_changed' });
+    expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+  });
+  it('only clears the quota observation for the completed native turn', () => {
+    ds.session.lastFailedTurn.limitedSnapshot = true;
+    clearLimitedFailedTurn(ds, 'other-turn');
+    expect(ds.session.lastFailedTurn).toBeDefined();
+    clearLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toBeUndefined();
+  });
+  it('expires provisional quota observations on current-generation native completion', () => {
+    ds.session.workerGeneration = 4;
+    ds.session.lastFailedTurn.limitedSnapshot = true;
+    recordFailedTurnTerminal(ds, { turnId: request.turnId, status: 'completed' },
+      { workerGeneration: 3, caller, silent: false });
+    expect(ds.session.lastFailedTurn).toBeDefined();
+    recordFailedTurnTerminal(ds, { turnId: request.turnId, status: 'completed' },
+      { workerGeneration: 4, caller, silent: false });
+    expect(ds.session.lastFailedTurn).toBeUndefined();
+  });
+  it('replaces an unclaimed quota observation with the real failed terminal', () => {
+    ds.session.lastFailedTurn.limitedSnapshot = true;
+    ds.lastUserPrompt = 'actual prompt'; ds.lastCliInput = 'actual wrapped input';
+    recordFailedTurnTerminal(ds, { turnId: request.turnId, status: 'failed', errorCode: 'rate_limited' },
+      { workerGeneration: 1, caller, silent: false });
+    expect(ds.session.lastFailedTurn).toMatchObject({ userPrompt: 'actual prompt', trustedCaller: caller });
+    expect(ds.session.lastFailedTurn.limitedSnapshot).toBeUndefined();
+    clearLimitedFailedTurn(ds);
+    expect(ds.session.lastFailedTurn).toBeDefined();
+  });
+  it.each(['failed', 'completed'])('keeps a claimed recovery fence across late terminal events (%s)', status => {
+    ds.session.workerGeneration = 1;
+    ds.session.lastFailedTurn.limitedSnapshot = true;
+    ds.session.lastFailedTurn.recovery = { ...request, turnId: 'recovery', sessionId: 'old', state: 'attempting' };
+    ds.lastCliInput = 'late input';
+    recordFailedTurnTerminal(ds, { turnId: request.turnId, status }, { workerGeneration: 1, caller, silent: false });
+    expect(ds.session.lastFailedTurn.recovery.state).toBe('attempting');
+    expect(store.updateSession).not.toHaveBeenCalled();
+  });
+  it('retains real failed terminals when a later screen changes', () => {
+    clearLimitedFailedTurn(ds);
+    expect(ds.session.lastFailedTurn?.turnId).toBe(request.turnId);
+    expect(store.updateSession).not.toHaveBeenCalled();
+  });
+  it.each(['attempting', 'accepted', 'dispatch_unknown', 'cancelled'])(
+    'retains claimed quota snapshots and durable receipts (%s)', state => {
+      ds.session.lastFailedTurn.limitedSnapshot = true;
+      ds.session.lastFailedTurn.recovery = { requestId: request.requestId, mode: request.mode,
+        turnId: 'recovery', sessionId: 'old', state };
+      clearLimitedFailedTurn(ds, request.turnId);
+      expect(ds.session.lastFailedTurn?.recovery?.state).toBe(state);
+      expect(store.updateSession).not.toHaveBeenCalled();
+    });
   it.each(['reply', 'clock', 'queue', 'active', 'working', 'native-recovery'])('rejects newer or owned input before any close (%s)', async kind => {
     if (kind === 'reply') ds.currentReplyTarget.turnId = 'om_new';
     if (kind === 'clock') ds.lastMessageAt = Date.parse(request.failedAt) + 1;
@@ -176,7 +301,7 @@ describe('controlled failed-turn recovery', () => {
     ds.lastUserPrompt = 'task'; ds.lastCliInput = 'wrapped';
     ds.usageLimit = { limited: true, kind: 'rate' };
     recordLimitedFailedTurn(ds, request.turnId);
-    expect(ds.session.lastFailedTurn).toMatchObject({ trustedCaller: caller, errorCode: 'rate_limited', originalTurnId: request.turnId });
+    expect(ds.session.lastFailedTurn).toMatchObject({ trustedCaller: caller, errorCode: 'rate_limited', originalTurnId: request.turnId, limitedSnapshot: true });
     const first = ds.session.lastFailedTurn;
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn).toBe(first);
@@ -185,6 +310,18 @@ describe('controlled failed-turn recovery', () => {
     ds.session.replyTargets = {}; delete ds.session.lastFailedTurn.trustedCaller;
     expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();
     ds.activeInteractiveTurn = { turnId: request.turnId, caller: { ...caller, senderType: 'bot' } };
+    expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();
+  });
+  it.each(['interactive', 'recovery', 'schedule'])(
+    'does not replace an explicit cross-app caller with a reply-target guess (%s)', source => {
+      const foreign = { ...caller, requestLarkAppId: 'cli_other' };
+      if (source === 'interactive') ds.activeInteractiveTurn = { turnId: request.turnId, caller: foreign };
+      if (source === 'recovery') ds.session.failedTurnRecovery = { turnId: request.turnId, caller: foreign };
+      if (source === 'schedule') ds.scheduledTurnCallers = new Map([[request.turnId, foreign]]);
+      expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();
+    });
+  it.each([undefined, 'cli_other'])('does not attach an unbound reply target to the live app (%s)', appId => {
+    ds.session.larkAppId = appId;
     expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();
   });
   it('rejects caller, input and scope overrides from clients', () => {

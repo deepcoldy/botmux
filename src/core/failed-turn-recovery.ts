@@ -11,6 +11,7 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { pickTurnReplyTarget } from './reply-target.js';
 import { buildFollowUpCliInput, rememberLastCliInput } from './session-manager.js';
 import { localeForBot } from '../i18n/index.js';
+import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
 import {
   findActiveBySessionId, closeSessionForBackgroundCleanup, forkWorker, sendWorkerInput,
@@ -50,8 +51,13 @@ export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCall
   const caller = ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
     : ds.activeInteractiveTurn?.turnId === turnId ? ds.activeInteractiveTurn.caller
       : ds.scheduledTurnCallers?.get(turnId);
-  if ((caller?.senderType === 'user' || caller?.source === 'schedule_creator') && caller.requestLarkAppId === ds.larkAppId
-      && caller.requestUserOpenId?.startsWith('ou_')) return { ...caller, senderType: 'user' };
+  if (caller) {
+    if ((caller.senderType === 'user' || caller.source === 'schedule_creator') && caller.requestLarkAppId === ds.larkAppId
+        && caller.requestUserOpenId?.startsWith('ou_')) return { ...caller, senderType: 'user' };
+    // An explicit foreign/bot caller cannot be replaced by reply metadata.
+    return;
+  }
+  if (ds.session.larkAppId !== ds.larkAppId) return;
   const target = pickTurnReplyTarget(ds.session, turnId);
   const human = target?.participants?.some(person => person.openId === target.senderOpenId && person.isBot === false)
     || ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === false;
@@ -62,7 +68,7 @@ export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCall
 /** Some structured quota failures have no turn_terminal. Record their input
  * once at the native limited edge, while the authenticated turn still exists. */
 export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | undefined): void {
-  if (!turnId || !ds.usageLimit || ds.session.lastFailedTurn?.turnId === turnId
+  if (!turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId
       || !shouldRecordFailedTurn({ turnId, status: 'failed' }, ds.currentReplyTarget?.turnId)) return;
   const caller = failedTurnCaller(ds, turnId);
   if (!caller) return;
@@ -71,6 +77,42 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
     trustedCaller: caller, silent: isSilentScheduledTurn(ds, turnId),
     originalTurnId: ds.session.failedTurnRecovery?.turnId === turnId
       ? ds.session.failedTurnRecovery.originalTurnId : turnId,
+  });
+  if (record) {
+    record.limitedSnapshot = true;
+    ds.session.lastFailedTurn = record;
+    store.updateSession(ds.session);
+  }
+}
+
+/** Invalidate only unclaimed provisional observations. Durable recovery
+ * receipts and real failed terminals must survive status/terminal updates. */
+export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void {
+  const record = ds.session.lastFailedTurn;
+  if (!record?.limitedSnapshot || record.recovery || turnId !== undefined && record.turnId !== turnId) return;
+  delete ds.session.lastFailedTurn;
+  store.updateSession(ds.session);
+}
+
+/** Terminal bookkeeping shares the provisional snapshot's lifecycle owner.
+ * The caller/silent facts are captured by the daemon before releasing the
+ * active turn; a late terminal must not erase an already-claimed receipt. */
+export function recordFailedTurnTerminal(
+  ds: DaemonSession,
+  terminal: { turnId: string; status: string; errorCode?: string },
+  context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
+): void {
+  if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
+    clearLimitedFailedTurn(ds, terminal.turnId);
+  }
+  if (terminal.status !== 'failed' && terminal.status !== 'ambiguous') return;
+  if (!shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)
+      || ds.session.lastFailedTurn?.turnId === terminal.turnId && ds.session.lastFailedTurn.recovery) return;
+  const record = buildFailedTurnRecord({ ...terminal, status: terminal.status }, {
+    userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
+    trustedCaller: context.caller, silent: context.silent,
+    originalTurnId: ds.session.failedTurnRecovery?.turnId === terminal.turnId
+      ? ds.session.failedTurnRecovery.originalTurnId : terminal.turnId,
   });
   if (record) { ds.session.lastFailedTurn = record; store.updateSession(ds.session); }
 }
@@ -121,6 +163,11 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
       const record = ds?.session.lastFailedTurn;
       if (!ds || ds !== initial || record !== old || record.turnId !== request.turnId
           || record.failedAt !== request.failedAt) return { ok: false, error: 'failure_changed' };
+      // Harvested-answer self-heal may never emit another screen frame. Do not
+      // replay a provisional quota observation after native recovery succeeds.
+      if (record.limitedSnapshot && (!ds.usageLimit?.limited || ds.lastScreenStatus !== 'limited')) {
+        return { ok: false, error: 'failure_changed' };
+      }
       const caller = record.trustedCaller;
       if (!caller || caller.senderType !== 'user' || caller.requestLarkAppId !== ds.larkAppId
           || !caller.requestUserOpenId?.startsWith('ou_')) return { ok: false, error: 'original_actor_unavailable' };
@@ -174,9 +221,10 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           if (transaction.cancelled) return setState('cancelled');
           const created = store.createSession(ds.chatId, ds.session.rootMessageId, ds.session.title,
             ds.chatType, ds.scope, { source: 'other', inherit: ds.session });
-          for (const name of ['workingDir', 'cliLaunchSnapshot', 'backendType', 'model', 'reasoningEffort',
-            'sessionAgentConfig', 'sandbox', 'sandboxPaths', 'sandboxNetwork', 'serviceTier',
-            'ownerOpenId', 'ownerUnionId', 'whiteboardId', 'quoteTargetId',
+          created.larkAppId = ds.larkAppId;
+          inheritSessionLaunchConfiguration(ds.session, created);
+          for (const name of ['ownerOpenId', 'ownerUnionId', 'creatorOpenId', 'lastCallerOpenId',
+            'larkThreadId', 'whiteboardId', 'quoteTargetId',
             'quoteTargetSenderOpenId', 'quoteTargetSenderIsBot'] as const) {
             if (name in ds.session) (created as unknown as Record<string, unknown>)[name] = structuredClone(ds.session[name as keyof Session]);
           }
@@ -184,7 +232,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           target = { session: created, worker: null, workerPort: null, workerToken: null,
             larkAppId: ds.larkAppId, chatId: ds.chatId, chatType: ds.chatType, scope: ds.scope,
             workingDir: created.workingDir, spawnedAt: Date.now(), cliVersion: ds.cliVersion,
-            lastMessageAt: Date.now(), hasHistory: false } as DaemonSession;
+            ownerOpenId: created.ownerOpenId, lastMessageAt: Date.now(), hasHistory: false } as DaemonSession;
           record.recovery!.sessionId = created.sessionId;
           const registry = getActiveSessionsRegistry();
           if (!registry || !setActiveSessionIfActive(registry, activeSessionKey(target), target)) {
