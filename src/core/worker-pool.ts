@@ -16917,7 +16917,7 @@ function setupWorkerHandlers(
           `[${t}] Codex App steer accepted `
           + `appTurn=${msg.appTurnId.slice(0, 12)} replyTurn=${msg.turnId.slice(0, 12)}`,
         );
-        if (managedAuxUiSuppressed(msg.turnId, undefined)) break;
+        if (managedAuxUiSuppressed(msg.turnId, undefined) || silentTurnReactions(ds)) break;
         try {
           await scopedReply(tr('worker.steer_accepted', undefined, loc), 'text', msg.turnId);
         } catch {

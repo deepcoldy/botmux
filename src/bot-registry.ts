@@ -2136,9 +2136,9 @@ export interface BotConfig {
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
   /**
-   * When true, suppress the lightweight GoGoGo → DONE message reactions used as
-   * progress markers in card-off sessions. Missing/false preserves the current
-   * card-off reaction behavior.
+   * When true, suppress GoGoGo → DONE reactions in card-off sessions and Codex
+   * App steer acknowledgement messages in any card mode. Missing/false preserves
+   * both kinds of feedback.
    */
   silentTurnReactions?: boolean;
   /**
