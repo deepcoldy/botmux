@@ -163,7 +163,6 @@ export function consumeTrustedResultDeliverySources(delivery: TrustedResultDeliv
 export function parseTrustedResultDelivery(
   value: unknown,
   pluginHome: string,
-  validateMarkdown?: (markdown: string) => void,
 ): TrustedResultDelivery {
   if (!isRecord(value) || value.schemaVersion !== 1) {
     throw new Error('invalid_host_delivery_schema');
@@ -186,10 +185,6 @@ export function parseTrustedResultDelivery(
     throw new Error('invalid_host_delivery_files');
   }
   if (!markdown?.trim() && rawFiles.length === 0) throw new Error('empty_host_delivery');
-  // Reject an oversized target card before resolving/opening attachments.
-  // This keeps the source artifacts available for a smaller retry.
-  if (typeof markdown === 'string' && markdown.trim()) validateMarkdown?.(markdown);
-
   const realPluginHome = realpathSync(pluginHome);
   const outboundPath = resolve(realPluginHome, 'outbound');
   if (lstatSync(outboundPath).isSymbolicLink()) throw new Error('invalid_host_delivery_outbound_root');

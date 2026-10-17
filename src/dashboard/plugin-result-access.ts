@@ -61,7 +61,7 @@ function requireViewer(
   const identity = deps.identity(req);
   if (identity?.principalUnionId) return identity.principalUnionId;
   if (!identity) {
-    const login = deps.loginUrl?.(`${url.pathname}${url.search}`);
+    const login = deps.loginUrl?.(url.pathname);
     if (login) {
       res.writeHead(302, { location: login, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
       res.end();
