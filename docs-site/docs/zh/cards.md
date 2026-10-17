@@ -99,6 +99,32 @@ botmux 在飞书里的「存在感」分四层，各自独立开关：
 
 > ⚠️ 原始卡片**只允许纯展示 + open_url 跳转按钮**：任何会触发回调的控件——回调按钮（带 `value`）、下拉 / 人员选择、日期时间选择、输入框、表单提交——都会被拒绝。这是防止自定义卡片伪造交互回调。
 
+## 卡片用量段自定义扩展
+
+用量段（`ctx 23% · 5h 18% · 7d 5%`）后面可以接上自己的内容，比如网关账号额度、构建状态、值班人。在 bots.json 里给 bot 配一个命令：
+
+```json
+"cardFooterExtension": {
+  "command": "~/.botmux/scripts/quota.sh",
+  "refreshSeconds": 60
+}
+```
+
+- daemon 按 `refreshSeconds`（默认 60，范围 10–3600）在后台执行 `/bin/sh -c <command>`，同一 bot 的所有会话共用一份结果；渲染卡片只读缓存，从不等命令
+- 输出一行一段，或 JSON `{"segments": ["…", "…"]}`；最多 4 段，每段最多 40 字，按纯文本渲染（markdown 会被转义）
+- 环境变量带上 `BOTMUX_LARK_APP_ID`、`BOTMUX_CLI_ID`、`BOTMUX_BOT_NAME`；stdin 关闭，超时 3 秒，非 0 退出视为失败
+- 失败或超时沿用上次成功的结果；上次成功超过 10 分钟就不再显示
+- 与 CLI 无关，所有 CLI 的会话都会显示；显示位置跟随 `usageDisplay`（实时卡片或回复卡片页脚），`off` 时与其它用量一起隐藏。不配置时卡片与原来逐字节相同
+
+示例输出：
+
+```
+01 5h 2% 7d 2%
+02 5h 4% 7d 2%
+```
+
+卡片上显示为 `ctx 14% · 01 5h 2% 7d 2% · 02 5h 4% 7d 2%`。
+
 ## 在消息里画图表（vega-lite）
 
 `botmux send` 正文中的 ` ```vega-lite ` 代码块会渲染成飞书 Card 2.0 原生图表；同一段 Vega-Lite 在 Web 等其它通道可直接渲染。支持的子集：

@@ -26,6 +26,7 @@ import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
+import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -404,6 +405,28 @@ function prepareAdoptedReplyImages(
  * remains best-effort even when a CLI has no supported transcript or a usage
  * resolver fails. */
 export function getDaemonSessionUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+  opts?: { fresh?: boolean },
+): CardUsageSnapshot {
+  const snapshot = readDaemonSessionUsageSnapshot(ds, effectiveCliId, opts);
+  // bots.json `cardFooterExtension`：按 bot 缓存的外部命令输出，追加在用量段末尾。
+  // 只读缓存、不等命令；与 CLI / 后端无关，所以放在所有分支之后统一合并。
+  try {
+    const larkAppId = ds.larkAppId ?? ds.session.larkAppId;
+    if (larkAppId) {
+      const bot = getBot(larkAppId);
+      const extensionSegments = getCardFooterExtensionSegments(
+        { larkAppId, cliId: bot.config.cliId, botName: bot.config.name },
+        bot.config.cardFooterExtension,
+      );
+      if (extensionSegments) return { ...snapshot, extensionSegments };
+    }
+  } catch { /* best-effort */ }
+  return snapshot;
+}
+
+function readDaemonSessionUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },

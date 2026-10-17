@@ -38,6 +38,7 @@ import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/gro
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
+import { normalizeCardFooterExtension, type CardFooterExtensionConfig } from './services/card-footer-extension.js';
 import { parseTriggerUserAuthConfig } from './services/trigger-user-auth.js';
 import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
@@ -2376,6 +2377,12 @@ export interface BotConfig {
    */
   pricing?: PricingOverrides;
   /**
+   * Custom text segments appended to the card usage line, produced by an
+   * external command the daemon runs on a timer (shared by all of this bot's
+   * sessions). See services/card-footer-extension.ts.
+   */
+  cardFooterExtension?: CardFooterExtensionConfig;
+  /**
    * Per-bot monthly budget config. When set, the daemon tracks spend and
    * alerts/blocks at thresholds. See services/budget-tracker.ts.
    */
@@ -3906,6 +3913,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // 非法项丢弃，全空返回 undefined。
     const pricing = normalizePricingOverrides(entry.pricing);
 
+    // cardFooterExtension：卡片用量段的外部命令扩展；command 缺失 / 非法 ⇒ undefined。
+    const cardFooterExtension = normalizeCardFooterExtension(entry.cardFooterExtension);
+
     // budget：per-bot 月度预算。parseBudgetConfig 做宽松校验，
     // 非法/缺字段返回 null。
     const budget = parseBudgetConfig(entry.budget);
@@ -4232,6 +4242,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       contentTriggers,
       voice,
       pricing,
+      cardFooterExtension,
       budget: budget ?? undefined,
     };
     const nativeSubagentRuntimeStatus: NativeSubagentRuntimeConfigState['status'] =
