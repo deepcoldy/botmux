@@ -202,7 +202,10 @@ describe('durable inbox primary consumer', () => {
 
   it('requeues an explicit busy result without reporting a dispatch error', async () => {
     const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
-    const store = inboxStore({ claims: [claim('om_busy')], retried });
+    // Explicit retry is a wait-state, not a failing attempt. Even an already
+    // high attempt count must not hit the generic poison-row completion path.
+    const busy = { ...claim('om_busy'), attempts: 999 };
+    const store = inboxStore({ claims: [busy], retried });
     const errors: unknown[] = [];
     const commits: DurableInboxPrimaryDispatchResult[] = [];
     const consumer = startDurableInboxPrimaryConsumer({
@@ -211,6 +214,7 @@ describe('durable inbox primary consumer', () => {
       concurrency: 1,
       intervalMs: 60_000,
       retryDelayMs: 750,
+      maxAttempts: 1,
       now: () => 9_000,
       dispatch: async () => ({ kind: 'retry', reason: 'session has an unfinished turn' }),
       onCommitted: ({ result }) => commits.push(result),
