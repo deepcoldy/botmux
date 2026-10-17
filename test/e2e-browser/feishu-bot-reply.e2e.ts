@@ -53,7 +53,7 @@ export function registerMidsceneSuites(): void {
 
       await navigateToMessenger(page);
       await openChat(page, agent, 'Claude');
-      await sendMessage(agent, msg);
+      await sendMessage(agent, msg, page);
       await waitForStreamingCard(agent, { msgHint: msg, page });
       // 流式卡片只证明 CLI 被拉起了；必须等到模型真正输出一条文本气泡才算成功。
       await waitForModelTextReply(agent, {

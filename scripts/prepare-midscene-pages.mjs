@@ -5,7 +5,14 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
-import { reportCases, testRunDump } from './midscene-report-evidence.mjs';
+import {
+  attemptResultCases,
+  feishuLaneProject,
+  isFeishuLaneProject,
+  reportCases,
+  selectFeishuLaneFiles,
+  testRunDump,
+} from './midscene-report-evidence.mjs';
 
 function parseArguments(argv) {
   const options = {};
@@ -78,13 +85,15 @@ function formatDuration(value) {
   return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} s`;
 }
 
-async function readYamlCases(root) {
+async function readYamlCases(root, selection) {
   const files = await findFiles(root, (name) => /\.ya?ml$/i.test(name));
   const cases = [];
-  for (const file of files.sort()) {
+  for (const file of selectFeishuLaneFiles(files.sort(), selection)) {
     const document = parseYaml(await readFile(file, 'utf8'));
     for (const testCase of document?.cases ?? []) {
-      if (typeof testCase?.name === 'string') cases.push(testCase.name);
+      if (typeof testCase?.name === 'string') {
+        cases.push({ name: testCase.name, project: feishuLaneProject(file) });
+      }
     }
   }
   return cases;
@@ -112,14 +121,17 @@ async function copyReportCandidate(candidate, { output, slug, nested = false }) 
   }));
 }
 
-async function loadProjectReport({ reportRoot, projectName, output, slug }) {
+async function loadProjectReport({ reportRoot, projectMatches, output, slug }) {
   const candidates = [];
   for (const report of await findReportFiles(reportRoot)) {
     try {
       const html = await readFile(report.file, 'utf8');
       const run = testRunDump(html);
-      if (!run?.projects?.some((project) => project.name === projectName)) continue;
-      const cases = await reportCases(run, projectName, { html, reportFile: report.file });
+      const projectNames = (run?.projects ?? [])
+        .map((project) => project.name)
+        .filter(projectMatches);
+      if (projectNames.length === 0) continue;
+      const cases = await reportCases(run, projectNames, { html, reportFile: report.file });
       if (cases.length > 0) {
         candidates.push({
           ...report,
@@ -164,11 +176,19 @@ function caseTarget(testCase) {
 
 function replayCell(testCase, videosByCase) {
   const src = videosByCase[testCase.name];
+  if (!src && testCase.status === 'success' && videosByCase[KEPT_IN_ARTIFACT]?.has(testCase.name)) {
+    return '<span class="unavailable">Passed — recording kept in the run artifact</span>';
+  }
   if (!src) return '<span class="unavailable">Not available</span>';
   return `<video controls preload="metadata" src="${escapeHtml(src)}"></video>`;
 }
 
-async function videoSources(videosDir, output) {
+// Recordings of passed cases stay in the run artifact. A full Feishu run
+// records ~1 GB, which made the Pages site too large to publish and grew the
+// gh-pages repository with every run; a replay matters for a failure.
+const KEPT_IN_ARTIFACT = Symbol('kept-in-artifact');
+
+async function videoSources(videosDir, output, publishable) {
   if (!videosDir) return {};
   const root = path.resolve(videosDir);
   let manifest;
@@ -181,8 +201,14 @@ async function videoSources(videosDir, output) {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return {};
   const sources = {};
   await mkdir(path.join(output, 'videos'), { recursive: true });
+  const kept = new Set();
+  sources[KEPT_IN_ARTIFACT] = kept;
   for (const [caseName, fileName] of Object.entries(manifest)) {
     if (typeof fileName !== 'string') continue;
+    if (!publishable(caseName)) {
+      kept.add(caseName);
+      continue;
+    }
     const base = path.basename(fileName);
     if (base !== fileName || !base.endsWith('.webm')) continue;
     const source = path.join(root, base);
@@ -220,7 +246,10 @@ function landingPage(cases, videosByCase) {
       ? `<a href="${escapeHtml(target)}"><img src="${escapeHtml(testCase.previewPath)}" alt="${escapeHtml(testCase.name)} screenshot" loading="lazy"></a>`
       : '<span class="unavailable">Not available</span>';
     const replay = replayCell(testCase, videosByCase);
-    return `<tr><td>${icon}</td><td>${name}</td><td>${escapeHtml(testCase.project)}</td><td>${escapeHtml(testCase.status)}</td><td>${formatDuration(testCase.durationMs)}</td><td>${preview}</td><td>${replay}</td></tr>`;
+    const failure = testCase.failure
+      ? `<div class="failure">${escapeHtml(testCase.failure)}</div>`
+      : '';
+    return `<tr><td>${icon}</td><td>${name}${failure}</td><td>${escapeHtml(testCase.project)}</td><td>${escapeHtml(testCase.status)}</td><td>${formatDuration(testCase.durationMs)}</td><td>${preview}</td><td>${replay}</td></tr>`;
   }).join('\n');
   return `<!doctype html>
 <html lang="en">
@@ -233,6 +262,7 @@ function landingPage(cases, videosByCase) {
     body { margin: 0; background: #0b0d13; color: #e8eaf2; }
     main { width: min(1280px, calc(100% - 40px)); margin: 48px auto; }
     .summary, .unavailable { color: #aeb4c6; }
+    .failure { margin-top: 6px; max-width: 420px; color: #ff9b9b; font-size: 13px; }
     a { color: #a99bff; }
     table { width: 100%; border-collapse: collapse; background: #131722; border: 1px solid #2b3142; }
     th, td { padding: 12px 14px; border-bottom: 1px solid #2b3142; text-align: left; vertical-align: top; }
@@ -257,20 +287,20 @@ export async function prepareMidscenePages(options) {
   const skippedCasesDir = required(options, 'skipped-cases-dir');
   const output = required(options, 'output');
   await mkdir(output, { recursive: true });
-  const videosByCase = await videoSources(options['videos-dir'], output);
 
   const cases = await loadProjectReport({
     reportRoot: dashboardReportRoot,
-    projectName: 'dashboard-smoke',
+    projectMatches: (name) => name === 'dashboard-smoke',
     output,
     slug: 'dashboard',
   });
 
-  const configuredFeishuCases = await readYamlCases(skippedCasesDir);
+  // Only the lanes this run selected; unselected lanes are not "not run".
+  const configuredFeishuCases = await readYamlCases(skippedCasesDir, options['feishu-cases'] ?? 'all');
   if (options['feishu-outcome'] === 'skipped' || !options['feishu-report-root']) {
-    cases.push(...configuredFeishuCases.map((name) => ({
+    cases.push(...configuredFeishuCases.map(({ name, project }) => ({
       name,
-      project: 'feishu-browser',
+      project,
       status: 'skipped',
       attempts: 0,
       reportPath: null,
@@ -280,17 +310,32 @@ export async function prepareMidscenePages(options) {
   } else {
     const reportedCases = await loadProjectReport({
       reportRoot: path.resolve(options['feishu-report-root']),
-      projectName: 'feishu-browser',
+      projectMatches: isFeishuLaneProject,
       output,
       slug: 'feishu',
     });
     cases.push(...reportedCases);
     const reportedNames = new Set(reportedCases.map((testCase) => testCase.name));
+    // A run killed at its time limit never writes the HTML report; recover the
+    // cases that finished from their per-attempt result files.
+    if (options['feishu-results-root']) {
+      const configuredNames = new Set(configuredFeishuCases.map(({ name }) => name));
+      for (const testCase of await attemptResultCases(
+        path.resolve(options['feishu-results-root']),
+        isFeishuLaneProject,
+      )) {
+        if (reportedNames.has(testCase.name) || !configuredNames.has(testCase.name)) continue;
+        reportedNames.add(testCase.name);
+        cases.push(testCase);
+      }
+      const order = new Map(configuredFeishuCases.map(({ name }, index) => [name, index]));
+      cases.sort((left, right) => (order.get(left.name) ?? -1) - (order.get(right.name) ?? -1));
+    }
     cases.push(...configuredFeishuCases
-      .filter((name) => !reportedNames.has(name))
-      .map((name) => ({
+      .filter(({ name }) => !reportedNames.has(name))
+      .map(({ name, project }) => ({
         name,
-        project: 'feishu-browser',
+        project,
         status: 'not-run',
         attempts: 0,
         reportPath: null,
@@ -299,6 +344,8 @@ export async function prepareMidscenePages(options) {
       })));
   }
 
+  const passed = new Set(cases.filter((testCase) => testCase.status === 'success').map((testCase) => testCase.name));
+  const videosByCase = await videoSources(options['videos-dir'], output, (name) => !passed.has(name));
   const manifest = { schemaVersion: 1, cases };
   await writeFile(path.join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   await writeFile(path.join(output, 'index.html'), landingPage(cases, videosByCase));
