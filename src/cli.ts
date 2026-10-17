@@ -308,7 +308,7 @@ import {
   orderedFooterRecipients,
   stripCodeSpans,
 } from './utils/bot-routing.js';
-import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
   crossPrincipalAsKeyword,
   crossPrincipalBotSendGate,
@@ -401,6 +401,15 @@ import {
 {
   const cfg = readGlobalConfig();
   if (cfg.lang) setDefaultLocale(cfg.lang);
+  const langFlagIdx = process.argv.findIndex(a => a === '--lang' || a.startsWith('--lang='));
+  if (langFlagIdx !== -1) {
+    const raw = process.argv[langFlagIdx].startsWith('--lang=')
+      ? process.argv[langFlagIdx].slice(7)
+      : process.argv[langFlagIdx + 1];
+    if (isLocale(raw)) {
+      setDefaultLocale(raw);
+    }
+  }
   // Wire user prompt-key overrides into t() so CLI-side prompt building (e.g.
   // `botmux skill show`, catalog rendering) honours customizations. Idempotent.
   registerPromptOverrideResolver();
@@ -1013,7 +1022,10 @@ async function pickExistingAppCredentials(
  * (`promptBotConfig` → SETUP_APP_JUST_CREATED → finishOpenPlatformSetup) 只是原样透传，
  * 所以「哪条来源算刚创建」必须在这一层锁住。生产代码没有别的调用方。
  */
-export async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
+export async function obtainCredentials(
+  rl: ReturnType<typeof createInterface>,
+  options: { isFirstStep?: boolean } = {},
+): Promise<
   | {
       ok: true;
       appId: string;
@@ -1027,23 +1039,23 @@ export async function obtainCredentials(rl: ReturnType<typeof createInterface>):
   | { ok: false; reason: 'cancelled' }
 > {
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
-  console.log('── 飞书应用 ──\n');
+  console.log(`\n${t('setup.credentials.header')}\n`);
   for (;;) {
-    const method = await pickChoice(rl, {
-      title: '飞书应用来源',
+    const method = await pickChoice(rl, () => ({
+      title: t('setup.credentials.source_title'),
       items: [
-        { label: '一次扫码创建新应用（推荐）', hint: '飞书 Web 登录后自动命名、创建应用、取凭证并完成开放平台配置' },
-        { label: '选择已有应用', hint: '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）' },
-        { label: '手动输入 AppID/Secret', hint: '已在开放平台创建好应用' },
+        { label: t('setup.credentials.one_scan'), hint: t('setup.credentials.one_scan_hint') },
+        { label: t('setup.credentials.pick_existing'), hint: t('setup.credentials.pick_existing_hint') },
+        { label: t('setup.credentials.manual'), hint: t('setup.credentials.manual_hint') },
       ],
       defaultIndex: 0,
-      footer: 'Esc 取消 setup',
-    });
+      footer: t('setup.menu.footer_cancel'),
+    }), { allowLangToggle: options.isFirstStep });
     if (method === null) return { ok: false, reason: 'cancelled' };
 
     if (method === 0) {
       const suggestedName = resolveSetupAppName(undefined, loadBotsJson().length);
-      const appName = (await ask(rl, `机器人名称 [${suggestedName}]: `)).trim() || suggestedName;
+      const appName = (await ask(rl, t('setup.credentials.bot_name_prompt', { name: suggestedName }))).trim() || suggestedName;
       const {
         createFeishuOpenPlatformApp,
         inspectCachedFeishuOpenPlatformSession,
@@ -1192,24 +1204,24 @@ export async function obtainCredentials(rl: ReturnType<typeof createInterface>):
     // 手动输入（method 2；非 TTY 下也是 0/1 失败后的直落兜底）：扫码路径已用
     // tenant_brand 自动识别；手动路径没有这个信号，兜底让用户手选租户类型
     // （决定建应用 / 运行时的域名）。
-    const brandIdx = await pickChoice(rl, {
-      title: '租户类型',
+    const brandIdx = await pickChoice(rl, () => ({
+      title: t('setup.credentials.tenant_title'),
       items: [
-        { label: '飞书（中国版）', hint: 'open.feishu.cn' },
-        { label: 'Lark（国际版）', hint: 'open.larksuite.com' },
+        { label: t('setup.credentials.tenant_feishu'), hint: 'open.feishu.cn' },
+        { label: t('setup.credentials.tenant_lark'), hint: 'open.larksuite.com' },
       ],
-      defaultIndex: 0,
-      footer: 'Esc 返回上一步',
-    });
+      defaultIndex: getDefaultLocale() === 'en' ? 1 : 0,
+      footer: t('setup.select.back_footer'),
+    }));
     if (brandIdx === null && interactive) continue; // Esc → 回「飞书应用来源」
     const brand: Brand = brandIdx === 1 ? 'lark' : 'feishu';
 
-    console.log(`\n请在浏览器打开 ${larkHosts(brand).openApi}/app 创建应用，然后回来粘 ID/Secret。\n`);
-    const appId = (await ask(rl, 'AppID (cli_xxx): ')).trim();
-    const appSecret = (await ask(rl, 'AppSecret: ')).trim();
+    console.log(`\n${t('setup.credentials.manual_url_hint', { url: larkHosts(brand).openApi })}\n`);
+    const appId = (await ask(rl, t('setup.credentials.appid_prompt'))).trim();
+    const appSecret = (await ask(rl, t('setup.credentials.appsecret_prompt'))).trim();
 
     if (!appId || !appSecret) {
-      console.log('\n❌ AppID/AppSecret 不能为空，setup 中止。');
+      console.log(`\n${t('setup.credentials.empty_abort')}`);
       return { ok: false, reason: 'cancelled' };
     }
     return { ok: true, appId, appSecret, brand };
@@ -1222,25 +1234,25 @@ export async function obtainCredentials(rl: ReturnType<typeof createInterface>):
  * setup 不允许没有 owner —— 没 owner 的配置一旦叠加 allowedChatGroups 即成权限黑洞.
  */
 async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Promise<string[]> {
-  printInputHelp('管理员 (owner)', [
-    '必填。至少一个能操作机器人的管理员，多个值用逗号分隔。',
-    '推荐格式（优先级高到低）：完整邮箱（alice@example.com）> union_id（on_xxx，跨应用稳定）> 手机号（大陆号直填 11 位，海外号带 + 区号）> open_id（ou_xxx，仅限同一应用）。',
-    '注意：邮箱必须完整，邮箱前缀（如 alice）无法解析、不接受。没有企业邮箱可用手机号。',
+  printInputHelp(t('setup.owner.title'), [
+    t('setup.owner.help_1'),
+    t('setup.owner.help_2'),
+    t('setup.owner.help_3'),
   ]);
   for (;;) {
-    const raw = (await ask(rl, '管理员 (owner): ')).trim();
+    const raw = (await ask(rl, t('setup.owner.prompt'))).trim();
     const entries = raw.split(',').map(s => s.trim()).filter(Boolean);
     if (entries.length === 0) {
-      console.log('   ❌ 必须至少指定一个管理员（不能为空）。');
+      console.log(t('setup.owner.required_err'));
       continue;
     }
     const invalid = findInvalidAllowedUserEntries(entries);
     if (invalid.length > 0) {
-      console.log(`   ❌ 以下不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id 或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
+      console.log(t('setup.owner.invalid_format_err', { invalid: invalid.join(', ') }));
       continue;
     }
     if (!hasOwnerEntry(entries)) {
-      console.log('   ❌ 至少需要一个完整邮箱、手机号、union_id 或 open_id 作为 owner。');
+      console.log(t('setup.owner.no_owner_err'));
       continue;
     }
     return entries;
@@ -1253,28 +1265,31 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
  * 顺序: 拿凭证 → tenant_access_token 验证 → 通过才返回 bot 对象. 验证失败
  * 直接返回 null, 调用方负责"不写 bots.json". Codex review 边界 #2.
  */
-async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any> | null> {
-  const creds = await obtainCredentials(rl);
+async function promptBotConfig(
+  rl: ReturnType<typeof createInterface>,
+  options: { isFirstStep?: boolean } = {},
+): Promise<Record<string, any> | null> {
+  const creds = await obtainCredentials(rl, options);
   if (!creds.ok) return null;
 
   // 凭证立刻验证. 通不过不写 bots.json.
-  console.log('\n校验凭证（取 tenant_access_token）…');
+  console.log(`\n${t('setup.credentials.validating')}`);
   const { validateCredentials } = await import('./setup/verify-permissions.js');
   const v = await validateCredentials(creds.appId, creds.appSecret, creds.brand);
   if (!v.ok) {
-    console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
-    console.log('   不写 bots.json。请重新运行 botmux setup。');
+    console.log(`\n${t('setup.credentials.invalid', { error: v.error, message: v.message })}`);
+    console.log(t('setup.credentials.retry_hint'));
     return null;
   }
-  console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
+  console.log(`${t('setup.credentials.valid')}\n`);
 
   // CLI 适配器：可搜索的级联选择器（Aiden / Forge 等分组可进入二级菜单）。
   // 非交互终端自动回退为序号 / ID 文本输入。
   // Esc = 中止 setup（不写盘）。新建流程的必答题没有"上一步"可退，绝不静默
   // 替用户选默认——扫码建出的应用可事后用「选择已有应用」找回，不会丢。
-  const selKey = await pickCliSelection(rl, { title: '选择 CLI 适配器' });
+  const selKey = await pickCliSelection(rl, { title: t('setup.cli.select_title') });
   if (selKey === null) {
-    console.log('\n已取消（Esc），setup 中止，不写任何配置。');
+    console.log(`\n${t('setup.common.cancelled_abort')}`);
     return null;
   }
   let cliId: CliId;
@@ -1287,43 +1302,43 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     cliLaunchMode = sel.cliLaunchMode;
   } catch (err: any) {
     console.log(`\n❌ ${err?.message ?? String(err)}`);
-    console.log('   不写 bots.json。请重新运行 botmux setup。');
+    console.log(t('setup.credentials.retry_hint'));
     return null;
   }
   const cliAvailability = checkCliAvailability({ cliId, wrapperCli, cliLaunchMode });
   if (!cliAvailability.available) {
-    console.log(`\n⚠️  所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}`);
-    console.log('   配置仍可继续；请在 daemon 所在机器安装或修正 PATH / CLI 路径后再启动 Bot。\n');
+    console.log(`\n${t('setup.cli.unavailable_warn', { reason: cliAvailability.reason ?? '本地启动依赖不可用' })}`);
+    console.log(t('setup.cli.unavailable_hint') + '\n');
   }
   // 新话题工作目录：两种模式二选一。旧问法只问「默认工作目录」但写的是
   // workingDir——那只是仓库选择卡片的扫描根，新话题照样弹卡，误导性强；
   // 真正「直接进目录、不弹卡」的是 defaultWorkingDir，现在显式让用户选。
   // 「固定默认目录」放首位当推荐默认：大量用户的真实诉求是"新话题直接进目录"，
   // 弹卡模式作为多仓库场景的进阶选项。
-  const dirMode = await pickChoice(rl, {
-    title: '新话题工作目录',
+  const dirMode = await pickChoice(rl, () => ({
+    title: t('setup.dir.title'),
     items: [
-      { label: '固定默认目录（推荐）', hint: '新话题直接在指定目录启动、不弹卡片' },
-      { label: '仓库选择卡片', hint: '新话题先弹卡片，从扫描到的 git 仓库中选一个再启动' },
+      { label: t('setup.dir.pinned'), hint: t('setup.dir.pinned_hint') },
+      { label: t('setup.dir.repo_picker'), hint: t('setup.dir.repo_picker_hint') },
     ],
     defaultIndex: 0,
-    footer: 'Esc 取消 setup · 之后可用 /config 或 botmux setup edit 修改',
-  });
+    footer: t('setup.cli.footer'),
+  }));
   // Esc = 中止 setup，不静默套用推荐默认（非 TTY 留空走 defaultIndex，不受影响）。
   if (dirMode === null) {
-    console.log('\n已取消（Esc），setup 中止，不写任何配置。');
+    console.log(`\n${t('setup.common.cancelled_abort')}`);
     return null;
   }
   let workingDir: string | undefined;
   let defaultWorkingDir: string | undefined;
   if (dirMode === 1) {
-    const raw = await ask(rl, '仓库扫描根目录（卡片会列出其下的 git 仓库，逗号分隔多个）[~]: ');
+    const raw = await ask(rl, t('setup.dir.scan_prompt'));
     workingDir = raw.trim() || '~';
   } else {
     // 存在性校验循环——运行时 daemon 对无效 defaultWorkingDir 只会静默回退
     // 弹卡，setup 阶段必须挡住。留空默认 ~（一定存在，回车即通过）。
     for (;;) {
-      const dir = (await ask(rl, '默认工作目录（新话题直接在此目录启动）[~]: ')).trim() || '~';
+      const dir = (await ask(rl, t('setup.dir.default_prompt'))).trim() || '~';
       if (ensureBotDefaultWorkingDirExists({ defaultWorkingDir: dir })) {
         defaultWorkingDir = dir;
         break;
@@ -1343,6 +1358,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     // 回退默认 ~，bots.json 不留多余字段。
     ...(workingDir ? { workingDir } : {}),
     ...(defaultWorkingDir ? { defaultWorkingDir } : {}),
+    ...(getDefaultLocale() === 'en' ? { lang: 'en' } : {}),
   };
   // brand 落盘：只在国际版 (lark) 时写字段，feishu 留空——保持旧 bots.json 干净，
   // 且 botBrand()/normalizeBrand() 读不到时 default 到 feishu，向后兼容。
@@ -1367,7 +1383,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
       // when that resolve is the very thing failing (cold-start race).
       bot.ownerOpenId = creds.userOpenId;
     } else {
-      console.log('⚠️  无法确认扫码人的 open_id 属于当前新应用，请手动填写 owner。');
+      console.log(t('setup.owner.scanner_unconfirmed'));
       bot.allowedUsers = await promptRequiredOwner(rl);
     }
   } else {
@@ -1425,7 +1441,7 @@ function formatBooleanValue(v: unknown, defaultValue: boolean): string {
  */
 function formatBotConfigTable(bots: any[]): string {
   if (bots.length === 0) return '';
-  const headers = ['进程名', 'App ID', 'CLI'];
+  const headers = [t('setup.table.process_name'), t('setup.table.app_id'), t('setup.table.cli')];
   const rows = bots.map((b, i) => [
     botProcessName(b, i, PM2_NAME),
     String(b?.larkAppId ?? ''),
@@ -1450,7 +1466,7 @@ async function pickBotSelection(
   title: string,
 ): Promise<number | undefined> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
+    const selected = await ask(rl, `${title} (${t('setup.edit.select_bot_prompt_hint')}): `);
     return parseBotSelection(selected, bots);
   }
   const idx = await interactiveSelect({
@@ -1459,7 +1475,7 @@ async function pickBotSelection(
       label: botProcessName(b, i, PM2_NAME),
       hint: `${b?.larkAppId ?? ''} · ${b?.cliId ?? 'claude-code'}`,
     })),
-    footer: 'Esc 返回操作菜单',
+    footer: t('setup.edit.footer_back'),
   });
   if (idx === null) return undefined;
   console.log(` ✔ ${title}: ${botProcessName(bots[idx], idx, PM2_NAME)}`);
@@ -1631,19 +1647,26 @@ function parseDotEnvToBotConfig(): Record<string, any> {
  * 失败路径 (扫码取消 / 凭证校验不通过): 不创建任何配置文件, 不动旧 .env.
  * Codex review 边界 #2: 中途失败一律不留半截 JSON.
  */
-async function writeSingleBotConfig(): Promise<boolean> {
+async function writeSingleBotConfig(options: { isFirstStep?: boolean } = {}): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const bot = await promptBotConfig(rl);
+  const bot = await promptBotConfig(rl, options);
   rl.close();
 
   if (!bot) return false;
 
   writeBotsJsonAtomic([bot]);
-  console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
+  console.log(`\n${t('setup.common.config_written', { path: BOTS_JSON_FILE })}`);
   await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot), appJustCreated: wasAppJustCreatedBySetup(bot) });
-  console.log(`下一步:`);
-  console.log(`  1. botmux start              启动 daemon`);
-  console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
+  console.log(t('setup.common.next_steps_title'));
+  console.log(t('setup.common.next_step_start'));
+  const platform = process.platform === 'darwin'
+    ? 'mac launchd'
+    : process.platform === 'linux'
+    ? 'linux user systemd'
+    : process.platform === 'win32'
+    ? 'Windows Task Scheduler'
+    : (getDefaultLocale() === 'en' ? 'not supported on current platform' : '当前平台暂不支持');
+  console.log(t('setup.common.next_step_autostart', { platform }));
   return true;
 }
 
@@ -2338,14 +2361,14 @@ async function cmdSetup(): Promise<void> {
   const hasBots = existsSync(BOTS_JSON_FILE);
   const hasEnv = existsSync(ENV_FILE);
 
-  console.log('\n🤖 botmux 配置向导\n');
-  console.log(`配置目录: ${CONFIG_DIR}`);
-  console.log(`数据目录: ${DATA_DIR}\n`);
+  console.log(`\n${t('setup.wizard.title')}\n`);
+  console.log(t('setup.wizard.config_dir', { dir: CONFIG_DIR }));
+  console.log(t('setup.wizard.data_dir', { dir: DATA_DIR }) + '\n');
 
   if (hasBots) {
     // --- Multi-bot mode (bots.json exists) ---
     const bots = loadBotsJson();
-    console.log(`已配置 ${bots.length} 个机器人：\n`);
+    console.log(t('setup.bots.count', { count: bots.length }) + '\n');
     console.log(formatBotConfigTable(bots));
     console.log('');
 
@@ -2354,188 +2377,188 @@ async function cmdSetup(): Promise<void> {
     // 「无效选择即报错退出」旧语义，避免管道输入在循环里打转。
     const interactiveMenus = process.stdin.isTTY && process.stdout.isTTY;
     for (;;) {
-    const action = await pickChoice(rl, {
-      title: '操作',
-      items: [
-        { label: '添加新机器人' },
-        { label: '编辑现有机器人' },
-        { label: '删除机器人' },
-        // 「重新配置」= 丢弃全部现有配置重建，低频且有破坏性，压轴放最后。
-        { label: '重新配置', hint: '丢弃现有配置，重建为单机器人配置' },
-      ],
-      defaultIndex: 0,
-      footer: 'Esc 退出',
-    });
-    if (action === null) {
-      rl.close();
-      console.log('\n已取消。');
-      return;
-    }
+      const action = await pickChoice(rl, () => ({
+        title: t('setup.menu.action_title'),
+        items: [
+          { label: t('setup.menu.add_bot') },
+          { label: t('setup.menu.edit_bot') },
+          { label: t('setup.menu.delete_bot') },
+          // 「重新配置」= 丢弃全部现有配置重建，低频且有破坏性，压轴放最后。
+          { label: t('setup.menu.reconfigure'), hint: t('setup.menu.reconfigure_hint') },
+        ],
+        defaultIndex: 0,
+        footer: t('setup.menu.footer_exit'),
+      }), { allowLangToggle: true });
+      if (action === null) {
+        rl.close();
+        console.log(`\n${t('setup.common.cancelled')}`);
+        return;
+      }
 
-    if (action === 3) {
-      console.log('\n── 重新配置 ──\n');
+      if (action === 3) {
+        console.log(`\n── ${t('setup.menu.reconfigure')} ──\n`);
+        const newBot = await promptBotConfig(rl);
+        rl.close();
+        if (!newBot) {
+          console.log(`\n${t('setup.common.aborted_keep_config')}`);
+          return;
+        }
+        // Codex review #1: 先 copyFileSync 备份, 再原子写新文件. 之前先 rename
+        // 旧文件再 write, 一旦 write 失败 (磁盘/权限/进程被 kill) 用户就丢了
+        // bots.json. copy 之后写失败旧文件原地不动, .bak 是无害的同名副本.
+        copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+        console.log(t('setup.common.backup_saved', { path: BOTS_JSON_FILE + '.bak' }));
+        writeBotsJsonAtomic([newBot]);
+        console.log(t('setup.common.config_written', { path: BOTS_JSON_FILE }));
+        await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
+        console.log(`${t('setup.common.next_restart')}\n`);
+        return;
+      }
+
+      if (action === 1) {
+        console.log(`\n${t('setup.edit.header')}\n`);
+        const index = await pickBotSelection(rl, bots, t('setup.edit.select_bot'));
+        if (index === undefined) {
+          if (interactiveMenus) {
+            console.log(t('setup.edit.returned_to_menu') + '\n');
+            continue;
+          }
+          rl.close();
+          console.log(`\n${t('setup.edit.no_bot_selected')}`);
+          return;
+        }
+
+        const original = bots[index];
+        let edited: Record<string, any>;
+        try {
+          edited = await promptEditBotConfig(rl, original);
+        } catch (err: any) {
+          rl.close();
+          console.log(`\n${t('setup.edit.failed', { error: err?.message ?? String(err) })}`);
+          return;
+        }
+        if (!ensureBotWorkingDirsExist(edited, '仓库扫描根目录') || !ensureBotDefaultWorkingDirExists(edited)) {
+          rl.close();
+          console.log(t('setup.edit.unmodified'));
+          return;
+        }
+        const cliAvailability = checkCliAvailability({
+          cliId: edited.cliId ?? 'claude-code',
+          cliPathOverride: edited.cliPathOverride,
+          wrapperCli: edited.wrapperCli,
+          cliLaunchMode: edited.cliLaunchMode,
+        });
+        if (!cliAvailability.available) {
+          console.log(`\n${t('setup.cli.unavailable_warn', { reason: cliAvailability.reason ?? '本地启动依赖不可用' })}`);
+          console.log(t('setup.cli.unavailable_hint') + '\n');
+        }
+
+        // 凭证字段有变化时, 像 promptBotConfig 一样跑一次 tenant_access_token
+        // 校验. 失败不写盘——避免编辑后 typo 一个字符, daemon 重启时才发现.
+        // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
+        const appIdChanged = edited.larkAppId !== original.larkAppId;
+        const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
+        if (appIdChanged || appSecretChanged) {
+          console.log(`\n${t('setup.credentials.validating')}`);
+          const { validateCredentials } = await import('./setup/verify-permissions.js');
+          const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
+          if (!v.ok) {
+            rl.close();
+            console.log(`\n${t('setup.credentials.invalid', { error: v.error, message: v.message })}`);
+            console.log(t('setup.edit.retry_hint'));
+            return;
+          }
+          console.log(`${t('setup.credentials.valid')}\n`);
+        }
+        rl.close();
+
+        const nextBots = bots.slice();
+        nextBots[index] = edited;
+        copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+        console.log(t('setup.common.backup_saved', { path: BOTS_JSON_FILE + '.bak' }));
+        writeBotsJsonAtomic(nextBots);
+        console.log(t('setup.edit.updated', { name: botProcessName(edited, index, PM2_NAME), appId: edited.larkAppId }));
+        // appId 切换 = 换了一个飞书应用, 新 appId 大概率需要重新申请权限 + 配重定向 URL.
+        // 把 printRemainingSteps 的深链端给用户, 比 README 警告里那句"历史数据不迁移"更可操作.
+        if (appIdChanged) {
+          await finishOpenPlatformSetup(edited.larkAppId, botBrand(edited));
+        }
+        console.log(`${t('setup.common.next_restart')}\n`);
+        return;
+      }
+
+      if (action === 2) {
+        console.log(`\n${t('setup.delete.header')}\n`);
+        const delIndex = await pickBotSelection(rl, bots, t('setup.delete.select_bot'));
+        if (delIndex === undefined) {
+          if (interactiveMenus) {
+            console.log(t('setup.edit.returned_to_menu') + '\n');
+            continue;
+          }
+          rl.close();
+          console.log(`\n${t('setup.delete.cancelled')}`);
+          return;
+        }
+        const nextBots = bots.slice();
+        const [removed] = nextBots.splice(delIndex, 1);
+        const confirm = (await ask(
+          rl,
+          t('setup.delete.confirm_prompt', { name: botProcessName(removed, delIndex, PM2_NAME), appId: removed.larkAppId }),
+        )).trim().toLowerCase();
+        rl.close();
+        if (confirm !== 'y' && confirm !== 'yes') {
+          console.log(`\n${t('setup.delete.cancelled')}`);
+          return;
+        }
+
+        copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+        console.log(t('setup.common.backup_saved', { path: BOTS_JSON_FILE + '.bak' }));
+        writeBotsJsonAtomic(nextBots);
+        console.log(t('setup.delete.deleted', { name: botProcessName(removed, delIndex, PM2_NAME), appId: removed.larkAppId }));
+        console.log(`${t('setup.common.next_restart')}\n`);
+        return;
+      }
+
+      console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
       const newBot = await promptBotConfig(rl);
       rl.close();
       if (!newBot) {
-        console.log('\n⚠️  setup 中止，旧配置保留不动。');
+        console.log(`\n${t('setup.common.aborted_bots_json_untouched')}`);
         return;
       }
-      // Codex review #1: 先 copyFileSync 备份, 再原子写新文件. 之前先 rename
-      // 旧文件再 write, 一旦 write 失败 (磁盘/权限/进程被 kill) 用户就丢了
-      // bots.json. copy 之后写失败旧文件原地不动, .bak 是无害的同名副本.
-      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      writeBotsJsonAtomic([newBot]);
-      console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
+      writeBotsJsonAtomic([...bots, newBot]);
+      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: bots.length + 1 })}`);
+      console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
       await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
-      console.log(`下一步: botmux restart\n`);
+      await printAddBotLiveHint(newBot.larkAppId);
       return;
-    }
-
-    if (action === 1) {
-      console.log('\n── 编辑现有机器人 ──\n');
-      const index = await pickBotSelection(rl, bots, '选择要编辑的机器人');
-      if (index === undefined) {
-        if (interactiveMenus) {
-          console.log('   已返回操作菜单。\n');
-          continue;
-        }
-        rl.close();
-        console.log('\n❌ 未选择机器人，配置未修改。');
-        return;
-      }
-
-      const original = bots[index];
-      let edited: Record<string, any>;
-      try {
-        edited = await promptEditBotConfig(rl, original);
-      } catch (err: any) {
-        rl.close();
-        console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
-        return;
-      }
-      if (!ensureBotWorkingDirsExist(edited, '仓库扫描根目录') || !ensureBotDefaultWorkingDirExists(edited)) {
-        rl.close();
-        console.log('   配置未修改。');
-        return;
-      }
-      const cliAvailability = checkCliAvailability({
-        cliId: edited.cliId ?? 'claude-code',
-        cliPathOverride: edited.cliPathOverride,
-        wrapperCli: edited.wrapperCli,
-        cliLaunchMode: edited.cliLaunchMode,
-      });
-      if (!cliAvailability.available) {
-        console.log(`\n⚠️  所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}`);
-        console.log('   配置仍会保存；请在 daemon 所在机器安装或修正 PATH / CLI 路径后再启动新会话。\n');
-      }
-
-      // 凭证字段有变化时, 像 promptBotConfig 一样跑一次 tenant_access_token
-      // 校验. 失败不写盘——避免编辑后 typo 一个字符, daemon 重启时才发现.
-      // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
-      const appIdChanged = edited.larkAppId !== original.larkAppId;
-      const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
-      if (appIdChanged || appSecretChanged) {
-        console.log('\n校验新凭证（取 tenant_access_token）…');
-        const { validateCredentials } = await import('./setup/verify-permissions.js');
-        const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
-        if (!v.ok) {
-          rl.close();
-          console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
-          console.log('   配置未修改。请重新运行 botmux setup → 编辑现有机器人。');
-          return;
-        }
-        console.log('✅ 凭证有效\n');
-      }
-      rl.close();
-
-      const nextBots = bots.slice();
-      nextBots[index] = edited;
-      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      writeBotsJsonAtomic(nextBots);
-      console.log(`✅ 已更新机器人 ${botProcessName(edited, index, PM2_NAME)} (${edited.larkAppId})`);
-      // appId 切换 = 换了一个飞书应用, 新 appId 大概率需要重新申请权限 + 配重定向 URL.
-      // 把 printRemainingSteps 的深链端给用户, 比 README 警告里那句"历史数据不迁移"更可操作.
-      if (appIdChanged) {
-        await finishOpenPlatformSetup(edited.larkAppId, botBrand(edited));
-      }
-      console.log(`下一步: botmux restart\n`);
-      return;
-    }
-
-    if (action === 2) {
-      console.log('\n── 删除机器人 ──\n');
-      const delIndex = await pickBotSelection(rl, bots, '选择要删除的机器人');
-      if (delIndex === undefined) {
-        if (interactiveMenus) {
-          console.log('   已返回操作菜单。\n');
-          continue;
-        }
-        rl.close();
-        console.log('\n❌ 未选择机器人，配置未修改。');
-        return;
-      }
-      const nextBots = bots.slice();
-      const [removed] = nextBots.splice(delIndex, 1);
-      const confirm = (await ask(
-        rl,
-        `确认删除 ${botProcessName(removed, delIndex, PM2_NAME)} (${removed.larkAppId})? (y/N): `,
-      )).trim().toLowerCase();
-      rl.close();
-      if (confirm !== 'y' && confirm !== 'yes') {
-        console.log('\n已取消，配置未修改。');
-        return;
-      }
-
-      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      writeBotsJsonAtomic(nextBots);
-      console.log(`✅ 已删除机器人 ${botProcessName(removed, delIndex, PM2_NAME)} (${removed.larkAppId})`);
-      console.log(`下一步: botmux restart\n`);
-      return;
-    }
-
-    console.log('\n── 添加新机器人 ──\n');
-    const newBot = await promptBotConfig(rl);
-    rl.close();
-    if (!newBot) {
-      console.log('\n⚠️  setup 中止，bots.json 不动。');
-      return;
-    }
-    writeBotsJsonAtomic([...bots, newBot]);
-    console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
-    console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
-    await printAddBotLiveHint(newBot.larkAppId);
-    return;
     }
 
   } else if (hasEnv) {
     // --- Single-bot mode (.env exists) ---
-    console.log(`当前使用单机器人配置: ${ENV_FILE}`);
+    console.log(t('setup.menu.single_bot_current', { file: ENV_FILE }));
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const action = await pickChoice(rl, {
-      title: '操作',
+    const action = await pickChoice(rl, () => ({
+      title: t('setup.menu.action_title'),
       items: [
-        { label: '添加新机器人', hint: '迁移 .env 到 bots.json 多机器人配置' },
-        { label: '覆盖当前配置' },
+        { label: t('setup.menu.add_bot'), hint: t('setup.menu.migrate_env_hint') },
+        { label: t('setup.menu.overwrite_env') },
       ],
       defaultIndex: 0,
-      footer: 'Esc 退出',
-    });
+      footer: t('setup.menu.footer_exit'),
+    }), { allowLangToggle: true });
     if (action === null) {
       rl.close();
-      console.log('\n已取消。');
+      console.log(`\n${t('setup.common.cancelled')}`);
       return;
     }
 
     if (action === 1) {
       rl.close();
-      const ok = await writeSingleBotConfig();
+      const ok = await writeSingleBotConfig({ isFirstStep: false });
       if (ok) {
         renameSync(ENV_FILE, ENV_FILE + '.bak');
-        console.log(`   旧 .env 已备份: ${ENV_FILE}.bak`);
+        console.log(`   ${t('setup.common.backup_saved', { path: ENV_FILE + '.bak' })}`);
       }
       return;
     }
@@ -2545,15 +2568,15 @@ async function cmdSetup(): Promise<void> {
     if (!existingBot.larkAppId || !existingBot.larkAppSecret) {
       console.log('\n⚠️  当前 .env 缺少 LARK_APP_ID 或 LARK_APP_SECRET，请先完成基础配置');
       rl.close();
-      await writeSingleBotConfig();
+      await writeSingleBotConfig({ isFirstStep: false });
       return;
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
-    console.log('\n── 添加新机器人 ──\n');
+    console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
     const newBot = await promptBotConfig(rl);
     rl.close();
     if (!newBot) {
-      console.log('\n⚠️  setup 中止，.env 和 bots.json 都不动。');
+      console.log(`\n${t('setup.common.aborted_env_untouched')}`);
       return;
     }
 
@@ -2561,14 +2584,14 @@ async function cmdSetup(): Promise<void> {
     writeBotsJsonAtomic([existingBot, newBot]);
     renameSync(ENV_FILE, ENV_FILE + '.bak');
     console.log(`\n✅ 已迁移到多机器人配置`);
-    console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
+    console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
+    console.log(`   ${t('setup.common.backup_saved', { path: ENV_FILE + '.bak' })}`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
     await printAddBotLiveHint(newBot.larkAppId);
 
   } else {
     // --- Fresh install ---
-    await writeSingleBotConfig();
+    await writeSingleBotConfig({ isFirstStep: true });
   }
 }
 
@@ -17918,9 +17941,24 @@ switch (command) {
   }
   case 'setup': {
     // 带子命令（list/add/configure/edit/remove/help）走脚本化非 TUI 模式；空参数 / 纯
-    // flag（如 --no-open-platform-auto）保持原交互 TUI，向后兼容。
+    // flag（如 --no-open-platform-auto / --lang en）保持原交互 TUI，向后兼容。
     const setupArgs = process.argv.slice(3);
-    if (isScriptedSetupInvocation(setupArgs)) await cmdSetupScripted(setupArgs);
+    const langFlagIdx = setupArgs.findIndex(a => a === '--lang' || a.startsWith('--lang='));
+    if (langFlagIdx !== -1) {
+      const raw = setupArgs[langFlagIdx].startsWith('--lang=')
+        ? setupArgs[langFlagIdx].slice(7)
+        : setupArgs[langFlagIdx + 1];
+      if (isLocale(raw)) {
+        setGlobalLocale(raw);
+        setDefaultLocale(raw);
+      }
+    }
+    const cleanSetupArgs = setupArgs.filter((a, i) => {
+      if (a === '--lang' || a.startsWith('--lang=')) return false;
+      if (i > 0 && setupArgs[i - 1] === '--lang') return false;
+      return true;
+    });
+    if (isScriptedSetupInvocation(cleanSetupArgs)) await cmdSetupScripted(setupArgs);
     else await cmdSetup();
     break;
   }

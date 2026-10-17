@@ -230,6 +230,8 @@ export interface BotConfigEditInput {
    *   - '' / '-' → 清空（回到默认 ON）
    */
   showInTeam?: string;
+  /** UI 语言：zh 或 en；'-' 或 null 清空。 */
+  lang?: string | null;
 }
 
 /**
@@ -687,6 +689,19 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
 
   // 平台团队展示默认 ON → 只把显式 false 落盘。
   applyOptionalBoolean(out, 'showInTeam', input.showInTeam, true);
+
+  if (input.lang !== undefined) {
+    if (input.lang === null || input.lang.trim() === '-') {
+      delete out.lang;
+    } else {
+      const v = input.lang.trim().toLowerCase();
+      if (v === 'zh' || v === 'en') {
+        out.lang = v;
+      } else {
+        throw new Error(`lang must be "zh" or "en": ${input.lang}`);
+      }
+    }
+  }
 
   return normalizeBotConfig(out) as T;
 }
