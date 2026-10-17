@@ -2836,7 +2836,7 @@ async function hydratePrimaryRecoveryMessage(
       && (!Array.isArray(message?.mentions) || message.mentions.length === 0)) {
     const detail = await runWithAbortDeadline(
       requestSignal => getMessageDetail(larkAppId, messageId, {
-        userCardContent: false,
+        userCardContent: true,
         timeoutMs: PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
         signal: requestSignal,
       }),

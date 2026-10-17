@@ -1767,7 +1767,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(mockGetMessageDetail).toHaveBeenCalledWith(
       MY_APP_ID,
       'om_primary_card_gap',
-      expect.objectContaining({ userCardContent: false, signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ userCardContent: true, signal: expect.any(AbortSignal) }),
     );
     expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
       eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_card_gap`,
