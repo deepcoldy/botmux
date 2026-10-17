@@ -203,7 +203,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -1735,6 +1735,72 @@ describe('Lark event dispatcher — durable primary processor', () => {
     });
     leadership.abort();
     runtime.close();
+  });
+
+  it('hydrates and canonicalizes a card mention omitted by history before recovery enqueue', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const now = Date.now();
+    mockListChats.mockResolvedValue([{ chatId: 'chat-primary', chatMode: 'group' }]);
+    mockListChatMessagesUntil.mockResolvedValue([makeHistoryMessage({
+      senderAppId: OTHER_BOT_APP_ID,
+      senderOpenBotId: OTHER_BOT_OPEN_ID,
+      senderType: 'app',
+      content: JSON.stringify({ text: '请升级至最新版本客户端，以查看内容' }),
+      messageId: 'om_primary_card_gap',
+      messageType: 'interactive',
+      chatId: 'chat-primary',
+      createTime: String(now),
+    })]);
+    mockGetMessageDetail.mockResolvedValue({
+      items: [{
+        mentions: [{ key: '@_user_1', name: '', id: MY_APP_ID, id_type: 'app_id' }],
+      }],
+    });
+    const enqueue = vi.fn(async () => ({ kind: 'inserted' as const }));
+
+    await __recoverDurablePrimaryIngressOnceForTest({
+      larkAppId: MY_APP_ID,
+      enqueue,
+      now,
+    });
+
+    expect(mockGetMessageDetail).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'om_primary_card_gap',
+      expect.objectContaining({ userCardContent: false, signal: expect.any(AbortSignal) }),
+    );
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_card_gap`,
+      data: expect.objectContaining({
+        __durableRecovery: { source: 'lark-history' },
+        message: expect.objectContaining({
+          mentions: [{ key: '@_user_1', name: '', id: { open_id: MY_OPEN_ID }, id_type: 'open_id' }],
+        }),
+      }),
+    }));
+    const recoveredData = enqueue.mock.calls[0]![0].data;
+    expect(isBotMentioned(MY_APP_ID, recoveredData.message, undefined)).toBe(true);
+  });
+
+  it('fails recovery closed when an omitted card mention cannot be hydrated', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const now = Date.now();
+    mockListChats.mockResolvedValue([{ chatId: 'chat-primary', chatMode: 'group' }]);
+    mockListChatMessagesUntil.mockResolvedValue([makeHistoryMessage({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '请升级至最新版本客户端，以查看内容' }),
+      messageId: 'om_primary_card_unavailable',
+      messageType: 'interactive',
+      chatId: 'chat-primary',
+      createTime: String(now),
+    })]);
+    mockGetMessageDetail.mockResolvedValue({ items: [] });
+
+    await expect(__recoverDurablePrimaryIngressOnceForTest({
+      larkAppId: MY_APP_ID,
+      enqueue: vi.fn(async () => ({ kind: 'inserted' as const })),
+      now,
+    })).rejects.toThrow('has no detail');
   });
 
   it('does not run the legacy listener poller in durable primary mode', async () => {

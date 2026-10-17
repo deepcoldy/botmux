@@ -19,7 +19,6 @@ interface CanonicalIdentity {
 
 interface CanonicalMention extends CanonicalIdentity {
   key?: string;
-  name?: string;
 }
 
 interface CanonicalLarkReceive {
@@ -61,9 +60,11 @@ function canonicalIdentity(value: unknown, rawIdType?: unknown): CanonicalIdenti
 function canonicalMention(value: unknown): CanonicalMention | undefined {
   const mention = record(value);
   if (!mention) return undefined;
+  // Display names are mutable presentation metadata and are inconsistently
+  // populated by message.list, message.get, and realtime delivery. Routing is
+  // bound by the placeholder key plus stable identity overlap below.
   return {
     ...(text(mention.key) ? { key: text(mention.key)! } : {}),
-    ...(text(mention.name) ? { name: text(mention.name)! } : {}),
     ...canonicalIdentity(mention.id, text(mention.id_type) ?? text(mention.idType)),
   };
 }
@@ -132,7 +133,6 @@ function mentionsCompatible(left: CanonicalMention[], right: CanonicalMention[])
   return left.every((mention, index) => {
     const other = right[index]!;
     return mention.key === other.key
-      && mention.name === other.name
       && identitiesCompatible(mention, other);
   });
 }

@@ -282,6 +282,22 @@ describe('SQLite durable coordination contract', () => {
       createdAt: 13,
     })).toEqual({ kind: 'conflict' });
     expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: {
+        ...mentioned,
+        event: {
+          ...mentioned.event,
+          message: {
+            ...mentioned.event.message,
+            mentions: [{ key: '@_user_1', name: 'Renamed User', id: { open_id: 'ou_mentioned', union_id: 'on_a' } }],
+          },
+        },
+      },
+      visibleAt: 13,
+      createdAt: 13,
+    })).toEqual({ kind: 'duplicate' });
+    expect(await store.enqueueInbox({
       eventId,
       partitionKey,
       payload: {

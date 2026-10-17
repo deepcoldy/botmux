@@ -19,7 +19,7 @@ import { commandSpec } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -2813,6 +2813,66 @@ function larkReceiveEventFromHistoryMessage(
   };
 }
 
+/**
+ * `im/v1/messages` 的列表接口会把部分 interactive 卡片压成“请升级客户端”占位，
+ * 并且可能完全省略 mentions；同一消息的单条详情仍保留 mentions。无主窗口恢复若直接
+ * 持久化列表快照，会先把一条“未 @ 本 bot”的残缺消息消费完成，随后完整 WS 副本又因
+ * payload 不同被判 conflict，最终形成一次静默丢失。
+ *
+ * 恢复扫描只为缺少 mentions 的卡片补一次权威详情；正文仍保留列表/WS 共用的简化形态，
+ * 由 claimed consumer 进入路由前再按既有 card resolver 解包，避免 REST 完整卡片与 WS
+ * 简化卡片在 durable 去重层制造另一种异文。目标 bot 的 app_id mention 同时归一到本
+ * app 已探明的 open_id，使后续 @ 路由与实时事件使用同一身份域。
+ */
+async function hydratePrimaryRecoveryMessage(
+  larkAppId: string,
+  message: any,
+  signal: AbortSignal,
+): Promise<any> {
+  const messageId = typeof message?.message_id === 'string' ? message.message_id : '';
+  const messageType = message?.message_type ?? message?.msg_type;
+  let hydrated = message;
+  if ((messageType === 'interactive' || messageType === 'nonsupport')
+      && (!Array.isArray(message?.mentions) || message.mentions.length === 0)) {
+    const detail = await runWithAbortDeadline(
+      requestSignal => getMessageDetail(larkAppId, messageId, {
+        userCardContent: false,
+        timeoutMs: PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
+        signal: requestSignal,
+      }),
+      PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
+      `primary ingress hydrate message ${messageId.substring(0, 12)}`,
+      signal,
+    );
+    const item = detail?.items?.[0];
+    if (!item) throw new Error(`primary ingress recovery message ${messageId} has no detail`);
+    hydrated = {
+      ...message,
+      ...(Array.isArray(item.mentions) ? { mentions: item.mentions } : {}),
+      ...(item.sender ? { sender: { ...(message?.sender ?? {}), ...item.sender } } : {}),
+    };
+  }
+
+  const bot = getBot(larkAppId);
+  if (!bot.botOpenId) {
+    throw new Error(`primary ingress recovery bot open_id unresolved for ${larkAppId}`);
+  }
+  if (!Array.isArray(hydrated?.mentions)) return hydrated;
+  return {
+    ...hydrated,
+    mentions: hydrated.mentions.map((mention: any) => {
+      if (mentionAppId(mention) !== larkAppId) return mention;
+      const existingId = mention?.id && typeof mention.id === 'object' ? mention.id : {};
+      const { app_id: _appId, ...otherIds } = existingId;
+      return {
+        ...mention,
+        id: { ...otherIds, open_id: bot.botOpenId },
+        id_type: 'open_id',
+      };
+    }),
+  };
+}
+
 const PRIMARY_INGRESS_RECOVERY_WINDOW_MS = Math.max(
   30_000,
   Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_WINDOW_MS) || 2 * 60_000,
@@ -2899,6 +2959,10 @@ async function recoverDurablePrimaryIngressOnce(input: {
   now?: number;
   until?: number;
 }): Promise<PrimaryIngressRecoverySummary> {
+  await ensureBotOpenId(input.larkAppId);
+  if (!getBot(input.larkAppId).botOpenId) {
+    throw new Error(`primary ingress recovery bot open_id unresolved for ${input.larkAppId}`);
+  }
   const startedAt = input.now ?? Date.now();
   const cutoff = startedAt - PRIMARY_INGRESS_RECOVERY_WINDOW_MS;
   const chats = await runWithAbortDeadline(
@@ -2945,16 +3009,17 @@ async function recoverDurablePrimaryIngressOnce(input: {
         + `inside the lookback window for chat ${chat.chatId}`,
       );
     }
-    for (const message of messages) {
+    for (const rawMessage of messages) {
       signal.throwIfAborted();
-      const messageId = typeof message?.message_id === 'string' ? message.message_id : '';
-      const createdAt = messageCreateTimeMs(message);
+      const messageId = typeof rawMessage?.message_id === 'string' ? rawMessage.message_id : '';
+      const createdAt = messageCreateTimeMs(rawMessage);
       if (!messageId || !messageId.startsWith('om_')) continue;
       if (!Number.isFinite(createdAt)) {
         throw new Error(`primary ingress recovery message ${messageId} has no create_time`);
       }
       if ((createdAt as number) < cutoff) continue;
       if (input.until !== undefined && (createdAt as number) > input.until) continue;
+      const message = await hydratePrimaryRecoveryMessage(input.larkAppId, rawMessage, signal);
       scanned += 1;
       recoveredEventIds.push(`${chat.chatId}:${messageId}`);
       const data = larkReceiveEventFromHistoryMessage(
@@ -4597,6 +4662,14 @@ export function createLarkEventDispatcherRuntime(
       // so the @ is recognized. Best-effort: on probe failure we degrade to the
       // prior behavior (the periodic heartbeat retries the probe).
       await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+
+      // Recovery rows intentionally persist the list endpoint's transport-stable
+      // card body. Best-effort resolve the full card before any listener/@
+      // routing consumes that snapshot; direct mentions were already hydrated
+      // before enqueue, so a later content lookup failure cannot erase the task.
+      if (data.__durableRecovery?.source === 'lark-history') {
+        await resolveNonsupportMessage(data, larkAppId);
+      }
 
       // Learn other bots' open_ids from @mentions in this event.
       // Lark open_id is per-app: these IDs are correct for our app context.
