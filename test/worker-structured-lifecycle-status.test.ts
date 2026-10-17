@@ -41,10 +41,13 @@ describe('worker structured-turn status wiring', () => {
     expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
     const checkpoint = functionSlice('checkpointStructuredBridgeRecovery', 'scheduledTaskAnchorsFilePath');
     expect(checkpoint).toContain('!structuredBridgeRecoveryAttempted');
-    const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 6_000);
+    const attachStart = source.indexOf('function codexBridgeAttach(');
+    const attach = source.slice(attachStart, source.indexOf('type CursorAttachMode', attachStart));
     expect(attach).toContain('!structuredBridgeRecoveryAttempted');
     expect(attach).toContain("!structuredBridgeIs('cursor')");
     expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
+    expect(attach).toContain('planBridgeTurnRecovery(restorable, rolloutSize)');
+    expect(attach).toContain('Structured bridge recovery skipped');
   });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
