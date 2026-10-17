@@ -56,6 +56,28 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
   return { ds, record, scheduler, authorizeScheduleSelfManage, scope, run: () => run({}, {}) };
 }
 
+function configureProviderActor(
+  h: ReturnType<typeof harness>,
+  action: 'update' | 'remove' | 'pause' | 'resume' | 'run' = 'remove',
+): void {
+  h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+  h.record.kind = 'direct';
+  h.record.controlOpenId = 'ou_admin';
+  h.record.controlUnionId = 'on_admin';
+  h.record.task.enabled = true;
+  h.scope.isTrustedHostIpcRequest = () => true;
+  h.scope.readJsonBody = async () => ({
+    sessionId: 's1',
+    originCapability: 'c'.repeat(64),
+    originTurnId: 'om_human',
+    action,
+    id: 'a1b2c3d4',
+    prompt: 'changed',
+    remoteRunnerSessionTool: true,
+    remoteRunnerControllerOpenId: 'ou_admin',
+  });
+}
+
 describe('managed schedule mutation route', () => {
   it('does not let a bot-authored create grant become pause authority', async () => {
     const h = harness(); h.ds.activeInteractiveTurn.caller.senderType = 'bot';
@@ -67,22 +89,7 @@ describe('managed schedule mutation route', () => {
     'lets the negotiated provider Actor %s its own direct task in the current chat',
     async action => {
       const h = harness(action);
-      h.ds.activeInteractiveTurn.caller.senderType = 'bot';
-      h.record.kind = 'direct';
-      h.record.controlOpenId = 'ou_admin';
-      h.record.controlUnionId = 'on_admin';
-      h.record.task.enabled = true;
-      h.scope.isTrustedHostIpcRequest = () => true;
-      h.scope.readJsonBody = async () => ({
-        sessionId: 's1',
-        originCapability: 'c'.repeat(64),
-        originTurnId: 'om_human',
-        action,
-        id: 'a1b2c3d4',
-        prompt: 'changed',
-        remoteRunnerSessionTool: true,
-        remoteRunnerControllerOpenId: 'ou_admin',
-      });
+      configureProviderActor(h, action);
 
       expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
       const method = { update: 'updateTask', remove: 'removeTask', pause: 'disableTask',
@@ -90,6 +97,96 @@ describe('managed schedule mutation route', () => {
       expect(h.scheduler[method]).toHaveBeenCalledOnce();
     },
   );
+
+  it('rejects a different administrator recorded as the task controller', async () => {
+    const h = harness('remove');
+    configureProviderActor(h);
+    h.record.controlOpenId = 'ou_other_admin';
+    // Keep every later guard independently satisfied: removing only the
+    // controlOpenId equality must make this test turn green and fail mutation.
+    h.record.controlUnionId = 'on_admin';
+    h.scope.getDashboardAdminOpenIds = () => ['ou_admin', 'ou_other_admin'];
+    h.scope.listChatMemberOpenIds = async () => ['ou_admin', 'ou_other_admin'];
+
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_mutation_operator_denied' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects a controller whose current union id differs from the task authority', async () => {
+    const h = harness('remove');
+    configureProviderActor(h);
+    h.record.controlUnionId = 'on_stale';
+
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_mutation_operator_denied' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects a provider controller that is not a current dashboard administrator', async () => {
+    const h = harness('remove');
+    configureProviderActor(h);
+    h.scope.getDashboardAdminOpenIds = () => [];
+
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_mutation_operator_denied' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects a provider controller that is not a current group member', async () => {
+    const h = harness('remove');
+    configureProviderActor(h);
+    h.scope.listChatMemberOpenIds = async () => [];
+
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_mutation_operator_denied' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['turn id', (h: ReturnType<typeof harness>) => {
+      h.ds.managedTurnOrigin.turnId = 'om_replaced';
+    }],
+    ['worker generation', (h: ReturnType<typeof harness>) => {
+      h.ds.workerGeneration += 1;
+    }],
+    ['origin capability', (h: ReturnType<typeof harness>) => {
+      h.ds.managedTurnOrigin.capability = 'd'.repeat(64);
+    }],
+  ] as const)('rejects a provider mutation when %s changes after async identity checks', async (_name, mutate) => {
+    const h = harness('remove');
+    configureProviderActor(h);
+    h.scope.listChatMemberOpenIds = async () => {
+      mutate(h);
+      return ['ou_admin'];
+    };
+
+    expect(await h.run()).toMatchObject({
+      status: 409,
+      value: { error: 'schedule_mutation_turn_changed' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+
+  it('does not let a provider Actor mutate a delegated task', async () => {
+    const h = harness('remove');
+    configureProviderActor(h);
+    h.record.kind = 'delegated';
+
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_mutation_operator_denied' },
+    });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
 
   it('keeps a provider Actor confined to its own controller and current chat', async () => {
     const h = harness('remove');

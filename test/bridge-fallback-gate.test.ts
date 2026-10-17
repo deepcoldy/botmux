@@ -120,6 +120,22 @@ function workerFunctionSlice(name: string, nextName: string): string {
   return source.slice(start, end);
 }
 
+describe('worker remote final identity wiring', () => {
+  it('passes the exact turn id and dispatch attempt into the fallback gate', () => {
+    const remoteFinal = workerFunctionSlice(
+      'deliverRemoteTurnFinal',
+      'deliverRemoteRunnerOutboundMessage',
+    );
+    const gateInputStart = remoteFinal.indexOf('const gateInput = {');
+    const gateInputEnd = remoteFinal.indexOf('};', gateInputStart);
+    expect(gateInputStart).toBeGreaterThanOrEqual(0);
+    expect(gateInputEnd).toBeGreaterThan(gateInputStart);
+    const gateInput = remoteFinal.slice(gateInputStart, gateInputEnd);
+    expect(gateInput).toContain('turnId,');
+    expect(gateInput).toContain('dispatchAttempt,');
+  });
+});
+
 describe('worker submit-failure retry wiring', () => {
   it('re-arms ordinary IM turns after active evidence through the bounded chain', () => {
     const schedule = workerFunctionSlice('scheduleSubmitFailureNotify', 'detectBareShellLaunch');
@@ -421,6 +437,40 @@ describe('shouldSuppressBridgeEmit', () => {
       false,
     )).toBe(true);
 
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-other',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'another turn must not borrow the marker',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'terminal-independent output is not the final answer',
+      },
+      undefined,
+      [{ ...marker, terminalIndependent: true }],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      {
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'missing worker identity must fail open to visible output',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
     expect(shouldSuppressBridgeEmit(
       {
         turnId: 'turn-headless',
