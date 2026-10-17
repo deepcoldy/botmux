@@ -417,6 +417,131 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
+  it('rejects a provider-selected schedule controller on a human-authored turn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-human-controller-'));
+    tempDirs.push(root);
+    const resultPath = join(root, 'session-tool-result.json');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'human-controller-provider', generation: 1, remoteSessionId: 'remote-human-controller-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+let activeTurnId;
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type === 'hello') {
+    emit({
+      type: 'hello', requestId: command.requestId, provider: 'human-controller-provider',
+      capabilities: ['start','resume','turn','cancel','detach','reattach','status','session_tool','session_tool_schedule','session_tool_schedule_actor'],
+    });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    activeTurnId = command.turnId;
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+    emit({
+      type: 'session_tool', operationId: 'session-tool-human-controller',
+      turnId: command.turnId, generation: 1, controllerOpenId: 'ou_developer',
+      request: { tool: 'schedule.add', schedule: '10m', prompt: 'must be rejected' },
+    });
+  } else if (command.type === 'session_tool_result') {
+    fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(command.result));
+    emit({ type: 'final', turnId: activeTurnId, content: 'controller rejection observed', state });
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_human_controller',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: {
+        expectedProvider: 'human-controller-provider',
+        requiredCapabilities: [
+          'start','resume','turn','cancel','detach','reattach','status',
+          'session_tool','session_tool_schedule','session_tool_schedule_actor',
+        ],
+      },
+    }]));
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-human-controller',
+        LARK_APP_ID: 'app_human_controller',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-human-controller',
+      chatId: 'oc_human_controller',
+      rootMessageId: 'om_human_controller',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: {
+        expectedProvider: 'human-controller-provider',
+        requiredCapabilities: [
+          'start','resume','turn','cancel','detach','reattach','status',
+          'session_tool','session_tool_schedule','session_tool_schedule_actor',
+        ],
+      },
+      prompt: 'human turn must reject provider controller',
+      turnId: 'turn-human-controller',
+      trustedCaller: {
+        requestUserOpenId: 'ou_human',
+        requestLarkAppId: 'app_human_controller',
+        senderType: 'user',
+      },
+      larkAppId: 'app_human_controller',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => existsSync(resultPath) && messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'turn-human-controller'
+        && message.status === 'completed'),
+      () => `human controller rejection did not settle\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toMatchObject({
+      outcome: 'rejected',
+      code: 'session_tool_controller_forbidden',
+    });
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'final_output',
+      turnId: 'turn-human-controller',
+      content: 'controller rejection observed',
+    }));
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
   it('passes trusted turn input, persists provider state, and projects a terminal screen', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-worker-'));
     tempDirs.push(root);

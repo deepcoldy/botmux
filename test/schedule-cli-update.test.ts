@@ -234,6 +234,26 @@ describe('schedule CLI prompt updates', () => {
     });
     expect(calls()).toBe(1);
   });
+  it('rejects legacy positional schedule input from a Remote Runner relay', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+    });
+    const before = readFileSync(f.path, 'utf8');
+    const result = await f.run([
+      'add', '10m', 'legacy positional prompt', '--topic',
+      '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('requires structured schedule/prompt values');
+    expect(requests).toHaveLength(0);
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
   it('forwards only a host-relayed Remote Runner controller to daemon authorization', async () => {
     const f = fixture(); const requests: Array<Record<string, unknown>> = [];
     await managed(f, undefined, 'om_live', requests);
