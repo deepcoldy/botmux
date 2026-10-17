@@ -76,7 +76,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
 import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -369,6 +369,7 @@ import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
+import { OrcaBackend, renderOrcaTranscriptHistory } from './adapters/backend/orca-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import {
   isCriticalInterruptKey,
@@ -5276,6 +5277,7 @@ let bridgeStalePidStateSessionId: string | undefined;
  *  the queue against the right turn, and prune the entry once no pending
  *  turn references the path anymore. */
 const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
+let orcaClaudeWebHistorySignature: string | undefined;
 let bridgeOffset = 0;
 const bridgeQueue = new BridgeTurnQueue(
   notifyTerminalTurnStarted,
@@ -6152,6 +6154,24 @@ function scheduleHerdrAdoptBridgeQuietEmit(): void {
   herdrAdoptBridgeQuietTimer.unref?.();
 }
 
+function setOrcaClaudeWebHistory(events: TranscriptEvent[]): void {
+  if (!(backend instanceof OrcaBackend) || lastInitConfig?.cliId !== 'claude-code') return;
+  const history = extractAssistantTurns(events).flatMap(turn => [
+    { kind: 'user', text: turn.userText },
+    { kind: 'assistant_final', text: turn.assistantText },
+  ]);
+  backend.setWebHistory(renderOrcaTranscriptHistory(history));
+}
+
+function refreshOrcaClaudeWebHistory(): void {
+  if (!(backend instanceof OrcaBackend) || !bridgeJsonlPath) return;
+  const paths = [...new Set([...bridgeSecondaryPaths.keys(), bridgeJsonlPath])];
+  const signature = transcriptFilesSignature(paths);
+  if (signature === orcaClaudeWebHistorySignature) return;
+  orcaClaudeWebHistorySignature = signature;
+  setOrcaClaudeWebHistory(paths.flatMap(path => drainTranscript(path, 0).events));
+}
+
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
   // The transcript file exists (or just appeared): this CLI session HAS
@@ -6180,6 +6200,7 @@ function bridgeAbsorbBaseline(): void {
   bridgeOffset = result.newOffset;
   bridgeQueue.absorb(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
+  setOrcaClaudeWebHistory(result.events);
   bridgeBaselineDone = true;
   // After absorb (uuids registered as seen so they won't re-emit as a Lark
   // turn), surface the last completed user/assistant exchange to Lark as a
@@ -7134,6 +7155,7 @@ function stopBridgeWatcher(): void {
   bridgeKnownSessionIds.clear();
   bridgeStalePidStateSessionId = undefined;
   bridgeSecondaryPaths.clear();
+  orcaClaudeWebHistorySignature = undefined;
   bridgeFingerprintScanLastMs.clear();
   // Attribution belongs to the CLI generation whose transcript we watched.
   // A fresh backend must not inherit a terminal/fingerprint from the exited
@@ -7240,6 +7262,7 @@ function bridgeDrainAndMaybeEmit(): void {
   if (!bridgeJsonlPath) return;
   bridgeIngest();
   emitReadyTurns();
+  refreshOrcaClaudeWebHistory();
   // Prune AFTER emit so a path is only retired once its turn has actually
   // been published. During non-idle ticks (fs.watch / 1s poll) we never
   // emit, so we never prune — the path stays put until idle resolves it.
@@ -7962,6 +7985,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     if (journalPath) {
       codexAdoptRecoveryAttempted = true;
       structuredBridgeRecoveryAttempted = true;
+    }
+    if (backend instanceof OrcaBackend) {
+      backend.setWebHistory(renderOrcaTranscriptHistory([...history, ...live]));
     }
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
@@ -8811,6 +8837,9 @@ function codexBridgeIngest(opts: {
     maybeEmitCodexStructuredRateLimit(codexSubagentLimitTracker.poll());
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
+  if (backend instanceof OrcaBackend) {
+    backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
+  }
   codexBridgeQueue.ingest(result.events);
   if (cliAdapter?.postTerminalPromptFence === true) {
     const turns = codexBridgeQueue.peek();
@@ -10257,28 +10286,29 @@ async function writeAdoptMessage(
   //     journal (a transparent pass-through on every non-ZMX backend).
   //   - raw sendText+Enter runs inside the same transaction for identical
   //     commit-journal atomicity.
+  // Refuse before prepareAdoptWrite marks the turn: this is a proven non-write,
+  // not an ambiguous submission. Orca refreshes draft state synchronously here
+  // so the first 700ms screen-poll window cannot append onto a local draft.
+  const composerConflict = adoptComposerConflict(adoptBackend);
+  if (composerConflict) {
+    log(`Refused ${lastInitConfig?.adoptSource ?? 'external'} adopt input: ${composerConflict}`);
+    scheduleSubmitFailureNotify(
+      content,
+      undefined,
+      t('worker.transcriptLabel'),
+      undefined,
+      composerConflict,
+      turnSeq,
+      { turnId, dispatchAttempt },
+      'failed',
+    );
+    return 'completed';
+  }
+
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
     const submissionBackend = adoptBackend;
     let recoveryFailureReason: string | undefined;
     let deliveryQuarantine: InputDeliveryQuarantine | null = null;
-    // Refuse adopt input while the local composer still holds an unsubmitted
-    // human draft, BEFORE any bridge attribution or terminal write — otherwise
-    // the Lark message would be appended onto the human's half-typed line.
-    const composerConflict = codexAdoptComposerConflict(submissionBackend);
-    if (composerConflict) {
-      log('Refused Codex adopt input because the local composer contains an unsubmitted draft');
-      scheduleSubmitFailureNotify(
-        content,
-        undefined,
-        t('worker.transcriptLabel'),
-        undefined,
-        composerConflict,
-        turnSeq,
-        { turnId, dispatchAttempt },
-        'failed',
-      );
-      return 'completed';
-    }
     try {
       const transaction = await runAmbiguousSubmissionTransaction(
         submissionBackend,
@@ -12220,7 +12250,13 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
-function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
+function adoptComposerConflict(target: SessionBackend): string | undefined {
+  if (target instanceof OrcaBackend) {
+    const state = target.inspectDraftSync();
+    if (state === 'draft') return t('worker.orca_composer_conflict');
+    if (state === 'unknown') return t('worker.orca_composer_check_failed');
+    return undefined;
+  }
   if (lastInitConfig?.cliId !== 'codex' || !lastInitConfig.adoptMode) return undefined;
   const state = detectCodexComposerState(target.captureInputState?.());
   if (state !== 'draft') return undefined;
@@ -15845,6 +15881,50 @@ async function spawnCli(
     }
   }
   // ── Adopt mode: observe the user's existing terminal backend (no attach) ──
+  if (cfg.adoptMode && cfg.adoptSource === 'orca' && cfg.adoptOrcaIdentity) {
+    isTmuxMode = true;
+    isPipeMode = true;
+    const orcaBe = new OrcaBackend(
+      cfg.adoptOrcaIdentity,
+      cfg.cliId === 'traex',
+      cfg.adoptOrcaSizeVerified === true,
+    );
+    effectiveBackendType = 'orca';
+    backend = orcaBe;
+    cliLifetimeNonce++;
+    if (cfg.adoptCliPid) orcaBe.cliPid = cfg.adoptCliPid;
+    orcaBe.cliCwd = cfg.adoptCwd ?? cfg.workingDir;
+    orcaBe.onPaneSizeChange((size) => {
+      const frame = `\x1b]1989;scaled;${size.cols};${size.rows}\x07`;
+      for (const client of wsClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(frame);
+      }
+    });
+    orcaBe.spawn('', [], {
+      cwd: cfg.workingDir,
+      cols: cfg.adoptPaneCols ?? PTY_COLS,
+      rows: cfg.adoptPaneRows ?? PTY_ROWS,
+      env: process.env as Record<string, string>,
+    });
+
+    setupAdoptTranscriptBridges(cfg);
+    setupAdoptInputAdapter(cfg);
+    setupAdoptIdleDetection(cfg, 'orca');
+    backend.onData(onPtyData);
+    backend.onExit((code, signal) => {
+      log(`Adopted Orca terminal ended (code: ${code}, signal: ${signal})`);
+      backend = null;
+      isPromptReady = false;
+      stopBridgeWatcher();
+      send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+    });
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();
+    publishLocalProcessAttestation(cfg.adoptCliPid);
+    log(`Adopt mode (orca): observing ${cfg.adoptOrcaIdentity.terminalHandle}`);
+    return;
+  }
+
   if (cfg.adoptMode && cfg.adoptSource === 'herdr' && cfg.adoptHerdrSessionName && (cfg.adoptHerdrPaneId || cfg.adoptHerdrTarget)) {
     isTmuxMode = false;
     isPipeMode = true;
@@ -21677,7 +21757,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         if (lastInitConfig?.adoptMode && isObserveBackend(backend)) {
           const sz = (backend as ObserveBackend).getPaneSize();
           if (sz && sz.cols > 0 && sz.rows > 0) {
-            const pin = `\x1b]1989;${sz.cols};${sz.rows}\x07`;
+            const sizeMode = backend instanceof OrcaBackend && backend.hasAuthoritativePaneSize()
+              ? 'scaled;'
+              : '';
+            const pin = `\x1b]1989;${sizeMode}${sz.cols};${sz.rows}\x07`;
             ws.send(pin);
             adoptWebGridPins.set(ws, pin);
           }
@@ -21689,14 +21772,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           const sz = backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows };
           ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
-        const seed = usesHerdrSnapshotWebHistory() && scrollback.length > 0
-          ? scrollback
-          : chooseWebTerminalSeed({
-            canCapture: isPipeMode && isObserveBackend(backend),
-            capture: () => (backend as ObserveBackend).captureCurrentScreen(),
-            scrollback,
-            onError: log,
-          });
+        const seed = backend instanceof OrcaBackend
+          ? backend.captureWebHistory()
+          : usesHerdrSnapshotWebHistory() && scrollback.length > 0
+            ? scrollback
+            : chooseWebTerminalSeed({
+              canCapture: isPipeMode && isObserveBackend(backend),
+              capture: () => (backend as ObserveBackend).captureCurrentScreen(),
+              scrollback,
+              onError: log,
+            });
         // A capture-pane seed carries screen cells but no DECSET state: a fresh
         // client xterm never learns the CLI enabled mouse tracking (grok build:
         // 1003+1006), so clicks/double-clicks are silently swallowed instead of
@@ -22641,6 +22726,17 @@ if(typeof ResizeObserver!=='undefined'){
       try{_wbApplyAutoFontSize()}catch(ex){}
       try{fit.fit()}catch(ex){}
       _lastC=_lastR=0;sendResize();
+    }
+    // Orca supplies a text snapshot at the source grid. A scaled frame is the
+    // plain fixed-grid pin with an attested geometry: resize to the source grid
+    // FIRST, then let the generic fitter size the font for that grid.
+    var _sf=data.match(/\\x1b\\]1989;scaled;(\\d+);(\\d+)\\x07/);
+    if(_sf){
+      var _sc=+_sf[1],_sr=+_sf[2];
+      _setFixedGrid(true);
+      if(_sc>0&&_sr>0){try{term.resize(_sc,_sr)}catch(ex){}}
+      try{_wbApplyAutoFontSize()}catch(ex){}
+      _lastC=_sc;_lastR=_sr;data=data.replace(_sf[0],'');
     }
     // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).

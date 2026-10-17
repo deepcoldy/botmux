@@ -9,7 +9,7 @@ import type {
   RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner' | 'orca';
 
 export interface BackendTurnInput {
   content: string;
@@ -387,6 +387,8 @@ export interface ObserveBackend extends SessionBackend {
   captureViewport(): string;
   /** Live pane dimensions, or null if the pane is gone. */
   getPaneSize(): { cols: number; rows: number } | null;
+  /** Notify viewers when an external pane changes geometry after attach. */
+  onPaneSizeChange?(cb: (size: { cols: number; rows: number }) => void): void;
   /** Cheap liveness probe. */
   isPaneAlive(): boolean;
   /**

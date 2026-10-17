@@ -8,7 +8,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 describe('Codex adopt composer collision guard wiring', () => {
   it('checks the adopted pane before bridge attribution and terminal input', () => {
     const worker = readFileSync(join(repoRoot, 'src/worker.ts'), 'utf8');
-    const adoptBranch = worker.indexOf('const composerConflict = codexAdoptComposerConflict(submissionBackend);');
+    const adoptBranch = worker.indexOf('const composerConflict = adoptComposerConflict(adoptBackend);');
     const bridgePreparation = worker.indexOf('prepareAdoptWrite,', adoptBranch);
     const adapterWrite = worker.indexOf('cliAdapter!.writeInput(', adoptBranch);
 

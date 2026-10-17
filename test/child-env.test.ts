@@ -484,6 +484,7 @@ describe('scrubInvokerTerminalEnv()', () => {
       LANG: 'en_US.UTF-8',
       SSH_AUTH_SOCK: '/tmp/agent.sock',
       HTTPS_PROXY: 'http://proxy:8080',
+      ORCA_REMOTE_CLI_BIN_DIR: '/home/me/.orca-relay/bin',
     };
 
     scrubInvokerTerminalEnv(env);
@@ -496,6 +497,9 @@ describe('scrubInvokerTerminalEnv()', () => {
     expect(env.LANG).toBe('en_US.UTF-8');
     expect(env.SSH_AUTH_SOCK).toBe('/tmp/agent.sock');
     expect(env.HTTPS_PROXY).toBe('http://proxy:8080');
+    // Machine-local bridge discovery survives; only one terminal's relay
+    // connection is transient and must be rediscovered through the wrapper.
+    expect(env.ORCA_REMOTE_CLI_BIN_DIR).toBe('/home/me/.orca-relay/bin');
   });
 
   it('pins the observed agent-shell fingerprints that turned the fleet colorless', () => {
@@ -509,6 +513,18 @@ describe('scrubInvokerTerminalEnv()', () => {
     // TERMINFO_DIRS is machine-level terminfo search-path config on
     // NixOS/custom-ncurses hosts, not an invoker fingerprint — never scrub it.
     expect(INVOKER_TERMINAL_ENV_KEYS).not.toContain('TERMINFO_DIRS');
+  });
+
+  it('removes stale Orca relay pointers without removing the bridge location', () => {
+    for (const key of [
+      'ORCA_RELAY_DIR',
+      'ORCA_RELAY_SOCKET_PATH',
+      'ORCA_RELAY_CREDENTIAL_FILE',
+      'ORCA_RELAY_NODE_PATH',
+    ]) {
+      expect(INVOKER_TERMINAL_ENV_KEYS).toContain(key);
+    }
+    expect(INVOKER_TERMINAL_ENV_KEYS).not.toContain('ORCA_REMOTE_CLI_BIN_DIR');
   });
 });
 

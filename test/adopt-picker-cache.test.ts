@@ -8,6 +8,7 @@ import { describe, it, expect, vi } from 'vitest';
 const discovery = vi.hoisted(() => ({
   tmux: vi.fn(() => []),
   zellij: vi.fn(() => []),
+  orca: vi.fn(() => []),
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({
@@ -17,6 +18,10 @@ vi.mock('../src/core/session-discovery.js', () => ({
 
 vi.mock('../src/core/zellij-adopt-discovery.js', () => ({
   discoverAdoptableZellijSessions: discovery.zellij,
+}));
+
+vi.mock('../src/core/orca-adopt-discovery.js', () => ({
+  discoverAdoptableOrcaSessions: discovery.orca,
 }));
 
 import {
@@ -62,6 +67,7 @@ describe('adopt-picker candidates cache', () => {
   it('passes the bot effective executable to both live discovery backends', async () => {
     discovery.tmux.mockClear();
     discovery.zellij.mockClear();
+    discovery.orca.mockClear();
     const discoverResumable = vi.fn(async () => []);
 
     await collectAdoptCandidates(
@@ -75,6 +81,7 @@ describe('adopt-picker candidates cache', () => {
 
     expect(discovery.tmux).toHaveBeenCalledWith('codex', '/opt/Vendor Codex/vendorCodex');
     expect(discovery.zellij).toHaveBeenCalledWith('codex', '/opt/Vendor Codex/vendorCodex');
+    expect(discovery.orca).toHaveBeenCalledWith('codex', '/opt/Vendor Codex/vendorCodex');
     expect(discoverResumable).toHaveBeenCalledWith(
       'codex',
       '/opt/Vendor Codex/vendorCodex',

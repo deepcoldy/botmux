@@ -11,7 +11,7 @@ import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/her
 
 const { Terminal } = xtermHeadless;
 
-export type PersistentBackendType = Exclude<BackendType, 'pty'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
 
 export interface HerdrExternalTarget {
   sessionName: string;

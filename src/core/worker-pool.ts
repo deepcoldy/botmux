@@ -19868,7 +19868,13 @@ export function forkAdoptWorker(
   // message; this is that path's delivery boundary for group background.
   const adoptPrompt = { content: opts?.prompt ?? '' };
   commitGroupContextDispatch(ds, adoptPrompt, opts?.turnId);
-  const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
+  const adoptBackendType = adopted.source === 'orca'
+    ? 'orca'
+    : adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
+  const adoptHasUsefulPid = adoptedCliId === 'claude-code'
+    || isStructuredBridge
+    || !!adopted.zellijPaneId
+    || adopted.source === 'orca';
 
   if (!ds.session.terminalCardEpoch) {
     ds.session.terminalCardEpoch = randomUUID();
@@ -19930,9 +19936,8 @@ export function forkAdoptWorker(
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    // Zellij adopt targets carry zellijSession+zellijPaneId (observe via
-    // dump-screen / drive via action); tmux carries tmuxTarget (pipe-pane).
-    // The worker's adopt branch picks the backend from whichever is present.
+    // Each adopt source carries its own stable identity. The worker selects the
+    // matching observe backend from adoptSource and those source-specific fields.
     backendType: adoptBackendType,
     adoptMode: true,
     envPolicy: botCfg.envPolicy,
@@ -19943,18 +19948,26 @@ export function forkAdoptWorker(
     adoptHerdrPaneId: adopted.herdrPaneId,
     adoptZellijSession: adopted.zellijSession,
     adoptZellijPaneId: adopted.zellijPaneId,
+    adoptOrcaIdentity: adopted.source === 'orca' ? {
+      terminalHandle: adopted.orcaTerminalHandle!,
+      ptyId: adopted.orcaPtyId,
+      incarnationId: adopted.orcaIncarnationId,
+      executionHostId: adopted.orcaExecutionHostId,
+      worktreeId: adopted.orcaWorktreeId!,
+      agentIdentity: adopted.orcaAgentIdentity!,
+      instance: adopted.orcaInstance ?? 'relay',
+    } : undefined,
+    adoptOrcaSizeVerified: adopted.orcaPaneSizeVerified === true,
     adoptPaneCols: adopted.paneCols,
     adoptPaneRows: adopted.paneRows,
     bridgeJsonlPath,
     // PID + cwd: claude uses for `~/.claude/sessions/<pid>.json` resolver;
     // codex uses for `/proc/<pid>/fd` rollout discovery (works even if
     // session-discovery couldn't probe sessionId up-front). zellij adopt ALSO
-    // needs the pid unconditionally: ZellijObserveBackend's liveness watches
-    // the CLI pid (process.kill(pid,0)) so the worker onExit's when a user-typed
-    // CLI exits back to a shell — without it, aiden/gemini/opencode/hermes would
-    // fall back to pane-only liveness and keep routing input into the shell.
-    adoptCliPid: hasCliPid && (adoptedCliId === 'claude-code' || isStructuredBridge || !!adopted.zellijPaneId) ? adopted.originalCliPid : undefined,
-    adoptCwd: hasCliPid && (adoptedCliId === 'claude-code' || isStructuredBridge || !!adopted.zellijPaneId) ? adopted.cwd : undefined,
+    // needs the pid unconditionally: Zellij watches it for liveness, while Orca
+    // uses a relay- or daemon-attested local PID for transcript binding.
+    adoptCliPid: hasCliPid && adoptHasUsefulPid ? adopted.originalCliPid : undefined,
+    adoptCwd: hasCliPid && adoptHasUsefulPid ? adopted.cwd : undefined,
     // Restored-from-metadata: this fork is recreating an /adopt session after
     // a daemon restart, NOT a fresh /adopt command. The Lark thread already
     // has every prior turn pushed as cards, so the worker should skip the
@@ -20004,7 +20017,7 @@ export function forkAdoptWorker(
   } catch (err) {
     logger.error(`[${t}] Failed to persist adopt worker pid: ${err instanceof Error ? err.message : String(err)}`);
   }
-  logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`})`);
+  logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.orcaTerminalHandle ?? adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`})`);
 
   ds.exitEventEmitted = false;
   try {
