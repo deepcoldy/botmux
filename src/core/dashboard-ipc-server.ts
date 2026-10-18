@@ -145,6 +145,7 @@ import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TUR
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
+import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
@@ -388,6 +389,31 @@ export function setDurableSessionSendHandler(
   handler: ((request: DurableSessionSendRequest) => Promise<DurableSessionSendResult>) | null,
 ): void {
   durableSessionSendHandler = handler;
+}
+
+export interface DurableSessionLifecycleRequest {
+  sessionId: string;
+  action: 'close' | 'resume';
+}
+
+export type DurableSessionLifecycleResult =
+  | { ok: true; outcome: 'closed' | 'active'; alreadyClosed?: boolean }
+  | {
+      ok: true;
+      outcome: 'closed_with_residual';
+      residual: { reason?: string; taskId?: string };
+      alreadyClosed?: boolean;
+    }
+  | { ok: false; error: string };
+
+let durableSessionLifecycleHandler: ((
+  request: DurableSessionLifecycleRequest,
+) => Promise<DurableSessionLifecycleResult>) | null = null;
+
+export function setDurableSessionLifecycleHandler(
+  handler: ((request: DurableSessionLifecycleRequest) => Promise<DurableSessionLifecycleResult>) | null,
+): void {
+  durableSessionLifecycleHandler = handler;
 }
 import {
   composeRowFromActive,
@@ -1761,6 +1787,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (coordinationModeIsPrimary()) {
+    // 副本本地 close 可能已经返回成功，但 PostgreSQL primary 行仍是 active。
+    // 只有通过鉴权的宿主/Dashboard 请求可以进入持久 lifecycle lane；
+    // 会话内 capability 不能据此获得 trusted-host 权限。
+    if (!isTrustedHostIpcRequest(req)) {
+      return jsonRes(res, 409, { ok: false, error: 'durable_primary_requires_host_control' });
+    }
+    if (!durableSessionLifecycleHandler) {
+      return jsonRes(res, 503, { ok: false, error: 'durable_primary_unavailable' });
+    }
+    try {
+      const result = await durableSessionLifecycleHandler({
+        sessionId: params.sessionId,
+        action: 'close',
+      });
+      return jsonRes(res, result.ok ? 200 : 409, result);
+    } catch (error) {
+      return jsonRes(res, 503, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
   const initial = findSessionRecord(params.sessionId);
   const initiallyClosed = initial?.status === 'closed';
   let codexArchiveReleaseTicket: CodexCleanupReleaseTicket | undefined;

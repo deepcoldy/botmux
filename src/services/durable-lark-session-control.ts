@@ -8,6 +8,7 @@ import {
 export const DURABLE_LARK_SESSION_CONTROL_VERSION = 1 as const;
 
 export type DurableLarkSessionControlAction = 'close' | 'resume';
+export type DurableSessionControlSource = 'lark-card' | 'lark-command' | 'trusted-host';
 
 export interface DurableLarkSessionControlEnvelope {
   version: typeof DURABLE_LARK_SESSION_CONTROL_VERSION;
@@ -17,6 +18,8 @@ export interface DurableLarkSessionControlEnvelope {
 }
 
 export interface DurableLarkSessionControlClaim {
+  /** 仅旧内存测试夹具允许缺省；正常解析出的 claim 始终携带来源。 */
+  source?: DurableSessionControlSource;
   operationId: string;
   partitionKey: string;
   larkAppId: string;
@@ -27,6 +30,19 @@ export interface DurableLarkSessionControlClaim {
   cardMessageId: string;
   attempts: number;
   data: DurableJson;
+}
+
+interface DurableDirectSessionControlEnvelope {
+  version: typeof DURABLE_LARK_SESSION_CONTROL_VERSION;
+  type: 'botmux.session.control';
+  source: Exclude<DurableSessionControlSource, 'lark-card'>;
+  larkAppId: string;
+  operationId: string;
+  action: DurableLarkSessionControlAction;
+  sessionId: string;
+  rootId: string;
+  operatorOpenId: string;
+  cardMessageId: string;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -151,6 +167,124 @@ export function durableLarkSessionControlEvent(input: {
   return event;
 }
 
+/**
+ * 构造不是由卡片点击产生的持久化生命周期请求。
+ *
+ * `lark-command` 会在 control consumer 中按真人发送者重新鉴权；
+ * `trusted-host` 只能在 daemon IPC HMAC 门禁之后创建，并使用非飞书审计主体。
+ */
+export function durableDirectSessionControlEvent(input: {
+  source: Exclude<DurableSessionControlSource, 'lark-card'>;
+  larkAppId: string;
+  operationId: string;
+  action: DurableLarkSessionControlAction;
+  sessionId: string;
+  rootId: string;
+  operatorOpenId?: string;
+  cardMessageId?: string;
+  now?: number;
+}): DurableInboxEvent {
+  const now = input.now ?? Date.now();
+  if (!Number.isSafeInteger(now) || now < 0) {
+    throw new Error('durable session control timestamp is invalid');
+  }
+  const larkAppId = bounded(input.larkAppId, 'larkAppId', 256);
+  if (!larkAppId.startsWith('cli_')) {
+    throw new Error('durable session control application is invalid');
+  }
+  const operationId = bounded(input.operationId, 'operationId', 1_024);
+  const sessionId = bounded(input.sessionId, 'sessionId', 256);
+  const rootId = bounded(input.rootId, 'rootId', 512);
+  if (!rootId.startsWith('om_') && !rootId.startsWith('oc_')) {
+    throw new Error('durable session control root identity is invalid');
+  }
+  const operatorOpenId = input.source === 'trusted-host'
+    ? 'trusted-host'
+    : bounded(input.operatorOpenId, 'operatorOpenId', 256);
+  if (input.source === 'lark-command' && !operatorOpenId.startsWith('ou_')) {
+    throw new Error('durable session control operator identity is invalid');
+  }
+  const cardMessageId = input.cardMessageId
+    ? bounded(input.cardMessageId, 'cardMessageId', 256)
+    : 'none';
+  const payload: DurableDirectSessionControlEnvelope = {
+    version: DURABLE_LARK_SESSION_CONTROL_VERSION,
+    type: 'botmux.session.control',
+    source: input.source,
+    larkAppId,
+    operationId,
+    action: input.action,
+    sessionId,
+    rootId,
+    operatorOpenId,
+    cardMessageId,
+  };
+  const event: DurableInboxEvent = {
+    eventId: operationId,
+    lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+    partitionKey: durableLarkSessionControlPartition(larkAppId, sessionId),
+    payload: payload as unknown as DurableJson,
+    visibleAt: now,
+    createdAt: now,
+  };
+  parseDurableSessionControlClaim({
+    event,
+    workerId: 'ingress-validation',
+    claimEpoch: 1,
+    claimUntil: now + 1,
+    attempts: 1,
+  });
+  return event;
+}
+
+/** 同时解析飞书卡片控制和已经鉴权的直接控制请求。 */
+export function parseDurableSessionControlClaim(
+  claim: InboxClaim,
+): DurableLarkSessionControlClaim {
+  const payload = record(claim.event.payload);
+  if (payload?.type !== 'botmux.session.control') {
+    return parseDurableLarkSessionControlClaim(claim);
+  }
+  if (claim.event.lane !== DURABLE_INBOX_LANE_SESSION_CONTROL
+      || payload.version !== DURABLE_LARK_SESSION_CONTROL_VERSION) {
+    throw new Error(`durable session control ${claim.event.eventId} has an invalid envelope`);
+  }
+  const source = payload.source;
+  if (source !== 'lark-command' && source !== 'trusted-host') {
+    throw new Error(`durable session control ${claim.event.eventId} has an invalid source`);
+  }
+  const larkAppId = bounded(payload.larkAppId, 'larkAppId', 256);
+  const operationId = bounded(payload.operationId, 'operationId', 1_024);
+  const action = payload.action;
+  if (!larkAppId.startsWith('cli_') || (action !== 'close' && action !== 'resume')) {
+    throw new Error(`durable session control ${claim.event.eventId} has an invalid identity`);
+  }
+  const sessionId = bounded(payload.sessionId, 'sessionId', 256);
+  const rootId = bounded(payload.rootId, 'rootId', 512);
+  const operatorOpenId = bounded(payload.operatorOpenId, 'operatorOpenId', 256);
+  const cardMessageId = bounded(payload.cardMessageId, 'cardMessageId', 256);
+  if ((!rootId.startsWith('om_') && !rootId.startsWith('oc_'))
+      || (source === 'lark-command' && !operatorOpenId.startsWith('ou_'))
+      || (source === 'trusted-host' && operatorOpenId !== 'trusted-host')
+      || claim.event.eventId !== operationId
+      || claim.event.partitionKey !== durableLarkSessionControlPartition(larkAppId, sessionId)) {
+    throw new Error(`durable session control ${claim.event.eventId} has a mismatched identity`);
+  }
+  return {
+    source,
+    operationId,
+    partitionKey: claim.event.partitionKey,
+    larkAppId,
+    action,
+    sessionId,
+    rootId,
+    operatorOpenId,
+    cardMessageId,
+    attempts: claim.attempts,
+    data: payload as unknown as DurableJson,
+  };
+}
+
 export function parseDurableLarkSessionControlClaim(
   claim: InboxClaim,
 ): DurableLarkSessionControlClaim {
@@ -171,6 +305,7 @@ export function parseDurableLarkSessionControlClaim(
     throw new Error(`durable session control ${claim.event.eventId} has a mismatched identity`);
   }
   return {
+    source: 'lark-card',
     operationId: claim.event.eventId,
     partitionKey: claim.event.partitionKey,
     larkAppId,

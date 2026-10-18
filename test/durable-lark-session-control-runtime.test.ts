@@ -10,10 +10,12 @@ import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-c
 import { createDurableSessionFacade } from '../src/services/durable-session-facade.js';
 import { createDurableSessionControlDispatch } from '../src/services/durable-session-control-dispatch.js';
 import {
+  durableDirectSessionControlEvent,
   durableLarkSessionControlEvent,
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
   parseDurableLarkSessionControlClaim,
+  parseDurableSessionControlClaim,
 } from '../src/services/durable-lark-session-control.js';
 import { createDurableLarkSessionControlRuntime } from '../src/services/durable-lark-session-control-runtime.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
@@ -75,11 +77,139 @@ function control(action: 'close' | 'resume' = 'close') {
   return { data, claim, control: parseDurableLarkSessionControlClaim(claim) };
 }
 
+function directControl(source: 'lark-command' | 'trusted-host', action: 'close' | 'resume' = 'close') {
+  const event = durableDirectSessionControlEvent({
+    source,
+    larkAppId: 'cli_test',
+    operationId: `${source}.session-control:cli_test:session-1:1:${action}`,
+    action,
+    sessionId: 'session-1',
+    rootId: 'om_root',
+    ...(source === 'lark-command' ? { operatorOpenId: 'ou_operator' } : {}),
+    cardMessageId: 'om_card',
+    now: 2,
+  });
+  const claim: InboxClaim = {
+    event,
+    workerId: 'control-worker',
+    claimEpoch: 1,
+    claimUntil: 60_000,
+    attempts: 1,
+  };
+  return { claim, control: parseDurableSessionControlClaim(claim) };
+}
+
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 describe('durable Lark session control runtime', () => {
+  it('closes a never-started canonical remote Session from trusted host state', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-unstarted-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const canonical = session({
+      remoteBackendState: {
+        version: 1,
+        provider: 'tae-traex',
+        generation: 0,
+        providerState: { sessionKey: 'bmx1-never-started' },
+      },
+    });
+    let persisted: Session | undefined;
+    await admitDurableLarkSession({ facade, message: message(), session: canonical });
+    const materializeClosedSession = vi.fn((value: Session) => {
+      persisted = structuredClone(value);
+      return persisted;
+    });
+    const closeSession = vi.fn();
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => persisted ? [persisted] : [],
+      getPersistedSession: () => persisted,
+      materializeClosedSession,
+      takeOverActiveSession: vi.fn(async () => {
+        throw new Error('must not take over an unstarted remote Session');
+      }),
+      canOperate: () => false,
+      closeSession,
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: error => error,
+      now: () => 20,
+    });
+    const input = directControl('trusted-host');
+    const dispatch = createDurableSessionControlDispatch({
+      store,
+      sessionOwnerId: facade.ownerId,
+      resolve: runtime.resolve,
+    });
+
+    await expect(dispatch(input.control, {
+      claim: input.claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'settled' });
+    expect(materializeClosedSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+      status: 'closed',
+      closedAt: new Date(20).toISOString(),
+    }));
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(parseDurablePrimarySessionRecord((await store.readSession('om_root::cli_test'))!))
+      .toMatchObject({
+        session: { status: 'closed' },
+        controls: [{ source: 'trusted-host', action: 'close' }],
+      });
+    await facade.stop();
+  });
+
+  it('re-authorizes typed Lark controls but trusts the HMAC-gated host source', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-source-auth-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    const current = session();
+    await admitDurableLarkSession({ facade, message: message(), session: current });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [current],
+      getPersistedSession: () => current,
+      materializeClosedSession: value => value,
+      canOperate: () => false,
+      closeSession: vi.fn(),
+      resumeSession: async () => ({ ok: false, error: 'not_closed' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      closeResidualText: () => 'residual',
+      closeRefusedText: () => 'refused',
+      resumeRefusedText: error => error,
+    });
+
+    await expect(runtime.resolve(directControl('lark-command').control, {
+      claim: directControl('lark-command').claim,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ kind: 'ignored', reason: 'operator is not allowed to control this Session' });
+    await expect(runtime.resolve(directControl('trusted-host').control, {
+      claim: directControl('trusted-host').claim,
+      signal: new AbortController().signal,
+    })).rejects.toThrow(/could not be taken over/);
+    await facade.stop();
+  });
+
   it('closes one owned Session, commits canonical state, and enqueues an idempotent card update', async () => {
     let now = 10;
     const dir = mkdtempSync(join(tmpdir(), 'botmux-control-runtime-'));

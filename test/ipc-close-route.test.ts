@@ -3,6 +3,7 @@
 // caller may only close the exact live session whose rotating capability it owns.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  setDurableSessionLifecycleHandler,
   setIpcAuthSecret,
   startIpcServer,
   type IpcServerHandle,
@@ -14,11 +15,15 @@ import * as sessionStore from '../src/services/session-store.js';
 const CAP = 'c0ffee12'.repeat(8);
 const HOST_SECRET = 'test-ipc-close-host-secret';
 let handle: IpcServerHandle | null = null;
+const ORIGINAL_COORDINATION_MODE = process.env.BOTMUX_COORDINATION_MODE;
 
 afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
+  setDurableSessionLifecycleHandler(null);
+  if (ORIGINAL_COORDINATION_MODE === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+  else process.env.BOTMUX_COORDINATION_MODE = ORIGINAL_COORDINATION_MODE;
   vi.restoreAllMocks();
 });
 
@@ -56,6 +61,50 @@ async function postClose(sessionId: string, opts: {
 }
 
 describe('POST /api/sessions/:sessionId/close', () => {
+  it('routes a trusted-host close through durable lifecycle control in primary mode', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-primary' },
+      larkAppId: 'app-1',
+    } as any);
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+    const durableClose = vi.fn(async () => ({
+      ok: true as const,
+      outcome: 'closed' as const,
+    }));
+    setDurableSessionLifecycleHandler(durableClose);
+
+    const res = await postClose('s-primary', {
+      auth: 'signed',
+      authRequired: true,
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed' });
+    expect(durableClose).toHaveBeenCalledWith({ sessionId: 's-primary', action: 'close' });
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not let an in-session capability mint trusted-host primary control', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-primary-cap' },
+      managedTurnOrigin: { capability: CAP },
+      larkAppId: 'app-1',
+    } as any);
+    const durableClose = vi.fn();
+    setDurableSessionLifecycleHandler(durableClose);
+
+    const res = await postClose('s-primary-cap', { authRequired: true });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'durable_primary_requires_host_control',
+    });
+    expect(durableClose).not.toHaveBeenCalled();
+  });
+
   it('accepts the exact live session capability and delegates to canonical closeSession', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-close' },

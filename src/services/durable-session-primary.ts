@@ -55,6 +55,7 @@ export interface DurablePrimarySessionControl {
   sessionId: string;
   operatorOpenId: string;
   cardMessageId: string;
+  source?: 'lark-command' | 'trusted-host';
   result: DurableJson;
 }
 
@@ -165,6 +166,9 @@ function parseControl(
     sessionId: boundedText(raw.sessionId, 'durable control sessionId', 256),
     operatorOpenId: boundedText(raw.operatorOpenId, 'durable control operatorOpenId', 256),
     cardMessageId: boundedText(raw.cardMessageId, 'durable control cardMessageId', 256),
+    ...(raw.source === 'lark-command' || raw.source === 'trusted-host'
+      ? { source: raw.source }
+      : {}),
     result: JSON.parse(JSON.stringify(result)) as DurableJson,
   };
 }
@@ -335,6 +339,9 @@ export async function commitDurableLarkSessionControl(input: {
     sessionId: input.control.sessionId,
     operatorOpenId: boundedText(input.control.operatorOpenId, 'durable control operatorOpenId', 256),
     cardMessageId: boundedText(input.control.cardMessageId, 'durable control cardMessageId', 256),
+    ...(input.control.source === 'lark-command' || input.control.source === 'trusted-host'
+      ? { source: input.control.source }
+      : {}),
     result: JSON.parse(JSON.stringify(input.result)) as DurableJson,
   };
   const sessionValue = cloneSession(input.session);

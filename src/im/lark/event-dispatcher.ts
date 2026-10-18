@@ -90,7 +90,7 @@ import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-r
 import { readBotsInfoJson } from '../../services/bots-info-cache.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
-import type { DurableInboxStore } from '../../services/durable-coordination.js';
+import type { DurableInboxEvent, DurableInboxStore } from '../../services/durable-coordination.js';
 import {
   enqueueDurableLarkMessage,
   type DurableLarkMessageEventType,
@@ -2604,6 +2604,8 @@ export interface RoutingContext {
   ingressAdmission?: { admitted: boolean };
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
+  /** Durable-primary only: queue one lifecycle control after Session admission. */
+  queuePostAdmissionControl?: (event: DurableInboxEvent) => void;
 }
 
 interface PendingForwardTopicPayload {
@@ -5679,6 +5681,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionOutput: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionOutput,
+                queuePostAdmissionControl: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).queuePostAdmissionControl,
               }
             : {}
         ),

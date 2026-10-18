@@ -128,8 +128,12 @@ import {
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
+import { requestDurableSessionControl } from './services/durable-session-control-request.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
-import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
+import {
+  durableDirectSessionControlEvent,
+  durableLarkSessionControlPartitionPrefix,
+} from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -198,6 +202,7 @@ import type { DaemonToWorker, LarkAttachment, LarkMessage } from './types.js';
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
   setDurableSessionSendHandler(null);
+  setDurableSessionLifecycleHandler(null);
 }
 
 interface ScheduleRunLogErrorDetails {
@@ -360,7 +365,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -27439,6 +27444,30 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
+      // durable-primary 下，精确的文字 `/close` 本身也是一条持久化 ingress 事件。
+      // 此处不改副本本地 Session：先提交本消息的 active 快照，再追加独立的
+      // owner-routed control；provider 回收与 canonical closed 提交都由该 control
+      // 负责，当前副本消失后仍可恢复。`/close wt` 暂时保留原确认流程，等待
+      // worktree retirement 接入同一套分布式协议。
+      if (cmd === '/close'
+          && commandContent.trim().toLowerCase() === '/close'
+          && existingDs
+          && senderOpenId
+          && ctx.queuePostAdmissionControl) {
+        const sessionId = existingDs.session.sessionId;
+        ctx.queuePostAdmissionControl(durableDirectSessionControlEvent({
+          source: 'lark-command',
+          larkAppId,
+          operationId: `lark-command.session-control:${larkAppId}:${parsed.messageId}`,
+          action: 'close',
+          sessionId,
+          rootId: storedSessionAnchorId(existingDs.session),
+          operatorOpenId: senderOpenId,
+          cardMessageId: existingDs.streamCardId ?? existingDs.session.streamCardId,
+        }));
+        markIngressAdmitted(ctx);
+        return true;
+      }
       // First message of a fresh thread carrying a session-needing daemon command
       // — e.g. another bot dispatched `/repo <path>` into a brand-new thread.
       // Without a session, handleCommand gets ds=undefined and `/repo` (and other
@@ -30553,6 +30582,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       },
     }));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
+    setDurableSessionLifecycleHandler(async request => {
+      const local = findActiveBySessionId(request.sessionId)?.session
+        ?? sessionStore.getOwnedSession(request.sessionId);
+      if (!local?.larkAppId) {
+        return { ok: false, error: 'durable_session_not_found' };
+      }
+      const runtime = durablePrimaryRuntimeByApp.get(local.larkAppId);
+      if (!runtime) return { ok: false, error: 'durable_primary_unavailable' };
+      const canonicalKey = sessionKey(storedSessionAnchorId(local), local.larkAppId);
+      return requestDurableSessionControl({
+        store: durableCoordinationRuntime.store,
+        request: {
+          larkAppId: local.larkAppId,
+          sessionKey: canonicalKey,
+          sessionId: request.sessionId,
+          action: request.action,
+        },
+      });
+    });
   } else {
     useOrdinaryOutputDelivery();
   }
@@ -31415,6 +31463,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
+    setDurableSessionLifecycleHandler(null);
     await durableInboxShadowConsumer?.stop(remainingBudget());
     const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
     if (durableSessionStop?.kind === 'timed_out') {
@@ -31486,6 +31535,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
+    setDurableSessionLifecycleHandler(null);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
