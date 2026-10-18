@@ -178,7 +178,7 @@ import {
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -188,7 +188,12 @@ import {
 } from './core/dashboard-url.js';
 import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/workbench-shell.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
-import { coordinationModeIsPrimary } from './services/durable-coordination-runtime.js';
+import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  runDurableConfigMutation,
+  setDurableConfigCoordinator,
+} from './services/durable-config-mutation.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import type { WorkspaceMetadata } from './core/workspace-metadata.js';
@@ -1353,7 +1358,11 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
   const persistedBotNames = readPersistedBotNames();
   return {
     readCatalog: readVcMeetingSharedConsumerCatalogSnapshot,
-    updateCatalog: updateVcMeetingSharedConsumerCatalog,
+    updateCatalog: input => runDurableConfigMutation({
+      scope: 'global',
+      path: globalConfigPath(),
+      mutation: async () => updateVcMeetingSharedConsumerCatalog(input),
+    }),
     loadBotConfigs,
     effectiveDefaultWorkingDir,
     onlineBotName: appId => registry.getByAppId(appId)?.botName ?? persistedBotNames.get(appId),
@@ -1685,19 +1694,23 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
   let changed = false;
   try {
     const path = requireConfigPath();
-    await withFileLock(path, async () => {
-      const raw = await readRawConfig(path);
-      const idx = findEntryIndex(raw, targetAppId);
-      if (idx < 0) throw new Error('bot_not_in_config');
-      const entry = raw[idx] as Record<string, unknown>;
-      const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
-      if (next.larkCliProfile) return;
-      next.larkCliProfile = targetAppId;
-      compactVcMeetingAgentEntry(entry, next);
-      // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
-      parseBotConfigsFromText(JSON.stringify(raw));
-      await writeRawConfigAtomic(path, raw);
-      changed = true;
+    await runDurableConfigMutation({
+      scope: 'bots',
+      path,
+      mutation: () => withFileLock(path, async () => {
+        const raw = await readRawConfig(path);
+        const idx = findEntryIndex(raw, targetAppId);
+        if (idx < 0) throw new Error('bot_not_in_config');
+        const entry = raw[idx] as Record<string, unknown>;
+        const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+        if (next.larkCliProfile) return;
+        next.larkCliProfile = targetAppId;
+        compactVcMeetingAgentEntry(entry, next);
+        // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
+        parseBotConfigsFromText(JSON.stringify(raw));
+        await writeRawConfigAtomic(path, raw);
+        changed = true;
+      }),
     });
   } catch (err: any) {
     return { ok: false, error: `vcMeetingBot_preflight_config_write_failed: ${err?.message ?? err}` };
@@ -1796,6 +1809,22 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // Single shared deps object for `applySettingsWrite` — both the browser
 // `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
 // route call through this so error codes / merge semantics stay identical.
+const dashboardCoordinationRuntime = coordinationModeIsPrimary()
+  ? await initializeDurableCoordinationRuntime({
+      ...process.env,
+      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
+      // narrow config-CAS provider must not race those reporters on one path.
+      BOTMUX_COORDINATION_HEALTH_FILE: '',
+    }, { allowPrimary: true })
+  : undefined;
+const dashboardConfigCoordinator = dashboardCoordinationRuntime?.mode === 'primary'
+  ? createDurableConfigCoordinator({
+      store: dashboardCoordinationRuntime.store,
+      ownerId: `config-dashboard:${process.pid}:${randomBytes(12).toString('hex')}`,
+    })
+  : undefined;
+setDurableConfigCoordinator(dashboardConfigCoordinator);
+
 async function reloadLocaleOnAllDaemons(): Promise<void> {
   await Promise.all(registry.list().map(d =>
     fetchDaemonIpc(d.ipcPort, '/api/locale/reload', { method: 'POST' }).catch(() => undefined),
@@ -1815,6 +1844,14 @@ const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(
 );
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
+settingsWriteApplierDeps.runConfigMutation = mutation => runDurableConfigMutation({
+  scope: 'global',
+  path: globalConfigPath(),
+  mutation: async () => {
+    invalidateGlobalConfigCache();
+    return mutation();
+  },
+});
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
@@ -2575,10 +2612,17 @@ function pluginPinnedPatch(body: unknown): boolean | null {
   return typeof pinned === 'boolean' ? pinned : null;
 }
 
-function writeDashboardPluginPin(pluginId: string, pinned: boolean): void {
-  const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
-  const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
-  mergeDashboardConfig({ pinnedPlugins: next });
+async function writeDashboardPluginPin(pluginId: string, pinned: boolean): Promise<void> {
+  await runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: async () => {
+      invalidateGlobalConfigCache();
+      const current = normalizePluginIdList(readGlobalConfig().dashboard?.pinnedPlugins) ?? [];
+      const next = pinned ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+      mergeDashboardConfig({ pinnedPlugins: next });
+    },
+  });
 }
 
 function requireInstalledPlugin(pluginId: string): InstalledPluginRecord | null {
@@ -2678,35 +2722,46 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
   return { plugins, globalPlugins, bots, gatewayAdapters };
 }
 
-function writeGlobalPluginBinding(pluginId: string, enabled: boolean): void {
-  const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-  assertPluginBindingTransition(pluginId, enabled, current);
-  if (enabled) materializePlugin(pluginId);
-  const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
-  mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Promise<void> {
+  await runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: async () => {
+      invalidateGlobalConfigCache();
+      const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+      assertPluginBindingTransition(pluginId, enabled, current);
+      if (enabled) materializePlugin(pluginId);
+      const next = enabled ? addPluginId(current, pluginId) : removePluginId(current, pluginId);
+      mergeGlobalConfig({ plugins: next.length > 0 ? next : null });
+    },
+  });
 }
 
 async function writeBotPluginBinding(pluginId: string, larkAppId: string, enabled: boolean): Promise<boolean> {
   try { loadBotConfigs(); } catch { return false; }
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-  return withFileLock(path, async () => {
-    const raw = await readRawConfig(path);
-    const index = findEntryIndex(raw, larkAppId);
-    if (index < 0) return false;
-    const entry = raw[index];
-    const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
-    const effective = resolveEffectivePluginIds(
-      { plugins: normalizePluginIdList(current) ?? [] },
-      { plugins: defaults },
-    );
-    assertPluginBindingTransition(pluginId, enabled, effective);
-    if (enabled) materializePlugin(pluginId);
-    const next = updateBotPluginOverride(current, pluginId, enabled);
-    if (next.length > 0) entry.plugins = next;
-    else delete entry.plugins;
-    await writeRawConfigAtomic(path, raw);
-    return true;
+  return runDurableConfigMutation({
+    scope: 'bots',
+    path,
+    mutation: () => withFileLock(path, async () => {
+      const raw = await readRawConfig(path);
+      const index = findEntryIndex(raw, larkAppId);
+      if (index < 0) return false;
+      const entry = raw[index];
+      const current = Object.prototype.hasOwnProperty.call(entry, 'plugins') ? entry.plugins : undefined;
+      const effective = resolveEffectivePluginIds(
+        { plugins: normalizePluginIdList(current) ?? [] },
+        { plugins: defaults },
+      );
+      assertPluginBindingTransition(pluginId, enabled, effective);
+      if (enabled) materializePlugin(pluginId);
+      const next = updateBotPluginOverride(current, pluginId, enabled);
+      if (next.length > 0) entry.plugins = next;
+      else delete entry.plugins;
+      await writeRawConfigAtomic(path, raw);
+      return true;
+    }),
   });
 }
 
@@ -2750,7 +2805,7 @@ async function handlePluginManagementApi(
     try { body = await readJsonBody(req); } catch { return pluginJson(res, 400, { ok: false, error: 'bad_json' }); }
     const pinned = pluginPinnedPatch(body);
     if (pinned === null) return pluginJson(res, 400, { ok: false, error: 'invalid_pinned' });
-    writeDashboardPluginPin(pluginId, pinned);
+    await writeDashboardPluginPin(pluginId, pinned);
     return pluginJson(res, 200, { ok: true, ...(await listDashboardPluginsPayload()) });
   }
 
@@ -2764,7 +2819,7 @@ async function handlePluginManagementApi(
     const enabled = pluginEnabledPatch(body);
     if (enabled === null) return pluginJson(res, 400, { ok: false, error: 'invalid_enabled' });
     try {
-      writeGlobalPluginBinding(pluginId, enabled);
+      await writeGlobalPluginBinding(pluginId, enabled);
     } catch (error) {
       const message = describePluginDependencyError(error);
       if (message) return pluginJson(res, 409, { ok: false, error: message });
@@ -5413,8 +5468,15 @@ const server = createServer(async (req, res) => {
         }
         patch.delivery = delivery;
       }
-      const currentSkills = readGlobalConfig().skills ?? {};
-      mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
+      await runDurableConfigMutation({
+        scope: 'global',
+        path: globalConfigPath(),
+        mutation: async () => {
+          invalidateGlobalConfigCache();
+          const currentSkills = readGlobalConfig().skills ?? {};
+          mergeGlobalConfig({ skills: { ...currentSkills, ...patch } });
+        },
+      });
       return jsonRes(res, 200, { ok: true, ...dashboardSkillsPayload() });
     }
 
@@ -8083,10 +8145,17 @@ function shutdown(): void {
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
   feedbackAnalyticsService?.close();
+  setDurableConfigCoordinator(undefined);
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
-  server.close(() => process.exit(gracefulProcessExitCode()));
+  server.close(() => {
+    void dashboardCoordinationRuntime?.close()
+      .catch(error => logger.warn(`[durable-config] provider close failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => process.exit(gracefulProcessExitCode()));
+    if (!dashboardCoordinationRuntime) process.exit(gracefulProcessExitCode());
+  });
   // Hard-exit fallback after 5s
   setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+process.on('exit', () => dashboardCoordinationRuntime?.terminate());

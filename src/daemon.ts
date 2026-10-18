@@ -26,6 +26,7 @@ import {
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
 import {
+  globalConfigPath,
   readGlobalConfig,
   repoPickerScanOptions,
   isMultiTopicOrchestrationEnabled,
@@ -135,6 +136,11 @@ import {
   readDurableGroupContextRecalls,
   recordDurableGroupContextRecall,
 } from './services/durable-group-context-recall.js';
+import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  runDurableConfigMutation,
+  setDurableConfigCoordinator,
+} from './services/durable-config-mutation.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import {
   durableDirectSessionControlEvent,
@@ -28595,6 +28601,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ownerId: `group-context-recall:${getDaemonBootId()}`,
       })
     : undefined;
+  const durableConfigCoordinator = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableConfigCoordinator({
+        store: durableCoordinationRuntime.store,
+        ownerId: `config-daemon:${getDaemonBootId()}`,
+      })
+    : undefined;
+  setDurableConfigCoordinator(durableConfigCoordinator);
   durableSessionShadowFacade = durableSessionFacade;
   const durableInboxShadowConsumer = durableCoordinationRuntime?.mode === 'shadow'
     ? startDurableInboxShadowConsumer({
@@ -28895,7 +28908,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     scheduleAuthorityStore = null;
     scheduler.setScheduleAuthorityUnavailable(error);
   }
-  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
+  void runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: () => migrateOverloadAlertAtStartup(
+      botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })),
+    ),
+  }).catch(error => logger.warn(
+    `[durable-config] overload alert migration skipped: ${error instanceof Error ? error.message : String(error)}`,
+  ));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
@@ -31522,6 +31543,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
     setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
     await durableInboxShadowConsumer?.stop(remainingBudget());
     const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
     if (durableSessionStop?.kind === 'timed_out') {
@@ -31603,6 +31625,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
     setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
