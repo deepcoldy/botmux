@@ -2880,11 +2880,12 @@ function isRunnerDeliveryCli(cliId?: string): boolean {
  *  brief asks the worker to `botmux report --dispatch-root`, which reaches the
  *  dispatcher's own session outside this topic. Addressing the dispatcher in
  *  this topic instead starts a fresh dispatcher session with no context (#1887). */
-function topicReportsToDispatcher(ds: DaemonSession): boolean {
+function topicReportsToDispatcher(ds: DaemonSession, dispatchRoot: string | undefined = ds.session.rootMessageId): boolean {
+  if (!dispatchRoot) return false;
   try {
     const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
     return resolveVerifiedDispatchReportTarget({
-      registry, dispatchRoot: ds.session.rootMessageId,
+      registry, dispatchRoot,
       secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     }).ok;
   } catch {
@@ -19151,10 +19152,19 @@ function deliverFinalOutput(
         : msg.userText;
       const renderedAssistantText = await prepareAdoptedReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
       if (!isStillOwned()) { onComplete?.(false); return; }
+      const zeroPromptDispatchRoot = frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
+        : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
+          : ds.session.rootMessageId;
+      // In a dispatched topic a bot initiator is the dispatcher: the automatic
+      // report below returns the result to its own session, so no @ here.
+      const reportInsteadOfAt = zeroPromptReply && initiator?.isBot === true
+        && topicReportsToDispatcher(ds, zeroPromptDispatchRoot);
       const recipientOpenId = managedReceiver
         ? undefined
         : imOrigin?.replyTargetSenderOpenId
-          ?? (zeroPromptReply ? initiator?.openId : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
+          ?? (zeroPromptReply
+            ? (reportInsteadOfAt ? undefined : initiator?.openId)
+            : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
       // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
       // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
       // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
@@ -19468,17 +19478,15 @@ function deliverFinalOutput(
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       if (!managedReceiver && (!msg.kind || msg.kind === 'bridge')
-        && sessionPromptInjection(ds) === 'none' && !(initiator?.isBot && !explicit)) {
+        && sessionPromptInjection(ds) === 'none' && !(initiator?.isBot && !explicit && !reportInsteadOfAt)) {
         // A real @ already returns this result to the initiating bot. Do not
         // also inject an HTTP report and make it process the same result twice.
+        // In a dispatched topic that @ was dropped above, so the report is the path.
         // Reporting is a separate sink. Its bounded retries must not resend
         // the already-delivered card or delay this sub-session's settlement.
         const report = cb.onZeroPromptFinal;
         const input = {
-          turnId: msg.turnId, content: safeAssistantText,
-          dispatchRoot: frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
-            : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
-              : ds.session.rootMessageId,
+          turnId: msg.turnId, content: safeAssistantText, dispatchRoot: zeroPromptDispatchRoot,
         };
         if (report) void Promise.resolve().then(() => report(ds, input)).catch(error => {
           logger.warn(`[${t}] Automatic dispatch report failed (turn ${msg.turnId}): ${error}`);

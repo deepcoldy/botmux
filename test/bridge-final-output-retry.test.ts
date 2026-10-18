@@ -58,6 +58,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildSessionCard: vi.fn(() => '{}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
+  buildTurnFailedCard: vi.fn((opts: { mentionOpenId?: string }) => JSON.stringify({ turnFailed: true, mentionOpenId: opts.mentionOpenId })),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
 
@@ -2847,6 +2848,79 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       const card = String(sessionReply.mock.calls[0][1]);
       expect(card).toContain('<at id=ou_admin_human></at>');
       expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('addresses the ambiguous-terminal failure card to the bot admin, not the dispatcher', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_card');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = dispatchedRunnerDs('dsh');
+      ds.adoptedFrom = undefined;
+      const { __testOnly_setupWorkerHandlers } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'turn-1', status: 'ambiguous' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(sessionReply.mock.calls[0][1]))).toEqual({ turnFailed: true, mentionOpenId: 'ou_admin_human' });
+    });
+
+    it('lets a zero-prompt CLI report to the dispatcher instead of @-ing it', async () => {
+      await bindTopicToDispatcher();
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
+    });
+
+    it('falls back to the bot admin for a failed zero-prompt turn in a dispatched topic', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_notice');
+      initWorkerPool({ sessionReply, onZeroPromptFinal: vi.fn(async () => {}), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      const card = String(sessionReply.mock.calls[0][1]);
+      expect(card).toContain('<at id=ou_admin_human></at>');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('keeps the zero-prompt @ and skips the report when the topic binding does not verify', async () => {
+      await bindTopicToDispatcher(true);
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_dispatcher_bot></at>');
+      expect(onZeroPromptFinal).not.toHaveBeenCalled();
     });
 
     it('keeps addressing the dispatcher when the topic binding does not verify', async () => {
