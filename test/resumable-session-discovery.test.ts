@@ -935,6 +935,47 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([]);
     });
 
+    it('keeps an external session whose first response_item is clean even if a later turn pastes an envelope', async () => {
+      // The weak verdict belongs to the FIRST real response_item (same as
+      // Codex); a later botmux-shaped paste must not hide the session.
+      writeRollout('2026/10/17', 'rollout-traex-weak-paste.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-weak-paste', cwd: '/root/traex' } },
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'review my prompt template' }] } },
+        botmuxResponseItem,
+      ]);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-weak-paste', title: 'review my prompt template' }),
+      ]);
+    });
+
+    it('lets a clean canonical record override a botmux first response_item', async () => {
+      writeRollout('2026/10/17', 'rollout-traex-weak-canonical-clean.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-weak-canonical-clean', cwd: '/root/traex' } },
+        botmuxResponseItem,
+        { type: 'history_mutation', payload: { operation: 'append', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'the real first prompt' }] },
+        ] } },
+      ]);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-weak-canonical-clean', title: 'the real first prompt' }),
+      ]);
+    });
+
+    it('lets a botmux canonical record override a clean first response_item', async () => {
+      writeRollout('2026/10/17', 'rollout-traex-weak-canonical-botmux.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-weak-canonical-botmux', cwd: '/root/traex' } },
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'runtime injection that looks clean' }] } },
+        { type: 'history_mutation', payload: { operation: 'append', items: [{
+          type: 'message', role: 'user',
+          content: [{ type: 'input_text', text: '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>' }],
+        }] } },
+      ]);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([]);
+    });
+
     it('drops the session when a native title exists but the only user turn is botmux', async () => {
       writeRollout('2026/10/17', 'rollout-traex-weak-native.jsonl', [
         { type: 'session_meta', payload: { id: 'traex-weak-native', cwd: '/root/traex' } },

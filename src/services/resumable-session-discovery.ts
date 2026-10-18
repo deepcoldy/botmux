@@ -585,9 +585,12 @@ async function parseRolloutTranscript(
     fallbackTitle: string;
     weakTitle: string;
     botmux: boolean;
-    weakBotmux: boolean;
+    /** TraeX: the first non-synthetic response_item already fixed the weak
+     *  origin/title; later response_items must not re-decide it. */
+    weakDecided: boolean;
   } = {
-    id: null, cwd: null, title: '', fallbackTitle: '', weakTitle: '', botmux: false, weakBotmux: false,
+    id: null, cwd: null, title: '', fallbackTitle: '', weakTitle: '', botmux: false,
+    weakDecided: false,
   };
   let excluded = false;
   let nativeMetadata: RolloutSessionMetadata | undefined;
@@ -638,28 +641,32 @@ async function parseRolloutTranscript(
       const text = rolloutResponseItemText(payload);
       if (!text) return; // empty / non-text content — not a title candidate
       if (isSyntheticPreamble(text)) return; // startup preamble, not a user turn
-      if (isBotmuxInjected(text)) {
-        if (options.dialect !== 'traex') {
-          acc.botmux = true;
-          return true;
-        }
-        acc.weakBotmux = true;
-      } else if (!acc.weakTitle) {
-        acc.weakTitle = truncateTitle(text);
+      if (options.dialect === 'traex') {
+        // TraeX keeps scanning for a canonical record (which overrides this
+        // weak verdict), but the weak verdict itself is the FIRST real
+        // response_item's, same as Codex: an external session that later
+        // pastes a botmux-shaped prompt must stay listed. A botmux first turn
+        // leaves no weak title, so unless a canonical record supplies a clean
+        // prompt the session has no real user turn and is dropped below.
+        if (acc.weakDecided || isTraexContextReminder(text)) return;
+        acc.weakDecided = true;
+        if (!isBotmuxInjected(text)) acc.weakTitle = truncateTitle(text);
+        return;
       }
+      if (isBotmuxInjected(text)) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (!acc.weakTitle) acc.weakTitle = truncateTitle(text);
       // 新格式（>=0.147）rollout 没有 event_msg/user_message，acc.title 永远
       // 为空：不含 fallbackTitle 会扫满 MAX_HEAD_LINES_PER_FILE。首个真实用户
       // 回合即定 origin（与 legacy 路径「id+cwd+title 齐即停扫」一致）；混合
       // 格式文件中 legacy 条目按时间序在前，acc.title 会先命中早退，不受影响。
-      if (options.dialect !== 'traex' && acc.id && acc.cwd && acc.weakTitle) return true;
+      if (acc.id && acc.cwd && acc.weakTitle) return true;
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
   const inferredTitle = acc.title || acc.fallbackTitle || acc.weakTitle;
-  const botmux = acc.botmux || (!acc.title && !acc.fallbackTitle && acc.weakBotmux);
   // No real user turn → nothing was origin-checked (and nothing to resume): a
   // native title alone must not admit the session.
-  if (excluded || botmux || !acc.id || !acc.cwd || !inferredTitle) return null;
+  if (excluded || acc.botmux || !acc.id || !acc.cwd || !inferredTitle) return null;
   const title = truncateTitle(nativeMetadata?.title ?? inferredTitle) || inferredTitle;
   return {
     cliSessionId: acc.id,
