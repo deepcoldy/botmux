@@ -1,6 +1,7 @@
 import {
   __testOnly_durablePrimaryWorkerAdmission,
   __testOnly_handleDocComment,
+  __testOnly_recordDurablePrimaryInputCommit,
 } from '../src/daemon.js';
 import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
 /**
@@ -394,6 +395,55 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.failedIdleTurnId).toBeUndefined();
     expect(ds.silentIdleTurnId).toBeUndefined();
     expect(ds.completedIdleTurnId).toBeUndefined();
+  });
+
+  it('reforks a dead durable-primary worker and waits for provider submission proof', async () => {
+    const anchor = 'om_thread_primary_dead_worker';
+    const turnId = 'om_primary_after_worker_exit';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.workerGeneration = 4;
+    ds.session.workerGeneration = 4;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 7,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, resume: any, options: any) => {
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId,
+        dispatchAttempt: 7,
+        durablePrimaryInbox: true,
+      });
+      target.workerGeneration = 5;
+      target.session.workerGeneration = 5;
+      target.worker = { killed: false, send: vi.fn() };
+      options.onAdmission?.('accepted');
+      setImmediate(() => {
+        __testOnly_recordDurablePrimaryInputCommit(target, {
+          type: 'turn_input_committed',
+          turnId,
+          dispatchAttempt: 7,
+          durablePrimaryInbox: true,
+        }, 5);
+      });
+      return true;
+    });
+
+    await handleThreadReply(makeEventData(turnId, 'continue after worker exit', anchor), ctx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.durablePrimaryInputCommits).toEqual([
+      expect.objectContaining({ turnId, dispatchAttempt: 7, workerGeneration: 5 }),
+    ]);
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
   });
 
   it('clears the previous failed label before reforking for a document comment', async () => {

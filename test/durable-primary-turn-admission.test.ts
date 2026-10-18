@@ -14,11 +14,22 @@ function state(overrides: Record<string, unknown> = {}) {
 }
 
 describe('durable primary existing-turn admission', () => {
-  it('retries before the worker is ready or while another turn owns the session', () => {
+  it('lets a dead worker reach cold refork but retries an in-flight start', () => {
     expect(durablePrimaryExistingTurnDisposition(
       state({ worker: null }),
       'om_next',
+    )).toBe('ready');
+    expect(durablePrimaryExistingTurnDisposition(
+      state({ worker: { killed: true } }),
+      'om_next',
+    )).toBe('ready');
+    expect(durablePrimaryExistingTurnDisposition(
+      state({ worker: null, workerStartPending: true }),
+      'om_next',
     )).toBe('retry');
+  });
+
+  it('retries before a live worker is ready or while another turn owns the session', () => {
     expect(durablePrimaryExistingTurnDisposition(
       state({ cliReady: false }),
       'om_next',

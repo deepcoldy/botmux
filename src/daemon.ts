@@ -22752,6 +22752,8 @@ function recordDurablePrimaryInputCommit(
   }
 }
 
+export const __testOnly_recordDurablePrimaryInputCommit = recordDurablePrimaryInputCommit;
+
 function waitForDurablePrimaryInputCommit(
   ds: DaemonSession,
   turnId: string,
@@ -25776,13 +25778,21 @@ async function handleThreadReplyAdmitted(
   // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
   // retry must be a pure claim-state transition.
   if (ds && ctx.durablePrimaryDispatch) {
-    const disposition = durablePrimaryExistingTurnDisposition(ds, parsed.messageId);
+    const disposition = durablePrimaryExistingTurnDisposition({
+      session: ds.session,
+      worker: ds.worker,
+      cliReady: ds.cliReady,
+      activeInteractiveTurn: ds.activeInteractiveTurn,
+      workerStartPending: ds.pendingRepo === true
+        || ds.initialStartPending === true
+        || hasQueuedActivationAdmissionGate(ds),
+    }, parsed.messageId);
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       markSessionActivity(ds, Date.now(), {
         human: parsed.senderType === 'user' && !isForeignBot,
       });
-      fillNativeTopicId(ds.session, scope, parsed.threadId);
+      const nativeTopicChanged = fillNativeTopicId(ds.session, scope, parsed.threadId);
       if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
       ds.session.quoteTargetSenderOpenId = callerOpenId;
       ds.session.quoteTargetSenderIsBot = isForeignBot;
@@ -25810,7 +25820,15 @@ async function handleThreadReplyAdmitted(
         sourceMessageId: parsed.messageId,
       });
       if (callerOpenId) ds.session.lastCallerOpenId = callerOpenId;
+      publishLastInputFromBotPatch(ds);
+      if (ds.session.vcMeetingReceiver) {
+        ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
+        if (ctx.vcMeetingImTurnOrigin) {
+          rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin);
+        }
+      }
       sessionStore.updateSession(ds.session);
+      if (nativeTopicChanged) publishNativeTopicLinkPatch(ds);
       markIngressAdmitted(ctx);
       logger.info(
         `[${tag(ds)}] Reused durable-primary provider submit proof for `
@@ -27207,6 +27225,12 @@ async function handleThreadReplyAdmitted(
           turnId: queuedHasDurableTail
             ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
             : parsed.messageId,
+          ...(!queuedHasDurableTail && ctx.durablePrimaryDispatch
+            ? {
+                dispatchAttempt: ctx.durablePrimaryDispatch.attempt,
+                durablePrimaryInbox: true as const,
+              }
+            : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true } : {}),
           ...(wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId
@@ -27267,6 +27291,24 @@ async function handleThreadReplyAdmitted(
         threadTrustedCaller,
         queuedHasDurableTail ? undefined : stripCrossPrincipalAsToken(parsed.content).text,
       );
+    }
+    if (ctx.durablePrimaryDispatch && !queuedHasDurableTail) {
+      try {
+        await waitForDurablePrimaryInputCommit(
+          ds,
+          parsed.messageId,
+          ctx.durablePrimaryDispatch.signal,
+        );
+      } catch (error) {
+        if (ctx.durablePrimaryDispatch.signal.aborted) throw error;
+        retryDurablePrimaryIngress(ctx, 'provider submit receipt is still pending after worker refork');
+        logger.warn(
+          `[${tag(ds)}] Durable-primary reforked turn ${parsed.messageId.slice(0, 12)} `
+          + `will retry after provider submit receipt wait failed: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
     }
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput

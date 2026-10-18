@@ -70,6 +70,17 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     expect(daemonSource).toMatch(/participantsIncomplete: passthroughWindow\.incomplete,\s*inThread: turn\.inThread,/);
   });
 
+  it('replays every user-visible turn patch before completing a durable-primary duplicate', () => {
+    const committedStart = daemonSource.indexOf("if (disposition === 'committed')");
+    const retryStart = daemonSource.indexOf("if (disposition === 'retry')", committedStart);
+    expect(committedStart).toBeGreaterThan(-1);
+    expect(retryStart).toBeGreaterThan(committedStart);
+    const branch = daemonSource.slice(committedStart, retryStart);
+    expect(branch).toContain('publishNativeTopicLinkPatch(ds)');
+    expect(branch).toContain('publishLastInputFromBotPatch(ds)');
+    expect(branch).toContain('rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin)');
+  });
+
   it('BOTH registration-race loser handoffs preserve the pre-extracted seed+follow-up post @s', () => {
     // Two CAS-loser handoffs (new-topic loser and the auto-create loser) must EACH
     // preserve the complete seed's post inline @s, or a double-race drops them.
