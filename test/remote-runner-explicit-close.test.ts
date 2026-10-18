@@ -216,6 +216,39 @@ describe('remote runner explicit close', () => {
     expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
   });
 
+  it('keeps a provider-proven retryable close active without latching a fence', async () => {
+    const { ds, worker } = createFixture(true);
+    worker!.send.mockImplementation((message: { type: string; requestId?: string }) => {
+      if (message.type === 'close' && message.requestId) {
+        queueMicrotask(() => worker!.emit('message', {
+          type: 'close_result',
+          requestId: message.requestId,
+          ok: false,
+          error: 'remote target remains live',
+          recovery: 'retryable',
+          admission: 'restorable',
+        }));
+      } else if (message.type === 'close_abort' && message.requestId) {
+        queueMicrotask(() => worker!.emit('message', {
+          type: 'close_abort_result',
+          requestId: message.requestId,
+          ok: true,
+          admissionRestored: true,
+        }));
+      }
+    });
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'remote_runner_worker_close_failed',
+      retryable: true,
+      recovery: 'retryable',
+    });
+    expect(ds.remoteCloseState).toBeUndefined();
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
+  });
+
   it('uses an empty, non-deferred resume fork for the control-only wake', async () => {
     const { ds } = createFixture(false);
     const fork = vi.fn((
