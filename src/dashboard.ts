@@ -1697,20 +1697,22 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
     await runDurableConfigMutation({
       scope: 'bots',
       path,
-      mutation: () => withFileLock(path, async () => {
-        const raw = await readRawConfig(path);
-        const idx = findEntryIndex(raw, targetAppId);
-        if (idx < 0) throw new Error('bot_not_in_config');
-        const entry = raw[idx] as Record<string, unknown>;
-        const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
-        if (next.larkCliProfile) return;
-        next.larkCliProfile = targetAppId;
-        compactVcMeetingAgentEntry(entry, next);
-        // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
-        parseBotConfigsFromText(JSON.stringify(raw));
-        await writeRawConfigAtomic(path, raw);
-        changed = true;
-      }),
+      mutation: async () => {
+        await withFileLock(path, async () => {
+          const raw = await readRawConfig(path);
+          const idx = findEntryIndex(raw, targetAppId);
+          if (idx < 0) throw new Error('bot_not_in_config');
+          const entry = raw[idx] as Record<string, unknown>;
+          const next = normalizeVcMeetingAgentRecord(entry.vcMeetingAgent);
+          if (next.larkCliProfile) return;
+          next.larkCliProfile = targetAppId;
+          compactVcMeetingAgentEntry(entry, next);
+          // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
+          parseBotConfigsFromText(JSON.stringify(raw));
+          await writeRawConfigAtomic(path, raw);
+          changed = true;
+        });
+      },
     });
   } catch (err: any) {
     return { ok: false, error: `vcMeetingBot_preflight_config_write_failed: ${err?.message ?? err}` };
