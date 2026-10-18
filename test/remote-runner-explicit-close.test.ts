@@ -122,6 +122,7 @@ function createFixture(liveWorker: boolean): {
     chatType: 'group',
     scope: 'chat',
     worker,
+    workerReady: liveWorker,
     session,
     initConfig: { backendType: 'remote-runner' },
   } as unknown as DaemonSession;
@@ -173,10 +174,13 @@ describe('remote runner explicit close', () => {
 
   it('allows a live pre-ready worker to close before backend state is persisted', async () => {
     const { ds } = createFixture(true);
+    ds.workerReady = false;
     ds.session.remoteBackendState = undefined;
     sessionStore.updateSession(ds.session);
 
-    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+    const closing = closeSession(ds.session.sessionId);
+    queueMicrotask(() => { ds.workerReady = true; });
+    await expect(closing).resolves.toMatchObject({
       ok: true,
       outcome: 'closed',
     });
