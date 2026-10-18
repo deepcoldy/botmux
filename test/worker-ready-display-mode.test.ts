@@ -1542,6 +1542,36 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(closeSessionMock).not.toHaveBeenCalled();
   });
 
+  it('does not leak an unhandled rejection when both the streaming and static fallback POSTs fail', async () => {
+    // Regression: the static-fallback catch rethrew a plain Lark API error out of
+    // the fire-and-forget worker message handler, so every cold wake of a session
+    // with a bad reply target surfaced as a daemon-level unhandled rejection.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      sessionReplyMock
+        .mockRejectedValueOnce(new Error('streaming POST failed'))
+        .mockRejectedValueOnce(new Error('fallback POST failed'));
+      const fakeWorker = makeFakeWorker();
+      const ds = makeDs({ worker: fakeWorker, workingDir: '/tmp' });
+      activate(ds);
+
+      setupActiveWorkerHandlers(ds, fakeWorker);
+      fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+      await flush();
+      await flush();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(sessionReplyMock).toHaveBeenCalledTimes(2);
+      expect(unhandled).toEqual([]);
+      expect(ds.streamCardId).toBeUndefined();
+      expect(closeSessionMock).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('prompt_ready sends a pending raw slash command once', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({

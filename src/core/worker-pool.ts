@@ -15104,7 +15104,10 @@ function setupWorkerHandlers(
               await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
               break;
             }
-            throw fallbackErr;
+            // This handler is fire-and-forget (worker IPC), so a rethrow only
+            // surfaces as a daemon-level unhandled rejection. Log and leave
+            // streamCardId cleared so a later screen_update can retry the card.
+            logger.warn(`[${t}] Failed to send static fallback card: ${fallbackErr}`);
           }
         }
 
