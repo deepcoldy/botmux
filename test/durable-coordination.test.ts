@@ -30,8 +30,8 @@ afterEach(() => {
 });
 
 describe('SQLite durable coordination contract', () => {
-  it('pins the control-operation-aware coordination contract version', () => {
-    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(4);
+  it('pins the auxiliary-state-aware coordination contract version', () => {
+    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(5);
   });
 
   it('uses monotonic session epochs and fences stale state writers', async () => {
@@ -97,6 +97,26 @@ describe('SQLite durable coordination contract', () => {
     expect(second.records.map(row => row.sessionKey)).toEqual(['session-c']);
     expect(second.nextSessionKey).toBeUndefined();
     await expect(store.listSessions({ limit: 0 })).rejects.toThrow(/between 1 and 1000/);
+    await store.close();
+  });
+
+  it('keeps auxiliary state outside the canonical Session list', async () => {
+    const store = makeStore(() => 10);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'auxiliary::recalls::chat-a', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await expect(store.writeAuxiliaryState({
+      lease, expectedRevision: null, value: { type: 'recalls', ids: ['om_1'] },
+    })).resolves.toMatchObject({
+      kind: 'written',
+      record: { stateKey: 'auxiliary::recalls::chat-a', revision: 1 },
+    });
+    await expect(store.readAuxiliaryState('auxiliary::recalls::chat-a')).resolves.toMatchObject({
+      stateKey: 'auxiliary::recalls::chat-a',
+      revision: 1,
+      value: { type: 'recalls', ids: ['om_1'] },
+    });
+    await expect(store.listSessions({ limit: 10 })).resolves.toEqual({ records: [] });
     await store.close();
   });
 
@@ -601,7 +621,7 @@ describe('SQLite durable coordination contract', () => {
     await reopened.close();
   });
 
-  it('upgrades version 2 stores with the control operation table', async () => {
+  it('upgrades version 2 stores with control operations and auxiliary state', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-control-migration-'));
     tempDirs.push(dir);
     const path = join(dir, 'coordination.db');
@@ -636,9 +656,34 @@ describe('SQLite durable coordination contract', () => {
     const migrated = openDatabaseSyncOrThrow(path);
     expect(migrated.prepare(
       'SELECT schema_version FROM durable_coordination_meta WHERE singleton = 1',
-    ).get()).toEqual({ schema_version: 3 });
+    ).get()).toEqual({ schema_version: 4 });
     migrated.close();
   });
+
+  it('upgrades version 3 stores with the auxiliary state table', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-auxiliary-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP TABLE durable_auxiliary_state;');
+    raw.prepare(
+      'UPDATE durable_coordination_meta SET schema_version = 3 WHERE singleton = 1',
+    ).run();
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 11 });
+    const lease = acquired(await reopened.acquireSessionLease({
+      sessionKey: 'auxiliary::migrated', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    await expect(reopened.writeAuxiliaryState({
+      lease, expectedRevision: null, value: { migrated: true },
+    })).resolves.toMatchObject({ kind: 'written', record: { revision: 1 } });
+    await reopened.close();
+  });
+
   it('retries claimed inbox work only after the requested visibility time', async () => {
     let now = 1;
     const store = makeStore(() => now);

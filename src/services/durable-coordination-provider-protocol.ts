@@ -11,6 +11,8 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'readSession',
   'listSessions',
   'writeSession',
+  'readAuxiliaryState',
+  'writeAuxiliaryState',
   'enqueueInbox',
   'enqueueInboxWithLease',
   'claimNextInbox',
@@ -120,6 +122,15 @@ function sessionRecord(value: unknown): boolean {
   const item = record(value);
   return !!item
     && nonempty(item.sessionKey)
+    && integer(item.revision, 1)
+    && durableJson(item.value)
+    && integer(item.updatedAt);
+}
+
+function auxiliaryStateRecord(value: unknown): boolean {
+  const item = record(value);
+  return !!item
+    && nonempty(item.stateKey)
     && integer(item.revision, 1)
     && durableJson(item.value)
     && integer(item.updatedAt);
@@ -252,6 +263,18 @@ export function validateDurableCoordinationProviderResult(
         ? sessionRecord(item.record)
         : item.kind === 'conflict'
           ? item.current === undefined || sessionRecord(item.current)
+          : true);
+      break;
+    }
+    case 'readAuxiliaryState':
+      valid = value === null || auxiliaryStateRecord(value);
+      break;
+    case 'writeAuxiliaryState': {
+      const item = oneOfKinds(value, ['written', 'conflict', 'stale_lease']);
+      valid = !!item && (item.kind === 'written'
+        ? auxiliaryStateRecord(item.record)
+        : item.kind === 'conflict'
+          ? item.current === undefined || auxiliaryStateRecord(item.current)
           : true);
       break;
     }

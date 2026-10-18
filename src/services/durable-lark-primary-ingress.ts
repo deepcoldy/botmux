@@ -129,6 +129,14 @@ function larkMessageId(value: unknown): string | undefined {
       ? (nested as Record<string, unknown>).message
       : undefined
   );
+  if (!message) {
+    const recalledMessageId = (
+      nested && typeof nested === 'object' && !Array.isArray(nested)
+        ? nested as Record<string, unknown>
+        : envelope
+    ).message_id;
+    return typeof recalledMessageId === 'string' ? recalledMessageId : undefined;
+  }
   if (!message || typeof message !== 'object' || Array.isArray(message)) return undefined;
   const messageId = (message as Record<string, unknown>).message_id;
   return typeof messageId === 'string' ? messageId : undefined;
@@ -396,11 +404,15 @@ export function startDurableLarkPrimaryIngress(
     const expectedUpdatedPrefix = `im.message.updated_v1:${larkAppId}:`;
     if (!messageId || !messageId.startsWith('om_') || messageId.length > 256
         || (eventType !== 'lark.im.message.receive_v1'
-          && eventType !== 'lark.im.message.updated_v1')
+          && eventType !== 'lark.im.message.updated_v1'
+          && eventType !== 'lark.im.message.recalled_v1')
         || (eventType === 'lark.im.message.receive_v1' && eventId !== expectedReceiveEventId)
         || (eventType === 'lark.im.message.updated_v1'
           && (!eventId.startsWith(expectedUpdatedPrefix)
             || eventId.length === expectedUpdatedPrefix.length))
+        || (eventType === 'lark.im.message.recalled_v1'
+          && (!eventId.startsWith(`im.message.recalled_v1:${larkAppId}:`)
+            || eventId.length === `im.message.recalled_v1:${larkAppId}:`.length))
         || (eventType === 'lark.im.message.updated_v1'
           && partitionKey === `lark-message-routing:${larkAppId}:__chatless__`)) {
       throw new Error('durable Lark ingress event does not match the application message identity');

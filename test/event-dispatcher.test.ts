@@ -1130,6 +1130,71 @@ describe('Lark event dispatcher — durable primary processor', () => {
     queuePostAdmissionOutput: queuePostAdmissionOutput ?? (() => undefined),
   });
 
+  it('persists recalled-message events before applying the local tombstone', async () => {
+    setGroupContextSettingsResolver(() => ({ enabled: true, maxContextChars: 4000 }));
+    try {
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const persistPrimaryGroupContextRecall = vi.fn(async () => undefined);
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        makeHandlers(),
+        'feishu',
+        undefined,
+        { enqueuePrimary, persistPrimaryGroupContextRecall },
+      );
+      runtime.connect();
+      const data = {
+        event_id: 'evt_primary_recall',
+        message_id: 'om_primary_recall',
+        chat_id: 'chat-primary',
+        recall_time: '1700000009000',
+      };
+
+      await capturedHandlers['im.message.recalled_v1'](data);
+      expect(enqueuePrimary).toHaveBeenCalledWith({
+        eventId: `im.message.recalled_v1:${MY_APP_ID}:evt_primary_recall`,
+        eventType: 'lark.im.message.recalled_v1',
+        partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+        data,
+      });
+      expect(persistPrimaryGroupContextRecall).not.toHaveBeenCalled();
+
+      await expect(runtime.processDurableMessage({
+        eventType: 'lark.im.message.recalled_v1',
+        eventId: `im.message.recalled_v1:${MY_APP_ID}:evt_primary_recall`,
+        partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+        larkAppId: MY_APP_ID,
+        messageId: 'om_primary_recall',
+        attempts: 1,
+        data,
+      }, {
+        claim: {
+          event: {
+            eventId: `im.message.recalled_v1:${MY_APP_ID}:evt_primary_recall`,
+            partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+            payload: {}, visibleAt: 1, createdAt: 1,
+          },
+          workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts: 1,
+        },
+        signal: new AbortController().signal,
+        queuePostAdmissionOutput: () => undefined,
+      })).resolves.toEqual({
+        kind: 'ignored',
+        reason: 'durable primary group-context recall committed',
+      });
+      expect(persistPrimaryGroupContextRecall).toHaveBeenCalledWith({
+        larkAppId: MY_APP_ID,
+        chatId: 'chat-primary',
+        messageId: 'om_primary_recall',
+        deletedAt: 1700000009000,
+      });
+      runtime.close();
+    } finally {
+      _resetGroupContextIngestForTest();
+    }
+  });
+
   it('routes without opening WS and returns the admitted canonical Session', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');

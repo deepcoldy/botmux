@@ -343,6 +343,37 @@ describe('durable Lark primary ingress', () => {
     await ingress.stop();
   });
 
+  it('persists a recalled-message event under the same fenced primary ingress', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck({
+      eventType: 'lark.im.message.recalled_v1',
+      eventId: 'im.message.recalled_v1:cli_test:evt_recall_1',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+      data: {
+        event_id: 'evt_recall_1',
+        message_id: 'om_1',
+        chat_id: 'oc_chat',
+        recall_time: '1700000009000',
+      },
+    })).resolves.toEqual({ kind: 'inserted' });
+    expect(store.enqueueInboxWithLease).toHaveBeenCalledWith(expect.objectContaining({
+      lease: expect.objectContaining({ epoch: 1 }),
+      event: expect.objectContaining({
+        eventId: 'im.message.recalled_v1:cli_test:evt_recall_1',
+        payload: expect.objectContaining({ type: 'lark.im.message.recalled_v1' }),
+      }),
+    }));
+    await ingress.stop();
+  });
+
   it('rejects a chatless update before it can escape the receive partition', async () => {
     const store = fakeStore();
     const ingress = startDurableLarkPrimaryIngress({

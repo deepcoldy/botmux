@@ -4465,6 +4465,20 @@ export interface LarkEventDispatcherRuntimeOptions {
     partitionKey: string;
     data: unknown;
   }) => Promise<unknown>;
+  /** Persist a recall before ACK so another replica cannot retain recalled
+   * group-context text after an owner move. */
+  persistPrimaryGroupContextRecall?: (input: {
+    larkAppId: string;
+    chatId: string;
+    messageId: string;
+    deletedAt: number;
+  }) => Promise<void>;
+  /** Hydrate the local projection from the shared recall log before composing
+   * group background on a replica that may not have received the WS event. */
+  readPrimaryGroupContextRecalls?: (input: {
+    larkAppId: string;
+    chatId: string;
+  }) => Promise<Array<{ messageId: string; deletedAt: number }>>;
   /** ACK 前的同步权限/生命周期预检；consumer 仍会在副作用前再次验证。 */
   authorizePrimaryControl?: (data: unknown) => boolean | Promise<boolean>;
   /**
@@ -5883,7 +5897,16 @@ export function createLarkEventDispatcherRuntime(
         if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)) {
           const mode = getCachedChatMode(larkAppId, editedChatId) ?? await getChatModeStrict(larkAppId, editedChatId);
           if (mode === 'p2p') data.message.chat_type = 'p2p';
-          else if (mode === 'group' || mode === 'topic') ingestGroupContextEvent(larkAppId, data);
+          else if (mode === 'group' || mode === 'topic') {
+            if (primary && runtimeOptions.readPrimaryGroupContextRecalls) {
+              const recalls = await runtimeOptions.readPrimaryGroupContextRecalls({
+                larkAppId,
+                chatId: editedChatId,
+              });
+              for (const recall of recalls) ingestGroupContextRecall(larkAppId, { chatId: editedChatId, ...recall });
+            }
+            ingestGroupContextEvent(larkAppId, data);
+          }
           else logger.debug(`[message-updated:${larkAppId}] chat mode unconfirmed, group-context skipped msg=${messageId.substring(0, 12)}`);
         }
       } catch (err) {
@@ -6241,13 +6264,23 @@ export function createLarkEventDispatcherRuntime(
     // 刻意不走 message_id claim（原消息已 claim 过同 id）。
     // 消息撤回：只给群聊上下文共享记录写 tombstone（group-context-ingest 自带开关与
     // 错误隔离），不影响任何会话 / 任务状态。recall 幂等，无需 message_id claim。
-    'im.message.recalled_v1': (data: any) => {
+    'im.message.recalled_v1': async (data: any) => {
       const ev = data?.event ?? data;
-      ingestGroupContextRecall(larkAppId, {
-        chatId: ev?.chat_id ?? ev?.message?.chat_id,
-        messageId: ev?.message_id ?? ev?.message?.message_id,
-        recallTime: ev?.recall_time,
-      });
+      const chatId = ev?.chat_id ?? ev?.message?.chat_id;
+      const messageId = ev?.message_id ?? ev?.message?.message_id;
+      const recallTime = ev?.recall_time;
+      if (runtimeOptions.enqueuePrimary) {
+        if (typeof chatId !== 'string' || !chatId || typeof messageId !== 'string' || !messageId) return;
+        const eventKey = `im.message.recalled_v1:${larkAppId}:${eventIdForKey(data) ?? messageId}`;
+        await enqueuePrimaryInArrivalOrder(() => ({
+          eventId: eventKey,
+          eventType: 'lark.im.message.recalled_v1',
+          partitionKey: rawMessageIngressAnchor(larkAppId, { chat_id: chatId }),
+          data,
+        }));
+        return;
+      }
+      ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime });
     },
     'im.message.updated_v1': async (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;
@@ -6552,7 +6585,33 @@ export function createLarkEventDispatcherRuntime(
       const primary = { message, context };
       const result = await serializeByAnchor(
         message.partitionKey,
-        () => {
+        async () => {
+          if (message.eventType === 'lark.im.message.recalled_v1') {
+            const ev = (message.data as any)?.event ?? message.data as any;
+            const chatId = ev?.chat_id ?? ev?.message?.chat_id;
+            const messageId = ev?.message_id ?? ev?.message?.message_id;
+            const deletedAt = Math.trunc(Number(ev?.recall_time)) || Date.now();
+            if (typeof chatId !== 'string' || !chatId
+                || typeof messageId !== 'string' || !messageId) {
+              throw new Error('durable primary recall is missing chat/message identity');
+            }
+            if (isGroupContextEnabled(larkAppId, chatId)) {
+              if (!runtimeOptions.persistPrimaryGroupContextRecall) {
+                throw new Error('durable primary recall persistence is not configured');
+              }
+              await runtimeOptions.persistPrimaryGroupContextRecall({
+                larkAppId,
+                chatId,
+                messageId,
+                deletedAt,
+              });
+              ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime: deletedAt });
+            }
+            return {
+              kind: 'ignored' as const,
+              reason: 'durable primary group-context recall committed',
+            };
+          }
           // The legacy path captures synchronously before SDK ACK. Primary has
           // already persisted this exact event before ACK, so capture belongs
           // inside the claimed partition lane. InputCaptureRuntime is
@@ -6575,6 +6634,16 @@ export function createLarkEventDispatcherRuntime(
                 reason: `durable primary input capture rejected: ${error.code}`,
               });
             }
+          }
+          const rawMessage = (message.data as any)?.message ?? (message.data as any)?.event?.message;
+          const chatId = rawMessage?.chat_id;
+          if (rawMessage?.chat_type !== 'p2p'
+              && typeof chatId === 'string'
+              && chatId
+              && isGroupContextEnabled(larkAppId, chatId)
+              && runtimeOptions.readPrimaryGroupContextRecalls) {
+            const recalls = await runtimeOptions.readPrimaryGroupContextRecalls({ larkAppId, chatId });
+            for (const recall of recalls) ingestGroupContextRecall(larkAppId, { chatId, ...recall });
           }
           return message.eventType === 'lark.im.message.updated_v1'
             ? processMessageUpdatedEvent(message.data, primary)

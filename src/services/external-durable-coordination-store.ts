@@ -10,6 +10,7 @@ import type {
   CompleteControlOperationAttemptInput,
   CompleteOutboxAttemptInput,
   ControlOperationMutationResult,
+  DurableAuxiliaryStateRecord,
   DurableCoordinationStore,
   DurableControlOperationRecord,
   DurableInboxEvent,
@@ -38,6 +39,8 @@ import type {
   SessionLeaseAcquisition,
   WriteSessionInput,
   WriteSessionResult,
+  WriteAuxiliaryStateInput,
+  WriteAuxiliaryStateResult,
 } from './durable-coordination.js';
 import {
   MAX_DURABLE_COORDINATION_PROVIDER_LINE_BYTES,
@@ -290,6 +293,15 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
 
   async writeSession(input: WriteSessionInput): Promise<WriteSessionResult> {
     return await this.call('writeSession', input) as unknown as WriteSessionResult;
+  }
+
+  async readAuxiliaryState(stateKey: string): Promise<DurableAuxiliaryStateRecord | undefined> {
+    const result = await this.call('readAuxiliaryState', stateKey);
+    return result === null ? undefined : result as unknown as DurableAuxiliaryStateRecord;
+  }
+
+  async writeAuxiliaryState(input: WriteAuxiliaryStateInput): Promise<WriteAuxiliaryStateResult> {
+    return await this.call('writeAuxiliaryState', input) as unknown as WriteAuxiliaryStateResult;
   }
 
   async enqueueInbox(event: DurableInboxEvent): Promise<DurableInsertResult> {

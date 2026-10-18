@@ -130,6 +130,11 @@ import {
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import { requestDurableSessionControl } from './services/durable-session-control-request.js';
+import {
+  createDurableGroupContextRecallFacade,
+  readDurableGroupContextRecalls,
+  recordDurableGroupContextRecall,
+} from './services/durable-group-context-recall.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
 import {
   durableDirectSessionControlEvent,
@@ -28584,6 +28589,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
     : undefined;
+  const durableGroupContextRecallFacade = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableGroupContextRecallFacade({
+        store: durableCoordinationRuntime.store,
+        ownerId: `group-context-recall:${getDaemonBootId()}`,
+      })
+    : undefined;
   durableSessionShadowFacade = durableSessionFacade;
   const durableInboxShadowConsumer = durableCoordinationRuntime?.mode === 'shadow'
     ? startDurableInboxShadowConsumer({
@@ -30250,6 +30261,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
               return primaryRuntime.ingress.enqueueClusterControlBeforeAck(input);
             },
+            persistPrimaryGroupContextRecall: async input => {
+              if (!primaryRuntime || !durableGroupContextRecallFacade) {
+                throw new Error('durable primary recall runtime is not ready');
+              }
+              await recordDurableGroupContextRecall({
+                facade: durableGroupContextRecallFacade,
+                ...input,
+              });
+            },
+            readPrimaryGroupContextRecalls: input => readDurableGroupContextRecalls({
+              store: durableCoordinationRuntime.store,
+              ...input,
+            }),
             authorizePrimaryControl: async data =>
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             readPrimarySession: async stableKey => {
@@ -31510,6 +31534,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }
+    const durableRecallStop = await durableGroupContextRecallFacade?.stop(remainingBudget());
+    if (durableRecallStop?.kind === 'timed_out') {
+      logger.warn(
+        `[durable-recall] facade stop timed out `
+        + `(pending=${durableRecallStop.pendingSessionKeys.length}, `
+        + `unreleased=${durableRecallStop.unreleasedSessionKeys.length})`,
+      );
+    }
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on
@@ -31575,6 +31607,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();
+    durableGroupContextRecallFacade?.terminate();
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }
