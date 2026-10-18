@@ -654,9 +654,12 @@ async function parseRolloutTranscript(
         for (const text of rolloutHistoryMutationUserTexts(payload)) recordWeakUserText(text);
       } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
         recordWeakUserText(rolloutResponseItemText(payload));
-      } else if (rec.type === 'event_msg' && payload?.type === 'task_complete' && acc.weakDecided) {
-        // The first turn ended without a canonical user record: keep the weak
-        // verdict rather than read the rest of a possibly huge rollout.
+      } else if (rec.type === 'event_msg' && acc.weakDecided
+        && (payload?.type === 'task_complete' || payload?.type === 'turn_aborted')) {
+        // The first turn ended (completed, or cancelled — the two terminal
+        // records the TraeX bridge recognises) without a canonical user record:
+        // keep the weak verdict rather than let a later turn rewrite it, and
+        // don't read the rest of a possibly huge rollout.
         return true;
       }
     } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {

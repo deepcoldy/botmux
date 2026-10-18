@@ -1003,6 +1003,32 @@ describe('discoverRolloutSessions (codex / traex)', () => {
         expect.objectContaining({ cliSessionId: 'traex-weak-bounded', title: 'first turn, 0.201.7 style' }),
       ]);
     });
+
+    it('keeps a cancelled weak-only external first turn even if a later turn pastes an envelope', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-aborted-external.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-aborted-external', cwd: '/root/traex' } },
+        { type: 'history_mutation', payload: { operation: 'append', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'external first prompt' }] },
+        ] } },
+        { type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-1', reason: 'interrupted' } },
+        traexUserTurn('traex-aborted-external', ENVELOPE, 'turn-2'),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-aborted-external', title: 'external first prompt' }),
+      ]);
+    });
+
+    it('still drops a cancelled weak-only botmux first turn even if a later turn is plain text', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-aborted-botmux.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-aborted-botmux', cwd: '/root/traex' } },
+        { type: 'history_mutation', payload: { operation: 'append', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: ENVELOPE }] },
+        ] } },
+        { type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-1', reason: 'interrupted' } },
+        traexUserTurn('traex-aborted-botmux', 'plain follow-up text', 'turn-2'),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
+    });
   });
 
   describe('TraeX internal helper sessions (review P2-2)', () => {
