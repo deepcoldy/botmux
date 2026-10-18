@@ -203,6 +203,7 @@ export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
   setDurableSessionSendHandler(null);
   setDurableSessionLifecycleHandler(null);
+  setDurableSessionListHandler(null);
 }
 
 interface ScheduleRunLogErrorDetails {
@@ -365,7 +366,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -30582,22 +30583,41 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       },
     }));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
+    setDurableSessionListHandler(async () => {
+      const listSessions = durableCoordinationRuntime.store.listSessions;
+      if (!listSessions) throw new Error('durable_primary_session_listing_unavailable');
+      const sessions = new Map<string, Session>();
+      let afterSessionKey: string | undefined;
+      for (let page = 0; page < 40; page += 1) {
+        const listed = await listSessions.call(durableCoordinationRuntime.store, {
+          ...(afterSessionKey ? { afterSessionKey } : {}),
+          limit: 256,
+        });
+        for (const item of listed.records) {
+          const value = item.value && typeof item.value === 'object' && !Array.isArray(item.value)
+            ? item.value as Record<string, unknown>
+            : undefined;
+          if (value?.type !== 'botmux.session.primary') continue;
+          const session = parseDurablePrimarySessionRecord(item).session;
+          if (session.larkAppId === cfg.larkAppId) sessions.set(session.sessionId, session);
+        }
+        if (!listed.nextSessionKey) return [...sessions.values()];
+        afterSessionKey = listed.nextSessionKey;
+      }
+      throw new Error('durable_primary_session_listing_limit_exceeded');
+    });
     setDurableSessionLifecycleHandler(async request => {
       const local = findActiveBySessionId(request.sessionId)?.session
         ?? sessionStore.getOwnedSession(request.sessionId);
       const larkAppId = local?.larkAppId || cfg.larkAppId;
       const rootId = request.rootId ?? (local ? storedSessionAnchorId(local) : undefined);
-      if (!rootId) {
-        return { ok: false, error: 'durable_session_not_found' };
-      }
       const runtime = durablePrimaryRuntimeByApp.get(larkAppId);
       if (!runtime) return { ok: false, error: 'durable_primary_unavailable' };
-      const canonicalKey = sessionKey(rootId, larkAppId);
       return requestDurableSessionControl({
         store: durableCoordinationRuntime.store,
         request: {
           larkAppId,
-          sessionKey: canonicalKey,
+          ...(rootId ? { sessionKey: sessionKey(rootId, larkAppId) } : {}),
           sessionId: request.sessionId,
           action: request.action,
         },
@@ -31466,6 +31486,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
+    setDurableSessionListHandler(null);
     await durableInboxShadowConsumer?.stop(remainingBudget());
     const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
     if (durableSessionStop?.kind === 'timed_out') {
@@ -31538,6 +31559,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
     setDurableSessionLifecycleHandler(null);
+    setDurableSessionListHandler(null);
     for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();

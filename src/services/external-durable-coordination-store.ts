@@ -278,6 +278,16 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
     return result === null ? undefined : result as unknown as DurableSessionRecord;
   }
 
+  async listSessions(input: {
+    afterSessionKey?: string;
+    limit: number;
+  }): Promise<{ records: DurableSessionRecord[]; nextSessionKey?: string }> {
+    return await this.call('listSessions', input) as unknown as {
+      records: DurableSessionRecord[];
+      nextSessionKey?: string;
+    };
+  }
+
   async writeSession(input: WriteSessionInput): Promise<WriteSessionResult> {
     return await this.call('writeSession', input) as unknown as WriteSessionResult;
   }

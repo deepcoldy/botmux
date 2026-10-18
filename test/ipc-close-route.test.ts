@@ -92,6 +92,32 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(closeSpy).not.toHaveBeenCalled();
   });
 
+  it('forwards a trusted routing anchor when the upgraded replica has no local row', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+    const durableClose = vi.fn(async () => ({
+      ok: true as const,
+      outcome: 'closed' as const,
+    }));
+    setDurableSessionLifecycleHandler(durableClose);
+
+    const res = await postClose('s-primary-remote', {
+      auth: 'signed',
+      authRequired: true,
+      rootId: 'om_primary_remote_root',
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed' });
+    expect(durableClose).toHaveBeenCalledWith({
+      sessionId: 's-primary-remote',
+      action: 'close',
+      rootId: 'om_primary_remote_root',
+    });
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
   it('does not let an in-session capability mint trusted-host primary control', async () => {
     process.env.BOTMUX_COORDINATION_MODE = 'primary';
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({

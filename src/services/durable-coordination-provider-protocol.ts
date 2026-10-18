@@ -9,6 +9,7 @@ export const DURABLE_COORDINATION_PROVIDER_METHODS = [
   'renewSessionLease',
   'releaseSessionLease',
   'readSession',
+  'listSessions',
   'writeSession',
   'enqueueInbox',
   'enqueueInboxWithLease',
@@ -236,6 +237,15 @@ export function validateDurableCoordinationProviderResult(
     case 'readSession':
       valid = value === null || sessionRecord(value);
       break;
+    case 'listSessions': {
+      const item = record(value);
+      valid = !!item
+        && Array.isArray(item.records)
+        && item.records.length <= 1_000
+        && item.records.every(sessionRecord)
+        && (item.nextSessionKey === undefined || nonempty(item.nextSessionKey));
+      break;
+    }
     case 'writeSession': {
       const item = oneOfKinds(value, ['written', 'conflict', 'stale_lease']);
       valid = !!item && (item.kind === 'written'

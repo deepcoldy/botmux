@@ -323,6 +323,14 @@ export interface DurableSessionLeaseStore {
 
 export interface DurableSessionStateStore {
   readSession(sessionKey: string): Promise<DurableSessionRecord | undefined>;
+  /** 按稳定键分页读取 canonical 状态；可选以兼容旧 provider。 */
+  listSessions?(input: {
+    afterSessionKey?: string;
+    limit: number;
+  }): Promise<{
+    records: DurableSessionRecord[];
+    nextSessionKey?: string;
+  }>;
   writeSession(input: WriteSessionInput): Promise<WriteSessionResult>;
 }
 

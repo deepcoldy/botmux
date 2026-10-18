@@ -472,6 +472,33 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     return row ? sessionRecord(row) : undefined;
   }
 
+  async listSessions(input: {
+    afterSessionKey?: string;
+    limit: number;
+  }): Promise<{ records: DurableSessionRecord[]; nextSessionKey?: string }> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
+      throw new Error('limit must be an integer between 1 and 1000');
+    }
+    const afterSessionKey = input.afterSessionKey === undefined
+      ? undefined
+      : nonempty(input.afterSessionKey, 'afterSessionKey');
+    const rows = (afterSessionKey
+      ? this.db.prepare(
+          'SELECT session_key, revision, value_json, updated_at FROM durable_sessions '
+          + 'WHERE session_key > ? ORDER BY session_key LIMIT ?',
+        ).all(afterSessionKey, input.limit + 1)
+      : this.db.prepare(
+          'SELECT session_key, revision, value_json, updated_at FROM durable_sessions '
+          + 'ORDER BY session_key LIMIT ?',
+        ).all(input.limit + 1)) as SessionRow[];
+    const hasMore = rows.length > input.limit;
+    const page = rows.slice(0, input.limit).map(sessionRecord);
+    return {
+      records: page,
+      ...(hasMore && page.length > 0 ? { nextSessionKey: page.at(-1)!.sessionKey } : {}),
+    };
+  }
+
   async writeSession(input: WriteSessionInput): Promise<WriteSessionResult> {
     const now = this.now();
     if (input.expectedRevision !== null

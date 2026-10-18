@@ -79,6 +79,27 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('lists canonical Sessions in stable key order with a bounded cursor', async () => {
+    const store = makeStore(() => 100);
+    for (const key of ['session-c', 'session-a', 'session-b']) {
+      const lease = acquired(await store.acquireSessionLease({
+        sessionKey: key,
+        ownerId: 'worker-a',
+        leaseDurationMs: 50,
+      }));
+      await store.writeSession({ lease, expectedRevision: null, value: { key } });
+    }
+
+    const first = await store.listSessions({ limit: 2 });
+    expect(first.records.map(row => row.sessionKey)).toEqual(['session-a', 'session-b']);
+    expect(first.nextSessionKey).toBe('session-b');
+    const second = await store.listSessions({ afterSessionKey: first.nextSessionKey, limit: 2 });
+    expect(second.records.map(row => row.sessionKey)).toEqual(['session-c']);
+    expect(second.nextSessionKey).toBeUndefined();
+    await expect(store.listSessions({ limit: 0 })).rejects.toThrow(/between 1 and 1000/);
+    await store.close();
+  });
+
   it('rejects stale lease renewal and both Session CAS mismatch legs', async () => {
     let now = 1;
     const store = makeStore(() => now);

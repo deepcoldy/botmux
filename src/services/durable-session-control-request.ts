@@ -5,7 +5,7 @@ import { parseDurablePrimarySessionRecord } from './durable-session-primary.js';
 
 export interface DurableSessionControlRequest {
   larkAppId: string;
-  sessionKey: string;
+  sessionKey?: string;
   sessionId: string;
   action: 'close' | 'resume';
 }
@@ -51,8 +51,33 @@ export async function requestDurableSessionControl(input: {
   const wait = input.wait ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const timeoutMs = input.timeoutMs ?? 45_000;
   const pollIntervalMs = input.pollIntervalMs ?? 100;
-  const initial = await input.store.readSession(input.request.sessionKey);
+  let canonicalKey = input.request.sessionKey;
+  let initial = canonicalKey
+    ? await input.store.readSession(canonicalKey)
+    : undefined;
+  if (!initial && input.store.listSessions) {
+    let afterSessionKey: string | undefined;
+    for (let page = 0; page < 40; page += 1) {
+      const listed = await input.store.listSessions({
+        ...(afterSessionKey ? { afterSessionKey } : {}),
+        limit: 256,
+      });
+      initial = listed.records.find(candidate => {
+        try {
+          const parsed = parseDurablePrimarySessionRecord(candidate);
+          return parsed.session.sessionId === input.request.sessionId
+            && parsed.session.larkAppId === input.request.larkAppId;
+        } catch {
+          return false;
+        }
+      });
+      if (initial || !listed.nextSessionKey) break;
+      afterSessionKey = listed.nextSessionKey;
+    }
+    canonicalKey = initial?.sessionKey;
+  }
   if (!initial) return { ok: false, error: 'durable_session_not_found' };
+  canonicalKey ??= initial.sessionKey;
   const canonical = parseDurablePrimarySessionRecord(initial);
   if (canonical.session.sessionId !== input.request.sessionId
       || canonical.session.larkAppId !== input.request.larkAppId) {
@@ -92,7 +117,7 @@ export async function requestDurableSessionControl(input: {
   }
   const deadline = now() + timeoutMs;
   while (now() < deadline) {
-    const currentRecord = await input.store.readSession(input.request.sessionKey);
+    const currentRecord = await input.store.readSession(canonicalKey);
     if (!currentRecord) return { ok: false, error: 'durable_session_disappeared' };
     const current = parseDurablePrimarySessionRecord(currentRecord);
     if (current.session.sessionId !== input.request.sessionId) {

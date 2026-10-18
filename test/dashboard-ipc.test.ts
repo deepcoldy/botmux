@@ -10,7 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionListHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -195,6 +195,7 @@ async function readSseEvent(
 }
 
 let handle: IpcServerHandle | null = null;
+const ORIGINAL_COORDINATION_MODE = process.env.BOTMUX_COORDINATION_MODE;
 
 afterEach(async () => {
   if (handle) await handle.close();
@@ -208,7 +209,10 @@ afterEach(async () => {
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
   setCrossPrincipalInterruptionDisableHandler(null);
+  setDurableSessionListHandler(null);
   setDurableSessionSendHandler(null);
+  if (ORIGINAL_COORDINATION_MODE === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+  else process.env.BOTMUX_COORDINATION_MODE = ORIGINAL_COORDINATION_MODE;
   setTurnResultRuntime(undefined);
   clearMessageListenerRunPreviewStore();
 });
@@ -4050,6 +4054,29 @@ describe('POST /api/grants/chat', () => {
 });
 
 describe('GET /api/sessions', () => {
+  it('uses canonical Session rows in primary mode even when no local row survived', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    setDurableSessionListHandler(async () => [{
+      sessionId: 'session-canonical',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      scope: 'thread',
+      title: 'Canonical only',
+      status: 'active',
+      createdAt: '2026-10-18T00:00:00.000Z',
+      larkAppId: 'cli_test',
+    }]);
+    workerPool.setActiveSessionsRegistry(new Map());
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions`);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      sessions: [{ sessionId: 'session-canonical', status: 'dormant' }],
+    });
+  });
+
   it('returns array shape (sessions: Row[])', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions`);

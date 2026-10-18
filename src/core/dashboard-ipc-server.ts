@@ -417,6 +417,14 @@ export function setDurableSessionLifecycleHandler(
 ): void {
   durableSessionLifecycleHandler = handler;
 }
+
+let durableSessionListHandler: (() => Promise<Session[]>) | null = null;
+
+export function setDurableSessionListHandler(
+  handler: (() => Promise<Session[]>) | null,
+): void {
+  durableSessionListHandler = handler;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -1439,7 +1447,23 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 // holder.
 export function setBotName(name: string): void { setRowsBotName(name); }
 
-function composeDashboardSessionRows(opts?: { includeTokenUsage?: boolean }): SessionRow[] {
+function composeDashboardSessionRows(
+  opts?: { includeTokenUsage?: boolean },
+  canonicalSessions?: Session[],
+): SessionRow[] {
+  if (canonicalSessions) {
+    const activeById = new Map(
+      listActiveSessions().map(ds => [ds.session.sessionId, ds]),
+    );
+    return canonicalSessions.map(session => {
+      const live = activeById.get(session.sessionId);
+      return live && session.status === 'active'
+        ? composeRowFromActive(live, opts)
+        : session.status === 'active'
+          ? composeRowFromPersistedActive(session, opts)
+          : composeRowFromClosed(session, opts);
+    });
+  }
   const active = listActiveSessions().map((ds) => composeRowFromActive(ds, opts));
   const activeIds = new Set(active.map(row => row.sessionId));
   const persisted = sessionStore.listSessions();
@@ -1531,11 +1555,27 @@ ipcRoute('POST', '/api/asks/answer', async (req, res) => {
   return jsonRes(res, 200, { ok: true, outcome });
 });
 
-ipcRoute('GET', '/api/sessions', (_req, res) => {
+ipcRoute('GET', '/api/sessions', async (_req, res) => {
   // Runtime active first, then persisted active rows that restore deliberately
   // left detached, then closed history. Persisted-active must never be projected
   // through composeRowFromClosed: teardown uncertainty is not a close.
-  jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
+  if (coordinationModeIsPrimary()) {
+    if (!durableSessionListHandler) {
+      return jsonRes(res, 503, { ok: false, error: 'durable_primary_unavailable' });
+    }
+    try {
+      const sessions = await durableSessionListHandler();
+      return jsonRes(res, 200, {
+        sessions: composeDashboardSessionRows({ includeTokenUsage: false }, sessions),
+      });
+    } catch (error) {
+      return jsonRes(res, 503, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
 });
 
 // This route deliberately has NO session-capability/public allowlist entry.

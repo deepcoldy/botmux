@@ -133,4 +133,25 @@ describe('trusted-host durable Session control request', () => {
     })).resolves.toEqual({ ok: true, outcome: 'closed', alreadyClosed: true });
     expect(enqueueInbox).not.toHaveBeenCalled();
   });
+
+  it('finds a canonical Session by id when the replica has no local routing row', async () => {
+    const closed = record('closed', 9);
+    const listSessions = vi.fn(async () => ({ records: [closed] }));
+    const store = {
+      readSession: vi.fn(),
+      listSessions,
+      enqueueInbox: vi.fn(),
+    } as unknown as DurableCoordinationStore;
+
+    await expect(requestDurableSessionControl({
+      store,
+      request: {
+        larkAppId: 'cli_test',
+        sessionId: 'session-1',
+        action: 'close',
+      },
+    })).resolves.toEqual({ ok: true, outcome: 'closed', alreadyClosed: true });
+    expect(listSessions).toHaveBeenCalledWith({ limit: 256 });
+    expect(store.readSession).not.toHaveBeenCalled();
+  });
 });
