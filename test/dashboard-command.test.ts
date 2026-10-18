@@ -6,6 +6,7 @@ import {
   dashboardExportTimeoutForBudget,
   executeDashboardCommand,
   executeDashboardCommandWithExportRefresh,
+  exportAfterDashboardAnswer,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
   refreshDashboardResultAfterExport,
@@ -341,6 +342,77 @@ describe('executeDashboardCommandWithExportRefresh', () => {
     await executeDashboardCommandWithExportRefresh(['wat'], failedEndpoint, ensureExport);
     await executeDashboardCommandWithExportRefresh(['current'], failedEndpoint, ensureExport);
     expect(ensureExport).not.toHaveBeenCalled();
+  });
+});
+
+describe('exportAfterDashboardAnswer', () => {
+  // A fresh Devbox where nobody ran `botmux dashboard` answers `/__cli/current`
+  // with no-active-token. That answer still proves the dashboard owns the port,
+  // and the web-terminal links (buildTerminalUrl, PTY and tmux alike) read the
+  // export cache without any dashboard token — so the export must happen.
+  it('exports on an authenticated no-active-token answer without touching any endpoint', async () => {
+    const answer = { ok: false as const, reason: 'no-active-token' as const };
+    const ensureExport = vi.fn(async () => 'https://devbox.example.com');
+    const callEndpoint = vi.fn();
+    await expect(exportAfterDashboardAnswer(answer, ensureExport, callEndpoint)).resolves.toBe(answer);
+    expect(ensureExport).toHaveBeenCalledTimes(1);
+    // No ensure / rotate (token creation), and nothing to re-read either.
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('keeps the no-active-token answer when the export rejects', async () => {
+    const answer = { ok: false as const, reason: 'no-active-token' as const };
+    await expect(exportAfterDashboardAnswer(
+      answer,
+      async () => { throw new Error('merlin-cli missing'); },
+      vi.fn(),
+    )).resolves.toBe(answer);
+  });
+
+  it.each([
+    ['unreachable'],
+    ['wrong-service'],
+    ['no-secret'],
+    ['http-error'],
+  ] as const)('never exports on a %s failure (the port is not proven)', async (reason) => {
+    const ensureExport = vi.fn(async () => 'https://devbox.example.com');
+    const callEndpoint = vi.fn();
+    const failure = { ok: false as const, reason };
+    await expect(exportAfterDashboardAnswer(failure, ensureExport, callEndpoint)).resolves.toBe(failure);
+    expect(ensureExport).not.toHaveBeenCalled();
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('exports and re-reads current on a usable link', async () => {
+    const events: string[] = [];
+    await expect(exportAfterDashboardAnswer(
+      { ok: true, url: 'http://127.0.0.1:9002/?t=token' },
+      async () => { events.push('export'); return 'https://devbox.example.com'; },
+      async (path) => { events.push(path); return { ok: true, url: 'https://devbox.example.com/?t=token' }; },
+    )).resolves.toEqual({ ok: true, url: 'https://devbox.example.com/?t=token' });
+    expect(events).toEqual(['export', '/__cli/current']);
+  });
+
+  it('does nothing without a budget (null exporter)', async () => {
+    const callEndpoint = vi.fn();
+    const answer = { ok: false as const, reason: 'no-active-token' as const };
+    await expect(exportAfterDashboardAnswer(answer, null, callEndpoint)).resolves.toBe(answer);
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('the command wrapper exports when its final answer is no-active-token', async () => {
+    // The wrapper routes every final endpoint answer through the helper: a
+    // no-token answer exports, and adds no endpoint call of its own (the only
+    // call below is the command's own rotate).
+    const ensureExport = vi.fn(async () => 'https://devbox.example.com');
+    const paths: string[] = [];
+    const execution = await executeDashboardCommandWithExportRefresh(['rotate'], async (path) => {
+      paths.push(path);
+      return { ok: false, reason: 'no-active-token' };
+    }, ensureExport);
+    expect(execution).toMatchObject({ kind: 'endpoint', result: { ok: false, reason: 'no-active-token' } });
+    expect(ensureExport).toHaveBeenCalledTimes(1);
+    expect(paths).toEqual(['/__cli/rotate']);
   });
 });
 

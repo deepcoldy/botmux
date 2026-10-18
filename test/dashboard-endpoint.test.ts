@@ -701,6 +701,23 @@ describe('PRODUCTION WIRING: `botmux dashboard` recovers the measured failure', 
     expect(body).not.toContain('executeDashboardCliCommand');
   });
 
+  it('printDashboardHintWithRetry exports before branching on a usable link (minimal source pin)', () => {
+    // A fresh Devbox answers no-active-token, which ENDS the poll without a usable
+    // link. Gating the export on `last.ok` (the shape this replaced) silently
+    // skipped it there, leaving every web-terminal link local. exportAfterDashboardAnswer
+    // is behaviourally tested in dashboard-command.test.ts; cli.ts exports nothing,
+    // so pin only that the poll hands it the answer BEFORE the `last.ok` branch.
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
+    const start = src.indexOf('async function printDashboardHintWithRetry(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\n}', start);
+    const body = src.slice(start, end)
+      .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+    const exportAt = body.indexOf('exportAfterDashboardAnswer(');
+    expect(exportAt).toBeGreaterThan(-1);
+    expect(exportAt).toBeLessThan(body.indexOf('if (last.ok)'));
+  });
+
   it('the raw command helper does NOT opt in (the readiness poll shape)', async () => {
     // executeDashboardCommand takes a single-arg caller: the poll passes
     // callDashboardEndpoint directly, so no options object reaches callDashboard

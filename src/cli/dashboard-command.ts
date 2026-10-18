@@ -326,20 +326,56 @@ export async function refreshDashboardResultAfterExport(
   }
 }
 
+/**
+ * Run the best-effort Devbox export once the dashboard has ANSWERED on its
+ * port, then — when the answer is a usable link — re-read `/__cli/current`.
+ *
+ * "Answered" deliberately includes `no-active-token`: the HMAC-gated
+ * `/__cli/current` route replied, so the port is proven (callDashboard() has
+ * healed `.dashboard-port` if it had to) and the dashboard merely has no login
+ * token yet. That is the normal state of a fresh Devbox install where nobody has
+ * run `botmux dashboard`, and the export must still happen there: the tunnel
+ * cache is what `devboxDashboardBaseUrl()` reads for every web-terminal link
+ * (`buildTerminalUrl`, shared by the PTY and tmux backends) and for the CSRF
+ * authority — none of which needs a dashboard token. Gating on a usable link
+ * left those links local until the owner happened to run `botmux dashboard`.
+ * This branch never mints or rotates a token: with no link to refresh, it makes
+ * no endpoint call at all.
+ *
+ * Any other failure proves nothing about which service owns the port, so it
+ * never exports. `ensureExport === null` means the caller has no budget left.
+ */
+export async function exportAfterDashboardAnswer(
+  result: DashboardResult,
+  ensureExport: (() => Promise<string | null>) | null,
+  callEndpoint: (path: DashboardEndpoint) => Promise<DashboardResult>,
+): Promise<DashboardResult> {
+  if (!ensureExport) return result;
+  if (result.ok) return refreshDashboardResultAfterExport(result, ensureExport, callEndpoint);
+  if (result.reason !== 'no-active-token') return result;
+  try {
+    await ensureExport();
+  } catch {
+    // Best effort, exactly like the usable-link branch: keep the answer.
+  }
+  return result;
+}
+
 /** Execute the user-facing command first, then add the Devbox export as a
- * post-success enhancement. Keeping that order in one tested helper prevents a
- * future refactor from exporting the configured/stale port before endpoint
- * discovery has identified the live dashboard. */
+ * post-answer enhancement (see {@link exportAfterDashboardAnswer}). Keeping that
+ * order in one tested helper prevents a future refactor from exporting the
+ * configured/stale port before endpoint discovery has identified the live
+ * dashboard. */
 export async function executeDashboardCommandWithExportRefresh(
   args: readonly string[],
   callEndpoint: (path: DashboardEndpoint) => Promise<DashboardResult>,
   ensureExport: () => Promise<string | null>,
 ): Promise<DashboardCommandExecution> {
   const execution = await executeDashboardCommand(args, callEndpoint);
-  if (execution.kind !== 'endpoint' || !execution.result.ok) return execution;
+  if (execution.kind !== 'endpoint') return execution;
   return {
     ...execution,
-    result: await refreshDashboardResultAfterExport(execution.result, ensureExport, callEndpoint),
+    result: await exportAfterDashboardAnswer(execution.result, ensureExport, callEndpoint),
   };
 }
 
@@ -427,7 +463,7 @@ export async function executeDashboardCommand(
  *
  * When `ensureExport` is given (the real CLI always passes it), the Devbox export
  * runs through {@link executeDashboardCommandWithExportRefresh}: only after the
- * first endpoint call succeeded, and the post-export re-read carries the same
+ * dashboard answered on its port, and the post-export re-read carries the same
  * opt-in as every other call this wrapper makes.
  *
  * @param callEndpoint the raw endpoint caller; this wrapper is what adds the opt-in

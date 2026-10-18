@@ -849,4 +849,72 @@ describe('devboxDashboardBaseUrl', () => {
       afterPortDrift: 'https://fresh-9002.example.com',
     });
   });
+
+  // End to end on the production paths: a fresh Devbox dashboard that has no
+  // login token yet answers `/__cli/current` with no-active-token. The export
+  // must still happen on that answer, because the web-terminal links — one
+  // builder, `buildTerminalUrl`, for the PTY and tmux backends alike — read only
+  // the export cache. Gating the export on a usable dashboard link left them
+  // local until the owner ran `botmux dashboard`.
+  it('a no-active-token dashboard answer still exports, and terminal links switch to the tunnel', () => {
+    const home = tmpDir();
+    const configDir = join(home, '.botmux');
+    mkdirSync(configDir, { mode: 0o700 });
+    chmodSync(configDir, 0o700);
+    writeFileSync(join(configDir, '.dashboard-port'), '9001\n', { mode: 0o600 });
+
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      ARNOLD_WORKSPACE_ID: 'probe',
+      PORT_LIST: '9001',
+    };
+    delete childEnv.BOTMUX_DEVBOX_AUTO_EXPORT;
+    delete childEnv.BOTMUX_PUBLIC_URL;
+    const child = spawnSyncTsEvalWithRepoImports(`
+      const { exportAfterDashboardAnswer } = await import('./src/cli/dashboard-command.js');
+      const { ensureDevboxDashboardExport } = await import('./src/platform/devbox-dashboard-export.js');
+      const { buildTerminalUrl, setTerminalProxyPort } = await import('./src/core/terminal-url.js');
+      setTerminalProxyPort(17001);
+      const ds = {
+        session: { sessionId: 'sess-1' },
+        workerPort: 17002,
+        workerToken: 'wtok',
+        workerViewToken: 'vtok',
+      };
+      const before = buildTerminalUrl(ds);
+      const endpointCalls = [];
+      const answer = await exportAfterDashboardAnswer(
+        { ok: false, reason: 'no-active-token' },
+        () => ensureDevboxDashboardExport({
+          port: 9001,
+          remoteBaseConfigured: false,
+          merlinCliPath: '/fake/merlin-cli',
+          runExport: async () => ({ stdout: '${PRIVATE_RESULT}', stderr: '' }),
+        }),
+        async (path) => { endpointCalls.push(path); return { ok: false, reason: 'unreachable' }; },
+      );
+      console.log(JSON.stringify({
+        before,
+        answer,
+        endpointCalls,
+        readLink: buildTerminalUrl(ds),
+        writeLink: buildTerminalUrl(ds, { write: true }),
+      }));
+    `, {
+      cwd: process.cwd(),
+      env: childEnv,
+      encoding: 'utf8',
+    });
+    expect(child.status, child.stderr?.toString()).toBe(0);
+    const out = JSON.parse(child.stdout.toString().trim().split('\n').at(-1) ?? '');
+    expect(out.before).not.toContain('devbox.example.com');
+    expect(out).toMatchObject({
+      answer: { ok: false, reason: 'no-active-token' },
+      // No token was minted or rotated: the helper made no endpoint call at all.
+      endpointCalls: [],
+      readLink: 'https://devbox.example.com/s/sess-1?viewToken=vtok',
+      writeLink: 'https://devbox.example.com/s/sess-1?token=wtok',
+    });
+  });
 });

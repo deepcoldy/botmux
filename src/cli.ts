@@ -214,10 +214,10 @@ import {
   dashboardExportTimeoutForBudget,
   dashboardFailureIsTerminal,
   executeDashboardCliCommand,
+  exportAfterDashboardAnswer,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
   formatDashboardUnreachable,
-  refreshDashboardResultAfterExport,
   shouldKeepWaitingForDashboard,
 } from './cli/dashboard-command.js';
 import {
@@ -3772,21 +3772,22 @@ async function printDashboardHintWithRetry(): Promise<void> {
     // accepts the connection and never answers would hang here forever and never
     // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
     last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
+    // 导出放在 dashboard 在其端口上应答之后（callDashboard 可能自愈
+    // `.dashboard-port`）。「应答」包含 `no-active-token`：全新 Devbox 上没人跑过
+    // `botmux dashboard` 时就是这个状态，此时也要导出——终端链接（PTY/tmux 共用的
+    // buildTerminalUrl）与 CSRF authority 只读导出缓存、不需要 dashboard token。
+    // 拿到可用链接时再用不轮换的 current 重读一次；no-active-token 不调任何
+    // endpoint，绝不创建/轮换 token。两者都结束本循环，所以只导出一次。导出超时
+    // 按剩余预算钳制，重读与轮询同样带 requestTimeoutMs。
+    const exportTimeoutMs = dashboardExportTimeoutForBudget(
+      DASHBOARD_READY_WAIT_MS - (Date.now() - started),
+    );
+    last = await exportAfterDashboardAnswer(
+      last,
+      exportTimeoutMs === null ? null : () => ensureDevboxDashboardExportForCurrentPort(exportTimeoutMs),
+      path => callDashboardEndpoint(path, { requestTimeoutMs: stepMs * 4 }),
+    );
     if (last.ok) {
-      // 导出放在 endpoint 证明了 dashboard 实际占用的端口之后（callDashboard 可能
-      // 自愈 `.dashboard-port`），只做一次，再用不轮换的 current 重读一次，让这条
-      // 提示直接拿到导出后的链接。导出超时按本函数剩余预算钳制；刷新那次请求与
-      // 轮询同样带 requestTimeoutMs，dashboard 半死不活时不会无上限地卡住。
-      const exportTimeoutMs = dashboardExportTimeoutForBudget(
-        DASHBOARD_READY_WAIT_MS - (Date.now() - started),
-      );
-      if (exportTimeoutMs !== null) {
-        last = await refreshDashboardResultAfterExport(
-          last,
-          () => ensureDevboxDashboardExportForCurrentPort(exportTimeoutMs),
-          path => callDashboardEndpoint(path, { requestTimeoutMs: stepMs * 4 }),
-        );
-      }
       // 与 `botmux dashboard` 同一套收敛：绑定中心化平台 / 自建反代后链接不带
       // token（`localUrl` 有值就是这一位），本地直连那条带 token，默认不打印。
       // 这段输出会被大模型读进上下文，所以第一行之外的安全提示也一起给。
