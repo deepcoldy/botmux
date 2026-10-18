@@ -276,6 +276,31 @@ export function parseDurablePrimarySessionRecord(record: DurableSessionRecord): 
   return { session, admission, admissions, controls };
 }
 
+/**
+ * Project a storage page for read-only management views. A single malformed
+ * legacy/corrupt primary row must remain quarantined instead of taking the
+ * whole Dashboard offline; mutation paths still use the strict parser above
+ * and therefore continue to fail closed for that row.
+ */
+export function listValidDurablePrimarySessions(
+  records: readonly DurableSessionRecord[],
+  larkAppId: string,
+  onInvalid?: (record: DurableSessionRecord, error: unknown) => void,
+): Session[] {
+  const sessions: Session[] = [];
+  for (const record of records) {
+    const value = object(record.value);
+    if (value?.type !== 'botmux.session.primary') continue;
+    try {
+      const session = parseDurablePrimarySessionRecord(record).session;
+      if (session.larkAppId === larkAppId) sessions.push(session);
+    } catch (error) {
+      onInvalid?.(record, error);
+    }
+  }
+  return sessions;
+}
+
 function mergePrimaryProjection(
   current: DurableSessionRecord | undefined,
   next: DurablePrimarySessionProjection,

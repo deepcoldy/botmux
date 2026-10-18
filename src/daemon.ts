@@ -125,6 +125,7 @@ import {
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import {
   claimDurableLarkActiveSession,
+  listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
@@ -30593,13 +30594,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ...(afterSessionKey ? { afterSessionKey } : {}),
           limit: 256,
         });
-        for (const item of listed.records) {
-          const value = item.value && typeof item.value === 'object' && !Array.isArray(item.value)
-            ? item.value as Record<string, unknown>
-            : undefined;
-          if (value?.type !== 'botmux.session.primary') continue;
-          const session = parseDurablePrimarySessionRecord(item).session;
-          if (session.larkAppId === cfg.larkAppId) sessions.set(session.sessionId, session);
+        for (const session of listValidDurablePrimarySessions(
+          listed.records,
+          cfg.larkAppId,
+          (record, error) => logger.warn(
+            `[dashboard] quarantined invalid canonical Session ${record.sessionKey}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ),
+        )) {
+          sessions.set(session.sessionId, session);
         }
         if (!listed.nextSessionKey) return [...sessions.values()];
         afterSessionKey = listed.nextSessionKey;
