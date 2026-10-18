@@ -48,6 +48,15 @@ export interface DurableLarkSessionControlRuntimeOptions {
   getPersistedSession(sessionId: string): Session | undefined;
   /** Import a canonical closed snapshot into this replica's local runtime store. */
   materializeClosedSession(session: Session): Session;
+  /**
+   * Claim and materialize a canonical active Session on this replica before a
+   * lifecycle operation. The callback must cross the distributed Session lease
+   * fence before installing any local runtime state.
+   */
+  takeOverActiveSession?(
+    sessionKey: string,
+    canonical: Session,
+  ): Promise<Session | undefined>;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
@@ -160,23 +169,30 @@ export function createDurableLarkSessionControlRuntime(
       return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
     }
 
-    const live = options.findActiveSession(control.sessionId);
+    let live = options.findActiveSession(control.sessionId);
     let persisted = options.getPersistedSession(control.sessionId);
-    if (control.action === 'resume' && !persisted) {
-      persisted = options.materializeClosedSession(structuredClone(canonicalSession));
-    }
-    const session = live?.session ?? persisted ?? canonicalSession;
     if (control.action === 'close' && canonicalSession.status === 'active') {
       if (!live) {
-        // Prefix fallback may discover an active Session owned by another Pod.
-        // Keep the Inbox row retryable; completing it as ignored would lose the
-        // user's close request before the exact runtime owner can claim it.
-        throw new Error('active control target is not local to this replica');
+        // Prefix fallback may discover an active Session whose prior owner is
+        // gone. Cross the same Session lease + Remote Runner takeover boundary
+        // as a normal follow-up before exposing closeSession to local state.
+        // While the old owner is still live this remains retryable; once its
+        // lease expires, any replica can materialize and apply the control.
+        await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+        live = options.findActiveSession(control.sessionId);
+        persisted = options.getPersistedSession(control.sessionId);
+        if (!live || live.session.sessionId !== canonicalSession.sessionId) {
+          throw new Error('active control target could not be taken over by this replica');
+        }
       }
       if (live.streamCardId !== control.cardMessageId) {
         return { kind: 'ignored', reason: 'close card no longer owns the active Session lifecycle' };
       }
     }
+    if (control.action === 'resume' && !persisted) {
+      persisted = options.materializeClosedSession(structuredClone(canonicalSession));
+    }
+    const session = live?.session ?? persisted ?? canonicalSession;
     if (control.action === 'resume' && !live && persisted?.status !== 'closed') {
       throw new Error('canonical closed Session could not be materialized locally');
     }

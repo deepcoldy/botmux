@@ -30160,6 +30160,46 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         let primaryControlRuntime: ReturnType<
           typeof createDurableLarkSessionControlRuntime
         > | undefined;
+        const takeOverPrimarySession = async (
+          stableKey: string,
+          canonical: Session,
+        ): Promise<Session | undefined> => {
+          if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+          try {
+            const claimed = await claimDurableLarkActiveSession({
+              facade: primaryRuntime.session,
+              sessionKey: stableKey,
+              expectedSessionId: canonical.sessionId,
+              expectedLarkAppId: cfg.larkAppId,
+            });
+            if (claimed.kind !== 'claimed') {
+              throw new Error(
+                claimed.kind === 'occupied'
+                  ? `durable active takeover Session is occupied by ${claimed.ownerId}`
+                  : `durable active takeover claim failed: ${claimed.kind}`,
+              );
+            }
+            const local = activeSessions.get(stableKey);
+            if (local?.session.sessionId === claimed.session.sessionId
+                && local.session.status === 'active') {
+              return local.session;
+            }
+            const takeover = await takeOverDurableActiveRemoteSession(
+              claimed.session,
+              activeSessions,
+            );
+            if (!takeover.ok) {
+              throw new Error(
+                `durable active takeover failed: ${takeover.error}`
+                + (takeover.detail ? ` (${takeover.detail})` : ''),
+              );
+            }
+            return takeover.ds.session;
+          } catch (error) {
+            await primaryRuntime.session.releaseLease(stableKey);
+            throw error;
+          }
+        };
         const eventRuntime = createLarkEventDispatcherRuntime(
           cfg.larkAppId,
           cfg.larkAppSecret,
@@ -30185,43 +30225,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
             },
-            takeOverPrimarySession: async (stableKey, canonical) => {
-              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
-              try {
-                const claimed = await claimDurableLarkActiveSession({
-                  facade: primaryRuntime.session,
-                  sessionKey: stableKey,
-                  expectedSessionId: canonical.sessionId,
-                  expectedLarkAppId: cfg.larkAppId,
-                });
-                if (claimed.kind !== 'claimed') {
-                  throw new Error(
-                    claimed.kind === 'occupied'
-                      ? `durable active takeover Session is occupied by ${claimed.ownerId}`
-                      : `durable active takeover claim failed: ${claimed.kind}`,
-                  );
-                }
-                const local = activeSessions.get(stableKey);
-                if (local?.session.sessionId === claimed.session.sessionId
-                    && local.session.status === 'active') {
-                  return local.session;
-                }
-                const takeover = await takeOverDurableActiveRemoteSession(
-                  claimed.session,
-                  activeSessions,
-                );
-                if (!takeover.ok) {
-                  throw new Error(
-                    `durable active takeover failed: ${takeover.error}`
-                    + (takeover.detail ? ` (${takeover.detail})` : ''),
-                  );
-                }
-                return takeover.ds.session;
-              } catch (error) {
-                await primaryRuntime.session.releaseLease(stableKey);
-                throw error;
-              }
-            },
+            takeOverPrimarySession,
           },
         );
         startEventDispatchers.push(() => {
@@ -30255,6 +30259,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               }
               return materialized;
             },
+            takeOverActiveSession: takeOverPrimarySession,
             canOperate: (chatId, operatorOpenId) =>
               canOperate(cfg.larkAppId, chatId, operatorOpenId),
             closeSession: sessionId => closeSessionHelper(sessionId, {
