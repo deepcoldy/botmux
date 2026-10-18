@@ -725,6 +725,7 @@ import {
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
+import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
 import { clearAllSessionIdentities } from './cli-identity.js';
@@ -2875,6 +2876,22 @@ function isRunnerDeliveryCli(cliId?: string): boolean {
   return cliId === 'mira' || cliId === 'mir' || cliId === 'dsh';
 }
 
+/** A topic opened by `botmux dispatch` carries a verified report binding: its
+ *  brief asks the worker to `botmux report --dispatch-root`, which reaches the
+ *  dispatcher's own session outside this topic. Addressing the dispatcher in
+ *  this topic instead starts a fresh dispatcher session with no context (#1887). */
+function topicReportsToDispatcher(ds: DaemonSession): boolean {
+  try {
+    const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
+    return resolveVerifiedDispatchReportTarget({
+      registry, dispatchRoot: ds.session.rootMessageId,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    }).ok;
+  } catch {
+    return false;
+  }
+}
+
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
   if (!owner) {
@@ -2882,7 +2899,8 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
     // `botmux send` to @-trigger a peer bot. For bot-to-bot handoffs, address
     // the daemon fallback card back to the original dispatcher so orchestration
     // resumes (the card's real <at> is what re-wakes the dispatching bot).
-    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId
+      && !topicReportsToDispatcher(ds)) {
       return ds.session.creatorOpenId;
     }
     return undefined;
@@ -2894,7 +2912,7 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
       // senders). Same constraint for the stdout-runner CLIs (mira/mir): the
       // daemon fallback card is their only @-trigger channel, so address the
       // dispatcher bot here too.
-      return isRunnerDeliveryCli(effectiveCliId) ? owner : undefined;
+      return isRunnerDeliveryCli(effectiveCliId) && !topicReportsToDispatcher(ds) ? owner : undefined;
     }
     return owner;
   } catch {

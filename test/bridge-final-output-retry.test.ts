@@ -2783,6 +2783,78 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('<at id=ou_orch_bot></at>');
   });
 
+  describe('in a topic opened by botmux dispatch', () => {
+    // The dispatcher already gets the result through `botmux report
+    // --dispatch-root`; an @ in the sub-topic only starts a fresh dispatcher
+    // session there without the dispatch context (#1887).
+    async function bindTopicToDispatcher(tamper = false): Promise<void> {
+      vi.stubEnv('BOTMUX_CORE_ONLY', '1');
+      const { createDispatchReportBinding, loadOrCreateDispatchReportBindingSecret } = await import('../src/core/dispatch-report-binding.js');
+      const reportBinding = createDispatchReportBinding(loadOrCreateDispatchReportBindingSecret(config.session.dataDir), {
+        dispatchRoot: 'om_root', targetLarkAppId: 'cli_orchestrator', targetSessionId: 'session-orchestrator',
+        targetChatId: 'oc_chat', targetScope: 'chat', sourceName: 'review', issuedAt: '2026-10-18T00:00:00.000Z',
+      });
+      if (tamper) reportBinding.signature = 'forged';
+      writeFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding } }));
+    }
+
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    async function deliverDispatchedFinal(ds: DaemonSession): Promise<string> {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      return String(sessionReply.mock.calls[0][1]);
+    }
+
+    function dispatchedRunnerDs(cliId: string): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.ownerOpenId = undefined;
+      ds.ownerOpenId = undefined;
+      ds.session.creatorOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      return ds;
+    }
+
+    it.each(['mira', 'mir', 'dsh'] as const)('does not address %s fallback output to the dispatcher', async (cliId) => {
+      await bindTopicToDispatcher();
+      const card = await deliverDispatchedFinal(dispatchedRunnerDs(cliId));
+      expect(card).toContain('final answer');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('does not address a known-bot owner either (/repo-primed dispatch)', async () => {
+      await bindTopicToDispatcher();
+      writeFileSync(join(config.session.dataDir, 'bot-openids-app_test.json'), JSON.stringify({ Orchestrator: 'ou_orch_bot' }));
+      const ds = dispatchedRunnerDs('mira');
+      ds.session.ownerOpenId = 'ou_orch_bot';
+      ds.ownerOpenId = 'ou_orch_bot';
+      expect(await deliverDispatchedFinal(ds)).not.toContain('ou_orch_bot');
+    });
+
+    it('still @mentions the bot admin when the dispatched turn failed', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_notice');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(dispatchedRunnerDs('dsh'), { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      const card = String(sessionReply.mock.calls[0][1]);
+      expect(card).toContain('<at id=ou_admin_human></at>');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('keeps addressing the dispatcher when the topic binding does not verify', async () => {
+      await bindTopicToDispatcher(true);
+      expect(await deliverDispatchedFinal(dispatchedRunnerDs('dsh'))).toContain('<at id=ou_dispatcher_bot></at>');
+    });
+  });
+
   it('keeps daemon final-output footer addressing for a human owner', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
