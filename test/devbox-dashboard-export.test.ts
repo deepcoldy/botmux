@@ -613,6 +613,16 @@ describe('ensureDevboxDashboardExport', () => {
     const home = tmpDir();
     mkdirSync(join(home, '.botmux'), { mode: 0o700 });
     writeFileSync(join(home, '.botmux', '.env'), 'BOTMUX_DEVBOX_AUTO_EXPORT=0\n', { mode: 0o600 });
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      ARNOLD_WORKSPACE_ID: 'probe',
+      PORT_LIST: '9001',
+    };
+    // An inherited value wins over the fixture file (dotenv precedence), so a
+    // shell exporting the switch as 1 OR 0 would make this case measure the
+    // shell instead of the file.
+    delete childEnv.BOTMUX_DEVBOX_AUTO_EXPORT;
     const child = spawnSyncTsEvalWithRepoImports(`
       const { ensureDevboxDashboardExport } = await import('./src/platform/devbox-dashboard-export.js');
       const defaultsToRead = await ensureDevboxDashboardExport({
@@ -638,12 +648,7 @@ describe('ensureDevboxDashboardExport', () => {
       console.log(JSON.stringify({ defaultsToRead, explicitlyIgnored }));
     `, {
       cwd: process.cwd(),
-      env: {
-        ...process.env,
-        HOME: home,
-        ARNOLD_WORKSPACE_ID: 'probe',
-        PORT_LIST: '9001',
-      },
+      env: childEnv,
       encoding: 'utf8',
     });
     expect(child.status, child.stderr?.toString()).toBe(0);
