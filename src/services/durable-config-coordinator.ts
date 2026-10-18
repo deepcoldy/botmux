@@ -14,7 +14,7 @@ const RECORD_VERSION = 1;
 const MAX_AUDIT_ENTRIES = 64;
 const LEASE_DURATION_MS = 300_000;
 
-export type DurableConfigScope = 'bots' | 'global';
+export type DurableConfigScope = 'bots' | 'global' | 'group-context';
 
 interface ConfigAuditEntry {
   operationId: string;
@@ -68,7 +68,9 @@ function parseConfigBytes(scope: DurableConfigScope, bytes: Buffer): unknown {
       throw new Error('durable_bots_config_invalid_shape');
     }
   } else if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('durable_global_config_invalid_shape');
+    throw new Error(scope === 'global'
+      ? 'durable_global_config_invalid_shape'
+      : 'durable_group_context_config_invalid_shape');
   }
   return parsed;
 }
@@ -82,7 +84,11 @@ async function snapshot(scope: DurableConfigScope, path: string): Promise<{
     bytes = await readFile(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    bytes = Buffer.from(scope === 'bots' ? '[]\n' : '{}\n', 'utf8');
+    bytes = Buffer.from(scope === 'bots'
+      ? '[]\n'
+      : scope === 'group-context'
+        ? '{"schemaVersion":1,"configs":{}}\n'
+        : '{}\n', 'utf8');
   }
   return { sha256: sha256(bytes), parsed: parseConfigBytes(scope, bytes) };
 }
@@ -90,6 +96,24 @@ async function snapshot(scope: DurableConfigScope, path: string): Promise<{
 function configMap(scope: DurableConfigScope, value: unknown): Map<string, unknown> {
   if (scope === 'global') {
     return new Map(Object.entries(value as Record<string, unknown>));
+  }
+  if (scope === 'group-context') {
+    const registry = value as Record<string, unknown>;
+    const configs = registry.configs && typeof registry.configs === 'object' && !Array.isArray(registry.configs)
+      ? registry.configs as Record<string, unknown>
+      : {};
+    const out = new Map<string, unknown>();
+    out.set('schemaVersion', registry.schemaVersion);
+    for (const [chatId, settings] of Object.entries(configs)) {
+      if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+        out.set(`configs.${chatId}`, settings);
+        continue;
+      }
+      for (const [key, field] of Object.entries(settings)) {
+        out.set(`configs.${chatId}.${key}`, field);
+      }
+    }
+    return out;
   }
   const entries = value as Array<Record<string, unknown>>;
   const out = new Map<string, unknown>();

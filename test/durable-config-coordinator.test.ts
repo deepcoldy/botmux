@@ -56,6 +56,28 @@ describe('durable config coordinator', () => {
     await store.close();
   });
 
+  it('isolates group-context configuration from the global config CAS key', async () => {
+    const { store, coordinator } = fixture();
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-group-context-'));
+    dirs.push(dir);
+    const path = join(dir, 'group-context-settings.json');
+    await coordinator.run({
+      scope: 'group-context',
+      path,
+      mutation: async () => {
+        writeFileSync(path, JSON.stringify({
+          schemaVersion: 1,
+          configs: { oc_group: { enabled: true } },
+        }) + '\n');
+      },
+    });
+
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::group-context'))
+      .toMatchObject({ revision: 2, value: { phase: 'committed', scope: 'group-context' } });
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global')).toBeUndefined();
+    await store.close();
+  });
+
   it('rejects another writer while the config lease is held', async () => {
     const { path, store, coordinator } = fixture();
     const peer = createDurableConfigCoordinator({ store, ownerId: 'config-peer' });
