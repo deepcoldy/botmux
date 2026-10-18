@@ -1654,7 +1654,38 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
-  it('backfills the failover window before releasing realtime primary messages', async () => {
+  it('durably accepts a first p2p message without primary recovery leadership', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const handlers = makeHandlers();
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'first private turn' }),
+      messageId: 'om_primary_first_p2p',
+      chatId: 'oc_first_p2p',
+      chatType: 'p2p',
+    });
+
+    await expect(capturedHandlers['im.message.receive_v1'](data)).resolves.toBeUndefined();
+    expect(enqueuePrimary).toHaveBeenCalledWith({
+      eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_first_p2p`,
+      partitionKey: `lark-message-routing:${MY_APP_ID}:oc_first_p2p`,
+      data,
+    });
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('persists realtime primary messages while the elected replica backfills history', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();
     let releaseChats!: (value: Array<{ chatId: string; chatMode?: string }>) => void;
@@ -1678,7 +1709,11 @@ describe('Lark event dispatcher — durable primary processor', () => {
       })]);
     const order: string[] = [];
     const enqueuePrimary = vi.fn(async (input: any) => {
-      order.push(input.eventId);
+      order.push(`live:${input.eventId}`);
+      return { kind: 'inserted' as const };
+    });
+    const enqueuePrimaryRecovery = vi.fn(async (input: any) => {
+      order.push(`recovery:${input.eventId}`);
       return { kind: 'inserted' as const };
     });
     const runtime = createLarkEventDispatcherRuntime(
@@ -1687,7 +1722,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       handlers,
       'feishu',
       undefined,
-      { enqueuePrimary, primaryRecoverySettleMs: 0 },
+      { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
     );
     const leadership = new AbortController();
     const recovery = runtime.connectPrimary({ signal: leadership.signal });
@@ -1700,24 +1735,23 @@ describe('Lark event dispatcher — durable primary processor', () => {
     });
 
     const liveAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](live));
-    await Promise.resolve();
-    expect(enqueuePrimary).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+    await liveAck;
 
     releaseChats([{ chatId: 'chat-primary', chatMode: 'group' }]);
     await vi.waitFor(() => expect(mockListChatMessagesUntil).toHaveBeenCalledOnce());
     capturedWsClientOptions?.onReady?.();
     await recovery.ready;
-    await liveAck;
 
     expect(order).toEqual([
-      `im.message.receive_v1:${MY_APP_ID}:om_primary_recovered`,
-      `im.message.receive_v1:${MY_APP_ID}:om_primary_handshake_gap`,
-      `im.message.receive_v1:${MY_APP_ID}:om_primary_handshake_gap`,
-      `im.message.receive_v1:${MY_APP_ID}:om_primary_live`,
+      `live:im.message.receive_v1:${MY_APP_ID}:om_primary_live`,
+      `recovery:im.message.receive_v1:${MY_APP_ID}:om_primary_recovered`,
+      `recovery:im.message.receive_v1:${MY_APP_ID}:om_primary_handshake_gap`,
+      `recovery:im.message.receive_v1:${MY_APP_ID}:om_primary_handshake_gap`,
     ]);
     expect(mockListChats).toHaveBeenCalledTimes(3);
     expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(3);
-    expect(enqueuePrimary).toHaveBeenNthCalledWith(1, {
+    expect(enqueuePrimaryRecovery).toHaveBeenNthCalledWith(1, {
       eventId: `im.message.receive_v1:${MY_APP_ID}:om_primary_recovered`,
       partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
       data: expect.objectContaining({
@@ -1733,6 +1767,33 @@ describe('Lark event dispatcher — durable primary processor', () => {
         }),
       }),
     });
+    leadership.abort();
+    runtime.close();
+  });
+
+  it('starts leader recovery after an already-connected standby transport becomes owner', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockListChats.mockResolvedValue([]);
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const enqueuePrimaryRecovery = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      makeHandlers(),
+      'feishu',
+      undefined,
+      { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
+    );
+    const client = runtime.connect();
+    capturedWsClientOptions?.onReady?.();
+    const leadership = new AbortController();
+
+    const recovery = runtime.connectPrimary({ signal: leadership.signal });
+    expect(recovery.client).toBe(client);
+    await recovery.ready;
+
+    expect(mockListChats).toHaveBeenCalledTimes(3);
+    expect(enqueuePrimaryRecovery).not.toHaveBeenCalled();
     leadership.abort();
     runtime.close();
   });
@@ -1835,7 +1896,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     }
   });
 
-  it('keeps realtime ACKs closed and retries when takeover reconciliation fails transiently', async () => {
+  it('keeps realtime ACKs independent while history recovery retries transient failures', async () => {
     vi.useFakeTimers();
     const leadership = new AbortController();
     try {
@@ -1844,13 +1905,14 @@ describe('Lark event dispatcher — durable primary processor', () => {
         .mockRejectedValueOnce(new Error('temporary list failure'))
         .mockResolvedValueOnce([]);
       const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const enqueuePrimaryRecovery = vi.fn(async () => ({ kind: 'inserted' as const }));
       const runtime = createLarkEventDispatcherRuntime(
         MY_APP_ID,
         'secret',
         makeHandlers(),
         'feishu',
         undefined,
-        { enqueuePrimary, primaryRecoverySettleMs: 0 },
+        { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
       );
       const recovery = runtime.connectPrimary({ signal: leadership.signal });
       capturedWsClientOptions?.onReady?.();
@@ -1865,13 +1927,14 @@ describe('Lark event dispatcher — durable primary processor', () => {
 
       await vi.advanceTimersByTimeAsync(999);
       expect(mockListChats).toHaveBeenCalledOnce();
-      expect(enqueuePrimary).not.toHaveBeenCalled();
+      expect(enqueuePrimary).toHaveBeenCalledOnce();
+      await liveAck;
       await vi.advanceTimersByTimeAsync(1);
       await recovery.ready;
-      await liveAck;
 
       expect(mockListChats).toHaveBeenCalledTimes(4);
       expect(enqueuePrimary).toHaveBeenCalledOnce();
+      expect(enqueuePrimaryRecovery).not.toHaveBeenCalled();
       leadership.abort();
       runtime.close();
     } finally {
@@ -1934,13 +1997,14 @@ describe('Lark event dispatcher — durable primary processor', () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockListChats.mockResolvedValueOnce([]);
     const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const enqueuePrimaryRecovery = vi.fn(async () => ({ kind: 'inserted' as const }));
     const runtime = createLarkEventDispatcherRuntime(
       MY_APP_ID,
       'secret',
       makeHandlers(),
       'feishu',
       undefined,
-      { enqueuePrimary, primaryRecoverySettleMs: 0 },
+      { enqueuePrimary, enqueuePrimaryRecovery, primaryRecoverySettleMs: 0 },
     );
     const leadership = new AbortController();
     const initial = runtime.connectPrimary({ signal: leadership.signal });
@@ -1958,16 +2022,15 @@ describe('Lark event dispatcher — durable primary processor', () => {
       chatType: 'group',
     });
     const liveAck = Promise.resolve(capturedHandlers['im.message.receive_v1'](live));
-    await Promise.resolve();
-    expect(enqueuePrimary).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(enqueuePrimary).toHaveBeenCalledOnce());
+    await liveAck;
 
     releaseReconnectScan([]);
     await vi.waitFor(() => expect(mockListChats).toHaveBeenCalledTimes(4));
     capturedWsClientOptions?.onReconnected?.();
-    await liveAck;
-
-    expect(mockListChats).toHaveBeenCalledTimes(6);
+    await vi.waitFor(() => expect(mockListChats).toHaveBeenCalledTimes(6));
     expect(enqueuePrimary).toHaveBeenCalledOnce();
+    expect(enqueuePrimaryRecovery).not.toHaveBeenCalled();
     leadership.abort();
     runtime.close();
   });

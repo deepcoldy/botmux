@@ -4428,7 +4428,17 @@ export interface LarkEventDispatcherRuntime {
 }
 
 export interface LarkEventDispatcherRuntimeOptions {
+  /** Realtime event ingress. In primary multi-replica mode every connected
+   * Lark SDK client must be allowed to persist the event selected for it. */
   enqueuePrimary?: (input: {
+    eventId: string;
+    eventType?: DurableLarkMessageEventType;
+    partitionKey: string;
+    data: unknown;
+  }) => Promise<unknown>;
+  /** Leader-fenced history recovery ingress. Defaults to enqueuePrimary for
+   * backward compatibility with single-replica callers and tests. */
+  enqueuePrimaryRecovery?: (input: {
     eventId: string;
     eventType?: DurableLarkMessageEventType;
     partitionKey: string;
@@ -4465,7 +4475,8 @@ interface PrimaryProcessContext {
   context: DurableLarkCanonicalHandlerContext;
 }
 
-/** Build routing once; leadership decides whether this replica connects WS. */
+/** Build routing once. In primary mode every replica connects WS; the
+ * application lease elects only the replica that performs history recovery. */
 export function createLarkEventDispatcherRuntime(
   larkAppId: string,
   larkAppSecret: string,
@@ -5912,21 +5923,6 @@ export function createLarkEventDispatcherRuntime(
     runtimeOptions.primaryRecoverySettleMs ?? PRIMARY_INGRESS_RECOVERY_SETTLE_MS,
   ));
 
-  const enqueuePrimaryAfterRecovery = (
-    input: Parameters<NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>>[0],
-  ): Promise<unknown> => {
-    const enqueue = runtimeOptions.enqueuePrimary;
-    if (!enqueue) return Promise.reject(new Error('durable primary enqueue is not configured'));
-    const recovery = primaryRecovery;
-    if (!recovery) return enqueue(input);
-    return recovery.ready.then(() => {
-      if (recovery.controller.signal.aborted || primaryRecovery !== recovery) {
-        throw new Error('durable primary ingress leadership changed during recovery');
-      }
-      return enqueue(input);
-    });
-  };
-
   type PrimaryIngressInput = Parameters<
     NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>
   >[0];
@@ -5945,11 +5941,14 @@ export function createLarkEventDispatcherRuntime(
       .then(async () => {
         try {
           const input = await buildInput();
-          // Register the recovery continuation or concrete partition tail
-          // before releasing the app-wide arrival slot. The durable write is
-          // still awaited only by this event's ACK, so different chats retain
-          // their normal database concurrency.
-          void enqueuePrimaryAfterRecovery(input).then(resolveAck, rejectAck);
+          // Register the concrete partition tail before releasing the app-wide
+          // arrival slot. In primary multi-replica mode this write is valid on
+          // every SDK client: Feishu uses cluster delivery and randomly picks
+          // one connected client, so standby sockets cannot wait for the
+          // recovery-leader gate before durably accepting realtime events.
+          const enqueue = runtimeOptions.enqueuePrimary;
+          if (!enqueue) throw new Error('durable primary enqueue is not configured');
+          void enqueue(input).then(resolveAck, rejectAck);
         } catch (error) {
           rejectAck(error);
         }
@@ -6306,12 +6305,13 @@ export function createLarkEventDispatcherRuntime(
     leadershipSignal: AbortSignal;
     resolve: () => void;
   } | undefined;
+  let primaryTransportReady = false;
 
   const beginPrimaryRecovery = (
     leadershipSignal: AbortSignal,
     afterFirstPass?: Promise<void>,
   ): Promise<void> => {
-    const enqueue = runtimeOptions.enqueuePrimary;
+    const enqueue = runtimeOptions.enqueuePrimaryRecovery ?? runtimeOptions.enqueuePrimary;
     if (!enqueue) throw new Error('durable primary recovery requires enqueuePrimary');
     primaryRecovery?.controller.abort(new Error('durable primary ingress recovery superseded'));
     const controller = new AbortController();
@@ -6428,6 +6428,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const settlePrimaryTransportReady = (): void => {
+    primaryTransportReady = true;
     const pending = pendingTransportReady;
     if (!pending || pending.leadershipSignal.aborted
         || pending.leadershipSignal !== primaryLeadershipSignal) return;
@@ -6436,6 +6437,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const restartPrimaryTransportRecovery = (): void => {
+    primaryTransportReady = false;
     if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
         || primaryLeadershipSignal.aborted) return;
     const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
@@ -6490,7 +6492,9 @@ export function createLarkEventDispatcherRuntime(
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
-    const ready = armPrimaryTransportRecovery(input.signal);
+    const ready = primaryTransportReady
+      ? beginPrimaryRecovery(input.signal, Promise.resolve())
+      : armPrimaryTransportRecovery(input.signal);
     const client = connect();
     return { client, ready };
   };
@@ -6503,6 +6507,7 @@ export function createLarkEventDispatcherRuntime(
       primaryRecovery = undefined;
       primaryLeadershipSignal = undefined;
       pendingTransportReady = undefined;
+      primaryTransportReady = false;
       if (listenerPollTimer) clearInterval(listenerPollTimer);
       if (initialListenerPollTimer) clearTimeout(initialListenerPollTimer);
       listenerPollTimer = undefined;
