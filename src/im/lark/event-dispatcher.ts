@@ -1264,10 +1264,19 @@ export function __resetEventClaimsForTest(): void {
   pendingMessageTriggers.clear();
 }
 
-export async function getGroupStats(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
+export async function getGroupStats(
+  larkAppId: string,
+  chatId: string,
+  options: { requireFresh?: boolean } = {},
+): Promise<{ userCount: number; botCount: number }> {
   const cacheKey = `${larkAppId}:${chatId}`;
   const cached = chatStatsCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
+  // Lark cluster delivery sends one membership event to one connected replica,
+  // not to every process that owns the same app. Primary replicas therefore
+  // cannot authorize the solo-group bypass from their process-local cache.
+  // A required fresh read also refuses the stale fallback on API failure and
+  // safely degrades to "multi-member: require @mention".
+  if (!options.requireFresh && cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
     return { userCount: cached.userCount, botCount: cached.botCount };
   }
   try {
@@ -1278,7 +1287,7 @@ export async function getGroupStats(larkAppId: string, chatId: string): Promise<
     // Soft failure — the fallback below assumes worst case (multi-user,
     // multi-bot → require @mention). No user-visible regression, so debug.
     logger.debug(`Failed to get chat stats for ${chatId}, using safe fallback: ${err}`);
-    if (cached) return { userCount: cached.userCount, botCount: cached.botCount };
+    if (!options.requireFresh && cached) return { userCount: cached.userCount, botCount: cached.botCount };
     // Fallback: assume multi-person, multi-bot → require @mention to be safe.
     return { userCount: 999, botCount: 999 };
   }
@@ -2456,6 +2465,10 @@ async function sendGrantRequestToApproverDm(o: {
  */
 export async function checkGroupMessageAccess(
   larkAppId: string, message: any, chatId: string, senderOpenId: string | undefined, memberUnionId?: string,
+  groupStatsOptions?: {
+    requireFresh?: boolean;
+    snapshot?: { userCount: number; botCount: number };
+  },
 ): Promise<'allowed' | 'not_allowed' | 'ignore'> {
   const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
   // 群消息访问检查只在人路径调用，union 走 memberUnionId 腿（不进 bot-trust）。
@@ -2475,7 +2488,8 @@ export async function checkGroupMessageAccess(
   // 'ignore'，挡住「用户 @ 新 bot、老 bot 跟着回复」。群聊 @ 策略 never/ambient
   // 在调用方（relax 条款）已先行结算，这里不受影响。
   if (isAllowed && isSoloGroupMentionBypassEnabled(larkAppId, chatId) && !mentionsAnotherMember(larkAppId, message)) {
-    const { userCount, botCount } = await getGroupStats(larkAppId, chatId);
+    const { userCount, botCount } = groupStatsOptions?.snapshot
+      ?? await getGroupStats(larkAppId, chatId, groupStatsOptions);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
     if (userCount <= 1 && botCount <= 1) {
       return 'allowed';
@@ -5485,7 +5499,7 @@ export function createLarkEventDispatcherRuntime(
         const mentionsOther = mentionsAnotherMember(larkAppId, message);
         let stats: { userCount: number; botCount: number } | null = null;
         if (soloGroupMentionBypass && ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
-          stats = await getGroupStats(larkAppId, chatId);
+          stats = await getGroupStats(larkAppId, chatId, { requireFresh: !!primary });
         }
         // 免@ 斜杠命令（commandTriggers）：与「群聊 @ 策略」正交 —— 它不放开整个群
         // 的免@，只放开配置里那几条命令，所以 mentionMode 留在默认 'always' 的群
@@ -5569,7 +5583,17 @@ export function createLarkEventDispatcherRuntime(
           );
         }
         if (!relax) {
-          const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId, humanSenderUnionId);
+          const access = await checkGroupMessageAccess(
+            larkAppId,
+            message,
+            chatId,
+            senderOpenId,
+            humanSenderUnionId,
+            {
+              requireFresh: !!primary,
+              ...(stats ? { snapshot: stats } : {}),
+            },
+          );
           if (access === 'not_allowed') {
             // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
             // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。

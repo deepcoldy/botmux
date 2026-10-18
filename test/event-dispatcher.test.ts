@@ -203,7 +203,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __recoverDurablePrimaryIngressOnceForTest, __resetMessageListenerPollCursorForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, createLarkEventDispatcherRuntime, decideRouting, ensureBotOpenId, getGroupStats, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -1159,6 +1159,88 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     runtime.close();
   });
+
+  it.each([true, false])(
+    'does not trust a replica-local solo-group cache for primary routing (ownsSession=%s)',
+    async ownsSession => {
+      __resetChatStatsForTest();
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupReplyMode: 'chat',
+        soloGroupMentionBypass: true,
+      });
+      mockGetChatMode.mockResolvedValue('group');
+      mockGetChatInfo
+        .mockReset()
+        .mockResolvedValueOnce({ userCount: 1, botCount: 1 })
+        .mockResolvedValueOnce({ userCount: 2, botCount: 1 });
+
+      // Seed the exact stale state a different replica would retain when Lark
+      // cluster-delivers the membership event to its peer.
+      await expect(getGroupStats(MY_APP_ID, 'chat-primary')).resolves.toEqual({
+        userCount: 1,
+        botCount: 1,
+      });
+
+      const handlers = makeHandlers();
+      handlers.isSessionOwner.mockReturnValue(ownsSession);
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      const data = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: 'post-membership-change plain text' }),
+        messageId: 'om_primary_membership_changed',
+        chatId: 'chat-primary',
+        chatType: 'group',
+      });
+
+      await expect(processPrimary(runtime, data, 'om_primary_membership_changed')).resolves.toEqual({
+        kind: 'ignored',
+        reason: 'message was filtered before canonical admission',
+      });
+      expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
+
+  it.each([true, false])(
+    'fails the primary solo-group bypass closed when the fresh membership read fails (ownsSession=%s)',
+    async ownsSession => {
+      __resetChatStatsForTest();
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupReplyMode: 'chat',
+        soloGroupMentionBypass: true,
+      });
+      mockGetChatMode.mockResolvedValue('group');
+      mockGetChatInfo
+        .mockReset()
+        .mockResolvedValueOnce({ userCount: 1, botCount: 1 })
+        .mockRejectedValueOnce(new Error('membership unavailable'));
+      await getGroupStats(MY_APP_ID, 'chat-primary');
+
+      const handlers = makeHandlers();
+      handlers.isSessionOwner.mockReturnValue(ownsSession);
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      const data = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: 'membership read failed' }),
+        messageId: 'om_primary_membership_unavailable',
+        chatId: 'chat-primary',
+        chatType: 'group',
+      });
+
+      await expect(processPrimary(runtime, data, 'om_primary_membership_unavailable')).resolves.toEqual({
+        kind: 'ignored',
+        reason: 'message was filtered before canonical admission',
+      });
+      expect(mockGetChatInfo).toHaveBeenCalledTimes(2);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
 
   it('exposes the canonical post-admission output queue to the routed handler', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
