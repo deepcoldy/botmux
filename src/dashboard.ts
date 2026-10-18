@@ -53,7 +53,7 @@ import {
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
-import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
+import { reconcileDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
   compactGroupsMatrix,
@@ -188,6 +188,7 @@ import {
 } from './core/dashboard-url.js';
 import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/workbench-shell.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { coordinationModeIsPrimary } from './services/durable-coordination-runtime.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import type { WorkspaceMetadata } from './core/workspace-metadata.js';
@@ -4469,6 +4470,27 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
+      if (coordinationModeIsPrimary()) {
+        const daemons = registry.list();
+        if (daemons.length === 0) {
+          return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
+        }
+        const snapshots = await Promise.all(daemons.map(daemon =>
+          reconcileDaemonSessions(
+            daemon,
+            aggregator,
+            AbortSignal.timeout(2_500),
+          ),
+        ));
+        if (snapshots.some(snapshot => snapshot === undefined)) {
+          return jsonRes(res, 503, { ok: false, error: 'daemon_session_snapshot_unavailable' });
+        }
+        for (let index = 0; index < snapshots.length; index += 1) {
+          for (const row of snapshots[index] ?? []) {
+            sessionPresentation.schedule(daemons[index]!.larkAppId, row);
+          }
+        }
+      }
       // Sessions spawned before a bot config carried a display name store the
       // raw appId as botName — resolve through the live registry so consumers
       // (dashboard) always see the human-facing name.
