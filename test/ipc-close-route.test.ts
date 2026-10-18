@@ -31,6 +31,7 @@ async function postClose(sessionId: string, opts: {
   auth?: 'capability' | 'signed' | 'none';
   authRequired?: boolean;
   capability?: string;
+  rootId?: string;
 } = {}): Promise<Response> {
   if (!handle) {
     if (opts.authRequired) setIpcAuthSecret(HOST_SECRET);
@@ -44,6 +45,7 @@ async function postClose(sessionId: string, opts: {
   const path = `/api/sessions/${sessionId}/close`;
   const body: Record<string, unknown> = {};
   if (auth === 'capability') body.originCapability = opts.capability ?? CAP;
+  if (opts.rootId) body.rootId = opts.rootId;
   const headers: HeadersInit = auth === 'signed'
     ? daemonIpcAuthHeaders({
       secret: HOST_SECRET,
@@ -77,11 +79,16 @@ describe('POST /api/sessions/:sessionId/close', () => {
     const res = await postClose('s-primary', {
       auth: 'signed',
       authRequired: true,
+      rootId: 'om_primary_root',
     });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, outcome: 'closed' });
-    expect(durableClose).toHaveBeenCalledWith({ sessionId: 's-primary', action: 'close' });
+    expect(durableClose).toHaveBeenCalledWith({
+      sessionId: 's-primary',
+      action: 'close',
+      rootId: 'om_primary_root',
+    });
     expect(closeSpy).not.toHaveBeenCalled();
   });
 

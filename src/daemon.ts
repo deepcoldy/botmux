@@ -30585,16 +30585,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     setDurableSessionLifecycleHandler(async request => {
       const local = findActiveBySessionId(request.sessionId)?.session
         ?? sessionStore.getOwnedSession(request.sessionId);
-      if (!local?.larkAppId) {
+      const larkAppId = local?.larkAppId || cfg.larkAppId;
+      const rootId = request.rootId ?? (local ? storedSessionAnchorId(local) : undefined);
+      if (!rootId) {
         return { ok: false, error: 'durable_session_not_found' };
       }
-      const runtime = durablePrimaryRuntimeByApp.get(local.larkAppId);
+      const runtime = durablePrimaryRuntimeByApp.get(larkAppId);
       if (!runtime) return { ok: false, error: 'durable_primary_unavailable' };
-      const canonicalKey = sessionKey(storedSessionAnchorId(local), local.larkAppId);
+      const canonicalKey = sessionKey(rootId, larkAppId);
       return requestDurableSessionControl({
         store: durableCoordinationRuntime.store,
         request: {
-          larkAppId: local.larkAppId,
+          larkAppId,
           sessionKey: canonicalKey,
           sessionId: request.sessionId,
           action: request.action,

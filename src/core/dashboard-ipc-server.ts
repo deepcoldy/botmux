@@ -394,6 +394,8 @@ export function setDurableSessionSendHandler(
 export interface DurableSessionLifecycleRequest {
   sessionId: string;
   action: 'close' | 'resume';
+  /** 可选 canonical 路由锚点；用于本地副本已没有 Session 行的故障收口。 */
+  rootId?: string;
 }
 
 export type DurableSessionLifecycleResult =
@@ -1801,6 +1803,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
       const result = await durableSessionLifecycleHandler({
         sessionId: params.sessionId,
         action: 'close',
+        ...(typeof body.rootId === 'string' ? { rootId: body.rootId } : {}),
       });
       return jsonRes(res, result.ok ? 200 : 409, result);
     } catch (error) {

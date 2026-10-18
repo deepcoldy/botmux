@@ -5982,6 +5982,12 @@ const server = createServer(async (req, res) => {
       if (op === 'locate' && requestIdentity && !enforceControlCsrf(req, res, requestIdentity)) return;
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const row = aggregator.getSession(sid);
+      const rootId = typeof row?.rootMessageId === 'string' && row.rootMessageId
+        ? row.rootMessageId
+        : typeof row?.chatId === 'string' && row.chatId
+          ? row.chatId
+          : undefined;
       // Defensive client-side deadline: the daemon side of every op here replies
       // promptly (close resolves its fence on the worker's flushed ACK; restart/
       // resume/start return after a fire-and-forget IPC). Close gets a separate
@@ -5991,6 +5997,12 @@ const server = createServer(async (req, res) => {
       try {
         upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
           method: 'POST',
+          ...(op === 'close' && rootId
+            ? {
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ rootId }),
+              }
+            : {}),
           signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs(op)),
         });
       } catch (err: any) {
