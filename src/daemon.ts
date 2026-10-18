@@ -30584,6 +30584,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       },
     }));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
+    const quarantinedDashboardSessionKeys = new Set<string>();
     setDurableSessionListHandler(async () => {
       const listSessions = durableCoordinationRuntime.store.listSessions;
       if (!listSessions) throw new Error('durable_primary_session_listing_unavailable');
@@ -30597,10 +30598,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         for (const session of listValidDurablePrimarySessions(
           listed.records,
           cfg.larkAppId,
-          (record, error) => logger.warn(
-            `[dashboard] quarantined invalid canonical Session ${record.sessionKey}: `
-            + `${error instanceof Error ? error.message : String(error)}`,
-          ),
+          (record, error) => {
+            if (quarantinedDashboardSessionKeys.has(record.sessionKey)) return;
+            quarantinedDashboardSessionKeys.add(record.sessionKey);
+            while (quarantinedDashboardSessionKeys.size > 1_024) {
+              quarantinedDashboardSessionKeys.delete(quarantinedDashboardSessionKeys.values().next().value!);
+            }
+            logger.warn(
+              `[dashboard] quarantined invalid canonical Session ${record.sessionKey}: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          },
         )) {
           sessions.set(session.sessionId, session);
         }
