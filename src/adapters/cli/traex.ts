@@ -16,6 +16,7 @@ import {
   findTraexRolloutBySessionId,
   traexSessionIdFromRolloutPath,
   readTraexThreadMetadataIndex,
+  traexRolloutUserInputs,
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
@@ -356,10 +357,13 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         botmuxOrigin: metadata.botmuxOrigin,
         cwd: metadata.cwd,
         lastActivityAt: metadata.updatedAtMs,
+        rolloutPath: metadata.rolloutPath,
       }]));
       return discoverRolloutSessions(traeSessionsRoot(), limit, exclude, {
         dialect: 'traex',
         metadataById,
+        userInputTexts: traexRolloutUserInputs,
+        sessionIdFromPath: traexSessionIdFromRolloutPath,
       });
     },
 

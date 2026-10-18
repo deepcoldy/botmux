@@ -554,6 +554,30 @@ function traexDisplayCompletions(payload: any, sourceSessionId?: string): any[] 
     && (!sourceSessionId || completion.thread_id === sourceSessionId));
 }
 
+/** Verified user input carried by one TraeX rollout record, for /adopt
+ *  history discovery: `history_mutation` display completions of type
+ *  UserMessage (0.208+, same turn/thread validation the bridge uses) and the
+ *  0.201.4 `item_completed` UserMessage mirror. The record's raw model-visible
+ *  `items` are deliberately NOT returned — TraeX also writes runtime
+ *  injections there as `role: user`, so they cannot decide session origin. */
+export function traexRolloutUserInputs(
+  rec: Record<string, unknown>,
+  sourceSessionId?: string,
+): string[] {
+  const payload = rec.payload as any;
+  if (rec.type === 'history_mutation') {
+    return traexDisplayCompletions(payload, sourceSessionId)
+      .filter((completion: any) => completion.item?.type === 'UserMessage')
+      .map((completion: any) => itemCompletedUserText(completion.item).trim())
+      .filter(Boolean);
+  }
+  if (rec.type === 'event_msg' && payload?.type === 'item_completed') {
+    const text = itemCompletedUserText(payload.item).trim();
+    return text ? [text] : [];
+  }
+  return [];
+}
+
 function traexHistoryCotEntries(payload: any, sourceSessionId?: string): CodexBridgeEvent['cotEntries'] {
   if (payload?.operation !== 'append') return [];
   const modelItems = Array.isArray(payload.items) ? payload.items : [];

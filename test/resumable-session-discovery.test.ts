@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,6 +8,29 @@ import {
   discoverAntigravitySessions,
   isBotmuxInjectedPrompt,
 } from '../src/services/resumable-session-discovery.js';
+import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
+
+/** What the TraeX adapter passes: verified user inputs decide origin, raw model
+ *  items are weak, filename ids group resume segments. */
+const TRAEX = {
+  dialect: 'traex' as const,
+  userInputTexts: traexRolloutUserInputs,
+  sessionIdFromPath: traexSessionIdFromRolloutPath,
+};
+
+/** TraeX 0.208+ user turn: the model-visible item plus its validated display
+ *  completion (same turn id, same thread id). */
+function traexUserTurn(sessionId: string, text: string, turnId = 'turn-1', threadId = sessionId) {
+  return { type: 'history_mutation', payload: {
+    operation: 'append',
+    turn_id: turnId,
+    items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }],
+    display_completions: [{
+      thread_id: threadId, turn_id: turnId,
+      item: { type: 'UserMessage', content: [{ type: 'text', text }] },
+    }],
+  } };
+}
 
 /**
  * Unit coverage for the on-disk session discovery that powers /adopt's second
@@ -914,9 +937,155 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       } } },
     ]);
 
-    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
       expect.objectContaining({ cliSessionId: 'traex-item-completed', title: 'summarise the release notes' }),
     ]);
+  });
+
+  describe('TraeX canonical vs raw model items (review P2-1)', () => {
+    const ENVELOPE = '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>';
+    const runtimeWarning = { type: 'history_mutation', payload: { operation: 'append', items: [{
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: 'Warning: the workspace is read-only for this turn.' }],
+    }] } };
+
+    it('drops a botmux turn hidden behind a runtime-injected user item (verified display completion)', async () => {
+      writeRollout('2026/10/18', 'rollout-traex-warning-dc.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-warning-dc', cwd: '/root/traex' } },
+        runtimeWarning,
+        traexUserTurn('traex-warning-dc', ENVELOPE),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('drops a botmux turn hidden behind a runtime-injected user item (legacy user_message event)', async () => {
+      writeRollout('2026/10/18', 'rollout-traex-warning-legacy.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-warning-legacy', cwd: '/root/traex' } },
+        runtimeWarning,
+        { type: 'event_msg', payload: { type: 'user_message', message: ENVELOPE } },
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('titles an external session by its verified input, not the runtime item before it', async () => {
+      writeRollout('2026/10/18', 'rollout-traex-warning-clean.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-warning-clean', cwd: '/root/traex' } },
+        runtimeWarning,
+        traexUserTurn('traex-warning-clean', 'profile the slow query'),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-warning-clean', title: 'profile the slow query' }),
+      ]);
+    });
+
+    it('ignores a display completion that belongs to another thread', async () => {
+      writeRollout('2026/10/18', 'rollout-traex-foreign-dc.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-foreign-dc', cwd: '/root/traex' } },
+        { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'my own first prompt' }] } },
+        traexUserTurn('traex-foreign-dc', ENVELOPE, 'turn-x', 'some-other-thread'),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-foreign-dc', title: 'my own first prompt' }),
+      ]);
+    });
+
+    it('stops at the end of a weak-only first turn instead of reading the whole rollout', async () => {
+      writeRollout('2026/10/18', 'rollout-traex-weak-bounded.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-weak-bounded', cwd: '/root/traex' } },
+        { type: 'history_mutation', payload: { operation: 'append', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'first turn, 0.201.7 style' }] },
+        ] } },
+        { type: 'event_msg', payload: { type: 'task_complete' } },
+        // Never reached: the scan ends with the first turn.
+        traexUserTurn('traex-weak-bounded', ENVELOPE, 'turn-2'),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-weak-bounded', title: 'first turn, 0.201.7 style' }),
+      ]);
+    });
+  });
+
+  describe('TraeX internal helper sessions (review P2-2)', () => {
+    for (const [label, meta] of [
+      ['thread_source=subagent', { thread_source: 'subagent' }],
+      ['source.subagent', { source: { subagent: { kind: 'guardian' } } }],
+    ] as const) {
+      it(`rejects ${label} rollouts even with clean user records and native metadata`, async () => {
+        writeRollout('2026/10/18', `rollout-traex-internal-${label.replace(/\W/g, '')}.jsonl`, [
+          { type: 'session_meta', payload: { id: 'traex-internal', cwd: '/root/traex', ...meta } },
+          traexUserTurn('traex-internal', 'review the diff for risky changes'),
+        ]);
+        const metadataById = new Map([['traex-internal', { title: 'Guardian review', firstUserMessage: 'review the diff' }]]);
+        expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { ...TRAEX, metadataById })).toEqual([]);
+      });
+    }
+  });
+
+  describe('TraeX resume segments and activity order (review P2-3 / P2-4)', () => {
+    const SID_A = '01a14a68-b8a9-74e0-bc4e-8ad73a773028';
+    const SID_B = '01a14a6b-ace0-7080-971b-d41592af5438';
+    const SID_C = '01a14a6c-0000-7000-8000-000000000003';
+    const TURN = '01a14a70-0000-7000-8000-0000000000aa';
+    const write = (name: string, sid: string, prompt: string, mtimeSec: number, cwd = '/root/traex'): string => {
+      writeRollout('2026/10/18', name, [
+        { type: 'session_meta', payload: { id: sid, cwd } },
+        traexUserTurn(sid, prompt),
+      ]);
+      const path = join(sessionsRoot, '2026/10/18', name);
+      utimesSync(path, mtimeSec, mtimeSec);
+      return path;
+    };
+
+    it('lists one candidate per thread across resume segments so siblings cannot crowd out other threads', async () => {
+      write(`rollout-2026-10-18T10-00-00-${SID_A}.jsonl`, SID_A, 'thread A', 1_792_300_000);
+      write(`rollout-2026-10-18T11-00-00-${SID_A}_${TURN}.jsonl`, SID_A, 'thread A', 1_792_300_300);
+      write(`rollout-2026-10-18T09-00-00-${SID_B}.jsonl`, SID_B, 'thread B', 1_792_299_000);
+      const metadataById = new Map([[SID_A, { firstUserMessage: 'thread A' }], [SID_B, { firstUserMessage: 'thread B' }]]);
+
+      const out = await discoverRolloutSessions(sessionsRoot, 2, undefined, { ...TRAEX, metadataById });
+      expect(out.map(s => s.cliSessionId)).toEqual([SID_A, SID_B]);
+      expect(out[0]!.lastActivityAt).toBe(1_792_300_300_000);
+    });
+
+    it('prefers the segment the native index points at', async () => {
+      const indexed = write(`rollout-2026-10-18T10-00-00-${SID_A}.jsonl`, SID_A, 'thread A', 1_792_300_000, '/root/indexed');
+      write(`rollout-2026-10-18T11-00-00-${SID_A}_${TURN}.jsonl`, SID_A, 'thread A', 1_792_300_300, '/root/stale');
+      const metadataById = new Map([[SID_A, { lastActivityAt: 1_792_300_500_000, rolloutPath: indexed }]]);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 5, undefined, { ...TRAEX, metadataById })).toEqual([
+        expect.objectContaining({ cliSessionId: SID_A, cwd: '/root/indexed' }),
+      ]);
+    });
+
+    it('never resurrects a botmux thread through an older sibling segment', async () => {
+      write(`rollout-2026-10-18T10-00-00-${SID_A}.jsonl`, SID_A, 'looks external', 1_792_300_000);
+      write(`rollout-2026-10-18T11-00-00-${SID_A}_${TURN}.jsonl`, SID_A,
+        '<session_id>botmux-id</session_id>\n<user_message>hi</user_message>', 1_792_300_300);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 5, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('orders and truncates by native activity, falling back to mtime without metadata', async () => {
+      // A: newest file, but its native activity is the oldest.
+      write(`rollout-2026-10-18T12-00-00-${SID_A}.jsonl`, SID_A, 'thread A', 1_792_300_900);
+      // B: older file, most recent native activity (e.g. renamed / resumed elsewhere).
+      write(`rollout-2026-10-18T08-00-00-${SID_B}.jsonl`, SID_B, 'thread B', 1_792_290_000);
+      // C: no native metadata → its mtime is its activity.
+      write(`rollout-2026-10-18T09-00-00-${SID_C}.jsonl`, SID_C, 'thread C', 1_792_300_500);
+      const metadataById = new Map([
+        [SID_A, { lastActivityAt: 1_792_100_000_000 }],
+        [SID_B, { lastActivityAt: 1_792_400_000_000 }],
+      ]);
+
+      const top1 = await discoverRolloutSessions(sessionsRoot, 1, undefined, { ...TRAEX, metadataById });
+      expect(top1.map(s => s.cliSessionId)).toEqual([SID_B]);
+      const all = await discoverRolloutSessions(sessionsRoot, 5, undefined, { ...TRAEX, metadataById });
+      expect(all.map(s => [s.cliSessionId, s.lastActivityAt])).toEqual([
+        [SID_B, 1_792_400_000_000],
+        [SID_C, 1_792_300_500_000],
+        [SID_A, 1_792_100_000_000],
+      ]);
+    });
   });
 
   describe('TraeX response_item-only rollouts (weak origin)', () => {
@@ -953,12 +1122,10 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       writeRollout('2026/10/17', 'rollout-traex-weak-canonical-clean.jsonl', [
         { type: 'session_meta', payload: { id: 'traex-weak-canonical-clean', cwd: '/root/traex' } },
         botmuxResponseItem,
-        { type: 'history_mutation', payload: { operation: 'append', items: [
-          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'the real first prompt' }] },
-        ] } },
+        traexUserTurn('traex-weak-canonical-clean', 'the real first prompt'),
       ]);
 
-      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
         expect.objectContaining({ cliSessionId: 'traex-weak-canonical-clean', title: 'the real first prompt' }),
       ]);
     });
@@ -967,13 +1134,10 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       writeRollout('2026/10/17', 'rollout-traex-weak-canonical-botmux.jsonl', [
         { type: 'session_meta', payload: { id: 'traex-weak-canonical-botmux', cwd: '/root/traex' } },
         { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'runtime injection that looks clean' }] } },
-        { type: 'history_mutation', payload: { operation: 'append', items: [{
-          type: 'message', role: 'user',
-          content: [{ type: 'input_text', text: '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>' }],
-        }] } },
+        traexUserTurn('traex-weak-canonical-botmux', '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>'),
       ]);
 
-      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
     });
 
     it('drops the session when a native title exists but the only user turn is botmux', async () => {
