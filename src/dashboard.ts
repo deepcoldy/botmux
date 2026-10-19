@@ -1086,11 +1086,6 @@ function resolveScheduleOwner(id: string): string | undefined {
   const primary = registry.list().find(d => d.botIndex === 0);
   return primary?.larkAppId;
 }
-const botOnboarding = new BotOnboardingManager({
-  botsJsonPath: BOTS_JSON_PATH,
-  stopBotLive: spawnStopBotLive,
-  startBotLive: spawnStartBotLive,
-});
 // 飞书 Web 登录态刷新（机器人改名缺登录态时的 dashboard 扫码入口）。机器级单例，
 // 写 ~/.botmux/feishu-session.json，与 setup / onboarding 复用同一份登录态。
 const feishuLogin = new FeishuLoginManager();
@@ -1826,6 +1821,19 @@ const dashboardConfigCoordinator = dashboardCoordinationRuntime?.mode === 'prima
     })
   : undefined;
 setDurableConfigCoordinator(dashboardConfigCoordinator);
+// BotOnboardingManager 的 constructor 会立刻恢复中断的 activation marker，
+// 其中可能写 bots.json。必须先注册 durable coordinator，再创建 manager；否则
+// primary 启动时恢复流程会绕过或缺失跨副本 CAS。
+const botOnboarding = new BotOnboardingManager({
+  botsJsonPath: BOTS_JSON_PATH,
+  stopBotLive: spawnStopBotLive,
+  startBotLive: spawnStartBotLive,
+  runBotsMutation: mutation => runDurableConfigMutation({
+    scope: 'bots',
+    path: BOTS_JSON_PATH,
+    mutation: async () => mutation(),
+  }),
+});
 
 async function reloadLocaleOnAllDaemons(): Promise<void> {
   await Promise.all(registry.list().map(d =>

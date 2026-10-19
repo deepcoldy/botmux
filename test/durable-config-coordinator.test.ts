@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDurableConfigCoordinator } from '../src/services/durable-config-coordinator.js';
 import {
@@ -12,6 +13,44 @@ import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-c
 import { invalidateGlobalConfigCache, mergeGlobalConfig } from '../src/global-config.js';
 
 const dirs: string[] = [];
+
+function contentSha256(path: string): string {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function pathSha256(path: string): string {
+  return createHash('sha256').update(resolve(path)).digest('hex');
+}
+
+async function seedLegacyRecord(
+  store: SqliteDurableCoordinationStore,
+  input: { scope: 'global'; path: string; phase: 'prepared' | 'committed' },
+): Promise<void> {
+  const key = `auxiliary::config-cas::${input.scope}`;
+  const acquired = await store.acquireSessionLease({
+    sessionKey: key,
+    ownerId: 'legacy-seed',
+    leaseDurationMs: 300_000,
+  });
+  if (acquired.kind !== 'acquired') throw new Error('failed to seed legacy record');
+  const digest = contentSha256(input.path);
+  await store.writeAuxiliaryState({
+    lease: acquired.lease,
+    expectedRevision: null,
+    value: {
+      version: 1,
+      type: 'botmux.config.cas',
+      scope: input.scope,
+      phase: input.phase,
+      operationId: 'legacy-operation',
+      baseSha256: digest,
+      contentSha256: digest,
+      updatedAt: 1,
+      audit: [],
+    },
+  });
+  await store.releaseSessionLease(acquired.lease);
+}
 
 function fixture() {
   let now = 1_800_000_000_000;
@@ -45,8 +84,12 @@ describe('durable config coordinator', () => {
     });
 
     const record = await store.readAuxiliaryState('auxiliary::config-cas::global');
-    expect(record).toMatchObject({ revision: 2, value: { phase: 'committed' } });
+    expect(record).toMatchObject({
+      revision: 2,
+      value: { version: 2, phase: 'committed', pathSha256: pathSha256(path) },
+    });
     expect(JSON.stringify(record)).not.toContain('must-not-leak');
+    expect(JSON.stringify(record)).not.toContain(path);
     expect(record?.value).toMatchObject({
       audit: [expect.objectContaining({
         outcome: 'committed',
@@ -140,7 +183,53 @@ describe('durable config coordinator', () => {
     await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
     writeFileSync(path, JSON.stringify({ editedOutsideCoordinator: true }) + '\n');
     await expect(coordinator.run({ scope: 'global', path, mutation: async () => undefined }))
-      .rejects.toThrow('durable_config_drift');
+      .rejects.toThrow('durable_config_content_drift');
+    await store.close();
+  });
+
+  it('binds a matching committed v1 record to the normalized path before continuing', async () => {
+    const { path, store, coordinator } = fixture();
+    await seedLegacyRecord(store, { scope: 'global', path, phase: 'committed' });
+
+    await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+
+    const record = await store.readAuxiliaryState('auxiliary::config-cas::global');
+    expect(record).toMatchObject({
+      revision: 4,
+      value: { version: 2, phase: 'committed', pathSha256: pathSha256(path) },
+    });
+    await store.close();
+  });
+
+  it('refuses to guess a path for an interrupted v1 prepared record', async () => {
+    const { path, store, coordinator } = fixture();
+    await seedLegacyRecord(store, { scope: 'global', path, phase: 'prepared' });
+    const mutation = vi.fn(async () => undefined);
+
+    await expect(coordinator.run({ scope: 'global', path, mutation }))
+      .rejects.toThrow('durable_config_path_identity_unbound');
+    expect(mutation).not.toHaveBeenCalled();
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({ revision: 1, value: { version: 1, phase: 'prepared' } });
+    await store.close();
+  });
+
+  it('rejects another path without changing the binding or blocking the original path', async () => {
+    const { path, store, coordinator } = fixture();
+    const alternatePath = join(path, '..', 'alternate.json');
+    writeFileSync(alternatePath, readFileSync(path));
+    await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+    const wrongMutation = vi.fn(async () => undefined);
+
+    await expect(coordinator.run({ scope: 'global', path: alternatePath, mutation: wrongMutation }))
+      .rejects.toThrow('durable_config_path_mismatch');
+    expect(wrongMutation).not.toHaveBeenCalled();
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({ revision: 2, value: { pathSha256: pathSha256(path) } });
+
+    await coordinator.run({ scope: 'global', path, mutation: async () => undefined });
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::global'))
+      .toMatchObject({ revision: 4, value: { pathSha256: pathSha256(path) } });
     await store.close();
   });
 

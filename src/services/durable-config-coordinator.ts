@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import type {
   DurableAuxiliaryStateRecord,
   DurableAuxiliaryStateStore,
@@ -10,7 +11,8 @@ import type {
 import { canonicalJson } from '../utils/canonical-input-hash.js';
 
 const RECORD_TYPE = 'botmux.config.cas';
-const RECORD_VERSION = 1;
+const LEGACY_RECORD_VERSION = 1;
+const RECORD_VERSION = 2;
 const MAX_AUDIT_ENTRIES = 64;
 const LEASE_DURATION_MS = 300_000;
 
@@ -26,8 +28,7 @@ interface ConfigAuditEntry {
   committedAt: number;
 }
 
-interface DurableConfigCasValue {
-  version: 1;
+interface DurableConfigCasValueBase {
   type: typeof RECORD_TYPE;
   scope: DurableConfigScope;
   phase: 'prepared' | 'committed';
@@ -37,6 +38,18 @@ interface DurableConfigCasValue {
   updatedAt: number;
   audit: ConfigAuditEntry[];
 }
+
+interface LegacyDurableConfigCasValue extends DurableConfigCasValueBase {
+  version: typeof LEGACY_RECORD_VERSION;
+}
+
+interface DurableConfigCasValue extends DurableConfigCasValueBase {
+  version: typeof RECORD_VERSION;
+  /** SHA-256 of the normalized absolute file path; never persist the path itself. */
+  pathSha256: string;
+}
+
+type ParsedDurableConfigCasValue = LegacyDurableConfigCasValue | DurableConfigCasValue;
 
 type DurableConfigStore = DurableSessionLeaseStore & DurableAuxiliaryStateStore;
 
@@ -186,13 +199,14 @@ function parseAudit(value: unknown): ConfigAuditEntry[] {
 function parseRecord(
   record: DurableAuxiliaryStateRecord,
   scope: DurableConfigScope,
-): DurableConfigCasValue {
+): ParsedDurableConfigCasValue {
   const raw = record.value;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('durable config CAS record is invalid');
   }
   const value = raw as Record<string, unknown>;
-  if (value.version !== RECORD_VERSION || value.type !== RECORD_TYPE || value.scope !== scope
+  if ((value.version !== LEGACY_RECORD_VERSION && value.version !== RECORD_VERSION)
+      || value.type !== RECORD_TYPE || value.scope !== scope
       || (value.phase !== 'prepared' && value.phase !== 'committed')) {
     throw new Error('durable config CAS record is invalid');
   }
@@ -200,8 +214,7 @@ function parseRecord(
   if (!Number.isSafeInteger(updatedAt) || updatedAt < 0) {
     throw new Error('durable config CAS updatedAt is invalid');
   }
-  return {
-    version: RECORD_VERSION,
+  const base: DurableConfigCasValueBase = {
     type: RECORD_TYPE,
     scope,
     phase: value.phase,
@@ -211,13 +224,21 @@ function parseRecord(
     updatedAt,
     audit: parseAudit(value.audit),
   };
+  if (value.version === LEGACY_RECORD_VERSION) {
+    return { ...base, version: LEGACY_RECORD_VERSION };
+  }
+  return {
+    ...base,
+    version: RECORD_VERSION,
+    pathSha256: digest(value.pathSha256, 'pathSha256'),
+  };
 }
 
 function stateKey(scope: DurableConfigScope): string {
   return `auxiliary::config-cas::${scope}`;
 }
 
-function appendAudit(value: DurableConfigCasValue, entry: ConfigAuditEntry): ConfigAuditEntry[] {
+function appendAudit(value: ParsedDurableConfigCasValue, entry: ConfigAuditEntry): ConfigAuditEntry[] {
   return [...value.audit, entry].slice(-MAX_AUDIT_ENTRIES);
 }
 
@@ -250,6 +271,8 @@ export function createDurableConfigCoordinator(input: {
       path: string;
       mutation: () => Promise<T>;
     }): Promise<T> {
+      const normalizedPath = resolve(path);
+      const pathSha256 = sha256(Buffer.from(normalizedPath, 'utf8'));
       const previous = localTails.get(scope) ?? Promise.resolve();
       let releaseLocal!: () => void;
       const localGate = new Promise<void>(resolve => { releaseLocal = resolve; });
@@ -269,6 +292,31 @@ export function createDurableConfigCoordinator(input: {
           const before = await snapshot(scope, path);
           let record = await input.store.readAuxiliaryState(key);
           let current = record ? parseRecord(record, scope) : undefined;
+
+          if (current?.version === RECORD_VERSION && current.pathSha256 !== pathSha256) {
+            throw new Error('durable_config_path_mismatch');
+          }
+
+          if (current?.version === LEGACY_RECORD_VERSION) {
+            // v1 records predate path identity. A committed record can only be
+            // bound when the candidate file still has exactly the committed
+            // bytes. An interrupted prepared record is ambiguous: its bytes may
+            // belong to a different path, so never guess during migration.
+            if (current.phase === 'prepared') {
+              throw new Error('durable_config_path_identity_unbound');
+            }
+            if (current.contentSha256 !== before.sha256) {
+              throw new Error('durable_config_content_drift');
+            }
+            const upgraded: DurableConfigCasValue = {
+              ...current,
+              version: RECORD_VERSION,
+              pathSha256,
+              updatedAt: now(),
+            };
+            record = await commit({ lease, expectedRevision: record!.revision, value: upgraded });
+            current = upgraded;
+          }
 
           if (current?.phase === 'prepared') {
             const recoveredChanged = before.sha256 !== current.baseSha256;
@@ -292,7 +340,7 @@ export function createDurableConfigCoordinator(input: {
           }
 
           if (current?.phase === 'committed' && current.contentSha256 !== before.sha256) {
-            throw new Error('durable_config_drift');
+            throw new Error('durable_config_content_drift');
           }
 
           const operationId = randomUUID();
@@ -300,6 +348,7 @@ export function createDurableConfigCoordinator(input: {
             version: RECORD_VERSION,
             type: RECORD_TYPE,
             scope,
+            pathSha256,
             phase: 'prepared',
             operationId,
             baseSha256: before.sha256,

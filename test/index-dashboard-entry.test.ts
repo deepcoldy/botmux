@@ -152,6 +152,8 @@ describe('loadDashboardEnvFile() — allowlisted .env load', () => {
     'BOTMUX_PUBLIC_URL=https://botmux.example.com',
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH=/var/lib/botmux/audit.ndjson',
     'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS=300000',
+    'BOTMUX_GLOBAL_CONFIG_FILE=/mnt/shared/global-config.json',
+    'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE=/mnt/shared/group-context-settings.json',
     'BOTMUX_DASHBOARD_FEISHU_H5_ENABLED=true',
     'BOTMUX_DASHBOARD_FEISHU_H5_APP_ID=cli_h5app',
     'BOTMUX_DASHBOARD_FEISHU_H5_APP_SECRET=h5-app-secret',
@@ -176,6 +178,8 @@ describe('loadDashboardEnvFile() — allowlisted .env load', () => {
     expect(env.BOTMUX_PUBLIC_URL).toBe('https://botmux.example.com');
     expect(env.BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH).toBe('/var/lib/botmux/audit.ndjson');
     expect(env.BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS).toBe('300000');
+    expect(env.BOTMUX_GLOBAL_CONFIG_FILE).toBe('/mnt/shared/global-config.json');
+    expect(env.BOTMUX_GROUP_CONTEXT_SETTINGS_FILE).toBe('/mnt/shared/group-context-settings.json');
     // The dashboard IS the H5 family's only legitimate consumer — this entry
     // point exists to deliver it (resolveDashboardH5AuthConfig reads it).
     expect(env.BOTMUX_DASHBOARD_FEISHU_H5_ENABLED).toBe('true');

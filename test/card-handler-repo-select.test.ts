@@ -2180,6 +2180,39 @@ describe('repo select card — worktree open', () => {
     expect(removeRepoWorktree).not.toHaveBeenCalled();
   });
 
+  it('close_worktree_confirm fails closed in durable primary before local close or worktree deletion', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      const ds = makeDs({ workingDir: '/repos/alpha-wt-task' });
+      const { deps, sessionReply } = makeDeps(ds);
+
+      const res = await handleCardAction({
+        operator: { open_id: OWNER },
+        action: { value: {
+          action: 'close_worktree_confirm',
+          root_id: ROOT_ID,
+          session_id: ds.session.sessionId,
+          invoker_open_id: OWNER,
+          confirmation_state: 'unsafe',
+        } },
+        context: { open_message_id: 'om_card' },
+      }, deps, APP_ID);
+
+      expect(res?.toast?.type).toBe('success');
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已拒绝本地关闭'),
+        undefined,
+        APP_ID,
+        'om_card',
+      );
+    } finally {
+      delete process.env.BOTMUX_COORDINATION_MODE;
+    }
+  });
+
   it('get_write_link 破例：非 operator 点击得到「无操作权限」toast，而非像其它敏感动作那样静默', async () => {
     // 与上面的 worktree_toggle_mode 对照：敏感门控默认静默 block（仅日志），但
     //「获取操作链接」是用户主动点的取权动作，静默会让人以为按钮坏了 —— 破例给提示。
