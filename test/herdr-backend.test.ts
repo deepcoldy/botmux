@@ -16,7 +16,7 @@
  * Run:  bunx vitest run test/herdr-backend.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -408,7 +408,9 @@ describe('HerdrBackend.spawn', () => {
       'workspace create', 'pane run', 'agent list', 'agent list', 'agent rename', 'agent get',
     ]);
     expect(herdrCall('agent', 'start')).toBeUndefined();
-    expect(existsSync(dirname(launcherPath))).toBe(false);
+    // A launched launcher removes itself (see the Gatekeeper fallback test).
+    expect(existsSync(dirname(launcherPath))).toBe(true);
+    rmSync(dirname(launcherPath), { recursive: true, force: true });
     be.kill();
   });
 
@@ -459,7 +461,8 @@ describe('HerdrBackend.spawn', () => {
     expect(captured.pollCount).toBe(2);
     expect(herdrCall('agent', 'rename', MANAGED_PANE, 'botmux')).toBeDefined();
     expect(herdrCall('agent', 'start')).toBeUndefined();
-    expect(existsSync(dirname(launcherPath))).toBe(false);
+    expect(existsSync(dirname(launcherPath))).toBe(true);
+    rmSync(dirname(launcherPath), { recursive: true, force: true });
     be.kill();
   });
 
@@ -490,8 +493,29 @@ describe('HerdrBackend.spawn', () => {
     );
     expect(herdrCall('agent', 'rename', MANAGED_PANE, 'botmux')).toBeDefined();
     expect(herdrCall('agent', 'start')).toBeUndefined();
-    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(true);
+    rmSync(dirname(paneLauncherPath()), { recursive: true, force: true });
     be.kill();
+  });
+
+  it('Herdr 0.7.5: leaves a detected launcher to remove itself and reaps it only as a fallback', () => {
+    // Herdr can detect the launcher by its argv while macOS still holds the exec
+    // for a Gatekeeper assessment. Deleting the file then fails the XProtect scan
+    // and Gatekeeper SIGKILLs the CLI, so detection must not delete it.
+    setManagedLaunchResponses('claude');
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION);
+    withPlatform('darwin', () => be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], {
+      cwd: '/work', cols: 120, rows: 30, env: {},
+    }));
+    be.kill();
+
+    const launcherDir = dirname(paneLauncherPath());
+    expect(existsSync(launcherDir)).toBe(true);
+    vi.advanceTimersByTime(59_000);
+    expect(existsSync(launcherDir)).toBe(true);
+    vi.advanceTimersByTime(1_000);
+    expect(existsSync(launcherDir)).toBe(false);
   });
 
   it('Herdr 0.7.5: rejects the wrong detected kind and closes only the new workspace', () => {
@@ -1530,6 +1554,40 @@ describe('HerdrBackend callbacks', () => {
     agentAlive = false;
     vi.advanceTimersByTime(600);
     expect(exits).toEqual([[0, null]]);
+    // Not a managed agent this backend owns: its pane is left alone.
+    expect(herdrCall('pane', 'close')).toBeUndefined();
+  });
+
+  it('closes the pane of an owned managed agent once its CLI exits', () => {
+    // The worker drops an exited backend before restarting, so without this
+    // every crashed attempt left an empty shell pane behind in the host.
+    let agentAlive = true;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => agentAlive
+          ? AGENT_LIST_REPLY('1-1')
+          : JSON.stringify({ result: { agents: [] } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, {
+      isReattach: true, agentName: 'botmux', ownsSession: false, ownsAgent: true,
+    });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(herdrCall('pane', 'close')).toBeUndefined();
+
+    agentAlive = false;
+    vi.advanceTimersByTime(600);
+    expect(exits).toEqual([[0, null]]);
+    expect(herdrCall('pane', 'close')).toEqual(['--session', SESSION, 'pane', 'close', '1-1']);
+    expect(herdrCall('session', 'stop')).toBeUndefined();
   });
 
   it('agent list probe failures do NOT report an exit while the herdr session still exists', () => {

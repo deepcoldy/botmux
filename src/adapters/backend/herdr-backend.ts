@@ -68,6 +68,9 @@ const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // new pane. Input readiness remains gated by the worker's onAgentStatus hook.
 const PANE_AGENT_START_TIMEOUT_MS = 30_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
+// A started launcher deletes itself. This fallback only reaps one Herdr never
+// ran, and is long enough for a macOS Gatekeeper assessment of the exec to end.
+const PANE_AGENT_LAUNCHER_FALLBACK_CLEANUP_MS = 60_000;
 // Watch the full useful lifecycle, not just settled statuses. Herdr's status
 // waits are level-triggered: when the pane is already in X they succeed
 // immediately. After one status wins we therefore exclude it
@@ -220,8 +223,9 @@ function shellSingleQuote(value: string): string {
  * Run this script by absolute path so interactive shell rc files cannot
  * shadow it by prepending real CLI directories to PATH. The mode-0700 script
  * restores the launch PATH and execs the full command, including wrappers and
- * multiline prompts. It removes itself before exec; the backend also cleans
- * up when automatic agent detection succeeds or any launch step fails.
+ * multiline prompts. It removes itself before exec; the backend removes it at
+ * once when a launch step fails, and only as a delayed fallback after the
+ * agent was detected (see startPaneAgent).
  */
 function createPaneAgentLauncher(
   canonicalExecutable: string,
@@ -235,7 +239,7 @@ function createPaneAgentLauncher(
   writeFileSync(path, [
     '#!/bin/sh',
     // Minimise the lifetime of the mode-0700 file containing the exact argv.
-    // The backend's finally block is the fallback if Herdr never executes it.
+    // The backend's cleanup is the fallback if Herdr never executes it.
     '/bin/rm -f -- "$0"',
     '/bin/rmdir -- "${0%/*}" 2>/dev/null || true',
     `PATH=${shellSingleQuote(originalPath)}`,
@@ -948,6 +952,7 @@ export class HerdrBackend implements SessionBackend {
     const originalPath = workspaceEnv.PATH ?? process.env.PATH ?? '';
     let workspaceId: string | undefined;
     let launcher: ReturnType<typeof createPaneAgentLauncher> | undefined;
+    let launched = false;
     try {
       const created = requiredJsonCommand(
         `herdr workspace create for ${this.agentName} in ${this.sessionName}`,
@@ -1012,6 +1017,7 @@ export class HerdrBackend implements SessionBackend {
       }
       // Recognition can precede interactive readiness. The worker retains its
       // first-prompt gate until onAgentStatus/normal prompt detection releases it.
+      launched = true;
       return paneId;
     } catch (err) {
       // Workspace creation succeeded but the CLI did not. Remove only the
@@ -1025,7 +1031,18 @@ export class HerdrBackend implements SessionBackend {
       }
       throw err;
     } finally {
-      if (launcher) rmSync(launcher.dir, { recursive: true, force: true });
+      if (launcher && launched) {
+        // Detection matches the launcher's argv, which can happen while macOS
+        // still holds its exec for a Gatekeeper assessment. Deleting the file
+        // then makes the XProtect scan fail and Gatekeeper SIGKILLs the CLI
+        // (`zsh: killed`), so a launched launcher is left to remove itself.
+        const dir = launcher.dir;
+        setTimeout(() => {
+          try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+        }, PANE_AGENT_LAUNCHER_FALLBACK_CLEANUP_MS).unref?.();
+      } else if (launcher) {
+        rmSync(launcher.dir, { recursive: true, force: true });
+      }
     }
   }
 
@@ -1447,6 +1464,12 @@ export class HerdrBackend implements SessionBackend {
     this.stopStatusWatcher();
     for (const cb of this.exitCbs) {
       try { cb(code, signal); } catch { /* listener crash shouldn't kill teardown */ }
+    }
+    // The managed CLI is gone; its pane now holds only the shell it was
+    // launched from. The worker drops this exited backend before restarting,
+    // so nothing else would close the pane and every attempt would leave one.
+    if (this.opts.ownsAgent && !this.opts.externalTarget && this.paneId) {
+      runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
     }
   }
 }
