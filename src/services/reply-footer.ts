@@ -19,3 +19,16 @@ export function parseReplyFooterEnv(value: string | undefined): ReplyFooterPrefe
   try { return normalizeReplyFooter(JSON.parse(value ?? '{}')); }
   catch { return {}; }
 }
+
+/** One effective policy for every footer block, including actions and custom cards. */
+export function resolveReplyFooterPolicy(preferences: ReplyFooterPreferences = {}) {
+  const enabled = preferences.replyFooterEnabled !== false;
+  return {
+    enabled,
+    brand: enabled && preferences.replyFooterBrand !== false,
+    model: enabled && preferences.replyFooterModel !== false,
+    usage: enabled && preferences.replyFooterUsage !== false,
+    recipients: enabled && preferences.replyFooterRecipients !== false,
+    voice: enabled && preferences.replyFooterVoice !== false,
+  };
+}

@@ -522,3 +522,42 @@ describe('Riff footer host policy in a warm sandbox', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+
+describe('normal CLI send reply rendering snapshot', () => {
+  it.each([false, true])('uses measured timing independently of usage and footer master=%s', (hidden) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-render-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(root, '.botmux'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, '.botmux', '.dashboard-secret'), 'host-secret', { mode: 0o600 });
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'codex', usageDisplay: 'off' }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId: 'codex', larkAppId: key.larkAppId,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId: key.turnId }));
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', 'TIMED BODY'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_DAEMON_IPC_PORT: '7951', BOTMUX_TEST_REPLY_RENDER_SNAPSHOT: JSON.stringify({
+            usage: { context: null, tokens: null }, footerPreferences: { replyFooterEnabled: !hidden },
+            timing: { executionDurationMs: 5000, waitingDurationMs: 2000, executionInProgress: true },
+          }) }, encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      expect(String(result.stdout)).toContain('CAPTURE_RENDER_QUERY=?turnId=om_turn');
+      const captured = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(captured).toHaveLength(1);
+      const card = captured[0].body.content;
+      expect(card).toContain('TIMED BODY');
+      expect(card.includes('执行至回复 5.0')).toBe(!hidden);
+      expect(card.includes('等待 2.0')).toBe(!hidden);
+      expect(card.includes('执行至回复')).toBe(!hidden);
+      expect(card.includes('botmux_reply_footer')).toBe(!hidden);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});

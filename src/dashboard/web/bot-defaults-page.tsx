@@ -4726,7 +4726,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                   void savePatch({ [key]: checked }, key, () => setFooterPrefs(previous));
                 }} />
             ))}
-            <ToggleRow dataAction="toggle-showReplyTiming" title={tr('botDefaults.footerTiming')}
+            <ToggleRow dataAction="toggle-showReplyTiming" title={tr('botDefaults.footerTiming')} help={tr('botDefaults.footerTimingHelp')}
               checked={showTiming} disabled={busy !== null}
               onChange={checked => {
                 const previous = showTiming; setShowTiming(checked);

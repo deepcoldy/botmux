@@ -1808,6 +1808,7 @@ export const messages: Record<string, string> = {
   // Markdown / contextual reply card chrome
   'card.you': 'You',
   'card.waiting_duration': 'Waiting {seconds}s',
+  'card.execution_until_reply': 'Execution until reply {seconds}s',
   'card.execution_duration': 'Execution time {seconds}s',
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',

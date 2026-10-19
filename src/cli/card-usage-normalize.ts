@@ -8,7 +8,6 @@
  *
  * 独立成模块（不放 cli.ts）：cli.ts 顶层就是命令分发 switch，测试无法直接 import。
  */
-import { normalizeReplyFooter } from '../services/reply-footer.js';
 import type { CardUsageSnapshot } from '../im/lark/md-card.js';
 import type { StatuslineQuota } from '../services/statusline-snapshot.js';
 
@@ -89,9 +88,6 @@ export function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | 
   const identity: Partial<CardUsageSnapshot> = {};
   for (const key of ['model', 'reasoningEffort', 'modelBackendVariant'] as const) {
     if (typeof raw[key] === 'string' && raw[key].trim()) identity[key] = raw[key].trim();
-  }
-  if (raw.replyFooter && typeof raw.replyFooter === 'object' && !Array.isArray(raw.replyFooter)) {
-    identity.replyFooter = normalizeReplyFooter(raw.replyFooter);
   }
   return { context, tokens, ...(quota ? { quota } : {}), ...identity };
 }

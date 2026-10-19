@@ -491,7 +491,7 @@ Dashboard → Bot configuration → Message cards exposes a Footer master switch
 | `replyFooterUsage` | `true` | Footer usage, only when `usageDisplay` is `"footer"` |
 | `replyFooterRecipients` | `true` | Footer recipients and their @ notifications; explicit body mentions remain unchanged |
 | `replyFooterVoice` | `true` | Voice summary button when voice is configured |
-| `showReplyTiming` | `false` | Waiting and execution time when measurements are available |
+| `showReplyTiming` | `false` | Waiting time plus execution until reply for normal sends, or final execution duration for terminal fallback; unknown measurements are omitted |
 
 The master takes precedence without clearing block settings or signature text. Blocks remain editable while disabled; re-enabling restores the last saved choices. When all available blocks are hidden or empty and there is no voice button, the footer and divider are omitted. Status cards, accounting and model execution parameters are unchanged. User-authored custom card content remains intact; only Botmux-generated footers are controlled.
 

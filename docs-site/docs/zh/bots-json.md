@@ -512,7 +512,7 @@ Dashboard → Bot 配置 → 消息卡片中，可设置 Footer 总开关及各�
 | `replyFooterUsage` | `true` | 页脚用量；只有 `usageDisplay: "footer"` 时显示 |
 | `replyFooterRecipients` | `true` | 页脚收件人及其 @ 通知；正文显式 @ 不受影响 |
 | `replyFooterVoice` | `true` | 已配置语音服务时的语音总结按钮 |
-| `showReplyTiming` | `false` | 有计时数据时的等待与执行耗时 |
+| `showReplyTiming` | `false` | 等待时间；普通发送显示“执行至回复”，原生回合结束后的兜底显示最终执行耗时；缺少可靠计时则省略 |
 
 总开关优先于各信息块；关闭不会清空子项配置或签名文本，关闭期间仍可编辑子项，重新开启后恢复最后保存的选择。所有可展示信息块均关闭或无内容且没有语音按钮时，整个 Footer 与分隔线自动省略。任务状态卡、用量记账和模型执行参数不受影响。自定义卡片中的用户自定义内容不由该开关移除，仅控制 Botmux 自动追加的页脚。
 
