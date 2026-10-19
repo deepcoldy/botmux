@@ -207,6 +207,7 @@ import {
   type SessionMcpRuntimeManifest,
 } from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
+import { sessionSkillManifestPath } from './core/skills/manifest-store.js';
 import { resolveEffectivePluginIds } from './core/plugins/effective.js';
 import {
   buildPluginCardActionCapabilitiesSnapshot,
@@ -19476,19 +19477,31 @@ async function spawnCli(
       ).map(canonical));
     }
     // The sandboxed CLI reads its OWN session's skill manifest via
-    // `botmux skill show <name>` (manifest-store.ts writes it to
-    // `<config.session.dataDir>/skill-manifests/<sessionId>.json`). Without an
-    // explicit carve-out the file sandbox never exposes it, so the read EACCES's
-    // and `skill show` maps that to "manifest not found" — user-skill bodies are
-    // unreadable under sandbox=true + skillInjection=prompt. Expose ONLY this
-    // session's own manifest file, read-only, canonicalized so a symlinked HOME
-    // (`/home/u` → `/data00/home/u`) still matches. Scoping to the single
-    // `<sessionId>.json` (not the whole skill-manifests dir) keeps a task from
-    // reading other sessions' manifests. Built from config.session.dataDir — the
-    // exact path the store writes to, not the possibly-unset SESSION_DATA_DIR.
-    mandatoryReadOnlyPaths.push(
-      canonical(join(config.session.dataDir, 'skill-manifests', `${cfg.sessionId}.json`)),
-    );
+    // `botmux skill list/show/read/resources` (manifest-store.ts). Without an
+    // explicit carve-out the deny-by-default policy never exposes it — bwrap
+    // simply doesn't mount it (ENOENT → "skill manifest not found"), Seatbelt
+    // denies it (EPERM). Expose ONLY this session's own manifest file,
+    // read-only: the single `<sessionId>.json`, never the skill-manifests dir,
+    // so a task cannot read other sessions' manifests. Mandatory (not the
+    // session-owned channel): the file name is `<sid>.json`, which that
+    // channel's segment==sessionId containment deliberately rejects, and a
+    // no-transport turn needs it too (no Feishu credential in it). The enabled
+    // skills' BODIES are a per-session SNAPSHOT under runtime-skills/<sid>/
+    // (core/skills/snapshot.ts) that rides sessionOwnedReadonlyRoots via
+    // cfg.skillReadonlyRoots — no host source dir is ever granted.
+    // Path from the store's own helper (same dataDir — SESSION_DATA_DIR is
+    // required above), so the store and the sandbox cannot drift. The leaf must
+    // be a regular file the daemon just (re)wrote in prepareCliPluginGeneration:
+    // a planted symlink would otherwise be followed by canonical() and turn this
+    // MANDATORY read-only grant (beats user/baseline denies by depth) onto an
+    // arbitrary target. Only the parent is canonicalized (symlinked HOME
+    // `/home/u` → `/data00/home/u`). Absent = this session has no user skills.
+    const ownSkillManifest = sessionSkillManifestPath(cfg.sessionId, dataDir);
+    try {
+      if (lstatSync(ownSkillManifest).isFile()) {
+        mandatoryReadOnlyPaths.push(join(canonical(dirname(ownSkillManifest)), basename(ownSkillManifest)));
+      }
+    } catch { /* absent — no user-skill manifest for this session */ }
     if (process.platform === 'darwin') {
       const gatewaySocketRoot = canonical(
         sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : sessionMcpGatewaySocketRoot(),

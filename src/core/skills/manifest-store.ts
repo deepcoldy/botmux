@@ -22,12 +22,32 @@ export class SkillManifestParseError extends Error {
   }
 }
 
-function manifestDir(): string {
-  return join(config.session.dataDir, 'skill-manifests');
+function manifestDir(dataDir: string = config.session.dataDir): string {
+  return join(dataDir, 'skill-manifests');
+}
+
+/** The ONE place that names a session's skill-manifest file. The store writes
+ *  and reads it here, and the worker's file-sandbox carve-out exposes exactly
+ *  this file read-only — sharing the helper keeps the two from drifting (a
+ *  renamed dir/extension would otherwise silently re-break `botmux skill show`
+ *  under sandbox=true). */
+export function sessionSkillManifestPath(sessionId: string, dataDir: string = config.session.dataDir): string {
+  return join(manifestDir(dataDir), `${sessionId}.json`);
 }
 
 function manifestPath(sessionId: string): string {
-  return join(manifestDir(), `${sessionId}.json`);
+  return sessionSkillManifestPath(sessionId);
+}
+
+const readManifestFileFromDisk = (file: string): string => readFileSync(file, 'utf-8');
+let readManifestFile = readManifestFileFromDisk;
+
+/** Test seam: inject the errno a sandbox / permission fault produces (EPERM
+ *  from a Seatbelt deny, EACCES) without touching host permissions — mode bits
+ *  can't produce it portably because root (the daemon's uid) bypasses them.
+ *  Production callers always read from disk. */
+export function __testOnly_setManifestFileReader(reader: ((file: string) => string) | undefined): void {
+  readManifestFile = reader ?? readManifestFileFromDisk;
 }
 
 export function writeSessionSkillManifest(manifest: SessionSkillManifest): void {
@@ -39,14 +59,17 @@ export function readSessionSkillManifest(sessionId: string): SessionSkillManifes
   const file = manifestPath(sessionId);
   let raw: string;
   try {
-    raw = readFileSync(file, 'utf-8');
+    raw = readManifestFile(file);
   } catch (err: any) {
     // ENOENT is the only "genuinely absent" case → null (callers report
-    // not-found). A permission error (EACCES/EPERM — e.g. the file sandbox
-    // never exposed this session's manifest) or any other read failure is a
-    // real fault: surface it so `skill show` can tell "no manifest" apart from
-    // "manifest unreadable", instead of masking a sandbox misconfig as
-    // not-found (the historical failure mode).
+    // not-found). Any other read failure is a real fault: surface it so
+    // `skill show` can tell "no manifest" apart from "manifest unreadable".
+    // Scope of this diagnosis: macOS Seatbelt denies an unexposed path with
+    // EPERM and a real permission/IO problem gives EACCES/EISDIR/…, so those
+    // are caught here. Linux bwrap does NOT mount an unexposed path at all —
+    // the read is a plain ENOENT, indistinguishable from "absent" — which is
+    // why the worker must expose this exact file (sessionSkillManifestPath)
+    // rather than rely on this classification.
     if (err?.code === 'ENOENT') return null;
     throw new SkillManifestReadError(file, err);
   }

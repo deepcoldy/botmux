@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
+  __testOnly_setManifestFileReader,
   readSessionSkillManifest,
+  sessionSkillManifestPath,
   writeSessionSkillManifest,
   SkillManifestReadError,
   SkillManifestParseError,
@@ -20,6 +22,7 @@ describe('session skill manifest store', () => {
   });
 
   afterEach(() => {
+    __testOnly_setManifestFileReader(undefined);
     vi.unstubAllEnvs();
     rmSync(dataDir, { recursive: true, force: true });
   });
@@ -50,23 +53,51 @@ describe('session skill manifest store', () => {
     expect(() => readSessionSkillManifest('bad')).toThrow(SkillManifestParseError);
   });
 
-  it('throws a read error (not null) when the manifest is present but unreadable', () => {
-    // A permission-denied read (the sandbox never exposed this session's
-    // manifest) must NOT collapse to "not found" — regression for the
-    // sandbox=true skill-body-unreadable bug.
-    mkdirSync(join(dataDir, 'skill-manifests'), { recursive: true });
-    const file = join(dataDir, 'skill-manifests', 'locked.json');
-    writeFileSync(file, '{}');
-    chmodSync(file, 0o000);
-    try {
-      // root ignores mode bits — skip the assertion there rather than false-fail.
-      let readable = true;
-      try { readSessionSkillManifest('locked'); } catch { readable = false; }
-      if (typeof process.getuid === 'function' && process.getuid() === 0) return;
-      expect(readable).toBe(false);
-      expect(() => readSessionSkillManifest('locked')).toThrow(SkillManifestReadError);
-    } finally {
-      chmodSync(file, 0o600);
+  it('names the manifest file through the shared path helper (the sandbox exposes this exact file)', () => {
+    writeSessionSkillManifest({
+      sessionId: 's-path', cliId: 'codex', workingDir: '/repo', policyMode: 'priority',
+      prioritySkills: [], diagnostics: [], generatedAt: '2026-06-14T00:00:00.000Z',
+    });
+    expect(sessionSkillManifestPath('s-path')).toBe(join(dataDir, 'skill-manifests', 's-path.json'));
+    expect(sessionSkillManifestPath('s-path', '/elsewhere')).toBe('/elsewhere/skill-manifests/s-path.json');
+    expect(existsSync(sessionSkillManifestPath('s-path'))).toBe(true);
+  });
+
+  // Mode bits can't stand in for "unreadable" here: the daemon runs as root,
+  // and root (CAP_DAC_OVERRIDE) reads a chmod-000 file fine — a chmod case would
+  // have to skip exactly where it matters. These cases hold for ANY uid.
+  it('a present-but-unreadable manifest throws a read error, not null — real fs (EISDIR, ELOOP)', () => {
+    mkdirSync(sessionSkillManifestPath('as-dir'), { recursive: true });
+    symlinkSync('loop.json', sessionSkillManifestPath('loop'));
+    for (const [sessionId, code] of [['as-dir', 'EISDIR'], ['loop', 'ELOOP']] as const) {
+      let caught: unknown;
+      try { readSessionSkillManifest(sessionId); } catch (err) { caught = err; }
+      expect(caught).toBeInstanceOf(SkillManifestReadError);
+      expect((caught as SkillManifestReadError).cause?.code).toBe(code);
+      expect((caught as SkillManifestReadError).path).toBe(sessionSkillManifestPath(sessionId));
     }
+  });
+
+  for (const code of ['EPERM', 'EACCES'] as const) {
+    it(`a ${code} read (macOS Seatbelt deny / real permission fault) throws a read error, not null`, () => {
+      mkdirSync(join(dataDir, 'skill-manifests'), { recursive: true });
+      writeFileSync(sessionSkillManifestPath('locked'), '{}');
+      __testOnly_setManifestFileReader(() => {
+        throw Object.assign(new Error(`${code}: operation not permitted`), { code });
+      });
+      let caught: unknown;
+      try { readSessionSkillManifest('locked'); } catch (err) { caught = err; }
+      expect(caught).toBeInstanceOf(SkillManifestReadError);
+      expect((caught as SkillManifestReadError).cause?.code).toBe(code);
+      __testOnly_setManifestFileReader(undefined);
+      expect(readSessionSkillManifest('locked')).toEqual({});
+    });
+  }
+
+  it('ENOENT stays "absent" (null) — also the shape Linux bwrap gives an unexposed path', () => {
+    __testOnly_setManifestFileReader(() => {
+      throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+    });
+    expect(readSessionSkillManifest('not-mounted')).toBeNull();
   });
 });

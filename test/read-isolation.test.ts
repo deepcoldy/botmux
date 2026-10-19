@@ -209,6 +209,28 @@ describe('mandatory device credential isolation', () => {
     }
   });
 
+  it('credential-only isolation leaves the session skill manifest, skill snapshot and store readable (`botmux skill show` works)', () => {
+    // Credential-only (sandbox off + device-credential marker) is allow-default:
+    // only the device authority namespace + reserved/dashboard top-level files
+    // are hidden. Guard against a future widening that would silently mask the
+    // skill reader's inputs. (No cross-session read isolation is promised in
+    // this mode — that is the full fs-policy sandbox's job.)
+    for (const botmuxHome of ['/home/agent/.botmux', '/srv/botmux-runtime']) {
+      const rules = buildCredentialIsolationRules({ homeDir: '/home/agent', botmuxHome });
+      for (const path of [
+        `${botmuxHome}/data/skill-manifests/s.json`,
+        `${botmuxHome}/data/runtime-skills/s/snapshot/deploy/SKILL.md`,
+        '/home/agent/.botmux/skills/store/deploy/SKILL.md',
+      ]) {
+        expect(rules.denyPaths.some(deny => path === deny || path.startsWith(`${deny}/`)), path).toBe(false);
+        expect(rules.denyRegexes.some(rx => new RegExp(rx).test(path)), path).toBe(false);
+      }
+    }
+    for (const name of ['data', 'skills']) {
+      expect(isCredentialIsolationReservedBasename(name), name).toBe(false);
+    }
+  });
+
   it('credential-only Seatbelt must expose both capability and attestation dirs read-only while keeping profileDir write-denied', async () => {
     const workerSource = await import('node:fs/promises').then(fs =>
       fs.readFile(new URL('../src/worker.ts', import.meta.url), 'utf8'));
@@ -941,6 +963,42 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     expect(isolatedPaneReattachSafe(JSON.stringify({ ...current, version: 16 }), ['credential'])).toBe(false);
   });
 
+  it('restore path: a v17 sandboxed pane (no skill manifest / snapshot binds) is killed + cold-spawned; a current one warm-reattaches', () => {
+    // v18 adds spawn-time read-only binds for the session's skill manifest and
+    // its skill snapshot dir. Warm reattach keeps the old process + mounts
+    // and skips skill generation, so a v17 pane would never get them. Compose
+    // the worker's own gate: isolatedPaneReattachSafe (as spawnCli calls it for
+    // the policy-ON arm) → evaluatePersistentPaneMigration.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(17);
+    const digest = 'ab'.repeat(32);
+    for (const { label, readIsolation, writeSandbox } of [
+      { label: 'linux oncall (bwrap)', readIsolation: false, writeSandbox: false },
+      { label: 'darwin oncall (Seatbelt)', readIsolation: true, writeSandbox: true },
+    ]) {
+      const caps = ['credential', 'read', 'write'] as const;
+      const expected = {
+        requiredCapabilities: caps, exactCapabilities: true,
+        readIsolation, writeSandbox, requireOriginChannel: true, policyDigest: digest,
+      };
+      const current = JSON.parse(isolationPaneMarkerContent('boot', caps, {
+        originChannelId: G1, readIsolation, writeSandbox, policyDigest: digest,
+      })) as Record<string, unknown>;
+      const decide = (marker: Record<string, unknown>) => evaluatePersistentPaneMigration({
+        appliedIsolationCapabilities: [...caps],
+        isolationCapableBackend: true,
+        noTransport: false,
+        isolationMarkerPresent: true,
+        policyOffTombstonePresent: false,
+        policyOffTombstoneValid: false,
+        paneProbe: 'exists',
+        pendingProvenancePresent: false,
+        isolationMarkerReattachSafe: isolatedPaneReattachSafe(JSON.stringify(marker), expected),
+      });
+      expect(decide(current), label).toEqual({ action: 'reattach' });
+      expect(decide({ ...current, version: 17 }), label).toEqual({ action: 'kill-then-cold-spawn', clearAfterKill: true });
+    }
+  });
+
   it('has moved the version past 12 — the release before the sandboxed-Codex CA env contract', () => {
     // A pane spawned before this change keeps its ORIGINAL process environment, so
     // it would never see the host CA bundle (SSL_CERT_FILE) and its Codex would keep
@@ -1058,6 +1116,47 @@ describe('worker capability carve-out ordering', () => {
     expect(strippedSource).not.toContain(
       'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
     );
+  });
+
+  it('exposes exactly this session\'s skill manifest file read-only and threads the skill snapshot into the policy', () => {
+    // sandbox=true + `botmux skill show`: fs-policy tests hand-feed the grants,
+    // so deleting the worker call site would leave them green while the live
+    // sandbox reverts to "skill manifest not found". Guard the call site.
+    const at = strippedSource.indexOf('const ownSkillManifest = sessionSkillManifestPath(cfg.sessionId, dataDir);');
+    expect(at).toBeGreaterThanOrEqual(0);
+    const fileCheckAt = strippedSource.indexOf('lstatSync(ownSkillManifest).isFile()', at);
+    const pushAt = strippedSource.indexOf(
+      'mandatoryReadOnlyPaths.push(join(canonical(dirname(ownSkillManifest)), basename(ownSkillManifest)))',
+      at,
+    );
+    const ctxAt = strippedSource.indexOf('const fsPolicyCtx = {', at);
+    expect(fileCheckAt).toBeGreaterThan(at);
+    expect(pushAt).toBeGreaterThan(fileCheckAt);
+    expect(ctxAt).toBeGreaterThan(pushAt);
+    // Never the shared manifest dir (every session's manifest lives there).
+    expect(strippedSource).not.toMatch(/ReadOnlyPaths\.push\([^;]*'skill-manifests'\s*\)\s*\)?;/);
+    // Enabled-skill source roots: delivery → cfg.skillReadonlyRoots → policy.
+    expect(strippedSource).toContain('cfg.skillReadonlyRoots = generation.skillReadonlyRoots;');
+    // The skill bodies reach the policy ONLY as session-owned roots (the
+    // session snapshot) — no host skill source channel exists in the worker.
+    expect(strippedSource).not.toContain('rehomedHostCliDataRoots');
+    // …and the mandatory read-only list actually reaches the policy context.
+    expect(strippedSource.slice(ctxAt, strippedSource.indexOf('const policy = (() => {', ctxAt))).toMatch(/\n\s*mandatoryReadOnlyPaths,\n/);
+  });
+
+  it('never reclaims the skill snapshot on a normal worker exit / detach — only on a real session close (or a v3 attempt exit)', () => {
+    // A daemon restart detaches the worker and later warm-reattaches the live
+    // pane, which still binds runtime-skills/<sid>/snapshot by inode. Only
+    // closeSession() (session-store) and the v3 ephemeral pool (synthetic
+    // sessions, after the worker process exited) may remove it; spawn-time
+    // regeneration is gated on !willReattachPersistent.
+    const sources = ['worker.ts', 'core/worker-pool.ts', 'core/session-manager.ts']
+      .map(f => stripComments(readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8')));
+    for (const src of sources) expect(src).not.toContain('removeSessionSkillRuntime');
+    expect(strippedSource).toMatch(/if \(!willReattachPersistent\) \{\s*mcpRuntimeManifest = opts\.pluginGenerationPrepared[\s\S]{0,200}prepareCliPluginGenerationAndGateway\(cfg, cliAdapter\)/);
+    const store = stripComments(readFileSync(new URL('../src/services/session-store.ts', import.meta.url), 'utf8'));
+    const close = store.slice(store.indexOf('export function closeSession('), store.indexOf('export function reactivateClosedSession('));
+    expect(close).toContain('removeSessionSkillRuntime(sessionId, config.session.dataDir)');
   });
 
   it('wires adapter sandboxReadonlyPaths() into the readonlyRoots channel (traex/coco migration markers)', () => {

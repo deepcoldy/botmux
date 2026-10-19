@@ -26,6 +26,9 @@ import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createEbsdAdapter } from '../src/adapters/cli/ebsd.js';
+import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
+import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
+import { sessionSkillSnapshotRoot } from '../src/core/skills/snapshot.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -1877,3 +1880,95 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
       .not.toBe('readOnly');
   });
 });
+
+// sandbox=true × `botmux skill list/show/read/resources`: the reader needs THIS
+// session's manifest (a mandatory read-only FILE grant made by the worker) and
+// its skill SNAPSHOT (`runtime-skills/<sid>/snapshot`, a session-owned root fed
+// through sessionOwnedReadonlyRoots). No host skill source is ever granted.
+describe('buildFsPolicy — session skill manifest + skill snapshot', () => {
+  const sd = '/Users/u/.botmux/data';
+  const store = '/Users/u/.botmux/skills/store';
+  const ownManifest = sessionSkillManifestPath('s', sd);
+  const otherManifest = sessionSkillManifestPath('other', sd);
+  const snapshot = sessionSkillSnapshotRoot('s', sd);
+  const otherSnapshot = sessionSkillSnapshotRoot('other', sd);
+  const skillCtx = (o: Partial<FsPolicyContext> = {}) => ctx({
+    mandatoryReadOnlyPaths: [ownManifest],
+    sessionOwnedReadonlyRoots: [snapshot],
+    ...o,
+  });
+
+  it('pins the paths the worker exposes to the ones the store and the snapshot write', () => {
+    expect(ownManifest).toBe(`${sd}/skill-manifests/s.json`);
+    expect(snapshot).toBe(`${sd}/runtime-skills/s/snapshot`);
+  });
+
+  for (const platform of ['darwin', 'linux'] as const) {
+    for (const larkTransportEnabled of [true, false]) {
+      it(`${platform} transport=${larkTransportEnabled}: own manifest + own snapshot are read-only; sibling sessions and the store are unreachable`, () => {
+        const p = buildFsPolicy(skillCtx({ platform, larkTransportEnabled }));
+        expect(accessForPath(p.rules, ownManifest).access).toBe('readOnly');
+        expect(accessForPath(p.rules, `${snapshot}/deploy/SKILL.md`).access).toBe('readOnly');
+        expect(accessForPath(p.rules, `${snapshot}/deploy/scripts/run.sh`).access).toBe('readOnly');
+        for (const closed of [otherManifest, `${otherSnapshot}/payroll/SKILL.md`, `${sd}/skill-manifests`,
+          `${store}/deploy/SKILL.md`, store, '/Users/u/.botmux/skills/registry.json']) {
+          expect(accessForPath(p.rules, closed).access, closed).not.toMatch(/readOnly|readWrite/);
+        }
+        expect(p.suppressedAuthorityPaths ?? []).not.toContain(snapshot);
+      });
+    }
+  }
+
+  it('without the grants (pre-fix shape) neither the manifest nor the skill body is reachable', () => {
+    const p = buildFsPolicy(ctx());
+    expect(accessForPath(p.rules, ownManifest).access).toBe('none');
+    expect(accessForPath(p.rules, `${snapshot}/deploy/SKILL.md`).access).toBe('none');
+    expect(accessForPath(p.rules, `${store}/deploy/SKILL.md`).access).toBe('none');
+  });
+
+  it('a sibling session\'s snapshot passed by mistake is not session-owned and never reaches a no-transport turn', () => {
+    const p = buildFsPolicy(skillCtx({ larkTransportEnabled: false, sessionOwnedReadonlyRoots: [snapshot, otherSnapshot] }));
+    expect(accessForPath(p.rules, `${otherSnapshot}/payroll/SKILL.md`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${snapshot}/deploy/SKILL.md`).access).toBe('readOnly');
+  });
+
+  it('compiles to bwrap binds of exactly the own manifest and the own snapshot root', () => {
+    const lsd = '/home/u/.botmux/data';
+    const p = buildFsPolicy(skillCtx({
+      platform: 'linux', homeDir: '/home/u', botmuxHome: '/home/u/.botmux',
+      sessionDataDir: lsd, botHome: '/home/u/.botmux/bots/cli_self', workingDir: '/home/u/proj',
+      mandatoryReadOnlyPaths: [sessionSkillManifestPath('s', lsd)],
+      sessionOwnedReadonlyRoots: [sessionSkillSnapshotRoot('s', lsd)],
+    }));
+    const { args } = compileToBwrap(p, { emptyDir: '/sbx/empty', emptiesDir: '/sbx/empties', chdir: '/home/u/proj' });
+    const bound = (path: string) => { const i = args.indexOf(path); return i > 0 ? args[i - 1] : undefined; };
+    expect(bound(`${lsd}/skill-manifests/s.json`)).toBe('--ro-bind');
+    expect(bound(`${lsd}/runtime-skills/s/snapshot`)).toBe('--ro-bind');
+    for (const absent of ['/home/u/.botmux/skills/store', '/home/u/.botmux/skills/store/deploy',
+      `${lsd}/skill-manifests`, `${lsd}/skill-manifests/other.json`, `${lsd}/runtime-skills/other/snapshot`]) {
+      expect(args).not.toContain(absent);
+    }
+  });
+
+  it('compiles to Seatbelt read-only grants for the own manifest and snapshot only (darwin)', () => {
+    const prof = compileToSeatbelt(buildFsPolicy(skillCtx()));
+    expect(prof).toContain(`(allow file-read* (subpath "${ownManifest}"))`);
+    expect(prof).toContain(`(allow file-read* (subpath "${snapshot}"))`);
+    expect(prof).toContain(`(deny file-write* (subpath "${snapshot}"))`);
+    expect(prof).not.toContain(store);
+    expect(prof).not.toContain(otherManifest);
+    expect(prof).not.toContain(otherSnapshot);
+  });
+
+  it('oncall + device-credential boundary: the credential masks hide neither the manifest nor the snapshot', () => {
+    for (const platform of ['darwin', 'linux'] as const) {
+      const cred = buildCredentialIsolationRules({ homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux' });
+      const p = buildFsPolicy(skillCtx({ platform, mandatoryDenyPaths: cred.denyPaths, mandatoryDenyRegexes: cred.denyRegexes }));
+      for (const path of [ownManifest, `${snapshot}/deploy/SKILL.md`]) {
+        expect(accessForPath(p.rules, path).access).toBe('readOnly');
+        expect((p.denyRegexes ?? []).some(rx => new RegExp(rx).test(path))).toBe(false);
+      }
+    }
+  });
+});
+

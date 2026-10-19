@@ -125,3 +125,38 @@ describe('enumerateScratchSecretPaths', () => {
     expect(got).not.toContain(join(home(), 'bots', app));
   });
 });
+
+describe('scratch × `botmux skill show`', () => {
+  it('the credential mask leaves the session skill manifest and skill snapshot readable through the COW root', () => {
+    layout();
+    process.env.LARKSUITE_CLI_DATA_DIR = larkData();
+    const manifest = join(data(), 'skill-manifests', 'sess-1.json');
+    const body = join(home(), 'skills', 'store', 'deploy', 'SKILL.md');
+    const snapshotBody = join(data(), 'runtime-skills', 'sess-1', 'snapshot', 'deploy', 'SKILL.md');
+    mkdirSync(join(data(), 'runtime-skills', 'sess-1', 'snapshot', 'deploy'), { recursive: true });
+    writeFileSync(snapshotBody, '# Deploy');
+    mkdirSync(join(data(), 'skill-manifests'), { recursive: true });
+    writeFileSync(manifest, '{}');
+    mkdirSync(join(home(), 'skills', 'store', 'deploy'), { recursive: true });
+    writeFileSync(body, '# Deploy');
+    writeFileSync(join(home(), 'skills', 'registry.json'), '{}');
+    try {
+      const secret = enumerateScratchSecretPaths({
+        botmuxHomes: [home()],
+        dataDirs: [data()],
+        homeDir: join(root, 'oshome'),
+        sessionId: 'sess-1',
+      });
+      // Scratch mounts the REAL tree; only enumerated secrets are masked. The
+      // skill reader's inputs must not be among them (they hold no credential).
+      for (const path of [manifest, body, snapshotBody]) {
+        expect(secret.denyPaths.some(p => path === p || path.startsWith(`${p}/`)), path).toBe(false);
+      }
+      // …while the transport credentials next to them stay masked.
+      expect(secret.denyPaths).toContain(join(home(), 'bots.json'));
+      expect(secret.denyPaths).toContain(join(data(), 'cli-identity'));
+    } finally {
+      delete process.env.LARKSUITE_CLI_DATA_DIR;
+    }
+  });
+});
