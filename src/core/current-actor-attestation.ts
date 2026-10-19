@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, readlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { CURRENT_ACTOR_SCHEMA, normalizeActorEmail, type CurrentActorDocument } from '../cli/current-actor.js';
 import { resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
@@ -131,6 +131,26 @@ export function resolveLoopbackPeerProcesses(input: {
     : { ok: false, reason: 'peer_unresolved' };
 }
 
+/** Codex keeps its native tool dispatcher alive across turns. It is part of
+ * the attested engine, not an old user command. Never recognize it from argv
+ * alone: require a direct attested Codex parent and the release sibling exe. */
+function isNativeCodexToolHost(
+  pid: number, parent: number, procRoot: string, trustedRootPids: ReadonlySet<number>,
+): boolean {
+  if (!trustedRootPids.has(parent)) return false;
+  try {
+    const parentExe = readlinkSync(join(procRoot, String(parent), 'exe'));
+    const hostExe = readlinkSync(join(procRoot, String(pid), 'exe'));
+    const cmdline = readFileSync(join(procRoot, String(pid), 'cmdline'), 'utf8');
+    const argv = cmdline.endsWith('\0') ? cmdline.slice(0, -1).split('\0') : [];
+    return basename(parentExe) === 'codex'
+      && hostExe === join(dirname(parentExe), 'codex-code-mode-host')
+      && argv.length === 1 && argv[0].length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function peerBelongsToCurrentTurn(input: {
   peer: ProcessIdentity;
   trustedRootPids: ReadonlySet<number>;
@@ -146,8 +166,14 @@ function peerBelongsToCurrentTurn(input: {
       if (!fields) return false;
       const parent = Number(fields[1]);
       const started = fields[PROC_STAT_STARTTIME_INDEX];
-      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')
-        || input.preexistingProcessIdentities.has(`${pid}:${started}`)) return false;
+      if (!Number.isSafeInteger(parent) || !/^\d+$/.test(started ?? '')) return false;
+      if (input.preexistingProcessIdentities.has(`${pid}:${started}`)) {
+        // Only traverse the native dispatcher as an ancestor of a new tool.
+        // It cannot itself claim this turn, nor can old tool descendants.
+        if (pid === input.peer.pid
+          || !isNativeCodexToolHost(pid, parent, input.procRoot, input.trustedRootPids)
+          || readProcStart(pid, input.procRoot) !== started) return false;
+      }
       pid = parent;
     } catch {
       return false;

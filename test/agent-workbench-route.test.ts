@@ -122,6 +122,40 @@ describe('Agent Workbench route and surface integration', () => {
     expect(platformGate.decision.kind).toBe('deny401');
   });
 
+  it('rejects a result-only H5 session from Workbench identity and API gates', () => {
+    const identity = resolveDashboardIdentity({
+      legacyCookie: undefined,
+      activeToken: 'active-management-token',
+      roleHeader: undefined,
+      actorHeader: undefined,
+      scopesHeader: undefined,
+      platformMachineId: null,
+      platformActorScope: machineId => `scope-${machineId}`,
+      legacyAuthSessionId: token => `legacy-${token}`,
+      h5: {
+        kind: 'feishu-h5',
+        userId: 'ou_result_viewer',
+        unionId: 'on_result_viewer',
+        resultOnly: true,
+        authSessionId: 'result-only-session',
+        issuedAt: 1,
+        expiresAt: 60_001,
+      },
+    });
+    expect(identity).toBeNull();
+    const gate = resolveDashboardRequestGate({
+      method: 'GET',
+      pathname: '/api/sessions',
+      hasTokenParam: false,
+      identity,
+      tokenFromRequest: undefined,
+      activeToken: 'active-management-token',
+      publicReadOnly: false,
+    });
+    expect(gate.workbenchOnlyIdentity).toBe(false);
+    expect(gate.decision.kind).toBe('deny401');
+  });
+
   // ── P1-4：能力集投影端点与前端消费链的接线钉死 ────────────────────────────
   // 语义矩阵在 dashboard-auth.test.ts / agent-workbench-components.test.ts；这里
   // 只钉「接的是同一根线」：端点调的是共享投影函数（而不是路由旁边再手写一张

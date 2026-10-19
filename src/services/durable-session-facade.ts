@@ -49,6 +49,8 @@ export interface DurableSessionFacade {
     sessionKey: string,
     buildValue: DurableSessionExactValueBuilder,
   ): Promise<DurableSessionFacadeWriteResult>;
+  /** Stop renewing and release this facade's exact current lease in lane order. */
+  releaseLease(sessionKey: string): Promise<boolean>;
   stop(timeoutMs?: number): Promise<DurableSessionFacadeStopResult>;
   terminate(): void;
 }
@@ -59,6 +61,10 @@ export interface DurableSessionFacadeOptions {
   ownerId?: string;
   leaseDurationMs?: number;
   shutdownMs?: number;
+  /** Keep the acquired lease alive while the latest committed value owns a
+   * live runtime. Omit for shadow/batch facades that need write-scoped leases. */
+  keepLeaseAlive?: (value: DurableJson) => boolean;
+  onLeaseLost?: (sessionKey: string, error: Error) => void;
 }
 
 interface PendingWriteBase {
@@ -76,8 +82,10 @@ type PendingWrite = PendingWriteBase & (
 interface SessionLane {
   sessionKey: string;
   pending: PendingWrite[];
+  releaseWaiters: Array<(released: boolean) => void>;
   running?: Promise<void>;
   lease?: SessionLease;
+  renewalTimer?: ReturnType<typeof setTimeout>;
 }
 
 function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
@@ -162,10 +170,50 @@ export function createDurableSessionFacade(
   let accepting = true;
   let terminated = false;
   let stopPromise: Promise<DurableSessionFacadeStopResult> | undefined;
+  const leaseRenewalMs = Math.max(250, Math.floor(leaseDurationMs / 3));
 
   const isStopping = (): boolean => !accepting || terminated;
 
+  const clearLaneRenewal = (lane: SessionLane): void => {
+    if (lane.renewalTimer) clearTimeout(lane.renewalTimer);
+    lane.renewalTimer = undefined;
+  };
+
+  const reportLeaseLoss = (lane: SessionLane, detail: unknown): void => {
+    clearLaneRenewal(lane);
+    lane.lease = undefined;
+    const error = detail instanceof Error
+      ? detail
+      : new Error(`durable Session lease renewal failed: ${String(detail)}`);
+    try { options.onLeaseLost?.(lane.sessionKey, error); } catch { /* observer only */ }
+  };
+
+  const armLaneRenewal = (lane: SessionLane, lease: SessionLease): void => {
+    clearLaneRenewal(lane);
+    if (isStopping() || lane.lease !== lease) return;
+    lane.renewalTimer = setTimeout(() => {
+      lane.renewalTimer = undefined;
+      if (isStopping() || lane.lease !== lease) return;
+      void options.store.renewSessionLease({ lease, leaseDurationMs }).then(result => {
+        if (isStopping()) return;
+        if (lane.lease !== lease) return;
+        if (result.kind !== 'applied') {
+          reportLeaseLoss(lane, 'stale lease');
+          return;
+        }
+        lane.lease = result.lease;
+        armLaneRenewal(lane, result.lease);
+      }).catch(error => {
+        if (!isStopping() && lane.lease === lease) {
+          reportLeaseLoss(lane, error);
+        }
+      });
+    }, leaseRenewalMs);
+    lane.renewalTimer.unref?.();
+  };
+
   const releaseLaneLease = async (lane: SessionLane, lease: SessionLease): Promise<boolean> => {
+    clearLaneRenewal(lane);
     try {
       const result = await options.store.releaseSessionLease(lease);
       if (result.kind !== 'applied' && result.kind !== 'stale') return false;
@@ -203,6 +251,7 @@ export function createDurableSessionFacade(
       throw error;
     }
     if (acquired.kind === 'occupied') {
+      clearLaneRenewal(lane);
       lane.lease = undefined;
       if (isStopping()) return { kind: 'stopped', coalescedCount };
       return { ...acquired, coalescedCount };
@@ -216,7 +265,10 @@ export function createDurableSessionFacade(
       const value = batch.mode === 'exact-current'
         ? cloneDurableJson(batch.buildValue(current ? cloneDurableSessionRecord(current) : undefined))
         : batch.value;
+      const keepLeaseAlive = options.keepLeaseAlive?.(value) === true;
       if (batch.mode === 'coalesced' && current && sameDurableJson(current.value, value)) {
+        if (keepLeaseAlive) armLaneRenewal(lane, acquired.lease);
+        else clearLaneRenewal(lane);
         return { kind: 'unchanged', lease: acquired.lease, record: current, coalescedCount };
       }
       const written = await options.store.writeSession({
@@ -226,30 +278,48 @@ export function createDurableSessionFacade(
       });
       if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
       if (written.kind === 'written') {
+        if (keepLeaseAlive) armLaneRenewal(lane, acquired.lease);
+        else clearLaneRenewal(lane);
         return { kind: 'written', lease: acquired.lease, record: written.record, coalescedCount };
       }
       if (written.kind === 'conflict') {
+        if (keepLeaseAlive) armLaneRenewal(lane, acquired.lease);
+        else clearLaneRenewal(lane);
         return { kind: 'conflict', current: written.current, coalescedCount };
+      }
+      if (keepLeaseAlive) {
+        reportLeaseLoss(lane, 'lease was stale when committing the Session write');
+      } else {
+        clearLaneRenewal(lane);
       }
       lane.lease = undefined;
       return { kind: 'stale_lease', coalescedCount };
     } catch (error) {
       if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
+      if (options.keepLeaseAlive) armLaneRenewal(lane, acquired.lease);
+      else await releaseLaneLease(lane, acquired.lease);
       throw error;
     }
   };
 
   const runLane = async (lane: SessionLane): Promise<void> => {
-    while (lane.pending.length > 0) {
-      const batch = lane.pending.shift()!;
-      let result: DurableSessionFacadeWriteResult;
-      try {
-        result = await performWrite(lane, batch, batch.waiters.length);
-      } catch (error) {
-        for (const waiter of batch.waiters) waiter.reject(error);
+    while (lane.pending.length > 0 || lane.releaseWaiters.length > 0) {
+      if (lane.pending.length > 0) {
+        const batch = lane.pending.shift()!;
+        let result: DurableSessionFacadeWriteResult;
+        try {
+          result = await performWrite(lane, batch, batch.waiters.length);
+        } catch (error) {
+          for (const waiter of batch.waiters) waiter.reject(error);
+          continue;
+        }
+        for (const waiter of batch.waiters) waiter.resolve(result);
         continue;
       }
-      for (const waiter of batch.waiters) waiter.resolve(result);
+      const waiters = lane.releaseWaiters.splice(0);
+      const lease = lane.lease;
+      const released = lease ? await releaseLaneLease(lane, lease) : true;
+      for (const resolve of waiters) resolve(released);
     }
   };
 
@@ -257,7 +327,9 @@ export function createDurableSessionFacade(
     if (lane.running) return;
     lane.running = runLane(lane).finally(() => {
       lane.running = undefined;
-      if (lane.pending.length > 0 && !terminated) startLane(lane);
+      if ((lane.pending.length > 0 || lane.releaseWaiters.length > 0) && !terminated) {
+        startLane(lane);
+      }
     });
   };
 
@@ -303,7 +375,7 @@ export function createDurableSessionFacade(
       }
       let lane = lanes.get(sessionKey);
       if (!lane) {
-        lane = { sessionKey, pending: [] };
+        lane = { sessionKey, pending: [], releaseWaiters: [] };
         lanes.set(sessionKey, lane);
       }
       return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
@@ -325,7 +397,7 @@ export function createDurableSessionFacade(
       }
       let lane = lanes.get(sessionKey);
       if (!lane) {
-        lane = { sessionKey, pending: [] };
+        lane = { sessionKey, pending: [], releaseWaiters: [] };
         lanes.set(sessionKey, lane);
       }
       return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
@@ -343,11 +415,24 @@ export function createDurableSessionFacade(
       }
       let lane = lanes.get(sessionKey);
       if (!lane) {
-        lane = { sessionKey, pending: [] };
+        lane = { sessionKey, pending: [], releaseWaiters: [] };
         lanes.set(sessionKey, lane);
       }
       return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
         lane!.pending.push({ mode: 'exact-current', buildValue, waiters: [{ resolve, reject }] });
+        startLane(lane!);
+      });
+    },
+    releaseLease: (rawSessionKey) => {
+      const sessionKey = validateSessionKey(rawSessionKey);
+      if (!accepting || terminated) return Promise.resolve(false);
+      let lane = lanes.get(sessionKey);
+      if (!lane) {
+        lane = { sessionKey, pending: [], releaseWaiters: [] };
+        lanes.set(sessionKey, lane);
+      }
+      return new Promise<boolean>(resolve => {
+        lane!.releaseWaiters.push(resolve);
         startLane(lane!);
       });
     },
@@ -385,6 +470,9 @@ export function createDurableSessionFacade(
       accepting = false;
       terminated = true;
       for (const lane of lanes.values()) {
+        clearLaneRenewal(lane);
+        const releaseWaiters = lane.releaseWaiters.splice(0);
+        for (const resolve of releaseWaiters) resolve(false);
         const pending = lane.pending.splice(0);
         for (const batch of pending) {
           const result: DurableSessionFacadeWriteResult = {

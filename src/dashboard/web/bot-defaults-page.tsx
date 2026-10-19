@@ -41,7 +41,9 @@ import {
   type BotDescriptionSnapshot,
 } from './bot-description.js';
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { resolvePairedBackendId } from '../../core/remote-cli-ids.js';
 import { isReservedPerBotEnvKey, parsePerBotEnvText, sanitizePerBotEnv } from '../../core/per-bot-env.js';
+import { supportsZeroPromptInjection } from '../../core/zero-prompt-support.js';
 import { confirm } from './confirm-modal.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
@@ -1030,6 +1032,7 @@ function BotDefaultsCard(props: {
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><LarkToolBindingSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
@@ -1076,7 +1079,10 @@ function BotDefaultsCard(props: {
             ) : null}
             {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
-            <section className="bd-tile"><ReplyDeliverySection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile">
+              <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />
+              <ReplyDeliverySection bot={bot} patchBot={patchBot} />
+            </section>
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
@@ -3784,6 +3790,45 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   );
 }
 
+function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const bound = bot.larkToolBinding !== false;
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = bound;
+    patchBot(bot.larkAppId, { larkToolBinding: next });
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/lark-tool-binding`, {
+        enabled: next,
+      }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.larkToolBindingSaved'),
+      rollback: () => patchBot(bot.larkAppId, { larkToolBinding: previous }),
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionLarkToolBinding')}</h3>
+      <ToggleRow
+        checked={bound}
+        disabled={busy}
+        dataAction="toggle-lark-tool-binding"
+        title={tr('botDefaults.larkToolBindingToggle')}
+        help={tr('botDefaults.larkToolBindingHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-lark-tool-binding-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
 function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
@@ -4942,6 +4987,75 @@ function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: P
       </div>
       <StatusSpan status={status} />
     </div>
+  );
+}
+
+/** 按 Bot 当前行的 CLI / 后端 / 沙盒实时判断（与 daemon 写入时的校验同一个函数），
+ *  本页改了沙盒、后端或 CLI 后立即反映，不依赖加载时的快照。 */
+export function zeroPromptSupportedFor(bot: Pick<BotDefaultsRow, 'cliId' | 'backendType' | 'defaultBackendType' | 'sandbox' | 'sandboxMode'>): boolean {
+  const sandbox = bot.sandboxMode === 'off' || bot.sandboxMode === 'oncall' || bot.sandboxMode === 'scratch'
+    ? bot.sandboxMode
+    : bot.sandbox ? 'oncall' : 'off';
+  // 后端按新会话 spawn 时的生效值（覆盖值，否则 daemon 默认，再按 CLI 配对），与 daemon
+  // 写入校验、spawn 时的强制校验一致。
+  const backendType = resolvePairedBackendId(bot.cliId, bot.backendType, bot.defaultBackendType);
+  return supportsZeroPromptInjection(bot.cliId, { backendType, sandbox });
+}
+
+/**
+ * 零注入：执行会话不附带 Botmux 的提示词、提醒与技能目录，最终回答由 Botmux 从转写里
+ * 自动回传并 @ 发起人。只对新会话生效。当前 CLI / 后端 / 沙箱组合不支持时开关禁用；
+ * 关联的 Agent 统一管理零注入时整块锁定。
+ */
+export function PromptInjectionSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
+  const tr = useT();
+  const [zero, setZero] = useState(props.bot.promptInjection === 'none');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const supported = zeroPromptSupportedFor(props.bot);
+
+  useEffect(() => setZero(props.bot.promptInjection === 'none'), [props.bot.promptInjection]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = zero;
+    setZero(next);
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/prompt-injection`, { promptInjection: next ? 'none' : 'default' }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const saved = body.promptInjection === 'none';
+        setZero(saved);
+        // 零注入强制 transcript 回传；同时刷新旁边回复投递开关显示的生效值。
+        const replyDelivery = body.replyDelivery === 'transcript' || body.replyDelivery === 'send' ? body.replyDelivery : undefined;
+        props.patchBot(props.bot.larkAppId, { promptInjection: saved ? 'none' : 'default', ...(replyDelivery ? { replyDelivery } : {}) });
+      },
+      rollback: () => setZero(previous),
+    });
+  }
+
+  return (
+    <section className="bd-section" data-prompt-injection>
+      <h3 className="bd-section-title">{tr('botDefaults.promptInjection')}</h3>
+      <AgentManagedLock lock={props.lock} section="promptInjection">
+        <ToggleRow
+          checked={zero}
+          // 已开启但当前组合不支持时仍允许关掉，避免卡在一个无法生效的状态里。
+          disabled={busy || (!supported && !zero)}
+          dataAction="toggle-prompt-injection"
+          title={tr('botDefaults.promptInjectionToggle')}
+          help={tr('botDefaults.promptInjectionHelp')}
+          onChange={checked => void save(checked)}
+        />
+        <small className="bd-section-note">
+          {supported ? tr('botDefaults.promptInjectionNote') : tr('botDefaults.promptInjectionUnsupported')}
+        </small>
+      </AgentManagedLock>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-prompt-injection-status': '' }} />
+      </div>
+    </section>
   );
 }
 

@@ -53,6 +53,16 @@ describe('external durable coordination provider', () => {
     });
     if (acquisition.kind !== 'acquired') throw new Error('expected fixture lease');
     const lease: SessionLease = acquisition.lease;
+    await expect(store.enqueueInboxWithLease({
+      lease,
+      event: {
+        eventId: 'event-a',
+        partitionKey: 'partition-a',
+        payload: { value: 1 },
+        visibleAt: 1,
+        createdAt: 1,
+      },
+    })).resolves.toEqual({ kind: 'inserted' });
     const operation = {
       operationId: 'fixture-control',
       sessionKey: 'session-a',

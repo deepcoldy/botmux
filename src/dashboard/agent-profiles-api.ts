@@ -34,6 +34,7 @@ import { lookupCliSelection } from '../setup/cli-selection.js';
 import { cliModelSupportsReasoningEffort, isCodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { validateWorkingDir } from '../core/working-dir.js';
 import { cliSupportsConfigDir } from '../core/cli-config-dir.js';
+import { supportsZeroPromptInjection } from '../core/prompt-injection.js';
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -97,6 +98,17 @@ function validateAgent(raw: unknown, deps: AgentProfilesApiDeps): Omit<AgentProf
   if (agent.workspace && agent.workspace.mode !== 'off') {
     const error = (deps.checkWorkingDir ?? defaultCheckWorkingDir)(agent.workspace.workingDir);
     if (error) throw new ApiError(400, 'workspace:invalid_working_dir', error);
+  }
+  // 零注入只有部分 CLI / 后端 / 沙箱组合支持。Agent 统一了 CLI 时提前拒绝；没统一 CLI
+  // 时由同步前的组合校验与各 Bot 的 daemon 把关（失败计入同步失败）。
+  if (agent.promptInjection?.mode === 'none' && agent.exec) {
+    const cliId = lookupCliSelection(agent.exec.cliId)!.cliId;
+    if (!supportsZeroPromptInjection(cliId, {
+      backendType: agent.backend?.backendType || undefined,
+      sandbox: agent.sandbox?.mode,
+    })) {
+      throw new ApiError(400, 'promptInjection:unsupported');
+    }
   }
   return agent;
 }

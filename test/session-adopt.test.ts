@@ -83,7 +83,25 @@ vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
+  collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
+
+// Resume-confirm tests swap in a fake on-disk store (`resumeStore.list`); while
+// it is unset every adapter is the real one.
+const resumeStore = vi.hoisted(() => ({
+  list: undefined as undefined | ((opts: { limit: number; exclude?: ReadonlySet<string> }) => Promise<any[]>),
+}));
+vi.mock('../src/adapters/cli/registry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/adapters/cli/registry.js')>();
+  return {
+    ...actual,
+    createCliAdapterSync: ((...args: Parameters<typeof actual.createCliAdapterSync>) => {
+      const adapter = actual.createCliAdapterSync(...args);
+      if (resumeStore.list) adapter.listResumableSessions = resumeStore.list;
+      return adapter;
+    }) as typeof actual.createCliAdapterSync,
+  };
+});
 
 vi.mock('../src/services/codex-app-threads.js', () => ({
   listCodexAppThreads: vi.fn(async () => []),
@@ -519,6 +537,154 @@ describe('Adopt card actions', () => {
 
       // Should silently return without error
       expect(killWorker).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('adopt_confirm (resume)', () => {
+    // 29 on-disk transcripts, newest first. The 9 newest belong to sessions
+    // still running in panes, so the card lists hist-10 … hist-29.
+    const HISTORY = Array.from({ length: 29 }, (_, i) => {
+      const n = String(i + 1).padStart(2, '0');
+      return { cliSessionId: `hist-${n}`, cwd: '/work/demo', title: `示例会话 ${n}`, lastActivityAt: 10_000 - i };
+    });
+    const LIVE = HISTORY.slice(0, 9).map((h, i) => ({
+      source: 'herdr' as const,
+      herdrSessionName: 'default',
+      herdrTarget: `w1:p${i + 1}`,
+      herdrPaneId: `w1:p${i + 1}`,
+      cliId: 'claude-code' as const,
+      cwd: '/work/demo',
+      paneCols: 200,
+      paneRows: 50,
+      sessionId: h.cliSessionId,
+    }));
+    // In the card only because the live duplicates were skipped.
+    const PICKED = 'hist-21';
+    let list: ReturnType<typeof vi.fn>;
+    const lastExclude = () => new Set((list.mock.calls.at(-1)![0] as { exclude?: ReadonlySet<string> }).exclude);
+
+    beforeEach(() => {
+      // Mirrors the real adapters: exclusion first, truncation second.
+      list = vi.fn(async ({ limit, exclude }: { limit: number; exclude?: ReadonlySet<string> }) =>
+        HISTORY.filter(h => !exclude?.has(h.cliSessionId)).slice(0, limit));
+      resumeStore.list = list as any;
+    });
+    afterEach(() => {
+      resumeStore.list = undefined;
+      vi.useRealTimers();
+    });
+
+    /** The snapshot as the /adopt command caches it: live panes, plus history
+     *  queried with their session ids excluded. */
+    async function cacheSnapshot(sessions: Map<string, DaemonSession>, atMs: number) {
+      const { discoverResumableSessionsForBot, ADOPT_RESUME_LIMIT } = await import('../src/core/command-handler.js');
+      const { cacheAdoptCandidates } = await import('../src/services/adopt-picker.js');
+      const candidates = {
+        sessions: LIVE,
+        resumable: await discoverResumableSessionsForBot(
+          'claude-code', undefined, sessions, ADOPT_RESUME_LIMIT, new Set(LIVE.map(s => s.sessionId)),
+        ),
+        resumeLimit: ADOPT_RESUME_LIMIT,
+      };
+      cacheAdoptCandidates(ROOT_ID, candidates, atMs);
+      return candidates;
+    }
+
+    function makeAdoptPickEvent(rootId: string, entryKey: string, operatorOpenId = 'ou_user') {
+      return {
+        action: { value: { action: 'adopt_pick', entry_key: entryKey, root_id: rootId, search: '', page: 0 } },
+        operator: { open_id: operatorOpenId },
+        context: { open_message_id: 'om_card_msg' },
+      };
+    }
+
+    function setup() {
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      return { ds, sessions, deps: makeDeps(sessions) };
+    }
+
+    const replies = (deps: CardHandlerDeps) =>
+      vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+
+    it('imports a history entry that is in the card only because live duplicates were skipped', async () => {
+      const { ds, sessions, deps } = setup();
+      const snapshot = await cacheSnapshot(sessions, Date.now());
+      expect(snapshot.resumable.map(r => r.cliSessionId)).toEqual(HISTORY.slice(9).map(h => h.cliSessionId));
+      list.mockClear();
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      // Confirm re-queries the store itself rather than trusting the snapshot.
+      expect(list).toHaveBeenCalledTimes(1);
+      for (const s of LIVE) expect(lastExclude().has(s.sessionId)).toBe(true);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      expect(ds.session.cliSessionId).toBe(PICKED);
+      expect(replies(deps)).not.toContain('已不存在');
+      expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
+    });
+
+    it('falls back to the pre-dedup query when the card snapshot has expired', async () => {
+      const { ds, sessions, deps } = setup();
+      await cacheSnapshot(sessions, Date.now() - 5 * 60 * 1000 - 1000);
+      list.mockClear();
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      // Same exclude set as before the live dedup: store identities (none here)
+      // plus the active sessions' own ids.
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(lastExclude()).toEqual(new Set(['uuid-adopt-test']));
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(replies(deps)).toContain('已不存在');
+    });
+
+    it('adopt_pick renews the snapshot so a confirm right after it still uses the same snapshot', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const t0 = new Date('2026-01-01T00:00:00Z').getTime();
+      vi.setSystemTime(t0);
+      const { ds, sessions, deps } = setup();
+      const snapshot = await cacheSnapshot(sessions, t0);
+      list.mockClear();
+
+      vi.setSystemTime(t0 + 299_000);
+      await handleCardAction(makeAdoptPickEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      const { buildAdoptSelectCard } = await import('../src/im/lark/card-builder.js');
+      expect(vi.mocked(buildAdoptSelectCard).mock.calls.at(-1)?.[3]).toBe(snapshot.resumable);
+
+      // Past the original 5-minute TTL, but only 3 s after the pick.
+      vi.setSystemTime(t0 + 302_000);
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      // The pick was served from the snapshot; only confirm queried the store.
+      expect(list).toHaveBeenCalledTimes(1);
+      for (const s of LIVE) expect(lastExclude().has(s.sessionId)).toBe(true);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      expect(ds.session.cliSessionId).toBe(PICKED);
+      expect(replies(deps)).not.toContain('已不存在');
+    });
+
+    it('reports not-found when the picked history entry left the store after the card was rendered', async () => {
+      const { ds, sessions, deps } = setup();
+      const snapshot = await cacheSnapshot(sessions, Date.now());
+      expect(snapshot.resumable.map(r => r.cliSessionId)).toContain(PICKED);
+      // The transcript is gone (or now claimed) by the time the user confirms.
+      list.mockClear();
+      list.mockImplementation(async ({ limit, exclude }: { limit: number; exclude?: ReadonlySet<string> }) =>
+        HISTORY.filter(h => h.cliSessionId !== PICKED && !exclude?.has(h.cliSessionId)).slice(0, limit));
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      expect(list).toHaveBeenCalledTimes(1);
+      for (const s of LIVE) expect(lastExclude().has(s.sessionId)).toBe(true);
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(replies(deps)).toContain('已不存在');
     });
   });
 

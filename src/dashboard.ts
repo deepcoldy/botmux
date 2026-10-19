@@ -131,6 +131,11 @@ import {
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
 } from './dashboard/h5-auth.js';
+import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
+import {
+  handlePluginResultAccess,
+  resolvePluginResultViewerIdentity,
+} from './dashboard/plugin-result-access.js';
 import { FileControlAuditSink } from './dashboard/control-audit.js';
 import {
   TerminalControlManager,
@@ -460,6 +465,12 @@ const dashboardH5Auth = createDashboardH5AuthController({
   sessions: dashboardSessions,
   audit: dashboardControlAudit,
 });
+const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+try {
+  pluginResultArtifacts.sweepExpired();
+} catch (error) {
+  logger.warn(`[dashboard] Failed to sweep expired plugin results: ${(error as Error).message}`);
+}
 const terminalControl = new TerminalControlManager({
   secret: SECRET,
   audit: dashboardControlAudit,
@@ -3904,6 +3915,27 @@ const server = createServer(async (req, res) => {
     // gate; no authorization code or session capability is ever put in a URL.
     if (await dashboardH5Auth.handle(req, res, url)) return;
 
+    // Result entry URLs carry an owner-bound view token valid for the artifact
+    // retention period. The token is distinct from every internal result id.
+    // route owns its identity gate because it must be reachable before the
+    // ordinary management-token gate, while still requiring the exact human
+    // principal bound when the artifact was created.
+    if (await handlePluginResultAccess(req, res, url, {
+      store: pluginResultArtifacts,
+      identity(req) {
+        return resolvePluginResultViewerIdentity(
+          dashboardRequestIdentity(req),
+          dashboardH5Auth.resolve(req),
+        );
+      },
+      loginUrl(returnTo) {
+        const platformLogin = buildPlatformDashboardLoginUrl(returnTo);
+        if (platformLogin) return platformLogin;
+        if (!dashboardH5AuthConfig.enabled) return undefined;
+        return `${dashboardH5AuthConfig.entryPath}?returnTo=${encodeURIComponent(returnTo)}`;
+      },
+    })) return;
+
     // Session Web preview is an authenticated, same-origin reverse proxy to an
     // agent-registered literal loopback target. It owns its auth gate because
     // WebSocket upgrades do not pass through decideDashboardAuth; using one
@@ -5568,18 +5600,7 @@ const server = createServer(async (req, res) => {
     // ─── Customization center (built-in prompt/skill overrides) ──────────────
     // GET is a public read (overview only, no secrets); all mutations are
     // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
-    if (await handleCustomizationApi(req, res, url, {
-      getBotNames: () => {
-        const names = readPersistedBotNames();
-        for (const bot of registry.list()) {
-          const name = bot.botName?.trim();
-          // A daemon can publish its App ID while the Feishu probe warms up.
-          // Keep a known cached name until a real live name is available.
-          if (name && name !== bot.larkAppId) names.set(bot.larkAppId, name);
-        }
-        return names;
-      },
-    })) {
+    if (await handleCustomizationApi(req, res, url)) {
       return;
     }
 

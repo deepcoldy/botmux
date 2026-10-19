@@ -41,6 +41,8 @@ export interface SetupBotFlags {
   showInTeam?: string;
   /** 仅 add：feishu | lark。 */
   brand?: string;
+  /** UI 语言：zh | en。 */
+  lang?: string;
 }
 
 export type SetupCommand =
@@ -80,6 +82,7 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--allowed-chat-groups': 'allowedChatGroups',
   '--show-in-team': 'showInTeam',
   '--brand': 'brand',
+  '--lang': 'lang',
 };
 
 export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
@@ -140,6 +143,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --allowed-chat-groups <g>  可对话群 chat_id（oc_xxx，逗号分隔）
   --show-in-team <bool>      平台团队页是否展示（默认 true）
   --brand <feishu|lark>      租户类型（仅 add）
+  --lang <zh|en>             Bot 语言（zh | en；edit 传 - 清空以继承全局语言）
 
 通用选项：
   --json                     输出机器可读 JSON（含 ok / error 字段）
@@ -353,6 +357,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
     showInTeam: flags.showInTeam,
     // 显式 --wrapper-cli 覆盖 --cli 推导出的前缀（undefined 时不动 base 里的值）。
     wrapperCli: flags.wrapperCli,
+    lang: flags.lang,
   };
   const bot = applyBotConfigEdits(base, input);
   if (!hasOwnerEntry(bot.allowedUsers)) {
@@ -402,6 +407,7 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.allowedUsers !== undefined) input.allowedUsers = flags.allowedUsers;
   if (flags.allowedChatGroups !== undefined) input.allowedChatGroups = flags.allowedChatGroups;
   if (flags.showInTeam !== undefined) input.showInTeam = flags.showInTeam;
+  if (flags.lang !== undefined) input.lang = flags.lang;
   return input;
 }
 

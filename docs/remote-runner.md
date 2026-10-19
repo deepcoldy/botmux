@@ -15,7 +15,8 @@
       "start", "resume", "turn", "cancel", "detach", "reattach", "status",
       "terminal_screen", "terminal_input", "terminal_resize", "outbound_message",
       "outbound_message_explicit_mention",
-      "session_tool"
+      "session_tool",
+      "session_tool_schedule"
     ],
     "handshakeTimeoutMs": 30000,
     "operationTimeoutMs": 20000
@@ -140,10 +141,13 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 主动消息写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`。该 capability 同样不属于默认必需集合，只有显式配置它的部署才会在握手时要求 provider 支持。
 成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
+`final.content` 若只包含 Unicode whitespace 或 format controls（例如 U+200B 零宽空格），仍会正常提交 `turn_terminal`，但不会生成没有可见正文的 `final_output` 卡片；一旦存在可见文字则保留原始内容，不改写正文中的连接符或双向控制序列。
 
-### 可选只读 Session 工具
+### 可选 Session 工具
 
-声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的只读 Session helper。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic 或 Bot；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。
+声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的结构化 Session helper；持久调度写操作还要求部署的 `requiredCapabilities` 和 provider hello 同时显式声明 `session_tool_schedule`。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。自由字符串使用单一 opaque argv token 传递，daemon 对 Remote Runner 请求再次核对当前 Chat、Topic root 和工作目录。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。只升级 Host 而未显式要求新 capability 的旧部署保持原只读权限面。
+
+Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Actor，可额外协商 `session_tool_schedule_actor`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明该能力时，`schedule.add` 事件才能携带 `controllerOpenId`；该字段不来自模型可写的结构化请求。worker 继续用同一 turn、dispatch attempt 与 backend generation 约束事件，daemon 再按当前 Bot App 解析 union_id，并复核 controller 是 Bot 管理员和目标群成员后，才把任务按该真人 owner/control identity 落盘。该能力不改变原始消息的 bot caller 归因，也不允许选择 App、Chat、Topic、工作目录、运行凭据或后续管理范围。
 
 当前 allowlist：
 
@@ -151,8 +155,11 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 - `quoted`：只接受合法 `om_` message id 和可选 `raw`；下载的附件经宿主 attachments 根校验后，以最多 8 个、合计最多 512 KiB 的有界 payload 回传。
 - `bots.list`：固定为当前群 `chat` scope，不开放跨团队发现或邀请。
 - `skill.list|show|read|resources`：沿用当前 Session 的 skill manifest 和内置技能；resource path 必须是无 `.` / `..` 的安全相对路径。
+- `schedule.list`：宿主强制附带当前 Session 的 Chat 过滤，不允许枚举其他群的任务。
+- `schedule.add`：只接受 schedule、prompt、名称、执行位置、静默、模型、思考强度和工作日历等结构化任务字段；Chat、Topic root、Bot 和工作目录由当前 Session 推导。
+- `schedule.update|remove|pause|resume|run`：只接受合法任务 ID 和各动作的最小字段，并继续通过现有 daemon mutation route 授权；`self` 只允许当前定时执行自行 pause/remove。
 
-不属于 allowlist 的 schedule、ask、handoff、workflow、改名、管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急、attention 或 final 能力。
+不属于 allowlist 的 ask、handoff、workflow、改名、任意管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急、attention 或 final 能力。
 
 ```json
 {

@@ -363,7 +363,7 @@ describe('remote runner protocol', () => {
     ]))).toBeUndefined();
   });
 
-  it('accepts only structured, read-only session tool requests', () => {
+  it('accepts only the structured session tool surface', () => {
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
@@ -398,8 +398,38 @@ describe('remote runner protocol', () => {
       operationId: 'session-tool-3',
       turnId: 'turn-1',
       generation: 3,
-      request: { tool: 'schedule.add', prompt: 'not read only' },
-    }))).toBeUndefined();
+      controllerOpenId: 'ou_developer',
+      request: {
+        tool: 'schedule.add',
+        schedule: '10m',
+        prompt: '提醒我复查构建',
+        name: '--chat-id=oc_other',
+        position: 'topic',
+        silent: true,
+        reasoningEffort: 'high',
+      },
+    }))).toMatchObject({
+      type: 'session_tool',
+      controllerOpenId: 'ou_developer',
+      request: {
+        tool: 'schedule.add',
+        schedule: '10m',
+        prompt: '提醒我复查构建',
+        position: 'topic',
+      },
+    });
+    for (const controllerOpenId of ['ou_', 'ou_bad value', 'developer', 42]) {
+      expect(parseRemoteRunnerEventLine(JSON.stringify({
+        protocol: REMOTE_RUNNER_PROTOCOL,
+        version: REMOTE_RUNNER_PROTOCOL_VERSION,
+        type: 'session_tool',
+        operationId: 'session-tool-invalid-controller',
+        turnId: 'turn-1',
+        generation: 3,
+        controllerOpenId,
+        request: { tool: 'schedule.add', schedule: '10m', prompt: 'x' },
+      }))).toBeUndefined();
+    }
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
@@ -409,6 +439,45 @@ describe('remote runner protocol', () => {
       generation: 3,
       request: { tool: 'history', limit: 101 },
     }))).toBeUndefined();
+    for (const request of [
+      { tool: 'schedule.list' },
+      { tool: 'schedule.update', taskId: 'deadbeef', prompt: '新提示' },
+      { tool: 'schedule.remove', taskId: 'deadbeef' },
+      { tool: 'schedule.pause', taskId: 'self' },
+      { tool: 'schedule.resume', taskId: 'deadbeef' },
+      { tool: 'schedule.run', taskId: 'deadbeef' },
+    ]) {
+      expect(parseRemoteRunnerEventLine(JSON.stringify({
+        protocol: REMOTE_RUNNER_PROTOCOL,
+        version: REMOTE_RUNNER_PROTOCOL_VERSION,
+        type: 'session_tool',
+        operationId: `session-tool-${request.tool}`,
+        turnId: 'turn-1',
+        generation: 3,
+        request,
+      }))).toMatchObject({ type: 'session_tool', request });
+    }
+    for (const request of [
+      { tool: 'schedule.list', chatId: 'oc_escape' },
+      { tool: 'schedule.add', schedule: '10m', prompt: 'x', chatId: 'oc_escape' },
+      { tool: 'schedule.add', schedule: '10m', prompt: 'x', workdir: '/tmp' },
+      { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'topic', topicTitle: 'bad' },
+      { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'top-level', followActive: true },
+      { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'new-topic', topicTitle: 'x'.repeat(201) },
+      { tool: 'schedule.update', taskId: 'deadbeef' },
+      { tool: 'schedule.remove', taskId: 'not-an-id' },
+      { tool: 'schedule.resume', taskId: 'self' },
+    ]) {
+      expect(parseRemoteRunnerEventLine(JSON.stringify({
+        protocol: REMOTE_RUNNER_PROTOCOL,
+        version: REMOTE_RUNNER_PROTOCOL_VERSION,
+        type: 'session_tool',
+        operationId: 'session-tool-invalid',
+        turnId: 'turn-1',
+        generation: 3,
+        request,
+      }))).toBeUndefined();
+    }
   });
 
   it('accepts authoritative usage on final and rejects malformed metrics', () => {

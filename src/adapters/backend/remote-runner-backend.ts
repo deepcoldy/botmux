@@ -830,12 +830,30 @@ export class RemoteRunnerBackend implements SessionBackend {
       operation.turnId,
       operation.generation,
       operation.request,
+      operation.controllerOpenId ?? null,
     ])).digest('hex');
   }
 
   private handleSessionTool(operation: RemoteRunnerSessionToolOperation): void {
     if (!this.providerCapabilities.has('session_tool')) {
       this.failProtocol('remote runner emitted session_tool without advertising the capability');
+      return;
+    }
+    const scheduleTool = operation.request.tool.startsWith('schedule.');
+    if (scheduleTool && (!this.providerCapabilities.has('session_tool_schedule')
+        || !this.requiredCapabilities.includes('session_tool_schedule'))) {
+      this.failProtocol(
+        'remote runner emitted a schedule session tool without explicit host and provider capability',
+      );
+      return;
+    }
+    if (operation.controllerOpenId
+        && (operation.request.tool !== 'schedule.add'
+          || !this.providerCapabilities.has('session_tool_schedule_actor')
+          || !this.requiredCapabilities.includes('session_tool_schedule_actor'))) {
+      this.failProtocol(
+        'remote runner emitted a schedule Actor without explicit host and provider capability',
+      );
       return;
     }
     if (!this.acceptAcknowledgedTurn(operation.turnId)) return;

@@ -19285,6 +19285,8 @@ form.dashboard-toolbar > input[type="text"]:focus {
 /* Scheduled idle-session cleanup block: stack the toggle + threshold + interval
    rows with steady spacing, matching the other settings blocks. */
 .settings-session-cleanup {
+  --idle-cleanup-segment-active-bg: var(--accent);
+  --idle-cleanup-segment-active-fg: var(--on-accent);
   display: flex;
   flex-direction: column;
   gap: 10px;

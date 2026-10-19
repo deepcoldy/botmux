@@ -1,10 +1,23 @@
 # 新会话的飞书工具身份
 
-正常由 Botmux 创建的新会话会自动将 `lark-cli` 绑定到当前 bot 配置中的 App ID 和品牌。不增加 UI 配置，不修改个人终端的默认 profile。
+Botmux 支持将会话内的 `lark-cli` 绑定到当前 bot 配置中的 App ID 和品牌。该功能为**可配置项且默认开启**。可以通过 Dashboard（Bot Defaults → 隔离与权限 → lark-cli 应用绑定）或斜杠命令 `/config set larkToolBinding off` 关闭（需新建会话或 `/restart` 生效）。
+
+- **开启/未配置（默认）**：会话内 `lark-cli` 默认以当前 Bot 的应用凭证以 bot 身份调用，支持 `--as user` 使用当前用户对同一应用的授权；若显式指定 `--profile <profile>`，自动透传按宿主机原生环境及对应 profile 执行，不拦截切换。
+- **显式关闭（`larkToolBinding: false`）**：不安装托管绑定包装器，完全回落为宿主机原生环境；若同时开启了 `triggerUserAuth`，则遵循按触发人鉴权规则。
 
 该绑定依赖支持 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 的较新 lark-cli；请使用
 `npm i -g @larksuite/cli@latest` 保持更新。旧版只识别 App Secret，无法使用
 Botmux 提供的短期 bot token。
+
+## 与按触发人鉴权（triggerUserAuth）的关系
+
+`larkToolBinding` 与 `triggerUserAuth` 职责明确分立：
+
+| `larkToolBinding` | `triggerUserAuth` | `lark-cli` 行为 |
+|---|---|---|
+| 开启（默认） | 任意 | 默认使用当前 Bot 身份；`--as user` 使用当轮触发人授权；`--profile <other>` 透传宿主对应 profile |
+| 关闭 | 关闭（默认） | 沿用宿主机默认凭证及用户 profile 切换 |
+| 关闭 | 开启（含 `lark-cli`） | 遵循按触发人鉴权（以当轮触发人身份运行，未授权直接拒绝并提示授权，不降级为机器账号） |
 
 ## 使用
 
@@ -25,12 +38,12 @@ botmux auth wait --request-id <返回的请求ID> --json
 
 bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不会自动重放业务命令；写入超时或部分成功时，应先确认结果，避免重复创建或发送。
 
-## 范围
+## 范围与生命周期
 
-- 仅功能上线后按标准流程创建的新本地会话接入。已接入的会话再次恢复时保留绑定。
-- 旧会话、不按标准方式启动的会话、远端后端、adopt、外部 app-server、workflow 和无飞书通道的会话沿用原有行为。
-- 不自动迁移、重启或显示旧会话迁移提示，不改变旧会话的 `/login` 和按用户鉴权流程。
-- Linux 与 macOS 使用相同的应用/用户解析路径，没有针对 macOS 的 user 拒绝规则。
+- 默认开启（未配置或显式开启）。已接入的会话恢复或重启时重新评估配置。
+- 当关闭该配置并重启（`/restart`）或恢复时，自动清理会话目录下的 `lark-tool-binding.json`、`lark-config/` 及托管包装脚本 `binDir/lark-cli`，且不会误伤 `triggerUserAuth` 包装脚本（如 `bytedcli` 或 trigger-user `lark-cli`）或其它文件。
+- 远端后端、adopt、外部 app-server、workflow 和无飞书通道的会话不使用应用绑定。
+- Linux 与 macOS 使用相同的应用/用户解析路径，标准 PTY/Tmux 与托管 RPC（如 Codex）后端行为保持一致。
 
 ## 实现
 
@@ -40,7 +53,7 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 
 bot 调用从当前应用的 SDK 获取 tenant access token，复用其缓存和到期刷新，再通过 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 交给工具；不向工具传递 App Secret，也不在会话启动时固定 token。凭证获取失败时拒绝执行。
 
-工具路径按合并后的 bot `env.PATH` 解析。参数取值类型和 `--as` 支持情况取自该 lark-cli 二进制的本地 `--help`，包括快捷命令和原生 API 命令；无法识别的参数在执行前报错，不能靠猜测删除业务参数。`event list/schema`、`doctor --offline` 等本地命令不取凭证，也不追加 `--as`。
+工具路径按合并后的 bot `env.PATH` 解析。参数取值类型和 `--as` 支持情况取自该 lark-cli 二进制的本地 `--help`，包括快捷命令和原生 API 命令；无法识别的参数在执行前报错，不能靠猜测删除业务参数。若显式指定 `--profile <profile>` 且 profile 不等于当前 Bot 的 App ID，则直接透传宿主原生环境和对应 profile 执行（使用宿主环境，不受当前 bot 凭证及按触发人鉴权约束）；若等于当前 Bot 的 App ID，则归一化为托管 Bot 身份。`event list/schema`、`doctor --offline` 等本地命令不取凭证，也不追加 `--as`。
 
 绑定入口、配置和 shell 启动路径使用真实目录路径。Linux 文件沙箱同时保留会话入口和 bot PATH，直接执行、sh、bash 以及通过符号链接配置的数据根使用同一绑定。
 

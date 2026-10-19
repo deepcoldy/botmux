@@ -8,7 +8,13 @@
 
 The bot replies with a card: "✅ Created group 'card race-condition bug' 👉 <join link>". Click in and start chatting right away — the whole group is one independent session.
 
-> When the group name is empty, a timestamp is used as a fallback. After creation, **no session is started automatically**; enter the group and message the bot to start chatting.
+> When the group name is empty, a timestamp placeholder is used until the first message names the group (see below). After creation, **no session is started automatically**; enter the group and message the bot to start chatting.
+
+## Automatic Group Name and Avatar
+
+Without a group name, the group starts with the placeholder "New session MM/DD HH:mm". After the first substantive message in it, the bot summarizes a short title and renames the group, just like the session-group mode for DMs. An explicit group name always wins.
+
+The avatar defaults to the session-group botmux logo on a gradient background; `--avatar name` uses a group-name text avatar instead (re-rendered after the automatic rename), and `--avatar off` keeps Lark's default. See [group creation options](https://github.com/deepcoldy/botmux/blob/master/docs/guide/group-creation.md) for the rest.
 
 ## Create a Group with Multiple Bots
 

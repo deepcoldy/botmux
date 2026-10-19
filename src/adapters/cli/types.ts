@@ -95,7 +95,9 @@ export interface ResumableSession {
   cliSessionId: string;
   /** Working directory the session ran in — where botmux re-spawns the CLI. */
   cwd: string;
-  /** Human title (first real user prompt, truncated). */
+  /** Human title, truncated: the CLI's native title when the transcript has
+   *  one (Claude-family: customTitle > aiTitle), otherwise the first real user
+   *  prompt. */
   title: string;
   /** Epoch ms of last activity (transcript mtime / last submit), for sort + display. */
   lastActivityAt: number;

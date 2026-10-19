@@ -56,3 +56,8 @@ export class ChatRenameSerialQueue {
     }
   }
 }
+
+/** The daemon-wide queue every rename path shares (session skill, host API,
+ *  `/g` auto title), keyed `${larkAppId}:${chatId}`, so one path's read →
+ *  write can never interleave with another's. */
+export const chatRenameSerialQueue = new ChatRenameSerialQueue();

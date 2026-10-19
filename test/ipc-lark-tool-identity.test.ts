@@ -49,6 +49,7 @@ describe('session application identity route', () => {
   async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string } = {}) {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+      larkToolBinding: true,
       triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } as any;
     vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
     await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
@@ -244,5 +245,19 @@ describe('session application identity route', () => {
     expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
     const user = await run(['docs', '+fetch', '--as=user']); expect(user.code, user.err).toBe(0);
     expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
+    const passthrough = await run(['docs', '+fetch', '--profile=cli_other']); expect(passthrough.code, passthrough.err).toBe(0);
+    expect(passthrough.out).toBe('cli_wrong|||wrong-user|docs +fetch --profile=cli_other');
+  });
+  it('rejects identity request when larkToolBinding is explicitly disabled on the bot', async () => {
+    vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: false } } as any);
+    const res = await request('bot');
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ ok: false, error: 'lark_tool_session_unavailable' });
+  });
+  it('allows identity request when larkToolBinding is unconfigured on the bot (default on)', async () => {
+    vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
+    const res = await request('bot');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, appId: 'cli_bound', mode: 'bot', credential: 'bound-bot-token' });
   });
 });

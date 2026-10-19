@@ -92,6 +92,9 @@ describe('real CLI send into a running reply card', () => {
   }>([
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'codex', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'grok', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
+    { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_requester'], senderIsBot: false, merged: true },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
@@ -194,6 +197,12 @@ describe('real CLI send into a running reply card', () => {
       if (merged) {
         expect(requests[0]).toMatchObject({ method: 'PATCH', path: '/open-apis/im/v1/messages/om_original_card' });
         expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
+        if (responseKind === 'progress') {
+          expect(store.read(key)?.progress).toContain('Hello! 这是完整答复。');
+          expect(store.read(key)?.finalDelivered).not.toBe(true);
+          expect(send).toHaveBeenCalledTimes(1);
+          return;
+        }
         const journal = openDatabaseSyncOrThrow(join(dataDir, 'group-context', `${key.larkAppId}.sqlite`));
         try {
           const published = journal.prepare('SELECT text, card_content_version FROM messages WHERE message_id = ? ORDER BY revision DESC LIMIT 1').get('om_original_card') as { text: string; card_content_version: number };

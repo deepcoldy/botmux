@@ -5,6 +5,7 @@ import {
   agentHasSections,
   agentLinkedBots,
   agentPushRequests,
+  agentZeroPromptConflict,
   botSectionValues,
   diffAgentSections,
   normalizeAgentInput,
@@ -199,5 +200,75 @@ describe('agentPushRequests', () => {
     expect(agentPushRequests({}, 'cli_a')).toEqual([]);
     expect(agentHasSections({})).toBe(false);
     expect(agentHasSections({ sandbox: { mode: 'off' } })).toBe(true);
+  });
+});
+
+describe('zero injection section', () => {
+  it('normalizes, compares and pushes the mode last', () => {
+    expect(normalizeAgentInput({ name: 'a', promptInjection: { mode: 'none' } }))
+      .toEqual({ ok: true, value: { name: 'a', description: '', promptInjection: { mode: 'none' } } });
+    expect(normalizeAgentInput({ name: 'a', promptInjection: { mode: 'off' } }))
+      .toEqual({ ok: false, error: 'promptInjection:invalid_prompt_injection' });
+    expect(diffAgentSections({ promptInjection: { mode: 'none' } }, { larkAppId: 'cli_a' })).toEqual([
+      { section: 'promptInjection', field: 'promptInjection', agent: 'none', bot: 'default' },
+    ]);
+    expect(diffAgentSections({ promptInjection: { mode: 'none' } }, { larkAppId: 'cli_a', promptInjection: 'none' })).toEqual([]);
+    const requests = agentPushRequests({
+      promptInjection: { mode: 'none' },
+      exec: { cliId: 'codex', model: '', reasoningEffort: '', configDir: '' },
+      sandbox: { mode: 'off' },
+      backend: { backendType: 'tmux' },
+      startup: { commands: ['/a'] },
+    }, 'cli_a');
+    // The daemon validates zero injection against the bot's current CLI / sandbox /
+    // backend, so it must come after those sections.
+    expect(requests.map(request => request.section)).toEqual(['exec', 'sandbox', 'backend', 'startup', 'promptInjection']);
+    expect(requests.at(-1)).toMatchObject({ url: '/api/bots/cli_a/prompt-injection', body: { promptInjection: 'none' } });
+  });
+
+  it('judges zero injection on the combination the bot will have after syncing', () => {
+    const antigravity = bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', promptInjection: 'none' });
+    // The agent only manages the backend; the bot keeps antigravity and zero injection.
+    expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' } }, antigravity)).toBe(true);
+    expect(agentZeroPromptConflict({ sandbox: { mode: 'scratch' } }, antigravity)).toBe(true);
+    expect(agentZeroPromptConflict({ backend: { backendType: 'herdr' } }, antigravity)).toBe(false);
+    // Switching the CLI away from antigravity makes zmx fine; to gemini it never is.
+    expect(agentZeroPromptConflict({ exec: { cliId: 'claude-code', model: '', reasoningEffort: '', configDir: '' }, backend: { backendType: 'zmx' } }, antigravity)).toBe(false);
+    expect(agentZeroPromptConflict({ exec: { cliId: 'gemini', model: '', reasoningEffort: '', configDir: '' } }, antigravity)).toBe(true);
+    // The agent turns zero injection on/off itself.
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'default' }, backend: { backendType: 'zmx' } }, antigravity)).toBe(false);
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, bot({ cliId: 'gemini', agentSelectionKey: 'gemini' }))).toBe(true);
+    expect(agentZeroPromptConflict({ backend: { backendType: 'zmx' } }, bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', promptInjection: 'default' }))).toBe(false);
+  });
+
+  it('resolves a cleared backend override to the daemon default', () => {
+    const antigravity = bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', defaultBackendType: 'zmx' });
+    // Clearing the tmux override lands on zmx, where antigravity zero injection cannot run.
+    expect(agentZeroPromptConflict({ backend: { backendType: '' }, promptInjection: { mode: 'none' } }, antigravity)).toBe(true);
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, antigravity)).toBe(false);
+    expect(agentZeroPromptConflict({ promptInjection: { mode: 'none' } }, { ...antigravity, backendType: null })).toBe(true);
+    // A remote daemon default pairs back to pty for a local CLI, as spawning does.
+    expect(agentZeroPromptConflict({ backend: { backendType: '' }, promptInjection: { mode: 'none' } }, { ...antigravity, defaultBackendType: 'riff' })).toBe(false);
+  });
+
+  it('judges an intermediate combination from the sections already written', () => {
+    const antigravity = bot({ cliId: 'antigravity', agentSelectionKey: 'antigravity', backendType: 'tmux', promptInjection: 'none' });
+    const agent: AgentSectionsConfig = { promptInjection: { mode: 'default' }, backend: { backendType: 'zmx' } };
+    // Final state is fine (zero injection off), but zmx before the switch-off landed is not.
+    expect(agentZeroPromptConflict(agent, antigravity)).toBe(false);
+    expect(agentZeroPromptConflict(agent, antigravity, ['backend'])).toBe(true);
+    expect(agentZeroPromptConflict(agent, antigravity, ['promptInjection', 'backend'])).toBe(false);
+  });
+
+  it('turns zero injection off before switching to a combination that cannot support it', () => {
+    // A bot still in zero injection rejects an unsupported CLI / sandbox / backend
+    // (zero_prompt_unsupported), so disabling must land first.
+    const requests = agentPushRequests({
+      promptInjection: { mode: 'default' },
+      exec: { cliId: 'gemini', model: '', reasoningEffort: '', configDir: '' },
+      backend: { backendType: 'tmux' },
+    }, 'cli_a');
+    expect(requests.map(request => request.section)).toEqual(['promptInjection', 'exec', 'backend']);
+    expect(requests[0]).toMatchObject({ body: { promptInjection: 'default' } });
   });
 });

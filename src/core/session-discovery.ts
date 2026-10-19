@@ -9,6 +9,7 @@ import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
+import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
@@ -41,6 +42,10 @@ export interface AdoptableSession {
   startedAt?: number;        // epoch ms
   paneCols: number;          // current pane width
   paneRows: number;          // current pane height
+  /** Display name from the backend. Herdr only: pane label (any CLI) > Claude
+   *  terminal title (generic / path-like titles dropped), cleaned to one line
+   *  of at most 80 code points. Absent → callers show the cwd basename. */
+  title?: string;
 }
 
 // ─── CLI process name → CliId mapping ────────────────────────────────────────
@@ -837,6 +842,41 @@ function herdrAgentSessionId(agent: any): string | undefined {
   return HERDR_SESSION_UUID_RE.exec(value)?.[1];
 }
 
+/** Same cap as resume (history) entry titles. */
+const HERDR_LIVE_TITLE_MAX = 80;
+
+/** One line, no control characters or `<` / `>` (no tag-like text reaches any
+ * downstream surface), at most 80 code points with a trailing `…` when cut.
+ * Cuts by code point so a surrogate pair is never split. */
+function cleanHerdrLiveTitle(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const text = raw
+    .replace(/[\u0000-\u0008\u000e-\u001f\u007f-\u009f<>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return undefined;
+  const chars = Array.from(text);
+  return chars.length > HERDR_LIVE_TITLE_MAX
+    ? `${chars.slice(0, HERDR_LIVE_TITLE_MAX - 1).join('')}…`
+    : text;
+}
+
+/** Display name for a herdr pane: the manual pane label (any CLI), else the
+ * Claude terminal title unless it is generic (`Claude Code`, the CLI display
+ * name, the herdr agent kind) or path-like. Other CLIs' terminal titles have
+ * no known shape, so they never contribute. Missing fields (older herdr) →
+ * undefined, and callers fall back to the cwd basename. */
+function herdrLiveTitle(label: unknown, terminalTitle: unknown, cliId: CliId, agentKind: unknown): string | undefined {
+  const fromLabel = cleanHerdrLiveTitle(label);
+  if (fromLabel) return fromLabel;
+  if (cliId !== 'claude-code') return undefined;
+  const title = cleanHerdrLiveTitle(terminalTitle);
+  if (!title || title.startsWith('/') || title.startsWith('~')) return undefined;
+  const generic = ['claude code', CLI_DISPLAY_NAMES[cliId].toLowerCase()];
+  if (typeof agentKind === 'string') generic.push(agentKind.toLowerCase());
+  return generic.includes(title.toLowerCase()) ? undefined : title;
+}
+
 function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: string): AdoptableSession[] {
   const rawSessions = herdrJson(['session', 'list', '--json']);
   const sessions = extractHerdrSessions(rawSessions).filter((s: any) => {
@@ -847,6 +887,13 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
   for (const session of sessions) {
     const sessionName = session.name as string;
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
+    // `agent list` carries no pane label, so list panes up front: the same
+    // single call feeds agent-row titles and the supplement pass below.
+    const panes = extractHerdrPanes(herdrJson(['--session', sessionName, 'pane', 'list']));
+    const paneById = new Map<string, any>();
+    for (const pane of panes) {
+      if (typeof pane?.pane_id === 'string') paneById.set(pane.pane_id, pane);
+    }
     const discoveredPaneIds = new Set<string>();
     for (const agent of extractHerdrAgents(rawAgents)) {
       const cliId = herdrAgentCliId(agent, filterCliId, filterExecutable);
@@ -877,6 +924,13 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         ? (cliPid ? readClaudeSessionMeta(cliPid) : undefined) ?? findUniqueClaudeSessionByCwd(cwd)
         : undefined;
       const grid = herdrPaneGrid(rawInfo);
+      const pane = paneById.get(paneId);
+      const title = herdrLiveTitle(
+        pane?.label,
+        typeof agent?.terminal_title_stripped === 'string' ? agent.terminal_title_stripped : pane?.terminal_title_stripped,
+        cliId,
+        agent?.agent,
+      );
       discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
@@ -893,6 +947,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         // Herdr's CLI reports no terminal width; the pane PTY is the source.
         paneCols: grid?.cols ?? 200,
         paneRows: grid?.rows ?? 50,
+        ...(title ? { title } : {}),
       });
     }
 
@@ -900,8 +955,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
     // agent_status=unknown (its hook integration has not emitted state yet).
     // Supplement agent-list discovery from pane process-info so such live CLIs
     // remain adoptable; plain shell panes naturally fail cliId detection.
-    const rawPanes = herdrJson(['--session', sessionName, 'pane', 'list']);
-    for (const pane of extractHerdrPanes(rawPanes)) {
+    for (const pane of panes) {
       const paneId = typeof pane?.pane_id === 'string' ? pane.pane_id : undefined;
       if (!paneId || discoveredPaneIds.has(paneId)) continue;
       const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
@@ -917,6 +971,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
       const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
       const grid = herdrPaneGrid(rawInfo);
+      const title = herdrLiveTitle(pane?.label, pane?.terminal_title_stripped, process.cliId, pane?.agent);
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -931,6 +986,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         startedAt: claudeMeta?.startedAt ?? readProcessStartTime(process.pid),
         paneCols: grid?.cols ?? 200,
         paneRows: grid?.rows ?? 50,
+        ...(title ? { title } : {}),
       });
     }
   }

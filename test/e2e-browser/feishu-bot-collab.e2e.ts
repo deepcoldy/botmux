@@ -24,7 +24,7 @@ import {
   testMessage,
   sendMentionMessage,
   navigateToMessenger,
-  openChat,
+  openGroupChat,
   getGroupChatName,
   scrollThreadToBottom,
   waitForStreamingCard,
@@ -51,7 +51,7 @@ export function registerMidsceneSuites(): void {
       agent = createAgent(page);
 
       await navigateToMessenger(page);
-      await openChat(page, agent, getGroupChatName());
+      await openGroupChat(page, agent, getGroupChatName());
     });
 
     afterAll(async () => {

@@ -5,6 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
+import { feishuLaneProject, selectFeishuLaneFiles } from './midscene-report-evidence.mjs';
 
 function parseArguments(argv) {
   const options = {};
@@ -49,21 +50,25 @@ async function findSummaries(root) {
   return matches.sort();
 }
 
-async function findYamlCases(root) {
-  const cases = [];
+async function findYamlCases(root, selection) {
+  const files = [];
   async function visit(directory) {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const candidate = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(candidate);
-      else if (entry.isFile() && /\.ya?ml$/i.test(entry.name)) {
-        const document = parseYaml(await readFile(candidate, 'utf8'));
-        for (const testCase of document?.cases ?? []) {
-          if (typeof testCase?.name === 'string') cases.push(testCase.name);
-        }
-      }
+      else if (entry.isFile() && /\.ya?ml$/i.test(entry.name)) files.push(candidate);
     }
   }
   await visit(root);
+  const cases = [];
+  for (const file of selectFeishuLaneFiles(files.sort(), selection)) {
+    const document = parseYaml(await readFile(file, 'utf8'));
+    for (const testCase of document?.cases ?? []) {
+      if (typeof testCase?.name === 'string') {
+        cases.push({ name: testCase.name, project: feishuLaneProject(file) });
+      }
+    }
+  }
   return cases;
 }
 
@@ -129,9 +134,9 @@ export function renderSummary({
       project: project.name,
     })),
   );
-  const skipped = skippedCases.map((name) => ({
+  const skipped = skippedCases.map(({ name, project }) => ({
     name,
-    project: 'feishu-browser',
+    project,
     status: 'skipped',
     attempts: [],
   }));
@@ -151,8 +156,9 @@ export function renderSummary({
     + evidenceOnlyCases.filter((testCase) => testCase.status === 'failed').length;
   const notRun = (counts?.notRun ?? 0)
     + evidenceOnlyCases.filter((testCase) => testCase.status === 'not-run').length;
-  const status =
-    testOutcome === 'success' &&
+  const status = feishuOutcome === 'cancelled'
+    ? 'Feishu run cancelled'
+    : testOutcome === 'success' &&
     summary?.status === 'success' &&
     (feishuOutcome === 'success' || feishuOutcome === 'skipped' || !feishuOutcome)
       ? skipped.length > 0
@@ -191,7 +197,12 @@ export function renderSummary({
     lines.push(`[Open the published Midscene HTML report](${pagesUrl})`, '');
   }
 
-  if (feishuOutcome === 'skipped') {
+  if (feishuOutcome === 'cancelled') {
+    lines.push(
+      '> The Feishu live job did not produce results — a newer push to the same pull request superseded this run, or it waited too long for the shared Feishu slot. Its cases are listed as not run; re-run the job to test them.',
+      '',
+    );
+  } else if (feishuOutcome === 'skipped') {
     lines.push(
       '> The credential-free Dashboard project ran normally. The separate Feishu live project was skipped because its URL or authenticated storage state is unavailable.',
       '',
@@ -202,8 +213,8 @@ export function renderSummary({
 
   if (cases.length > 0) {
     lines.push(
-      '| Case | Evidence | Project | Status | Attempts |',
-      '|:--|:--|:--|:--|--:|',
+      '| Case | Evidence | Project | Status | Attempts | Failure |',
+      '|:--|:--|:--|:--|--:|:--|',
       ...cases.map((testCase) => {
         const icon =
           testCase.status === 'success'
@@ -230,7 +241,7 @@ export function renderSummary({
           : fallback
             ? `[report artifact](${fallback})`
             : '—';
-        return `| ${icon} ${caseLabel} | ${evidenceCell} | ${cell(testCase.project)} | ${cell(testCase.status)} | ${attempts} |`;
+        return `| ${icon} ${caseLabel} | ${evidenceCell} | ${cell(testCase.project)} | ${cell(testCase.status)} | ${attempts} | ${cell(caseEvidence?.failure ?? '')} |`;
       }),
       '',
       `Run duration: ${duration(summary?.durationMs)}.`,
@@ -265,7 +276,7 @@ async function main() {
       : null;
   const skippedCases =
     options['feishu-outcome'] === 'skipped' && options['skipped-cases-dir']
-      ? await findYamlCases(options['skipped-cases-dir'])
+      ? await findYamlCases(options['skipped-cases-dir'], options['feishu-cases'] ?? 'all')
       : [];
   const siteManifest = options['site-manifest']
     ? JSON.parse(await readFile(options['site-manifest'], 'utf8'))

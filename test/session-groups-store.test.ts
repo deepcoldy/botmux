@@ -11,9 +11,9 @@
  * Run:  pnpm vitest run test/session-groups-store.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 let tempDir: string;
 
@@ -40,7 +40,7 @@ import {
   removeSessionGroup,
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
-import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV } from '../src/services/session-group-title.js';
+import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV, oneShotTitleAllowed, oneShotProfileEnv } from '../src/services/session-group-title.js';
 import {
   resolveTagMode,
   resolveSessionTagName,
@@ -346,5 +346,66 @@ describe('resolveSessionTagName（标签名回落链）', () => {
   it('clampSessionTagName 对全空白返回空串（= 清除配置回默认）', () => {
     expect(clampSessionTagName('   ')).toBe('');
     expect(clampSessionTagName(' 工作 ')).toBe('工作');
+  });
+});
+
+describe('oneShotTitleAllowed (/g auto title runs on the host)', () => {
+  let home = '';
+  const saved = { HOME: process.env.HOME, SESSION_DATA_DIR: process.env.SESSION_DATA_DIR };
+  beforeEach(() => {
+    // Hermetic host: no device enrollment unless a case creates it.
+    home = mkdtempSync(join(tmpdir(), 'one-shot-home-'));
+    process.env.HOME = home;
+    delete process.env.SESSION_DATA_DIR;
+  });
+  afterEach(() => {
+    process.env.HOME = saved.HOME;
+    if (saved.SESSION_DATA_DIR === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = saved.SESSION_DATA_DIR;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('refuses launch variants the one-shot cannot reproduce', () => {
+    expect(oneShotTitleAllowed({ cliId: 'traex', cliLaunchMode: 'forge-traex' })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'codex', codexAuthSync: 'isolated' })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'codex', codexInstancePool: { instances: [] } })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'codex', codexAuthSync: 'shared' })).toBe(true);
+  });
+
+  it('refuses on a host with mandatory device-credential isolation', () => {
+    expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(true);
+    mkdirSync(join(home, '.botmux', 'device-auth'), { recursive: true });
+    writeFileSync(join(home, '.botmux', 'device-auth', 'device.json'), '{}');
+    expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(false);
+  });
+
+  it('allows only unsandboxed bots on a CLI with a one-shot mode, failing closed', () => {
+    const prev = process.env.BOTMUX_SANDBOX;
+    delete process.env.BOTMUX_SANDBOX;
+    try {
+      expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(true);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: 'off' })).toBe(true);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: true })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: 'scratch' })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', readIsolation: true })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: 'typo' })).toBe(false);
+      expect(oneShotTitleAllowed({ cliId: 'aiden' })).toBe(false);
+      process.env.BOTMUX_SANDBOX = '1';
+      expect(oneShotTitleAllowed({ cliId: 'claude-code' })).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SANDBOX; else process.env.BOTMUX_SANDBOX = prev;
+    }
+  });
+});
+
+describe('oneShotProfileEnv (cliConfigDir parity with the worker)', () => {
+  it('carries a Claude profile as CLAUDE_CONFIG_DIR, expanding ~', () => {
+    expect(oneShotProfileEnv({ cliId: 'claude-code', cliConfigDir: '~/.claude-api' })).toEqual({
+      CLAUDE_CONFIG_DIR: join(homedir(), '.claude-api'),
+    });
+    expect(oneShotProfileEnv({ cliId: 'claude-code', cliConfigDir: '/opt/claude-profile' })).toEqual({
+      CLAUDE_CONFIG_DIR: '/opt/claude-profile',
+    });
+    expect(oneShotProfileEnv({ cliId: 'claude-code' })).toEqual({});
+    expect(oneShotProfileEnv({ cliId: 'codex', cliConfigDir: '~/.codex-x' })).toEqual({});
   });
 });

@@ -1704,6 +1704,12 @@ export interface BotConfig {
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
+   * lark-cli 应用绑定开关（默认开启）。
+   * 默认开启（未配置或 true）：会话内 lark-cli 默认以当前 Bot 应用凭证以 bot 身份调用，支持 --as user 与 --profile 透传；
+   * 显式关闭（false）：不安装托管包装器，完全沿用宿主机环境及按触发人鉴权规则。需 /restart 重启或新建会话生效。
+   */
+  larkToolBinding?: boolean;
+  /**
    * Local file sandbox selection.
    *   true/"oncall" — per-session deny-by-default three-tier whitelist
    *     (Linux bwrap + macOS Seatbelt, identical semantics; see
@@ -4004,6 +4010,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : normalizeRemoteRunnerConfig(entry.remoteRunner),
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
+      larkToolBinding: typeof entry.larkToolBinding === 'boolean' ? entry.larkToolBinding : undefined,
       // Wire representation stays backwards compatible: oncall = legacy `true`;
       // only scratch is a string; off serializes as false.
       sandbox: sandboxMode === 'oncall' ? true : sandboxMode === 'scratch' ? 'scratch' : false,

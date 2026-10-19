@@ -1,11 +1,13 @@
 export interface LarkToolInvocation {
   args: string[];
   mode: 'bot' | 'user';
+  sawAs: boolean;
   offline: boolean;
   supportsAs: boolean;
   showHelp: boolean;
   /** Index of the actual flag terminator, excluding '--' used as a value. */
   literalIndex: number;
+  passthroughProfile?: string;
 }
 
 interface CommandHelp {
@@ -53,6 +55,7 @@ export function parseLarkToolInvocation(
   let metadata = parseHelp(readHelp(command));
   let mode = binding.defaultAs, sawAs = false, sawProfile = false;
   let showHelp = false, version = false, doctorOffline = false, literalIndex = -1;
+  let passthroughProfile: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--') {
@@ -83,8 +86,16 @@ export function parseLarkToolInvocation(
         sawAs = true; mode = value; continue;
       }
       if (flag.name === '--profile') {
-        if (sawProfile || value !== binding.appId) throw new Error(`lark-cli is bound to application ${binding.appId}; profile switching is unavailable`);
-        sawProfile = true; continue;
+        if (sawProfile) throw new Error('Use at most one --profile');
+        if (!value) throw new Error('--profile requires a non-empty value');
+        sawProfile = true;
+        if (value === binding.appId) {
+          continue;
+        }
+        passthroughProfile = value;
+        output.push(arg);
+        if (flag.takesValue && inlineValue === undefined) output.push(value);
+        continue;
       }
       if (flag.name === '--help') showHelp = value !== 'false';
       if (flag.name === '--version') version = value !== 'false';
@@ -111,17 +122,21 @@ export function parseLarkToolInvocation(
     || root === 'doctor' && doctorOffline;
   const supportsAs = metadata.flags.has('--as');
   if (sawAs && !supportsAs && !showHelp) throw new Error('This lark-cli command does not accept --as');
-  if (!offline && ['auth', 'profile', 'config', 'update'].includes(root)
+  if (!offline && !passthroughProfile && ['auth', 'profile', 'config', 'update'].includes(root)
     && !(root === 'auth' && sub === 'status')) {
     throw new Error('Managed lark-cli cannot change accounts. For this application authorization use botmux auth request --scope "<required scopes>" --json');
   }
-  return { args: output, mode, offline, supportsAs, showHelp, literalIndex };
+  return { args: output, mode, sawAs, offline, supportsAs, showHelp, literalIndex, passthroughProfile };
 }
 
 export function larkToolExecutionArgs(invocation: LarkToolInvocation): string[] {
   const args = [...invocation.args];
-  if (!invocation.offline && invocation.supportsAs) {
-    args.splice(invocation.literalIndex < 0 ? args.length : invocation.literalIndex, 0, '--as', invocation.mode);
+  if (!invocation.offline) {
+    if (!invocation.passthroughProfile && invocation.supportsAs) {
+      args.splice(invocation.literalIndex < 0 ? args.length : invocation.literalIndex, 0, '--as', invocation.mode);
+    } else if (invocation.passthroughProfile && invocation.sawAs && invocation.supportsAs) {
+      args.splice(invocation.literalIndex < 0 ? args.length : invocation.literalIndex, 0, '--as', invocation.mode);
+    }
   }
   return args;
 }

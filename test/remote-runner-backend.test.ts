@@ -153,6 +153,7 @@ describe('RemoteRunnerBackend', () => {
 
   it.each([
     ['session-no-session-tool', 'session-tool'],
+    ['session-no-schedule-capability', 'schedule-tool'],
     ['session-session-tool-generation', 'future-generation'],
   ])('fails closed for session tool protocol guard %s', async (sessionId, content) => {
     const backend = new RemoteRunnerBackend(
@@ -174,6 +175,88 @@ describe('RemoteRunnerBackend', () => {
     await ready;
 
     await backend.submitTurn({ turnId: `turn-${content}`, content });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rejects a schedule session tool when the host did not require the schedule capability', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool',
+      ],
+    }, 'session-host-read-only');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-schedule-tool', content: 'schedule-tool' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('accepts a provider-selected schedule Actor only after bilateral capability negotiation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule', 'session_tool_schedule_actor',
+      ],
+    }, 'session-schedule-actor');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-schedule-actor', content: 'schedule-actor' });
+    await final;
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      controllerOpenId: 'ou_developer',
+      request: { tool: 'schedule.add', schedule: '10m', prompt: 'check' },
+    }));
+  });
+
+  it('rejects a provider-selected schedule Actor when the host did not require it', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule',
+      ],
+    }, 'session-schedule-actor-host-disabled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const execute = vi.fn();
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-schedule-actor', content: 'schedule-actor' });
     await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
       code: 'remote_runner_protocol_error',
     })]));

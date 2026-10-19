@@ -35,7 +35,7 @@ import {
   sendMessage,
   sendThreadReply,
   navigateToMessenger,
-  openChat,
+  openGroupChat,
   openThreadForMessage,
   scrollThreadToBottom,
   waitForModelTextReply,
@@ -63,7 +63,7 @@ export function registerMidsceneSuites(): void {
       agent = createAgent(page);
 
       await navigateToMessenger(page);
-      await openChat(page, agent, chatName);
+      await openGroupChat(page, agent, chatName);
     });
 
     afterAll(async () => {
@@ -78,7 +78,7 @@ export function registerMidsceneSuites(): void {
 
       // Un-@ top-level message: ambient mode must pick it up on its own.
       const first = testMessage('traex-ambient-1');
-      await sendMessage(agent, first);
+      await sendMessage(agent, first, page);
       await openThreadForMessage(agent, { msgHint: first, timeoutMs: 180_000, page });
       try {
         await page.locator('text=直接开启会话').first().click({ timeout: 5_000 });

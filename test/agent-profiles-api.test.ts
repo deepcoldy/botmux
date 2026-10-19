@@ -139,3 +139,23 @@ describe('/api/agents', () => {
     expect((await call('POST', '/api/agents', { agent: { name: '' } })).body.error).toBe('name_required');
   });
 });
+
+describe('/api/agents zero injection', () => {
+  it('stores the mode and rejects it up front when the unified CLI cannot support it', async () => {
+    const ok = await call('POST', '/api/agents', { agent: { ...agent, promptInjection: { mode: 'none' } } });
+    expect(ok.body.agent.promptInjection).toEqual({ mode: 'none' });
+    const gemini = await call('POST', '/api/agents', {
+      agent: { name: 'g', exec: { cliId: 'gemini', model: '', reasoningEffort: '' }, promptInjection: { mode: 'none' } },
+    });
+    expect(gemini).toMatchObject({ status: 400, body: { error: 'promptInjection:unsupported' } });
+    const withSandbox = await call('POST', '/api/agents', {
+      agent: { ...agent, sandbox: { mode: 'off' }, promptInjection: { mode: 'none' } },
+    });
+    expect(withSandbox.status).toBe(200);
+    // Without a unified CLI each bot's daemon validates against its own CLI on push.
+    const noExec = await call('POST', '/api/agents', { agent: { name: 'n', promptInjection: { mode: 'none' } } });
+    expect(noExec.status).toBe(200);
+    expect((await call('POST', '/api/agents', { agent: { name: 'n', promptInjection: { mode: 'off' } } })).body.error)
+      .toBe('promptInjection:invalid_prompt_injection');
+  });
+});

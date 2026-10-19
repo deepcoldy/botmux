@@ -2,6 +2,8 @@ import { sendJson } from './dashboard-api.js';
 import {
   agentBotDrift,
   agentPushRequests,
+  agentZeroPromptConflict,
+  ZERO_PROMPT_SECTIONS,
   type AgentBotSnapshot,
   type AgentProfile,
   type AgentProfilesDoc,
@@ -86,6 +88,11 @@ export interface BotSyncResult {
 /**
  * 把 Agent 下发到一个 Bot：只推当前有偏差的分组（没偏差的不碰，避免无谓地触发
  * daemon 侧的会话保护检查）。各分组顺序执行、互不阻断；离线 Bot 直接报失败。
+ *
+ * 零注入：daemon 的 CLI / 沙箱 / 后端写入接口不检查零注入，所以先按同步后的组合整体
+ * 判断（不成立就一组都不写），再在每次写入这几组前按「已成功写入的分组」重新判断——
+ * 前面某组失败（如关闭零注入没写成）时，后面的写入不能让 Bot 停在不支持的组合上。
+ * 被拦下的分组推迟到其它分组之后再试（顺序不同的中间组合可能成立），仍不成立才报失败。
  */
 export async function syncAgentToBot(
   agent: AgentSectionsConfig,
@@ -98,7 +105,24 @@ export async function syncAgentToBot(
     result.failures.push({ section: 'exec', error: 'offline' });
     return result;
   }
-  for (const request of agentPushRequests(agent, bot.larkAppId, status.sections)) {
+  const affectsZeroPrompt = status.sections.some(section => ZERO_PROMPT_SECTIONS.includes(section));
+  if (affectsZeroPrompt && agentZeroPromptConflict(agent, bot)) {
+    result.failures.push({ section: 'promptInjection', error: 'zero_prompt_unsupported' });
+    return result;
+  }
+  const written: AgentSection[] = [];
+  let pending = agentPushRequests(agent, bot.larkAppId, status.sections);
+  while (pending.length) {
+    const blocked = pending.filter(request => ZERO_PROMPT_SECTIONS.includes(request.section)
+      && agentZeroPromptConflict(agent, bot, [...written, request.section]));
+    const ready = pending.filter(request => !blocked.includes(request));
+    if (!ready.length) {
+      for (const request of blocked) result.failures.push({ section: request.section, error: 'zero_prompt_unsupported' });
+      break;
+    }
+    // 只写第一个可写的分组，然后按新的已写入集合重新判断其余分组。
+    const request = ready[0]!;
+    pending = pending.filter(entry => entry !== request);
     try {
       const response = await send(request.method, request.url, request.body);
       // 关闭旧会话发生在写入之后，失败响应里也可能带着关闭摘要，先计数再判成败。
@@ -109,6 +133,7 @@ export async function syncAgentToBot(
         continue;
       }
       result.pushed.push(request.section);
+      written.push(request.section);
       const warning = response.body?.availabilityWarning;
       if (typeof warning === 'string' && warning) result.warnings.push(warning);
     } catch (error) {

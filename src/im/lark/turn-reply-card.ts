@@ -155,9 +155,9 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const terminal = replyCardIsTerminal(record);
   const pendingAsks = (record.asks ?? []).filter(entry => !entry.result && !entry.ask.settled);
   const phaseLabels = en
-    ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted' }
-      : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认' };
-  const phaseIcons = { queued: '⏳', working: '💭', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️' };
+    ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted', superseded: 'Continued in a later message' }
+      : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认', superseded: '已由后续消息接续' };
+  const phaseIcons = { queued: '⏳', working: '💭', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️', superseded: '↪️' };
   const toolCount = presentation.showProcess ? record.tools.length : 0;
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;

@@ -28,6 +28,7 @@ function harness(overrides: Record<string, unknown> = {}) {
   const turnId = 'om_kickoff';
   const ds: any = {
     larkAppId: 'cli_target', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
+    workingDir: '/repo',
     session: { sessionId: 'target-session', scope: 'thread', rootMessageId: 'om_root',
       replyTargets: { [turnId]: { rootMessageId: 'om_root' } } },
     workerGeneration: 7,
@@ -82,6 +83,68 @@ function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('delegated schedule add route', () => {
+  it('aligns a Remote Runner bot turn with its provider-selected developer Actor', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.getBot = () => ({ config: {} });
+    expect(await h.run()).toMatchObject({
+      status: 201,
+      value: { task: { ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user' } },
+    });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+    }));
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects a provider-selected Actor outside a frozen Remote Runner relay', async () => {
+    const h = harness({ remoteRunnerControllerOpenId: 'ou_user_target' });
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'invalid_schedule_request' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['human', 'not-admin', 'not-member', 'no-union'] as const)(
+    'revalidates a provider-selected Actor: %s', async mode => {
+      const h = harness({
+        remoteRunnerSessionTool: true,
+        remoteRunnerControllerOpenId: 'ou_user_target',
+      });
+      h.scope.readGlobalConfig = () => ({});
+      if (mode === 'human') h.ds.activeInteractiveTurn.caller.senderType = 'user';
+      if (mode === 'not-admin') h.scope.getDashboardAdminOpenIds = () => [];
+      if (mode === 'not-member') h.scope.listChatMemberOpenIds = async () => [];
+      if (mode === 'no-union') h.scope.resolveUnionIdFromOpenId = async () => null;
+      const result = await h.run();
+      expect(result).toMatchObject({
+        status: 403,
+        value: { error: mode === 'human'
+          ? 'schedule_session_tool_controller_forbidden'
+          : 'schedule_delegation_operator_denied' },
+      });
+      expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses a provider-selected Actor if the worker generation changes during resolution', async () => {
+    const h = harness({
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_user_target',
+    });
+    h.scope.readGlobalConfig = () => ({});
+    h.scope.resolveUnionIdFromOpenId = async () => {
+      h.ds.workerGeneration++;
+      return 'on_user';
+    };
+    expect(await h.run()).toMatchObject({
+      status: 409,
+      value: { error: 'schedule_delegation_turn_changed' },
+    });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
   it('redeems an exact single-hop dispatch as one anonymous-run task', async () => {
     const h = harness();
     expect(await h.run()).toMatchObject({ status: 201, value: { ok: true, replay: false } });
@@ -209,6 +272,41 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
     } };
     h.ds.session.replyTargets = {};
     expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerUnionId: 'on_active_user' } } });
+  });
+
+  it('accepts a Remote Runner session tool only inside its frozen chat, root, and working directory', async () => {
+    const h = directHumanHarness();
+    h.body.remoteRunnerSessionTool = true;
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = 'om_root';
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      chatId: 'oc_chat', rootMessageId: 'om_root', workingDir: '/repo',
+    } } });
+  });
+
+  it.each([
+    [{ chatId: 'oc_other' }, 'schedule_session_tool_scope_invalid'],
+    [{ workingDir: '/tmp/evil' }, 'schedule_session_tool_scope_invalid'],
+    [{ rootMessageId: 'om_other' }, 'schedule_session_tool_root_mismatch'],
+  ])('rejects Remote Runner direct scope expansion %o', async (patch, error) => {
+    const h = directHumanHarness();
+    h.body.remoteRunnerSessionTool = true;
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = 'om_root';
+    Object.assign(h.body.task, patch);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Remote Runner root outside topic execution', async () => {
+    const h = directHumanHarness();
+    h.body.remoteRunnerSessionTool = true;
+    h.body.task.rootMessageId = 'om_root';
+    expect(await h.run()).toMatchObject({
+      status: 400,
+      value: { error: 'schedule_session_tool_root_forbidden' },
+    });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
   });
 
   it.each([
