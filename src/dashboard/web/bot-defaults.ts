@@ -141,6 +141,14 @@ export type BotDefaultsRow = {
   /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
   defaultBackendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';
+  replyFooterEnabled?: boolean;
+  replyFooterBrand?: boolean;
+  replyFooterModel?: boolean;
+  replyFooterUsage?: boolean;
+  replyFooterRecipients?: boolean;
+  replyFooterVoice?: boolean;
+  showReplyTiming?: boolean;
+
   usageSupported?: boolean;
   disableStreamingCard?: boolean;
   replyCardMode?: 'legacy' | 'unified';

@@ -140,6 +140,7 @@ import {
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
+import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import {
@@ -481,9 +482,14 @@ export function getDaemonReplyCardUsageSnapshot(
 ): CardUsageSnapshot {
   let showUsage = false;
   try { showUsage = resolveUsageDisplay(ds.larkAppId) === 'footer'; } catch { /* default: streaming */ }
-  return withCardRuntimeIdentity(ds, showUsage
-    ? getDaemonSessionUsageSnapshot(ds, effectiveCliId)
-    : { context: null, tokens: null }, effectiveCliId);
+  let replyFooter = normalizeReplyFooter(undefined);
+  try { replyFooter = normalizeReplyFooter(getBot(ds.larkAppId).config); } catch { /* offline/unregistered: compatible defaults */ }
+  return {
+    ...withCardRuntimeIdentity(ds, showUsage
+      ? getDaemonSessionUsageSnapshot(ds, effectiveCliId)
+      : { context: null, tokens: null }, effectiveCliId),
+    ...(Object.keys(replyFooter).length ? { replyFooter } : {}),
+  };
 }
 
 /** Streaming-card metrics obey usageDisplay; known model/effort do not depend

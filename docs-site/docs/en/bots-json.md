@@ -477,3 +477,22 @@ Strict mode covers Botmux-owned PTY, tmux, tmux-pipe, zellij, zmx, local Codex/T
 Herdr, Riff, Mojo, Forge launch mode, adopted processes and externally owned App Servers cannot currently establish this boundary, so strict mode refuses those paths. Shells/profiles deliberately invoked by a CLI, credential/config files, OS file permissions and cloud identities remain outside this feature. Per-bot CODEX_HOME, codexAuthSync and file sandbox behavior remain independent.
 
 Dashboard reads only configured names. Its env form is write-only: saving replaces the complete map and saving blank clears it. Strict sessions do not return credential-bearing reproduction commands. Diagnostics show names/policy only. Explicit bot values are still plaintext in bots.json and process environments; this is not a secret vault.
+
+
+## Reply card footer
+
+Dashboard → Bot configuration → Message cards exposes a Footer master switch and independent block switches. They are also available through `/botconfig set <field> on|off`.
+
+| Field | Default | Scope |
+| --- | --- | --- |
+| `replyFooterEnabled` | `true` | Entire reply footer, including divider and voice button |
+| `replyFooterBrand` | `true` | Brand signature, still subject to the global brand switch and `brandLabel` |
+| `replyFooterModel` | `true` | Model, reasoning effort and backend variant |
+| `replyFooterUsage` | `true` | Footer usage, only when `usageDisplay` is `"footer"` |
+| `replyFooterRecipients` | `true` | Footer recipients and their @ notifications; explicit body mentions remain unchanged |
+| `replyFooterVoice` | `true` | Voice summary button when voice is configured |
+| `showReplyTiming` | `false` | Waiting and execution time when measurements are available |
+
+The master takes precedence without clearing block settings or signature text. Blocks remain editable while disabled; re-enabling restores the last saved choices. When all available blocks are hidden or empty and there is no voice button, the footer and divider are omitted. Status cards, accounting and model execution parameters are unchanged. User-authored custom card content remains intact; only Botmux-generated footers are controlled.
+
+Dashboard and `/botconfig` changes apply to subsequent new replies without restarting. Existing cards are not rewritten; final-output retries keep their first-render settings snapshot. Isolated or remote env-only sends without config or daemon access use the session spawn snapshot; recreate those sessions to refresh it. Restart after manually editing `bots.json` to synchronize the daemon.

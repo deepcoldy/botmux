@@ -3963,6 +3963,28 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
+  it('keeps the entire footer hidden across daemon final-output retries', async () => {
+    const bot = getBot('app_test');
+    bot.config.replyFooterEnabled = false;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.activeModel = 'observed-model';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    // A retry must use the first render policy, even if settings later change.
+    bot.config.replyFooterEnabled = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(call[1]).not.toContain('botmux_reply_footer');
+      expect(call[1]).not.toContain('observed-model');
+      expect(call[1]).not.toContain('"tag":"hr"');
+    }
+  });
+
   it('freezes the observed model and effort across final reply retries', async () => {
     const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });

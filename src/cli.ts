@@ -6236,6 +6236,7 @@ async function readCardUsageSnapshotForSend(
   larkAppId: string,
 ): Promise<CardUsageSnapshot> {
   const configuredRuntime: CardUsageSnapshot = {
+    replyFooter: resolveReplyFooterPreferences(larkAppId),
     context: null, tokens: null,
     ...(session.model?.trim() ? { model: session.model.trim() } : {}),
     ...(session.reasoningEffort?.trim() ? { reasoningEffort: session.reasoningEffort.trim() } : {}),
@@ -8815,6 +8816,7 @@ import {
   resolveBrandLabel,
   resolveReplyStyleConfig,
   resolveUsageDisplay,
+  resolveReplyFooterPreferences,
 } from './bot-registry.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
@@ -9385,6 +9387,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     brand: cred.brand as 'feishu' | 'lark' | undefined,
     feedback: cred.feedback,
     replyStyle: resolveReplyStyleConfig(appId),
+    ...resolveReplyFooterPreferences(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -9471,6 +9474,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     allowedUsers: [],
     feedback,
     replyStyle: resolveReplyStyleConfig(appId),
+    ...resolveReplyFooterPreferences(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -12263,9 +12267,10 @@ async function cmdSend(rest: string[]): Promise<void> {
         cc: footerAddressing.cc,
         inlinedIds: inlineResult.usedIds,
       });
+      const customFooterPrefs = resolveReplyFooterPreferences(appId);
       const withFooter = withCustomCardMentionFooter(
         inlineResult.card,
-        mentionFooter,
+        customFooterPrefs.replyFooterEnabled === false || customFooterPrefs.replyFooterRecipients === false ? [] : mentionFooter,
         localeForBot(appId),
       );
       if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
@@ -12447,7 +12452,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       let voiceOn = false;
       // A managed receiver card has no callback controls: a voice-summary
       // button would open a second, unledgered model/output action when clicked.
-      if (!sendTopLevel && !vcMeetingManagedSendOrigin) {
+      if (!sendTopLevel && !vcMeetingManagedSendOrigin
+          && usageSnapshot.replyFooter?.replyFooterEnabled !== false
+          && usageSnapshot.replyFooter?.replyFooterVoice !== false) {
         try {
           const { isVoiceConfigured } = await import('./services/voice/index.js');
           voiceOn = isVoiceConfigured(appId);

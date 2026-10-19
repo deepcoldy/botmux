@@ -2414,3 +2414,32 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
   });
 });
+
+
+describe('reply footer controls', () => {
+  it('preserves independent choices while toggling the master and rolls back failed saves', async () => {
+    let fail = false;
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({ ok: !fail, status: fail ? 500 : 200, body: fail ? { error: 'write_failed' } : { ok: true, ...patch } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+      bot: { larkAppId: 'cli_footer', replyFooterModel: false }, putCardPref,
+    })); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); await Promise.resolve(); });
+    };
+    await set('replyFooterEnabled', false);
+    expect(putCardPref).toHaveBeenLastCalledWith({ replyFooterEnabled: false });
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    // Child settings remain visible and editable while the master is off.
+    expect(toggle('replyFooterUsage').props.disabled).toBe(false);
+    await set('replyFooterUsage', false);
+    await set('replyFooterEnabled', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    expect(toggle('replyFooterUsage').props.checked).toBe(false);
+    fail = true;
+    await set('replyFooterModel', true);
+    expect(toggle('replyFooterModel').props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+});

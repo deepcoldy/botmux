@@ -21,7 +21,10 @@ const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' }
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 
 describe('real CLI send into a running reply card', () => {
-  it.each<{ cliId: string; configuredCliId: string; frozenCliId?: string; mode?: 'legacy' | 'unified'; layout?: 'result' }>([
+  it.each<{ cliId: string; configuredCliId: string; frozenCliId?: string; mode?: 'legacy' | 'unified'; layout?: 'result'; footerOff?: boolean }>([
+    { cliId: 'codex', configuredCliId: 'codex', footerOff: true },
+    { cliId: 'claude-code', configuredCliId: 'claude-code', footerOff: true },
+    { cliId: 'codex', configuredCliId: 'codex', mode: 'unified', footerOff: true },
     { cliId: 'cursor', configuredCliId: 'cursor' },
     { cliId: 'minimax', configuredCliId: 'minimax' },
     { cliId: 'codex', configuredCliId: 'codex' },
@@ -33,7 +36,7 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'minimax', configuredCliId: 'minimax', frozenCliId: 'codex' },
     { cliId: 'codex', configuredCliId: 'codex', frozenCliId: 'minimax' },
     ...['minimax', 'traex', 'codex', 'claude-code'].map(cliId => ({ cliId, configuredCliId: cliId, mode: 'unified' as const })),
-  ])('repairs reply fences for $cliId (default $configuredCliId, launch $frozenCliId, mode $mode, layout $layout)', ({ cliId, configuredCliId, frozenCliId, mode = 'legacy', layout }) => {
+  ])('repairs reply fences for $cliId (default $configuredCliId, launch $frozenCliId, mode $mode, layout $layout)', ({ cliId, configuredCliId, frozenCliId, mode = 'legacy', layout, footerOff }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-reply-markdown-'));
     const dataDir = join(root, 'data');
     const runtime = cliId === 'cursor'
@@ -42,7 +45,7 @@ describe('real CLI send into a running reply card', () => {
     const content = [ ...(layout ? ['# 依赖检查完成', ''] : []), '实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '配置： ```JSON', '{\"workingDir\":\"/workspace\"}', '```', '', '执行： ```bash', 'echo ready', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
     try {
       writeFileSync(join(root, 'bots.json'), JSON.stringify([{
-        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: configuredCliId, replyCardMode: mode,
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: configuredCliId, replyCardMode: mode, ...(footerOff ? { replyFooterEnabled: false } : {}),
       }]));
       seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
         sessionId: key.sessionId, status: 'active', cliId, cliSessionId: 'native_reply', ...runtime,
@@ -75,8 +78,13 @@ describe('real CLI send into a running reply card', () => {
       expect(blocks[2].content).toBe('echo ready\n');
       expect(markdown).toContain('**请选择：**');
       const footer = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_footer');
-      expect(footer.content).toContain(`**${runtime.model}**`);
-      if (runtime.reasoningEffort) expect(footer.content).toContain('high');
+      if (footerOff) {
+        expect(footer).toBeUndefined();
+        expect(card.body.elements.some((e: any) => e.tag === 'hr')).toBe(false);
+      } else {
+        expect(footer.content).toContain(`**${runtime.model}**`);
+        if (runtime.reasoningEffort) expect(footer.content).toContain('high');
+      }
       const store = openDatabaseSyncOrThrow(join(dataDir, 'session-stores', key.larkAppId, 'sessions.db'), { readOnly: true });
       try {
         const row = store.prepare('SELECT row FROM sessions WHERE session_id = ?').get(key.sessionId) as { row: string };

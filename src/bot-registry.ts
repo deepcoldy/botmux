@@ -1,3 +1,4 @@
+import { normalizeReplyFooter, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
@@ -2098,6 +2099,13 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  replyFooterEnabled?: boolean;
+  replyFooterBrand?: boolean;
+  replyFooterModel?: boolean;
+  replyFooterUsage?: boolean;
+  replyFooterRecipients?: boolean;
+  replyFooterVoice?: boolean;
+
   /** Show per-turn waiting and native execution time on final reply cards. Default off. */
   showReplyTiming?: boolean;
   tuiSlashAllow?: string[];
@@ -4120,6 +4128,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      ...normalizeReplyFooter(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
@@ -4288,4 +4297,25 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
  */
 export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
   return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
+}
+
+/** Live registry first, disk second, own-bot spawn snapshot for isolated sends. */
+export function resolveReplyFooterPreferences(larkAppId: string): ReplyFooterPreferences {
+  const registered = bots.get(larkAppId);
+  if (registered) return normalizeReplyFooter(registered.config);
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const entries = JSON.parse(readFileSync(path, 'utf-8'));
+      if (Array.isArray(entries)) {
+        const entry = entries.find(e => e?.larkAppId === larkAppId);
+        if (entry) return normalizeReplyFooter(entry);
+      }
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId) {
+    try { return normalizeReplyFooter(JSON.parse(process.env.BOTMUX_REPLY_FOOTER ?? '{}')); }
+    catch { /* invalid env uses compatible defaults */ }
+  }
+  return {};
 }

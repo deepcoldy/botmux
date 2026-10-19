@@ -142,6 +142,8 @@ export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
  * latest context-window measurement; tokens are cumulative for the Session.
  * Missing facts are omitted independently and must never be estimated. */
 export interface CardUsageSnapshot {
+  /** Reply-only display policy, frozen with final-output snapshots. */
+  replyFooter?: import('../../services/reply-footer.js').ReplyFooterPreferences;
   context: {
     usedTokens: number;
     windowTokens?: number;
@@ -698,14 +700,16 @@ export function buildReplyCardFooter(opts: {
   waitingDurationMs?: number;
   locale?: Locale;
 }): ReplyCardFooter | null {
+  const prefs = opts.usage?.replyFooter;
+  if (prefs?.replyFooterEnabled === false) return null;
   const parts: string[] = [];
-  const brandSeg = brandFooterSegment(opts.brand);
+  const brandSeg = prefs?.replyFooterBrand === false ? null : brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
   let hasUsage = false;
   if (opts.usage) {
-    const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
+    const usageSeg = prefs?.replyFooterUsage === false ? null : cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
-    const runtimeSeg = cardUsageRuntimeSegment(opts.usage);
+    const runtimeSeg = prefs?.replyFooterModel === false ? null : cardUsageRuntimeSegment(opts.usage);
     if (runtimeSeg) { parts.push(runtimeSeg); hasUsage = true; }
   }
   const durationMs = opts.executionDurationMs;
@@ -718,7 +722,7 @@ export function buildReplyCardFooter(opts: {
   if (hasDuration) {
     parts.push(t('card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
   }
-  const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
+  const recipientOpenIds = prefs?.replyFooterRecipients === false ? [] : [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
   if (hasRecipient) {
     parts.push(

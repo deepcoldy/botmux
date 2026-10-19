@@ -1,3 +1,4 @@
+import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
@@ -607,6 +608,8 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
 function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
+    ...normalizeReplyFooter(body),
+    showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
@@ -4522,6 +4525,9 @@ function ProfileRoles(props: { appId: string }) {
 export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [footerPrefs, setFooterPrefs] = useState(() => normalizeReplyFooter(bot));
+  const [showTiming, setShowTiming] = useState(bot.showReplyTiming === true);
+  useEffect(() => { setFooterPrefs(normalizeReplyFooter(bot)); setShowTiming(bot.showReplyTiming === true); }, [bot.replyFooterEnabled, bot.replyFooterBrand, bot.replyFooterModel, bot.replyFooterUsage, bot.replyFooterRecipients, bot.replyFooterVoice, bot.showReplyTiming]);
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
@@ -4703,6 +4709,29 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             })}
           </div>
           {replyMode !== 'legacy' && pinToggle}
+        </section>
+
+        <section className="bd-card-setting-group" data-reply-footer-group>
+          <h4 className="bd-card-setting-heading">{tr('botDefaults.footerGroup')}</h4>
+          <p className="hint">{tr('botDefaults.footerHelp')}</p>
+          <div className="bd-card-control-list">
+            {REPLY_FOOTER_KEYS.map(key => (
+              <ToggleRow key={key} dataAction={`toggle-${key}`}
+                title={tr(`botDefaults.${key}`)} checked={footerPrefs[key] !== false}
+                disabled={busy !== null}
+                onChange={checked => {
+                  const previous = footerPrefs;
+                  setFooterPrefs({ ...footerPrefs, [key]: checked });
+                  void savePatch({ [key]: checked }, key, () => setFooterPrefs(previous));
+                }} />
+            ))}
+            <ToggleRow dataAction="toggle-showReplyTiming" title={tr('botDefaults.footerTiming')}
+              checked={showTiming} disabled={busy !== null}
+              onChange={checked => {
+                const previous = showTiming; setShowTiming(checked);
+                void savePatch({ showReplyTiming: checked }, 'showReplyTiming', () => setShowTiming(previous));
+              }} />
+          </div>
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>
