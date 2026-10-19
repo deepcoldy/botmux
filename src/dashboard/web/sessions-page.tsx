@@ -1964,7 +1964,7 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
   );
 }
 
-function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
+export function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1975,6 +1975,11 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
     const input = inputRef.current;
     input.focus();
     input.select();
+  }, [editing]);
+
+  useLayoutEffect(() => {
+    if (!editing || !inputRef.current) return;
+    const input = inputRef.current;
     const fit = () => {
       const cs = getComputedStyle(input);
       const span = document.createElement('span');
