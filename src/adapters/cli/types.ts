@@ -522,6 +522,14 @@ export interface CliAdapter {
     /** Only supplied for an authoritative current viewport. Adapters may use
      * explicit terminal interruption evidence when native state omits it. */
     getCurrentScreen?: () => string;
+    /** 该会话对应的 CLI 进程是否存活（worker 持有 pane 子进程 pid）：
+     *  - true：进程存活。native state 里存在「回合未闭合」结构信号时应判忙，
+     *    即使状态库长时间无写入——前台长工具期间落库可能静默数分钟
+     *    （实测 opencode2 sleep 150：149s 零行更新，progress 为 ephemeral）；
+     *  - false：进程已退出，未闭合结构按崩溃 / 孤儿 fail-open；
+     *  - undefined：拿不到 pid（如无 pid 的 adopt），适配器回退到自身的
+     *    状态库时效窗口。 */
+    isCliProcessAlive?: () => boolean | undefined;
   }) => boolean;
 
   /** Opt-in positive marker for an idle→working edge observed in PTY output.

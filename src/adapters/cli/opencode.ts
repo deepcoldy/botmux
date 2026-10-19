@@ -278,6 +278,8 @@ export function isOpenCodeSessionBusy(
   kind: OpenCodeDbKind = 'v1',
   freshnessWindowMs: number = OPENCODE_BUSY_FRESHNESS_MS,
   dbPath = opencodeDbPath(),
+  /** 由 worker 注入：本会话 CLI 子进程是否存活；undefined = 无法判断（无 pid）。 */
+  isCliProcessAlive?: () => boolean | undefined,
 ): boolean {
   const freshBaseline = Date.now() - freshnessWindowMs;
 
@@ -295,30 +297,18 @@ export function isOpenCodeSessionBusy(
       ).get(cliSessionId) as { t?: number } | undefined;
       const turnCutoff = lastIdle?.t ?? 0;
 
-      // 「回合是否结束」与「进程是否还活着」是两个独立判据，不能共用一个
-      // cutoff（早期版本用 max(freshBaseline, lastIdle) 一把筛，长回合里 user
-      // 行超过 120s 时效后，步骤间空档又会漏判成空闲）：
+      // 第一步：纯结构性地判断回合是否尚未闭合，**不做任何时效筛选**。
+      // 「回合是否结束」与「进程是否还活着」必须分开：前台长工具期间 DB 可以
+      // 数分钟零写入（实测 opencode 2.0.32 前台 sleep 150：工具 running 期间
+      // 连续 149s 无任何行创建/更新；tool.progress 是 ephemeral 事件不落库，
+      // session_inbox/session_pending 也为空），用 DB 静默推断死亡必然误杀。
       //
-      //  - turnCutoff：权威回合边界（最后一条 idle 标记），**不设时效**。
-      //    只看它之后的活动；idle 之前的 running part / 未完成 assistant 都是
-      //    已结束回合的历史，不能再把会话判忙。
-      //  - freshBaseline：存活性窗口（120s）。窗口内没有任何行被创建或更新，
-      //    视为进程异常 / 孤儿记录，fail-open 放行（与旧版孤儿策略一致）。
-      //    OpenCode 执行中会持续刷新 assistant 行的 time_updated（实测流式 /
-      //    长工具期间 4–186s 跨度均在更新），所以长回合只要还活着就有新鲜行。
-      const alive = db.prepare(
-        "SELECT 1 AS alive FROM session_message " +
-        "WHERE session_id = ? AND (time_created > ? OR time_updated > ?) " +
-        "LIMIT 1"
-      ).get(cliSessionId, freshBaseline, freshBaseline) as { alive?: number } | undefined;
-      if (!alive?.alive) return false;
-
       // 1. 工具仍在运行。V2 把 part 嵌在 assistant message 的 `content[]` 里
       //    （`content[*].state.status='running'`，实测 2.0.x 行形状），旧查询只
       //    查消息顶层 `$.state.status`，而顶层恒为 NULL —— 该判据在 2.0.32 实测
-      //    100% 漏检。按行 time_updated 做回合内隔离：长工具的 time_created
-      //    可能很旧，但执行中 time_updated 持续刷新；顶层查询保留作旧/未来行
-      //    形状的防御性兜底。
+      //    100% 漏检。按行 time_updated 落在 idle 标记之后做回合内隔离：长工具
+      //    的 time_created 可能很旧，但完成时 time_updated 会刷新；顶层查询保留
+      //    作旧/未来行形状的防御性兜底。
       const nestedRunningTool = db.prepare(
         "SELECT 1 AS busy FROM session_message AS m, " +
         "json_each(json_extract(m.data, '$.content')) AS p " +
@@ -326,7 +316,6 @@ export function isOpenCodeSessionBusy(
         "  AND json_extract(p.value, '$.state.status') = 'running' " +
         "LIMIT 1"
       ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
-      if (nestedRunningTool?.busy) return true;
 
       const topLevelRunning = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
@@ -334,7 +323,6 @@ export function isOpenCodeSessionBusy(
         "  AND json_extract(data, '$.state.status') = 'running' " +
         "LIMIT 1"
       ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
-      if (topLevelRunning?.busy) return true;
 
       // 2. 回合内已有 assistant message 但尚未 completed（模型生成中）。
       const incompleteAssistant = db.prepare(
@@ -343,12 +331,9 @@ export function isOpenCodeSessionBusy(
         "  AND json_extract(data, '$.time.completed') IS NULL " +
         "LIMIT 1"
       ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
-      if (incompleteAssistant?.busy) return true;
 
       // 3. idle 之后存在 user message：回合已提交但 idle 标记尚未写入。
-      //    不做时效筛选（长回合的 user 行可能远超 120s），孤儿场景由最前面
-      //    的 alive 闸门兜底。覆盖两类屏幕启发式必误判的空档（旧逻辑在这两
-      //    处都返回 false）：
+      //    覆盖两类屏幕启发式必误判的空档（旧逻辑在这两处都返回 false）：
       //    a) 提交后、首条 assistant 落库前（relay 首 token 延迟）；
       //    b) 上一条 assistant 已 completed、下一步 assistant 尚未创建
       //       （步骤间等待；实测 relay 下 2–8s，超过 IdleDetector 的 2s 静默
@@ -359,9 +344,29 @@ export function isOpenCodeSessionBusy(
         "WHERE session_id = ? AND type = 'user' AND time_created > ? " +
         "LIMIT 1"
       ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
-      if (openTurnUserMessage?.busy) return true;
 
-      return false;
+      const turnOpen = !!(nestedRunningTool?.busy || topLevelRunning?.busy
+        || incompleteAssistant?.busy || openTurnUserMessage?.busy);
+      if (!turnOpen) return false;
+
+      // 第二步：回合未闭合时，用「进程是否存活」区分长任务与崩溃孤儿。
+      //  - 进程存活：无条件判忙。DB 静默不等于空闲（长工具 / 长 relay 等待），
+      //    闭合信号只有 idle 标记，等待本身是回合的一部分。
+      //  - 进程已退出：fail-open（与旧版孤儿保护意图一致）。opencode 下次打开
+      //    该会话会自行对账：实测被杀会话残留的 running part 在 resume 时被
+      //    改写为 tool/error、补齐 assistant completed，再正常写 idle 标记。
+      const liveness = isCliProcessAlive?.();
+      if (liveness === true) return true;
+      if (liveness === false) return false;
+
+      // 拿不到进程信号时（无 pid 的 adopt 等）回退到旧的 DB 存活性窗口：
+      // freshnessWindowMs 内没有任何行被创建或更新，视为异常 / 孤儿，fail-open。
+      const alive = db.prepare(
+        "SELECT 1 AS alive FROM session_message " +
+        "WHERE session_id = ? AND (time_created > ? OR time_updated > ?) " +
+        "LIMIT 1"
+      ).get(cliSessionId, freshBaseline, freshBaseline) as { alive?: number } | undefined;
+      return !!alive?.alive;
     }, dbPath) ?? false;
   }
 

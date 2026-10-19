@@ -460,6 +460,66 @@ describe('isOpenCodeSessionBusy V2', () => {
 
     expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(false);
   });
+
+  // —— 进程存活信号：前台长工具期间 DB 可静默数分钟（实测 sleep 150 连续 149s
+  //    零行更新，tool.progress 为 ephemeral 不落库，inbox/pending 均空），
+  //    不能由 DB 静默推断回合结束 ——
+  it('stays busy through a silent long foreground tool while the CLI process is alive', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_silent_long_tool_alive';
+    const now = Date.now();
+    // 实测时间线：user 182s 前；assistant 181s 前创建后再无更新（time_updated
+    // 停在工具转 running 的时刻），content 内工具仍 running；无 idle 标记。
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 182_000, { time: { created: now - 182_000 }, text: 'sleep 150' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 181_000,
+      assistant(now - 181_000, undefined, [toolPart('running')]), now - 178_000);
+    db.close();
+
+    // 无进程信号时回退 DB 时效窗口：全部陈旧 → fail-open
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(false);
+    // 有进程存活信号时：结构未闭合即 busy，无视 DB 静默时长
+    expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => true)).toBe(true);
+    // 进程已退出：按崩溃孤儿 fail-open
+    expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => false)).toBe(false);
+  });
+
+  it('stays busy in a long inter-step relay gap while the CLI process is alive', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_silent_gap_alive';
+    const now = Date.now();
+    // user 300s 前；上一步 assistant 200s 前完成，之后 relay 长时间无新行落库
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 300_000, { time: { created: now - 300_000 }, text: 'slow relay' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 210_000,
+      assistant(now - 210_000, now - 200_000, [toolPart('completed')]), now - 200_000);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => true)).toBe(true);
+    expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => false)).toBe(false);
+  });
+
+  it('does not let a live process resurrect a turn already closed by an idle marker', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_alive_but_idle';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 300_000, { time: { created: now - 300_000 }, text: 'old turn' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'idle', now - 290_000, { time: { created: now - 290_000 }, outcome: 'succeeded' });
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => true)).toBe(false);
+  });
+
+  it('fails open immediately on a dead CLI process even if rows were updated seconds ago', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_dead_process_fresh_rows';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 5_000, { time: { created: now - 5_000 }, text: 'x' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 4_000,
+      assistant(now - 4_000, undefined, [toolPart('running')]), now - 1_000);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => true)).toBe(true);
+    expect(isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, () => false)).toBe(false);
+  });
 });
 
 describe('createOpenCodeAdapter isSessionBusy', () => {
@@ -511,5 +571,28 @@ describe('createOpenCode2Adapter isSessionBusy', () => {
     const adapter = createOpenCode2Adapter();
     expect(adapter.isSessionBusy).toBeDefined();
     expect(adapter.isSessionBusy?.({ sessionId: BOTMUX_SESSION_ID })).toBe(true);
+  });
+
+  it('forwards the CLI process liveness probe for silent long-running work', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2AdapterLiveness';
+    const stale = Date.now() - 200_000;
+    // 陈旧但未闭合（前台长工具静默中）
+    db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
+      .run(`msg_${++idSeq}`, sid, 'user', stale, stale, JSON.stringify({ time: { created: stale } }));
+    db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
+      .run(`msg_${++idSeq}`, sid, 'assistant', stale + 1_000, stale + 3_000, JSON.stringify({
+        time: { created: stale + 1_000 },
+        content: [{ type: 'tool', state: { status: 'running' } }],
+      }));
+    db.close();
+
+    const adapter = createOpenCode2Adapter();
+    expect(adapter.isSessionBusy?.({
+      sessionId: 'dummy', cliSessionId: sid, isCliProcessAlive: () => true,
+    })).toBe(true);
+    expect(adapter.isSessionBusy?.({
+      sessionId: 'dummy', cliSessionId: sid, isCliProcessAlive: () => false,
+    })).toBe(false);
   });
 });
