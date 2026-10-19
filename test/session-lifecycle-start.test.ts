@@ -6311,6 +6311,7 @@ describe('managed turn authority worker generations', () => {
     requestUserOpenId: 'ou_schedule_owner',
     requestUserUnionId: 'on_schedule_owner',
     requestLarkAppId: 'app_test',
+    senderType: 'user' as const,
     source: 'schedule_creator' as const,
     taskId: 'feedbeef',
   };
@@ -7592,6 +7593,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     requestUserOpenId: 'ou_owner',
     requestUserUnionId: 'on_owner',
     requestLarkAppId: 'cli_creator',
+    senderType: 'user' as const,
     source: 'schedule_creator',
     taskId: 'abcdef12',
   };

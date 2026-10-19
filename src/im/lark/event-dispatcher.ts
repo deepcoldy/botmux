@@ -4,11 +4,12 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { createHash } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
-import { listChats } from '../../services/groups-store.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { listChats, type ChatBrief } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { upsertBotInfoEntries } from '../../services/bots-info-store.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
@@ -18,7 +19,7 @@ import { commandSpec } from '../../core/command-schema.js';
 import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, type MentionIdentity } from './message-parser.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -2775,7 +2776,11 @@ function unwrapEditedTextContent(rawContent: string): string {
   return JSON.stringify({ ...parsed, text: paragraphs.join('\n') });
 }
 
-function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
+function larkReceiveEventFromHistoryMessage(
+  message: any,
+  chatId: string,
+  chatType: 'group' | 'p2p' = 'group',
+): any {
   const { senderOpenId, senderTypeRaw, senderIdType } = historyMessageSender(message);
   // sender_type and the ID DOMAIN are independent axes. A bot sender keeps
   // sender_type='app', but when we resolved its identity to an open_id (via
@@ -2791,8 +2796,9 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
     message: {
       ...message,
       message_type: message?.message_type ?? message?.msg_type,
+      content: message?.content ?? message?.body?.content,
       chat_id: message?.chat_id ?? chatId,
-      chat_type: message?.chat_type ?? 'group',
+      chat_type: message?.chat_type ?? chatType,
     },
     sender: {
       // Preserve the bot sender_type (talk/quota gates and foreign-bot owner
@@ -2805,6 +2811,283 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
           : { open_id: senderOpenId },
     },
   };
+}
+
+/**
+ * `im/v1/messages` 的列表接口会把部分 interactive 卡片压成“请升级客户端”占位，
+ * 并且可能完全省略 mentions；同一消息的单条详情仍保留 mentions。无主窗口恢复若直接
+ * 持久化列表快照，会先把一条“未 @ 本 bot”的残缺消息消费完成，随后完整 WS 副本又因
+ * payload 不同被判 conflict，最终形成一次静默丢失。
+ *
+ * 恢复扫描只为缺少 mentions 的卡片补一次权威详情；正文仍保留列表/WS 共用的简化形态，
+ * 由 claimed consumer 进入路由前再按既有 card resolver 解包，避免 REST 完整卡片与 WS
+ * 简化卡片在 durable 去重层制造另一种异文。目标 bot 的 app_id mention 同时归一到本
+ * app 已探明的 open_id，使后续 @ 路由与实时事件使用同一身份域。
+ */
+async function hydratePrimaryRecoveryMessage(
+  larkAppId: string,
+  message: any,
+  signal: AbortSignal,
+): Promise<any> {
+  const messageId = typeof message?.message_id === 'string' ? message.message_id : '';
+  const messageType = message?.message_type ?? message?.msg_type;
+  let hydrated = message;
+  if ((messageType === 'interactive' || messageType === 'nonsupport')
+      && (!Array.isArray(message?.mentions) || message.mentions.length === 0)) {
+    const detail = await runWithAbortDeadline(
+      requestSignal => getMessageDetail(larkAppId, messageId, {
+        userCardContent: true,
+        timeoutMs: PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
+        signal: requestSignal,
+      }),
+      PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
+      `primary ingress hydrate message ${messageId.substring(0, 12)}`,
+      signal,
+    );
+    const item = detail?.items?.[0];
+    if (!item) throw new Error(`primary ingress recovery message ${messageId} has no detail`);
+    hydrated = {
+      ...message,
+      ...(Array.isArray(item.mentions) ? { mentions: item.mentions } : {}),
+      ...(item.sender ? { sender: { ...(message?.sender ?? {}), ...item.sender } } : {}),
+    };
+  }
+
+  const bot = getBot(larkAppId);
+  if (!bot.botOpenId) {
+    throw new Error(`primary ingress recovery bot open_id unresolved for ${larkAppId}`);
+  }
+  if (!Array.isArray(hydrated?.mentions)) return hydrated;
+  return {
+    ...hydrated,
+    mentions: hydrated.mentions.map((mention: any) => {
+      if (mentionAppId(mention) !== larkAppId) return mention;
+      const existingId = mention?.id && typeof mention.id === 'object' ? mention.id : {};
+      const { app_id: _appId, ...otherIds } = existingId;
+      return {
+        ...mention,
+        id: { ...otherIds, open_id: bot.botOpenId },
+        id_type: 'open_id',
+      };
+    }),
+  };
+}
+
+const PRIMARY_INGRESS_RECOVERY_WINDOW_MS = Math.max(
+  30_000,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_WINDOW_MS) || 2 * 60_000,
+);
+const PRIMARY_INGRESS_RECOVERY_SCAN_LIMIT = Math.max(
+  1,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_SCAN_LIMIT) || 500,
+);
+const PRIMARY_INGRESS_RECOVERY_PAGE_SIZE = Math.min(50, Math.max(
+  1,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_PAGE_SIZE) || 50,
+));
+const PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS = Math.max(
+  1_000,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS) || 15_000,
+);
+const PRIMARY_INGRESS_RECOVERY_RUN_TIMEOUT_MS = Math.max(
+  PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS + 5_000,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_RUN_TIMEOUT_MS) || 120_000,
+);
+const PRIMARY_INGRESS_RECOVERY_CONCURRENCY = Math.min(16, Math.max(
+  1,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_CONCURRENCY) || 6,
+));
+const PRIMARY_INGRESS_RECOVERY_RETRY_MS = Math.max(
+  250,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_RETRY_MS) || 1_000,
+);
+const PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS) || 30_000,
+);
+const PRIMARY_INGRESS_RECOVERY_SETTLE_MS = Math.min(30_000, Math.max(
+  250,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_RECOVERY_SETTLE_MS) || 2_000,
+));
+const PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS = Math.min(400, Math.max(
+  100,
+  Number(process.env.BOTMUX_PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS) || 400,
+));
+
+interface PrimaryIngressRecoverySummary {
+  chats: number;
+  scanned: number;
+  enqueued: number;
+  fingerprint: string;
+}
+
+function recoveryChatType(chat: ChatBrief): 'group' | 'p2p' {
+  return chat.chatMode === 'p2p' ? 'p2p' : 'group';
+}
+
+async function primaryUpdatedMessageIngressAnchor(
+  larkAppId: string,
+  message: any,
+): Promise<string> {
+  if (typeof message?.chat_id === 'string' && message.chat_id.trim()) {
+    return rawMessageIngressAnchor(larkAppId, message);
+  }
+  const messageId = typeof message?.message_id === 'string' ? message.message_id : '';
+  if (!messageId.startsWith('om_')) {
+    throw new Error('durable primary update has no message identity');
+  }
+  const detail = await runWithAbortDeadline(
+    signal => getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      timeoutMs: PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS,
+      signal,
+    }),
+    PRIMARY_INGRESS_UPDATE_CHAT_LOOKUP_TIMEOUT_MS,
+    `primary ingress resolve update chat ${messageId.substring(0, 12)}`,
+  );
+  const chatId = detail?.items?.[0]?.chat_id ?? detail?.message?.chat_id ?? detail?.chat_id;
+  if (typeof chatId !== 'string' || !chatId.trim()) {
+    throw new Error(`durable primary update ${messageId} has no authoritative chat_id`);
+  }
+  return rawMessageIngressAnchor(larkAppId, { ...message, chat_id: chatId.trim() });
+}
+
+async function recoverDurablePrimaryIngressOnce(input: {
+  larkAppId: string;
+  enqueue: NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>;
+  signal: AbortSignal;
+  now?: number;
+  until?: number;
+}): Promise<PrimaryIngressRecoverySummary> {
+  await ensureBotOpenId(input.larkAppId);
+  if (!getBot(input.larkAppId).botOpenId) {
+    throw new Error(`primary ingress recovery bot open_id unresolved for ${input.larkAppId}`);
+  }
+  const startedAt = input.now ?? Date.now();
+  const cutoff = startedAt - PRIMARY_INGRESS_RECOVERY_WINDOW_MS;
+  const chats = await runWithAbortDeadline(
+    () => listChats(input.larkAppId),
+    PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
+    'primary ingress list chats',
+    input.signal,
+  );
+  input.signal.throwIfAborted();
+  const uniqueChats = [...new Map(chats.map(chat => [chat.chatId, chat])).values()];
+  let nextChat = 0;
+  let scanned = 0;
+  let enqueued = 0;
+  const recoveredEventIds: string[] = [];
+
+  const recoverChat = async (chat: ChatBrief, signal: AbortSignal): Promise<void> => {
+    let stoppedAtCutoff = false;
+    let stoppedAtLimit = false;
+    const messages = await runWithAbortDeadline(
+      requestSignal => listChatMessagesUntil(input.larkAppId, chat.chatId, {
+        pageSize: PRIMARY_INGRESS_RECOVERY_PAGE_SIZE,
+        timeoutMs: PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
+        signal: requestSignal,
+        stopAfter: (message, seenCount) => {
+          const createdAt = messageCreateTimeMs(message);
+          if (Number.isFinite(createdAt) && (createdAt as number) < cutoff) {
+            stoppedAtCutoff = true;
+            return true;
+          }
+          if (seenCount >= PRIMARY_INGRESS_RECOVERY_SCAN_LIMIT) {
+            stoppedAtLimit = true;
+            return true;
+          }
+          return false;
+        },
+      }),
+      PRIMARY_INGRESS_RECOVERY_REQUEST_TIMEOUT_MS,
+      `primary ingress recover chat ${chat.chatId.substring(0, 12)}`,
+      signal,
+    );
+    if (stoppedAtLimit && !stoppedAtCutoff) {
+      throw new Error(
+        `primary ingress recovery exceeded ${PRIMARY_INGRESS_RECOVERY_SCAN_LIMIT} messages `
+        + `inside the lookback window for chat ${chat.chatId}`,
+      );
+    }
+    for (const rawMessage of messages) {
+      signal.throwIfAborted();
+      const messageId = typeof rawMessage?.message_id === 'string' ? rawMessage.message_id : '';
+      const createdAt = messageCreateTimeMs(rawMessage);
+      if (!messageId || !messageId.startsWith('om_')) continue;
+      if (!Number.isFinite(createdAt)) {
+        throw new Error(`primary ingress recovery message ${messageId} has no create_time`);
+      }
+      if ((createdAt as number) < cutoff) continue;
+      if (input.until !== undefined && (createdAt as number) > input.until) continue;
+      const message = await hydratePrimaryRecoveryMessage(input.larkAppId, rawMessage, signal);
+      scanned += 1;
+      recoveredEventIds.push(`${chat.chatId}:${messageId}`);
+      const data = larkReceiveEventFromHistoryMessage(
+        message,
+        chat.chatId,
+        recoveryChatType(chat),
+      );
+      data.__durableRecovery = { source: 'lark-history' };
+      await input.enqueue({
+        eventId: `im.message.receive_v1:${input.larkAppId}:${messageId}`,
+        partitionKey: rawMessageIngressAnchor(input.larkAppId, data.message),
+        data,
+      });
+      enqueued += 1;
+    }
+  };
+
+  await runWithAbortDeadline(async runSignal => {
+    const workers = Array.from(
+      { length: Math.min(PRIMARY_INGRESS_RECOVERY_CONCURRENCY, uniqueChats.length) },
+      async () => {
+        while (!runSignal.aborted) {
+          const index = nextChat;
+          nextChat += 1;
+          if (index >= uniqueChats.length) return;
+          await recoverChat(uniqueChats[index]!, runSignal);
+        }
+      },
+    );
+    await Promise.all(workers);
+  }, PRIMARY_INGRESS_RECOVERY_RUN_TIMEOUT_MS, 'primary ingress recovery', input.signal);
+
+  recoveredEventIds.sort();
+  return {
+    chats: uniqueChats.length,
+    scanned,
+    enqueued,
+    fingerprint: createHash('sha256').update(recoveredEventIds.join('\n')).digest('hex'),
+  };
+}
+
+function waitForPrimaryRecoverySettle(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('durable primary ingress recovery aborted'));
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+export async function __recoverDurablePrimaryIngressOnceForTest(input: {
+  larkAppId: string;
+  enqueue: NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>;
+  signal?: AbortSignal;
+  now?: number;
+}): Promise<PrimaryIngressRecoverySummary> {
+  return await recoverDurablePrimaryIngressOnce({
+    ...input,
+    signal: input.signal ?? new AbortController().signal,
+  });
 }
 
 // Reserve before joining the canonical anchor queue. The raw routing lane is
@@ -4133,6 +4416,10 @@ async function processCommentEvent(
 
 export interface LarkEventDispatcherRuntime {
   connect(): Lark.WSClient;
+  connectPrimary(input: { signal: AbortSignal }): {
+    client: Lark.WSClient;
+    ready: Promise<void>;
+  };
   close(): void;
   processDurableMessage(
     message: DurableLarkMessageClaim,
@@ -4156,9 +4443,21 @@ export interface LarkEventDispatcherRuntimeOptions {
   authorizePrimaryControl?: (data: unknown) => boolean | Promise<boolean>;
   /**
    * Primary consumer 在执行本地会话副作用前回读权威 Session。若权威 active
-   * Session 属于另一副本，本副本必须抛错并让 Inbox 重试，不能冷启替换它。
+   * Session 属于另一副本，本副本必须先经过 takeOverPrimarySession 的分布式
+   * owner fence；不能直接冷启替换它。
    */
   readPrimarySession?: (sessionKey: string) => Promise<Session | undefined>;
+  /**
+   * Primary-only failover seam. The callback must acquire a fresh canonical
+   * Session owner epoch before it materializes the active runtime locally.
+   * Returning without installing that exact Session keeps the route fenced.
+   */
+  takeOverPrimarySession?: (
+    sessionKey: string,
+    canonical: Session,
+  ) => Promise<Session | undefined>;
+  /** Test seam; production defaults to a 2s post-ready REST quiet period. */
+  primaryRecoverySettleMs?: number;
 }
 
 interface PrimaryProcessContext {
@@ -4296,14 +4595,19 @@ export function createLarkEventDispatcherRuntime(
   const assertPrimaryRouteOwner = async (
     ctx: RoutingContext,
     primary: PrimaryProcessContext | undefined,
-  ): Promise<void> => {
-    if (!primary || !runtimeOptions.readPrimarySession) return;
+  ): Promise<boolean> => {
+    if (!primary || !runtimeOptions.readPrimarySession) return false;
     const anchor = ctx.runtimeRoutingAnchor ?? ctx.anchor;
     const canonicalKey = sessionKey(anchor, larkAppId);
     const canonical = await runtimeOptions.readPrimarySession(canonicalKey);
-    if (!canonical || canonical.status !== 'active') return;
-    const local = handlers.resolveDurableSession?.(ctx);
-    if (local?.sessionId === canonical.sessionId) return;
+    if (!canonical || canonical.status !== 'active') return false;
+    let local = handlers.resolveDurableSession?.(ctx);
+    if (runtimeOptions.takeOverPrimarySession) {
+      await runtimeOptions.takeOverPrimarySession(canonicalKey, canonical);
+      local = handlers.resolveDurableSession?.(ctx);
+      if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
+    }
+    if (local?.sessionId === canonical.sessionId && local.status === 'active') return true;
     throw new Error(
       `durable primary active canonical Session is owned by another replica: ${canonicalKey}`,
     );
@@ -4358,6 +4662,14 @@ export function createLarkEventDispatcherRuntime(
       // so the @ is recognized. Best-effort: on probe failure we degrade to the
       // prior behavior (the periodic heartbeat retries the probe).
       await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+
+      // Recovery rows intentionally persist the list endpoint's transport-stable
+      // card body. Best-effort resolve the full card before any listener/@
+      // routing consumes that snapshot; direct mentions were already hydrated
+      // before enqueue, so a later content lookup failure cannot erase the task.
+      if (data.__durableRecovery?.source === 'lark-history') {
+        await resolveNonsupportMessage(data, larkAppId);
+      }
 
       // Learn other bots' open_ids from @mentions in this event.
       // Lark open_id is per-app: these IDs are correct for our app context.
@@ -4572,8 +4884,11 @@ export function createLarkEventDispatcherRuntime(
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
               const seedPayload = { data, ctx: seedCtx, ownsSession: false };
               if (primary) {
-                await assertPrimaryRouteOwner(seedCtx, primary);
-                await dispatchHumanMessage(seedPayload);
+                const ownsCanonical = await assertPrimaryRouteOwner(seedCtx, primary);
+                await dispatchHumanMessage({
+                  ...seedPayload,
+                  ownsSession: seedPayload.ownsSession || ownsCanonical,
+                });
                 return primaryResult(seedCtx, primary);
               }
               await dispatchHumanMessage(seedPayload)
@@ -4690,14 +5005,35 @@ export function createLarkEventDispatcherRuntime(
 
       const senderOpenId = sender?.sender_id?.open_id as string | undefined;
       // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMember）要用。
-      const humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
+      let humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
       if (primary && isUnsupportedPrimarySessionlessCommand(message, senderOpenId)) {
         return ignoredUnsupportedPrimarySideEffect('sessionless commands');
       }
       await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
-      const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
+      let isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
+      // REST recovery rows omit union_id. Avoid paying a contact lookup when
+      // open_id/chat policy already proves talk access; when union identity is
+      // the only possible grant, transient lookup failures must retry the Inbox
+      // claim instead of permanently completing this recovered message ignored.
+      if (primary && data.__durableRecovery?.source === 'lark-history'
+          && !isAllowed && !humanSenderUnionId && senderOpenId) {
+        const union = await resolveUnionIdFromOpenIdStrict(larkAppId, senderOpenId);
+        if (union.status === 'retryable') throw new Error(union.error);
+        if (union.status === 'resolved') {
+          humanSenderUnionId = union.unionId;
+          if (sender?.sender_id) sender.sender_id.union_id = union.unionId;
+          isAllowed = canTalk(
+            larkAppId,
+            chatId,
+            senderOpenId,
+            undefined,
+            humanSenderUnionId,
+            chatType,
+          );
+        }
+      }
       // Trusted creator metadata affects addressing only. Unauthorized senders
       // must not trigger Lark/registry I/O; operation gates stay unchanged.
       if (isAllowed) {
@@ -5318,7 +5654,7 @@ export function createLarkEventDispatcherRuntime(
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
-      await assertPrimaryRouteOwner(ctx, primary);
+      ownsSession = (await assertPrimaryRouteOwner(ctx, primary)) || ownsSession;
       // Record explicit DM /t intent before this message releases the raw
       // per-chat routing lane and before handleNewTopic begins its async session
       // registration. A back-to-back root-linked reply can therefore select the
@@ -5489,7 +5825,7 @@ export function createLarkEventDispatcherRuntime(
       // 让下游与 WS 事件完全同形：REST 正文在 body.content，把它提升到 content
       //（resolveNonsupportMessage 回读时也是这么做的）。编辑富文本编辑器额外包了
       // <p> 段落，需先还原为普通 text 消息形态。
-      if (!data.message.content && current.body?.content) {
+      if (current.body?.content) {
         data.message.content = unwrapEditedTextContent(current.body.content);
       }
 
@@ -5564,6 +5900,63 @@ export function createLarkEventDispatcherRuntime(
       if (primary) throw err;
     }
   }
+
+  interface PrimaryRecoveryState {
+    controller: AbortController;
+    ready: Promise<void>;
+  }
+  let primaryRecovery: PrimaryRecoveryState | undefined;
+  let primaryLeadershipSignal: AbortSignal | undefined;
+  const primaryRecoverySettleMs = Math.min(30_000, Math.max(
+    0,
+    runtimeOptions.primaryRecoverySettleMs ?? PRIMARY_INGRESS_RECOVERY_SETTLE_MS,
+  ));
+
+  const enqueuePrimaryAfterRecovery = (
+    input: Parameters<NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>>[0],
+  ): Promise<unknown> => {
+    const enqueue = runtimeOptions.enqueuePrimary;
+    if (!enqueue) return Promise.reject(new Error('durable primary enqueue is not configured'));
+    const recovery = primaryRecovery;
+    if (!recovery) return enqueue(input);
+    return recovery.ready.then(() => {
+      if (recovery.controller.signal.aborted || primaryRecovery !== recovery) {
+        throw new Error('durable primary ingress leadership changed during recovery');
+      }
+      return enqueue(input);
+    });
+  };
+
+  type PrimaryIngressInput = Parameters<
+    NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>
+  >[0];
+  let primaryIngressReservationTail = Promise.resolve();
+  const enqueuePrimaryInArrivalOrder = (
+    buildInput: () => PrimaryIngressInput | Promise<PrimaryIngressInput>,
+  ): Promise<unknown> => {
+    let resolveAck!: (value: unknown) => void;
+    let rejectAck!: (error: unknown) => void;
+    const ack = new Promise<unknown>((resolve, reject) => {
+      resolveAck = resolve;
+      rejectAck = reject;
+    });
+    const reservation = primaryIngressReservationTail
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const input = await buildInput();
+          // Register the recovery continuation or concrete partition tail
+          // before releasing the app-wide arrival slot. The durable write is
+          // still awaited only by this event's ACK, so different chats retain
+          // their normal database concurrency.
+          void enqueuePrimaryAfterRecovery(input).then(resolveAck, rejectAck);
+        } catch (error) {
+          rejectAck(error);
+        }
+      });
+    primaryIngressReservationTail = reservation.then(() => undefined, () => undefined);
+    return ack;
+  };
 
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
@@ -5759,11 +6152,11 @@ export function createLarkEventDispatcherRuntime(
       const rawMessage = data?.message;
       const ingressAnchor = rawMessageIngressAnchor(larkAppId, rawMessage);
       if (runtimeOptions.enqueuePrimary) {
-        return runtimeOptions.enqueuePrimary({
+        return enqueuePrimaryInArrivalOrder(() => ({
           eventId: eventKey,
           partitionKey: ingressAnchor,
           data,
-        }).then(() => undefined);
+        })).then(() => undefined);
       }
       let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
       // Reserve the app/chat ingress lane before any routing await. Canonical
@@ -5828,18 +6221,31 @@ export function createLarkEventDispatcherRuntime(
         recallTime: ev?.recall_time,
       });
     },
-    'im.message.updated_v1': (data: any) => {
+    'im.message.updated_v1': async (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;
       const eventKey = `im.message.updated_v1:${larkAppId}:${eventIdForKey(data) ?? eventMessage?.message_id ?? unkeyableEventKey()}`;
-      const ingressAnchor = rawMessageIngressAnchor(larkAppId, eventMessage);
       if (runtimeOptions.enqueuePrimary) {
-        return runtimeOptions.enqueuePrimary({
+        // updated_v1 frequently omits chat_id.  Resolve it before durable
+        // enqueue so an edit cannot escape to __chatless__ and overtake the
+        // recovered receive row in the real chat partition.  Lookup failure
+        // rejects the WS callback and relies on Lark redelivery; never ACK an
+        // update whose ordering domain is still unknown.
+        const ingressAnchor = primaryUpdatedMessageIngressAnchor(
+          larkAppId,
+          eventMessage,
+        );
+        // Start independent lookups at frame arrival; the reservation FIFO
+        // consumes their results in order. Attach a handler immediately so a
+        // fast rejection cannot become unhandled while an earlier slot waits.
+        void ingressAnchor.catch(() => undefined);
+        return enqueuePrimaryInArrivalOrder(async () => ({
           eventId: eventKey,
           eventType: 'lark.im.message.updated_v1',
-          partitionKey: ingressAnchor,
+          partitionKey: await ingressAnchor,
           data,
-        }).then(() => undefined);
+        })).then(() => undefined);
       }
+      const ingressAnchor = rawMessageIngressAnchor(larkAppId, eventMessage);
       // 事件常不带 chat_id（字段不可靠）；缺时 rawMessageIngressAnchor 收敛到 __chatless__
       // 全局泳道，读回权威消息后再在 processMessageEvent 内按真实 anchor 串行。
       scheduleAckSafeEvent(
@@ -5896,10 +6302,161 @@ export function createLarkEventDispatcherRuntime(
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
+  let pendingTransportReady: {
+    leadershipSignal: AbortSignal;
+    resolve: () => void;
+  } | undefined;
+
+  const beginPrimaryRecovery = (
+    leadershipSignal: AbortSignal,
+    afterFirstPass?: Promise<void>,
+  ): Promise<void> => {
+    const enqueue = runtimeOptions.enqueuePrimary;
+    if (!enqueue) throw new Error('durable primary recovery requires enqueuePrimary');
+    primaryRecovery?.controller.abort(new Error('durable primary ingress recovery superseded'));
+    const controller = new AbortController();
+    const forwardAbort = () => controller.abort(leadershipSignal.reason);
+    if (leadershipSignal.aborted) forwardAbort();
+    else leadershipSignal.addEventListener('abort', forwardAbort, { once: true });
+    let resolveReady!: () => void;
+    let rejectReady!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    void ready.catch(() => undefined);
+    const recovery: PrimaryRecoveryState = { controller, ready };
+    primaryRecovery = recovery;
+    const recoveryStartedAt = Date.now();
+    let recoveryUpperBound: number | undefined;
+    void (async () => {
+      try {
+        while (!controller.signal.aborted && primaryRecovery === recovery) {
+          try {
+            const first = await recoverDurablePrimaryIngressOnce({
+              larkAppId,
+              enqueue,
+              signal: controller.signal,
+              now: recoveryStartedAt,
+              ...(recoveryUpperBound === undefined ? {} : { until: recoveryUpperBound }),
+            });
+            let summary = first;
+            if (afterFirstPass) {
+              await runWithAbortDeadline(
+                () => afterFirstPass,
+                PRIMARY_INGRESS_TRANSPORT_READY_TIMEOUT_MS,
+                'primary ingress transport ready',
+                controller.signal,
+              );
+              controller.signal.throwIfAborted();
+              recoveryUpperBound ??= Date.now();
+              const second = await recoverDurablePrimaryIngressOnce({
+                larkAppId,
+                enqueue,
+                signal: controller.signal,
+                now: recoveryStartedAt,
+                until: recoveryUpperBound,
+              });
+              await waitForPrimaryRecoverySettle(
+                primaryRecoverySettleMs,
+                controller.signal,
+              );
+              const settled = await recoverDurablePrimaryIngressOnce({
+                larkAppId,
+                enqueue,
+                signal: controller.signal,
+                now: recoveryStartedAt,
+                until: recoveryUpperBound,
+              });
+              if (second.fingerprint !== settled.fingerprint) {
+                throw new Error('primary ingress recovery history changed during settle window');
+              }
+              summary = {
+                chats: Math.max(first.chats, second.chats, settled.chats),
+                scanned: first.scanned + second.scanned + settled.scanned,
+                enqueued: first.enqueued + second.enqueued + settled.enqueued,
+                fingerprint: settled.fingerprint,
+              };
+            }
+            if (controller.signal.aborted || primaryRecovery !== recovery) {
+              throw controller.signal.reason ?? new Error('durable primary ingress recovery superseded');
+            }
+            logger.info(
+              `[durable-primary:${larkAppId}] ingress recovery complete `
+              + `chats=${summary.chats} scanned=${summary.scanned} enqueued=${summary.enqueued}`,
+            );
+            resolveReady();
+            return;
+          } catch (error) {
+            if (controller.signal.aborted || primaryRecovery !== recovery) throw error;
+            logger.warn(
+              `[durable-primary:${larkAppId}] ingress recovery failed closed; retrying: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(() => {
+                controller.signal.removeEventListener('abort', onAbort);
+                resolve();
+              }, PRIMARY_INGRESS_RECOVERY_RETRY_MS);
+              timer.unref?.();
+              const onAbort = () => {
+                clearTimeout(timer);
+                reject(controller.signal.reason ?? new Error('durable primary ingress recovery aborted'));
+              };
+              if (controller.signal.aborted) onAbort();
+              else controller.signal.addEventListener('abort', onAbort, { once: true });
+            });
+          }
+        }
+        throw controller.signal.reason ?? new Error('durable primary ingress recovery stopped');
+      } catch (error) {
+        rejectReady(error);
+      } finally {
+        leadershipSignal.removeEventListener('abort', forwardAbort);
+      }
+    })();
+    return ready;
+  };
+
+  const armPrimaryTransportRecovery = (leadershipSignal: AbortSignal): Promise<void> => {
+    let resolveTransportReady!: () => void;
+    const transportReady = new Promise<void>(resolve => {
+      resolveTransportReady = resolve;
+    });
+    pendingTransportReady = { leadershipSignal, resolve: resolveTransportReady };
+    return beginPrimaryRecovery(leadershipSignal, transportReady);
+  };
+
+  const settlePrimaryTransportReady = (): void => {
+    const pending = pendingTransportReady;
+    if (!pending || pending.leadershipSignal.aborted
+        || pending.leadershipSignal !== primaryLeadershipSignal) return;
+    pendingTransportReady = undefined;
+    pending.resolve();
+  };
+
+  const restartPrimaryTransportRecovery = (): void => {
+    if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
+        || primaryLeadershipSignal.aborted) return;
+    const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
+    void ready.catch(error => {
+      if (primaryLeadershipSignal?.aborted) return;
+      logger.warn(
+        `[durable-primary:${larkAppId}] reconnect recovery stopped unexpectedly: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  };
 
   const connect = (): Lark.WSClient => {
     if (wsClient) return wsClient;
-    wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand);
+    wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
+      onReady: settlePrimaryTransportReady,
+      onReconnecting: restartPrimaryTransportRecovery,
+      onReconnected: settlePrimaryTransportReady,
+      onRestarting: restartPrimaryTransportRecovery,
+    });
+    if (runtimeOptions.enqueuePrimary) return wsClient;
     listenerPollTimer = setInterval(() => {
       if (listenerPollInFlight) return;
       listenerPollInFlight = true;
@@ -5928,9 +6485,24 @@ export function createLarkEventDispatcherRuntime(
     return wsClient;
   };
 
+  const connectPrimary = (input: { signal: AbortSignal }): {
+    client: Lark.WSClient;
+    ready: Promise<void>;
+  } => {
+    primaryLeadershipSignal = input.signal;
+    const ready = armPrimaryTransportRecovery(input.signal);
+    const client = connect();
+    return { client, ready };
+  };
+
   return {
     connect,
+    connectPrimary,
     close: () => {
+      primaryRecovery?.controller.abort(new Error('Lark event dispatcher closed'));
+      primaryRecovery = undefined;
+      primaryLeadershipSignal = undefined;
+      pendingTransportReady = undefined;
       if (listenerPollTimer) clearInterval(listenerPollTimer);
       if (initialListenerPollTimer) clearTimeout(initialListenerPollTimer);
       listenerPollTimer = undefined;

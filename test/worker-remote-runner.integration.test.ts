@@ -63,6 +63,7 @@ describe('remote runner worker wiring', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-takeover-'));
     tempDirs.push(root);
     const commandsPath = join(root, 'commands.jsonl');
+    const releaseRecoveredFinalPath = join(root, 'release-recovered-final');
     const provider = join(root, 'provider.mjs');
     writeFileSync(provider, `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -91,7 +92,11 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     };
     const progress = { protocol, version, type: 'progress', turnId: 'om_turn_survived', content: 'still running' };
     process.stdout.write(JSON.stringify(ready) + '\\n' + JSON.stringify(progress) + '\\n');
-    setTimeout(() => emit({ type: 'final', turnId: 'om_turn_survived', content: 'TAKEOVER_OK', state }), 50);
+    const releaseTimer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(releaseRecoveredFinalPath)})) return;
+      clearInterval(releaseTimer);
+      emit({ type: 'final', turnId: 'om_turn_survived', content: 'TAKEOVER_OK', state });
+    }, 10);
   } else if (command.type === 'turn') {
     emit({ type: 'status', requestId: command.requestId, status: 'busy' });
     emit({ type: 'final', turnId: command.turnId, content: 'FOLLOWUP_OK', state: command.state });
@@ -161,34 +166,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
-    await waitFor(
-      () => messages.some(message => message.type === 'turn_terminal'
-        && message.turnId === 'om_turn_survived'
-        && message.status === 'completed'),
-      () => `remote runner takeover did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
-    );
-    expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
-    expect(messages).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'capture_identity',
-        turnId: 'om_turn_survived',
-      }),
-      expect.objectContaining({
-        type: 'final_output',
-        turnId: 'om_turn_survived',
-        content: 'TAKEOVER_OK',
-      }),
-      expect.objectContaining({
-        type: 'turn_terminal',
-        turnId: 'om_turn_survived',
-        status: 'completed',
-      }),
-    ]));
-    expect(messages.some(message => message.type === 'error')).toBe(false);
-
+    // A takeover-triggering follow-up can reach the just-forked worker while
+    // its async init is still resuming the provider-owned turn. It must remain
+    // queued across the worker-ready edge until that recovered turn settles.
     child.send({
       type: 'message',
-      content: 'follow up after takeover',
+      content: 'follow up during takeover',
       turnId: 'om_turn_followup',
       dispatchAttempt: 9,
       trustedCaller: {
@@ -197,6 +180,26 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
         senderType: 'user',
       },
     } satisfies DaemonToWorker);
+    await waitFor(
+      () => messages.some(message => message.type === 'ready')
+        && messages.some(message => message.type === 'capture_identity'
+          && message.turnId === 'om_turn_survived'),
+      () => `remote runner takeover did not become ready\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    // The worker's ordinary 15s first-prompt fallback used to re-arm readiness
+    // and flush this queued successor into the still-active recovered turn.
+    // Hold beyond that edge and prove the provider received no new turn.
+    await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 16_000));
+    expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
+    expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+
+    writeFileSync(releaseRecoveredFinalPath, 'release\n');
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_turn_survived'
+        && message.status === 'completed'),
+      () => `remote runner takeover did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
     await waitFor(
       () => messages.some(message => message.type === 'turn_terminal'
         && message.turnId === 'om_turn_followup'
@@ -212,9 +215,22 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       expect.objectContaining({
         turnId: 'om_turn_followup',
         dispatchAttempt: 9,
-        content: 'follow up after takeover',
+        content: 'follow up during takeover',
       }),
     ]);
+    expect(messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'final_output',
+        turnId: 'om_turn_survived',
+        content: 'TAKEOVER_OK',
+      }),
+      expect.objectContaining({
+        type: 'turn_terminal',
+        turnId: 'om_turn_survived',
+        status: 'completed',
+      }),
+    ]));
+    expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
   it('passes persisted provider state to resume after a worker restart', async () => {
@@ -323,6 +339,223 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       turnId: 'turn-after-worker-restart',
       content: 'RESUMED_OK',
     }));
+  });
+
+  it('completes a visually empty remote final without emitting final_output', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-invisible-final-'));
+    tempDirs.push(root);
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'invisible-provider', generation: 1, remoteSessionId: 'remote-invisible-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type === 'hello') {
+    emit({ type: 'hello', requestId: command.requestId, provider: 'invisible-provider', capabilities: ['start','resume','turn','cancel','detach','reattach','status'] });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: '\\u200B', state }), 20);
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_invisible_final',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'invisible-provider' },
+    }]));
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-invisible-final',
+        LARK_APP_ID: 'app_invisible_final',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-invisible-final',
+      chatId: 'oc_invisible_final',
+      rootMessageId: 'om_invisible_final',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'invisible-provider' },
+      prompt: 'return an invisible final',
+      turnId: 'turn-invisible-final',
+      trustedCaller: {
+        requestUserOpenId: 'ou_remote_user',
+        requestLarkAppId: 'app_invisible_final',
+        senderType: 'user',
+      },
+      larkAppId: 'app_invisible_final',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'turn-invisible-final'
+        && message.status === 'completed'),
+      () => `invisible final did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.some(message => message.type === 'final_output'
+      && message.turnId === 'turn-invisible-final')).toBe(false);
+    expect(messages.some(message => message.type === 'error')).toBe(false);
+  });
+
+  it('rejects a provider-selected schedule controller on a human-authored turn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-human-controller-'));
+    tempDirs.push(root);
+    const resultPath = join(root, 'session-tool-result.json');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const state = { version: 1, provider: 'human-controller-provider', generation: 1, remoteSessionId: 'remote-human-controller-1' };
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+let activeTurnId;
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type === 'hello') {
+    emit({
+      type: 'hello', requestId: command.requestId, provider: 'human-controller-provider',
+      capabilities: ['start','resume','turn','cancel','detach','reattach','status','session_tool','session_tool_schedule','session_tool_schedule_actor'],
+    });
+  } else if (command.type === 'start') {
+    emit({ type: 'ready', requestId: command.requestId, state });
+  } else if (command.type === 'turn') {
+    activeTurnId = command.turnId;
+    emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
+    emit({
+      type: 'session_tool', operationId: 'session-tool-human-controller',
+      turnId: command.turnId, generation: 1, controllerOpenId: 'ou_developer',
+      request: { tool: 'schedule.add', schedule: '10m', prompt: 'must be rejected' },
+    });
+  } else if (command.type === 'session_tool_result') {
+    fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(command.result));
+    emit({ type: 'final', turnId: activeTurnId, content: 'controller rejection observed', state });
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  } else if (command.type === 'detach') {
+    emit({ type: 'status', requestId: command.requestId, status: 'detached', state });
+  } else if (command.type === 'reattach' || command.type === 'status') {
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_human_controller',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: {
+        expectedProvider: 'human-controller-provider',
+        requiredCapabilities: [
+          'start','resume','turn','cancel','detach','reattach','status',
+          'session_tool','session_tool_schedule','session_tool_schedule_actor',
+        ],
+      },
+    }]));
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-human-controller',
+        LARK_APP_ID: 'app_human_controller',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-human-controller',
+      chatId: 'oc_human_controller',
+      rootMessageId: 'om_human_controller',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: {
+        expectedProvider: 'human-controller-provider',
+        requiredCapabilities: [
+          'start','resume','turn','cancel','detach','reattach','status',
+          'session_tool','session_tool_schedule','session_tool_schedule_actor',
+        ],
+      },
+      prompt: 'human turn must reject provider controller',
+      turnId: 'turn-human-controller',
+      trustedCaller: {
+        requestUserOpenId: 'ou_human',
+        requestLarkAppId: 'app_human_controller',
+        senderType: 'user',
+      },
+      larkAppId: 'app_human_controller',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => existsSync(resultPath) && messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'turn-human-controller'
+        && message.status === 'completed'),
+      () => `human controller rejection did not settle\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toMatchObject({
+      outcome: 'rejected',
+      code: 'session_tool_controller_forbidden',
+    });
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'final_output',
+      turnId: 'turn-human-controller',
+      content: 'controller rejection observed',
+    }));
+    expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
   it('passes trusted turn input, persists provider state, and projects a terminal screen', async () => {

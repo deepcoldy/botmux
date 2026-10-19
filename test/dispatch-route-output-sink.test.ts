@@ -21,6 +21,11 @@ import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
 import { DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
+import {
+  isDispatchOriginNotSendableError,
+  isolatedDispatchOutputSinkAllowed,
+  withIsolatedDispatchSinkFence,
+} from '../src/core/dispatch-output-sink.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 function routeHandler(routeConstant: string): string {
@@ -62,20 +67,47 @@ function session(opts: { cliId?: string; sink?: Sink }) {
   } as any;
 }
 
-function run(code: string, ds: any, body: Record<string, unknown>, trustedHost: boolean) {
-  const sendMessage = vi.fn(async () => 'om_seed');
-  const replyMessage = vi.fn(async () => 'om_kickoff');
+type WriteOptions = { beforeWrite?: () => Promise<void> } | undefined;
+
+function run(
+  code: string,
+  ds: any,
+  body: Record<string, unknown>,
+  trustedHost: boolean,
+  hooks: { beforeProviderWrite?: () => void; duringLookup?: () => void } = {},
+) {
+  // Provider seams behave like the real Lark client: whatever happens inside
+  // the provider call (token fetch, retry wait) comes first, then the caller's
+  // beforeWrite fence runs immediately before the write itself.
+  const writes: string[] = [];
+  const sendMessage = vi.fn(async (...args: unknown[]) => {
+    hooks.beforeProviderWrite?.();
+    await (args[6] as WriteOptions)?.beforeWrite?.();
+    writes.push('seed');
+    return 'om_seed';
+  });
+  const replyMessage = vi.fn(async (...args: unknown[]) => {
+    hooks.beforeProviderWrite?.();
+    await (args[7] as WriteOptions)?.beforeWrite?.();
+    writes.push('kickoff');
+    return 'om_kickoff';
+  });
   const scope: any = {
     readJsonBody: async () => body, JsonBodyTooLargeError,
     DISPATCH_REPORT_REGISTER_MAX_BYTES: 64 * 1024, DISPATCH_USER_DELIVERY_MAX_BYTES,
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => trustedHost, selfDaemonLarkAppId: 'cli_source',
     validateCodexAppManagedSendOrigin, isCodexAppCliId,
+    isolatedDispatchOutputSinkAllowed, withIsolatedDispatchSinkFence, isDispatchOriginNotSendableError,
     jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
     isMultiTopicOrchestrationEnabled: () => true,
     readGroupCollaborationMode: () => undefined,
     evaluateProjectDispatchPolicy: () => ({ ok: true }),
-    lookupMessageChatId: async () => 'oc_target',
+    lookupMessageChatId: async () => {
+      await Promise.resolve();
+      hooks.duringLookup?.();
+      return 'oc_target';
+    },
     sendMessage, replyMessage,
     loadOrCreateDispatchReportBindingSecret: () => 'secret',
     createDispatchReportBinding: () => ({}),
@@ -92,7 +124,7 @@ function run(code: string, ds: any, body: Record<string, unknown>, trustedHost: 
     join, logger: { info: vi.fn(), warn: vi.fn() },
   };
   const handler = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
-  return { result: handler({}, {}) as Promise<{ status: number; value: any }>, sendMessage, replyMessage };
+  return { result: handler({}, {}) as Promise<{ status: number; value: any }>, sendMessage, replyMessage, writes };
 }
 
 const paneClaim = { sessionId: 'source-session', originCapability: CAPABILITY, originTurnId: 'om_turn', originDispatchAttempt: 1 };
@@ -113,6 +145,7 @@ describe.each(routes)('dispatch %s: Codex App output-sink gate', (_label, code, 
       expect(status).toBe(409);
       expect(value.error).toBe('origin_not_sendable');
       expect(call[writer]).not.toHaveBeenCalled();
+      expect(call.writes).toEqual([]);
     },
   );
 
@@ -121,6 +154,31 @@ describe.each(routes)('dispatch %s: Codex App output-sink gate', (_label, code, 
     const { status } = await call.result;
     expect(status).toBeLessThan(300);
     expect(call[writer]).toHaveBeenCalled();
+    expect(call.writes.length).toBe(1);
+  });
+
+  // The route-entry check passed, then the turn settled (its ledger entry was
+  // removed) before the provider write — e.g. during a provider token fetch or
+  // retry wait. The write fence must re-evaluate the ledger and refuse.
+  it('refuses at the provider-write fence when the turn settles after the entry check', async () => {
+    const ds = session({ sink: 'lark' });
+    const call = run(code, ds, body, false, {
+      beforeProviderWrite: () => { ds.session.codexAppDispatchLedger = []; },
+    });
+    const { status, value } = await call.result;
+    expect(status).toBe(409);
+    expect(value.error).toBe('origin_not_sendable');
+    expect(call.writes).toEqual([]);
+  });
+
+  it('the write fence leaves trusted-host callers alone even if the ledger changes', async () => {
+    const ds = session({ sink: 'lark' });
+    const call = run(code, ds, body, true, {
+      beforeProviderWrite: () => { ds.session.codexAppDispatchLedger = []; },
+    });
+    const { status } = await call.result;
+    expect(status).toBeLessThan(300);
+    expect(call.writes.length).toBe(1);
   });
 
   it('lets a non-Codex-App isolated pane through (no ledger to bind)', async () => {
@@ -134,5 +192,74 @@ describe.each(routes)('dispatch %s: Codex App output-sink gate', (_label, code, 
     const call = run(code, session({ sink: 'http_wait' }), body, true);
     const { status } = await call.result;
     expect(status).toBeLessThan(300);
+  });
+});
+
+describe('dispatch kickoff delivery: settlement during the root-chat lookup', () => {
+  it('re-checks the ledger after lookupMessageChatId and performs no provider write', async () => {
+    const ds = session({ sink: 'lark' });
+    const call = run(deliverCode, ds, deliverBody, false, {
+      duringLookup: () => { ds.session.codexAppDispatchLedger = []; },
+    });
+    const { status, value } = await call.result;
+    expect(status).toBe(409);
+    expect(value.error).toBe('origin_not_sendable');
+    expect(call.replyMessage).not.toHaveBeenCalled();
+    expect(call.writes).toEqual([]);
+  });
+});
+
+/** The dispatch-policy route is a direct dispatch's first daemon call AND the
+ *  daemon authority behind the CLI's `/repo` prime fence (re-presenting the
+ *  frozen origin claim right before that provider write). */
+describe('dispatch-policy route: origin claim and output-sink gate', () => {
+  const ipcSource = ts.createSourceFile(
+    'dashboard-ipc-server.ts',
+    readFileSync('src/core/dashboard-ipc-server.ts', 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const route = ipcSource.statements.find(node => ts.isExpressionStatement(node)
+    && ts.isCallExpression(node.expression)
+    && node.expression.expression.getText(ipcSource) === 'ipcRoute'
+    && node.expression.arguments[1]?.getText(ipcSource) === "'/api/sessions/:sessionId/project-dispatch-policy'") as ts.ExpressionStatement;
+  const auth = ipcSource.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'sessionCliIpcAuth')!;
+  const policyCode = ts.transpileModule(
+    `${auth.getText(ipcSource)}\nconst handler = ${(route.expression as ts.CallExpression).arguments[2]!.getText(ipcSource)}`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } },
+  ).outputText;
+  const policy = (ds: any, body: Record<string, unknown>, trustedHost: boolean) => {
+    const scope: any = {
+      readJsonBody: async () => body,
+      findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
+      authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => trustedHost,
+      isolatedDispatchOutputSinkAllowed,
+      readGroupCollaborationMode: () => undefined,
+      evaluateProjectDispatchPolicy: () => ({ ok: true, projectMode: false }),
+      config: { session: { dataDir: '/nonexistent' } },
+      jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
+    };
+    const handler = new Function('scope', `with (scope) { ${policyCode}; return handler; }`)(scope);
+    return handler({}, {}, { sessionId: 'source-session' }) as Promise<{ status: number; value: any }>;
+  };
+  const policyBody = { ...paneClaim, targetChatId: 'oc_target', targetAppIds: [] };
+
+  it.each(['http_wait', 'http_async', 'suppressed'] as const)('refuses an isolated pane bound to %s', async sink => {
+    const { status, value } = await policy(session({ sink }), policyBody, false);
+    expect(status).toBe(409);
+    expect(value.error).toBe('origin_not_sendable');
+  });
+
+  it('refuses a stale (rotated) origin claim — the claim must equal the live capability', async () => {
+    const ds = session({ sink: 'lark' });
+    ds.managedTurnOrigin = { capability: 'd'.repeat(64), turnId: 'om_next', dispatchAttempt: 1 };
+    const { status, value } = await policy(ds, policyBody, false);
+    expect(status).toBe(403);
+    expect(value.error).toBe('origin_unproven');
+  });
+
+  it('allows a live Lark-bound claim and leaves trusted-host callers unchanged', async () => {
+    expect((await policy(session({ sink: 'lark' }), policyBody, false)).status).toBe(200);
+    expect((await policy(session({ sink: 'http_wait' }), policyBody, true)).status).toBe(200);
   });
 });

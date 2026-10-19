@@ -3511,6 +3511,102 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
+  it('refreshes the persisted activity clock only after a live document comment is accepted', async () => {
+    const sub = docSub(`doc-live-activity-${Date.now()}`);
+    const ds = seedThreadSession(sub.sessionAnchor, 'live activity');
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    const before = Date.now() - 60_000;
+    ds.lastMessageAt = before;
+    ds.session.lastMessageAt = new Date(before).toISOString();
+    bindSubToSession(sub, ds);
+
+    await expect(handleDocComment(docCtx(sub, 'live-activity'))).resolves.toBe(true);
+
+    expect(ds.lastMessageAt).toBeGreaterThan(before);
+    expect(Date.parse(ds.session.lastMessageAt!)).toBeGreaterThan(before);
+    expect(ds.session.lastHumanMessageAt).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
+  it('refreshes the persisted activity clock after a document-comment refork is accepted', async () => {
+    const sub = docSub(`doc-refork-activity-${Date.now()}`);
+    const ds = seedThreadSession(sub.sessionAnchor, 'refork activity');
+    const before = Date.now() - 60_000;
+    ds.lastMessageAt = before;
+    ds.session.lastMessageAt = new Date(before).toISOString();
+    bindSubToSession(sub, ds);
+
+    await expect(handleDocComment(docCtx(sub, 'refork-activity'))).resolves.toBe(true);
+
+    expect(ds.lastMessageAt).toBeGreaterThan(before);
+    expect(Date.parse(ds.session.lastMessageAt!)).toBeGreaterThan(before);
+    expect(ds.session.lastHumanMessageAt).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
+  it('does not refresh activity when a document-comment refork is rejected', async () => {
+    const sub = docSub(`doc-refork-activity-rejected-${Date.now()}`);
+    const ds = seedThreadSession(sub.sessionAnchor, 'rejected refork activity');
+    const before = Date.now() - 60_000;
+    ds.lastMessageAt = before;
+    ds.session.lastMessageAt = new Date(before).toISOString();
+    bindSubToSession(sub, ds);
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _resume: any, opts?: any) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+
+    await expect(handleDocComment(docCtx(sub, 'refork-activity-rejected'))).resolves.toBe(false);
+
+    expect(ds.lastMessageAt).toBe(before);
+    expect(ds.session.lastMessageAt).toBe(new Date(before).toISOString());
+    expect(ds.session.lastHumanMessageAt).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
+  it.each([
+    ['live worker', true],
+    ['refork', false],
+  ])('keeps an admitted %s comment successful when activity persistence fails', async (_label, live) => {
+    const sub = docSub(`doc-activity-persist-failure-${live}-${Date.now()}`);
+    const ds = seedThreadSession(sub.sessionAnchor, `activity failure ${live}`);
+    const send = vi.fn();
+    if (live) ds.worker = { killed: false, send } as any;
+    const before = Date.now() - 60_000;
+    const beforeIso = new Date(before).toISOString();
+    ds.lastMessageAt = before;
+    ds.session.lastMessageAt = beforeIso;
+    bindSubToSession(sub, ds);
+    const originalUpdate = mocks.updateSession.getMockImplementation()!;
+    let activityWriteFailed = false;
+    mocks.updateSession.mockImplementation((session: any) => {
+      if (!activityWriteFailed
+        && session.sessionId === ds.session.sessionId
+        && session.lastMessageAt !== beforeIso) {
+        activityWriteFailed = true;
+        throw new Error('activity persistence unavailable');
+      }
+      return originalUpdate(session);
+    });
+    const ctx = docCtx(sub, `activity-persist-failure-${live}`);
+
+    try {
+      await expect(handleDocComment(ctx)).resolves.toBe(true);
+      await expect(handleDocComment(ctx)).resolves.toBe(true);
+
+      expect(activityWriteFailed).toBe(true);
+      expect(ds.session.docCommentTargets).toHaveProperty(ctx.replyId);
+      if (live) {
+        expect(send).toHaveBeenCalledTimes(1);
+      } else {
+        expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      mocks.updateSession.mockImplementation(originalUpdate);
+      removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+    }
+  });
+
   it('refuses doc-watch prewarm before turn mutation when a worker-null setup owner exists', async () => {
     const sub = docSub(`doc-prewarm-protected-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'prewarm protected');

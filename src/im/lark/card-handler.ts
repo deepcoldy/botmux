@@ -2499,6 +2499,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         botCfg.cliRuntime?.executable,
       );
       cacheAdoptCandidates(rootId, candidates, Date.now());
+    } else if (value.action === 'adopt_pick') {
+      // A pick usually precedes confirm, and the resume confirm reads this
+      // snapshot: renew it so a pick just before the TTL still reaches confirm.
+      cacheAdoptCandidates(rootId, candidates, Date.now());
     }
     const { buildAdoptSelectCard } = await import('./card-builder.js');
     const cardJson = buildAdoptSelectCard(
@@ -2566,13 +2570,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     const botCfg = getBot(ds.larkAppId).config;
-    const { clearAdoptCandidates } = await import('../../services/adopt-picker.js');
+    const { clearAdoptCandidates, getCachedAdoptCandidates } = await import('../../services/adopt-picker.js');
 
     // ── Resume-import path (key = "resume:<cliSessionId>") ──────────────
     if (entryKey.startsWith('resume:')) {
       const cliSessionId = entryKey.slice('resume:'.length);
       const { discoverResumableSessionsForBot, startResumeImportSession, ADOPT_RESUME_LIMIT } = await import('../../core/command-handler.js');
-      const resumable = await discoverResumableSessionsForBot(botCfg.cliId, botCfg.cliPathOverride, activeSessions, ADOPT_RESUME_LIMIT);
+      // Re-query with the same live-session exclusion the card was rendered
+      // with, or entries that filled the cap in place of live duplicates would
+      // be cut off. Panes are not re-scanned here (3s callback budget); an
+      // expired snapshot falls back to the query without live ids.
+      const snapshot = getCachedAdoptCandidates(rootId, Date.now());
+      const liveSessionIds = snapshot
+        ? new Set(snapshot.sessions.flatMap(s => s.sessionId ? [s.sessionId] : []))
+        : undefined;
+      const resumable = await discoverResumableSessionsForBot(
+        botCfg.cliId, botCfg.cliPathOverride, activeSessions, ADOPT_RESUME_LIMIT, liveSessionIds,
+      );
       if (
         ds.session !== sourceSession || ds.session.status !== 'active'
         || activeSessions.get(sKey) !== ds || isSessionTransferring(ds)

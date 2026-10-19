@@ -83,9 +83,22 @@ botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
 
-委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
-\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+真人当前回合创建的 direct 任务，以及宿主显式启用了 self-management 的委托任务，
+在自己的 scheduled turn 内都可用 \`botmux schedule pause self\` 或
+\`botmux schedule remove self\` 停止自己。
 \`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
+
+如果任务需要先发送最终结果再删除自身，必须把两个动作合并到同一次发送：
+
+\`\`\`bash
+botmux send --response-kind final --schedule-remove-self --no-mention "任务已完成"
+\`\`\`
+
+该命令先确认 final 已成功投递并落账，再让 daemon 删除当前精确 task，最后才推进排队
+turn。不要先发 final、再单独执行 \`schedule remove self\`；final 可能已经把长驻 CLI
+切到下一排队 turn，后续命令会因身份过期而被安全拒绝。如果结构化结果里的
+\`scheduleSelfCleanup.removed\` 为 \`false\`，原样重试同一命令；BotMux 会复用已投递的
+final，只补做自删，不会重复发消息。
 
 ## 典型用法
 
@@ -551,6 +564,8 @@ EOF
 
 \`--card-file <path>\` 或 \`--card-json '<json>'\` 直接发送 interactive card JSON。输入既可以是直接卡片对象（如 \`{"schema":"2.0",...}\`），也可以是 webhook/openapi 形态 \`{"msg_type":"interactive","card":{...}}\` 或 \`{"msg_type":"interactive","content":"{...}"}\`。
 
+**自定义卡片作为最终答复**：当前会话内用 \`botmux send --card-file "$TMPDIR/card.json" --response-kind final --mention-back\`。必须是 schema 2.0、包含 body.elements；保留原卡头、多列、折叠区等排版，宿主在**同一张卡**上添加最终签名及已配置的反馈控件，复用本轮回复卡和最终交付记录。不要再补一条普通 final 收尾消息。卡片不能占用 \`botmux_\` 前缀元素 ID；不支持与跨群/顶层发送或 \`--completion-proposal-file\` 混用。普通进度卡仍不加最终签名/反馈；宿主托管的 final 卡不要用 \`card patch\` 覆盖，以免破坏反馈与轮次状态。
+
 安全边界：自定义卡片是**纯展示 + open_url 跳转**——所有会触发回调的交互控件（回调按钮、下拉 select、person 选择、overflow、日期/时间选择、input、表单提交等）都会被拒绝，只保留展示元素（markdown/图片/多列/图表…）与 open_url 按钮。这样外部卡片无法误触 botmux 内部 close/restart/ask/relay/dashboard 等处理器。\`--card-file/--card-json\` 暂不和 \`--images\`/\`--files\`/\`--videos\`/\`--content-file\`/\`--voice\` 混用；素材需要先上传成飞书资源并写入卡片 JSON。
 
 \`\`\`bash
@@ -748,6 +763,7 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 | \`--card-file <path>\` | 直接发送 interactive card JSON 文件（纯展示 + open_url，交互控件被拒） |
 | \`--card-json <json>\` | 直接发送 interactive card JSON 字符串（纯展示 + open_url，交互控件被拒） |
 | \`--response-kind final\` | 声明当前标准回复是最终答案，允许 Core 挂反馈与受约束完成后续 |
+| \`--schedule-remove-self\` | 仅 scheduled turn + 标准 final；投递成功并落账后删除当前精确任务 |
 | \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
 | \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |

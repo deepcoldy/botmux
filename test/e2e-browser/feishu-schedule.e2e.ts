@@ -105,7 +105,7 @@ export function registerMidsceneSuites(): void {
 
       // Step 1: Start a session to get a thread.
       const setupMsg = testMessage('sched-setup');
-      await sendMessage(agent, setupMsg);
+      await sendMessage(agent, setupMsg, page);
       await waitForStreamingCard(agent, {
         timeoutMs: 90_000,
         msgHint: setupMsg,

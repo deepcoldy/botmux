@@ -248,6 +248,166 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('delivers local plugin results through the trusted host without exposing downstream rows', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered: any[] = [];
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_trusted',
+            requestUserUnionId: 'on_trusted',
+            requestLarkAppId: 'cli_trusted',
+            source: 'gateway_meta',
+            senderType: 'user',
+          },
+          turnId: 'om_delivery',
+        }),
+        trustedResultDelivery: async input => {
+          delivered.push(input);
+          return {
+            delivered: true,
+            deliveryId: input.delivery.deliveryId,
+            fileCount: input.delivery.files?.length ?? 0,
+          };
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({ name: 'echo', arguments: {} });
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].pluginId).toBe('plugin-delivery');
+    expect(delivered[0].identity.caller.requestUserUnionId).toBe('on_trusted');
+    expect(delivered[0].delivery.markdown).toBe('分析摘要');
+    expect(delivered[0].delivery.files).toHaveLength(1);
+    const visible = JSON.stringify(result);
+    expect(visible).toContain('delivery_fixture_001');
+    expect(visible).not.toContain('PRIVATE_ROWS_MUST_NOT_REACH_CALLER');
+    expect(visible).not.toContain('private-result-row');
+    expect(visible).not.toContain('messageIds');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('pins one trusted identity snapshot across downstream execution and host delivery', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const identities = [
+      {
+        caller: {
+          requestUserOpenId: 'ou_a', requestUserUnionId: 'on_a', requestLarkAppId: 'cli_a',
+          source: 'gateway_meta', senderType: 'user' as const,
+        },
+        turnId: 'om_a',
+      },
+      {
+        caller: {
+          requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b', requestLarkAppId: 'cli_b',
+          source: 'gateway_meta', senderType: 'user' as const,
+        },
+        turnId: 'om_b',
+      },
+    ];
+    let reads = 0;
+    let deliveredIdentity: any;
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-snapshot' },
+      {
+        trustedTurnIdentity: () => identities[Math.min(reads++, identities.length - 1)],
+        trustedResultDelivery: async input => {
+          deliveredIdentity = input.identity;
+          return { delivered: true, deliveryId: input.delivery.deliveryId, fileCount: 1 };
+        },
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-snapshot-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    await client.callTool({ name: 'echo', arguments: {} });
+    expect(reads).toBe(1);
+    expect(deliveredIdentity.turnId).toBe('om_a');
+    expect(deliveredIdentity.caller.requestUserUnionId).toBe('on_a');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('fails closed when a plugin asks for host delivery without a trusted human turn', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const gateway = new PluginMcpGateway(['plugin-delivery']);
+    const client = new Client({ name: 'gateway-delivery-untrusted-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/trusted_human_identity/);
+    await client.close();
+    await gateway.close();
+  });
+
+  it('rejects a bot-authored trusted identity before invoking host delivery', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered = vi.fn();
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-bot' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_bot', requestUserUnionId: 'on_bot',
+            requestLarkAppId: 'cli_bot', source: 'gateway_meta', senderType: 'bot',
+          },
+          turnId: 'om_bot',
+        }),
+        trustedResultDelivery: delivered,
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-bot-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/trusted_human_identity/);
+    expect(delivered).not.toHaveBeenCalled();
+    await client.close();
+    await gateway.close();
+  });
+
+  it('rejects host delivery from a non-stdio downstream before invoking the host', async () => {
+    installFixturePlugin('plugin-delivery', 'delivery');
+    const delivered = vi.fn();
+    const gateway = new PluginMcpGateway(
+      ['plugin-delivery'],
+      { ...process.env, BOTMUX_SESSION_ID: 'session-delivery-remote' },
+      {
+        trustedTurnIdentity: () => ({
+          caller: {
+            requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
+            requestLarkAppId: 'cli_user', source: 'gateway_meta', senderType: 'user',
+          },
+          turnId: 'om_user',
+        }),
+        trustedResultDelivery: delivered,
+      },
+    );
+    const client = new Client({ name: 'gateway-delivery-remote-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+    await client.listTools();
+    const route = (gateway as any).toolRoutes.get('echo');
+    route.connection.server = { ...route.connection.server, transport: 'streamable-http' };
+    await expect(client.callTool({ name: 'echo', arguments: {} }))
+      .rejects.toThrow(/requires_local_stdio/);
+    expect(delivered).not.toHaveBeenCalled();
+    await client.close();
+    await gateway.close();
+  });
+
   it('strips caller supplied trusted caller metadata when no host identity exists', async () => {
     installFixturePlugin('plugin-a', 'alpha');
     const gateway = new PluginMcpGateway(

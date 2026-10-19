@@ -46,6 +46,7 @@ import {
   type AgentFieldDiff,
   type AgentLinkStatus,
   type AgentProfile,
+  type AgentPromptInjectionMode,
   type AgentSection,
   type AgentSectionsConfig,
   type AgentWorkspaceMode,
@@ -148,6 +149,7 @@ function diffValue(tr: Translate, cliState: CliOptionsState, field: AgentDiffFie
     case 'backendType': return backendLabel(tr, value);
     case 'autoWorktree': return value === 'true' ? tr('agents.valueOn') : tr('agents.valueOff');
     case 'startupCommands': return value ? value.split('\n').join(' / ') : tr('agents.valueNone');
+    case 'promptInjection': return value === 'none' ? tr('agents.valueOn') : tr('agents.valueOff');
     default: return value || tr('agents.valueDefault');
   }
 }
@@ -191,7 +193,10 @@ function summarizeSync(tr: Translate, results: readonly BotSyncResult[], bots: r
   else {
     const first = failed[0]!;
     const name = botName(bots.find(bot => bot.larkAppId === first.larkAppId), first.larkAppId);
-    const reason = first.failures[0]!.error === 'offline' ? tr('agents.stateOffline') : first.failures[0]!.error;
+    const error = first.failures[0]!.error;
+    const reason = error === 'offline' ? tr('agents.stateOffline')
+      : error === 'zero_prompt_unsupported' ? tr('agents.syncZeroPromptUnsupported')
+        : error;
     parts.push(tr('agents.syncSomeFailed', { failed: failed.length, total: results.length, name, reason }));
   }
   if (closed > 0) parts.push(tr('botDefaults.agentClosedCount', { count: closed }));
@@ -695,6 +700,7 @@ type Draft = {
   sandbox: { on: boolean; mode: (typeof AGENT_SANDBOX_MODES)[number] };
   backend: { on: boolean; backendType: string };
   startup: { on: boolean; text: string };
+  promptInjection: { on: boolean; mode: AgentPromptInjectionMode };
 };
 
 function draftFromAgent(agent: AgentProfile): Draft {
@@ -717,6 +723,7 @@ function draftFromAgent(agent: AgentProfile): Draft {
     sandbox: { on: !!agent.sandbox, mode: agent.sandbox?.mode ?? 'off' },
     backend: { on: !!agent.backend, backendType: agent.backend?.backendType ?? '' },
     startup: { on: !!agent.startup, text: (agent.startup?.commands ?? []).join('\n') },
+    promptInjection: { on: !!agent.promptInjection, mode: agent.promptInjection?.mode ?? 'none' },
   };
 }
 
@@ -742,6 +749,7 @@ function inputFromDraft(draft: Draft): AgentInput {
     ...(draft.sandbox.on ? { sandbox: { mode: draft.sandbox.mode } } : {}),
     ...(draft.backend.on ? { backend: { backendType: draft.backend.backendType as AgentBackendConfig['backendType'] } } : {}),
     ...(draft.startup.on ? { startup: { commands: parseStartupCommands(draft.startup.text) } } : {}),
+    ...(draft.promptInjection.on ? { promptInjection: { mode: draft.promptInjection.mode } } : {}),
   };
 }
 
@@ -773,7 +781,7 @@ function AgentEditor(props: {
   const linkedBots = props.bots.filter(bot => linkedIds.includes(bot.larkAppId));
   const otherBots = props.bots.filter(bot => !linkedIds.includes(bot.larkAppId));
   const disabled = !canEdit || busy;
-  const patch = <K extends 'exec' | 'workspace' | 'sandbox' | 'backend' | 'startup'>(key: K, value: Partial<Draft[K]>) => {
+  const patch = <K extends 'exec' | 'workspace' | 'sandbox' | 'backend' | 'startup' | 'promptInjection'>(key: K, value: Partial<Draft[K]>) => {
     setDraft(current => ({ ...current, [key]: { ...current[key], ...value } }));
   };
 
@@ -917,6 +925,25 @@ function AgentEditor(props: {
             <div className="bd-row">
               <BackendTypeField value={draft.backend.backendType} disabled={disabled} onChange={backendType => patch('backend', { backendType })} />
             </div>
+          </EditorSection>
+        </section>
+
+        <section className="bd-tile">
+          <EditorSection
+            title={tr('agents.section.promptInjection')}
+            help={tr('agents.section.promptInjectionHelp')}
+            on={draft.promptInjection.on}
+            disabled={disabled}
+            onToggle={on => patch('promptInjection', { on })}
+          >
+            <ToggleRow
+              checked={draft.promptInjection.mode === 'none'}
+              disabled={disabled}
+              dataAction="agent-prompt-injection"
+              title={tr('agents.promptInjectionZero')}
+              onChange={checked => patch('promptInjection', { mode: checked ? 'none' : 'default' })}
+            />
+            <p className="bd-section-note">{tr('agents.promptInjectionNote')}</p>
           </EditorSection>
         </section>
 
@@ -1465,6 +1492,7 @@ export function agentInputFromBot(name: string, bot: BotDefaultsRow): AgentInput
     ...(values.sandbox.mode !== 'off' ? { sandbox: values.sandbox } : {}),
     ...(values.backend.backendType ? { backend: values.backend } : {}),
     ...(values.startup.commands.length ? { startup: values.startup } : {}),
+    ...(values.promptInjection.mode === 'none' ? { promptInjection: values.promptInjection } : {}),
   };
 }
 

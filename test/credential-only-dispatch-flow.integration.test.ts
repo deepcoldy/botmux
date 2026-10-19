@@ -94,6 +94,44 @@ describe('credential-only pane: botmux dispatch reaches the target for every ski
     expect(r.daemonCalls).toHaveLength(0);
   }, 120_000);
 
+  // A turn interruption rotates the capability in the middle of a direct
+  // dispatch. Every later request must still present the claim frozen before
+  // the dispatch began — so the daemon refuses it — and nothing may succeed
+  // under the next turn's identity (or its output sink).
+  const DISPATCH_ROUTES = /\/project-dispatch-policy$|\/api\/report-relay\/register$|\/api\/dispatch-user\/deliver$|\/project$/;
+  it.skipIf(!canRun)('origin rotation after seed registration: the kickoff is refused, never sent as the next turn', async () => {
+    const r = await runCredentialOnlyDispatch({
+      repoRoot, bwrap, node: node!, rotateCapabilityAfter: '/api/report-relay/register',
+      dispatchArgs: ['--title', '子项目', '--bot', 'ou_coder:coder', '--brief', 'task'],
+    });
+    const context = `${r.stderr}\n${JSON.stringify(r.daemonCalls.map(c => [c.url, c.presented, c.status]))}`;
+    const dispatchCalls = r.daemonCalls.filter(call => DISPATCH_ROUTES.test(call.url));
+    expect(r.registered, context).toBe(true);
+    // Delivery was attempted with the frozen (pre-rotation) claim and refused.
+    const deliver = dispatchCalls.filter(call => call.url === '/api/dispatch-user/deliver');
+    expect(deliver.length, context).toBeGreaterThan(0);
+    expect(deliver.every(call => call.presented === 'initial' && call.status === 403), context).toBe(true);
+    expect(r.deliveredAccepted, context).toBe(false);
+    expect(dispatchCalls.some(call => call.presented === 'rotated'), context).toBe(false);
+    expect(r.code, context).not.toBe(0);
+  }, 120_000);
+
+  it.skipIf(!canRun)('origin rotation before the /repo prime: the CLI-side provider write is fenced off', async () => {
+    const r = await runCredentialOnlyDispatch({
+      repoRoot, bwrap, node: node!, rotateCapabilityAfter: '/api/report-relay/register',
+      dispatchArgs: ['--title', '子项目', '--bot', 'ou_coder:coder', '--repo', '<ROOT>', '--standby'],
+    });
+    const context = `${r.stderr}\n${JSON.stringify(r.daemonCalls.map(c => [c.url, c.presented, c.status]))}`;
+    expect(r.registered, context).toBe(true);
+    // The prime goes straight to Lark from the pane; its fence re-presented the
+    // frozen claim to the daemon, which refused it, so nothing was written.
+    expect(r.larkReplies, context).toBe(0);
+    expect(r.stderr, context).toContain('dispatch origin changed before provider effect');
+    expect(r.daemonCalls.filter(call => DISPATCH_ROUTES.test(call.url)).some(call => call.presented === 'rotated'), context)
+      .toBe(false);
+    expect(r.code, context).not.toBe(0);
+  }, 120_000);
+
   it.skipIf(!canRun)('a relay-only (full-sandbox shaped) pane keeps refusing --bot and still relays --bot-app', async () => {
     const refused = await runCredentialOnlyDispatch({
       repoRoot, bwrap, node: node!, dropScopeMarker: true,

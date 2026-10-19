@@ -175,7 +175,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, latestLarkToolBindingForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -425,6 +425,7 @@ import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle }
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
+import { isolatedDispatchOutputSinkAllowed } from './dispatch-output-sink.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import {
   NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS,
@@ -448,11 +449,12 @@ import {
   sessionPreviewDescriptor,
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
-import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
+import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn-recovery.js';
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
@@ -2171,6 +2173,35 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
   }
 }
 
+/** Privileged host recovery: worker capabilities and request actor claims do not authorize this route. */
+ipcRoute('GET', '/api/sessions/:sessionId/failure-recovery', (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const row = ds?.session ?? sessionStore.getOwnedSession(params.sessionId);
+  const failure = row?.lastFailedTurn;
+  if (!failure) return jsonRes(res, 404, { ok: false, error: 'failure_not_found' });
+  return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, failure: {
+    turnId: failure.turnId, failedAt: failure.failedAt, errorCode: failure.errorCode,
+    originalTurnId: failure.originalTurnId ?? failure.turnId,
+    actorBound: !!failure.trustedCaller, recovery: failure.recovery,
+  } });
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/failure-recovery', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  let body: unknown;
+  try { body = await readBoundedJsonBody(req, 4096, 1000); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_recovery_request' }); }
+  const request = parseFailedTurnRecoveryRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_recovery_request' });
+  try {
+    const result = await recoverFailedTurn(params.sessionId, request);
+    return jsonRes(res, result.ok ? 200 : 409, result);
+  } catch {
+    return jsonRes(res, 503, { ok: false, error: 'recovery_persistence_unavailable' });
+  }
+});
+
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
   const initial = findActiveBySessionId(params.sessionId);
   if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
@@ -2206,7 +2237,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
       ds.workerReady = false;
       // In-worker respawn: the next prompt belongs to a NEW CLI generation.
       ds.cliReady = false;
-      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', reason: 'operator', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
     } catch (err) {
       return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
     }
@@ -2609,7 +2640,9 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
 
 /** Session-local access key, installed with the tool entry at standard launch.
  * This selects the configured app; it is not a process/turn attestation API. */
-function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string): boolean {
+function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string, botConfig?: { larkToolBinding?: boolean }): boolean {
+  const cfg = botConfig ?? (appId ? (() => { try { return getBot(appId).config; } catch { return undefined; } })() : undefined);
+  if (cfg?.larkToolBinding === false) return false;
   try {
     const binding = readLarkToolBinding(larkToolBindingPath(config.session.dataDir, sessionId));
     return binding.appId === appId && binding.sessionId === sessionId
@@ -2622,8 +2655,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   try { body = await readBoundedJsonBody(req, 4096, 1000); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
   const ds = findActiveBySessionId(params.sessionId);
+  let botConfig: { larkToolBinding?: boolean } | undefined;
+  try { botConfig = ds ? getBot(ds.larkAppId).config : undefined; } catch { /* bot missing */ }
   if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
-    || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId)) {
+    || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
   if (!body || Object.keys(body).some(key => key !== 'mode') || !['bot', 'user'].includes(String(body.mode))) {
@@ -2918,7 +2953,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 });
 
 const proactiveChatRenameCooldown = new ChatRenameCooldown();
-const chatRenameSerialQueue = new ChatRenameSerialQueue();
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
   const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
@@ -3188,6 +3222,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy', async (req,
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  // Same isolated-caller output-sink rule as the dispatch write routes. This is
+  // a direct dispatch's first daemon call (refuse before any effect) and the
+  // origin fence it re-checks right before its own `/repo` prime write.
+  if (!isTrustedHostIpcRequest(req) && !isolatedDispatchOutputSinkAllowed(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
+  }
   const targetChatId = typeof body?.targetChatId === 'string' ? body.targetChatId.trim() : '';
   const title = typeof body?.title === 'string' ? body.title.trim() : '';
   const targetAppIds = Array.isArray(body?.targetAppIds)
@@ -3291,7 +3331,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
       ds.workerReady = false;
       // In-worker respawn: the next prompt belongs to a NEW CLI generation.
       ds.cliReady = false;
-      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
@@ -7269,6 +7309,9 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // disables the toggle wherever the worker would fail-close on it.
     readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
     backendType: backendTypeStore.getBotBackendType(cachedLarkAppId) ?? null,
+    // 没有覆盖时会话实际用的后端（BACKEND_TYPE / 自动探测）。Dashboard 判断零注入等
+    // 依赖后端的能力时按「覆盖值，否则这个默认值」算生效后端。
+    defaultBackendType: config.daemon.backendType,
     usageDisplay: cardPrefs.usageDisplay,
     // Whether this bot's CLI can produce native usage at all. When false the
     // dashboard hides the usage-display control (offering it would be a knob
@@ -8560,7 +8603,13 @@ botConfigPutRoute<{ promptInjection?: unknown }>('/api/bot-prompt-injection', 'p
   normalize: body => body.promptInjection === 'none' || body.promptInjection === 'default'
     ? fieldOk(body.promptInjection)
     : fieldInvalid('invalid_prompt_injection'),
-  respond: value => ({ ok: true, promptInjection: value }),
+  // 零注入会强制 transcript 回传：同时带回写入后的回复投递**生效值**，Dashboard 旁边的
+  // 回复投递开关据此刷新，不用猜（Bot 也可能显式配置了 transcript）。
+  respond: value => {
+    let cliId: string | undefined;
+    try { cliId = getBot(cachedLarkAppId).config.cliId; } catch { cliId = undefined; }
+    return { ok: true, promptInjection: value, replyDelivery: effectiveReplyDelivery(cachedLarkAppId, cliId) };
+  },
 });
 
 botConfigPutRoute<{ replyDelivery?: unknown }>('/api/bot-reply-delivery', 'replyDelivery', {
@@ -8798,6 +8847,18 @@ ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) =
   // 回响规范化后的实际生效值，前端保存后无需再拉一次聚合接口就能对齐。
   jsonRes(res, 200, { ok: true, triggerUserAuth: value });
 }));
+
+// PUT /api/bot-lark-tool-binding — lark-cli 固定绑定当前应用开关。Body `{ enabled?: boolean; larkToolBinding?: boolean }`
+botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-lark-tool-binding', 'larkToolBinding', {
+  normalize: body => {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) return fieldInvalid('no_valid_fields');
+    const on = body.enabled === true || body.larkToolBinding === true;
+    const off = body.enabled === false || body.larkToolBinding === false;
+    if (!on && !off) return fieldInvalid('no_valid_fields');
+    return fieldOk(on ? true : false);
+  },
+  respond: value => ({ ok: true, larkToolBinding: value !== false }),
+});
 
 // GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
 // 边界提示（token 存储保护程度、自带凭证的 MCP server）。

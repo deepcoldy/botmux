@@ -133,6 +133,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliId: 'claude-code',
       workingDir: '~',
       workingDirs: ['~'],
+      remoteRunner: { requiredCapabilities: ['turn_recovery'] },
       get backendType() { return daemonConfig.backendType === 'tmux' ? 'tmux' : undefined; },
     },
     botName: 'TestBot',
@@ -179,7 +180,11 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
+import {
+  restoreActiveSessions,
+  resumeSession,
+  takeOverDurableActiveRemoteSession,
+} from '../src/core/session-manager.js';
 import {
   closeSession,
   ensureOrdinaryTurnRecoveryAttached,
@@ -234,6 +239,116 @@ function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.cre
   sessionStore.closeSession(s.sessionId);
   return s;
 }
+
+function activeRemoteCanonical(overrides: Record<string, unknown> = {}) {
+  return {
+    sessionId: 'session-remote-takeover',
+    chatId: 'oc_remote',
+    chatType: 'group' as const,
+    rootMessageId: 'om_remote_root',
+    title: 'Remote takeover',
+    status: 'active' as const,
+    scope: 'thread' as const,
+    createdAt: '2026-10-16T00:00:00.000Z',
+    lastMessageAt: '2026-10-16T00:01:00.000Z',
+    larkAppId: 'app_test',
+    cliId: 'remote-runner' as const,
+    backendType: 'remote-runner' as const,
+    pid: 777,
+    webPort: 6789,
+    workerGeneration: 4,
+    remoteBackendState: {
+      version: 1 as const,
+      provider: 'takeover-provider',
+      generation: 7,
+      remoteSessionId: 'remote-session-7',
+      agentThreadId: 'remote-thread',
+    },
+    ...overrides,
+  };
+}
+
+describe('takeOverDurableActiveRemoteSession', () => {
+  it('materializes only the claimed canonical snapshot and reattaches before routing', async () => {
+    const canonical = activeRemoteCanonical();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
+      expect(prompt).toBe('');
+      expect(resume).toEqual({ resume: true, remoteResumeMode: 'reattach' });
+      ds.worker = { killed: false };
+      opts?.onAdmission?.('accepted');
+      return true;
+    });
+
+    const result = await takeOverDurableActiveRemoteSession(canonical, map);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.ds.session).toMatchObject({
+        sessionId: canonical.sessionId,
+        status: 'active',
+        workerGeneration: 4,
+        remoteBackendState: { generation: 7, remoteSessionId: 'remote-session-7' },
+      });
+      expect(result.ds.session.pid).toBeUndefined();
+      expect(result.ds.session.webPort).toBeUndefined();
+      expect(result.ds.suppressRecoveryCard).toBe(true);
+    }
+    expect(forkWorker).toHaveBeenCalledOnce();
+    expect(map.get(sessionKey('om_remote_root', 'app_test'))?.session.sessionId)
+      .toBe(canonical.sessionId);
+    expect(sessionStore.getOwnedSession(canonical.sessionId)?.status).toBe('active');
+  });
+
+  it('rejects non-remote or incomplete canonical state before materialization', async () => {
+    await expect(takeOverDurableActiveRemoteSession(
+      activeRemoteCanonical({ remoteBackendState: undefined }),
+      new Map(),
+    )).resolves.toMatchObject({ ok: false, error: 'unsupported_session' });
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and unregisters when no takeover worker is admitted', async () => {
+    const canonical = activeRemoteCanonical();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(forkWorker).mockImplementationOnce((_ds: any, _prompt: any, _resume: any, opts: any) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+
+    await expect(takeOverDurableActiveRemoteSession(
+      canonical,
+      map,
+    )).resolves.toMatchObject({ ok: false, error: 'worker_start_failed' });
+    expect(map.size).toBe(0);
+    expect(sessionStore.getOwnedSession(canonical.sessionId)).toMatchObject({
+      status: 'active',
+      restoreQuarantinedAt: expect.any(String),
+    });
+  });
+
+  it('does not overwrite an unregistered active local row', async () => {
+    const canonical = activeRemoteCanonical();
+    sessionStore.updateSession({
+      ...canonical,
+      pid: 123,
+      remoteBackendState: {
+        ...canonical.remoteBackendState,
+        remoteSessionId: 'possibly-live-local-remote',
+      },
+    });
+    await expect(takeOverDurableActiveRemoteSession(
+      canonical,
+      new Map(),
+    )).resolves.toMatchObject({
+      ok: false,
+      error: 'materialization_failed',
+      detail: expect.stringContaining('unregistered active local Session'),
+    });
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getOwnedSession(canonical.sessionId)?.pid).toBe(123);
+  });
+});
 
 describe('resumeSession', () => {
   it('rechecks retirement after waiting for the active-session lock', async () => {

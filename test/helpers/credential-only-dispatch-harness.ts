@@ -34,6 +34,7 @@ import {
   managedOriginCapabilityDirectory,
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
+  replaceManagedOriginCapabilityFile,
 } from '../../src/core/managed-origin-capability.js';
 import { seedPersistedSessionRows } from './session-store-disk.js';
 
@@ -44,6 +45,9 @@ export interface DispatchFlowCall {
    *  (relay re-exec) calls are HMAC-signed instead. */
   viaCapability: boolean;
   viaHostAuth: boolean;
+  /** Which capability a pane request presented (rotation scenarios). */
+  presented: 'initial' | 'rotated' | 'none';
+  status: number;
   body: string;
 }
 
@@ -56,6 +60,8 @@ export interface DispatchFlowResult {
   larkCalls: Array<{ method: string; url: string }>;
   /** Kickoff delivery reached the daemon (the task was actually sent). */
   delivered: boolean;
+  /** Kickoff delivery reached the daemon AND was accepted (2xx). */
+  deliveredAccepted: boolean;
   /** Seed registration reached the daemon (new topic created). */
   registered: boolean;
   /** `/repo` prime (or any message reply) reached Lark. */
@@ -117,6 +123,12 @@ export async function runCredentialOnlyDispatch(input: {
   /** Strip the credential-only scope marker → a relay-only (full-sandbox
    *  shaped) pane, as a control. */
   dropScopeMarker?: boolean;
+  /** Emulate the real daemon's origin check (a non-host request must present
+   *  the LIVE capability, else 403 origin_unproven) and rotate the live
+   *  capability — exactly as a turn interruption does, including the atomic
+   *  rewrite of the pane-visible capability files — right after the daemon
+   *  answers the first request whose URL ends with this suffix. */
+  rotateCapabilityAfter?: string;
 }): Promise<DispatchFlowResult> {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'credonly-flow-')));
   const botmuxHome = join(root, '.botmux');
@@ -167,6 +179,19 @@ process.exit(r.status ?? 1);
   }), { mode: 0o600 });
 
   const daemonCalls: DispatchFlowCall[] = [];
+  const rotatedCapability = randomBytes(32).toString('hex');
+  let liveCapability = capability;
+  let rotated = false;
+  const rotate = (): void => {
+    rotated = true;
+    liveCapability = rotatedCapability;
+    replaceManagedOriginCapabilityFile(managedOriginCapabilityPath(dataDir, sessionId, channelId), JSON.stringify({
+      sessionId, channelId, capability: rotatedCapability, larkAppId: 'cli_src', turnId: 'turn-2',
+    }));
+    replaceManagedOriginCapabilityFile(join(relay.outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
+      sessionId, channelId, token: rotatedCapability, larkAppId: 'cli_src', turnId: 'turn-2',
+    }));
+  };
   const daemon = createServer(async (req, res) => {
     const body = await readBody(req);
     const url = req.url ?? '';
@@ -177,15 +202,28 @@ process.exit(r.status ?? 1);
       res.end();
       return;
     }
-    daemonCalls.push({
+    const viaHostAuth = !!req.headers['x-botmux-cli-auth'];
+    const presented: DispatchFlowCall['presented'] = body.includes(capability)
+      ? 'initial'
+      : body.includes(rotatedCapability) ? 'rotated' : 'none';
+    const call: DispatchFlowCall = {
       url, method: req.method ?? '', body,
-      viaCapability: body.includes(capability),
-      viaHostAuth: !!req.headers['x-botmux-cli-auth'],
-    });
+      viaCapability: presented !== 'none',
+      viaHostAuth,
+      presented,
+      status: 0,
+    };
+    daemonCalls.push(call);
     const json = (status: number, payload: unknown) => {
+      call.status = status;
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(payload));
+      if (input.rotateCapabilityAfter && !rotated && status < 300 && url.endsWith(input.rotateCapabilityAfter)) rotate();
     };
+    if (input.rotateCapabilityAfter && !viaHostAuth && req.method === 'POST'
+      && !body.includes(liveCapability)) {
+      return json(403, { ok: false, error: 'origin_unproven' });
+    }
     if (req.method === 'GET' && url === `/api/sessions/${sessionId}`) return json(200, { session: row });
     if (url.endsWith('/project-dispatch-policy')) return json(200, { ok: true });
     if (url === '/api/report-relay/register') return json(200, { ok: true, dispatchRoot: 'om_seed_1' });
@@ -299,11 +337,15 @@ process.exit(r.status ?? 1);
   rmSync(root, { recursive: true, force: true });
 
   const delivered = daemonCalls.some(call => call.url === '/api/dispatch-user/deliver');
+  const deliveredAccepted = daemonCalls.some(call => call.url === '/api/dispatch-user/deliver' && call.status < 300);
   const registered = daemonCalls.some(call => call.url === '/api/report-relay/register');
   const larkReplies = larkCalls.filter(call => call.url.includes('/reply')).length;
   const paneDirect = daemonCalls.some(call => call.viaCapability && !call.viaHostAuth);
   // Only the host re-exec holds the dashboard secret (masked in the pane).
   const relayed = daemonCalls.some(call => call.viaHostAuth);
   const path = relayed ? 'relay' : paneDirect ? 'direct' : 'refused';
-  return { code, stderr, stdout, relayRequests, daemonCalls, larkCalls, delivered, registered, larkReplies, path };
+  return {
+    code, stderr, stdout, relayRequests, daemonCalls, larkCalls,
+    delivered, deliveredAccepted, registered, larkReplies, path,
+  };
 }

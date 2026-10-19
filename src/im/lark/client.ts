@@ -619,6 +619,48 @@ export async function resolveUnionIdFromOpenId(
   }
 }
 
+export type UnionIdLookup =
+  | { status: 'resolved'; unionId: string }
+  | { status: 'unavailable' }
+  | { status: 'retryable'; error: string };
+
+/** Strict open_id → union_id lookup for durable admission decisions. */
+export async function resolveUnionIdFromOpenIdStrict(
+  larkAppId: string,
+  openId: string,
+): Promise<UnionIdLookup> {
+  const c = getBotClient(larkAppId);
+  try {
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
+    });
+    const unionId = typeof res?.data?.user?.union_id === 'string'
+      ? res.data.user.union_id.trim()
+      : '';
+    if (res?.code === 0 && unionId) return { status: 'resolved', unionId };
+    if (res?.code === 0 || classifyContactErrorCode(res?.code)
+        || res?.code === LARK_CODE_APP_SCOPE_MISSING
+        || res?.code === LARK_CODE_USER_SCOPE_MISSING) {
+      return { status: 'unavailable' };
+    }
+    return {
+      status: 'retryable',
+      error: `Lark union_id lookup failed: code=${res?.code ?? 'unknown'}`,
+    };
+  } catch (error) {
+    const code = getLarkErrorCode(error);
+    if (classifyContactErrorCode(code)
+        || code === LARK_CODE_APP_SCOPE_MISSING
+        || code === LARK_CODE_USER_SCOPE_MISSING) {
+      return { status: 'unavailable' };
+    }
+    return {
+      status: 'retryable',
+      error: `Lark union_id lookup failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /** 用户资料（名字+头像）查询缓存：key = appId:idType:id。字符串值 = 确定性
  *  负结果的类别（跨应用/不可见/无效 id），每次查都会失败，别反复打 API。
  *  瞬时失败（网络/频控/服务端 40003）不缓存——下次调用应当重试，负缓存瞬时

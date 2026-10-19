@@ -12,6 +12,7 @@ import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shad
 import type { DurableLarkSessionControlClaim } from '../src/services/durable-lark-session-control.js';
 import {
   admitDurableLarkSession,
+  claimDurableLarkActiveSession,
   commitDurableLarkSessionControl,
   durablePrimarySessionProjection,
   parseDurablePrimarySessionRecord,
@@ -326,6 +327,73 @@ describe('durable primary Session admission', () => {
     expect(JSON.stringify(retry.receipt)).not.toContain('ou_owner');
     expect(JSON.stringify(retry.receipt)).not.toContain('/shared/project');
     expect(JSON.stringify(retry.receipt)).not.toContain('Primary Session');
+    await facade.stop();
+  });
+
+  it('claims an unchanged active canonical Session under a fresh exact revision', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'takeover-owner' });
+    await admitDurableLarkSession({ facade, message: message('om_initial'), session: session() });
+
+    await expect(claimDurableLarkActiveSession({
+      facade,
+      sessionKey: 'om_root::cli_test',
+      expectedSessionId: 'session-1',
+      expectedLarkAppId: 'cli_test',
+    })).resolves.toMatchObject({
+      kind: 'claimed',
+      session: { sessionId: 'session-1', status: 'active' },
+      record: { revision: 2 },
+      lease: { ownerId: 'takeover-owner' },
+    });
+    expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!)).toMatchObject({
+      session: { sessionId: 'session-1', status: 'active' },
+      admissions: [{ messageId: 'om_initial' }],
+    });
+    await facade.stop();
+  });
+
+  it('does not materialize ownership when another owner still holds the Session lease', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'takeover-contender' });
+    vi.mocked(store.acquireSessionLease).mockResolvedValueOnce({
+      kind: 'occupied',
+      ownerId: 'live-owner',
+      epoch: 4,
+      leaseUntil: 90_000,
+    });
+
+    await expect(claimDurableLarkActiveSession({
+      facade,
+      sessionKey: 'om_root::cli_test',
+      expectedSessionId: 'session-1',
+      expectedLarkAppId: 'cli_test',
+    })).resolves.toEqual({
+      kind: 'occupied',
+      ownerId: 'live-owner',
+      epoch: 4,
+      leaseUntil: 90_000,
+      coalescedCount: 1,
+    });
+    expect(store.readSession).not.toHaveBeenCalled();
+    expect(store.writeSession).not.toHaveBeenCalled();
+    await facade.stop();
+  });
+
+  it('fails closed when the canonical Session changed before takeover claim', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'takeover-stale-reader' });
+    await admitDurableLarkSession({ facade, message: message('om_closed'), session: session({
+      status: 'closed',
+      closedAt: '2026-10-05T00:02:00.000Z',
+    }) });
+
+    await expect(claimDurableLarkActiveSession({
+      facade,
+      sessionKey: 'om_root::cli_test',
+      expectedSessionId: 'session-1',
+      expectedLarkAppId: 'cli_test',
+    })).rejects.toThrow(/changed before claim/);
     await facade.stop();
   });
 

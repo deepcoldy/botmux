@@ -39,10 +39,19 @@ Agent 只收录 Dashboard 已经有逐字段写入接口、线上确实在用的
 | 运行环境 | `sandboxMode`（`off` / `oncall` / `scratch`） | `PUT /api/bot-sandbox` |
 | 运行环境 | `backendType`（空 = 跟随全局） | `PUT /api/bot-backend-type` |
 | 启动 | `startupCommands` | `PUT /api/bot-startup-commands` |
+| 零注入 | `promptInjection`（`default` / `none`） | `PUT /api/bot-prompt-injection` |
 
 每组字段都可以**不设置**。未设置的分组不下发，Bot 保留自己的值。比如一个 Agent 只设置了「执行」，关联后只统一 CLI 和模型，工作目录仍由各 Bot 自己决定。
 
 明确留给 Bot 的字段：飞书凭证、`allowedUsers` 等名单、群相关的回复与 @ 模式、卡片样式、按群覆盖（`groupDefaultModels` 等）、配额、授权、触发器。
+
+下发顺序即上表顺序，零注入例外：daemon 只在零注入自己的写入接口上按 Bot **当前**的 CLI / 沙箱 / 后端校验，CLI / 沙箱 / 后端的写入接口（`/api/bot-agent`、`/api/bot-sandbox`、`/api/bot-backend-type`）不检查零注入。所以：
+
+- 开启零注入排最后（先下发会按旧组合校验）；关闭排最前（零注入还开着时，切到不支持的组合会被下面的逐步校验拦下）。
+- Agent 统一了 CLI 时，保存 Agent 就按该 CLI 提前拒绝不支持的组合（`promptInjection:unsupported`）。
+- 后端一律按新会话 spawn 时的**生效值**判断：覆盖值，没有覆盖（或 Agent 清除了覆盖）时用 daemon 的默认后端（`BACKEND_TYPE` / 自动探测，daemon 在 Bot 配置快照里以 `defaultBackendType` 带给 Dashboard），再按 CLI 配对（远端 CLI 用同名后端；本地 CLI 落在远端后端上回落到 daemon 默认值，默认值也是远端时用 pty）。配对规则抽到无依赖的 `core/remote-cli-ids.ts`（`resolvePairedBackendId`），spawn 用的 `reconcileRiffBackendType` 委托过去；daemon 的零注入写入校验、运行时判断（`supportsZeroPromptInjectionForBot`，提示词构造与回复投递据此决定）、Bot 页开关、Agent 同步校验共用，口径与 spawn 时的强制校验一致。
+- 同步会改到这几组时，浏览器先按**同步后的组合**（Agent 管的取 Agent，不管的取 Bot 当前值）整体判断，不成立就一组都不写、报 `zero_prompt_unsupported`。
+- 整体成立后，每次写入这几组前再按**已成功写入的分组**判断中间组合：前面某组失败（例如关闭零注入没写成）时，后面的写入不会把 Bot 留在不支持的组合上。被拦下的分组推迟到其它分组之后再试（例如零注入开着时 claude-code + zmx → antigravity + tmux，先换后端再换 CLI），仍不成立才报失败。
 
 暂不纳入 v1、后续可加的字段：
 

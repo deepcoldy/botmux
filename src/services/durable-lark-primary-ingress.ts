@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type {
-  DurableInboxStore,
+  DurableFencedInboxStore,
   DurableInsertResult,
   DurableSessionLeaseStore,
   SessionLease,
@@ -12,7 +12,7 @@ import {
 } from './durable-inbox-shadow.js';
 import { durableLarkSessionControlEvent } from './durable-lark-session-control.js';
 
-export type DurableLarkPrimaryIngressStore = DurableInboxStore & DurableSessionLeaseStore;
+export type DurableLarkPrimaryIngressStore = DurableFencedInboxStore & DurableSessionLeaseStore;
 
 export interface DurableLarkIngressLeadership {
   lease: SessionLease;
@@ -301,7 +301,17 @@ export function startDurableLarkPrimaryIngress(
           || lease?.epoch !== expectedEpoch || !leadershipIsFresh()) {
         throw new DurableLarkIngressNotLeaderError('Lark ingress leadership changed before enqueue');
       }
-      const result = await options.store.enqueueInbox(event);
+      const currentLease = lease;
+      if (!currentLease || currentLease.epoch !== expectedEpoch) {
+        throw new DurableLarkIngressNotLeaderError('Lark ingress leadership changed before enqueue');
+      }
+      const result = await options.store.enqueueInboxWithLease({
+        lease: currentLease,
+        event,
+      });
+      if (result.kind === 'stale_lease') {
+        throw new DurableLarkIngressNotLeaderError('Lark ingress lease expired before durable enqueue');
+      }
       if (result.kind === 'conflict') {
         throw new Error(`durable Lark ingress conflicting duplicate ${event.eventId}`);
       }
@@ -342,7 +352,9 @@ export function startDurableLarkPrimaryIngress(
           || (eventType === 'lark.im.message.receive_v1' && eventId !== expectedReceiveEventId)
           || (eventType === 'lark.im.message.updated_v1'
             && (!eventId.startsWith(expectedUpdatedPrefix)
-              || eventId.length === expectedUpdatedPrefix.length))) {
+              || eventId.length === expectedUpdatedPrefix.length))
+          || (eventType === 'lark.im.message.updated_v1'
+            && partitionKey === `lark-message-routing:${larkAppId}:__chatless__`)) {
         throw new Error('durable Lark ingress event does not match the application message identity');
       }
       const wallNow = now();

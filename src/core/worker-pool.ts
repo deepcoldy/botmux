@@ -9,6 +9,7 @@ import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signa
 import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
+import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
 import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
@@ -17,6 +18,7 @@ import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from 
 import { execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
+import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -26,7 +28,7 @@ import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
-import { hookCommandFor } from '../adapters/hook-command.js';
+import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
@@ -111,13 +113,15 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from '../im/lark/md-card.js';
+import { buildTrustedResultDeliveryCard } from '../im/lark/trusted-result-delivery-card.js';
+import { resolvePluginResultAccessUrl } from './plugin-result-access-url.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
-import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
+import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -5475,6 +5479,10 @@ const skillsInstalledCliIds = new Set<string>();
  */
 export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: CliAdapterOptions): void {
   const adapter = createCliAdapterSync(cliId, cliPathOverride, opts);
+  if (cliId === 'cursor') {
+    try { installCursorUsageHook(join(homedir(), '.cursor', 'hooks.json'), cursorUsageHookCommand()); }
+    catch (err) { logger.warn(`[cursor] usage hook install failed: ${String(err)}`); }
+  }
   // Hooks land in the adapter's data root, so each config profile is its own
   // install target: gate per (cli, profile), not per cli.
   const installKey = cliSupportsConfigDir(cliId) && opts?.configDir ? `${cliId}\0${opts.configDir}` : cliId;
@@ -6162,6 +6170,19 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
   }
 }
 
+/**
+ * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
+ * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
+ */
+export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | null | undefined {
+  try {
+    const binding = getBot(ds.larkAppId).config.larkToolBinding;
+    return binding === false ? null : true;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Join or start one correlated physical restart for a session. */
 export function requestSessionRestart(
   ds: DaemonSession,
@@ -6176,7 +6197,7 @@ export function requestSessionRestart(
       ds.workerReady = false;
       // In-worker respawn: the next prompt belongs to a NEW CLI generation.
       ds.cliReady = false;
-      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
       return;
     }
     // No live worker but the persistent pane may still be alive (e.g. after a
@@ -11045,62 +11066,12 @@ async function forkFromSource(
     // bug in a multi-bot fleet), and destabilises sandbox transcript/BOT_HOME
     // location.
     childSession.larkAppId = ds.larkAppId;
-    // Frozen launch posture — inherit the source's RECORDED decisions wholesale
-    // rather than letting forkWorker re-derive them for a brand-new row. Two
-    // reasons this is mandatory, not cosmetic:
-    //   • sandbox*: a fresh child row has sandbox===undefined, and forkWorker's
-    //     cold-spawn runs with resume=true → it hits the "resume + no recorded
-    //     decision → sandbox=false" branch meant for pre-sandbox-era legacy
-    //     sessions. A fork of a sandboxed session would therefore run UNSANDBOXED
-    //     (bwrap credential seal — bots.json deny / sibling appsecrets /
-    //     master.key / network deny — silently dropped). This is a security
-    //     escape, so copy the recorded decision and its path lists verbatim.
-    //   • reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
-    //     without these the child's sessionAgentConfig() sees !agentFrozen and
-    //     re-freezes from the CURRENT bot config, silently dropping any per-session
-    //     /effort override the source carried (reasoningEffort has no botCfg
-    //     fallback at all → drops to undefined). Copying the frozen tuple keeps
-    //     the clone's launch identity == the source's. `model` is no longer a
-    //     FROZEN value — it resolves from the live bot config at every spawn — but
-    //     the record of what the source last launched with still has to travel:
-    //     when the source is pinned to a CLI the bot no longer runs, that record is
-    //     the only thing keeping either session off the CLI default (rule 3 in
-    //     resolveSessionLaunchModel). Copying it cannot resurrect the old frozen
-    //     bug, because the live bot model outranks it whenever the CLIs match.
-    //     An explicit per-trigger override rides on the runtime childDs below.
-    // readIsolation is intentionally NOT copied: it is not a persisted Session
-    // field (forkWorker derives it from botCfg at spawn), and the child runs the
-    // SAME bot, so it is preserved automatically. persistentBackendTarget is also
-    // intentionally NOT inherited — that is the parent's specific pane/Herdr
-    // affinity; the child cold-spawns its own fresh backing.
-    childSession.sandbox = ds.session.sandbox;
-    childSession.sandboxPaths = ds.session.sandboxPaths;
-    childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
-    childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
-    childSession.sandboxNetwork = ds.session.sandboxNetwork;
-    childSession.sandboxNetworkPolicy = ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined;
-    childSession.reasoningEffort = ds.session.reasoningEffort;
-    childSession.modelBackendVariant = ds.session.modelBackendVariant;
-    childSession.model = ds.session.model;
-    childSession.cliLaunchSnapshot = ds.session.cliLaunchSnapshot
-      ? {
-          ...ds.session.cliLaunchSnapshot,
-          cliRuntime: ds.session.cliLaunchSnapshot.cliRuntime
-            ? { ...ds.session.cliLaunchSnapshot.cliRuntime, update: { ...ds.session.cliLaunchSnapshot.cliRuntime.update } }
-            : null,
-          startupCommands: [...ds.session.cliLaunchSnapshot.startupCommands],
-        }
-      : undefined;
-    childSession.cliRuntime = ds.session.cliRuntime
-      ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
-      : undefined;
-    childSession.cliPathOverride = ds.session.cliPathOverride;
-    // The fork resumes from the source's transcript, which lives under the source's
-    // frozen profile; with agentFrozen copied, sessionAgentConfig would never fill it.
-    childSession.cliConfigDir = ds.session.cliConfigDir;
-    childSession.wrapperCli = ds.session.wrapperCli;
-    childSession.cliLaunchMode = ds.session.cliLaunchMode;
-    childSession.agentFrozen = ds.session.agentFrozen;
+    // Both native fork and clean failed-turn recovery inherit one recorded
+    // launch posture. Never re-derive sandbox/CLI profile from the live bot:
+    // a missing sandbox stamp on resume can silently disable isolation.
+    // Model remains a launch record; current matching-CLI settings still win
+    // in resolveSessionLaunchModel. Native pane/conversation IDs are separate.
+    inheritSessionLaunchConfiguration(ds.session, childSession);
     childSession.promptInjection = sessionPromptInjection(ds);
     childSession.nativeSessionTitle = childTitle;
     childSession.nativeSessionTitleUserDefined = true;
@@ -11731,6 +11702,12 @@ function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined
   if (ds.scheduledTurnCallers.size === 0) ds.scheduledTurnCallers = undefined;
 }
 
+/** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
+export async function prepareFailedTurnRecoveryIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  if (!callbacks?.prepareRawInputTurn) throw new Error('recovery_identity_preparation_unavailable');
+  await callbacks.prepareRawInputTurn(ds, turnId);
+}
+
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
  * clean-input gate at message acceptance time. This freezes the sidecar onto
  * the IPC item, so later config flips do not mutate an already queued turn. */
@@ -11893,6 +11870,7 @@ export function sendWorkerInput(
     // itself. Only while parked: an ordinary turn changes no launch config, and
     // an unconditional field would be pure noise on every message.
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
@@ -12291,6 +12269,7 @@ export function promoteQueuedActivationTail(
       content: exactInput.content,
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
       turnId: head.turnId,
       ...(head.dispatchAttempt !== undefined
@@ -13636,6 +13615,7 @@ export function forkWorker(
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
     ...(botCfg.triggerUserAuth ? { triggerUserAuth: botCfg.triggerUserAuth } : {}),
+    larkToolBinding: botCfg.larkToolBinding !== false,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -14092,6 +14072,9 @@ function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string |
   // turn id over private IPC; it can never choose which human that id denotes.
   const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
   if (replyTargetCaller) return replyTargetCaller;
+  const recovered = ds.session.failedTurnRecovery;
+  if (recovered?.turnId === turnId && recovered.caller.requestLarkAppId === ds.larkAppId
+      && recovered.caller.senderType === 'user') return recovered.caller.requestUserOpenId;
   const scheduledCaller = ds.scheduledTurnCallers?.get(turnId);
   if (scheduledCaller) {
     // The worker publishes the same turn more than once: first at init, then
@@ -15124,7 +15107,10 @@ function setupWorkerHandlers(
               await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
               break;
             }
-            throw fallbackErr;
+            // This handler is fire-and-forget (worker IPC), so a rethrow only
+            // surfaces as a daemon-level unhandled rejection. Log and leave
+            // streamCardId cleared so a later screen_update can retry the card.
+            logger.warn(`[${t}] Failed to send static fallback card: ${fallbackErr}`);
           }
         }
 
@@ -15387,6 +15373,11 @@ function setupWorkerHandlers(
         if (!ownsLifecycleMutation()) break;
         if (msg.sessionId !== ds.session.sessionId) break;
         handleCotThinkingSuperseded(ds, msg);
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          void supersedeTurnReplyCard(ds, msg,
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
+            ownsLifecycleMutation).catch(error => logger.warn(`[${t}] reply-card superseded: ${error.message}`));
+        }
         break;
       }
 
@@ -15407,7 +15398,11 @@ function setupWorkerHandlers(
           }
           break;
         }
-        handleCotThinkingUpdate(ds, msg);
+        // Grok public activity is enabled for dynamic replies. Preserve its
+        // legacy message layout unless the user explicitly requests /cot show.
+        if (effectiveCliId !== 'grok' || ds.cotForced) {
+          handleCotThinkingUpdate(ds, msg);
+        }
         break;
       }
 
@@ -16469,7 +16464,7 @@ function setupWorkerHandlers(
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${sessionCliDisplayName(ds, botCfg)}...`);
           ds.workerReady = false;
-          ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
+          ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
         } else {
           ds.managedTurnOrigin = undefined;
         }
@@ -16803,6 +16798,102 @@ function setupWorkerHandlers(
               + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
+        }
+        break;
+      }
+
+      case 'plugin_result_delivery': {
+        const deliveryUuid = (kind: string) => `prd_${createHash('sha256')
+          .update(`${msg.pluginId}\0${msg.deliveryId}\0${kind}`, 'utf8')
+          .digest('hex')
+          .slice(0, 46)}`;
+        const reply = (value: Extract<DaemonToWorker, { type: 'plugin_result_delivery_result' }>) => {
+          if (worker.connected) worker.send(value);
+        };
+        const reject = (error: string) => reply({
+          type: 'plugin_result_delivery_result',
+          requestId: msg.requestId,
+          ok: false,
+          error,
+        });
+        if (!ownsWorkerSession() || msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Rejected plugin result delivery from stale worker`);
+          reject('stale_worker');
+          break;
+        }
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          reject('delivery_suppressed_for_turn');
+          break;
+        }
+        const expectedCaller = currentGatewayCallerOpenId(ds, msg.turnId);
+        if (!expectedCaller || msg.callerOpenId !== expectedCaller) {
+          logger.warn(`[${t}] Rejected plugin result delivery with mismatched turn caller`);
+          reject('trusted_caller_mismatch');
+          break;
+        }
+        const frozen = frozenReplyContextForTurn(ds, msg.turnId);
+        const resultBinding = msg.responseKind === 'final'
+          ? turnResultBinding(ds, msg.turnId, msg.dispatchAttempt, workerGeneration)
+          : undefined;
+        const resultMessages = (messageIds: string[]): TurnDeliveryReceipt['messages'] => messageIds.map(messageId => ({
+          messageId,
+          kind: 'primary',
+        }));
+        const observeDelivery = (
+          status: TurnDeliveryReceipt['status'],
+          messageIds: string[],
+          reason?: string,
+        ) => observeTurnResultDelivery(
+          resultBinding,
+          { status: 'unavailable', reason: 'trusted_plugin_delivery' },
+          {
+            channel: 'im',
+            status,
+            platform: 'lark',
+            chatId: ds.chatId,
+            ...(frozen.target.mode !== 'plain' ? { parentMessageId: frozen.target.rootMessageId } : {}),
+            messages: resultMessages(messageIds),
+            ...(reason ? { reason } : {}),
+          },
+        );
+        try {
+          if (!/^[A-Za-z0-9_-]{20,256}$/.test(msg.viewToken)
+            || !Number.isFinite(Date.parse(msg.expiresAt))
+            || !Number.isSafeInteger(msg.fileCount)
+            || msg.fileCount < 0) {
+            throw new Error('invalid_plugin_result_entry');
+          }
+          const accessUrl = resolvePluginResultAccessUrl(msg.viewToken);
+          if (!accessUrl) throw new Error('plugin_result_access_url_unavailable');
+          const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: msg.expiresAt });
+          const messageId = await scopedReply(card, 'interactive', msg.turnId, {
+            uuid: deliveryUuid('entry'),
+            replyTarget: frozen.target,
+          });
+          const messageIds = [messageId];
+          // Persist the delivery fact before acknowledging the worker. Once
+          // acknowledged it may immediately emit turn_terminal, so reversing
+          // this order creates an empty/not-ready terminal race.
+          observeDelivery('delivered', messageIds);
+          reply({
+            type: 'plugin_result_delivery_result',
+            requestId: msg.requestId,
+            ok: true,
+            messageIds,
+          });
+        } catch (error) {
+          const messageIds: string[] = [];
+          observeDelivery(
+            messageIds.length ? 'partial' : 'failed',
+            messageIds,
+            'trusted_plugin_delivery_failed',
+          );
+          logger.error(
+            `[${t}] Plugin result delivery failed plugin=${msg.pluginId}`,
+          );
+          // Provider errors may contain result text, filenames or paths. Keep
+          // details in host logs and return only a stable non-sensitive code.
+          reject('plugin_result_delivery_failed');
         }
         break;
       }
@@ -19905,6 +19996,7 @@ export function forkAdoptWorker(
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
     larkAppId: botCfg.larkAppId,
+    larkToolBinding: botCfg.larkToolBinding !== false,
     // Freeze on the session transport capability: a no-transport session
     // (apiOnly bot OR HTTP virtual chat) must not even RECEIVE the real secret —
     // withholding it removes the capability rather than gating a tamperable flag

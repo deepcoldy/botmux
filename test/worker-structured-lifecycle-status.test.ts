@@ -35,16 +35,27 @@ describe('worker structured-turn status wiring', () => {
     expect(scope).toContain('codexBridgeFallbackActive()');
     expect(scope).toContain('.structured');
     const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
+    expect(mark.indexOf('structuredBridgeRecoveryCursorAtMark()')).toBeLessThan(mark.indexOf('codexBridgeQueue.mark('));
+    expect(mark).toContain('recoveryCursorAtMark');
     expect(mark.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
     const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
     expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(emit.indexOf('drainEmittable()'));
     expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
     const checkpoint = functionSlice('checkpointStructuredBridgeRecovery', 'scheduledTaskAnchorsFilePath');
     expect(checkpoint).toContain('!structuredBridgeRecoveryAttempted');
-    const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 6_000);
+    // Bounded by the function's end rather than a fixed character window.
+    const attachStart = source.indexOf('function codexBridgeAttach(');
+    const attachEnd = source.indexOf('\ntype CursorAttachMode', attachStart);
+    expect(attachEnd).toBeGreaterThan(attachStart);
+    const attach = source.slice(attachStart, attachEnd);
     expect(attach).toContain('!structuredBridgeRecoveryAttempted');
     expect(attach).toContain("!structuredBridgeIs('cursor')");
     expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
+    expect(attach).toContain('planBridgeTurnRecovery(restorable, rolloutSize)');
+    expect(attach).toContain('Structured bridge recovery skipped');
+    const claudeRestore = functionSlice('tryRestoreInterruptedBridgeTurns', 'startBridgeWatcher');
+    expect(claudeRestore).toContain('planBridgeTurnRecovery(restorable, transcriptSize)');
+    expect(claudeRestore).toContain('Bridge recovery skipped');
   });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');

@@ -198,6 +198,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
     stubbedBots.set(appId, {
       config: {
         larkAppId: appId,
+        larkToolBinding: true,
         triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
       },
     });
@@ -235,10 +236,11 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
   const inlineCli = 'codex';
   const APP = 'cli_credboundary';
 
-  function withTriggerUserAuth(enabled: boolean, run: () => void, tools = ['lark-cli']): void {
+  function withTriggerUserAuth(enabled: boolean, run: () => void, tools = ['lark-cli'], larkToolBinding = true): void {
     stubbedBots.set(APP, {
       config: {
         larkAppId: APP,
+        larkToolBinding,
         ...(enabled
           ? { triggerUserAuth: { enabled: true, tools, fallback: 'bot-identity' } }
           : {}),
@@ -331,16 +333,12 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
     });
   });
 
-  it('defaults an omitted launch decision to legacy-safe resume semantics', () => {
+  it('omits managed lark identity when larkToolBinding is off even if triggerUserAuth is on', () => {
     withTriggerUserAuth(true, () => {
-      const text = buildNewTopicPrompt(
-        'read the linked doc', 'sess-bound', inlineCli, undefined, undefined, undefined,
-        undefined, undefined, { name: 'Bot', openId: 'ou_bot' }, 'zh', undefined,
-        { larkAppId: APP, chatId: 'oc_chat' },
-      );
+      const text = boundOpening();
       expect(text).not.toContain('<botmux_lark_tool>');
       expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
-    });
+    }, ['lark-cli'], false);
   });
 
   it('does not claim managed lark identity inside workflow workers', () => {

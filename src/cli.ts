@@ -31,6 +31,7 @@ import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
  */
 import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
 import { readScheduleUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
+import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
@@ -43,6 +44,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
+import { parse as parseDotEnv } from 'dotenv';
 import { canonicalJson } from './utils/canonical-input-hash.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
@@ -207,10 +209,12 @@ import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/bi
 import { isMultiTopicOrchestrationEnabled, isRemoteAccessEnabled } from './global-config.js';
 import {
   DASHBOARD_COMMAND_USAGE,
-  DASHBOARD_LOCAL_TOKEN_FLAG,
+  DASHBOARD_READY_WAIT_MS,
   dashboardComingUpFromState,
+  dashboardExportTimeoutForBudget,
   dashboardFailureIsTerminal,
   executeDashboardCliCommand,
+  exportAfterDashboardAnswer,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
   formatDashboardUnreachable,
@@ -307,7 +311,7 @@ import {
   orderedFooterRecipients,
   stripCodeSpans,
 } from './utils/bot-routing.js';
-import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
 import {
   crossPrincipalAsKeyword,
   crossPrincipalBotSendGate,
@@ -400,6 +404,15 @@ import {
 {
   const cfg = readGlobalConfig();
   if (cfg.lang) setDefaultLocale(cfg.lang);
+  const langFlagIdx = process.argv.findIndex(a => a === '--lang' || a.startsWith('--lang='));
+  if (langFlagIdx !== -1) {
+    const raw = process.argv[langFlagIdx].startsWith('--lang=')
+      ? process.argv[langFlagIdx].slice(7)
+      : process.argv[langFlagIdx + 1];
+    if (isLocale(raw)) {
+      setDefaultLocale(raw);
+    }
+  }
   // Wire user prompt-key overrides into t() so CLI-side prompt building (e.g.
   // `botmux skill show`, catalog rendering) honours customizations. Idempotent.
   registerPromptOverrideResolver();
@@ -1012,7 +1025,10 @@ async function pickExistingAppCredentials(
  * (`promptBotConfig` → SETUP_APP_JUST_CREATED → finishOpenPlatformSetup) 只是原样透传，
  * 所以「哪条来源算刚创建」必须在这一层锁住。生产代码没有别的调用方。
  */
-export async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promise<
+export async function obtainCredentials(
+  rl: ReturnType<typeof createInterface>,
+  options: { isFirstStep?: boolean } = {},
+): Promise<
   | {
       ok: true;
       appId: string;
@@ -1026,23 +1042,23 @@ export async function obtainCredentials(rl: ReturnType<typeof createInterface>):
   | { ok: false; reason: 'cancelled' }
 > {
   const interactive = process.stdin.isTTY && process.stdout.isTTY;
-  console.log('── 飞书应用 ──\n');
+  console.log(`\n${t('setup.credentials.header')}\n`);
   for (;;) {
-    const method = await pickChoice(rl, {
-      title: '飞书应用来源',
+    const method = await pickChoice(rl, () => ({
+      title: t('setup.credentials.source_title'),
       items: [
-        { label: '一次扫码创建新应用（推荐）', hint: '飞书 Web 登录后自动命名、创建应用、取凭证并完成开放平台配置' },
-        { label: '选择已有应用', hint: '飞书 Web 登录列出你创建过的应用，自动取 AppID/Secret（仅飞书租户）' },
-        { label: '手动输入 AppID/Secret', hint: '已在开放平台创建好应用' },
+        { label: t('setup.credentials.one_scan'), hint: t('setup.credentials.one_scan_hint') },
+        { label: t('setup.credentials.pick_existing'), hint: t('setup.credentials.pick_existing_hint') },
+        { label: t('setup.credentials.manual'), hint: t('setup.credentials.manual_hint') },
       ],
       defaultIndex: 0,
-      footer: 'Esc 取消 setup',
-    });
+      footer: t('setup.menu.footer_cancel'),
+    }), { allowLangToggle: options.isFirstStep });
     if (method === null) return { ok: false, reason: 'cancelled' };
 
     if (method === 0) {
       const suggestedName = resolveSetupAppName(undefined, loadBotsJson().length);
-      const appName = (await ask(rl, `机器人名称 [${suggestedName}]: `)).trim() || suggestedName;
+      const appName = (await ask(rl, t('setup.credentials.bot_name_prompt', { name: suggestedName }))).trim() || suggestedName;
       const {
         createFeishuOpenPlatformApp,
         inspectCachedFeishuOpenPlatformSession,
@@ -1191,24 +1207,24 @@ export async function obtainCredentials(rl: ReturnType<typeof createInterface>):
     // 手动输入（method 2；非 TTY 下也是 0/1 失败后的直落兜底）：扫码路径已用
     // tenant_brand 自动识别；手动路径没有这个信号，兜底让用户手选租户类型
     // （决定建应用 / 运行时的域名）。
-    const brandIdx = await pickChoice(rl, {
-      title: '租户类型',
+    const brandIdx = await pickChoice(rl, () => ({
+      title: t('setup.credentials.tenant_title'),
       items: [
-        { label: '飞书（中国版）', hint: 'open.feishu.cn' },
-        { label: 'Lark（国际版）', hint: 'open.larksuite.com' },
+        { label: t('setup.credentials.tenant_feishu'), hint: 'open.feishu.cn' },
+        { label: t('setup.credentials.tenant_lark'), hint: 'open.larksuite.com' },
       ],
-      defaultIndex: 0,
-      footer: 'Esc 返回上一步',
-    });
+      defaultIndex: getDefaultLocale() === 'en' ? 1 : 0,
+      footer: t('setup.select.back_footer'),
+    }));
     if (brandIdx === null && interactive) continue; // Esc → 回「飞书应用来源」
     const brand: Brand = brandIdx === 1 ? 'lark' : 'feishu';
 
-    console.log(`\n请在浏览器打开 ${larkHosts(brand).openApi}/app 创建应用，然后回来粘 ID/Secret。\n`);
-    const appId = (await ask(rl, 'AppID (cli_xxx): ')).trim();
-    const appSecret = (await ask(rl, 'AppSecret: ')).trim();
+    console.log(`\n${t('setup.credentials.manual_url_hint', { url: larkHosts(brand).openApi })}\n`);
+    const appId = (await ask(rl, t('setup.credentials.appid_prompt'))).trim();
+    const appSecret = (await ask(rl, t('setup.credentials.appsecret_prompt'))).trim();
 
     if (!appId || !appSecret) {
-      console.log('\n❌ AppID/AppSecret 不能为空，setup 中止。');
+      console.log(`\n${t('setup.credentials.empty_abort')}`);
       return { ok: false, reason: 'cancelled' };
     }
     return { ok: true, appId, appSecret, brand };
@@ -1221,25 +1237,25 @@ export async function obtainCredentials(rl: ReturnType<typeof createInterface>):
  * setup 不允许没有 owner —— 没 owner 的配置一旦叠加 allowedChatGroups 即成权限黑洞.
  */
 async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Promise<string[]> {
-  printInputHelp('管理员 (owner)', [
-    '必填。至少一个能操作机器人的管理员，多个值用逗号分隔。',
-    '推荐格式（优先级高到低）：完整邮箱（alice@example.com）> union_id（on_xxx，跨应用稳定）> 手机号（大陆号直填 11 位，海外号带 + 区号）> open_id（ou_xxx，仅限同一应用）。',
-    '注意：邮箱必须完整，邮箱前缀（如 alice）无法解析、不接受。没有企业邮箱可用手机号。',
+  printInputHelp(t('setup.owner.title'), [
+    t('setup.owner.help_1'),
+    t('setup.owner.help_2'),
+    t('setup.owner.help_3'),
   ]);
   for (;;) {
-    const raw = (await ask(rl, '管理员 (owner): ')).trim();
+    const raw = (await ask(rl, t('setup.owner.prompt'))).trim();
     const entries = raw.split(',').map(s => s.trim()).filter(Boolean);
     if (entries.length === 0) {
-      console.log('   ❌ 必须至少指定一个管理员（不能为空）。');
+      console.log(t('setup.owner.required_err'));
       continue;
     }
     const invalid = findInvalidAllowedUserEntries(entries);
     if (invalid.length > 0) {
-      console.log(`   ❌ 以下不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id 或 open_id（邮箱前缀不接受）: ${invalid.join(', ')}`);
+      console.log(t('setup.owner.invalid_format_err', { invalid: invalid.join(', ') }));
       continue;
     }
     if (!hasOwnerEntry(entries)) {
-      console.log('   ❌ 至少需要一个完整邮箱、手机号、union_id 或 open_id 作为 owner。');
+      console.log(t('setup.owner.no_owner_err'));
       continue;
     }
     return entries;
@@ -1252,28 +1268,31 @@ async function promptRequiredOwner(rl: ReturnType<typeof createInterface>): Prom
  * 顺序: 拿凭证 → tenant_access_token 验证 → 通过才返回 bot 对象. 验证失败
  * 直接返回 null, 调用方负责"不写 bots.json". Codex review 边界 #2.
  */
-async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<Record<string, any> | null> {
-  const creds = await obtainCredentials(rl);
+async function promptBotConfig(
+  rl: ReturnType<typeof createInterface>,
+  options: { isFirstStep?: boolean } = {},
+): Promise<Record<string, any> | null> {
+  const creds = await obtainCredentials(rl, options);
   if (!creds.ok) return null;
 
   // 凭证立刻验证. 通不过不写 bots.json.
-  console.log('\n校验凭证（取 tenant_access_token）…');
+  console.log(`\n${t('setup.credentials.validating')}`);
   const { validateCredentials } = await import('./setup/verify-permissions.js');
   const v = await validateCredentials(creds.appId, creds.appSecret, creds.brand);
   if (!v.ok) {
-    console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
-    console.log('   不写 bots.json。请重新运行 botmux setup。');
+    console.log(`\n${t('setup.credentials.invalid', { error: v.error, message: v.message })}`);
+    console.log(t('setup.credentials.retry_hint'));
     return null;
   }
-  console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
+  console.log(`${t('setup.credentials.valid')}\n`);
 
   // CLI 适配器：可搜索的级联选择器（Aiden / Forge 等分组可进入二级菜单）。
   // 非交互终端自动回退为序号 / ID 文本输入。
   // Esc = 中止 setup（不写盘）。新建流程的必答题没有"上一步"可退，绝不静默
   // 替用户选默认——扫码建出的应用可事后用「选择已有应用」找回，不会丢。
-  const selKey = await pickCliSelection(rl, { title: '选择 CLI 适配器' });
+  const selKey = await pickCliSelection(rl, { title: t('setup.cli.select_title') });
   if (selKey === null) {
-    console.log('\n已取消（Esc），setup 中止，不写任何配置。');
+    console.log(`\n${t('setup.common.cancelled_abort')}`);
     return null;
   }
   let cliId: CliId;
@@ -1286,43 +1305,43 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     cliLaunchMode = sel.cliLaunchMode;
   } catch (err: any) {
     console.log(`\n❌ ${err?.message ?? String(err)}`);
-    console.log('   不写 bots.json。请重新运行 botmux setup。');
+    console.log(t('setup.credentials.retry_hint'));
     return null;
   }
   const cliAvailability = checkCliAvailability({ cliId, wrapperCli, cliLaunchMode });
   if (!cliAvailability.available) {
-    console.log(`\n⚠️  所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}`);
-    console.log('   配置仍可继续；请在 daemon 所在机器安装或修正 PATH / CLI 路径后再启动 Bot。\n');
+    console.log(`\n${t('setup.cli.unavailable_warn', { reason: cliAvailability.reason ?? '本地启动依赖不可用' })}`);
+    console.log(t('setup.cli.unavailable_hint') + '\n');
   }
   // 新话题工作目录：两种模式二选一。旧问法只问「默认工作目录」但写的是
   // workingDir——那只是仓库选择卡片的扫描根，新话题照样弹卡，误导性强；
   // 真正「直接进目录、不弹卡」的是 defaultWorkingDir，现在显式让用户选。
   // 「固定默认目录」放首位当推荐默认：大量用户的真实诉求是"新话题直接进目录"，
   // 弹卡模式作为多仓库场景的进阶选项。
-  const dirMode = await pickChoice(rl, {
-    title: '新话题工作目录',
+  const dirMode = await pickChoice(rl, () => ({
+    title: t('setup.dir.title'),
     items: [
-      { label: '固定默认目录（推荐）', hint: '新话题直接在指定目录启动、不弹卡片' },
-      { label: '仓库选择卡片', hint: '新话题先弹卡片，从扫描到的 git 仓库中选一个再启动' },
+      { label: t('setup.dir.pinned'), hint: t('setup.dir.pinned_hint') },
+      { label: t('setup.dir.repo_picker'), hint: t('setup.dir.repo_picker_hint') },
     ],
     defaultIndex: 0,
-    footer: 'Esc 取消 setup · 之后可用 /config 或 botmux setup edit 修改',
-  });
+    footer: t('setup.cli.footer'),
+  }));
   // Esc = 中止 setup，不静默套用推荐默认（非 TTY 留空走 defaultIndex，不受影响）。
   if (dirMode === null) {
-    console.log('\n已取消（Esc），setup 中止，不写任何配置。');
+    console.log(`\n${t('setup.common.cancelled_abort')}`);
     return null;
   }
   let workingDir: string | undefined;
   let defaultWorkingDir: string | undefined;
   if (dirMode === 1) {
-    const raw = await ask(rl, '仓库扫描根目录（卡片会列出其下的 git 仓库，逗号分隔多个）[~]: ');
+    const raw = await ask(rl, t('setup.dir.scan_prompt'));
     workingDir = raw.trim() || '~';
   } else {
     // 存在性校验循环——运行时 daemon 对无效 defaultWorkingDir 只会静默回退
     // 弹卡，setup 阶段必须挡住。留空默认 ~（一定存在，回车即通过）。
     for (;;) {
-      const dir = (await ask(rl, '默认工作目录（新话题直接在此目录启动）[~]: ')).trim() || '~';
+      const dir = (await ask(rl, t('setup.dir.default_prompt'))).trim() || '~';
       if (ensureBotDefaultWorkingDirExists({ defaultWorkingDir: dir })) {
         defaultWorkingDir = dir;
         break;
@@ -1342,6 +1361,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
     // 回退默认 ~，bots.json 不留多余字段。
     ...(workingDir ? { workingDir } : {}),
     ...(defaultWorkingDir ? { defaultWorkingDir } : {}),
+    ...(getDefaultLocale() === 'en' ? { lang: 'en' } : {}),
   };
   // brand 落盘：只在国际版 (lark) 时写字段，feishu 留空——保持旧 bots.json 干净，
   // 且 botBrand()/normalizeBrand() 读不到时 default 到 feishu，向后兼容。
@@ -1366,7 +1386,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
       // when that resolve is the very thing failing (cold-start race).
       bot.ownerOpenId = creds.userOpenId;
     } else {
-      console.log('⚠️  无法确认扫码人的 open_id 属于当前新应用，请手动填写 owner。');
+      console.log(t('setup.owner.scanner_unconfirmed'));
       bot.allowedUsers = await promptRequiredOwner(rl);
     }
   } else {
@@ -1424,7 +1444,7 @@ function formatBooleanValue(v: unknown, defaultValue: boolean): string {
  */
 function formatBotConfigTable(bots: any[]): string {
   if (bots.length === 0) return '';
-  const headers = ['进程名', 'App ID', 'CLI'];
+  const headers = [t('setup.table.process_name'), t('setup.table.app_id'), t('setup.table.cli')];
   const rows = bots.map((b, i) => [
     botProcessName(b, i, PM2_NAME),
     String(b?.larkAppId ?? ''),
@@ -1449,7 +1469,7 @@ async function pickBotSelection(
   title: string,
 ): Promise<number | undefined> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    const selected = await ask(rl, '选择机器人（进程名 或 AppID）: ');
+    const selected = await ask(rl, `${title} (${t('setup.edit.select_bot_prompt_hint')}): `);
     return parseBotSelection(selected, bots);
   }
   const idx = await interactiveSelect({
@@ -1458,7 +1478,7 @@ async function pickBotSelection(
       label: botProcessName(b, i, PM2_NAME),
       hint: `${b?.larkAppId ?? ''} · ${b?.cliId ?? 'claude-code'}`,
     })),
-    footer: 'Esc 返回操作菜单',
+    footer: t('setup.edit.footer_back'),
   });
   if (idx === null) return undefined;
   console.log(` ✔ ${title}: ${botProcessName(bots[idx], idx, PM2_NAME)}`);
@@ -1630,19 +1650,26 @@ function parseDotEnvToBotConfig(): Record<string, any> {
  * 失败路径 (扫码取消 / 凭证校验不通过): 不创建任何配置文件, 不动旧 .env.
  * Codex review 边界 #2: 中途失败一律不留半截 JSON.
  */
-async function writeSingleBotConfig(): Promise<boolean> {
+async function writeSingleBotConfig(options: { isFirstStep?: boolean } = {}): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const bot = await promptBotConfig(rl);
+  const bot = await promptBotConfig(rl, options);
   rl.close();
 
   if (!bot) return false;
 
   writeBotsJsonAtomic([bot]);
-  console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
+  console.log(`\n${t('setup.common.config_written', { path: BOTS_JSON_FILE })}`);
   await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), { reuseOnly: hasSetupWebSession(bot), appJustCreated: wasAppJustCreatedBySetup(bot) });
-  console.log(`下一步:`);
-  console.log(`  1. botmux start              启动 daemon`);
-  console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : process.platform === 'win32' ? 'Windows Task Scheduler' : '当前平台暂不支持'}，无需 sudo）`);
+  console.log(t('setup.common.next_steps_title'));
+  console.log(t('setup.common.next_step_start'));
+  const platform = process.platform === 'darwin'
+    ? 'mac launchd'
+    : process.platform === 'linux'
+    ? 'linux user systemd'
+    : process.platform === 'win32'
+    ? 'Windows Task Scheduler'
+    : (getDefaultLocale() === 'en' ? 'not supported on current platform' : '当前平台暂不支持');
+  console.log(t('setup.common.next_step_autostart', { platform }));
   return true;
 }
 
@@ -2337,14 +2364,14 @@ async function cmdSetup(): Promise<void> {
   const hasBots = existsSync(BOTS_JSON_FILE);
   const hasEnv = existsSync(ENV_FILE);
 
-  console.log('\n🤖 botmux 配置向导\n');
-  console.log(`配置目录: ${CONFIG_DIR}`);
-  console.log(`数据目录: ${DATA_DIR}\n`);
+  console.log(`\n${t('setup.wizard.title')}\n`);
+  console.log(t('setup.wizard.config_dir', { dir: CONFIG_DIR }));
+  console.log(t('setup.wizard.data_dir', { dir: DATA_DIR }) + '\n');
 
   if (hasBots) {
     // --- Multi-bot mode (bots.json exists) ---
     const bots = loadBotsJson();
-    console.log(`已配置 ${bots.length} 个机器人：\n`);
+    console.log(t('setup.bots.count', { count: bots.length }) + '\n');
     console.log(formatBotConfigTable(bots));
     console.log('');
 
@@ -2353,188 +2380,188 @@ async function cmdSetup(): Promise<void> {
     // 「无效选择即报错退出」旧语义，避免管道输入在循环里打转。
     const interactiveMenus = process.stdin.isTTY && process.stdout.isTTY;
     for (;;) {
-    const action = await pickChoice(rl, {
-      title: '操作',
-      items: [
-        { label: '添加新机器人' },
-        { label: '编辑现有机器人' },
-        { label: '删除机器人' },
-        // 「重新配置」= 丢弃全部现有配置重建，低频且有破坏性，压轴放最后。
-        { label: '重新配置', hint: '丢弃现有配置，重建为单机器人配置' },
-      ],
-      defaultIndex: 0,
-      footer: 'Esc 退出',
-    });
-    if (action === null) {
-      rl.close();
-      console.log('\n已取消。');
-      return;
-    }
+      const action = await pickChoice(rl, () => ({
+        title: t('setup.menu.action_title'),
+        items: [
+          { label: t('setup.menu.add_bot') },
+          { label: t('setup.menu.edit_bot') },
+          { label: t('setup.menu.delete_bot') },
+          // 「重新配置」= 丢弃全部现有配置重建，低频且有破坏性，压轴放最后。
+          { label: t('setup.menu.reconfigure'), hint: t('setup.menu.reconfigure_hint') },
+        ],
+        defaultIndex: 0,
+        footer: t('setup.menu.footer_exit'),
+      }), { allowLangToggle: true });
+      if (action === null) {
+        rl.close();
+        console.log(`\n${t('setup.common.cancelled')}`);
+        return;
+      }
 
-    if (action === 3) {
-      console.log('\n── 重新配置 ──\n');
+      if (action === 3) {
+        console.log(`\n── ${t('setup.menu.reconfigure')} ──\n`);
+        const newBot = await promptBotConfig(rl);
+        rl.close();
+        if (!newBot) {
+          console.log(`\n${t('setup.common.aborted_keep_config')}`);
+          return;
+        }
+        // Codex review #1: 先 copyFileSync 备份, 再原子写新文件. 之前先 rename
+        // 旧文件再 write, 一旦 write 失败 (磁盘/权限/进程被 kill) 用户就丢了
+        // bots.json. copy 之后写失败旧文件原地不动, .bak 是无害的同名副本.
+        copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+        console.log(t('setup.common.backup_saved', { path: BOTS_JSON_FILE + '.bak' }));
+        writeBotsJsonAtomic([newBot]);
+        console.log(t('setup.common.config_written', { path: BOTS_JSON_FILE }));
+        await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
+        console.log(`${t('setup.common.next_restart')}\n`);
+        return;
+      }
+
+      if (action === 1) {
+        console.log(`\n${t('setup.edit.header')}\n`);
+        const index = await pickBotSelection(rl, bots, t('setup.edit.select_bot'));
+        if (index === undefined) {
+          if (interactiveMenus) {
+            console.log(t('setup.edit.returned_to_menu') + '\n');
+            continue;
+          }
+          rl.close();
+          console.log(`\n${t('setup.edit.no_bot_selected')}`);
+          return;
+        }
+
+        const original = bots[index];
+        let edited: Record<string, any>;
+        try {
+          edited = await promptEditBotConfig(rl, original);
+        } catch (err: any) {
+          rl.close();
+          console.log(`\n${t('setup.edit.failed', { error: err?.message ?? String(err) })}`);
+          return;
+        }
+        if (!ensureBotWorkingDirsExist(edited, '仓库扫描根目录') || !ensureBotDefaultWorkingDirExists(edited)) {
+          rl.close();
+          console.log(t('setup.edit.unmodified'));
+          return;
+        }
+        const cliAvailability = checkCliAvailability({
+          cliId: edited.cliId ?? 'claude-code',
+          cliPathOverride: edited.cliPathOverride,
+          wrapperCli: edited.wrapperCli,
+          cliLaunchMode: edited.cliLaunchMode,
+        });
+        if (!cliAvailability.available) {
+          console.log(`\n${t('setup.cli.unavailable_warn', { reason: cliAvailability.reason ?? '本地启动依赖不可用' })}`);
+          console.log(t('setup.cli.unavailable_hint') + '\n');
+        }
+
+        // 凭证字段有变化时, 像 promptBotConfig 一样跑一次 tenant_access_token
+        // 校验. 失败不写盘——避免编辑后 typo 一个字符, daemon 重启时才发现.
+        // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
+        const appIdChanged = edited.larkAppId !== original.larkAppId;
+        const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
+        if (appIdChanged || appSecretChanged) {
+          console.log(`\n${t('setup.credentials.validating')}`);
+          const { validateCredentials } = await import('./setup/verify-permissions.js');
+          const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
+          if (!v.ok) {
+            rl.close();
+            console.log(`\n${t('setup.credentials.invalid', { error: v.error, message: v.message })}`);
+            console.log(t('setup.edit.retry_hint'));
+            return;
+          }
+          console.log(`${t('setup.credentials.valid')}\n`);
+        }
+        rl.close();
+
+        const nextBots = bots.slice();
+        nextBots[index] = edited;
+        copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+        console.log(t('setup.common.backup_saved', { path: BOTS_JSON_FILE + '.bak' }));
+        writeBotsJsonAtomic(nextBots);
+        console.log(t('setup.edit.updated', { name: botProcessName(edited, index, PM2_NAME), appId: edited.larkAppId }));
+        // appId 切换 = 换了一个飞书应用, 新 appId 大概率需要重新申请权限 + 配重定向 URL.
+        // 把 printRemainingSteps 的深链端给用户, 比 README 警告里那句"历史数据不迁移"更可操作.
+        if (appIdChanged) {
+          await finishOpenPlatformSetup(edited.larkAppId, botBrand(edited));
+        }
+        console.log(`${t('setup.common.next_restart')}\n`);
+        return;
+      }
+
+      if (action === 2) {
+        console.log(`\n${t('setup.delete.header')}\n`);
+        const delIndex = await pickBotSelection(rl, bots, t('setup.delete.select_bot'));
+        if (delIndex === undefined) {
+          if (interactiveMenus) {
+            console.log(t('setup.edit.returned_to_menu') + '\n');
+            continue;
+          }
+          rl.close();
+          console.log(`\n${t('setup.delete.cancelled')}`);
+          return;
+        }
+        const nextBots = bots.slice();
+        const [removed] = nextBots.splice(delIndex, 1);
+        const confirm = (await ask(
+          rl,
+          t('setup.delete.confirm_prompt', { name: botProcessName(removed, delIndex, PM2_NAME), appId: removed.larkAppId }),
+        )).trim().toLowerCase();
+        rl.close();
+        if (confirm !== 'y' && confirm !== 'yes') {
+          console.log(`\n${t('setup.delete.cancelled')}`);
+          return;
+        }
+
+        copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
+        console.log(t('setup.common.backup_saved', { path: BOTS_JSON_FILE + '.bak' }));
+        writeBotsJsonAtomic(nextBots);
+        console.log(t('setup.delete.deleted', { name: botProcessName(removed, delIndex, PM2_NAME), appId: removed.larkAppId }));
+        console.log(`${t('setup.common.next_restart')}\n`);
+        return;
+      }
+
+      console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
       const newBot = await promptBotConfig(rl);
       rl.close();
       if (!newBot) {
-        console.log('\n⚠️  setup 中止，旧配置保留不动。');
+        console.log(`\n${t('setup.common.aborted_bots_json_untouched')}`);
         return;
       }
-      // Codex review #1: 先 copyFileSync 备份, 再原子写新文件. 之前先 rename
-      // 旧文件再 write, 一旦 write 失败 (磁盘/权限/进程被 kill) 用户就丢了
-      // bots.json. copy 之后写失败旧文件原地不动, .bak 是无害的同名副本.
-      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      writeBotsJsonAtomic([newBot]);
-      console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
+      writeBotsJsonAtomic([...bots, newBot]);
+      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: bots.length + 1 })}`);
+      console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
       await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
-      console.log(`下一步: botmux restart\n`);
+      await printAddBotLiveHint(newBot.larkAppId);
       return;
-    }
-
-    if (action === 1) {
-      console.log('\n── 编辑现有机器人 ──\n');
-      const index = await pickBotSelection(rl, bots, '选择要编辑的机器人');
-      if (index === undefined) {
-        if (interactiveMenus) {
-          console.log('   已返回操作菜单。\n');
-          continue;
-        }
-        rl.close();
-        console.log('\n❌ 未选择机器人，配置未修改。');
-        return;
-      }
-
-      const original = bots[index];
-      let edited: Record<string, any>;
-      try {
-        edited = await promptEditBotConfig(rl, original);
-      } catch (err: any) {
-        rl.close();
-        console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
-        return;
-      }
-      if (!ensureBotWorkingDirsExist(edited, '仓库扫描根目录') || !ensureBotDefaultWorkingDirExists(edited)) {
-        rl.close();
-        console.log('   配置未修改。');
-        return;
-      }
-      const cliAvailability = checkCliAvailability({
-        cliId: edited.cliId ?? 'claude-code',
-        cliPathOverride: edited.cliPathOverride,
-        wrapperCli: edited.wrapperCli,
-        cliLaunchMode: edited.cliLaunchMode,
-      });
-      if (!cliAvailability.available) {
-        console.log(`\n⚠️  所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}`);
-        console.log('   配置仍会保存；请在 daemon 所在机器安装或修正 PATH / CLI 路径后再启动新会话。\n');
-      }
-
-      // 凭证字段有变化时, 像 promptBotConfig 一样跑一次 tenant_access_token
-      // 校验. 失败不写盘——避免编辑后 typo 一个字符, daemon 重启时才发现.
-      // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
-      const appIdChanged = edited.larkAppId !== original.larkAppId;
-      const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
-      if (appIdChanged || appSecretChanged) {
-        console.log('\n校验新凭证（取 tenant_access_token）…');
-        const { validateCredentials } = await import('./setup/verify-permissions.js');
-        const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
-        if (!v.ok) {
-          rl.close();
-          console.log(`\n❌ 凭证校验失败 (${v.error}): ${v.message}`);
-          console.log('   配置未修改。请重新运行 botmux setup → 编辑现有机器人。');
-          return;
-        }
-        console.log('✅ 凭证有效\n');
-      }
-      rl.close();
-
-      const nextBots = bots.slice();
-      nextBots[index] = edited;
-      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      writeBotsJsonAtomic(nextBots);
-      console.log(`✅ 已更新机器人 ${botProcessName(edited, index, PM2_NAME)} (${edited.larkAppId})`);
-      // appId 切换 = 换了一个飞书应用, 新 appId 大概率需要重新申请权限 + 配重定向 URL.
-      // 把 printRemainingSteps 的深链端给用户, 比 README 警告里那句"历史数据不迁移"更可操作.
-      if (appIdChanged) {
-        await finishOpenPlatformSetup(edited.larkAppId, botBrand(edited));
-      }
-      console.log(`下一步: botmux restart\n`);
-      return;
-    }
-
-    if (action === 2) {
-      console.log('\n── 删除机器人 ──\n');
-      const delIndex = await pickBotSelection(rl, bots, '选择要删除的机器人');
-      if (delIndex === undefined) {
-        if (interactiveMenus) {
-          console.log('   已返回操作菜单。\n');
-          continue;
-        }
-        rl.close();
-        console.log('\n❌ 未选择机器人，配置未修改。');
-        return;
-      }
-      const nextBots = bots.slice();
-      const [removed] = nextBots.splice(delIndex, 1);
-      const confirm = (await ask(
-        rl,
-        `确认删除 ${botProcessName(removed, delIndex, PM2_NAME)} (${removed.larkAppId})? (y/N): `,
-      )).trim().toLowerCase();
-      rl.close();
-      if (confirm !== 'y' && confirm !== 'yes') {
-        console.log('\n已取消，配置未修改。');
-        return;
-      }
-
-      copyFileSync(BOTS_JSON_FILE, BOTS_JSON_FILE + '.bak');
-      console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
-      writeBotsJsonAtomic(nextBots);
-      console.log(`✅ 已删除机器人 ${botProcessName(removed, delIndex, PM2_NAME)} (${removed.larkAppId})`);
-      console.log(`下一步: botmux restart\n`);
-      return;
-    }
-
-    console.log('\n── 添加新机器人 ──\n');
-    const newBot = await promptBotConfig(rl);
-    rl.close();
-    if (!newBot) {
-      console.log('\n⚠️  setup 中止，bots.json 不动。');
-      return;
-    }
-    writeBotsJsonAtomic([...bots, newBot]);
-    console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
-    console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
-    await printAddBotLiveHint(newBot.larkAppId);
-    return;
     }
 
   } else if (hasEnv) {
     // --- Single-bot mode (.env exists) ---
-    console.log(`当前使用单机器人配置: ${ENV_FILE}`);
+    console.log(t('setup.menu.single_bot_current', { file: ENV_FILE }));
     const rl = createInterface({ input: process.stdin, output: process.stdout });
-    const action = await pickChoice(rl, {
-      title: '操作',
+    const action = await pickChoice(rl, () => ({
+      title: t('setup.menu.action_title'),
       items: [
-        { label: '添加新机器人', hint: '迁移 .env 到 bots.json 多机器人配置' },
-        { label: '覆盖当前配置' },
+        { label: t('setup.menu.add_bot'), hint: t('setup.menu.migrate_env_hint') },
+        { label: t('setup.menu.overwrite_env') },
       ],
       defaultIndex: 0,
-      footer: 'Esc 退出',
-    });
+      footer: t('setup.menu.footer_exit'),
+    }), { allowLangToggle: true });
     if (action === null) {
       rl.close();
-      console.log('\n已取消。');
+      console.log(`\n${t('setup.common.cancelled')}`);
       return;
     }
 
     if (action === 1) {
       rl.close();
-      const ok = await writeSingleBotConfig();
+      const ok = await writeSingleBotConfig({ isFirstStep: false });
       if (ok) {
         renameSync(ENV_FILE, ENV_FILE + '.bak');
-        console.log(`   旧 .env 已备份: ${ENV_FILE}.bak`);
+        console.log(`   ${t('setup.common.backup_saved', { path: ENV_FILE + '.bak' })}`);
       }
       return;
     }
@@ -2544,15 +2571,15 @@ async function cmdSetup(): Promise<void> {
     if (!existingBot.larkAppId || !existingBot.larkAppSecret) {
       console.log('\n⚠️  当前 .env 缺少 LARK_APP_ID 或 LARK_APP_SECRET，请先完成基础配置');
       rl.close();
-      await writeSingleBotConfig();
+      await writeSingleBotConfig({ isFirstStep: false });
       return;
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
-    console.log('\n── 添加新机器人 ──\n');
+    console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
     const newBot = await promptBotConfig(rl);
     rl.close();
     if (!newBot) {
-      console.log('\n⚠️  setup 中止，.env 和 bots.json 都不动。');
+      console.log(`\n${t('setup.common.aborted_env_untouched')}`);
       return;
     }
 
@@ -2560,14 +2587,14 @@ async function cmdSetup(): Promise<void> {
     writeBotsJsonAtomic([existingBot, newBot]);
     renameSync(ENV_FILE, ENV_FILE + '.bak');
     console.log(`\n✅ 已迁移到多机器人配置`);
-    console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
+    console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
+    console.log(`   ${t('setup.common.backup_saved', { path: ENV_FILE + '.bak' })}`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot), appJustCreated: wasAppJustCreatedBySetup(newBot) });
     await printAddBotLiveHint(newBot.larkAppId);
 
   } else {
     // --- Fresh install ---
-    await writeSingleBotConfig();
+    await writeSingleBotConfig({ isFirstStep: true });
   }
 }
 
@@ -3666,15 +3693,16 @@ async function callDashboardEndpoint(
  * `devboxDashboardBaseUrl()` 读侧用的是同一份判据，避免写 9002、读 9001。
  * 非 Devbox / 已配置中心平台或自建反代 / `merlin-cli` 不可用时全部静默 no-op。
  */
-async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
+async function ensureDevboxDashboardExportForCurrentPort(timeoutMs?: number): Promise<string | null> {
   const portFile = join(CONFIG_DIR, '.dashboard-port');
   const port = Number((existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
     || process.env.BOTMUX_DASHBOARD_PORT || '7891');
-  await ensureDevboxDashboardExport({
+  return ensureDevboxDashboardExport({
     port,
     remoteBaseConfigured: Boolean(
       (isRemoteAccessEnabled() && platformMachineBaseUrl()) || publicReverseProxyBaseUrl(),
     ),
+    timeoutMs,
   });
 }
 
@@ -3738,16 +3766,27 @@ async function printDashboardHintWithRetry(): Promise<void> {
   const stepMs = 500;
   const started = Date.now();
   let last: Awaited<ReturnType<typeof callDashboardEndpoint>> | null = null;
-  // 只在轮询之前做一次：导出结果与「dashboard 起没起来」无关，放在循环体里每轮都会
-  // 重新 spawn 一次 merlin-cli，而失败路径最坏每轮付满 5s 超时——本函数自己的预算
-  // 撑不住，实测会把 start/restart 的这段拖到近两倍。
-  await ensureDevboxDashboardExportForCurrentPort();
   for (;;) {
     // Bounded per request (NOT opted into rescanning): this loop's own budget is
     // only consulted below, after the await returns, so a recorded port that
     // accepts the connection and never answers would hang here forever and never
     // reach that check. See requestTimeoutMs in dashboard-endpoint.ts.
     last = await callDashboardEndpoint('/__cli/current', { requestTimeoutMs: stepMs * 4 });
+    // 导出放在 dashboard 在其端口上应答之后（callDashboard 可能自愈
+    // `.dashboard-port`）。「应答」包含 `no-active-token`：全新 Devbox 上没人跑过
+    // `botmux dashboard` 时就是这个状态，此时也要导出——终端链接（PTY/tmux 共用的
+    // buildTerminalUrl）与 CSRF authority 只读导出缓存、不需要 dashboard token。
+    // 拿到可用链接时再用不轮换的 current 重读一次；no-active-token 不调任何
+    // endpoint，绝不创建/轮换 token。两者都结束本循环，所以只导出一次。导出超时
+    // 按剩余预算钳制，重读与轮询同样带 requestTimeoutMs。
+    const exportTimeoutMs = dashboardExportTimeoutForBudget(
+      DASHBOARD_READY_WAIT_MS - (Date.now() - started),
+    );
+    last = await exportAfterDashboardAnswer(
+      last,
+      exportTimeoutMs === null ? null : () => ensureDevboxDashboardExportForCurrentPort(exportTimeoutMs),
+      path => callDashboardEndpoint(path, { requestTimeoutMs: stepMs * 4 }),
+    );
     if (last.ok) {
       // 与 `botmux dashboard` 同一套收敛：绑定中心化平台 / 自建反代后链接不带
       // token（`localUrl` 有值就是这一位），本地直连那条带 token，默认不打印。
@@ -3785,17 +3824,19 @@ async function printDashboardHintWithRetry(): Promise<void> {
  * `dashboard` is the non-rotating get-or-create form; help and invalid
  * subcommands never call either credential endpoint. */
 async function cmdDashboard(args: string[]): Promise<void> {
-  const positional = args.filter(arg => arg !== DASHBOARD_LOCAL_TOKEN_FLAG);
-  const rawAction = positional[0]?.toLowerCase();
-  const resolvesEndpoint = positional.length <= 1
-    && !args.some(arg => ['--help', '-h', 'help'].includes(arg.toLowerCase()))
-    && (rawAction === undefined || rawAction === 'current' || rawAction === 'rotate');
-  if (resolvesEndpoint) await ensureDevboxDashboardExportForCurrentPort();
   // The opt-in for a dead recorded port lives INSIDE executeDashboardCliCommand
   // so it is directly testable (see its doc comment for why source-regex guards
   // were not). `printDashboardHintWithRetry()` deliberately does not use this
   // wrapper — a 500ms poll must never scan the probe range per tick.
-  const execution = await executeDashboardCliCommand(args, callDashboardEndpoint);
+  //
+  // The Devbox export runs INSIDE the wrapper too, after the first endpoint call
+  // has proven which port the live dashboard owns (see
+  // executeDashboardCommandWithExportRefresh).
+  const execution = await executeDashboardCliCommand(
+    args,
+    callDashboardEndpoint,
+    () => ensureDevboxDashboardExportForCurrentPort(),
+  );
   if (execution.kind === 'help') {
     console.log(DASHBOARD_COMMAND_USAGE);
     return;
@@ -4274,14 +4315,70 @@ type AuthoritativeAbandonResult =
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
+type LocalSessionLifecycleMutation = 'delete' | 'resume' | 'suspend' | 'prune' | 'wake';
+
+/** Resolve the coordination mode for a standalone host CLI invocation.
+ * Daemons dotenv-load ~/.botmux/.env, but `botmux delete|resume|suspend|list`
+ * run directly from the user's shell and otherwise see only exported values.
+ * Match dotenv precedence (process env wins) while reading exactly one
+ * non-secret setting from the file and never mutating process.env. */
+function localCliCoordinationMode(
+  env: NodeJS.ProcessEnv = process.env,
+  envFile = ENV_FILE,
+): string | undefined {
+  const inline = env.BOTMUX_COORDINATION_MODE;
+  if (inline !== undefined) return inline.trim();
+  try {
+    return parseDotEnv(readFileSync(envFile, 'utf8')).BOTMUX_COORDINATION_MODE?.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * PostgreSQL primary coordination makes the durable Session row canonical.
+ * The host CLI still discovers sessions from a Pod-local store, so any local
+ * lifecycle mutation can otherwise create a split state (for example local
+ * `closed` while the canonical row remains `active`). Keep every local CLI
+ * mutation fail-closed until it is routed through the durable session-control
+ * lane with fencing.
+ */
+function primaryLocalLifecycleMutationError(
+  operation: LocalSessionLifecycleMutation,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (localCliCoordinationMode(env) !== 'primary') return undefined;
+
+  const action = operation === 'delete'
+    ? '`botmux delete` 关闭'
+    : operation === 'resume'
+      ? '`botmux resume` 恢复'
+      : operation === 'suspend'
+        ? '`botmux suspend` 挂起'
+        : operation === 'prune'
+          ? '`botmux list` 自动清理'
+          : '`botmux list` 唤醒';
+  return `BOTMUX_COORDINATION_MODE=primary 下暂不支持通过本地 CLI ${action}会话；本地 Session store 不是 canonical truth，继续执行可能造成它与 PostgreSQL 状态分裂。请在原话题使用会话卡片执行关闭或恢复；其他生命周期操作需等待 durable session-control 支持。本次未做任何修改。`;
+}
+
+function rejectPrimaryLocalLifecycleMutation(operation: LocalSessionLifecycleMutation): void {
+  const error = primaryLocalLifecycleMutationError(operation);
+  if (!error) return;
+  console.error(`❌ ${error}`);
+  process.exit(1);
+}
+
 async function abandonSessionAuthoritatively(
   session: SessionData,
-  online: DaemonDescriptorLite[] = listOnlineDaemons(),
+  online?: DaemonDescriptorLite[],
 ): Promise<AuthoritativeAbandonResult> {
+  const primaryError = primaryLocalLifecycleMutationError('delete');
+  if (primaryError) return { ok: false, error: primaryError };
+
   if (!session.larkAppId) {
     return { ok: false, error: SESSION_ROW_MISSING_APP_ID };
   }
-  const daemon = online.find(d => d.larkAppId === session.larkAppId);
+  const daemon = (online ?? listOnlineDaemons()).find(d => d.larkAppId === session.larkAppId);
   const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
   const injectedPort = isCurrentSession
     ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
@@ -4343,6 +4440,8 @@ async function abandonSessionAuthoritatively(
 }
 
 async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
+  if (primaryLocalLifecycleMutationError('prune')) return false;
+
   const result = await postOwningDaemonSessionMutation(session, 'prune');
   if (result === 'applied') return true;
   if (result === 'refused' || result === 'forbidden_isolated') return false;
@@ -4732,6 +4831,9 @@ async function requestDormantSessionWake(
   | { ok: true }
   | { ok: false; error: string }
 > {
+  const primaryError = primaryLocalLifecycleMutationError('wake');
+  if (primaryError) return { ok: false, error: primaryError };
+
   const online = listOnlineDaemons();
   const daemon = session.larkAppId
     ? online.find(d => d.larkAppId === session.larkAppId)
@@ -5345,12 +5447,24 @@ async function cmdList(): Promise<void> {
     }
     return closed;
   };
-  // Scratches: close silently — they were placeholders, not dead sessions.
-  await closeNow(prunedScratch, 'scratch');
-  if (pruned.length > 0) {
-    const prunedCount = await closeNow(pruned, 'real');
-    if (prunedCount > 0) {
-      console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+  const primaryMode = localCliCoordinationMode() === 'primary';
+  if (primaryMode) {
+    // Keep `list` read-only in primary mode. These rows come from the Pod-local
+    // store, so even an apparently harmless scratch cleanup could close only
+    // the local row while PostgreSQL keeps the canonical Session active.
+    live.push(...prunedScratch, ...pruned);
+    const skipped = prunedScratch.length + pruned.length;
+    if (skipped > 0) {
+      console.warn(`⚠️ primary coordination 下已跳过 ${skipped} 个本地会话的自动清理；本次仅展示，不修改状态。`);
+    }
+  } else {
+    // Scratches: close silently — they were placeholders, not dead sessions.
+    await closeNow(prunedScratch, 'scratch');
+    if (pruned.length > 0) {
+      const prunedCount = await closeNow(pruned, 'real');
+      if (prunedCount > 0) {
+        console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+      }
     }
   }
 
@@ -5374,6 +5488,8 @@ async function cmdList(): Promise<void> {
 }
 
 async function cmdDelete(): Promise<void> {
+  rejectPrimaryLocalLifecycleMutation('delete');
+
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux delete <session-id|all>');
@@ -5500,6 +5616,8 @@ async function cmdSuspend(): Promise<void> {
     console.error('              下次冷启动由 provisioning 自动同步最新登录凭证）');
     process.exit(1);
   }
+
+  if (!dryRun) rejectPrimaryLocalLifecycleMutation('suspend');
 
   const sessions = loadSessions();
   let matched = [...sessions.values()].filter(s => s.status === 'active');
@@ -6541,6 +6659,8 @@ async function cmdWorkflowGrant(runId: string | undefined, rest: string[]): Prom
 }
 
 async function cmdResume(): Promise<void> {
+  rejectPrimaryLocalLifecycleMutation('resume');
+
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux resume <session-id|prefix>');
@@ -6783,6 +6903,7 @@ const SEND_HELP_BODY = [
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
   '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈与页脚签名',
+  '       --schedule-remove-self          scheduled turn 的 final 成功投递后删除当前任务',
   '       --completion-proposal-file <path>  仅限标准 final；附一个 requester-only 的二选一可选后续动作',
   '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
@@ -7667,6 +7788,28 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
 }
 
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
+  const remoteRunnerSessionTool = rest.includes('--remote-runner-session-tool');
+  if (remoteRunnerSessionTool && process.env.BOTMUX_HOST_RELAY_AUTHORIZED !== '1') {
+    console.error('botmux schedule refused: --remote-runner-session-tool requires the owning worker\'s live turn authority');
+    process.exit(1);
+  }
+  const trustedRemoteRunnerRelay = remoteRunnerSessionTool
+    && process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+    && !!process.env.BOTMUX_SESSION_ID
+    && !!process.env.BOTMUX_TURN_ID;
+  if (remoteRunnerSessionTool && !trustedRemoteRunnerRelay) {
+    console.error('botmux schedule refused: the Remote Runner relay is missing its frozen session/turn');
+    process.exit(1);
+  }
+  const remoteRunnerControllerOpenId = trustedRemoteRunnerRelay
+    ? process.env.BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID?.trim()
+    : undefined;
+  if (remoteRunnerControllerOpenId
+      && !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId)) {
+    console.error('botmux schedule refused: Remote Runner controller identity is invalid');
+    process.exit(1);
+  }
+  rest = rest.filter(arg => arg !== '--remote-runner-session-tool');
   if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
     console.log(SCHEDULE_UPDATE_USAGE);
     return;
@@ -7674,6 +7817,14 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
   // writes to the right file even when invoked outside the daemon env.
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
+
+  const frozenRelaySession = trustedRemoteRunnerRelay
+    ? await detectCurrentSession()
+    : undefined;
+  if (trustedRemoteRunnerRelay && !frozenRelaySession) {
+    console.error('botmux schedule refused: the Remote Runner relay session is unavailable');
+    process.exit(1);
+  }
 
   const scheduler = await import('./core/scheduler.js');
   const scheduleStore = await import('./services/schedule-store.js');
@@ -7684,8 +7835,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // binds to the primary bot (bots.json[0]) so mutations keep the legacy
   // "ownerless task runs on bot-0" semantics; `list` without a bound bot
   // aggregates every readable store instead.
-  const cliScopeAppId = argValue(rest, '--lark-app-id')
-    ?? (await detectCurrentSession())?.larkAppId
+  const cliScopeAppId = frozenRelaySession?.larkAppId
+    ?? (!trustedRemoteRunnerRelay ? argValue(rest, '--lark-app-id') : undefined)
+    ?? (!trustedRemoteRunnerRelay ? (await detectCurrentSession())?.larkAppId : undefined)
     ?? process.env.BOTMUX_LARK_APP_ID;
   // LAZY + sandbox-safe bots.json read: sandboxed sessions always carry a
   // scope (env-injected appId) and must never touch bots.json — it is denied
@@ -7761,7 +7913,17 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   }
 
   if (sub === 'add') {
-    const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
+    const [positionalSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
+    const structuredSchedule = argValue(rest, '--schedule');
+    if (trustedRemoteRunnerRelay && (structuredSchedule === undefined || positionalSchedule !== undefined || promptParts.length > 0)) {
+      console.error('botmux schedule refused: the Remote Runner relay requires structured schedule/prompt values');
+      process.exit(1);
+    }
+    if (!trustedRemoteRunnerRelay && structuredSchedule !== undefined) {
+      console.error('--schedule is reserved for the Remote Runner host relay.');
+      process.exit(1);
+    }
+    const rawSchedule = trustedRemoteRunnerRelay ? structuredSchedule : positionalSchedule;
     if (!rawSchedule) {
       console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
@@ -7773,10 +7935,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const cur = await detectCurrentSession();
+    const cur = frozenRelaySession ?? await detectCurrentSession();
     let creatorAuthError: unknown;
-    try { await detectAuthenticatedCurrentSession(); }
-    catch (error) { creatorAuthError = error; }
+    if (!trustedRemoteRunnerRelay) {
+      try { await detectAuthenticatedCurrentSession(); }
+      catch (error) { creatorAuthError = error; }
+    }
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
       console.error('--id 需要一个 8 位小写十六进制任务 ID。');
@@ -7786,15 +7950,21 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('--id 只接受 8 位小写十六进制任务 ID。');
       process.exit(1);
     }
-    const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
-    const explicitRootMessageId = argValue(rest, '--root-msg-id');
+    const chatId = trustedRemoteRunnerRelay ? cur?.chatId : argValue(rest, '--chat-id') ?? cur?.chatId;
+    const explicitRootMessageId = trustedRemoteRunnerRelay ? undefined : argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
       ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
     // Resolve the daemon that owns the authoritative task store. A bare host
     // terminal uses the primary bot selected above; managed sessions stay
     // pinned to their own app.
     const larkAppId = cliScopeAppId ?? scheduleStore.getScheduleScope() ?? undefined;
-    const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
+    const workingDir = trustedRemoteRunnerRelay
+      ? cur?.workingDir
+      : argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
+    if (!workingDir) {
+      console.error('botmux schedule refused: the Remote Runner relay working directory is unavailable');
+      process.exit(1);
+    }
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
     const legacyDeliver = argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined;
     const wantsNewTopic = rest.includes('--new-topic') || legacyDeliver === 'new-topic';
@@ -7898,7 +8068,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             path: SCHEDULE_DELEGATED_ADD_ROUTE,
             sessionId: cur.sessionId,
             larkAppId,
-            body: { task: {
+            body: {
+              ...(trustedRemoteRunnerRelay ? { remoteRunnerSessionTool: true } : {}),
+              ...(remoteRunnerControllerOpenId ? { remoteRunnerControllerOpenId } : {}),
+              task: {
               id: delegatedTaskId,
               name,
               schedule: rawSchedule,
@@ -7916,7 +8089,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               calendarDayType: normalizedDayType,
               ...(wantsFollowActive ? { followActive: true } : {}),
               ...(topicTitle ? { topicTitle } : {}),
-            } },
+              },
+            },
           });
         } catch (error) {
           if (creatorAuthError) throw creatorAuthError;
@@ -8006,7 +8180,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const scheduledSelfManageCandidate = !!mutationSession?.turnId
     && mutationSession.turnId.startsWith('schedule:')
     && ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
-  if (sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
+  if (!trustedRemoteRunnerRelay
+      && sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
     await detectAuthenticatedCurrentSession();
   }
   const managedMutation = async (
@@ -8038,7 +8213,14 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         path: SCHEDULE_MANAGED_MUTATE_ROUTE,
         sessionId: mutationSession?.sessionId ?? '',
         larkAppId: mutationAppId,
-        body: { action, id, larkAppId: mutationAppId, ...extra },
+        body: {
+          ...(trustedRemoteRunnerRelay ? { remoteRunnerSessionTool: true } : {}),
+          ...(remoteRunnerControllerOpenId ? { remoteRunnerControllerOpenId } : {}),
+          action,
+          id,
+          larkAppId: mutationAppId,
+          ...extra,
+        },
       });
     } catch (error) {
       throw new Error(`无法连接当前 Bot daemon；未执行任何定时任务修改：${error instanceof Error ? error.message : String(error)}`);
@@ -8054,7 +8236,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       // refuses canonical updates for delegated tasks and for tasks bound to a
       // protected precondition (which the CLI cannot rebind).
       const updates = readScheduleUpdate(rest);
-      await detectAuthenticatedCurrentSession();
+      if (!trustedRemoteRunnerRelay) await detectAuthenticatedCurrentSession();
       await managedMutation('update', updates);
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
       break;
@@ -8625,6 +8807,7 @@ import {
   prepareCardMarkdown,
   type CardRenderDiagnostic,
   type CardUsageSnapshot,
+  type ReplyCardV2,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
 import { repairReplyMarkdown } from './services/reply-markdown.js';
@@ -8636,7 +8819,7 @@ import {
 } from './im/lark/reply-card-style.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
 import { buildCompletionProposalElement } from './im/lark/completion-proposal-card.js';
-import { composeFinalCardSections } from './im/lark/final-card-sections.js';
+import { composeFinalCardSections, customFinalCardError } from './im/lark/final-card-sections.js';
 import {
   completionProposalCardDispatchUuid,
   createCompletionProposalStore,
@@ -8758,7 +8941,7 @@ async function relaySend(
     // the dashboard hand anyway; excluding it would silently send the reason as a
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent', '--schedule-remove-self']);
     content = pos.length > 0
       ? normalizePositionalSendContent(pos.join(' '))
       : await readStdin();
@@ -8841,7 +9024,7 @@ async function relaySend(
   // identity (must match the watcher's allowlist); path,
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self']);
   const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
@@ -9372,7 +9555,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
+    const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--schedule-remove-self']);
     content = pos.length > 0
       ? normalizePositionalSendContent(pos.join(' '))
       : await readStdin();
@@ -9785,6 +9968,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
     process.exit(2);
   }
+  const scheduleRemoveSelfOccurrences = rest.filter(token => token === '--schedule-remove-self').length;
+  if (scheduleRemoveSelfOccurrences > 1) {
+    console.error('botmux send: --schedule-remove-self 只能指定一次');
+    process.exit(2);
+  }
+  const scheduleRemoveSelfRequested = scheduleRemoveSelfOccurrences === 1;
   const asOccurrences = rest.filter(token => token === '--as' || token.startsWith('--as=')).length;
   if (asOccurrences > 1) {
     console.error('botmux send: --as 只能指定一次');
@@ -10072,7 +10261,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
   const turnSendLedger = new TurnSendLedger(resolveDataDir());
-  while (liveMarkerCtx?.markerPid && liveMarkerCtx.turnId && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
+  while (!scheduleRemoveSelfRequested
+    && liveMarkerCtx?.markerPid && liveMarkerCtx.turnId
+    && (liveMarkerCtx.queuedTurnId || (liveMarkerCtx.queuedTurns && liveMarkerCtx.queuedTurns.length > 0))) {
     const activeMarkerKey = {
       larkAppId: originSession?.larkAppId ?? s.larkAppId,
       sessionId: originSessionId ?? sid,
@@ -10092,6 +10283,78 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     break;
   }
+
+  const scheduleCleanupPlan = planScheduleFinalCleanup({
+    requested: scheduleRemoveSelfRequested,
+    responseKind,
+    turnId: currentTurnId,
+    incompatible: [
+      ...(sendTopLevel ? ['--top-level'] : []),
+      ...(overrideChatId ? ['--chat-id'] : []),
+      ...(sendInto ? ['--into'] : []),
+      ...(asVoice ? ['--voice'] : []),
+      ...(customCardRequested ? ['--card-file/--card-json'] : []),
+      ...(files.length > 0 ? ['--files'] : []),
+      ...(videoAttachments.length > 0 ? ['--videos'] : []),
+      ...(attention.requested ? ['--attention'] : []),
+      ...(urgent.requested ? ['--urgent'] : []),
+      ...(asChoice ? ['--as'] : []),
+      ...(isSlashSend ? ['--slash'] : []),
+    ],
+  });
+  if (!scheduleCleanupPlan.ok) {
+    console.error(`botmux send: ${scheduleCleanupPlan.error}`);
+    process.exit(2);
+  }
+  const scheduleRemoveSelfTaskId = scheduleCleanupPlan.taskId;
+  let scheduleSelfCleanup: {
+    requested: true;
+    taskId: string;
+    removed: boolean;
+    replay?: boolean;
+    error?: string;
+  } | undefined;
+  const removeScheduleSelfAfterFinal = async (): Promise<typeof scheduleSelfCleanup> => {
+    if (!scheduleRemoveSelfTaskId) return undefined;
+    if (scheduleSelfCleanup) return scheduleSelfCleanup;
+    try {
+      const response = await postCurrentSessionDaemonRoute({
+        path: SCHEDULE_MANAGED_MUTATE_ROUTE,
+        sessionId: sid,
+        larkAppId: s.larkAppId!,
+        body: { action: 'remove', id: scheduleRemoveSelfTaskId },
+      });
+      const body = await response.json().catch(() => ({})) as {
+        ok?: boolean;
+        replay?: boolean;
+        error?: string;
+      };
+      if (!response.ok || body.ok !== true) {
+        throw new Error(body.error ?? `HTTP ${response.status}`);
+      }
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: true,
+        ...(body.replay === true ? { replay: true } : {}),
+      };
+      console.error(body.replay === true
+        ? `✓ 定时任务 ${scheduleRemoveSelfTaskId} 已经删除（幂等回读）`
+        : `✓ 最终答复已投递，定时任务 ${scheduleRemoveSelfTaskId} 已自动删除`);
+    } catch (error) {
+      scheduleSelfCleanup = {
+        requested: true,
+        taskId: scheduleRemoveSelfTaskId,
+        removed: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      console.error(
+        `⚠️ 最终答复已投递，但定时任务 ${scheduleRemoveSelfTaskId} 自动删除失败：${scheduleSelfCleanup.error}`
+        + '；当前 turn 已保留，请原样重试同一命令（不会重复发送 final，只会补做自删）',
+      );
+    }
+    return scheduleSelfCleanup;
+  };
 
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
@@ -10177,8 +10440,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error('botmux send refused: --remote-runner-outbound requires the owning worker\'s live turn authority');
       process.exit(2);
     }
-    if (responseKind === undefined || !['progress', 'auxiliary'].includes(responseKind)) {
-      console.error('botmux send refused: --remote-runner-outbound requires --response-kind progress|auxiliary');
+    if (responseKind === undefined || !['progress', 'auxiliary', 'final'].includes(responseKind)) {
+      console.error('botmux send refused: --remote-runner-outbound requires --response-kind progress|auxiliary|final');
       process.exit(2);
     }
     if (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined || noQuote
@@ -10330,6 +10593,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // docCommentTargets entry remains the authoritative origin sink.
   const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
     || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
+  if (scheduleRemoveSelfTaskId && isOriginDocCommentTurn) {
+    console.error('botmux send: --schedule-remove-self 只支持当前会话内的标准 final 卡，不支持文档评论回复');
+    process.exit(2);
+  }
   // A virtual document anchor is never an IM receive_id. Missing, ambiguous,
   // stale, or cross-session origin state must fail before any provider effect.
   if (!isOriginDocCommentTurn
@@ -10378,7 +10645,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound']);
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound', '--schedule-remove-self']);
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -10456,11 +10723,22 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound', '--schedule-remove-self']);
     if (pos.length > 0) {
       content = normalizePositionalSendContent(pos.join(' '));
     } else {
       content = await readStdin();
+    }
+  }
+  const customFinal = !!customCard && effectiveResponseKind === 'final';
+  if (customFinal) {
+    const error = customFinalCardError(customCard!);
+    if (error) { console.error(`botmux send: ${error}`); process.exit(2); }
+    // A custom final enters the same authoritative reply lifecycle, never a
+    // detoured publication. Keep these gates even when feedback is disabled.
+    if (sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) {
+      console.error('botmux send: 自定义 final 卡片仅支持当前会话内回复');
+      process.exit(2);
     }
   }
   // Keep memory attribution in the model's rollout, but never render the
@@ -10688,6 +10966,14 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    await removeScheduleSelfAfterFinal();
+    if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
+      advanceAncestorSessionTurn(
+        sendDataDir,
+        liveMarkerCtx.markerPid,
+        originTurnId ?? currentTurnId,
+      );
+    }
     console.error(`✓ 已复用本轮最终回答 ${existingTurnPrimary.messageId}`);
     console.log(JSON.stringify({
       success: true,
@@ -10695,6 +10981,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       sessionId: sid,
       turnId: currentTurnId,
       replayed: true,
+      ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
     }));
     return;
   }
@@ -11241,7 +11528,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
   const withOncallGroup = (card: string): string => {
-    if (effectiveResponseKind !== 'final' || customCardRequested || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
+    if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
     const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
     if (attached !== card) oncallGroupCard = JSON.parse(attached);
     return attached;
@@ -11254,8 +11541,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
-  if (feedbackPolicy && effectiveResponseKind === 'final' && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
-    console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
+  if (feedbackPolicy && effectiveResponseKind === 'final' && (asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
+    console.error('botmux send: --response-kind final 仅支持当前会话内的最终答案卡片');
     process.exit(2);
   }
   let completionProposalVisible: CompletionProposalVisibleInput | undefined;
@@ -11585,7 +11872,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(originTurnId ? { turnId: originTurnId } : {}),
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
-        ...(remoteRunnerOutbound ? { terminalIndependent: true } : {}),
+        ...(remoteRunnerOutbound && effectiveResponseKind !== 'final'
+          ? { terminalIndependent: true }
+          : {}),
         ...(terminalCarrier ? { terminalCarrier } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
@@ -11849,9 +12138,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // A file-sandbox relay supplies a host-private copy normalized inside the
     // sandbox namespace. Voice/doc-comment paths returned above use the same
     // already-sanitized outbound content, without card-markdown preparation.
-    let text = extractCardText(content);
+    let text = customFinal ? expectedLinkRenderedContent : extractCardText(content);
     const preparedContentFile = process.env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
-    if (preparedContentFile) {
+    if (!customCard && preparedContentFile) {
       try { text = readFileSync(preparedContentFile, 'utf-8'); } catch { /* fall back safely below */ }
     }
 
@@ -11901,7 +12190,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
       // --slash 同理跳过：斜杠命令正文（如 `/clear`）不该被扫成 @，收件人只认
       // 显式 --mention（下面的 slash 分支只用 explicit mentions 拼 <at> 前缀）。
-      if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin) {
+      if (!noMention && !isSlashSend && !customCard && !vcMeetingManagedSendOrigin) {
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
       // Scan a code-span-stripped copy so a bot name quoted inside backticks or a
       // fenced block (e.g. an example `botmux send --mention @Bot …` or an
@@ -12003,16 +12292,19 @@ async function cmdSend(rest: string[]): Promise<void> {
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
+    let customCardUsedIds = new Set<string>();
     if (customCard) {
       const inlineResult = applyInlineMentionsToCard(customCard, mentions);
+      customCardUsedIds = inlineResult.usedIds;
+      customCard = inlineResult.card;
       const mentionFooter = orderedFooterRecipients({
         sendTo: footerAddressing.sendTo,
         mentionIds: mentions.map(m => m.open_id),
         cc: footerAddressing.cc,
         inlinedIds: inlineResult.usedIds,
       });
-      const withFooter = withCustomCardMentionFooter(
-        inlineResult.card,
+      const withFooter = customFinal ? { ok: true as const, card: customCard } : withCustomCardMentionFooter(
+        customCard,
         mentionFooter,
         localeForBot(appId),
       );
@@ -12057,7 +12349,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       console.error(`botmux send: --layout 不作用于纯${pureFileSend ? '文件' : '视频'}消息，本次已忽略`);
       replyLayout = undefined;
     }
-    if (customCard) {
+    if (customCard && !customFinal) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
     } else if (isSlashSend) {
       // --slash: deliver the command as a single-line plain-`text` message so the
@@ -12122,6 +12414,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       messageId = videoResult.sent[0];
     } else {
       // 回复一律卡片（纯文本 post 路径已删）。
+      const customReplyCard = customCard as unknown as ReplyCardV2 | undefined;
       const cardText = repairReplyMarkdown(text);
       // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
       // aware, see applyInlineMentions); any --mention not inlined here is
@@ -12132,7 +12425,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       const layoutHeader = replyLayout
         ? buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)
         : undefined;
-      const { text: md, usedIds } = applyInlineMentions(layoutBody.markdown, mentions);
+      const { text: md, usedIds } = customCard
+        ? { text: '', usedIds: customCardUsedIds }
+        : applyInlineMentions(layoutBody.markdown, mentions);
       // Non-inlined mentions are no longer dangled as a trailing @ block at the
       // body bottom — they're consolidated onto the footer `发送给：` line below
       // (human addressee first, then explicit targets). See orderedFooterRecipients.
@@ -12152,7 +12447,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           ? 'lexical'
           : 'filesystem';
       const renderDiagnostics: CardRenderDiagnostic[] = [];
-      const elements = (md || imageKeys.length > 0)
+      const elements = customReplyCard
+        ? [...customReplyCard.body.elements]
+        : (md || imageKeys.length > 0)
         ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode, imageMode, renderDiagnostics)
         : [];
 
@@ -12238,7 +12535,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      const canonicalCard = createReplyCard([...elements], layoutHeader);
+      // Preserve caller-owned layout/header/config; only the host sections and
+      // multi-user updates join the canonical lifecycle. Never flatten to Markdown.
+      const canonicalCard: ReplyCardV2 = customReplyCard
+        ? { ...customReplyCard,
+            config: { ...customReplyCard.config, update_multi: true },
+            body: { ...customReplyCard.body, elements } }
+        : createReplyCard([...elements], layoutHeader);
       if (effectiveResponseKind === 'final') {
         composeFinalCardSections(canonicalCard, {
           ...(completionProposalRecord
@@ -12282,6 +12585,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
         && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
+        && !containsLarkAtTag(customCardPayload)
         && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
       const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
       if (replyRecord && replyKey) {
@@ -12360,9 +12664,17 @@ async function cmdSend(rest: string[]): Promise<void> {
           Date.now(),
           messageId,
           text,
-          customCard || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
+          (customCard && !customFinal) || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
             ? 'non_patchable'
             : 'standard_reply_card',
+        );
+      }
+      await removeScheduleSelfAfterFinal();
+      if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
+        advanceAncestorSessionTurn(
+          sendDataDir,
+          liveMarkerCtx.markerPid,
+          originTurnId ?? currentTurnId,
         );
       }
       console.error(`✓ 已复用本轮最终回答 ${messageId}`);
@@ -12372,6 +12684,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         sessionId: sid,
         turnId: currentTurnId,
         replayed: true,
+        ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       }));
       return;
     }
@@ -12388,11 +12701,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // gating it on `feedbackPolicy` used to mean "feedback off → no completion
     // record at all". Record every canonical in-session final answer; the
     // feedback policy/card only decides whether a *control* rides along.
-    // The excluded shapes (custom card, pure video, managed VC send) are not
-    // canonical final-answer cards — and they are exactly the shapes the
-    // feedback gate above rejects outright, so the recorded set stays identical
-    // whether feedback is on or off.
-    if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    // Schema-2 custom finals cross the same composition/delivery path above.
+    // Non-card attachments and managed VC sends retain their existing exclusions.
+    if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
       const carriesFeedbackControl = !!feedbackPolicy;
       const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
       const correlationDiscriminator = currentTurnId ? messageId : undefined;
@@ -12493,13 +12804,16 @@ async function cmdSend(rest: string[]): Promise<void> {
         sentAtMs,
         messageId,
         text,
-        !customCard && !pureFileSend && !pureVideoSend
+        (!customCard || customFinal) && !pureFileSend && !pureVideoSend
           ? 'standard_reply_card'
           : 'non_patchable',
       );
     }
+    await removeScheduleSelfAfterFinal();
     let advancedNextTurnId: string | undefined;
-    if (effectiveResponseKind === 'final' && liveMarkerCtx?.markerPid) {
+    if (effectiveResponseKind === 'final'
+      && (!scheduleRemoveSelfTaskId || scheduleSelfCleanup?.removed === true)
+      && liveMarkerCtx?.markerPid) {
       const advResult = advanceAncestorSessionTurn(
         sendDataDir,
         liveMarkerCtx.markerPid,
@@ -12669,6 +12983,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
+      ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       ...(completionProposalRecord && !completionProposalOmittedReason
         ? { proposalId: completionProposalRecord.proposalId, proposalStatus: completionProposalRecord.status }
         : completionProposalFile !== undefined
@@ -13071,7 +13386,9 @@ async function postCurrentSessionDaemonRoute(input: {
   sessionId: string;
   larkAppId: string;
   body: Record<string, unknown>;
-  originClaim?: ManagedOriginCapabilityClaim;
+  /** A caller-frozen origin claim. `null` = frozen as "no claim" (never re-read);
+   *  omitted = read the current capability for this request (legacy callers). */
+  originClaim?: ManagedOriginCapabilityClaim | null;
   signal?: AbortSignal;
 }): Promise<Response> {
   const relayDir = process.env.BOTMUX_SEND_RELAY;
@@ -13091,12 +13408,14 @@ async function postCurrentSessionDaemonRoute(input: {
       signal: input.signal,
     }, hostSecret);
   }
-  const originClaim = input.originClaim ?? readManagedOriginCapability(
-    resolveDataDir(),
-    input.sessionId,
-    relayDir,
-    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-  );
+  const originClaim = input.originClaim !== undefined
+    ? input.originClaim ?? undefined
+    : readManagedOriginCapability(
+        resolveDataDir(),
+        input.sessionId,
+        relayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      );
   return loopbackFetch(`http://127.0.0.1:${port}${input.path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -13115,6 +13434,7 @@ async function trySyncProjectDispatch(input: {
   sessionId: string;
   larkAppId: string;
   action: ReturnType<typeof buildProjectDispatchSyncAction>;
+  originClaim?: ManagedOriginCapabilityClaim | null;
 }): Promise<boolean> {
   try {
     const response = await postCurrentSessionDaemonRoute({
@@ -13122,6 +13442,7 @@ async function trySyncProjectDispatch(input: {
       sessionId: input.sessionId,
       larkAppId: input.larkAppId,
       body: { ...input.action },
+      ...(input.originClaim !== undefined ? { originClaim: input.originClaim } : {}),
     });
     const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
     if (response.ok && body.ok) return true;
@@ -13141,6 +13462,7 @@ async function assertProjectDispatchPolicy(input: {
   hasLegacyBots: boolean;
   title: string;
   existingDispatch: boolean;
+  originClaim?: ManagedOriginCapabilityClaim | null;
 }): Promise<void> {
   const response = await postCurrentSessionDaemonRoute({
     path: `/api/sessions/${encodeURIComponent(input.sessionId)}/project-dispatch-policy`,
@@ -13153,6 +13475,7 @@ async function assertProjectDispatchPolicy(input: {
       title: input.title,
       existingDispatch: input.existingDispatch,
     },
+    ...(input.originClaim !== undefined ? { originClaim: input.originClaim } : {}),
   });
   const body = await response.json().catch(() => ({})) as {
     ok?: boolean;
@@ -13177,6 +13500,18 @@ async function resolveDispatchThreadId(larkAppId: string, rootMessageId: string)
   } catch {
     return null;
   }
+}
+
+/** Immutable snapshot of the caller's managed-origin claim (null for a host
+ *  caller, which has no channel/relay and authenticates as trusted host). */
+function freezeDispatchOriginClaim(sessionId: string): ManagedOriginCapabilityClaim | null {
+  const claim = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  );
+  return claim ? Object.freeze({ ...claim }) : null;
 }
 
 /** Dispatch options the host relay deliberately refuses (see relayDispatch's
@@ -13403,6 +13738,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
   }
+  // Freeze ONE origin claim for this whole dispatch BEFORE its first await. An
+  // isolated caller authenticates every daemon request with it; re-reading the
+  // rotating capability per request would let a dispatch that straddles a turn
+  // interruption register its seed as turn N and then deliver the kickoff as
+  // turn N+1 (with N+1's output sink). With the claim frozen, the daemon
+  // refuses every request after a rotation (claim ≠ live capability). Hosts
+  // read no claim (null) and keep their trusted-host authentication.
+  const dispatchOriginClaim = freezeDispatchOriginClaim(sid);
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
@@ -13424,12 +13767,35 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     rootMessageId: dispatchOrigin.rootMessageId, replyTargetRootId: dispatchTurn?.rootMessageId,
     replyTargetTurnId: dispatchTurn?.turnId, replyTargetQuoteOnly: dispatchTurn?.quoteOnly, currentTurnId: dispatchTurnId,
   });
+  // Origin-revocation fence for this CLI's OWN provider write (the `/repo`
+  // prime goes straight to Lark): an isolated caller re-presents the SAME frozen
+  // claim to the daemon right before writing. A rotated/revoked capability or a
+  // settled turn (output-sink rule) refuses the write. Host callers: no-op.
+  const assertDispatchOriginLive = async (): Promise<void> => {
+    if (!dispatchOriginClaim) return;
+    try {
+      await assertProjectDispatchPolicy({
+        sessionId: sid,
+        larkAppId: s.larkAppId!,
+        targetChatId,
+        targetAppIds: parsedBotApps.map(item => item.appId),
+        hasLegacyBots: legacyBots.length > 0,
+        title: title.trim(),
+        existingDispatch: !!intoRoot,
+        originClaim: dispatchOriginClaim,
+      });
+    } catch (error) {
+      throw new Error(`dispatch origin changed before provider effect: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const dispatchWriteOptions = { beforeWrite: async () => {
+    await assertDispatchOriginLive();
     const { getBot } = await import('./bot-registry.js');
     if (getBot(dispatchSourceAppId).config.topicUnavailablePolicy !== 'stop' || dispatchSource.mode === 'plain') return;
     const { getMessageDetail } = await import('./im/lark/client.js');
     await assertMessageTopicAvailable(dispatchSourceAppId, dispatchSource.rootMessageId,
       (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+    await assertDispatchOriginLive();
   } };
 
   const targetChatId = overrideChatId ?? s.chatId;
@@ -13492,6 +13858,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       hasLegacyBots: legacyBots.length > 0,
       title: title.trim(),
       existingDispatch: !!intoRoot,
+      originClaim: dispatchOriginClaim,
     });
   } catch (error) {
     console.error(`dispatch 不符合当前群的协作模式: ${error instanceof Error ? error.message : String(error)}`);
@@ -13640,7 +14007,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const deliverKickoff = async (rootId: string, content: string): Promise<string> => {
     const response = await postCurrentSessionDaemonRoute({
-      path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId,
+      path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId, originClaim: dispatchOriginClaim,
       body: { rootId, chatId: targetChatId, content,
         targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0,
         ...(delegateScheduleCreate ? { delegateScheduleCreate: true } : {}),
@@ -13687,6 +14054,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         missingBotAppIds: acceptance?.missingBotAppIds,
       });
       const projectSynced = await trySyncProjectDispatch({
+        originClaim: dispatchOriginClaim,
         sessionId: sid,
         larkAppId: s.larkAppId,
         action: buildProjectDispatchSyncAction({
@@ -13728,6 +14096,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       path: DISPATCH_REPORT_REGISTER_ROUTE,
       sessionId: sid,
       larkAppId: s.larkAppId,
+      originClaim: dispatchOriginClaim,
       body: {
         seedText: built.seedText,
         targetChatId,
@@ -13813,6 +14182,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       missingBotAppIds: acceptance?.missingBotAppIds,
     });
     const projectSynced = await trySyncProjectDispatch({
+        originClaim: dispatchOriginClaim,
       sessionId: sid,
       larkAppId: s.larkAppId,
       action: buildProjectDispatchSyncAction({
@@ -13870,6 +14240,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         errorCode: 'TRANSPORT_FAILED',
       });
       await trySyncProjectDispatch({
+        originClaim: dispatchOriginClaim,
         sessionId: sid,
         larkAppId: s.larkAppId,
         action: buildProjectDispatchSyncAction({
@@ -16864,6 +17235,7 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // prefix keeps the name outside the plugin-command grammar so the v1 default
     // branch's plugin lookup can never match it.
     '__turn-idle-v2',
+    '__cursor-usage-v1', // local, session-scoped usage callback; no messaging
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
@@ -17782,9 +18154,27 @@ switch (command) {
   }
   case 'setup': {
     // 带子命令（list/add/configure/edit/remove/help）走脚本化非 TUI 模式；空参数 / 纯
-    // flag（如 --no-open-platform-auto）保持原交互 TUI，向后兼容。
+    // flag（如 --no-open-platform-auto / --lang en）保持原交互 TUI，向后兼容。
     const setupArgs = process.argv.slice(3);
-    if (isScriptedSetupInvocation(setupArgs)) await cmdSetupScripted(setupArgs);
+    const cleanSetupArgs = setupArgs.filter((a, i) => {
+      if (a === '--lang' || a.startsWith('--lang=')) return false;
+      if (i > 0 && setupArgs[i - 1] === '--lang') return false;
+      return true;
+    });
+    const isScripted = isScriptedSetupInvocation(cleanSetupArgs);
+    if (!isScripted) {
+      const langFlagIdx = setupArgs.findIndex(a => a === '--lang' || a.startsWith('--lang='));
+      if (langFlagIdx !== -1) {
+        const raw = setupArgs[langFlagIdx].startsWith('--lang=')
+          ? setupArgs[langFlagIdx].slice(7)
+          : setupArgs[langFlagIdx + 1];
+        if (isLocale(raw)) {
+          setGlobalLocale(raw);
+          setDefaultLocale(raw);
+        }
+      }
+    }
+    if (isScripted) await cmdSetupScripted(setupArgs);
     else await cmdSetup();
     break;
   }
@@ -18085,6 +18475,11 @@ switch (command) {
     // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
     // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
     await cmdUserPromptHook();
+    break;
+  }
+  case '__cursor-usage-v1': {
+    const { runCursorUsageHook } = await import('./services/cursor-usage-hook.js');
+    await runCursorUsageHook();
     break;
   }
   case 'statusline': {

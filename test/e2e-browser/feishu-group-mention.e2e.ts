@@ -21,12 +21,13 @@ import {
   sendMessage,
   sendMentionMessage,
   navigateToMessenger,
-  openChat,
+  openGroupChat,
   getGroupChatName,
   openThreadForMessage,
   scrollThreadToBottom,
   waitForModelTextReply,
   closeSession,
+  DIRECT_START_LABEL,
 } from './helpers.js';
 
 export function registerMidsceneSuites(): void {
@@ -48,7 +49,7 @@ export function registerMidsceneSuites(): void {
       agent = createAgent(page);
 
       await navigateToMessenger(page);
-      await openChat(page, agent, getGroupChatName());
+      await openGroupChat(page, agent, getGroupChatName());
     });
 
     afterAll(async () => {
@@ -62,7 +63,7 @@ export function registerMidsceneSuites(): void {
       // Plain tag only — we're testing that NO bot replies, so we MUST NOT
       // instruct the bot to reply. Default testMessage() would ask for a reply.
       const msg = testMessage('no-mention', { plain: true });
-      await sendMessage(agent, msg);
+      await sendMessage(agent, msg, page);
 
       // Wait 30 seconds — bots should NOT respond without @mention
       await page.waitForTimeout(30_000);
@@ -91,7 +92,7 @@ export function registerMidsceneSuites(): void {
       // 走「话题」tab 打开宽版话题视图，同时顺手点掉 repo 选择卡。
       await openThreadForMessage(agent, { msgHint: msg, timeoutMs: 180_000, page });
       try {
-        await page.locator('text=直接开启会话').first().click({ timeout: 5_000 });
+        await page.getByText(DIRECT_START_LABEL).first().click({ timeout: 5_000 });
         await page.waitForTimeout(3000);
       } catch { /* not present, fine */ }
 

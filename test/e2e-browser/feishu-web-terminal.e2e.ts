@@ -58,7 +58,7 @@ export function registerMidsceneSuites(): void {
 
     it('web terminal opens from the current streaming card', async () => {
       const msg = testMessage('terminal');
-      await sendMessage(agent, msg);
+      await sendMessage(agent, msg, page);
 
       // Open thread, handle repo, wait for streaming card
       await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg, page });

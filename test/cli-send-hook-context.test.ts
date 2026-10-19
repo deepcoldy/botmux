@@ -131,6 +131,31 @@ describe('cmdSend hook context wiring', () => {
     expect(relaySend).toContain("'--plugin-card-action'");
   });
 
+  it('finishes a scheduled task only after final delivery and before turn advancement', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    const sendStart = cliSource.indexOf('async function cmdSend(');
+    const sendEnd = cliSource.indexOf('\n// ─── Card subcommand', sendStart);
+    const cmdSend = cliSource.slice(sendStart, sendEnd);
+
+    expect(cliSource).toContain('--schedule-remove-self');
+    expect(relaySend).toContain("'--schedule-remove-self'");
+    expect(cmdSend).toContain("responseKind !== 'final'");
+    expect(cmdSend).toContain('planScheduleFinalCleanup({');
+    expect(cmdSend).toContain("action: 'remove', id: scheduleRemoveSelfTaskId");
+    expect(cmdSend).toContain('while (!scheduleRemoveSelfRequested');
+    expect(cmdSend).toContain("...(isSlashSend ? ['--slash'] : [])");
+    expect(cmdSend).toContain('scheduleSelfCleanup?.removed === true');
+    expect(cmdSend).toContain('--schedule-remove-self 只支持当前会话内的标准 final 卡，不支持文档评论回复');
+    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
+    const cleanup = cmdSend.indexOf('await removeScheduleSelfAfterFinal();', primarySend);
+    const advance = cmdSend.indexOf('advanceAncestorSessionTurn(', cleanup);
+    expect(primarySend).toBeGreaterThanOrEqual(0);
+    expect(cleanup).toBeGreaterThan(primarySend);
+    expect(advance).toBeGreaterThan(cleanup);
+  });
+
   it('keeps completion proposals on the canonical final-card and sandbox outbox paths', () => {
     const relayStart = cliSource.indexOf('async function relaySend(');
     const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
@@ -786,7 +811,7 @@ describe('cmdSend hook context wiring', () => {
       .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
   });
 
-  it('keeps Remote Runner outbound sends host-only, route-frozen, and non-terminal', () => {
+  it('keeps Remote Runner outbound sends host-only, route-frozen, and explicitly terminal-aware', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
@@ -796,13 +821,14 @@ describe('cmdSend hook context wiring', () => {
     expect(guard).toBeLessThan(providerImport);
     const remoteGuard = cmdSend.slice(guard, cmdSend.indexOf('// A proof is a point-in-time', guard));
     expect(remoteGuard).toContain('trustedRelayCtx.sessionId !== sid');
-    expect(remoteGuard).toContain("['progress', 'auxiliary']");
+    expect(remoteGuard).toContain("['progress', 'auxiliary', 'final']");
     expect(remoteGuard).toContain('sendTopLevel || overrideChatId || sendInto');
     expect(remoteGuard).toContain('Number(mentionArgs.length > 0)');
     expect(remoteGuard).not.toContain('|| mentionArgs.length > 0');
     expect(remoteGuard).not.toContain('images.length > 0');
     expect(remoteGuard).toContain('files.length > 0');
-    expect(cmdSend).toContain('...(remoteRunnerOutbound ? { terminalIndependent: true } : {})');
+    expect(cmdSend).toContain("remoteRunnerOutbound && effectiveResponseKind !== 'final'");
+    expect(cmdSend).toContain('? { terminalIndependent: true }');
   });
 
   it.each([
@@ -845,45 +871,48 @@ describe('cmdSend hook context wiring', () => {
     }
   });
 
-  it('accepts one explicit Remote Runner recipient before ordinary content validation', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-explicit-'));
-    const dataDir = join(root, 'data');
-    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
-      larkAppId: 'app-a', larkAppSecret: 'test', cliId: 'remote-runner',
-    }]));
-    seedPersistedSessionRows(dataDir, 'app-a', {
-      session: {
-        sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
-        title: 'remote', status: 'active', createdAt: new Date(0).toISOString(),
-        larkAppId: 'app-a', cliId: 'remote-runner', pid: process.pid,
-      },
-    });
-    try {
-      const missingContent = join(root, 'missing.md');
-      const result = await runCli([
-        'send', '--remote-runner-outbound', '--response-kind', 'auxiliary',
-        '--session-id', 'session', '--mention', 'ou_target:Target',
-        '--content-file', missingContent,
-      ], {
-        ...process.env,
-        HOME: root,
-        SESSION_DATA_DIR: dataDir,
-        BOTS_CONFIG: join(root, 'bots.json'),
-        BOTMUX_SESSION_ID: 'session',
-        BOTMUX_TURN_ID: 'turn-live',
-        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
-        BOTMUX_SEND_RELAY: '',
-        BOTMUX_WORKFLOW: '',
-        BOTMUX_LARK_APP_ID: '',
-        BOTMUX_LARK_APP_SECRET: '',
+  it.each(['auxiliary', 'final'] as const)(
+    'accepts one explicit Remote Runner recipient for %s before ordinary content validation',
+    async responseKind => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-explicit-'));
+      const dataDir = join(root, 'data');
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: 'app-a', larkAppSecret: 'test', cliId: 'remote-runner',
+      }]));
+      seedPersistedSessionRows(dataDir, 'app-a', {
+        session: {
+          sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+          title: 'remote', status: 'active', createdAt: new Date(0).toISOString(),
+          larkAppId: 'app-a', cliId: 'remote-runner', pid: process.pid,
+        },
       });
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain(`文件不存在: ${missingContent}`);
-      expect(result.stderr).not.toContain('--remote-runner-outbound supports only');
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
+      try {
+        const missingContent = join(root, 'missing.md');
+        const result = await runCli([
+          'send', '--remote-runner-outbound', '--response-kind', responseKind,
+          '--session-id', 'session', '--mention', 'ou_target:Target',
+          '--content-file', missingContent,
+        ], {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: 'session',
+          BOTMUX_TURN_ID: 'turn-live',
+          BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_LARK_APP_ID: '',
+          BOTMUX_LARK_APP_SECRET: '',
+        });
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain(`文件不存在: ${missingContent}`);
+        expect(result.stderr).not.toContain('--remote-runner-outbound supports only');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('validates the exact document text path before reading content or invoking TTS/uploads', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
@@ -1019,7 +1048,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(content)');
     expect(cmdSend).toContain('const managedRenderedPayloadError = managedVcSendPayloadError({');
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(text)');
-    expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
+    expect(cmdSend).toContain('if (!noMention && !isSlashSend && !customCard && !vcMeetingManagedSendOrigin)');
     expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
       .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
@@ -1078,9 +1107,9 @@ describe('cmdSend hook context wiring', () => {
     expect(deliveryIndex).toBeGreaterThan(storeWrite);
     // Turn-completion recording is gated on the response KIND, not on the
     // feedback policy — feedback off must still produce a correlatable record.
-    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
     const oncallIndex = cmdSend.indexOf('recordOncallGroupDelivery(resolveDataDir()');
-    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
     expect(oncallIndex).toBeGreaterThan(primarySend);
     expect(oncallIndex).toBeLessThan(completionIndex);
     // The feedback control (policy + card snapshot) rides along only when a
@@ -1096,7 +1125,8 @@ describe('cmdSend hook context wiring', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(completionIndex).toBeGreaterThanOrEqual(0);
     const block = cmdSend.slice(completionIndex, cmdSend.indexOf('turn delivery indexing failed after delivery', completionIndex));
     const localWrite = block.indexOf('getSkillFeedbackStore(resolveDataDir())');
     const fallback = block.indexOf('if (indexError !== undefined) {');

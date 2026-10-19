@@ -268,6 +268,8 @@ Written and hot-applied — no restart needed.
 
 `/group <group name>` (alias `/g`): automatically creates a new Lark group, invites you in, transfers ownership to you, and runs the entire group as a standalone CLI session. `@botA @botB /g <group name>` can add multiple bots into the new group at once.
 
+Like session groups, the new group gets a gradient logo avatar by default, and without a name it is renamed from its first message.
+
 Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot roles:
 
 ```bash

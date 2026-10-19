@@ -37,7 +37,7 @@ describe('dashboard bot payload helpers', () => {
       'displayName', 'larkBotName',
       'defaultOncall', 'defaultWorkingDir', 'defaultWorkingDirAutoWorktree',
       'autoboundChatCount', 'brandLabel',
-      'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
+      'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
       'codexAppCleanInput', 'codexBrowser', 'writableTerminalLinkInCard', 'privateCard',

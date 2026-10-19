@@ -19,7 +19,7 @@ function extract(path: string, names: string[]): string {
   }).join('\n');
 }
 
-const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'cmdDispatch']);
+const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'freezeDispatchOriginClaim', 'cmdDispatch']);
 // larkGet / larkRequestDeadline live in lark-get.ts (re-exported by client.ts).
 const clientCode = extract('src/im/lark/lark-get.ts', ['larkRequestDeadline', 'larkGet'])
   + '\n' + extract('src/im/lark/client.ts', ['getMessageDetail', 'getMessageThreadId']);
@@ -105,6 +105,8 @@ function harness(mode: Mode, options: {
     assertProjectDispatchPolicy: vi.fn(async () => {}),
     ensureLocalBotCollaboration: vi.fn(async () => {}),
     resolveDataDir: () => '/isolated/data', join: (...parts: string[]) => parts.join('/'),
+    // Host-shaped caller: no isolation channel/relay, so no origin claim to freeze.
+    readManagedOriginCapability: () => null,
     readFileSync: () => '[]',
     waitForExactDispatchAcceptance: vi.fn(async () => ({
       acceptedBotAppIds: options.acceptance === 'accepted' ? ['cli_target'] : [],

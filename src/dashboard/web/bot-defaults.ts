@@ -125,6 +125,8 @@ export type BotDefaultsRow = {
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
+  /** lark-cli 应用绑定开关（默认开启）。默认开启以当前 Bot 应用凭证调用并支持 --profile 透传；设为 false 显式关闭。 */
+  larkToolBinding?: boolean;
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
@@ -136,6 +138,8 @@ export type BotDefaultsRow = {
   readIsolation?: boolean;
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
+  defaultBackendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';
   usageSupported?: boolean;
   disableStreamingCard?: boolean;

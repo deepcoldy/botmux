@@ -1,0 +1,16 @@
+# Lane: Codex private-chat modes (/reply-mode chat|topic|group in the DM).
+# The DM mode is per bot, so these cases hold the Codex DM exclusively
+# (chat-lease.ts) while other Codex DM lanes wait; each case restores the mode.
+cases:
+  - name: Codex DM chat mode replies inline and keeps one session
+    tags: [mode, dm, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: dm-chat-codex }
+  - name: Codex DM thread mode gives each message its own topic and session
+    tags: [mode, dm, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: dm-thread-codex }
+  - name: Codex DM group mode moves the conversation into a new session group
+    tags: [mode, dm, codex, core]
+    steps:
+      - feishu.runScenario: { scenario: dm-group-codex }

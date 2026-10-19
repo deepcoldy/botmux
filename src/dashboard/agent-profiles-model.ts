@@ -14,12 +14,17 @@
 
 import { normalizeCliConfigDir } from '../core/cli-config-dir.js';
 import { normalizeStartupCommandList, parseStartupCommandsInput } from '../core/startup-commands.js';
-import { isRemoteCliId } from '../core/remote-cli-ids.js';
+import { isRemoteCliId, resolvePairedBackendId } from '../core/remote-cli-ids.js';
+import { supportsZeroPromptInjection } from '../core/zero-prompt-support.js';
+import { lookupCliSelection } from '../setup/cli-selection.js';
 
 export const AGENT_PROFILES_VERSION = 1;
 
-/** 每个分组对应一个现有 daemon IPC；未设置的分组不下发、不比较。 */
-export const AGENT_SECTIONS = ['exec', 'workspace', 'sandbox', 'backend', 'startup'] as const;
+/**
+ * 每个分组对应一个现有 daemon IPC；未设置的分组不下发、不比较。顺序即下发顺序，零注入
+ * 例外（见 {@link agentPushRequests}）：开启要排在 CLI / 沙箱 / 后端之后，关闭要排在它们之前。
+ */
+export const AGENT_SECTIONS = ['exec', 'workspace', 'sandbox', 'backend', 'startup', 'promptInjection'] as const;
 export type AgentSection = (typeof AGENT_SECTIONS)[number];
 
 export const AGENT_WORKSPACE_MODES = ['off', 'default', 'oncall'] as const;
@@ -27,6 +32,9 @@ export type AgentWorkspaceMode = (typeof AGENT_WORKSPACE_MODES)[number];
 
 export const AGENT_SANDBOX_MODES = ['off', 'oncall', 'scratch'] as const;
 export type AgentSandboxMode = (typeof AGENT_SANDBOX_MODES)[number];
+
+export const AGENT_PROMPT_INJECTION_MODES = ['default', 'none'] as const;
+export type AgentPromptInjectionMode = (typeof AGENT_PROMPT_INJECTION_MODES)[number];
 
 /** 与 services/backend-type-store.ts 的 EDITABLE_BACKEND_TYPES 保持一致（有测试守护）。 */
 export const AGENT_BACKEND_TYPES = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'] as const;
@@ -62,6 +70,8 @@ export interface AgentSandboxConfig { mode: AgentSandboxMode }
 /** '' = 跟随 daemon 全局默认后端。 */
 export interface AgentBackendConfig { backendType: '' | AgentBackendType }
 export interface AgentStartupConfig { commands: string[] }
+/** 零注入：`none` = 新会话不附带 Botmux 提示词（见 core/prompt-injection）。 */
+export interface AgentPromptInjectionConfig { mode: AgentPromptInjectionMode }
 
 export interface AgentSectionsConfig {
   exec?: AgentExecConfig;
@@ -69,6 +79,7 @@ export interface AgentSectionsConfig {
   sandbox?: AgentSandboxConfig;
   backend?: AgentBackendConfig;
   startup?: AgentStartupConfig;
+  promptInjection?: AgentPromptInjectionConfig;
 }
 
 export interface AgentProfile extends AgentSectionsConfig {
@@ -168,12 +179,20 @@ function normalizeStartup(raw: unknown): NormalizeResult<AgentStartupConfig> {
   return { ok: true, value: { commands } };
 }
 
+function normalizePromptInjection(raw: unknown): NormalizeResult<AgentPromptInjectionConfig> {
+  if (!isRecord(raw) || !(AGENT_PROMPT_INJECTION_MODES as readonly unknown[]).includes(raw.mode)) {
+    return { ok: false, error: 'invalid_prompt_injection' };
+  }
+  return { ok: true, value: { mode: raw.mode as AgentPromptInjectionMode } };
+}
+
 const SECTION_NORMALIZERS: { [K in AgentSection]: (raw: unknown) => NormalizeResult<NonNullable<AgentSectionsConfig[K]>> } = {
   exec: normalizeExec,
   workspace: normalizeWorkspace,
   sandbox: normalizeSandbox,
   backend: normalizeBackend,
   startup: normalizeStartup,
+  promptInjection: normalizePromptInjection,
 };
 
 /**
@@ -256,7 +275,10 @@ export interface AgentBotSnapshot {
   sandbox?: boolean;
   sandboxMode?: string | null;
   backendType?: string | null;
+  /** daemon 的默认后端（`backendType` 没有覆盖时生效）。 */
+  defaultBackendType?: string | null;
   startupCommands?: string;
+  promptInjection?: string;
 }
 
 /** 把 Bot 当前配置投影成 Agent 分组形状。用于「从 Bot 生成 Agent」与偏差比较。 */
@@ -286,6 +308,7 @@ export function botSectionValues(bot: AgentBotSnapshot): Required<AgentSectionsC
         : '',
     },
     startup: { commands: parseStartupCommands(bot.startupCommands ?? '') },
+    promptInjection: { mode: bot.promptInjection === 'none' ? 'none' : 'default' },
   };
 }
 
@@ -294,7 +317,7 @@ export function botSectionValues(bot: AgentBotSnapshot): Required<AgentSectionsC
 export type AgentDiffField =
   | 'cliId' | 'model' | 'reasoningEffort' | 'configDir'
   | 'workspaceMode' | 'workingDir' | 'autoWorktree'
-  | 'sandboxMode' | 'backendType' | 'startupCommands';
+  | 'sandboxMode' | 'backendType' | 'startupCommands' | 'promptInjection';
 
 export interface AgentFieldDiff {
   section: AgentSection;
@@ -356,7 +379,44 @@ export function diffAgentSections(agent: AgentSectionsConfig, bot: AgentBotSnaps
     const b = current.startup.commands.join('\n');
     if (a !== b) push('startup', 'startupCommands', a, b);
   }
+  if (agent.promptInjection && agent.promptInjection.mode !== current.promptInjection.mode) {
+    push('promptInjection', 'promptInjection', agent.promptInjection.mode, current.promptInjection.mode);
+  }
   return diffs;
+}
+
+/** 会改变零注入能否成立的分组。 */
+export const ZERO_PROMPT_SECTIONS: readonly AgentSection[] = ['exec', 'sandbox', 'backend', 'promptInjection'];
+
+/**
+ * Bot 应用了 Agent 的分组后，零注入会不会落在不支持的 CLI / 后端 / 沙盒组合上。
+ * `applied` 缺省 = Agent 的全部分组（同步完成后的组合）；给出时只把这些分组视为已写入、
+ * 其余仍取 Bot 当前值（逐步下发时的中间组合）。
+ *
+ * daemon 只有零注入自己的写入接口会按当前组合校验；CLI / 沙箱 / 后端的写入接口不检查
+ * 零注入，所以这几组的每一步写入都要由调用方先判断（见 agents-api 的 syncAgentToBot）。
+ */
+export function agentZeroPromptConflict(
+  agent: AgentSectionsConfig,
+  bot: AgentBotSnapshot,
+  applied?: readonly AgentSection[],
+): boolean {
+  const use = (section: AgentSection) => !applied || applied.includes(section);
+  const current = botSectionValues(bot);
+  const mode = use('promptInjection') && agent.promptInjection ? agent.promptInjection.mode : current.promptInjection.mode;
+  if (mode !== 'none') return false;
+  // 不管 CLI 时沿用 Bot 的真实 CLI（与 Bot 配置页的零注入开关同一口径）。
+  const exec = use('exec') ? agent.exec : undefined;
+  const cliId = exec ? (lookupCliSelection(exec.cliId)?.cliId ?? exec.cliId) : str(bot.cliId);
+  // 后端按新会话 spawn 时的生效值：覆盖值（空 = 清除覆盖），否则 daemon 默认后端，再按
+  // CLI 配对（与 daemon 写入校验、spawn 时的强制校验同一规则）。
+  const backendType = resolvePairedBackendId(
+    cliId,
+    use('backend') && agent.backend ? agent.backend.backendType : current.backend.backendType,
+    str(bot.defaultBackendType),
+  );
+  const sandbox = use('sandbox') && agent.sandbox ? agent.sandbox.mode : current.sandbox.mode;
+  return !supportsZeroPromptInjection(cliId, { backendType, sandbox });
 }
 
 export type AgentLinkState = 'synced' | 'drift' | 'offline';
@@ -391,7 +451,8 @@ export interface AgentPushRequest {
 
 /**
  * Agent 已设置分组 → 现有逐字段写入请求。`only` 限定分组（如「只同步有偏差的」）。
- * 顺序固定为 AGENT_SECTIONS：先切 CLI 再动沙箱，与手动在 Bot 设置页操作的常见顺序一致。
+ * 顺序按 AGENT_SECTIONS：先切 CLI 再动沙箱，与手动在 Bot 设置页操作的常见顺序一致；
+ * 关闭零注入例外地排在最前（见函数内注释）。
  */
 export function agentPushRequests(
   agent: AgentSectionsConfig,
@@ -401,6 +462,18 @@ export function agentPushRequests(
   const base = `/api/bots/${encodeURIComponent(larkAppId)}`;
   const want = (section: AgentSection) => !only || only.includes(section);
   const out: AgentPushRequest[] = [];
+  // 零注入开着时，CLI / 沙箱 / 后端不能切到不支持零注入的组合（同步时逐步拦下，见
+  // agentZeroPromptConflict）；开启时 daemon 按 Bot 当前组合校验。所以关闭零注入要最先
+  // 下发，开启则最后下发。
+  const promptInjection: AgentPushRequest | null = agent.promptInjection && want('promptInjection')
+    ? {
+      section: 'promptInjection',
+      method: 'PUT',
+      url: `${base}/prompt-injection`,
+      body: { promptInjection: agent.promptInjection.mode },
+    }
+    : null;
+  if (promptInjection && agent.promptInjection!.mode === 'default') out.push(promptInjection);
   if (agent.exec && want('exec')) {
     out.push({
       section: 'exec',
@@ -442,6 +515,7 @@ export function agentPushRequests(
       body: { startupCommands: agent.startup.commands.join('\n') },
     });
   }
+  if (promptInjection && agent.promptInjection!.mode === 'none') out.push(promptInjection);
   return out;
 }
 

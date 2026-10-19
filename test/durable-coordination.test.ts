@@ -31,7 +31,7 @@ afterEach(() => {
 
 describe('SQLite durable coordination contract', () => {
   it('pins the control-operation-aware coordination contract version', () => {
-    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(3);
+    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(4);
   });
 
   it('uses monotonic session epochs and fences stale state writers', async () => {
@@ -153,6 +153,264 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.completeInboxClaim(reclaimed!)).toEqual({ kind: 'applied' });
     expect(await store.claimNextInbox({ workerId: 'worker-c', leaseDurationMs: 10 }))
       .toMatchObject({ event: { eventId: 'event-2' } });
+    await store.close();
+  });
+
+  it('deduplicates realtime and REST snapshots of one Lark receive event by immutable identity', async () => {
+    const store = makeStore(() => 10);
+    const eventId = 'im.message.receive_v1:cli_test:om_same';
+    const partitionKey = 'lark-message-routing:cli_test:oc_chat';
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          message: {
+            message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+            message_type: 'text', content: '{"text":"same"}', create_time: '1',
+          },
+          sender: { sender_id: { open_id: 'ou_user', union_id: 'on_user' } },
+        },
+      },
+      visibleAt: 10,
+      createdAt: 10,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          message: {
+            message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+            msg_type: 'text', body: { content: '{"text":"same"}' }, create_time: '1',
+          },
+          sender: { sender_id: { open_id: 'ou_user' } },
+        },
+      },
+      visibleAt: 11,
+      createdAt: 11,
+    })).toEqual({ kind: 'duplicate' });
+    for (const changed of [
+      { message: { chat_id: 'oc_other' } },
+      { message: { content: '{"text":"/restart"}' } },
+      { sender: { sender_id: { open_id: 'ou_other' } } },
+      { sender: { sender_id: { open_id: 'ou_user', union_id: 'on_other' } } },
+    ]) {
+      const message = {
+        message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+        message_type: 'text', content: '{"text":"same"}', create_time: '1',
+        ...(changed.message ?? {}),
+      };
+      expect(await store.enqueueInbox({
+        eventId,
+        partitionKey,
+        payload: {
+          version: 1,
+          type: 'lark.im.message.receive_v1',
+          larkAppId: 'cli_test',
+          event: {
+            message,
+            sender: changed.sender ?? { sender_id: { open_id: 'ou_user' } },
+          },
+        },
+        visibleAt: 11,
+        createdAt: 11,
+      })).toEqual({ kind: 'conflict' });
+    }
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: {
+          event: {
+            message: {
+              message_id: 'om_same', chat_id: 'oc_chat', chat_type: 'group',
+              message_type: 'text', content: '{"text":"same"}', create_time: '1',
+            },
+            sender: { sender_id: { open_id: 'ou_nested_other' } },
+          },
+        },
+      },
+      visibleAt: 11,
+      createdAt: 11,
+    })).toEqual({ kind: 'conflict' });
+
+    const mentionedEventId = 'im.message.receive_v1:cli_test:om_mentioned';
+    const mentioned = {
+      version: 1,
+      type: 'lark.im.message.receive_v1',
+      larkAppId: 'cli_test',
+      event: {
+        message: {
+          message_id: 'om_mentioned', chat_id: 'oc_chat', chat_type: 'group',
+          message_type: 'text', content: '{"text":"@user hi"}', create_time: '2',
+          mentions: [{ key: '@_user_1', name: 'User', id: { open_id: 'ou_mentioned', union_id: 'on_a' } }],
+        },
+        sender: { sender_id: { open_id: 'ou_user' } },
+      },
+    } as const;
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: mentioned,
+      visibleAt: 12,
+      createdAt: 12,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: {
+        ...mentioned,
+        event: {
+          ...mentioned.event,
+          message: {
+            ...mentioned.event.message,
+            mentions: [{ key: '@_user_1', name: 'User', id: { open_id: 'ou_mentioned', union_id: 'on_b' } }],
+          },
+        },
+      },
+      visibleAt: 13,
+      createdAt: 13,
+    })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId: mentionedEventId,
+      partitionKey,
+      payload: {
+        ...mentioned,
+        event: {
+          ...mentioned.event,
+          message: {
+            ...mentioned.event.message,
+            mentions: [{ key: '@_user_1', name: 'Renamed User', id: { open_id: 'ou_mentioned', union_id: 'on_a' } }],
+          },
+        },
+      },
+      visibleAt: 13,
+      createdAt: 13,
+    })).toEqual({ kind: 'duplicate' });
+    const cardEventId = 'im.message.receive_v1:cli_test:om_card';
+    const card = {
+      ...mentioned,
+      event: {
+        ...mentioned.event,
+        message: {
+          ...mentioned.event.message,
+          message_id: 'om_card',
+          message_type: 'interactive',
+          content: '{"title":null,"elements":[[{"tag":"text","text":"请升级至最新版本客户端，以查看内容"}]]}',
+        },
+      },
+    };
+    expect(await store.enqueueInbox({
+      eventId: cardEventId,
+      partitionKey,
+      payload: card,
+      visibleAt: 14,
+      createdAt: 14,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: cardEventId,
+      partitionKey,
+      payload: {
+        ...card,
+        event: {
+          ...card.event,
+          message: {
+            ...card.event.message,
+            content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"same card"}]}}',
+          },
+        },
+      },
+      visibleAt: 15,
+      createdAt: 15,
+    })).toEqual({ kind: 'duplicate' });
+    const fullCardEventId = 'im.message.receive_v1:cli_test:om_full_card';
+    const fullCard = {
+      ...card,
+      event: {
+        ...card.event,
+        message: {
+          ...card.event.message,
+          message_id: 'om_full_card',
+          content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"first"}]}}',
+        },
+      },
+    };
+    expect(await store.enqueueInbox({
+      eventId: fullCardEventId,
+      partitionKey,
+      payload: fullCard,
+      visibleAt: 16,
+      createdAt: 16,
+    })).toEqual({ kind: 'inserted' });
+    expect(await store.enqueueInbox({
+      eventId: fullCardEventId,
+      partitionKey,
+      payload: {
+        ...fullCard,
+        event: {
+          ...fullCard.event,
+          message: {
+            ...fullCard.event.message,
+            content: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"changed"}]}}',
+          },
+        },
+      },
+      visibleAt: 17,
+      createdAt: 17,
+    })).toEqual({ kind: 'conflict' });
+    expect(await store.enqueueInbox({
+      eventId,
+      partitionKey,
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: { message: { message_id: 'om_other', chat_id: 'oc_chat' } },
+      },
+      visibleAt: 12,
+      createdAt: 12,
+    })).toEqual({ kind: 'conflict' });
+    await store.close();
+  });
+
+  it('atomically fences inbox insertion with the current ingress lease', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'botmux.ingress:lark:cli_test',
+      ownerId: 'ingress-a',
+      leaseDurationMs: 10,
+    }));
+    const event = {
+      eventId: 'im.message.receive_v1:cli_test:om_fenced',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+      payload: {
+        version: 1,
+        type: 'lark.im.message.receive_v1',
+        larkAppId: 'cli_test',
+        event: { message: { message_id: 'om_fenced', chat_id: 'oc_chat' } },
+      },
+      visibleAt: 10,
+      createdAt: 10,
+    } as const;
+
+    await expect(store.enqueueInboxWithLease({ lease, event }))
+      .resolves.toEqual({ kind: 'inserted' });
+    now = 20;
+    await expect(store.enqueueInboxWithLease({ lease, event: { ...event, eventId: 'event-late' } }))
+      .resolves.toEqual({ kind: 'stale_lease' });
+    expect(await store.claimNextInbox({ workerId: 'worker', leaseDurationMs: 10 }))
+      .toMatchObject({ event: { eventId: event.eventId } });
     await store.close();
   });
 

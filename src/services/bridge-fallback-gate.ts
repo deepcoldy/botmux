@@ -193,9 +193,21 @@ export function stripTrailingBridgeSentinelLine(finalText: string): string {
  *  Shared by emitReadyTurns and emitReadyCodexTurns so the per-mode rule lives in
  *  one place and is unit-tested directly. codex-app does not use adopt and drives
  *  its own strip on the deliverable content path. */
+export function hasUserVisibleText(text: string): boolean {
+  // String.trim() deliberately does not remove Unicode format controls. A
+  // Remote Runner final containing only U+200B therefore used to produce a
+  // footer-only Lark card. Ignore Unicode whitespace and Cf controls for the
+  // visibility predicate, but preserve the original bytes whenever any real
+  // text remains (for example an emoji ZWJ sequence still has visible bases).
+  return String(text ?? '').replace(/[\p{White_Space}\p{Cf}]/gu, '').length > 0;
+}
+
 export function bridgePostText(finalText: string, adoptMode: boolean): string {
   const withoutMemoryCitation = stripTrailingOaiMemoryCitation(finalText);
-  return adoptMode ? withoutMemoryCitation : stripTrailingBridgeSentinelLine(withoutMemoryCitation);
+  const postText = adoptMode
+    ? withoutMemoryCitation
+    : stripTrailingBridgeSentinelLine(withoutMemoryCitation);
+  return hasUserVisibleText(postText) ? postText : '';
 }
 
 export interface BridgeSendMarker {
@@ -229,8 +241,9 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
 }
 
 export interface BridgeGateInput {
-  /** Exact delivery identity, required to suppress a failed-turn diagnostic.
-   * Time-only legacy markers cannot prove that this attempt delivered a final. */
+  /** Exact BotMux turn identity. Headless backends may not have a transcript
+   * mark time, so a delivered final marker can still deduplicate by this
+   * stronger correlation (including the durable dispatch attempt). */
   turnId?: string;
   dispatchAttempt?: number;
   /** When the user message was queued — defines the lower bound of the
@@ -391,6 +404,19 @@ export function shouldSuppressBridgeEmit(
   if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled) return true;
   if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
     && turn.terminalStatus !== 'completed') return true;
+  // Headless backends (notably Remote Runner) do not always own a transcript
+  // mark window. An exact delivered final marker is stronger than timestamp
+  // attribution and survives provider completion latency / host recovery.
+  // Keep the dispatch attempt in the identity so a stale durable retry cannot
+  // suppress a later attempt of the same logical turn.
+  if (turn.turnId && markers.some(marker => marker.turnId === turn.turnId
+      && marker.dispatchAttempt === turn.dispatchAttempt
+      && marker.terminalIndependent !== true
+      && isFinalBridgeSendMarker(marker)
+      && (marker.replyCardResponseKind === undefined
+        || marker.replyCardResponseKind === 'final'))) {
+    return true;
+  }
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;

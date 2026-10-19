@@ -8,6 +8,7 @@ import {
   buildBridgeSendPreviewText,
   bridgePostText,
   composeFailedBridgeFallbackContent,
+  hasUserVisibleText,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
@@ -118,6 +119,22 @@ function workerFunctionSlice(name: string, nextName: string): string {
   expect(end).toBeGreaterThan(start);
   return source.slice(start, end);
 }
+
+describe('worker remote final identity wiring', () => {
+  it('passes the exact turn id and dispatch attempt into the fallback gate', () => {
+    const remoteFinal = workerFunctionSlice(
+      'deliverRemoteTurnFinal',
+      'deliverRemoteRunnerOutboundMessage',
+    );
+    const gateInputStart = remoteFinal.indexOf('const gateInput = {');
+    const gateInputEnd = remoteFinal.indexOf('};', gateInputStart);
+    expect(gateInputStart).toBeGreaterThanOrEqual(0);
+    expect(gateInputEnd).toBeGreaterThan(gateInputStart);
+    const gateInput = remoteFinal.slice(gateInputStart, gateInputEnd);
+    expect(gateInput).toContain('turnId,');
+    expect(gateInput).toContain('dispatchAttempt,');
+  });
+});
 
 describe('worker submit-failure retry wiring', () => {
   it('re-arms ordinary IM turns after active evidence through the bounded chain', () => {
@@ -283,6 +300,19 @@ describe('bridgePostText (adopt sentinel contract — codex #791 blocker)', () =
     expect(bridgePostText(finalText, false)).toBe('Visible fallback.');
     expect(bridgePostText(finalText, true)).toBe('Visible fallback.');
   });
+
+  it('treats whitespace and Unicode format controls as visually empty', () => {
+    const invisible = ' \n\t\u200B\u200C\u200D\u200E\u200F\u202E\u2060\u2066\u2069\uFEFF';
+    expect(hasUserVisibleText(invisible)).toBe(false);
+    expect(bridgePostText(invisible, false)).toBe('');
+    expect(bridgePostText(invisible, true)).toBe('');
+  });
+
+  it('preserves content when format controls join otherwise visible text', () => {
+    expect(hasUserVisibleText('👩‍💻')).toBe(true);
+    expect(hasUserVisibleText('\u200Bvisible')).toBe(true);
+    expect(bridgePostText('\u200Bvisible\u200D', false)).toBe('\u200Bvisible\u200D');
+  });
 });
 
 describe('isBridgeNothingToSendFinal', () => {
@@ -386,6 +416,87 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(true);
   });
 
+  it('an exact final marker suppresses a headless provider fallback without a mark-time window', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      turnId: 'turn-headless',
+      dispatchAttempt: 7,
+      responseKind: 'final',
+      contentLength: 12,
+    };
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'provider synthesized an empty-result fallback',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(true);
+
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-other',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'another turn must not borrow the marker',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'terminal-independent output is not the final answer',
+      },
+      undefined,
+      [{ ...marker, terminalIndependent: true }],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      {
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'missing worker identity must fail open to visible output',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 8,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'a later durable attempt must stay visible',
+      },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      {
+        turnId: 'turn-headless',
+        dispatchAttempt: 7,
+        markTimeMs: undefined,
+        isLocal: false,
+        finalText: 'a real final after progress must stay visible',
+      },
+      undefined,
+      [{ ...marker, responseKind: 'progress' }],
+      false,
+    )).toBe(false);
+  });
+
   it('non-adopt: a progress / kind-less marker still defers to the length heuristic', () => {
     const shortSend = 'Working on it.';
     const longFinal = 'Here is the complete, substantive answer that is materially '
@@ -431,6 +542,21 @@ describe('shouldSuppressBridgeEmit', () => {
       [marker],
       false,
     )).toBe(false);
+  });
+
+  it('lets a negotiated Remote Runner final send own terminal delivery', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      contentLength: normalise('explicit final').length,
+      previewText: 'explicit final',
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: 'provider acknowledgement' },
+      500,
+      [marker],
+      false,
+    )).toBe(true);
   });
 
   it('non-adopt: managed-card final suppresses; managed-card progress/auxiliary does not', () => {

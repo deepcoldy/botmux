@@ -275,6 +275,206 @@ describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
     expect(out[0]).toMatchObject({ cliSessionId: 'dddd4444-0000-0000-0000-000000000004', cwd: '/root/big' });
     expect(out[0]!.title.length).toBeLessThanOrEqual(80);
   });
+
+  // Skill-opening sessions: Claude writes the `<command-message>` turn, then an
+  // isMeta:true user turn holding the expanded skill body ("Base directory for
+  // this skill: …"). That expansion is Claude's own record, not something the
+  // user typed, so it must never become the title. Real transcripts store it in
+  // both content shapes (text-part array and plain string).
+  const skillCommand = {
+    type: 'user',
+    cwd: '/work/demo',
+    message: { role: 'user', content: '<command-message>demo-skill is running…</command-message>\n<command-name>/demo-skill</command-name>' },
+  };
+  const skillBody = 'Base directory for this skill: /work/demo/.claude/skills/demo-skill\n\n# Demo skill';
+  const skillExpansion = (content: unknown) => ({ type: 'user', isMeta: true, cwd: '/work/demo', message: { role: 'user', content } });
+  const toolResult = {
+    type: 'user',
+    cwd: '/work/demo',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_demo', content: 'ok' }] },
+  };
+
+  it('skips an isMeta skill expansion (array content) when picking the first prompt', async () => {
+    writeSession('-work-demo', 'skill-open-array', [
+      skillCommand,
+      skillExpansion([{ type: 'text', text: skillBody }]),
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: '修复登录页样式' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]).toMatchObject({ cliSessionId: 'skill-open-array', cwd: '/work/demo', title: '修复登录页样式' });
+  });
+
+  it('skips an isMeta skill expansion (string content) when picking the first prompt', async () => {
+    writeSession('-work-demo', 'skill-open-string', [
+      skillCommand,
+      skillExpansion(skillBody),
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: '修复登录页样式' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]).toMatchObject({ cliSessionId: 'skill-open-string', cwd: '/work/demo', title: '修复登录页样式' });
+  });
+
+  it('uses aiTitle when there is no customTitle', async () => {
+    writeSession('-work-demo', 'ai-title-only', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'the login page css is broken' } },
+      { type: 'assistant', message: { role: 'assistant', content: 'ok' } },
+      { type: 'ai-title', aiTitle: '  修复登录页样式  ', sessionId: 'ai-title-only' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('修复登录页样式');
+  });
+
+  it('prefers customTitle over aiTitle regardless of record order', async () => {
+    writeSession('-work-demo', 'custom-then-ai', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'initial prompt' } },
+      { type: 'custom-title', customTitle: 'demo-task · 示例', sessionId: 'custom-then-ai' },
+      { type: 'ai-title', aiTitle: '修复登录页样式', sessionId: 'custom-then-ai' },
+    ]);
+    writeSession('-work-demo', 'ai-then-custom', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'initial prompt' } },
+      { type: 'ai-title', aiTitle: '修复登录页样式', sessionId: 'ai-then-custom' },
+      { type: 'custom-title', customTitle: 'demo-task · 示例', sessionId: 'ai-then-custom' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    const titles = new Map(out.map((s) => [s.cliSessionId, s.title]));
+    expect(titles.size).toBe(2);
+    expect(titles.get('custom-then-ai')).toBe('demo-task · 示例');
+    expect(titles.get('ai-then-custom')).toBe('demo-task · 示例');
+  });
+
+  it('falls back to the first real user prompt when every aiTitle is blank or not a string', async () => {
+    writeSession('-work-demo', 'ai-title-invalid', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'the fallback prompt' } },
+      { type: 'ai-title', aiTitle: '   ' },
+      { type: 'ai-title', aiTitle: '' },
+      { type: 'ai-title', aiTitle: null },
+      { type: 'ai-title', aiTitle: 123 },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('the fallback prompt');
+  });
+
+  it('keeps the latest valid aiTitle when a later aiTitle is blank', async () => {
+    writeSession('-work-demo', 'ai-title-then-blank', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'initial prompt' } },
+      { type: 'ai-title', aiTitle: 'First ai title' },
+      { type: 'ai-title', aiTitle: 'Latest ai title' },
+      { type: 'ai-title', aiTitle: '   ' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Latest ai title');
+  });
+
+  it('truncates an aiTitle longer than 80 characters', async () => {
+    const long = '修复登录页样式'.repeat(15);
+    writeSession('-work-demo', 'ai-title-long', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'initial prompt' } },
+      { type: 'ai-title', aiTitle: long },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe(`${long.slice(0, 79)}…`);
+    expect(out[0]?.title).toHaveLength(80);
+  });
+
+  it('finds an aiTitle appended after line 5000', async () => {
+    const lines: unknown[] = [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'initial prompt' } },
+    ];
+    for (let i = 0; i < 5_001; i++) {
+      lines.push({ type: 'assistant', message: { role: 'assistant', content: `filler ${i}` } });
+    }
+    lines.push({ type: 'ai-title', aiTitle: 'Late ai title' });
+    writeSession('-work-demo', 'ai-title-after-head-cap', lines);
+
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Late ai title');
+  });
+
+  it('ignores sidechain ai-title records', async () => {
+    writeSession('-work-demo', 'sidechain-ai-only', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'the real first question' } },
+      { type: 'ai-title', isSidechain: true, aiTitle: 'subagent title noise' },
+    ]);
+    writeSession('-work-demo', 'sidechain-ai-after-main', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'the real first question' } },
+      { type: 'ai-title', aiTitle: '修复登录页样式' },
+      { type: 'ai-title', isSidechain: true, aiTitle: 'subagent title noise' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    const titles = new Map(out.map((s) => [s.cliSessionId, s.title]));
+    expect(titles.get('sidechain-ai-only')).toBe('the real first question');
+    expect(titles.get('sidechain-ai-after-main')).toBe('修复登录页样式');
+  });
+
+  it('ignores aiTitle keys on records whose type is not ai-title', async () => {
+    writeSession('-work-demo', 'stray-ai-only', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'the fallback prompt' } },
+      { type: 'summary', aiTitle: 'not a title record' },
+      { aiTitle: 'record without a type' },
+    ]);
+    writeSession('-work-demo', 'stray-ai-after-main', [
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: 'the fallback prompt' } },
+      { type: 'ai-title', aiTitle: '修复登录页样式' },
+      { type: 'summary', aiTitle: 'not a title record' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    const titles = new Map(out.map((s) => [s.cliSessionId, s.title]));
+    expect(titles.get('stray-ai-only')).toBe('the fallback prompt');
+    expect(titles.get('stray-ai-after-main')).toBe('修复登录页样式');
+  });
+
+  // A session driven only by slash commands has no typed prompt once isMeta is
+  // skipped; without a customTitle / aiTitle it has nothing to show and is
+  // dropped like the other command-only sessions.
+  it('drops skill-only sessions with no typed prompt and no custom/ai title', async () => {
+    writeSession('-work-demo', 'skill-only-untitled', [
+      skillCommand,
+      skillExpansion([{ type: 'text', text: skillBody }]),
+      toolResult,
+      { type: 'assistant', message: { role: 'assistant', content: 'done' } },
+    ]);
+    expect(await discoverClaudeFamilySessions(dataDir, 10)).toEqual([]);
+  });
+
+  // isMeta turns are skipped only for the title: they still pass through the
+  // botmux-origin check, and the envelope that follows them is still seen.
+  it('still drops a botmux-origin session whose first user turn is an isMeta skill expansion', async () => {
+    writeSession('-work-demo', 'meta-then-botmux', [
+      skillExpansion([{ type: 'text', text: skillBody }]),
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: '<user_message>\n修复登录页样式\n</user_message>\n<sender type="user" open_id="ou_x" />' } },
+    ]);
+    // A standalone session with the same opening survives.
+    writeSession('-work-demo', 'meta-then-typed', [
+      skillExpansion([{ type: 'text', text: skillBody }]),
+      { type: 'user', cwd: '/work/demo', message: { role: 'user', content: '修复登录页样式' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['meta-then-typed']);
+  });
+
+  it('keeps a skill-only session that has a customTitle', async () => {
+    writeSession('-work-demo', 'skill-only-custom', [
+      skillCommand,
+      skillExpansion([{ type: 'text', text: skillBody }]),
+      toolResult,
+      { type: 'custom-title', customTitle: 'demo-task · 示例', sessionId: 'skill-only-custom' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ cliSessionId: 'skill-only-custom', cwd: '/work/demo', title: 'demo-task · 示例' });
+  });
+
+  it('keeps a skill-only session that has an aiTitle', async () => {
+    writeSession('-work-demo', 'skill-only-ai', [
+      skillCommand,
+      skillExpansion([{ type: 'text', text: skillBody }]),
+      toolResult,
+      { type: 'ai-title', aiTitle: '修复登录页样式', sessionId: 'skill-only-ai' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ cliSessionId: 'skill-only-ai', cwd: '/work/demo', title: '修复登录页样式' });
+  });
 });
 
 describe('discoverRolloutSessions (codex / traex)', () => {

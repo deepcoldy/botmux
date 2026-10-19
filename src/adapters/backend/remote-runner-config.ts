@@ -55,6 +55,18 @@ export function normalizeRemoteRunnerConfig(value: unknown): RemoteRunnerConfig 
       throw new Error('remoteRunner.requiredCapabilities contains an unsupported capability');
     }
     requiredCapabilities = [...new Set(raw.requiredCapabilities)] as RemoteRunnerCapability[];
+    if (requiredCapabilities.includes('session_tool_schedule')
+        && !requiredCapabilities.includes('session_tool')) {
+      throw new Error('remoteRunner.requiredCapabilities session_tool_schedule requires session_tool');
+    }
+    if (requiredCapabilities.includes('session_tool_schedule_actor')
+        && !requiredCapabilities.includes('session_tool_schedule')) {
+      throw new Error('remoteRunner.requiredCapabilities session_tool_schedule_actor requires session_tool_schedule');
+    }
+    if (requiredCapabilities.includes('outbound_message_final')
+        && !requiredCapabilities.includes('outbound_message')) {
+      throw new Error('remoteRunner.requiredCapabilities outbound_message_final requires outbound_message');
+    }
   }
 
   const handshakeTimeoutMs = optionalTimeout(raw.handshakeTimeoutMs, 'handshakeTimeoutMs');

@@ -22,6 +22,8 @@ daemon 在线时，`botmux delete` 会先请求会话所属 daemon 执行与 `/c
 worker、后端与订阅。仅当所属 daemon 确认不在线时才使用本地收口；在线
 daemon 拒绝或 IPC 连接失败时命令返回失败，不会继续本地强杀。
 
+当 `BOTMUX_COORDINATION_MODE=primary` 时，PostgreSQL 中的 durable Session 才是 canonical truth。此模式下 `delete`、`resume`、非 dry-run 的 `suspend`，以及交互式 `list` 中的删除/唤醒都会明确拒绝；`list` 仍可只读展示，但会跳过本地自动清理。关闭或恢复请在原话题使用会话卡片，确保操作经过带 fencing 的 durable session-control 通道。
+
 ## 开机自启
 
 ```bash

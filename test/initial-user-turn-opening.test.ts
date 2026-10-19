@@ -340,11 +340,13 @@ describe('empty-started session — first real business turn must use the new-to
       larkAppId: APP,
       larkAppSecret: 's',
       triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      larkToolBinding: false,
     };
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
       cliId: 'codex',
+      larkToolBinding: false,
       triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],

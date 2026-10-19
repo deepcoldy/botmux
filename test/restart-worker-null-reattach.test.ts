@@ -87,7 +87,7 @@ describe('P1 requestSessionRestart wiring', () => {
     // Live-worker branch still sends the in-worker restart IPC — now also
     // carrying the latest per-bot env AND model (config edits apply on /restart).
     expect(body).toContain(
-      "ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) }",
+      "ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) }",
     );
 
     // No-worker branch: pane teardown MUST precede forkWorker.

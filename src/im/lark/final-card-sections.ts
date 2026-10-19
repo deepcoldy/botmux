@@ -38,3 +38,23 @@ export function composeFinalCardSections(
   card.body.elements = elements;
   return card;
 }
+
+/** Custom finals share host-owned footer, feedback and runtime sections. Reject
+ * collisions before composition rather than silently removing caller content.
+ * Callback validation remains the responsibility of normalizeInteractiveCardInput.
+ */
+export function customFinalCardError(card: Record<string, unknown>): string | undefined {
+  const body = card.body as { elements?: unknown } | undefined;
+  if (card.schema !== '2.0' || !body || !Array.isArray(body.elements)) {
+    return '自定义 final 卡片必须是 schema 2.0 且包含 body.elements';
+  }
+  const containsReservedId = (value: unknown): boolean => {
+    if (!value || typeof value !== 'object') return false;
+    if (Array.isArray(value)) return value.some(containsReservedId);
+    const record = value as Record<string, unknown>;
+    return (typeof record.element_id === 'string' && record.element_id.startsWith('botmux_'))
+      || Object.values(record).some(containsReservedId);
+  };
+  if (containsReservedId(card)) return '自定义 final 卡片不能占用 botmux_ 前缀的宿主元素 ID';
+  return undefined;
+}

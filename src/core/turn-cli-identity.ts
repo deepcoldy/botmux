@@ -20,7 +20,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
 import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
-import { hasLarkToolBinding } from './lark-tool-binding.js';
+import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
 import {
   triggerUserAuthApplies,
@@ -92,7 +92,7 @@ export async function publishTurnCliIdentity(
   rememberLarkToolDelegation(sessionDataDir, sessionId, turnId, args.delegatedIdentity);
 
   for (const tool of TRIGGER_USER_AUTH_TOOLS) {
-    if (tool === 'lark-cli' && hasLarkToolBinding(sessionDataDir, sessionId)) {
+    if (tool === 'lark-cli' && isLarkToolBound(botConfig, sessionDataDir, sessionId)) {
       outcomes.push({ tool, state: 'off' }); // the new session entry resolves this itself
       continue;
     }

@@ -339,6 +339,9 @@ describe('buildFsPolicy', () => {
     // is readWrite (the worker pre-creates it), siblings and the shared root stay
     // deny-by-default — the trail names the session and its dispatch outcome.
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal/s.log').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage/s.jsonl').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage/other.jsonl').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal/other.log').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/ready-signal').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/dsh-tui-ready-signal.log').access).toBe('none');
@@ -1201,6 +1204,8 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/other/latest.json').access).not.toBe('readWrite');
     // parity with turn-sends: single own marker file still granted
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage/s.jsonl').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cursor-usage/other.jsonl').access).not.toBe('readWrite');
   });
 
   it('grants the OWN turn-send-ledger session dir readWrite under no-transport too (root and siblings stay closed)', () => {
