@@ -9,7 +9,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
-import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
+import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -1381,7 +1381,8 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
                 ? stripTrailingGroupContextCardPurposeMarker(node.text)
                 : node.text;
               if (visibleText !== node.text
-                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                && (hasTrailingGroupContextMediaPurposeMarker(node.text)
+                  || paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
                 if (visibleText) textNodes.push(visibleText);
                 continue;
               }

@@ -9,13 +9,17 @@ export type GroupContextCardProjection = { kind: 'runtime' }
 type CardNode = Record<string, any>;
 
 // Version 1 reserves runs of 12, 13, and 14 of the existing footer carrier.
+// Runs 15–17 carry the same purposes inside media, so a flattened table's
+// final row can be distinguished from a signed footer paragraph.
 // Lark retains U+2063 when flattening B into A, unlike arbitrary JSON metadata
 // or hidden Markdown links. The original four-character footer signature is
 // a prefix, so normal history/quoted parsing keeps stripping the whole footer.
 const PURPOSE_LENGTH: Record<GroupContextCardPurpose, number> = { runtime: 12, message: 13, 'turn-message': 14 };
-const PURPOSE_BY_LENGTH = new Map(Object.entries(PURPOSE_LENGTH).map(([purpose, length]) => [length, purpose as GroupContextCardPurpose]));
+const PURPOSE_BY_LENGTH = new Map(Object.entries(PURPOSE_LENGTH).flatMap(([purpose, length]) =>
+  [[length, purpose as GroupContextCardPurpose], [length + 3, purpose as GroupContextCardPurpose]]));
 const CARRIER = /\u2063{4,}/g;
-const TRAILING_PURPOSE_CARRIER = /\u2063{12,14}$/;
+const TRAILING_PURPOSE_CARRIER = /(?<!\u2063)\u2063{12,17}$/;
+const TRAILING_MEDIA_CARRIER = /(?<!\u2063)\u2063{15,17}$/;
 
 function nodes(value: unknown, visibleOnly = false): CardNode[] {
   if (!value || typeof value !== 'object') return [];
@@ -45,6 +49,10 @@ export function stripTrailingGroupContextCardPurposeMarker(value: string): strin
   return value.replace(TRAILING_PURPOSE_CARRIER, '');
 }
 
+export function hasTrailingGroupContextMediaPurposeMarker(value: string): boolean {
+  return TRAILING_MEDIA_CARRIER.test(value);
+}
+
 function inlinePurposeCarrier(root: any[], marker: string): boolean {
   // Prefer the first authored Markdown block. A signed visible footer is
   // always the final paragraph after Lark's B→A flattening; putting the inline
@@ -63,16 +71,16 @@ function inlinePurposeCarrier(root: any[], marker: string): boolean {
 }
 
 /** Reuse an existing media/table text field instead of allocating a blank row. */
-function inlineMediaPurposeCarrier(value: any, marker: string): boolean {
+function inlineMediaPurposeCarrier(value: any, marker: string, kind: 'table' | 'img'): boolean {
   if (!value || typeof value !== 'object') return false;
-  if (Array.isArray(value)) return value.some(child => inlineMediaPurposeCarrier(child, marker));
+  if (Array.isArray(value)) return value.some(child => inlineMediaPurposeCarrier(child, marker, kind));
   if (RUNTIME_ID.test(value.element_id ?? '')) return false;
-  if (value.tag === 'img') {
+  if (kind === 'img' && value.tag === 'img') {
     const alt = typeof value.alt === 'string' ? value.alt : value.alt?.content;
     value.alt = { tag: 'plain_text', content: `${stripTrailingGroupContextCardPurposeMarker(typeof alt === 'string' ? alt : '')}${marker}` };
     return true;
   }
-  if (value.tag === 'table' && Array.isArray(value.columns)) {
+  if (kind === 'table' && value.tag === 'table' && Array.isArray(value.columns)) {
     // The last text cell also stays at the end when a table is flattened.
     const textColumns = value.columns.filter((column: CardNode) => column?.data_type === 'lark_md');
     for (const row of [...(Array.isArray(value.rows) ? value.rows : [])].reverse()) {
@@ -88,7 +96,7 @@ function inlineMediaPurposeCarrier(value: any, marker: string): boolean {
       return true;
     }
   }
-  return ['elements', 'columns'].some(key => inlineMediaPurposeCarrier(value[key], marker));
+  return ['elements', 'columns'].some(key => inlineMediaPurposeCarrier(value[key], marker, kind));
 }
 
 /** Stamp an outgoing structured card without mutating the caller's object. */
@@ -101,12 +109,22 @@ export function markGroupContextCardPurpose(card: string | Record<string, any>, 
   if (!clone || typeof clone !== 'object' || Array.isArray(clone)) return card;
   const root = elements(clone);
   if (!root) return card;
+  // A saved card may carry an older purpose in image alt. Remove it before
+  // choosing a different carrier, otherwise re-stamping creates a conflict.
+  for (const node of nodes(root, true)) {
+    for (const key of node.tag === 'img' ? ['alt'] : node.tag === 'table' ? ['rows', 'columns'] : []) {
+      if (node[key] !== undefined) node[key] = stripMediaPurposeText(node[key]);
+    }
+  }
   const marker = '\u2063'.repeat(PURPOSE_LENGTH[purpose]);
+  const mediaMarker = '\u2063'.repeat(PURPOSE_LENGTH[purpose] + 3);
   const footer = nodes(root).find(node => node.element_id === REPLY_CARD_FOOTER_ELEMENT_ID && typeof node.content === 'string');
   if (footer) {
     if (footer.content.includes(REPLY_CARD_FOOTER_MARKER)) footer.content = footer.content.replace(CARRIER, marker);
     else footer.content = footer.content.replace(/(?=<\/font>\s*$)|$/, marker);
-  } else if (!inlinePurposeCarrier(root, marker) && !inlineMediaPurposeCarrier(root, marker)) {
+  } else if (!inlinePurposeCarrier(root, marker)
+    && !inlineMediaPurposeCarrier(root, mediaMarker, 'table')
+    && !inlineMediaPurposeCarrier(root, mediaMarker, 'img')) {
     // Unsupported custom shapes retain the compatibility carrier.
     root.push({ tag: 'markdown', element_id: REPLY_CARD_FOOTER_ELEMENT_ID, text_size: 'notation',
       content: `<font color='grey'>${marker}</font>` });
@@ -265,7 +283,10 @@ function conversation(card: CardNode, turnReply: boolean, legacy = false): Group
 }
 
 /** A shared-only structural projection. Ordinary history parsing stays intact. */
-export function projectGroupContextCard(rawContent: string): GroupContextCardProjection | undefined {
+export function projectGroupContextCard(
+  rawContent: string,
+  options: { botmuxSender?: boolean } = {},
+): GroupContextCardProjection | undefined {
   let card: CardNode;
   try { card = JSON.parse(rawContent); } catch { return undefined; }
   if (!card || typeof card !== 'object' || Array.isArray(card)) return undefined;
@@ -294,7 +315,7 @@ export function projectGroupContextCard(rawContent: string): GroupContextCardPro
     const imageOnlyApiCard = root?.length && root.every(paragraph => Array.isArray(paragraph)
       && paragraph.length > 0 && paragraph.every(node => node?.tag === 'img'
         || node?.tag === 'text' && typeof node.text === 'string' && !node.text.trim()));
-    return imageOnlyApiCard ? { kind: 'unresolved' } : undefined;
+    return options.botmuxSender === true && imageOnlyApiCard ? { kind: 'unresolved' } : undefined;
   }
   const statusText = renderedText(status);
   // The rendered property tree can omit Markdown's bold delimiters. Rebuild

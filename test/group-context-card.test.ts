@@ -153,7 +153,7 @@ describe('group-context card projection', () => {
       if (body.startsWith('!')) {
         // The list API drops image alt; it must request structured B rather
         // than accidentally sharing runtime images as conversation.
-        expect(projectGroupContextCard(simplified(JSON.stringify(marked)))).toEqual({ kind: 'unresolved' });
+        expect(projectGroupContextCard(simplified(JSON.stringify(marked)), { botmuxSender: true })).toEqual({ kind: 'unresolved' });
       } else {
         const table = marked.body.elements[0];
         const flattened = JSON.stringify({ elements: [[{ tag: 'text', text: `A B\n${table.rows[0].c0} ${table.rows[0].c1}` }]] });
@@ -169,6 +169,52 @@ describe('group-context card projection', () => {
       if (body.startsWith('!')) expect(projection.text).toContain('Preview');
       else expect(projection.text).toContain('| A | B |');
     }
+  });
+
+  describe.each(['image-first', 'table-first'])('%s mixed media', order => {
+    it.each(['runtime', 'message', 'turn-message'] as const)('retains %s after the list API drops image alt', purpose => {
+      const image = '![Preview](img_v3_mixed)';
+      const table = '| A | B |\n| --- | --- |\n| 1 | 2 |';
+      const body = order === 'image-first' ? `${image}\n\n${table}` : `${table}\n\n${image}`;
+      const marked = markGroupContextCardPurpose({ schema: '2.0', body: {
+        elements: buildImageCardElements(body, [], undefined, undefined, 'medium'),
+      } }, purpose);
+      const flat: any[][] = [];
+      const visit = (node: any): void => {
+        if (Array.isArray(node)) { node.forEach(visit); return; }
+        if (!node || typeof node !== 'object') return;
+        if (node.tag === 'img') flat.push([{ tag: 'img', image_key: node.img_key }]);
+        if (node.tag === 'table') flat.push([{ tag: 'text', text: `A B\n${node.rows[0].c0} ${node.rows[0].c1}` }]);
+        visit(node.elements); visit(node.columns);
+      };
+      visit(marked.body.elements);
+      const raw = JSON.stringify({ elements: flat });
+      expect(projectGroupContextCard(raw)?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+      expect(JSON.stringify(marked)).not.toContain('botmux_reply_footer');
+      if (purpose === 'message') {
+        const projected = conversation(raw);
+        expect(projected.resources.map(resource => resource.key)).toEqual(['img_v3_mixed']);
+        expect(projected.text).toContain('1 2');
+        expect(projected.text).not.toContain('\u2063');
+      }
+    });
+  });
+
+  it('replaces an older image purpose when switching mixed cards to a table carrier', () => {
+    const card = { schema: '2.0', body: { elements: [
+      { tag: 'img', img_key: 'img_v3_old', alt: { tag: 'plain_text', content: `Preview${'\u2063'.repeat(12)}` } },
+      { tag: 'table', columns: [{ name: 'c0', display_name: 'A', data_type: 'lark_md' }], rows: [{ c0: 'Public' }] },
+    ] } };
+    const next = markGroupContextCardPurpose(card, 'message');
+    expect(next.body.elements[0].alt?.content).toBe('Preview');
+    expect(projectGroupContextCard(JSON.stringify(next))?.kind).toBe('conversation');
+    expect(markGroupContextCardPurpose(next, 'message')).toEqual(next);
+    expect(JSON.stringify(card)).toContain('\u2063');
+  });
+
+  it('keeps unmarked image lists on the ordinary parsing path without producer evidence', () => {
+    const raw = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_external' }]] });
+    expect(projectGroupContextCard(raw)).toBeUndefined();
   });
 
   it('keeps unmarked structured image cards on the ordinary parsing path', () => {

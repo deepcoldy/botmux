@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const network = vi.hoisted(() => ({ history: vi.fn(), thread: vi.fn(), threadContext: vi.fn(), byThreadId: vi.fn(), download: vi.fn(), detail: vi.fn(), update: vi.fn() }));
@@ -216,6 +216,7 @@ describe('group context platform integration', () => {
 
   it.each(['runtime', 'message'] as const)('rehydrates image-only list cards to retain %s classification without a Footer', async purpose => {
     const now = Date.now();
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([{ larkAppId: 'cli_peer', botName: 'Fixture' }]));
     const flattened = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_public' }]] });
     const structured = JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
       { tag: 'img', img_key: 'img_v3_public', alt: { tag: 'plain_text', content: 'Public image' } },
@@ -234,6 +235,39 @@ describe('group context platform integration', () => {
       expect(stored?.text).toContain('Public image');
       expect(stored?.text).not.toContain('\u2063');
     }
+  });
+
+  it.each(['detail-failure', 'detail-still-list', 'over-limit'] as const)('preserves third-party image lists during %s', async scenario => {
+    const now = Date.now();
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([{ larkAppId: 'cli_peer', botName: 'Fixture' }]));
+    const foreignCount = scenario === 'over-limit' ? 12 : 1;
+    const knownCount = scenario === 'over-limit' ? 10 : 1;
+    const imageCard = (key: string) => JSON.stringify({ elements: [[{ tag: 'img', image_key: key }]] });
+    const message = (id: string, sender: string, key: string) => ({ message_id: id, chat_id: 'oc_room',
+      create_time: String(now - 100), update_time: String(now - 100), msg_type: 'interactive',
+      sender: { id: sender, sender_type: 'app' }, body: { content: imageCard(key) } });
+    network.history.mockResolvedValue([
+      ...Array.from({ length: foreignCount }, (_, i) => message(`om_external_${i}`, 'cli_external', `img_v3_external_${i}`)),
+      ...Array.from({ length: knownCount }, (_, i) => message(`om_known_${i}`, 'cli_peer', `img_v3_known_${i}`)),
+    ]);
+    network.detail.mockImplementation(async (_app, id, options) => {
+      if (scenario === 'detail-failure') throw new Error('detail unavailable');
+      const card = scenario === 'over-limit' && options.userCardContent
+        ? JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
+            { tag: 'img', img_key: `img_v3_${id}`, alt: { tag: 'plain_text', content: '' } },
+          ] } }, 'runtime'))
+        : imageCard(`img_v3_${id}`);
+      return { items: [{ update_time: String(now - 1), body: { content: card } }] };
+    });
+    const prepared = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '总结' });
+    for (let i = 0; i < foreignCount; i++) {
+      expect(getGroupContextMessage('cli_b', 'oc_room', `om_external_${i}`)?.resourceRefs.map(ref => ref.key)).toEqual([`img_v3_external_${i}`]);
+    }
+    expect(network.detail.mock.calls.every(call => call[1].startsWith('om_known_'))).toBe(true);
+    expect(new Set(network.detail.mock.calls.map(call => call[1])).size).toBe(Math.min(knownCount, 8));
+    // Unknown known-producer cards stay excluded; failure cannot publish runtime images.
+    for (let i = 0; i < knownCount; i++) expect(getGroupContextMessage('cli_b', 'oc_room', `om_known_${i}`)).toBeUndefined();
+    expect(prepared?.incomplete).toBe(true);
   });
 
   it('excludes a card completed after the triggering message even if the list had an old timestamp', async () => {
