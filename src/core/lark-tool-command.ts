@@ -36,7 +36,8 @@ function parseHelp(text: string): CommandHelp {
       flags.set(match[2], flag);
       if (match[1]) flags.set(match[1], flag);
     } else if (section === 'commands') {
-      const match = /^\s+([+\w][\w.+-]*)\s{2,}/.exec(line);
+      // Cobra pads names to the longest one, which then has a single space.
+      const match = /^\s+([+\w][\w.+-]*)(?:\s|$)/.exec(line);
       if (match) commands.add(match[1]);
     }
   }
