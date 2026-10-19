@@ -13783,7 +13783,9 @@ export function forkWorker(
       ? botCfg.remoteRunner
       : botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
         ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
-        : botCfg.riff,
+        : botCfg.backendType === 'herdr'
+          ? (botCfg.herdr ?? config.daemon.herdr)
+          : botCfg.riff,
     remoteBackendState: ds.session.remoteBackendState,
     ...(remoteResumeMode ? { remoteResumeMode } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,

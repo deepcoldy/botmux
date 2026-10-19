@@ -17247,17 +17247,25 @@ async function spawnCli(
     // Isolation/MCP incarnations move historical shared-host agents to the
     // data-root-scoped managed target. Retire the exact old pane before backend
     // selection mutates the durable stamp or a replacement CLI can spawn.
+    const effectiveHerdrConfig = (cfg.backendConfig && typeof cfg.backendConfig === 'object' && ('sessionName' in cfg.backendConfig || 'placement' in cfg.backendConfig))
+      ? (cfg.backendConfig as import('./adapters/backend/types.js').HerdrBackendConfig)
+      : undefined;
     retireSupersededRecordedHerdrTarget({
       sessionId: cfg.sessionId,
       ownershipScope: isolationRuntimeDataDir,
       reuseRecordedHerdrTarget,
       persistentBackendTarget: cfg.persistentBackendTarget,
+      herdrConfig: effectiveHerdrConfig,
     });
   }
+  const effectiveHerdrConfig = (cfg.backendConfig && typeof cfg.backendConfig === 'object' && ('sessionName' in cfg.backendConfig || 'placement' in cfg.backendConfig))
+    ? (cfg.backendConfig as import('./adapters/backend/types.js').HerdrBackendConfig)
+    : undefined;
   const selectBackend = () => selectSessionBackend({
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    herdrConfig: effectiveHerdrConfig,
     remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
@@ -20359,6 +20367,7 @@ async function spawnCli(
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
+      cliId: cfg.cliId,
       model: cfg.model,
       modelBackendVariant: cfg.modelBackendVariant,
       reasoningEffort: cfg.reasoningEffort,

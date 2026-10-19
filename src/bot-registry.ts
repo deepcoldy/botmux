@@ -12,7 +12,7 @@ import {
   normalizeScratchStorage,
   type SandboxMode,
 } from './adapters/cli/sandbox-mode.js';
-import type { BackendType } from './adapters/backend/types.js';
+import type { BackendType, HerdrBackendConfig } from './adapters/backend/types.js';
 import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import {
@@ -1765,6 +1765,14 @@ export interface BotConfig {
    * selection, and auth settings for riff's HTTP API.
    */
   riff?: RiffBackendConfig;
+
+  /**
+   * Configuration for the herdr backend. Optional even when `backendType` is
+   * `'herdr'`: default placement uses machine-wide managed 'botmux' host session.
+   * Can target an existing host session (e.g. 'default') and place panes into
+   * specific tabs or workspaces.
+   */
+  herdr?: HerdrBackendConfig;
 
   /**
    * Configuration for the mojo backend (@byted/mojo headless CLI). Optional
@@ -4017,6 +4025,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
+      herdr: entry.herdr && typeof entry.herdr === 'object' ? {
+        sessionName: typeof entry.herdr.sessionName === 'string' && entry.herdr.sessionName.trim() ? entry.herdr.sessionName.trim() : undefined,
+        placement: entry.herdr.placement === 'tab' || entry.herdr.placement === 'split' || entry.herdr.placement === 'workspace' ? entry.herdr.placement : undefined,
+        workspace: typeof entry.herdr.workspace === 'string' && entry.herdr.workspace.trim() ? entry.herdr.workspace.trim() : undefined,
+        tab: typeof entry.herdr.tab === 'string' && entry.herdr.tab.trim() ? entry.herdr.tab.trim() : undefined,
+        splitDirection: entry.herdr.splitDirection === 'down' ? 'down' : (entry.herdr.splitDirection === 'right' ? 'right' : undefined),
+      } : undefined,
       mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'

@@ -11,6 +11,43 @@ import type {
 
 export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner';
 
+export type HerdrBackendPlacement = 'workspace' | 'tab' | 'split';
+
+export interface HerdrBackendConfig {
+  /**
+   * Named Herdr session to host Botmux-managed agents.
+   * Defaults to 'botmux'.
+   * When pointing to an external user session (e.g. 'default'), Botmux launches
+   * agents inside that session and never destroys or restarts the host session.
+   */
+  sessionName?: string;
+
+  /**
+   * Placement mode for new managed agent panes:
+   * - 'workspace' (default): creates a new workspace for each topic (herdr workspace create).
+   * - 'tab': creates a new tab inside the target workspace (herdr tab create).
+   * - 'split': splits an existing pane inside the target tab (herdr pane split).
+   */
+  placement?: HerdrBackendPlacement;
+
+  /**
+   * Target workspace identifier or label (or prefix) when placement is 'tab' or 'split'.
+   * Matches by prefix, substring, or exact label. Falls back to the active workspace.
+   */
+  workspace?: string;
+
+  /**
+   * Target tab label or prefix when placement is 'split' (e.g. "3 其他" or "3 ").
+   * Matches by prefix, substring, or exact label.
+   */
+  tab?: string;
+
+  /**
+   * Split direction when placement is 'split'. Default 'right'.
+   */
+  splitDirection?: 'right' | 'down';
+}
+
 export interface BackendTurnInput {
   content: string;
   turnId: string;
@@ -99,6 +136,10 @@ export interface SpawnOpts {
    * Backends that execute `bin` directly (pty/tmux/zellij/zmx) ignore it.
    */
   cliBin?: string;
+  /** Logical CLI identifier (e.g. 'claude', 'codex') for agent kind fallback. */
+  cliId?: string;
+  /** Explicit Herdr managed agent kind override. */
+  herdrAgentKind?: string;
   /** Provider-neutral model selection for structured remote runners. */
   model?: string;
   /** Provider-neutral model backend variant for structured remote runners. */

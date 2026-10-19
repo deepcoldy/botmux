@@ -18,7 +18,7 @@ import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
 import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
-import type { BackendType, PersistentBackendTarget, SessionBackend, SessionProbe } from './types.js';
+import type { BackendType, HerdrBackendConfig, PersistentBackendTarget, SessionBackend, SessionProbe } from './types.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
 const MANAGED_HERDR_AGENT_TOKEN_LENGTH = 25;
@@ -88,12 +88,14 @@ export function retireSupersededRecordedHerdrTarget(opts: {
   ownershipScope?: string;
   reuseRecordedHerdrTarget: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
+  herdrConfig?: HerdrBackendConfig;
 }): void {
   if (opts.reuseRecordedHerdrTarget) return;
   const recorded = opts.persistentBackendTarget;
   if (recorded?.backendType !== 'herdr' || !recorded.agentName) return;
 
-  const replacementSessionName = HerdrBackend.managedSessionName();
+  const configuredSession = opts.herdrConfig?.sessionName?.trim();
+  const replacementSessionName = configuredSession || HerdrBackend.managedSessionName();
   const replacementAgentName = managedHerdrAgentName(opts.sessionId, opts.ownershipScope);
   if (
     recorded.sessionName === replacementSessionName
@@ -390,7 +392,8 @@ export interface SelectedSessionBackend {
 export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
-  backendConfig?: RiffBackendConfig | EffectiveMojoConfig | RemoteRunnerConfig;
+  backendConfig?: RiffBackendConfig | EffectiveMojoConfig | RemoteRunnerConfig | HerdrBackendConfig;
+  herdrConfig?: HerdrBackendConfig;
   remoteBackendState?: RemoteRunnerBackendState;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
@@ -620,20 +623,31 @@ export function selectSessionBackend(opts: {
     }
 
     // Every fresh agent actively launched by this machine's Botmux shares the
-    // reserved `botmux` Herdr host, regardless of which Lark bot, dashboard, or
-    // other Botmux entry point requested it. Topics remain isolated as distinct
-    // managed agents/panes. /adopt stays bound to its explicit user session.
-    const hostSessionName = HerdrBackend.managedSessionName();
+    // configured Herdr host (defaults to the reserved `botmux` session),
+    // regardless of which Lark bot, dashboard, or other Botmux entry point
+    // requested it. Topics remain isolated as distinct managed agents/panes.
+    // /adopt stays bound to its explicit user session.
+    const herdrCfg = opts.herdrConfig ?? (opts.backendConfig && typeof opts.backendConfig === 'object' && 'sessionName' in opts.backendConfig ? (opts.backendConfig as HerdrBackendConfig) : undefined);
+    const configuredSession = herdrCfg?.sessionName?.trim();
+    const isCustomSession = Boolean(configuredSession && configuredSession !== HerdrBackend.managedSessionName());
+    const hostSessionName = configuredSession || HerdrBackend.managedSessionName();
     const agentName = managedHerdrAgentName(opts.sessionId, opts.herdrOwnershipScope);
     const hostExists = HerdrBackend.hasSession(hostSessionName);
     const reattach = hostExists && HerdrBackend.hasAgent(hostSessionName, agentName);
+
+    if (isCustomSession && !hostExists && !reattach) {
+      throw new Error(`herdr session "${hostSessionName}" is not running; please start it or check your herdr.sessionName configuration`);
+    }
+
     return {
       backend: new HerdrBackend(hostSessionName, {
-        createSession: !hostExists,
+        createSession: !hostExists && !isCustomSession,
         agentName,
         isReattach: reattach,
         ownsSession: false,
         ownsAgent: true,
+        herdrConfig: herdrCfg,
+        isCustomHost: isCustomSession,
       }),
       isTmuxMode: false,
       isPipeMode: true,
@@ -641,7 +655,7 @@ export function selectSessionBackend(opts: {
       persistentSessionName: hostSessionName,
       persistentBackendTarget: { backendType: 'herdr', sessionName: hostSessionName, agentName },
       isReattach: reattach,
-      createdHerdrSessionName: hostExists ? undefined : hostSessionName,
+      createdHerdrSessionName: hostExists || isCustomSession ? undefined : hostSessionName,
     };
   }
 
