@@ -132,8 +132,15 @@ describe('remote runner protocol', () => {
         startedAtMs: 1234,
         trustedCaller: {
           requestUserOpenId: 'ou_actor',
+          requestUserUnionId: 'on_bot',
           requestLarkAppId: 'cli_app',
-          senderType: 'user',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
         },
       },
     }))).toMatchObject({
@@ -142,6 +149,15 @@ describe('remote runner protocol', () => {
         turnId: 'turn-survived',
         generation: 7,
         dispatchAttempt: 3,
+        trustedCaller: {
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
+        },
       },
     });
     expect(parseRemoteRunnerEventLine(JSON.stringify({
@@ -151,6 +167,28 @@ describe('remote runner protocol', () => {
       requestId: 'resume-recovery-bad',
       state: { version: 1, provider: 'reference', generation: 7 },
       recoveredTurn: { turnId: 'turn-survived', generation: -1 },
+    }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-forged-owner',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_human',
+          requestLarkAppId: 'cli_app',
+          senderType: 'user',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
+        },
+      },
     }))).toBeUndefined();
   });
 

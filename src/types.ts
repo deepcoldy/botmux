@@ -92,6 +92,23 @@ export interface TrustedCaller {
    *  happens to hold such a mapping becomes a way for anyone who can make it
    *  speak to borrow that access, with the audit trail pointing at the bot. */
   senderType?: 'user' | 'bot';
+  /**
+   * Host-attested developer for an inbound peer-bot turn. This is deliberately
+   * separate from requestUser*: the immediate caller remains the bot for
+   * routing, allowlists and audit, while a remote runner may explicitly opt in
+   * to the bot owner's human credentials (for example, developer_default).
+   *
+   * The value is present only when the sender was positively identified as a
+   * bot, its union_id matched the authoritative platform team-sync roster, and
+   * the owner was resolved through the receiving Lark app. Message text,
+   * session ownership and last-human state never populate it.
+   */
+  botOwner?: {
+    openId: string;
+    unionId: string;
+    email: string;
+    source: 'platform_team';
+  };
 }
 
 export interface VcMeetingConsumerProfileFilter {

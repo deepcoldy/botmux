@@ -118,6 +118,12 @@ export interface RemoteRunnerTrustedCaller {
   source?: 'schedule_creator' | 'failed_turn_recovery';
   taskId?: string;
   senderType?: 'user' | 'bot';
+  botOwner?: {
+    openId: string;
+    unionId: string;
+    email: string;
+    source: 'platform_team';
+  };
 }
 
 export interface RemoteRunnerRecoveredTurn {
@@ -499,6 +505,17 @@ function nonNegativeInteger(value: unknown): number | undefined {
   return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : undefined;
 }
 
+function normalizeBotOwner(value: unknown): RemoteRunnerTrustedCaller['botOwner'] | undefined | null {
+  if (value === undefined) return undefined;
+  const raw = record(value);
+  const openId = nonEmptyString(raw?.openId, 256);
+  const unionId = nonEmptyString(raw?.unionId, 256);
+  const email = nonEmptyString(raw?.email, 320)?.toLowerCase();
+  if (!raw || !openId?.startsWith('ou_') || !unionId?.startsWith('on_')
+      || !email || !email.includes('@') || raw.source !== 'platform_team') return null;
+  return { openId, unionId, email, source: 'platform_team' };
+}
+
 function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | undefined {
   const raw = record(value);
   if (!raw) return undefined;
@@ -519,13 +536,16 @@ function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | und
     const caller = record(raw.trustedCaller);
     const openId = nonEmptyString(caller?.requestUserOpenId, 256);
     const appId = nonEmptyString(caller?.requestLarkAppId, 256);
-    if (!caller || !openId || !appId || !['user', 'bot'].includes(String(caller.senderType))) {
+    const botOwner = normalizeBotOwner(caller?.botOwner);
+    if (!caller || !openId || !appId || !['user', 'bot'].includes(String(caller.senderType))
+      || botOwner === null || (botOwner !== undefined && caller.senderType !== 'bot')) {
       return undefined;
     }
     trustedCaller = {
       requestUserOpenId: openId,
       requestLarkAppId: appId,
       senderType: caller.senderType as 'user' | 'bot',
+      ...(botOwner ? { botOwner } : {}),
     };
   }
   return {

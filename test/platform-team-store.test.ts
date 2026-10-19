@@ -16,6 +16,7 @@ import {
   isPlatformTeamMember,
   listPlatformTeams,
   PLATFORM_TEAM_PREFIX,
+  resolvePlatformTeamBotOwner,
 } from '../src/services/platform-team-store.js';
 import { recordTeamGroup, isTeamGroupChat, listTeamGroups } from '../src/services/team-groups-store.js';
 
@@ -26,7 +27,7 @@ const payload = (rev: string, teams: unknown[]) => ({ rev, teams });
 const team = (
   teamId: string,
   chatIds: string[],
-  bots: Array<{ appId: string; unionId?: string }>,
+  bots: Array<{ appId: string; unionId?: string; ownerUnionId?: string }>,
   memberUnionIds: string[] = [],
 ) => ({ teamId, teamName: teamId, groupChatIds: chatIds, bots, memberUnionIds });
 
@@ -121,4 +122,36 @@ describe('applyPlatformTeamSync', () => {
     expect(applied?.teams).toHaveLength(1);
     expect(applied?.teams[0].bots).toEqual([{ appId: 'cli_a', unionId: 'on_a', name: undefined }]);
   });
+
+  it('resolves a peer bot owner only inside the target bot team', () => {
+    applyPlatformTeamSync(dataDir, payload('rev1', [
+      team('t1', ['oc_hall'], [
+        { appId: 'cli_target', unionId: 'on_target', ownerUnionId: 'on_targetowner' },
+        { appId: 'cli_source', unionId: 'on_source_bot', ownerUnionId: 'on_sourceowner' },
+      ], ['on_targetowner', 'on_sourceowner']),
+    ]));
+    expect(resolvePlatformTeamBotOwner(dataDir, 'cli_target', 'on_source_bot')).toEqual({
+      status: 'resolved', ownerUnionId: 'on_sourceowner',
+    });
+  });
+
+  it('fails closed for conflicting or non-member owner attribution', () => {
+    applyPlatformTeamSync(dataDir, payload('rev1', [
+      team('a', ['oc_a'], [
+        { appId: 'cli_target', unionId: 'on_target' },
+        { appId: 'cli_source_a', unionId: 'on_source', ownerUnionId: 'on_ownera' },
+      ], ['on_ownera']),
+      team('b', ['oc_b'], [
+        { appId: 'cli_target', unionId: 'on_target' },
+        { appId: 'cli_source_b', unionId: 'on_source', ownerUnionId: 'on_ownerb' },
+      ], ['on_ownerb']),
+      team('c', ['oc_c'], [
+        { appId: 'cli_target', unionId: 'on_target' },
+        { appId: 'cli_source_c', unionId: 'on_unowned', ownerUnionId: 'on_notmember' },
+      ], []),
+    ]));
+    expect(resolvePlatformTeamBotOwner(dataDir, 'cli_target', 'on_source')).toEqual({ status: 'conflict' });
+    expect(resolvePlatformTeamBotOwner(dataDir, 'cli_target', 'on_unowned')).toEqual({ status: 'missing' });
+  });
+
 });

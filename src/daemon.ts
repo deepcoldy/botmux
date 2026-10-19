@@ -1,6 +1,7 @@
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
+import { withPlatformBotOwner } from './core/bot-owner-attribution.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -265,6 +266,33 @@ function trustedCallerForTurn(
     requestLarkAppId: larkAppId,
     ...(senderIsBot === undefined ? {} : { senderType: senderIsBot ? 'bot' as const : 'user' as const }),
   };
+}
+
+/**
+ * Add a separately attested developer to an ordinary peer-bot turn. Missing
+ * or ambiguous ownership leaves the annotation absent so credential consumers
+ * fail closed without changing bot routing or talk authorization.
+ */
+async function trustedCallerForInboundTurn(
+  larkAppId: string,
+  senderOpenId?: string,
+  senderUnionId?: string,
+  senderIsBot?: boolean,
+): Promise<TrustedCaller | undefined> {
+  const caller = trustedCallerForTurn(
+    larkAppId,
+    senderOpenId,
+    senderUnionId,
+    senderIsBot,
+  );
+  const enriched = await withPlatformBotOwner(caller, config.session.dataDir);
+  if (caller?.senderType === 'bot' && !enriched?.botOwner) {
+    logger.debug(
+      `[bot-owner] no verified platform owner for bot=${senderUnionId?.slice(0, 12) ?? 'unknown'} `
+      + `target=${larkAppId}; user credentials remain unavailable`,
+    );
+  }
+  return enriched;
 }
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
@@ -5865,11 +5893,18 @@ async function submitQueuedMessage(
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
   if (!isCurrent()) { rollbackReplyContext(); return false; }
+  const trustedCaller = await trustedCallerForInboundTurn(
+    ds.larkAppId,
+    message.senderId,
+    message.senderUnionId,
+    senderIsBot,
+  );
+  if (!isCurrent()) { rollbackReplyContext(); return false; }
   // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
   // and carried across runner recovery; user-written text cannot enable it.
   if (!sendWorkerInput(ds, input, message.messageId, {
     notifyRejection: false,
-    trustedCaller: trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot),
+    trustedCaller,
   })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
   beginNewTurn(ds, text, message.messageId);
@@ -8416,8 +8451,15 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         // the SAME native thread, with its own Botmux delivery identity.
         await noteTurnReceived(askSession, turnId, text, sender, turnId);
         if (!isCurrent()) return false;
+        const trustedCaller = await trustedCallerForInboundTurn(
+          boundAsk.larkAppId,
+          by,
+          actor?.memberUnionId,
+          byType,
+        );
+        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
         if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
-          trustedCaller: trustedCallerForTurn(boundAsk.larkAppId, by, actor?.memberUnionId, byType) })) return false;
+          trustedCaller })) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
         rememberLastCliInput(askSession, text, input);
         markSessionActivity(askSession);
@@ -23585,7 +23627,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // senderOpenId 已在上方（force-topic grant 限制前）声明；这里只补 master 新增的 senderUnionId。
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
-  const trustedCaller = trustedCallerForTurn(larkAppId, senderOpenId, senderUnionId, senderIsBotTriState(parsed.senderType, isForeignBotSender));
+  const trustedCaller = await trustedCallerForInboundTurn(
+    larkAppId,
+    senderOpenId,
+    senderUnionId,
+    senderIsBotTriState(parsed.senderType, isForeignBotSender),
+  );
   // union_id 信任腿（canOperate/evaluateTalk 的 teamBot）只对**飞书盖章的 bot 发送方**
   // 生效：平台 roster 是成员机器自报的，若不锁 sender_type，恶意成员把某个真人的
   // union_id 报成"自家 bot"，那个真人就会在全团队机器上被当队友 bot 放行（talk +
@@ -25432,7 +25479,7 @@ async function handlePrincipalLaneLiveMessage(
         const target = liveReference.target;
         const provenance = liveReference.provenance;
         const activeTurn = target?.activeInteractiveTurn;
-        const proposer = trustedCallerForTurn(
+        const proposer = await trustedCallerForInboundTurn(
           ctx.larkAppId,
           parsed.senderId,
           parsed.senderUnionId,
@@ -25789,7 +25836,12 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
-  const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId, senderIsBotTriState(parsed.senderType, isForeignBot));
+  const threadTrustedCaller = await trustedCallerForInboundTurn(
+    larkAppId,
+    threadSenderOpenId,
+    threadSenderUnionId,
+    senderIsBotTriState(parsed.senderType, isForeignBot),
+  );
   const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)
     : undefined;

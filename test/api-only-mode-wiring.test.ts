@@ -887,25 +887,22 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // non-empty 4th argument, and it must be the tri-state helper rather than a
     // bare `sender_type` comparison — that one reads a cross-ref-identified peer
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
-    const trustedCallerArgs = [...daemonSource.matchAll(/const\s+\w+\s*=\s*trustedCallerForTurn\(([^;]*?)\);/g)]
+    const trustedCallerArgs = [...daemonSource.matchAll(/const\s+\w+\s*=\s*(?:await\s+)?trustedCallerForInboundTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    // Three IM entry paths plus the authenticated dispatch launch caller.
-    expect(trustedCallerArgs.length).toBe(4);
-    for (const args of trustedCallerArgs.slice(0, 3)) {
+    expect(trustedCallerArgs.length).toBe(5);
+    for (const args of trustedCallerArgs) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
       expect(senderTypeArg).not.toBe('');
-      expect(senderTypeArg).toContain('senderIsBotTriState(');
       expect(senderTypeArg).not.toMatch(/^isBotSenderType\)?$/);
-      // ...and the cross-ref leg must actually be wired in: passing a literal
-      // `false` there keeps the helper name but drops peer-bot recognition,
-      // which is the exact case a bare `sender_type` check already missed.
-      expect(senderTypeArg).toContain('isForeignBot');
     }
+    expect(daemonSource.match(/senderIsBotTriState\(parsed\.senderType, isForeignBot(?:Sender)?\)/g)?.length)
+      .toBeGreaterThanOrEqual(3);
     // Dispatch launch is not an IM event on the target app: its same-host HMAC
     // authenticated and policy-allowlisted source daemon attests the human
     // caller union_id, while the immediate trigger is known to be that bot.
-    const dispatchArgs = trustedCallerArgs[3]!;
+    const dispatchArgs = [...daemonSource.matchAll(/const\s+dispatchTrustedCaller\s*=\s*trustedCallerForTurn\(([^;]*?)\);/g)]
+      .map(m => m[1].split(',').map(part => part.trim()))[0]!;
     expect(dispatchArgs.slice(0, 3).join(', ')).toContain('operation.callerUnionId');
     expect(dispatchArgs[3]).toBe('true');
     expect(daemonSource).toContain('trustedCaller: dispatchTrustedCaller');
@@ -914,7 +911,8 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     const queue = region(daemonSource, 'async function submitQueuedMessage(', '// Dependencies passed to command-handler');
     expect(queue).toContain('const senderIsBot = senderIsBotTriState(message.senderType,');
     expect(queue).toContain('isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId)');
-    expect(queue).toContain('trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot)');
+    expect(queue).toContain('trustedCallerForInboundTurn(');
+    expect(queue).toContain('message.senderUnionId,\n    senderIsBot,');
     // The source testimony must never be reused as evaluateBotTalk's bot union.
     expect(daemonSource).toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId)');
     expect(daemonSource).not.toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId, callerUnionId)');
