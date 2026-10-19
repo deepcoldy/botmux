@@ -1682,9 +1682,11 @@ export interface BotConfig {
   /**
    * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
    * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
-   * `bytedcli` run as the person who sent the current message, and a sender who
-   * has not authorized gets the bot's own tenant identity (or a failure, per
-   * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
+   * `bytedcli` run as the person who sent the current message; a sender who has
+   * not authorized gets a refusal carrying an authorization link — never the
+   * bot's, the owner's or anyone else's login. `credentialSource` picks where
+   * that person's credentials come from (central platform / this machine).
+   * See services/trigger-user-auth.ts.
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**

@@ -519,6 +519,13 @@ export const messages: Record<string, string> = {
   'cmd.login.lark_begin_failed': '❌ Could not start lark-cli authorization: {detail}',
   'cmd.login.lark_status_yes': 'lark-cli (your Feishu identity): authorized',
   'cmd.login.lark_status_no': 'lark-cli (your Feishu identity): not authorized — send /login lark and tap the link',
+  // Platform-backed source: on a bound machine with credentialSource ≠ local, /login points at the platform.
+  'cmd.login.platform_title': '🔐 Authorize on the central platform (once, for every bound machine)',
+  'cmd.login.platform_step1': 'Open the platform credentials page and complete the {provider} authorization:',
+  'cmd.login.platform_step2': 'Then retry the original action in this topic — no further command needed.',
+  'cmd.login.platform_note': 'Note: this machine is bound to the central platform, which stores and renews your {tool} authorization (revoke it there too). Tick the team this machine belongs to when authorizing, or this machine cannot obtain it.',
+  'cmd.login.platform_local_hint': 'To use a machine-local device login instead, send /login {command}.',
+  'cmd.login.platform_status': 'Central platform: this machine is bound; {tool} authorization is obtained from the platform first. View/revoke: {url}',
   'trigger_user_auth.provider_lark': 'Feishu',
   'trigger_user_auth.denied_you': 'botmux: this step runs as you and needs your own {provider} authorization, but you have not authorized {tool}. Command not run.',
   'trigger_user_auth.denied_known_user': 'botmux: this step needs {name}\'s own {provider} authorization, but they have not authorized {tool}. Command not run.',
@@ -527,6 +534,15 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_auto_login': 'botmux: this step needs YOUR OWN {tool} ({provider}) permission. Authorize just once (it then renews automatically — no repeated taps) by opening:',
   'trigger_user_auth.denied_auto_retry': 'Then just ask me to retry — no command to type. Not tapping means not authorizing, and this step will not run (nor as the bot or anyone else).',
   'trigger_user_auth.denied_howto_status': 'botmux: to check whether you are already authorized, send /login status.',
+  // Platform-backed source (triggerUserAuth.credentialSource = auto/platform on a bound machine):
+  // the refusal points at the platform's credentials page instead of a local device login.
+  'trigger_user_auth.denied_platform_login': 'botmux: this step needs YOUR OWN {tool} ({provider}) permission. Authorize once on the central platform — it then serves every bound machine and renews automatically — by opening:',
+  'trigger_user_auth.denied_platform_consent': 'botmux: you have authorized {tool} ({provider}) on the central platform, but not for the team this machine belongs to. Enable that team on the platform credentials page, then retry:',
+  'trigger_user_auth.denied_platform_retry': 'Then just ask me to retry — no command to type. Not authorizing means this step will not run (nor as the bot or anyone else).',
+  'trigger_user_auth.denied_platform_unavailable': 'botmux: the central platform is unreachable, so your {tool} ({provider}) authorization could not be obtained. Command not run. Stop automatic retries and repeated login requests; retry later. Existing authorization is retained.',
+  'trigger_user_auth.denied_platform_unbound': 'botmux: this machine is not bound to the central platform, but this bot requires {tool} credentials from the platform only. Command not run. Ask the operator to run botmux bind on the host, or set triggerUserAuth.credentialSource to auto / local.',
+  'trigger_user_auth.denied_platform_not_teammate': 'botmux: the central platform refused to issue your {tool} ({provider}) authorization: you and this machine\'s owner share no team. Command not run, and nobody else\'s identity is used instead.',
+  'trigger_user_auth.denied_platform_forbidden': 'botmux: the central platform refused this machine\'s {tool} grant request ({detail}). Command not run. Ask the operator to check this machine\'s platform binding.',
   'cmd.login.title': '🔐 Lark User OAuth',
   'cmd.login.step1': '1. Click the link below to authorize:',
   'cmd.login.step2_auto': '2. When authorization finishes the browser shows "✅ Authorized" — that is the end of it. Nothing to copy; just come back here and retry.',
@@ -1019,7 +1035,7 @@ export const messages: Record<string, string> = {
   'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
   'ai.credentials.on_auth_failure': 'On a Feishu auth failure, report it as-is. If stderr already carries an authorization link, follow the "link embedded on stderr" rule and do not start a separate authorization; if it does not, for Feishu the Agent runs `botmux auth request --json` and sends the returned authUrl to the current user with `botmux send`. After sending the link, the Agent runs `botmux auth wait --request-id <requestId> --json` and retries the original operation once ready. Continue using the user identity injected for this turn.',
   'ai.credentials.on_bytedcli_auth_failure': 'On a ByteCloud auth failure, report it as-is. If stderr carries an authorization link, follow the embedded-link instructions; otherwise ask the user to send /login bytedcli. Continue using the user identity injected for this turn.',
-  'ai.credentials.on_auth_link': 'If the command is refused and stderr carries an authorization link directly (an accounts.feishu.cn/device/verify or ByteCloud/cloud.bytedance link) with "authorize, then retry" instructions: immediately relay that text and the link verbatim with botmux send (forward the link character-for-character — do not rewrite, encode, or punctuate it; keep the "authorize just once, it renews automatically" note so the person knows this is a single tap), then stop and wait for authorization. Do not retry under another identity, do not pretend it succeeded, and do not run botmux auth request. The person will call you again after authorizing; retry then.',
+  'ai.credentials.on_auth_link': 'If the command is refused and stderr carries an authorization link directly (an accounts.feishu.cn/device/verify, ByteCloud/cloud.bytedance, or central-platform credentials-page link) with "authorize, then retry" instructions: immediately relay that text and the link verbatim with botmux send (forward the link character-for-character — do not rewrite, encode, or punctuate it; keep the "authorize just once, it renews automatically" note so the person knows this is a single tap), then stop and wait for authorization. Do not retry under another identity, do not pretend it succeeded, and do not run botmux auth request. The person will call you again after authorizing; retry then.',
   // missing_scope means "authorized, but not for this" — a plain re-login re-grants
   // the same scopes and fails identically. Feishu already names what is missing.
   'ai.credentials.on_missing_scope': 'For missing_scope (99991679), the Agent runs `botmux auth request --scope "<required scopes>" --json` and sends the returned authUrl with `botmux send`. When Feishu lists alternative permissions for one operation, request one of them; for example, choose im:chat:read from im:chat, im:chat:readonly, im:chat:read. Combine scopes when separate operations require independent permissions. Explain the requested permissions, then run `botmux auth wait --request-id <requestId> --json` and retry as the current user once ready.',

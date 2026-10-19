@@ -3693,12 +3693,15 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const enabled = policy?.enabled === true;
   const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
   const fallback = policy?.fallback ?? 'bot-identity';
+  const credentialSource = policy?.credentialSource ?? 'auto';
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
     authorizedCount?: number;
     tokenStoreAdvisory?: string;
     mcpAdvisory?: string;
+    platformBound?: boolean;
+    platformCredentialsUrl?: string;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -3732,7 +3735,11 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback });
+    void save({ enabled: true, tools: next, fallback, credentialSource });
+  }
+
+  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
+    void save({ enabled: true, tools, fallback, credentialSource: next });
   }
 
   return (
@@ -3745,7 +3752,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
         onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback } : null,
+          checked ? { enabled: true, tools, fallback, credentialSource } : null,
         )}
       />
       {enabled ? (
@@ -3765,6 +3772,33 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </label>
             ))}
           </div>
+          <div className="bd-row">
+            <span>{tr('botDefaults.triggerUserAuthSource')}</span>
+            <select
+              data-action="trigger-user-auth-source"
+              value={credentialSource}
+              disabled={busy}
+              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+            >
+              <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
+              <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
+              <option value="local">{tr('botDefaults.triggerUserAuthSourceLocal')}</option>
+            </select>
+          </div>
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthSourceHelp')}</p>
+          {credentialSource !== 'local' && info && info.platformBound === false ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="unbound">
+              ⚠️ {tr(credentialSource === 'platform'
+                ? 'botDefaults.triggerUserAuthPlatformUnboundStrict'
+                : 'botDefaults.triggerUserAuthPlatformUnbound')}
+            </p>
+          ) : null}
+          {credentialSource !== 'local' && info?.platformBound && info.platformCredentialsUrl ? (
+            <p className="bd-section-note" data-trigger-user-auth-platform="bound">
+              {tr('botDefaults.triggerUserAuthPlatformBound')}{' '}
+              <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
+            </p>
+          ) : null}
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>

@@ -516,6 +516,13 @@ export const messages: Record<string, string> = {
   'cmd.login.lark_begin_failed': '❌ 无法发起 lark-cli 授权：{detail}',
   'cmd.login.lark_status_yes': 'lark-cli（你的飞书身份）：已授权',
   'cmd.login.lark_status_no': 'lark-cli（你的飞书身份）：未授权 —— 发 /login lark 点链接完成授权',
+  // 中心化平台来源：本机已绑定且 credentialSource ≠ local 时，/login 指向平台凭据页。
+  'cmd.login.platform_title': '🔐 在中心化平台授权（一次授权，所有绑定平台的机器通用）',
+  'cmd.login.platform_step1': '打开平台凭据页，按页面提示完成 {provider} 授权：',
+  'cmd.login.platform_step2': '授权完成后直接在本话题重试刚才的操作即可，不用再发命令。',
+  'cmd.login.platform_note': '说明：本机已绑定中心化平台，{tool} 的授权统一由平台保管与续期，撤销也在那里。授权时请把本机所在的团队勾上，否则这台机器拿不到。',
+  'cmd.login.platform_local_hint': '如需改用仅本机有效的扫码方式，发 /login {command}。',
+  'cmd.login.platform_status': '中心化平台：本机已绑定，{tool} 授权优先从平台获取；查看/撤销：{url}',
   'trigger_user_auth.provider_lark': '飞书',
   'trigger_user_auth.denied_you': 'botmux: 这一步要用你自己的 {provider} 授权，但你还没授权过 {tool}，命令未执行。',
   'trigger_user_auth.denied_known_user': 'botmux: 这一步需要「{name}」本人的 {provider} 授权，但 ta 还没授权过 {tool}，命令未执行。',
@@ -524,6 +531,15 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_auto_login': 'botmux: 这一步要用你本人的 {tool}（{provider}）权限。只需授权这一次（之后自动续期、不用反复点），点开下面的链接确认即可：',
   'trigger_user_auth.denied_auto_retry': '点完直接让我重试刚才的操作就行，不用再发任何命令。不点 = 不授权 = 这一步不会执行（也不会用机器人或别人的身份代跑）。',
   'trigger_user_auth.denied_howto_status': 'botmux: 想确认自己是否已授权，可发 /login status。',
+  // 中心化平台来源（triggerUserAuth.credentialSource = auto/platform 且本机已绑定）：
+  // 拒绝文案指向平台凭据页，不再让人在本机扫码——一次授权，所有机器通用。
+  'trigger_user_auth.denied_platform_login': 'botmux: 这一步要用你本人的 {tool}（{provider}）权限。请在中心化平台授权一次，之后所有绑定平台的机器都通用（自动续期、不用重复授权），打开下面的链接完成：',
+  'trigger_user_auth.denied_platform_consent': 'botmux: 你已在中心化平台授权过 {tool}（{provider}），但还没允许本机所在的团队使用。请在平台凭据页为该团队开启后重试：',
+  'trigger_user_auth.denied_platform_retry': '完成后直接让我重试刚才的操作即可，不用再发任何命令。不授权 = 这一步不会执行（也不会用机器人或别人的身份代跑）。',
+  'trigger_user_auth.denied_platform_unavailable': 'botmux: 中心化平台暂时不可达，拿不到你的 {tool}（{provider}）授权，命令未执行。请停止自动重试和重复要求用户登录，稍后再试；已有授权会保留。',
+  'trigger_user_auth.denied_platform_unbound': 'botmux: 本机尚未绑定中心化平台，而本 bot 要求 {tool} 凭据只能来自平台，命令未执行。请管理员在宿主终端执行 botmux bind，或把 triggerUserAuth.credentialSource 改为 auto / local。',
+  'trigger_user_auth.denied_platform_not_teammate': 'botmux: 中心化平台拒绝签发 {tool}（{provider}）授权：你与本机所有者不在同一个团队。命令未执行，也不会用别人的身份代跑。',
+  'trigger_user_auth.denied_platform_forbidden': 'botmux: 中心化平台拒绝了本机的 {tool} 授权请求（{detail}），命令未执行。请管理员检查本机的平台绑定状态。',
   'cmd.login.title': '🔐 飞书用户授权',
   'cmd.login.step1': '1. 点击下方链接完成授权：',
   'cmd.login.step2_auto': '2. 授权完成后浏览器会显示「✅ 授权成功」，到这里就结束了——不需要复制任何东西，回到本话题重试即可。',
@@ -1017,7 +1033,7 @@ export const messages: Record<string, string> = {
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
   'ai.credentials.on_auth_failure': '遇到飞书鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`，再用 `botmux send` 将返回的 authUrl 发给本轮用户，发出链接后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。凭证沿用本轮注入的用户身份。',
   'ai.credentials.on_bytedcli_auth_failure': '遇到 ByteCloud 鉴权失败：原样说明失败。stderr 已附授权链接时按「stderr 附链接」流程处理；未附链接时提示用户发 /login bytedcli。凭证沿用本轮注入的用户身份。',
-  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify 或 ByteCloud/cloud.bytedance 链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
+  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify、ByteCloud/cloud.bytedance 或中心化平台凭据页链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
   // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑普通授权，
   // 那只会拿到同样的权限再失败一次。飞书已经把缺的 scope 名字列出来了，照抄即可。
   'ai.credentials.on_missing_scope': '如果报 missing_scope（99991679），由 Agent 运行 `botmux auth request --scope "<所需权限>" --json`，再用 `botmux send` 发回 authUrl。飞书错误若列出满足同一操作的候选权限，选择其中一个即可，例如 im:chat、im:chat:readonly、im:chat:read 选择 im:chat:read。不同操作各自需要的独立权限才合并请求。说明本次请求的权限，再运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 后以本轮用户身份重试原操作。',

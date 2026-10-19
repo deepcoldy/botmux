@@ -10,7 +10,8 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
+import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
@@ -3801,9 +3802,44 @@ export async function handleCommand(
           await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
           break;
         }
+        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
+        // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
+        // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
+        const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
+        const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
+        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
+        const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
+          ? platformCredentialsUrl() : null;
+        if (platformCredsUrl && (subCmd === ''
+          || (credSource === 'platform' && (subCmd === 'lark' || subCmd === 'bytedcli')))) {
+          const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
+            : [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / ');
+          const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
+            ? t('trigger_user_auth.provider_lark', undefined, loc)
+            : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
+          const lines = [
+            t('cmd.login.platform_title', undefined, loc), '',
+            t('cmd.login.platform_step1', { provider }, loc),
+            platformCredsUrl, '',
+            t('cmd.login.platform_step2', undefined, loc), '',
+            t('cmd.login.platform_note', { tool: which }, loc),
+          ];
+          if (credSource === 'auto' && subCmd === '') {
+            lines.push('', t('cmd.login.platform_local_hint', { command: larkGoverned ? 'lark' : 'bytedcli' }, loc));
+          }
+          await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
+          if (platformCredsUrl) {
+            lines.push(t('cmd.login.platform_status', {
+              tool: [larkGoverned ? 'lark-cli' : '', bytedcliGoverned ? 'bytedcli' : ''].filter(Boolean).join(' / '),
+              url: platformCredsUrl,
+            }, loc));
+          }
           if (ds && isLarkToolBound(botCfg2, config.session.dataDir, ds.session.sessionId)) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
