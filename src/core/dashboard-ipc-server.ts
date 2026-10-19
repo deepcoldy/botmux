@@ -1,3 +1,4 @@
+import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
@@ -7247,6 +7248,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   let model: string | null = null;
   let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  let codexProfile: string | null = null;
   let serviceTier: CodexServiceTier | null = null;
   let nativeSubagentRuntime: BotConfig['nativeSubagentRuntime'] | null = null;
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
@@ -7275,6 +7277,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
       ? cfg.modelBackendVariant
       : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
+    codexProfile = cfg.codexProfile ?? null;
     serviceTier = cfg.serviceTier ?? null;
     const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime);
     nativeSubagentRuntime = normalizedNativeSubagentRuntime.ok
@@ -7367,6 +7370,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     model,
     modelBackendVariant,
     reasoningEffort,
+    codexProfile,
     serviceTier,
     nativeSubagentRuntime,
     turnTimeoutMs,
@@ -8029,6 +8033,13 @@ ipcRoute('PUT', '/api/bot-description', requireBoundBot(async (req, res) => {
 // sessions frozen on a different cliId/wrapperCli are closed immediately, so
 // a later lazy resume can't resurrect the old CLI (#346 covered the restart
 // path; this covers the hot-switch path).
+ipcRoute('GET', '/api/bot-codex-profiles', requireBoundBot(async (_req, res) => {
+  const appId = cachedLarkAppId;
+  const cfg = getBot(appId).config;
+  const catalog = await scanCodexProfiles({ ...cfg, backendType: cfg.backendType ?? config.daemon.backendType, codexRpcInput: cfg.codexRpcInput === true || config.codexRpcInputDefault });
+  jsonRes(res, 200, { ...catalog, larkAppId: appId });
+}));
+
 ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   const larkAppId = cachedLarkAppId;
   const body = await readJsonBodyOrBadJson<{
@@ -8037,6 +8048,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     model?: unknown;
     modelBackendVariant?: unknown;
     reasoningEffort?: unknown;
+    codexProfile?: unknown;
     serviceTier?: unknown;
     nativeSubagentRuntime?: unknown;
     turnTimeoutMs?: unknown;
@@ -8058,6 +8070,11 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   if (body.replaceCliSelection !== undefined && typeof body.replaceCliSelection !== 'boolean') {
     return jsonRes(res, 400, { ok: false, error: 'invalid_replace_cli_selection' });
   }
+  const profilePresent = Object.hasOwn(body, 'codexProfile');
+  let requestedProfile: string | undefined;
+  let nextProfile: string | undefined;
+  try { requestedProfile = normalizeCodexProfile(body.codexProfile); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'codex_profile_invalid_name' }); }
   const requestedSelection = selected;
   const model = typeof body.model === 'string' ? body.model.trim() : '';
   const modelBackendVariantFieldPresent = Object.prototype.hasOwnProperty.call(body, 'modelBackendVariant');
@@ -8315,6 +8332,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       const effectiveServiceTier = supportsServiceTier
         ? (serviceTierFieldPresent ? serviceTier ?? undefined : entry.serviceTier)
         : undefined;
+      nextProfile = profilePresent ? requestedProfile : entry.codexProfile;
+      if (nextProfile && effectiveServiceTier && effectiveServiceTier !== 'default') {
+        return { write: false, result: { error: 'codex_profile_unsupported_service_tier' } };
+      }
       if (effectiveServiceTier && effectiveServiceTier !== 'default') {
         // A bare Codex catalog cannot attest a wrapper-selected provider/profile.
         // Never execute arbitrary wrappers or hooks as a capability probe.
@@ -8336,6 +8357,14 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         }
       }
 
+      if (nextProfile) {
+        try {
+          await validateCodexProfile({ ...entry, ...selected, cliRuntime: nextRuntime, cliPathOverride: effectivePath, serviceTier: effectiveServiceTier, backendType: entry.backendType ?? config.daemon.backendType, codexRpcInput: entry.codexRpcInput === true || config.codexRpcInputDefault }, nextProfile);
+        } catch (error) {
+          return { write: false, result: { error: `codex_profile_${error instanceof CodexProfileError ? error.code : 'scan_failed'}` } };
+        }
+      }
+
       const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
         ? entry.modelBackendVariant
         : undefined;
@@ -8354,6 +8383,8 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       const nextServiceTier = supportsServiceTier
         ? (serviceTierFieldPresent ? serviceTier ?? undefined : entry.serviceTier)
         : undefined;
+      if (nextProfile) entry.codexProfile = nextProfile;
+      else delete entry.codexProfile;
       entry.cliId = selected.cliId;
       if (selected.cliId !== 'codex-app' && entry.codexBrowser !== undefined) {
         delete entry.codexBrowser;
@@ -8469,6 +8500,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     }
 
     const bot = getBot(larkAppId);
+    bot.config.codexProfile = nextProfile;
     bot.config.cliId = selected.cliId;
     bot.config.cliRuntime = nextRuntime;
     bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
@@ -8522,6 +8554,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       model: model || null,
       modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      codexProfile: bot.config.codexProfile ?? null,
       serviceTier: supportsServiceTier ? bot.config.serviceTier ?? null : null,
       nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,

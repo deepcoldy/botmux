@@ -36,6 +36,7 @@ export interface DashboardBotDescriptor {
   model?: string;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  codexProfile?: string | null;
   serviceTier?: CodexServiceTier;
   nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /** dsh runner turn timeout (ms); dashboard exposes it for the dsh CLI only. */
@@ -103,6 +104,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.modelBackendVariant ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
+    ...(bot.codexProfile ? { codexProfile: bot.codexProfile } : {}),
     ...(bot.serviceTier ? { serviceTier: bot.serviceTier } : {}),
     ...(bot.nativeSubagentRuntime ? { nativeSubagentRuntime: bot.nativeSubagentRuntime } : {}),
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),

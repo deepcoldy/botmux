@@ -7740,6 +7740,192 @@ describe('PUT /api/bot-substitute-mode', () => {
 });
 
 describe('PUT /api/bot-agent', () => {
+  describe('Codex profile selection (#2036)', () => {
+    let dir: string;
+    let configPath: string;
+    let previousConfig: string | undefined;
+    let previousHome: string | undefined;
+    const appId = 'test-codex-profile';
+    const save = (body: Record<string, unknown>) => fetch(`http://127.0.0.1:${handle!.port}/api/bot-agent`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cliId: 'codex', ...body }),
+    });
+    const disk = () => JSON.parse(readFileSync(configPath, 'utf8'))[0];
+    beforeEach(async () => {
+      dir = mkdtempSync(join('/tmp', 'botmux-profile-api-'));
+      configPath = join(dir, 'bots.json');
+      previousConfig = process.env.BOTS_CONFIG;
+      previousHome = process.env.CODEX_HOME;
+      process.env.BOTS_CONFIG = configPath;
+      process.env.CODEX_HOME = dir;
+      const bin = join(dir, 'codex-fixture');
+      writeFileSync(bin, '#!/bin/sh\ncase "$1" in\n--version) echo "codex-cli 0.134.0";;\n--help) echo "--profile PROFILE";;\n*) exit 91;;\nesac\n', { mode: 0o700 });
+      writeFileSync(join(dir, 'withhooks.config.toml'), 'model="fixture"');
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', cliRuntime: { id: 'fixture', executable: bin }, cliPathOverride: bin }]));
+      loadBotConfigs().forEach(c => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    });
+    afterEach(() => {
+      if (previousConfig === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previousConfig;
+      if (previousHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previousHome;
+      rmSync(dir, { recursive: true, force: true });
+    });
+    it('scans the bound Bot and preserves/clears the server value consistently', async () => {
+      const catalog = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-codex-profiles`);
+      expect(await catalog.json()).toMatchObject({ larkAppId: appId, source: dir, candidates: [{ name: 'withhooks', available: true }] });
+      expect((await save({ codexProfile: 'withhooks' })).status).toBe(200);
+      expect(await (await save({ model: 'gpt-6-astra' })).json()).toMatchObject({ codexProfile: 'withhooks' });
+      expect(disk().codexProfile).toBe('withhooks');
+      expect(getBot(appId).config.codexProfile).toBe('withhooks');
+      expect(await (await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`)).json()).toMatchObject({ codexProfile: 'withhooks' });
+      expect(await (await save({ codexProfile: null })).json()).toMatchObject({ codexProfile: null });
+      // A stale memory value cannot resurrect the server's cleared field.
+      getBot(appId).config.codexProfile = 'withhooks';
+      expect(await (await save({ model: 'gpt-6-astra' })).json()).toMatchObject({ codexProfile: null });
+      expect(disk()).not.toHaveProperty('codexProfile');
+      expect(getBot(appId).config.codexProfile).toBeUndefined();
+    });
+    it('rejects removed/malformed profiles atomically, retaining the old value', async () => {
+      await save({ codexProfile: 'withhooks', model: 'before' });
+      rmSync(join(dir, 'withhooks.config.toml'));
+      const before = readFileSync(configPath, 'utf8');
+      expect(await (await save({ model: 'after' })).json()).toMatchObject({ error: 'codex_profile_not_found' });
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect(getBot(appId).config.codexProfile).toBe('withhooks');
+      writeFileSync(join(dir, 'withhooks.config.toml'), 'secret="DO_NOT_LEAK');
+      const bad = await (await save({ codexProfile: 'withhooks' })).json();
+      expect(bad.error).toBe('codex_profile_invalid_toml');
+      expect(JSON.stringify(bad)).not.toContain('DO_NOT_LEAK');
+      expect((await save({ codexProfile: '' })).status).toBe(200);
+    });
+    it('rejects a file removed while save capability validation is in flight without partial writes', async () => {
+      const before = readFileSync(configPath, 'utf8');
+      const marker = join(dir, 'probe-started');
+      const release = join(dir, 'probe-release');
+      writeFileSync(join(dir, 'codex-fixture'), `#!/bin/sh
+case "$1" in
+--version) echo 'codex-cli 0.134.0';;
+--help) touch '${marker}'; while [ ! -f '${release}' ]; do sleep 0.01; done; echo '--profile PROFILE';;
+*) exit 91;;
+esac
+`, { mode: 0o700 });
+      const pending = save({ codexProfile: 'withhooks', model: 'must-not-save' });
+      try {
+        await vi.waitFor(() => expect(existsSync(marker)).toBe(true));
+        rmSync(join(dir, 'withhooks.config.toml'));
+      } finally { writeFileSync(release, ''); }
+      expect(await (await pending).json()).toMatchObject({ error: 'codex_profile_not_found' });
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect(getBot(appId).config.codexProfile).toBeUndefined();
+      expect(getBot(appId).config.model).not.toBe('must-not-save');
+    });
+    it('requires explicit clearing before incompatible CLI switch and leaves other CLIs unaffected', async () => {
+      await save({ codexProfile: 'withhooks' });
+      expect((await save({ cliId: 'claude-code' })).status).toBe(400);
+      expect(await (await save({ cliId: 'claude-code', codexProfile: null })).json()).toMatchObject({ cliId: 'claude-code', codexProfile: null });
+      expect((await save({ cliId: 'claude-code', model: 'sonnet' })).status).toBe(200);
+    });
+    it.skipIf(process.env.BOTMUX_PROFILE_BROWSER !== '1')('scans, searches, saves, refreshes and clears profiles through real browser controls', async () => {
+      const { chromium } = await import('playwright');
+      const { build } = await import('esbuild');
+      const { createServer } = await import('node:http');
+      writeFileSync(join(dir, 'review.config.toml'), 'model=\"fixture\"');
+      const bundle = await build({
+        stdin: { contents: `
+          import React, { useState } from 'react';
+          import { createRoot } from 'react-dom/client';
+          import { BotAgentSection } from './src/dashboard/web/bot-defaults-page.tsx';
+          const initial = ${JSON.stringify({ larkAppId: appId, cliId: 'codex', cliRuntime: disk().cliRuntime, model: '' })};
+          function App() {
+            const [bot, setBot] = useState(initial);
+            return <main className="bot-defaults-page" style={{maxWidth:900,margin:'30px auto'}}><div className="bd-body">
+              <BotAgentSection bot={bot} sessionFallback="codex"
+                cliState={{options:[{id:'codex',label:'Codex'}],ttadkModelDefault:'',ttadkModelSuggestions:[]}}
+                patchBot={(_, patch) => setBot(current => ({...current, ...patch}))} />
+              <pre data-saved-launch>{JSON.stringify({cliId:bot.cliId,codexProfile:bot.codexProfile},null,2)}</pre>
+            </div></main>;
+          }
+          createRoot(document.getElementById('root')).render(<App/>);
+        `, resolveDir: process.cwd(), loader: 'tsx' },
+        bundle: true, write: false, platform: 'browser', format: 'esm', minify: true,
+      });
+      const server = createServer((req, res) => {
+        if (req.url === '/app.js') { res.setHeader('Content-Type', 'text/javascript'); res.end(bundle.outputFiles[0]!.contents); }
+        else if (req.url === '/style.css') { res.setHeader('Content-Type', 'text/css'); res.end(readFileSync('src/dashboard/web/style.css')); }
+        else res.end('<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/style.css"><div id="root"></div><script type="module" src="/app.js"></script>');
+      });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+      try {
+        browser = await chromium.launch({ executablePath: process.env.BOTMUX_TEST_BROWSER_EXECUTABLE || undefined, args: ['--no-sandbox'] });
+        const page = await browser.newPage({ viewport: { width: 1120, height: 1000 } });
+        const requests: Record<string, unknown>[] = [];
+        await page.route('**/api/**', async route => {
+          if (route.request().method() === 'PUT' && route.request().url().endsWith('/agent')) {
+            const body = route.request().postDataJSON();
+            requests.push(body);
+            const response = await save(body);
+            await route.fulfill({ status: response.status, contentType: 'application/json', body: await response.text() });
+          } else if (route.request().url().endsWith('/codex-profiles')) {
+            const response = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-codex-profiles`);
+            await route.fulfill({ status: response.status, contentType: 'application/json', body: await response.text() });
+          } else await route.fulfill({ json: { models: [], profiles: [], source: 'static' } });
+        });
+        await page.goto(`http://127.0.0.1:${(server.address() as any).port}`);
+        const picker = page.locator('[data-section="codex-profile"]');
+        await picker.locator('[role="status"]').filter({ hasText: /扫描完成|Scan complete/ }).waitFor();
+        await page.locator('#bd-menu-codexProfile summary').click();
+        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('with');
+        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /^withhooks$/ }).click();
+        await page.locator('[data-action="save-agent"]').click();
+        await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": "withhooks"' }).waitFor();
+        expect(requests[0]).toMatchObject({ codexProfile: 'withhooks' });
+        expect(disk().codexProfile).toBe('withhooks');
+        expect(getBot(appId).config.codexProfile).toBe('withhooks');
+        if (process.env.BOTMUX_PROFILE_SCREENSHOT_DIR) {
+          mkdirSync(process.env.BOTMUX_PROFILE_SCREENSHOT_DIR, { recursive: true });
+          await page.screenshot({ path: join(process.env.BOTMUX_PROFILE_SCREENSHOT_DIR, 'profile-selected.png'), fullPage: true });
+        }
+        rmSync(join(dir, 'withhooks.config.toml'));
+        await picker.getByRole('button', { name: /刷新候选|Refresh profiles/ }).click();
+        await picker.locator('[role="status"]').filter({ hasText: /当前选择不可用|Current selection is unavailable/ }).waitFor();
+        expect(await page.locator('input[data-input="codexProfile"]').inputValue()).toBe('withhooks');
+        if (process.env.BOTMUX_PROFILE_SCREENSHOT_DIR) {
+          await page.screenshot({ path: join(process.env.BOTMUX_PROFILE_SCREENSHOT_DIR, 'profile-missing.png'), fullPage: true });
+        }
+        await page.locator('#bd-menu-codexProfile summary').click();
+        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('');
+        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /不指定 profile|No profile/ }).click();
+        await page.locator('[data-action="save-agent"]').click();
+        await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": null' }).waitFor();
+        expect(disk()).not.toHaveProperty('codexProfile');
+        expect(getBot(appId).config.codexProfile).toBeUndefined();
+      } finally {
+        await browser?.close();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    }, 60_000);
+
+    it('freezes new sessions, preserves existing selection through clear/reload and fork inheritance', async () => {
+      const oldDir = config.session.dataDir;
+      config.session.dataDir = join(dir, 'data');
+      sessionStore.init(appId);
+      try {
+        const plain = sessionStore.createSession('oc_profile', 'om_plain', 'plain', 'group');
+        await save({ codexProfile: 'withhooks' });
+        const selected = sessionStore.createSession('oc_profile', 'om_selected', 'selected', 'group');
+        expect(plain.codexProfile).toBeNull();
+        expect(selected).toMatchObject({ codexProfile: 'withhooks', codexProfileHome: dir });
+        await save({ codexProfile: null });
+        const forked = sessionStore.createSession('oc_fork', 'om_fork', 'fork', 'group', undefined, { inherit: selected });
+        expect(forked).toMatchObject({ codexProfile: 'withhooks', codexProfileHome: dir });
+        sessionStore.init(appId);
+        expect(sessionStore.getSession(selected.sessionId)?.codexProfile).toBe('withhooks');
+        expect(sessionStore.getSession(plain.sessionId)?.codexProfile).toBeNull();
+      } finally { config.session.dataDir = oldDir; }
+    });
+  });
+
   describe('custom wrapper preservation (#2022)', () => {
     let dir: string;
     let configPath: string;

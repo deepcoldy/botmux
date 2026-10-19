@@ -1,3 +1,4 @@
+import { CodexProfilePicker } from './codex-profile-picker.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
@@ -2246,6 +2247,10 @@ export function BotAgentSection(props: {
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
   const [serviceTier, setServiceTier] = useState<'' | 'default' | 'priority' | 'ultrafast'>(bot.serviceTier ?? '');
   const [serviceTierTouched, setServiceTierTouched] = useState(false);
+  const currentAgentAppId = useRef(bot.larkAppId);
+  currentAgentAppId.current = bot.larkAppId;
+  const [codexProfile, setCodexProfile] = useState(bot.codexProfile ?? '');
+  const [codexProfileTouched, setCodexProfileTouched] = useState(false);
   const [nativeModelMode, setNativeModelMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
   const [nativeModel, setNativeModel] = useState(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
   const [nativeEffortMode, setNativeEffortMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
@@ -2286,6 +2291,8 @@ export function BotAgentSection(props: {
     setModelBackendVariant(bot.modelBackendVariant ?? '');
     setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setCodexProfile(bot.codexProfile ?? '');
+    setCodexProfileTouched(false);
     setServiceTier(bot.serviceTier ?? '');
     setServiceTierTouched(false);
     setNativeModelMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
@@ -2313,6 +2320,7 @@ export function BotAgentSection(props: {
     bot.model,
     bot.modelBackendVariant,
     bot.reasoningEffort,
+    bot.codexProfile,
     bot.serviceTier,
     bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
@@ -2487,6 +2495,7 @@ export function BotAgentSection(props: {
           };
       const body = {
         cliId: cliKey,
+        ...(codexProfileTouched ? { codexProfile: codexProfile || null } : {}),
         ...(cliSelectionTouched ? { replaceCliSelection: true } : {}),
         model,
         ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
@@ -2508,6 +2517,7 @@ export function BotAgentSection(props: {
         ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
+      if (currentAgentAppId.current !== bot.larkAppId) return;
       if (res.ok && res.body.ok) {
         const summary = parseAgentSwitchSummary(res.body);
         const closedCount = summary.closed;
@@ -2550,6 +2560,7 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          codexProfile: res.body.codexProfile ?? null,
           serviceTier: res.body.serviceTier ?? undefined,
           nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
@@ -2565,6 +2576,8 @@ export function BotAgentSection(props: {
         setTurnTimeoutMin(turnTimeoutMinFromMs(
           typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
         ));
+        setCodexProfile(res.body.codexProfile ?? '');
+        setCodexProfileTouched(false);
         setTurnTimeoutTouched(false);
         setModelBackendVariant(res.body.modelBackendVariant ?? '');
         setModelBackendVariantTouched(false);
@@ -3022,6 +3035,11 @@ export function BotAgentSection(props: {
           </div>
         </div>
       )}
+      {(selectedCliId === 'codex' || codexProfile) && <CodexProfilePicker
+        appId={bot.larkAppId} contextKey={bot}
+        value={codexProfile} disabled={!!props.lock || agentBusy}
+        launchChanged={cliSelectionTouched || runtimeTouched}
+        onChange={value => { setCodexProfile(value); setCodexProfileTouched(true); }} />}
       {isDsh && (
         <div className="bd-row">
           <label>

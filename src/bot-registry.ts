@@ -1,3 +1,4 @@
+import { normalizeCodexProfile, assertCodexProfileLaunch } from './services/codex-profiles.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
@@ -1558,6 +1559,8 @@ export interface BotConfig {
   dshRuntime?: 'official' | 'tui';
   /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Named Codex config layer. Frozen with its home when a session is created. */
+  codexProfile?: string;
   /** Codex-only service tier for newly created sessions. Missing inherits Codex. */
   serviceTier?: CodexServiceTier;
   /** Native TraeCode spawn_agent model/effort override policy. */
@@ -3463,6 +3466,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.cliRuntime !== undefined && typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
       throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with wrapperCli`);
     }
+    const codexProfile = normalizeCodexProfile(entry.codexProfile);
+    if (codexProfile) assertCodexProfileLaunch(entry);
     const cliRuntime = entry.cliRuntime === undefined
       ? undefined
       : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
@@ -3969,6 +3974,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           entry.reasoningEffort,
         )
         ? entry.reasoningEffort : undefined,
+      codexProfile,
       serviceTier: isCodexServiceTierCliId(entryCliId) && isCodexServiceTier(entry.serviceTier)
         ? entry.serviceTier
         : undefined,
