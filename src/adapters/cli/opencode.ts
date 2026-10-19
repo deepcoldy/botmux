@@ -293,44 +293,62 @@ export function isOpenCodeSessionBusy(
         "SELECT COALESCE(MAX(time_created), 0) AS t FROM session_message " +
         "WHERE session_id = ? AND type = 'idle'"
       ).get(cliSessionId) as { t?: number } | undefined;
+      const turnCutoff = lastIdle?.t ?? 0;
 
-      // 只把 cutoff 之后的活动算作「当前回合」：cutoff 取时效窗口与最近 idle
-      // 标记的较大值——idle 之前的 running part / 未完成 assistant 都是已结束
-      // 回合的历史，不能再把会话判忙；cutoff 同时保留孤儿记录 fail-open 语义。
-      const cutoff = Math.max(freshBaseline, lastIdle?.t ?? 0);
+      // 「回合是否结束」与「进程是否还活着」是两个独立判据，不能共用一个
+      // cutoff（早期版本用 max(freshBaseline, lastIdle) 一把筛，长回合里 user
+      // 行超过 120s 时效后，步骤间空档又会漏判成空闲）：
+      //
+      //  - turnCutoff：权威回合边界（最后一条 idle 标记），**不设时效**。
+      //    只看它之后的活动；idle 之前的 running part / 未完成 assistant 都是
+      //    已结束回合的历史，不能再把会话判忙。
+      //  - freshBaseline：存活性窗口（120s）。窗口内没有任何行被创建或更新，
+      //    视为进程异常 / 孤儿记录，fail-open 放行（与旧版孤儿策略一致）。
+      //    OpenCode 执行中会持续刷新 assistant 行的 time_updated（实测流式 /
+      //    长工具期间 4–186s 跨度均在更新），所以长回合只要还活着就有新鲜行。
+      const alive = db.prepare(
+        "SELECT 1 AS alive FROM session_message " +
+        "WHERE session_id = ? AND (time_created > ? OR time_updated > ?) " +
+        "LIMIT 1"
+      ).get(cliSessionId, freshBaseline, freshBaseline) as { alive?: number } | undefined;
+      if (!alive?.alive) return false;
 
       // 1. 工具仍在运行。V2 把 part 嵌在 assistant message 的 `content[]` 里
       //    （`content[*].state.status='running'`，实测 2.0.x 行形状），旧查询只
       //    查消息顶层 `$.state.status`，而顶层恒为 NULL —— 该判据在 2.0.32 实测
-      //    100% 漏检。顶层查询保留作旧/未来行形状的防御性兜底。
+      //    100% 漏检。按行 time_updated 做回合内隔离：长工具的 time_created
+      //    可能很旧，但执行中 time_updated 持续刷新；顶层查询保留作旧/未来行
+      //    形状的防御性兜底。
       const nestedRunningTool = db.prepare(
         "SELECT 1 AS busy FROM session_message AS m, " +
         "json_each(json_extract(m.data, '$.content')) AS p " +
-        "WHERE m.session_id = ? AND m.time_created > ? " +
+        "WHERE m.session_id = ? AND m.time_updated > ? " +
         "  AND json_extract(p.value, '$.state.status') = 'running' " +
         "LIMIT 1"
-      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
       if (nestedRunningTool?.busy) return true;
 
       const topLevelRunning = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
-        "WHERE session_id = ? AND time_created > ? " +
+        "WHERE session_id = ? AND time_updated > ? " +
         "  AND json_extract(data, '$.state.status') = 'running' " +
         "LIMIT 1"
-      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
       if (topLevelRunning?.busy) return true;
 
-      // 2. cutoff 之后已有 assistant message 但尚未 completed（模型生成中）。
+      // 2. 回合内已有 assistant message 但尚未 completed（模型生成中）。
       const incompleteAssistant = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
-        "WHERE session_id = ? AND time_created > ? AND type = 'assistant' " +
+        "WHERE session_id = ? AND type = 'assistant' AND time_updated > ? " +
         "  AND json_extract(data, '$.time.completed') IS NULL " +
         "LIMIT 1"
-      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
       if (incompleteAssistant?.busy) return true;
 
-      // 3. cutoff 之后存在 user message：回合已提交但 idle 标记尚未写入。
-      //    覆盖两类屏幕启发式必误判的空档（旧逻辑在这两处都返回 false）：
+      // 3. idle 之后存在 user message：回合已提交但 idle 标记尚未写入。
+      //    不做时效筛选（长回合的 user 行可能远超 120s），孤儿场景由最前面
+      //    的 alive 闸门兜底。覆盖两类屏幕启发式必误判的空档（旧逻辑在这两
+      //    处都返回 false）：
       //    a) 提交后、首条 assistant 落库前（relay 首 token 延迟）；
       //    b) 上一条 assistant 已 completed、下一步 assistant 尚未创建
       //       （步骤间等待；实测 relay 下 2–8s，超过 IdleDetector 的 2s 静默
@@ -338,9 +356,9 @@ export function isOpenCodeSessionBusy(
       //       回合权威 / 推进排队输入）。
       const openTurnUserMessage = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
-        "WHERE session_id = ? AND time_created > ? AND type = 'user' " +
+        "WHERE session_id = ? AND type = 'user' AND time_created > ? " +
         "LIMIT 1"
-      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      ).get(cliSessionId, turnCutoff) as { busy?: number } | undefined;
       if (openTurnUserMessage?.busy) return true;
 
       return false;

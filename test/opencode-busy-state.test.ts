@@ -211,9 +211,10 @@ describe('isOpenCodeSessionBusy V2', () => {
     type: 'user' | 'assistant' | 'idle',
     created: number,
     data: Record<string, unknown>,
+    updated?: number,
   ) => {
     db.prepare('INSERT INTO session_message (id, session_id, type, time_created, time_updated, data) VALUES (?,?,?,?,?,?)')
-      .run(id, sid, type, created, created, JSON.stringify(data));
+      .run(id, sid, type, created, updated ?? created, JSON.stringify(data));
   };
   const assistant = (created: number, completed?: number, content: unknown[] = []) => ({
     time: completed === undefined ? { created } : { created, completed },
@@ -379,20 +380,85 @@ describe('isOpenCodeSessionBusy V2', () => {
     insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 20_000, { time: { created: now - 20_000 }, text: 'three tools' });
     expect(busyAt()).toBe(true); // 提交后、首个 assistant 前
     insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 19_000,
-      assistant(now - 19_000, now - 17_000, [toolPart('completed')]));
+      assistant(now - 19_000, now - 17_000, [toolPart('completed')]), now - 17_000);
     expect(busyAt()).toBe(true); // 步骤 1→2 空档
     insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 16_000,
-      assistant(now - 16_000, now - 14_000, [toolPart('completed')]));
+      assistant(now - 16_000, now - 14_000, [toolPart('completed')]), now - 14_000);
     expect(busyAt()).toBe(true); // 步骤 2→3 空档
     insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 10_000,
-      assistant(now - 10_000, undefined, [toolPart('running')]));
-    expect(busyAt()).toBe(true); // 工具执行中（未完成 assistant + 嵌套 running）
+      assistant(now - 10_000, undefined, [toolPart('running')]), now - 500);
+    expect(busyAt()).toBe(true); // 工具执行中（未完成 assistant + 嵌套 running，行持续更新）
     insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 9_000,
-      assistant(now - 9_000, now - 200, [toolPart('completed'), { type: 'text' }]));
+      assistant(now - 9_000, now - 200, [toolPart('completed'), { type: 'text' }]), now - 200);
     expect(busyAt()).toBe(true); // 最终回复已完成，idle 标记写入前的最后窗口
     insertV2(db, sid, `msg_${++idSeq}`, 'idle', now, { time: { created: now }, outcome: 'succeeded' });
     expect(busyAt()).toBe(false); // 整轮结束
     db.close();
+  });
+
+  // —— 长回合：回合边界（idle 标记）不能与 120s 存活性窗口共用 cutoff ——
+  it('stays busy in an inter-step gap of a long turn even though the user row is older than 120s', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_long_turn_step_gap';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 180_000, { time: { created: now - 180_000 }, text: 'long task' });
+    // 上一条 assistant 10s 前创建、1s 前刚随工具完成而更新；下一步尚未落库
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 10_000,
+      assistant(now - 10_000, now - 1_000, [toolPart('completed')]), now - 1_000);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('stays busy for a long-running tool whose message was created long ago but keeps updating', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_long_running_tool';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 200_000, { time: { created: now - 200_000 }, text: 'long tool' });
+    // assistant 行 130s 前创建，但刚刚仍在更新，嵌套工具仍是 running
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 130_000,
+      assistant(now - 130_000, undefined, [toolPart('running')]), now - 500);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('detects a nested running part without relying on the open-user-row fallback', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_nested_running_no_user';
+    const now = Date.now();
+    // 无 user 行兜底；assistant 顶层已标 completed，但 content 里工具仍 running
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 3_000,
+      assistant(now - 3_000, now - 500, [toolPart('running')]), now - 500);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(true);
+  });
+
+  it('fails open when a long turn went silent beyond the liveness window (process presumed dead)', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_long_turn_orphan';
+    const now = Date.now();
+    // user 200s 前、最后一条 assistant 130s 前更新后再无活动，idle 从未写入
+    insertV2(db, sid, `msg_${++idSeq}`, 'user', now - 200_000, { time: { created: now - 200_000 }, text: 'crashed' });
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 190_000,
+      assistant(now - 190_000, now - 130_000, [toolPart('completed')]), now - 130_000);
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(false);
+  });
+
+  it('does not keep a stale running part busy after an idle marker even if it updated recently', () => {
+    const db = openV2Db();
+    const sid = 'ses_v2_running_part_behind_idle';
+    const now = Date.now();
+    insertV2(db, sid, `msg_${++idSeq}`, 'assistant', now - 2_000,
+      assistant(now - 2_000, undefined, [toolPart('running')]), now - 1_000);
+    // idle 标记比 running part 的最后更新还新（防御性构造）
+    insertV2(db, sid, `msg_${++idSeq}`, 'idle', now, { time: { created: now }, outcome: 'succeeded' });
+    db.close();
+
+    expect(isOpenCodeSessionBusy(sid, 'v2')).toBe(false);
   });
 });
 
