@@ -425,4 +425,26 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
 
     expect(rows).toEqual([expect.objectContaining({ cliSessionId: SID_2, title: 'Ship release notes' })]);
   });
+
+  it('hides a goal worker that later received a normal turn (objective only left in preview)', async () => {
+    const sessionsDir = join(traeHome, 'cli', 'sessions', '2026', '10', '19');
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, `rollout-2026-10-19T09-00-00-${SID_1}.jsonl`), [
+      JSON.stringify({ type: 'session_meta', payload: { id: SID_1, cwd: '/root/project', thread_source: 'user' } }),
+      '',
+    ].join('\n'));
+
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, cwd TEXT NOT NULL,',
+      "  title TEXT NOT NULL, first_user_message TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', name TEXT",
+      ');',
+    ].join('\n'));
+    db.prepare('INSERT INTO threads VALUES (?, ?, 1792400000, ?, ?, ?, ?, ?)')
+      .run(SID_1, '/r1.jsonl', '/root/project', 'status?', 'status?', GOAL_COMMAND_OBJECTIVE, 'Read $BOTMUX_GOAL_PATH. Write files');
+    db.close();
+
+    expect(await createTraexAdapter('/bin/traex').listResumableSessions!({ limit: 10 })).toEqual([]);
+  });
 });

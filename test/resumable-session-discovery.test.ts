@@ -1032,6 +1032,92 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     });
   });
 
+  describe('TraeX first-turn identity (steer / type-ahead)', () => {
+    const ENVELOPE = '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>';
+    const rawTurnItem = (text: string, turnId: string) => ({ type: 'history_mutation', payload: {
+      operation: 'append', turn_id: turnId,
+      items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }],
+    } });
+
+    it('does not let a steered next-turn input launder a botmux first turn', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-steer-launder.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-steer-launder', cwd: '/root/traex' } },
+        rawTurnItem(ENVELOPE, 'turn-1'),
+        // Type-ahead for turn 2 lands before turn 1's terminal record.
+        traexUserTurn('traex-steer-launder', 'a clean steered follow-up', 'turn-2'),
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('does not let a steered next-turn envelope hide an external first turn', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-steer-external.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-steer-external', cwd: '/root/traex' } },
+        rawTurnItem('external first prompt', 'turn-1'),
+        traexUserTurn('traex-steer-external', ENVELOPE, 'turn-2'),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-steer-external', title: 'external first prompt' }),
+      ]);
+    });
+
+    it('still lets a canonical record of the same turn override the weak verdict', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-same-turn.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-same-turn', cwd: '/root/traex' } },
+        rawTurnItem(ENVELOPE, 'turn-1'),
+        traexUserTurn('traex-same-turn', 'the verified first prompt', 'turn-1'),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-same-turn', title: 'the verified first prompt' }),
+      ]);
+    });
+  });
+
+  describe('TraeX lazy prompt metadata', () => {
+    const sid = (i: number) => `01a1${String(i).padStart(4, '0')}-0000-7000-8000-000000000000`;
+
+    it('loads prompt-bearing metadata only for the threads it parses (plus a small look-ahead)', async () => {
+      const light = new Map<string, { lastActivityAt: number }>();
+      for (let i = 0; i < 40; i++) {
+        writeRollout('2026/10/19', `rollout-2026-10-19T10-00-00-${sid(i)}.jsonl`, [
+          { type: 'session_meta', payload: { id: sid(i), cwd: '/root/traex' } },
+        ]);
+        light.set(sid(i), { lastActivityAt: 1_792_000_000_000 + i * 1000 });
+      }
+      const requested: string[] = [];
+      const out = await discoverRolloutSessions(sessionsRoot, 3, undefined, {
+        ...TRAEX,
+        metadataById: light,
+        loadSessionDetails: (ids) => {
+          requested.push(...ids);
+          return new Map(ids.map(id => [id, { title: `title ${id}`, firstUserMessage: `prompt ${id}` }]));
+        },
+      });
+
+      // Newest native activity first; titles come from the lazily loaded details.
+      expect(out.map(s => s.cliSessionId)).toEqual([sid(39), sid(38), sid(37)]);
+      expect(out[0]!.title).toBe(`title ${sid(39)}`);
+      expect(requested.length).toBeLessThanOrEqual(3 + 8);
+      expect(new Set(requested).size).toBe(requested.length);
+    });
+
+    it('falls back to a per-id load when the filename carries no thread id', async () => {
+      writeRollout('2026/10/19', 'rollout-unnamed.jsonl', [
+        { type: 'session_meta', payload: { id: 'thread-without-filename-id', cwd: '/root/traex' } },
+      ]);
+      const requested: string[] = [];
+      const out = await discoverRolloutSessions(sessionsRoot, 5, undefined, {
+        ...TRAEX,
+        loadSessionDetails: (ids) => {
+          requested.push(...ids);
+          return new Map(ids.map(id => [id, { firstUserMessage: 'prompt from the index' }]));
+        },
+      });
+      expect(requested).toEqual(['thread-without-filename-id']);
+      expect(out).toEqual([expect.objectContaining({ title: 'prompt from the index' })]);
+    });
+  });
+
   describe('TraeX botmux v3 goal workers', () => {
     it('rejects a goal worker whose native first input is the botmux objective (0.210 preview)', async () => {
       writeRollout('2026/10/19', 'rollout-traex-v3-goal-index.jsonl', [

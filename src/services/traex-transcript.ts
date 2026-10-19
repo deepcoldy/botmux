@@ -166,7 +166,18 @@ function withTraeDb<T>(fn: (db: DatabaseSyncLike) => T, dbPath = traeStateDbPath
   }
 }
 
-export interface TraexThreadMetadata {
+/** Cheap per-thread identity / ordering data — no prompt-bearing columns, so
+ *  it can be read for every thread on each /adopt. */
+export interface TraexThreadIndexEntry {
+  id: string;
+  cwd?: string;
+  rolloutPath?: string;
+  updatedAtMs?: number;
+}
+
+/** Prompt-derived data. Read only for the threads a picker actually inspects
+ *  (see readTraexThreadDetails): prompts can be tens of KiB each. */
+export interface TraexThreadDetails {
   id: string;
   /** What TraeX itself shows for the thread: `threads.name` (0.208+, written by
    *  `/rename` and TraeX's own auto-naming) else the legacy `threads.title`
@@ -176,16 +187,13 @@ export interface TraexThreadMetadata {
   /** First prompt: `first_user_message`, else `preview` (0.210 leaves the
    *  former empty and only fills `preview`). */
   firstUserMessage?: string;
-  /** Some text column carries a botmux-injected envelope, i.e. botmux spawned
-   *  this thread. Same origin rule as resume discovery (isBotmuxInjectedPrompt):
-   *  such a thread must never surface its native title in /adopt. */
+  /** Some text column carries a botmux-injected envelope or botmux v3's own
+   *  `/goal` objective, i.e. botmux spawned this thread. Same origin rules as
+   *  resume discovery: such a thread never surfaces its native title in /adopt. */
   botmuxOrigin?: boolean;
-  cwd?: string;
-  rolloutPath?: string;
-  updatedAtMs?: number;
 }
 
-type TraexThreadMetadataRow = {
+type TraexThreadRow = {
   id?: unknown;
   name?: unknown;
   title?: unknown;
@@ -206,9 +214,21 @@ function traexUpdatedAtMs(value: unknown): number | undefined {
   return timestamp >= 1_000_000_000_000 ? timestamp : timestamp * 1000;
 }
 
-function normalizeTraexThreadMetadata(
-  row: TraexThreadMetadataRow | undefined,
-): TraexThreadMetadata | undefined {
+function normalizeTraexThreadIndexEntry(row: TraexThreadRow | undefined): TraexThreadIndexEntry | undefined {
+  const id = nonEmptyString(row?.id);
+  if (!id) return undefined;
+  const cwd = nonEmptyString(row?.cwd);
+  const rolloutPath = nonEmptyString(row?.rolloutPath);
+  const updatedAtMs = traexUpdatedAtMs(row?.updatedAt);
+  return {
+    id,
+    ...(cwd ? { cwd } : {}),
+    ...(rolloutPath ? { rolloutPath } : {}),
+    ...(updatedAtMs ? { updatedAtMs } : {}),
+  };
+}
+
+function normalizeTraexThreadDetails(row: TraexThreadRow | undefined): TraexThreadDetails | undefined {
   const id = nonEmptyString(row?.id);
   if (!id) return undefined;
   const name = nonEmptyString(row?.name);
@@ -216,72 +236,103 @@ function normalizeTraexThreadMetadata(
   const preview = nonEmptyString(row?.preview);
   const firstUserMessage = nonEmptyString(row?.firstUserMessage) ?? preview;
   const title = name ?? legacyTitle;
-  // TraeX derives its default title/preview from the first prompt, so a botmux
-  // envelope can sit in any of these columns (`preview` is covered through the
-  // firstUserMessage fallback). A single hit marks the thread botmux-origin
-  // (the live picker then falls back to the project dir, resume drops it).
-  const botmuxOrigin = [name, legacyTitle, firstUserMessage]
+  // TraeX derives its default title / preview from the first input, so a
+  // botmux envelope can sit in any of these columns — and `preview` is checked
+  // on its own: a goal-mode thread that later receives a normal turn keeps the
+  // goal objective in `preview` while `title` / `first_user_message` become
+  // that later input (measured on 0.210.1). A single hit marks the thread
+  // botmux-origin (the live picker falls back to the project dir, resume drops
+  // it).
+  const candidates = [name, legacyTitle, firstUserMessage, preview];
+  const botmuxOrigin = candidates
     .some(text => text !== undefined && isBotmuxInjectedPrompt(text.trim()))
-    // A botmux v3 goal worker: TraeX 0.210 goal mode keeps the `/goal`
-    // objective as the first input (`preview`, via the fallback above).
-    || [legacyTitle, firstUserMessage].some(text => text !== undefined && isBotmuxGoalObjective(text));
-  const cwd = nonEmptyString(row?.cwd);
-  const rolloutPath = nonEmptyString(row?.rolloutPath);
-  const updatedAtMs = traexUpdatedAtMs(row?.updatedAt);
+    || candidates.some(text => text !== undefined && isBotmuxGoalObjective(text));
   return {
     id,
     ...(title ? { title } : {}),
     ...(firstUserMessage ? { firstUserMessage } : {}),
     ...(botmuxOrigin ? { botmuxOrigin } : {}),
-    ...(cwd ? { cwd } : {}),
-    ...(rolloutPath ? { rolloutPath } : {}),
-    ...(updatedAtMs ? { updatedAtMs } : {}),
   };
 }
 
-/** `threads` columns this reader understands, as `[column, alias]`. The set
- *  drifts across TraeX releases (`name`/`preview` are 0.208+, very old DBs lack
+/** `threads` columns these readers understand, as `[column, alias]`, split so
+ *  the per-/adopt full scan never touches prompt-bearing text. The set drifts
+ *  across TraeX releases (`name`/`preview` are 0.208+, very old DBs lack
  *  `first_user_message`), and selecting a missing column throws — which
  *  withTraeDb would swallow into "no metadata at all". Project only the columns
  *  the live schema has and NULL the rest. */
-const TRAEX_THREAD_METADATA_COLUMNS: ReadonlyArray<readonly [string, keyof TraexThreadMetadataRow]> = [
-  ['name', 'name'],
-  ['title', 'title'],
-  ['first_user_message', 'firstUserMessage'],
-  ['preview', 'preview'],
+type TraexThreadColumns = ReadonlyArray<readonly [string, keyof TraexThreadRow]>;
+const TRAEX_THREAD_INDEX_COLUMNS: TraexThreadColumns = [
   ['cwd', 'cwd'],
   ['rollout_path', 'rolloutPath'],
   ['updated_at', 'updatedAt'],
 ];
+const TRAEX_THREAD_DETAIL_COLUMNS: TraexThreadColumns = [
+  ['name', 'name'],
+  ['title', 'title'],
+  ['first_user_message', 'firstUserMessage'],
+  ['preview', 'preview'],
+];
+/** Bound on `IN (…)` parameters per detail query (SQLite's default limit is
+ *  far higher; this just keeps statements small). */
+const TRAEX_THREAD_DETAIL_BATCH = 200;
 
-function traexThreadMetadataSelect(db: DatabaseSyncLike): string | undefined {
+function traexThreadSelect(db: DatabaseSyncLike, wanted: TraexThreadColumns): string | undefined {
   const columns = new Set(
     (db.prepare('PRAGMA table_info(threads)').all() as Array<{ name?: unknown }>)
       .map(column => column.name),
   );
   if (!columns.has('id')) return undefined;
-  const projection = TRAEX_THREAD_METADATA_COLUMNS.map(([column, alias]) =>
+  const projection = wanted.map(([column, alias]) =>
     columns.has(column) ? `${column} AS ${alias}` : `NULL AS ${alias}`);
   return `SELECT id, ${projection.join(', ')} FROM threads`;
 }
 
-/** Read TraeX's resume-picker metadata (display name, first prompt, cwd,
- *  activity). Best-effort: older/missing/corrupt databases return an empty map
- *  and callers fall back to parsing rollout JSONL. */
-export function readTraexThreadMetadataIndex(
+/** Every thread's identity / ordering data (cwd, rollout path, updated_at) —
+ *  enough to order resume candidates by native activity. Best-effort: an
+ *  older/missing/corrupt database yields an empty map and callers fall back to
+ *  parsing rollout JSONL. */
+export function readTraexThreadIndex(
   dbPath = traeStateDbPath(),
-): ReadonlyMap<string, TraexThreadMetadata> {
+): ReadonlyMap<string, TraexThreadIndexEntry> {
   return withTraeDb((db) => {
-    const out = new Map<string, TraexThreadMetadata>();
-    const select = traexThreadMetadataSelect(db);
+    const out = new Map<string, TraexThreadIndexEntry>();
+    const select = traexThreadSelect(db, TRAEX_THREAD_INDEX_COLUMNS);
     if (!select) return out;
-    const rows = db.prepare(select).all() as TraexThreadMetadataRow[];
-    for (const row of rows) {
-      const metadata = normalizeTraexThreadMetadata(row);
-      if (metadata) out.set(metadata.id, metadata);
+    for (const row of db.prepare(select).all() as TraexThreadRow[]) {
+      const entry = normalizeTraexThreadIndexEntry(row);
+      if (entry) out.set(entry.id, entry);
     }
     return out;
-  }, dbPath) ?? new Map<string, TraexThreadMetadata>();
+  }, dbPath) ?? new Map<string, TraexThreadIndexEntry>();
+}
+
+/** Title / first prompt / origin for just these threads — the candidates a
+ *  picker is about to show. Prompt columns are read whole on purpose: origin
+ *  detection needs the envelope's closing tags and trailing footer, which can
+ *  sit tens of KiB into a long pasted prompt, so a prefix cut would turn a
+ *  botmux thread into a false "external" one. */
+export function readTraexThreadDetails(
+  ids: readonly string[],
+  dbPath = traeStateDbPath(),
+): ReadonlyMap<string, TraexThreadDetails> {
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return new Map<string, TraexThreadDetails>();
+  return withTraeDb((db) => {
+    const out = new Map<string, TraexThreadDetails>();
+    const select = traexThreadSelect(db, TRAEX_THREAD_DETAIL_COLUMNS);
+    if (!select) return out;
+    for (let start = 0; start < unique.length; start += TRAEX_THREAD_DETAIL_BATCH) {
+      const batch = unique.slice(start, start + TRAEX_THREAD_DETAIL_BATCH);
+      const rows = db.prepare(`${select} WHERE id IN (${batch.map(() => '?').join(', ')})`)
+        .all(...batch) as TraexThreadRow[];
+      for (const row of rows) {
+        const details = normalizeTraexThreadDetails(row);
+        if (details) out.set(details.id, details);
+      }
+    }
+    return out;
+  }, dbPath) ?? new Map<string, TraexThreadDetails>();
 }
 
 /** Resolve one live TraeX session's native title for the /adopt picker.
@@ -298,15 +349,9 @@ export function readTraexThreadTitle(
   dbPath = traeStateDbPath(),
 ): string | undefined {
   if (!cliSessionId) return undefined;
-  return withTraeDb((db) => {
-    const select = traexThreadMetadataSelect(db);
-    if (!select) return undefined;
-    const row = db.prepare(select + ' WHERE id = ? LIMIT 1')
-      .get(cliSessionId) as TraexThreadMetadataRow | undefined;
-    const metadata = normalizeTraexThreadMetadata(row);
-    if (!metadata?.title || metadata.botmuxOrigin) return undefined;
-    return metadata.title.replace(/\s+/g, ' ').trim() || undefined;
-  }, dbPath) ?? undefined;
+  const details = readTraexThreadDetails([cliSessionId], dbPath).get(cliSessionId);
+  if (!details?.title || details.botmuxOrigin) return undefined;
+  return details.title.replace(/\s+/g, ' ').trim() || undefined;
 }
 
 type TraexRolloutKind = 'user' | 'internal' | 'legacy' | 'empty' | 'pending';

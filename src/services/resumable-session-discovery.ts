@@ -550,6 +550,11 @@ export interface RolloutDiscoveryOptions {
    *  for a session that has a real, non-botmux first prompt: the native title
    *  decorates an origin-checked session, it never admits one on its own. */
   metadataById?: ReadonlyMap<string, RolloutSessionMetadata>;
+  /** TraeX: batch-load the prompt-derived metadata (title / first prompt /
+   *  origin) for these ids, merged over `metadataById`. Called only for the
+   *  threads discovery is about to parse, so the per-/adopt cost no longer
+   *  scales with every prompt in the store. */
+  loadSessionDetails?: (ids: readonly string[]) => ReadonlyMap<string, RolloutSessionMetadata>;
   /** Verified user input carried by one record (TraeX: validated
    *  `display_completions[].UserMessage` and the 0.201.4 item_completed
    *  mirror). These decide origin; raw model `items` are only a weak fallback. */
@@ -586,6 +591,7 @@ async function parseRolloutTranscript(
   mtimeMs: number,
   exclude?: ReadonlySet<string>,
   options: RolloutDiscoveryOptions = {},
+  lookupMetadata: (id: string) => RolloutSessionMetadata | undefined = id => options.metadataById?.get(id),
 ): Promise<RolloutParse> {
   const traex = options.dialect === 'traex';
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
@@ -606,9 +612,14 @@ async function parseRolloutTranscript(
     /** TraeX: that first weak item was botmux. Rejects the thread at the end
      *  of the first turn unless a canonical record in it says otherwise. */
     weakBotmux: boolean;
+    /** TraeX: native turn id of that first weak item, when it carries one.
+     *  Only canonical records of this same turn may override the weak verdict:
+     *  steer / type-ahead input of the NEXT turn can land before this turn's
+     *  terminal record. */
+    weakTurnId: string | undefined;
   } = {
     id: null, cwd: null, title: '', fallbackTitle: '', weakTitle: '', botmux: false,
-    rejected: false, weakDecided: false, weakBotmux: false,
+    rejected: false, weakDecided: false, weakBotmux: false, weakTurnId: undefined,
   };
   let excluded = false;
   let nativeMetadata: RolloutSessionMetadata | undefined;
@@ -626,9 +637,10 @@ async function parseRolloutTranscript(
     if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
     return Boolean(acc.id && acc.cwd && acc.fallbackTitle);
   };
-  const recordWeakUserText = (text: string): void => {
+  const recordWeakUserText = (text: string, turnId: string | undefined): void => {
     if (acc.weakDecided || !text || isSyntheticPreamble(text) || isTraexContextReminder(text)) return;
     acc.weakDecided = true;
+    acc.weakTurnId = turnId;
     // A botmux first turn leaves no weak title and marks the thread botmux
     // unless a canonical record of the same turn supplies a clean prompt.
     if (isBotmuxTurn(text)) acc.weakBotmux = true;
@@ -636,6 +648,11 @@ async function parseRolloutTranscript(
   };
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
+    const turnId = typeof payload?.turn_id === 'string' && payload.turn_id ? payload.turn_id : undefined;
+    // TraeX: may this record's canonical user input still decide origin? Yes
+    // until a weak verdict exists; after that only within the same native turn
+    // (unknown turn on the weak item → no identity to compare, allow).
+    const canDecide = !traex || !acc.weakDecided || acc.weakTurnId === undefined || turnId === acc.weakTurnId;
     if (rec.type === 'session_meta' && payload) {
       if (typeof payload.id === 'string') {
         acc.id = payload.id;
@@ -646,7 +663,7 @@ async function parseRolloutTranscript(
         // user records say — reject before trusting any metadata (same rule as
         // the pid lookup's rollout classification).
         if (traex && isInternalCodexSessionMeta(payload)) { acc.rejected = true; return true; }
-        nativeMetadata = options.metadataById?.get(payload.id);
+        nativeMetadata = lookupMetadata(payload.id);
         if (nativeMetadata?.botmuxOrigin) { acc.botmux = true; return true; } // botmux-origin → drop
       }
       if (typeof payload.cwd === 'string') acc.cwd = payload.cwd;
@@ -655,6 +672,7 @@ async function parseRolloutTranscript(
         if (stop) return true;
       }
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
+      if (!canDecide) return; // TraeX: a later turn cannot rewrite the first turn's weak verdict
       if (isBotmuxTurn(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
     } else if (traex) {
@@ -665,13 +683,15 @@ async function parseRolloutTranscript(
           return true;
         }
       }
-      for (const text of options.userInputTexts?.(rec, pathSessionId ?? acc.id ?? undefined) ?? []) {
-        if (recordCanonicalUserText(text.trim())) return true;
+      if (canDecide) {
+        for (const text of options.userInputTexts?.(rec, pathSessionId ?? acc.id ?? undefined) ?? []) {
+          if (recordCanonicalUserText(text.trim())) return true;
+        }
       }
       if (rec.type === 'history_mutation' && payload) {
-        for (const text of rolloutHistoryMutationUserTexts(payload)) recordWeakUserText(text);
+        for (const text of rolloutHistoryMutationUserTexts(payload)) recordWeakUserText(text, turnId);
       } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
-        recordWeakUserText(rolloutResponseItemText(payload));
+        recordWeakUserText(rolloutResponseItemText(payload), turnId);
       } else if (rec.type === 'event_msg' && acc.weakDecided
         && (payload?.type === 'task_complete' || payload?.type === 'turn_aborted')) {
         // The first turn ended (completed, or cancelled — the two terminal
@@ -717,6 +737,10 @@ async function parseRolloutTranscript(
     },
   };
 }
+
+/** Extra threads whose prompt metadata is prefetched beyond the ones still
+ *  needed to fill `limit` (covers a few rejections without another query). */
+const DETAILS_PREFETCH_MARGIN = 8;
 
 interface RolloutCandidate extends FileEntry {
   /** Stable thread id from the filename, when the dialect can tell. */
@@ -779,10 +803,39 @@ export async function discoverRolloutSessions(
   // resurrected by another segment. Parse count stays bounded exactly as for
   // Codex — files are read until `limit` threads are collected.
   const decided = new Set<string>();
-  for (const f of orderTraexRolloutCandidates(files, options)) {
+  const candidates = orderTraexRolloutCandidates(files, options);
+  // Prompt-derived metadata is loaded per id on demand and prefetched in
+  // batches of (threads still needed + DETAILS_PREFETCH_MARGIN) along the
+  // activity order, so only threads that are actually parsed — plus a small
+  // look-ahead — ever have their prompt columns read.
+  const metadata = new Map(options.metadataById);
+  const detailsLoaded = new Set<string>();
+  const loadDetails = (ids: readonly string[]): void => {
+    const missing = options.loadSessionDetails ? ids.filter(id => !detailsLoaded.has(id)) : [];
+    if (missing.length === 0) return;
+    for (const id of missing) detailsLoaded.add(id);
+    for (const [id, details] of options.loadSessionDetails!(missing)) {
+      metadata.set(id, { ...metadata.get(id), ...details });
+    }
+  };
+  const lookupMetadata = (id: string): RolloutSessionMetadata | undefined => {
+    loadDetails([id]);
+    return metadata.get(id);
+  };
+  for (let i = 0; i < candidates.length; i++) {
+    const f = candidates[i]!;
     if (out.length >= limit) break;
     if (f.sessionId && decided.has(f.sessionId)) continue;
-    const parsed = await parseRolloutTranscript(f.path, f.mtimeMs, exclude, options);
+    if (f.sessionId && options.loadSessionDetails && !detailsLoaded.has(f.sessionId)) {
+      const want = limit - out.length + DETAILS_PREFETCH_MARGIN;
+      const batch = new Set<string>();
+      for (let j = i; j < candidates.length && batch.size < want; j++) {
+        const sid = candidates[j]!.sessionId;
+        if (sid && !decided.has(sid) && !detailsLoaded.has(sid) && !exclude?.has(sid)) batch.add(sid);
+      }
+      loadDetails([...batch]);
+    }
+    const parsed = await parseRolloutTranscript(f.path, f.mtimeMs, exclude, options, lookupMetadata);
     if (parsed.kind === 'rejected') {
       decided.add(parsed.cliSessionId);
     } else if (parsed.kind === 'session' && !decided.has(parsed.session.cliSessionId)) {

@@ -20,7 +20,8 @@ import {
   traexHistorySize,
   traexHistorySidIsOwned,
   traexSessionIdFromRolloutPath,
-  readTraexThreadMetadataIndex,
+  readTraexThreadDetails,
+  readTraexThreadIndex,
   readTraexThreadTitle,
 } from '../src/services/traex-transcript.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
@@ -2850,20 +2851,24 @@ describe('TraeX native thread metadata', () => {
     ].join('\n'));
     db.close();
 
-    expect(readTraexThreadMetadataIndex(dbPath).get('traex-native-id')).toEqual({
+    expect(readTraexThreadIndex(dbPath).get('traex-native-id')).toEqual({
       id: 'traex-native-id',
-      title: 'Native renamed title',
-      firstUserMessage: 'original prompt',
       cwd: '/root/current',
       rolloutPath: '/root/rollout.jsonl',
       updatedAtMs: 1_787_900_000_000,
+    });
+    expect(readTraexThreadDetails(['traex-native-id'], dbPath).get('traex-native-id')).toEqual({
+      id: 'traex-native-id',
+      title: 'Native renamed title',
+      firstUserMessage: 'original prompt',
     });
     expect(readTraexThreadTitle('traex-native-id', dbPath)).toBe('Native renamed title');
   });
 
   it('returns empty metadata when the state DB is absent', () => {
     const dbPath = join(dir, 'missing-state.sqlite');
-    expect(readTraexThreadMetadataIndex(dbPath).size).toBe(0);
+    expect(readTraexThreadIndex(dbPath).size).toBe(0);
+    expect(readTraexThreadDetails(['missing'], dbPath).size).toBe(0);
     expect(readTraexThreadTitle('missing', dbPath)).toBeUndefined();
   });
 
@@ -2904,7 +2909,7 @@ describe('TraeX native thread metadata', () => {
       { id: 'native-unnamed', name: null, title: 'Legacy display title', firstUserMessage: '', preview: '' },
     ]);
 
-    const index = readTraexThreadMetadataIndex(dbPath);
+    const index = readTraexThreadDetails(['native-0210', 'native-0209', 'native-unnamed'], dbPath);
     expect(index.get('native-0210')).toMatchObject({ title: '回复确认收到', firstUserMessage: '请只回复两个字：收到。' });
     expect(index.get('native-0210')?.botmuxOrigin).toBeUndefined();
     expect(index.get('native-0209')).toMatchObject({ title: 'Fix TraeX terminal fence wedge', firstUserMessage: 'hi' });
@@ -2927,7 +2932,7 @@ describe('TraeX native thread metadata', () => {
 
     for (const id of ['botmux-title', 'botmux-title-only', 'botmux-named', 'botmux-preview']) {
       expect(readTraexThreadTitle(id, dbPath), id).toBeUndefined();
-      expect(readTraexThreadMetadataIndex(dbPath).get(id)?.botmuxOrigin, id).toBe(true);
+      expect(readTraexThreadDetails([id], dbPath).get(id)?.botmuxOrigin, id).toBe(true);
     }
   });
 
@@ -2940,10 +2945,43 @@ describe('TraeX native thread metadata', () => {
       { id: 'user-goal', name: 'Ship release notes', title: '', firstUserMessage: '', preview: 'ship the release notes' },
     ]);
 
-    expect(readTraexThreadMetadataIndex(dbPath).get('v3-goal')?.botmuxOrigin).toBe(true);
+    expect(readTraexThreadDetails(['v3-goal'], dbPath).get('v3-goal')?.botmuxOrigin).toBe(true);
     expect(readTraexThreadTitle('v3-goal', dbPath)).toBeUndefined();
-    expect(readTraexThreadMetadataIndex(dbPath).get('user-goal')?.botmuxOrigin).toBeUndefined();
+    expect(readTraexThreadDetails(['user-goal'], dbPath).get('user-goal')?.botmuxOrigin).toBeUndefined();
     expect(readTraexThreadTitle('user-goal', dbPath)).toBe('Ship release notes');
+  });
+
+  it('keeps a goal worker botmux-origin after a later normal turn rewrites title / first_user_message', () => {
+    // Measured on TraeX 0.210.1: once a goal-mode thread receives an ordinary
+    // input, title and first_user_message become that input while preview
+    // keeps the goal objective — preview must be judged on its own.
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      { id: 'v3-goal-steered', name: 'Read $BOTMUX_GOAL_PATH. Write files', title: 'status?', firstUserMessage: 'status?', preview: GOAL_COMMAND_OBJECTIVE },
+      { id: 'envelope-preview', name: 'Clean name', title: 'clean follow-up', firstUserMessage: 'clean follow-up', preview: BOTMUX_ENVELOPE },
+    ]);
+
+    for (const id of ['v3-goal-steered', 'envelope-preview']) {
+      expect(readTraexThreadDetails([id], dbPath).get(id)?.botmuxOrigin, id).toBe(true);
+      expect(readTraexThreadTitle(id, dbPath), id).toBeUndefined();
+    }
+  });
+
+  it('reads only identity columns for the index and prompt columns only for requested ids', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, Array.from({ length: 450 }, (_, i) => ({
+      id: `t-${i}`, name: `Name ${i}`, title: `prompt ${i}`, firstUserMessage: `prompt ${i}`, preview: `prompt ${i}`,
+    })));
+
+    const index = readTraexThreadIndex(dbPath);
+    expect(index.size).toBe(450);
+    expect(Object.keys(index.get('t-1')!).sort()).toEqual(['cwd', 'id', 'rolloutPath', 'updatedAtMs']);
+    // More ids than one IN (...) batch, plus unknown / duplicate ids.
+    const ids = [...Array.from({ length: 450 }, (_, i) => `t-${i}`), 't-3', 'nope'];
+    const details = readTraexThreadDetails(ids, dbPath);
+    expect(details.size).toBe(450);
+    expect(details.get('t-449')).toEqual({ id: 't-449', title: 'Name 449', firstUserMessage: 'prompt 449' });
+    expect(readTraexThreadDetails(['t-7'], dbPath).size).toBe(1);
   });
 
   it('reads the title from schemas that predate first_user_message / name / preview', () => {
@@ -2956,7 +2994,8 @@ describe('TraeX native thread metadata', () => {
     ].join('\n'));
     db.close();
 
-    expect(readTraexThreadMetadataIndex(dbPath).get('old-native')).toMatchObject({ title: 'Old schema title', cwd: '/root/old' });
+    expect(readTraexThreadIndex(dbPath).get('old-native')).toMatchObject({ cwd: '/root/old' });
+    expect(readTraexThreadDetails(['old-native'], dbPath).get('old-native')).toMatchObject({ title: 'Old schema title' });
     expect(readTraexThreadTitle('old-native', dbPath)).toBe('Old schema title');
     expect(readTraexThreadTitle('old-botmux', dbPath)).toBeUndefined();
   });
