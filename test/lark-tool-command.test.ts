@@ -14,6 +14,17 @@ describe('lark-cli argv metadata', () => {
     expect(invocation.args).toContain('--dry-run');
   });
 
+  it('reads snake_case flags declared by shortcut help', () => {
+    const readHelp = (cmd: readonly string[]) => {
+      const help = readLarkToolHelp(cmd);
+      return cmd.join(' ') === 'docs +fetch' ? help.replace('      --dry-run', '      --output_as string   format\n      --dry-run') : help;
+    };
+    for (const args of [['docs', '+fetch', '--output_as', 'image', '--dry-run'], ['docs', '+fetch', '--output_as=image', '--dry-run']]) {
+      const invocation = parseLarkToolInvocation(args, binding, readHelp);
+      expect(larkToolExecutionArgs(invocation)).toEqual([...args, '--as', 'bot']);
+    }
+  });
+
   it.each([
     ['docs', '+fetch', '--doc', 'doc-fixture', '--scope', 'keyword', '--keyword', '--as=user', '--dry-run'],
     ['sheets', '+cells-replace', '--replacement', '--as=user', '--dry-run'],
