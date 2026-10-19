@@ -1032,6 +1032,108 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     });
   });
 
+  describe('TraeX first-turn rule (table — keep in sync with parseRolloutTranscript)', () => {
+    const ENV = '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>';
+    const REMINDER = "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n</system-reminder>";
+    type Rec = (sid: string) => unknown;
+    const turn = (t?: string) => (t ? { turn_id: t } : {});
+    // W: weak user items
+    const ri = (text: string): Rec => () => ({ type: 'response_item', payload: {
+      type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+    const hm = (text: string, t?: string): Rec => () => ({ type: 'history_mutation', payload: {
+      operation: 'append', ...turn(t), items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }] } });
+    // C: canonical inputs
+    const dc = (text: string, t: string): Rec => sid => traexUserTurn(sid, text, t);
+    const ic = (text: string, t?: string): Rec => () => ({ type: 'event_msg', payload: {
+      type: 'item_completed', ...turn(t), item: { type: 'UserMessage', content: [{ type: 'text', text }] } } });
+    const um = (text: string, t?: string): Rec => () => ({ type: 'event_msg', payload: { type: 'user_message', message: text, ...turn(t) } });
+    // T: terminals
+    const done = (t?: string): Rec => () => ({ type: 'event_msg', payload: { type: 'task_complete', ...turn(t) } });
+    const aborted = (t?: string): Rec => () => ({ type: 'event_msg', payload: { type: 'turn_aborted', ...turn(t) } });
+
+    /** [case, records, expected title — null = not listed] */
+    const CASES: Array<[string, Rec[], string | null]> = [
+      ['W clean only', [hm('external prompt', 't1')], 'external prompt'],
+      ['W botmux only', [hm(ENV, 't1')], null],
+      ['synthetic items never decide', [hm(REMINDER, 't1'), hm('external prompt', 't1')], 'external prompt'],
+      ['open: T ignored', [done('t0'), hm('external prompt', 't1')], 'external prompt'],
+      ['open: C decides before any W', [dc('verified prompt', 't1'), hm(ENV, 't1')], 'verified prompt'],
+      ['weak: later W ignored', [hm('external prompt', 't1'), hm(ENV, 't1')], 'external prompt'],
+      ['weak: same-turn C overrides botmux W', [hm(ENV, 't1'), dc('verified prompt', 't1')], 'verified prompt'],
+      ['weak: same-turn C overrides clean W', [hm('runtime warning', 't1'), dc(ENV, 't1')], null],
+      ['steer: next-turn clean C cannot launder', [hm(ENV, 't1'), dc('steered follow-up', 't2')], null],
+      ['steer: next-turn botmux C cannot hide', [hm('external prompt', 't1'), dc(ENV, 't2')], 'external prompt'],
+      ['late bind: W mirror reveals turn (botmux)', [ri(ENV), hm(ENV, 't1'), dc('steered follow-up', 't2')], null],
+      ['late bind: W mirror reveals turn (clean)', [ri('external prompt'), hm('external prompt', 't1'), dc(ENV, 't2')], 'external prompt'],
+      ['late bind: C mirror reveals turn', [ri(ENV), ic(ENV, 't1'), dc('steered follow-up', 't2')], null],
+      ['late bind: event_msg mirror reveals turn', [ri('external prompt'), um('external prompt', 't1'), dc(ENV, 't2')], 'external prompt'],
+      ['replayed T of another turn is skipped (C)', [hm('runtime warning', 't1'), done('t0'), dc(ENV, 't1')], null],
+      ['replayed T of another turn is skipped (turn-less C)', [hm('runtime warning', 't1'), aborted('t0'), um(ENV)], null],
+      ['first-turn T closes (complete)', [hm('external prompt', 't1'), done('t1'), dc(ENV, 't2')], 'external prompt'],
+      ['first-turn T closes (aborted)', [hm(ENV, 't1'), aborted('t1'), dc('steered follow-up', 't2')], null],
+      ['turn-less C inside first turn: title', [hm('runtime warning', 't1'), um('the real prompt'), done('t1')], 'the real prompt'],
+      ['turn-less C inside first turn: botmux', [hm('runtime warning', 't1'), um(ENV)], null],
+      ['turn-less C after first-turn T', [hm('external prompt', 't1'), aborted('t1'), um(ENV)], 'external prompt'],
+      ['unknown first turn: turn-less T closes', [ri('external prompt'), done(), dc(ENV, 't2')], 'external prompt'],
+      ['unknown first turn: any T closes', [ri('external prompt'), done('t9'), dc(ENV, 't2')], 'external prompt'],
+      ['unknown first turn, no mirror: C overrides (legacy fallback)', [ri('external prompt'), dc(ENV, 't2')], null],
+    ];
+
+    it.each(CASES)('%s', async (_name, records, expected) => {
+      const sid = 'traex-rule';
+      writeRollout('2026/10/20', 'rollout-traex-rule.jsonl', [
+        { type: 'session_meta', payload: { id: sid, cwd: '/root/traex' } },
+        ...records.map(r => r(sid)),
+      ]);
+      const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX);
+      if (expected === null) expect(out).toEqual([]);
+      else expect(out).toEqual([expect.objectContaining({ cliSessionId: sid, title: expected })]);
+    });
+  });
+
+  describe('TraeX prefetch stays bounded', () => {
+    const sid = (i: number) => `01a2${String(i).padStart(4, '0')}-0000-7000-8000-000000000000`;
+    function seed(count: number): Map<string, { lastActivityAt: number }> {
+      const light = new Map<string, { lastActivityAt: number }>();
+      for (let i = 0; i < count; i++) {
+        writeRollout('2026/10/20', `rollout-2026-10-20T10-00-00-${sid(i)}.jsonl`, [
+          { type: 'session_meta', payload: { id: sid(i), cwd: '/root/traex' } },
+        ]);
+        // Higher index = more recent, so the excluded ones below come first.
+        light.set(sid(i), { lastActivityAt: 1_792_000_000_000 + i * 1000 });
+      }
+      return light;
+    }
+    function countingLoader() {
+      const calls: string[][] = [];
+      const load = (ids: readonly string[]) => {
+        calls.push([...ids]);
+        return new Map(ids.map(id => [id, { firstUserMessage: `prompt ${id}` }]));
+      };
+      return { calls, load };
+    }
+
+    it('excluded threads ahead of eligible ones cost no detail queries', async () => {
+      const light = seed(150);
+      const exclude = new Set(Array.from({ length: 100 }, (_, k) => sid(149 - k))); // the 100 newest
+      const { calls, load } = countingLoader();
+      const out = await discoverRolloutSessions(sessionsRoot, 1, exclude, { ...TRAEX, metadataById: light, loadSessionDetails: load });
+
+      expect(out.map(s => s.cliSessionId)).toEqual([sid(49)]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.length).toBeLessThanOrEqual(1 + 8);
+      expect(calls.flat().some(id => exclude.has(id))).toBe(false);
+    });
+
+    it('an all-excluded store issues no detail query at all', async () => {
+      const light = seed(60);
+      const { calls, load } = countingLoader();
+      const out = await discoverRolloutSessions(sessionsRoot, 5, new Set(light.keys()), { ...TRAEX, metadataById: light, loadSessionDetails: load });
+      expect(out).toEqual([]);
+      expect(calls).toHaveLength(0);
+    });
+  });
+
   describe('TraeX first-turn identity (steer / type-ahead)', () => {
     const ENVELOPE = '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>';
     const rawTurnItem = (text: string, turnId: string) => ({ type: 'history_mutation', payload: {

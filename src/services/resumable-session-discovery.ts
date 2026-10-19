@@ -577,15 +577,41 @@ type RolloutParse =
 /** Parse one Codex/TRAE rollout. session_meta carries the resume id + cwd.
  *  Codex: the first event_msg/user_message, else the first non-synthetic
  *  response_item role:user, decides origin and title.
- *  TraeX: internal helper sessions (guardian/subagent) are rejected up front.
- *  Origin and title then come from a CANONICAL user record — the native index
- *  first prompt, event_msg/user_message, or a verified user input
- *  (options.userInputTexts). Raw history_mutation items and response_items are
- *  WEAK: the first non-synthetic one is remembered as a fallback title (or, if
- *  it is botmux, as a botmux verdict) and scanning continues to the end of that
- *  first turn for a canonical record, which overrides the weak verdict. A weak
- *  botmux verdict that survives the turn rejects the whole thread. TraeX also
- *  treats botmux v3's own `/goal` objective as botmux-origin. */
+ *  TraeX: internal helper sessions (guardian/subagent) are rejected up front,
+ *  a native index first prompt decides outright, botmux v3's own `/goal`
+ *  objective counts as botmux-origin, and everything else follows the
+ *  first-turn rule below.
+ *
+ *  ── TraeX first-turn rule (one state machine; keep this table and the
+ *     table-driven test "TraeX first-turn rule" in sync) ──────────────────
+ *  Records, each with an optional native turn id:
+ *    W  weak user item   response_item role:user, raw history_mutation item
+ *                        (TraeX also writes runtime injections there)
+ *    C  canonical input  verified display completion / item_completed
+ *                        (options.userInputTexts), event_msg user_message
+ *    T  terminal         event_msg task_complete / turn_aborted
+ *  Synthetic preambles / context reminders never count as W or C.
+ *  "Same turn" for ids a, b: a === b when both are known; true when either is
+ *  unknown (legacy turn-less shapes — the T rule below keeps them inside the
+ *  first turn).
+ *
+ *    phase  record  effect
+ *    open   W       the first one fixes the WEAK verdict (its text: title, or
+ *                   botmux) and the first turn's id (may be unknown) → weak
+ *    open   C       decides origin outright (botmux → reject; clean → title)
+ *    open   T       ignored — there is no verdict to close
+ *    weak   W / C   LATE BINDING: same text as the verdict, carrying a turn id
+ *                   while the first turn's id is unknown → that id becomes the
+ *                   first turn's (a mirror of the same input revealed it)
+ *    weak   W       otherwise ignored: the first weak item already decided
+ *    weak   C       same turn as the first turn → overrides the weak verdict
+ *                   (botmux → reject; clean → title); a different, known turn
+ *                   (steer / type-ahead of the next turn) → ignored
+ *    weak   T       same turn → the first turn is over: the weak verdict is
+ *                   final and scanning stops; a different, known turn (a
+ *                   replayed terminal in a resumed rollout) → ignored
+ *  End of scan in phase weak: a botmux weak verdict rejects the thread; a
+ *  clean one titles it. */
 async function parseRolloutTranscript(
   path: string,
   mtimeMs: number,
@@ -617,9 +643,11 @@ async function parseRolloutTranscript(
      *  steer / type-ahead input of the NEXT turn can land before this turn's
      *  terminal record. */
     weakTurnId: string | undefined;
+    /** TraeX: text of that first weak item, to recognise its mirrors. */
+    weakText: string;
   } = {
     id: null, cwd: null, title: '', fallbackTitle: '', weakTitle: '', botmux: false,
-    rejected: false, weakDecided: false, weakBotmux: false, weakTurnId: undefined,
+    rejected: false, weakDecided: false, weakBotmux: false, weakTurnId: undefined, weakText: '',
   };
   let excluded = false;
   let nativeMetadata: RolloutSessionMetadata | undefined;
@@ -637,26 +665,38 @@ async function parseRolloutTranscript(
     if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
     return Boolean(acc.id && acc.cwd && acc.fallbackTitle);
   };
+  const isUserTurnText = (text: string): boolean =>
+    Boolean(text) && !isSyntheticPreamble(text) && !isTraexContextReminder(text);
+  // First-turn rule (see the table above). Weak verdict = phase "weak".
+  const inFirstTurn = (turnId: string | undefined): boolean =>
+    !acc.weakDecided || acc.weakTurnId === undefined || turnId === undefined || turnId === acc.weakTurnId;
+  const bindFirstTurnMirror = (text: string, turnId: string | undefined): void => {
+    if (acc.weakDecided && acc.weakTurnId === undefined && turnId !== undefined && text === acc.weakText) {
+      acc.weakTurnId = turnId;
+    }
+  };
   const recordWeakUserText = (text: string, turnId: string | undefined): void => {
-    if (acc.weakDecided || !text || isSyntheticPreamble(text) || isTraexContextReminder(text)) return;
+    if (!isUserTurnText(text)) return;
+    if (acc.weakDecided) { bindFirstTurnMirror(text, turnId); return; }
     acc.weakDecided = true;
     acc.weakTurnId = turnId;
+    acc.weakText = text;
     // A botmux first turn leaves no weak title and marks the thread botmux
     // unless a canonical record of the same turn supplies a clean prompt.
     if (isBotmuxTurn(text)) acc.weakBotmux = true;
     else acc.weakTitle = truncateTitle(text);
   };
+  /** A canonical input under the first-turn rule; true → stop scanning. */
+  const recordFirstTurnCanonical = (rawText: string, turnId: string | undefined): boolean => {
+    const text = rawText.trim();
+    if (!isUserTurnText(text)) return false;
+    bindFirstTurnMirror(text, turnId);
+    if (!inFirstTurn(turnId)) return false;
+    return recordCanonicalUserText(text) === true;
+  };
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
     const turnId = typeof payload?.turn_id === 'string' && payload.turn_id ? payload.turn_id : undefined;
-    // TraeX: may this record's canonical user input still decide origin? Yes
-    // until a weak verdict exists; after that only within the same native turn.
-    // A side without a turn id (legacy user_message, weak item without one) has
-    // no identity to compare: it is accepted, because scanning already stops at
-    // the first turn's terminal record once a weak verdict exists, so anything
-    // read here is still inside the first turn.
-    const canDecide = !traex || !acc.weakDecided || acc.weakTurnId === undefined
-      || turnId === undefined || turnId === acc.weakTurnId;
     if (rec.type === 'session_meta' && payload) {
       if (typeof payload.id === 'string') {
         acc.id = payload.id;
@@ -675,8 +715,10 @@ async function parseRolloutTranscript(
         const stop = recordCanonicalUserText(nativeMetadata.firstUserMessage.trim());
         if (stop) return true;
       }
+    } else if (traex && rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
+      // TraeX canonical input (C) under the first-turn rule.
+      if (recordFirstTurnCanonical(payload.message, turnId)) return true;
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
-      if (!canDecide) return; // TraeX: a later turn cannot rewrite the first turn's weak verdict
       if (isBotmuxTurn(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
     } else if (traex) {
@@ -687,21 +729,18 @@ async function parseRolloutTranscript(
           return true;
         }
       }
-      if (canDecide) {
-        for (const text of options.userInputTexts?.(rec, pathSessionId ?? acc.id ?? undefined) ?? []) {
-          if (recordCanonicalUserText(text.trim())) return true;
-        }
+      for (const text of options.userInputTexts?.(rec, pathSessionId ?? acc.id ?? undefined) ?? []) {
+        if (recordFirstTurnCanonical(text, turnId)) return true; // C
       }
       if (rec.type === 'history_mutation' && payload) {
-        for (const text of rolloutHistoryMutationUserTexts(payload)) recordWeakUserText(text, turnId);
+        for (const text of rolloutHistoryMutationUserTexts(payload)) recordWeakUserText(text, turnId); // W
       } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
-        recordWeakUserText(rolloutResponseItemText(payload), turnId);
-      } else if (rec.type === 'event_msg' && acc.weakDecided
+        recordWeakUserText(rolloutResponseItemText(payload), turnId); // W
+      } else if (rec.type === 'event_msg' && acc.weakDecided && inFirstTurn(turnId)
         && (payload?.type === 'task_complete' || payload?.type === 'turn_aborted')) {
-        // The first turn ended (completed, or cancelled — the two terminal
-        // records the TraeX bridge recognises) without a canonical user record:
-        // keep the weak verdict rather than let a later turn rewrite it, and
-        // don't read the rest of a possibly huge rollout.
+        // T of the first turn (the two terminal records the TraeX bridge
+        // recognises): the weak verdict is final; don't read the rest of a
+        // possibly huge rollout.
         return true;
       }
     } else if (rec.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
@@ -830,6 +869,10 @@ export async function discoverRolloutSessions(
     const f = candidates[i]!;
     if (out.length >= limit) break;
     if (f.sessionId && decided.has(f.sessionId)) continue;
+    // A live / excluded thread is rejected at its session_meta anyway; skip it
+    // before it can trigger a prefetch (its own details are never loaded, so
+    // every excluded candidate would otherwise start a fresh look-ahead).
+    if (f.sessionId && exclude?.has(f.sessionId)) { decided.add(f.sessionId); continue; }
     if (f.sessionId && options.loadSessionDetails && !detailsLoaded.has(f.sessionId)) {
       const want = limit - out.length + DETAILS_PREFETCH_MARGIN;
       const batch = new Set<string>();
