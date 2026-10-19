@@ -5,14 +5,15 @@
  * Run: npx vitest run --project unit test/cli-backend-liveness.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { spawn } from 'node:child_process';
+import { spawnTsEval } from './helpers/ts-runner.js';
 import { cliProcessAliveFromBackend } from '../src/adapters/cli/backend-liveness.js';
 
 function startSleep(ms: number) {
-  const child = spawn(process.execPath, ['-e', `setTimeout(()=>{},${ms})`], {
-    stdio: 'ignore', detached: false,
+  // 自包含片段（无仓库 import），用 runtime 感知的 spawnTsEval（见
+  // test/helpers/ts-runner.ts：Bun 下 `bun -e`，Node 下 `node --input-type=module -e`）。
+  return spawnTsEval(`setTimeout(()=>{},${ms})`, {
+    stdio: 'ignore',
   });
-  return child;
 }
 
 describe('cliProcessAliveFromBackend', () => {
