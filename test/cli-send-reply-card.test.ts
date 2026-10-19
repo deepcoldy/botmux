@@ -489,3 +489,36 @@ describe('real CLI send into a running reply card', () => {
     }
   });
 });
+
+
+describe('Riff footer host policy in a warm sandbox', () => {
+  it.each([
+    { disk: {}, env: '{"replyFooterEnabled":false}', hidden: true },
+    { disk: { replyFooterEnabled: true }, env: '{"replyFooterEnabled":false}', hidden: true },
+    { disk: { replyFooterEnabled: false }, env: '{}', hidden: false },
+    { disk: { replyFooterEnabled: false }, env: '{invalid', hidden: false },
+  ])('honors host policy $env instead of stale disk $disk', ({ disk, env, hidden }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-riff-footer-'));
+    try {
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'stale-secret', cliId: 'riff', ...disk,
+      }]));
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', 'BODY'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: join(root, 'data'), BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_LARK_APP_ID: key.larkAppId, BOTMUX_LARK_APP_SECRET: 'host-secret',
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_root',
+          BOTMUX_TURN_ID: key.turnId, BOTMUX_REPLY_FOOTER: env },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(requests).toHaveLength(1);
+      const card = JSON.parse(requests[0].body.content);
+      expect(JSON.stringify(card)).toContain('BODY');
+      expect(card.body.elements.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(!hidden);
+      expect(card.body.elements.some((e: any) => e.tag === 'hr')).toBe(!hidden);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});

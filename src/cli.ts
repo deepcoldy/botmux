@@ -8818,6 +8818,7 @@ import {
   resolveUsageDisplay,
   resolveReplyFooterPreferences,
 } from './bot-registry.js';
+import { parseReplyFooterEnv } from './services/reply-footer.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { loadCompanionSecret } from './dashboard/companion-api.js';
@@ -9474,7 +9475,8 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     allowedUsers: [],
     feedback,
     replyStyle: resolveReplyStyleConfig(appId),
-    ...resolveReplyFooterPreferences(appId),
+    // This env-only session belongs to the host. Warm sandbox config may be stale.
+    ...parseReplyFooterEnv(process.env.BOTMUX_REPLY_FOOTER),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||

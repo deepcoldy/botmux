@@ -605,10 +605,11 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
     : tr('botDefaults.maxLiveWorkersStateOn', { count: cap });
 }
 
-function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
+export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
-    ...normalizeReplyFooter(body),
+    // The server omits default-true keys; overwrite old false values as well.
+    ...Object.fromEntries(REPLY_FOOTER_KEYS.map(key => [key, body[key] !== false])),
     showReplyTiming: body.showReplyTiming,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,

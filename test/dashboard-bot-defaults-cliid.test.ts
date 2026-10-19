@@ -7,6 +7,7 @@ import {
   BotAgentSection,
   BotDefaultsTabs,
   CardBehaviorSection,
+  patchCardPrefsFromBody,
   CodexAppDisplaySection,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
@@ -2440,6 +2441,39 @@ describe('reply footer controls', () => {
     fail = true;
     await set('replyFooterModel', true);
     expect(toggle('replyFooterModel').props.checked).toBe(false);
+    act(() => renderer.unmount());
+  });
+});
+
+
+describe('reply footer parent response synchronization', () => {
+  it('clears saved false values when a sparse response restores defaults', async () => {
+    const backend: Record<string, boolean> = { replyFooterEnabled: false, replyFooterModel: false };
+    function Parent() {
+      const [bot, setBot] = React.useState({ larkAppId: 'cli_footer_parent', ...backend });
+      return React.createElement(CardBehaviorSection, { bot, putCardPref: async patch => {
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === true) delete backend[key];
+          else backend[key] = value as boolean;
+        }
+        const body = { ok: true, ...backend };
+        setBot(current => patchCardPrefsFromBody(current, body));
+        return { ok: true, status: 200, body };
+      } });
+    }
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => { renderer = TestRenderer.create(React.createElement(Parent)); });
+    const toggle = (key: string) => renderer.root.findByProps({ 'data-action': `toggle-${key}` });
+    const set = async (key: string, checked: boolean) => {
+      await act(async () => { toggle(key).props.onChange({ currentTarget: { checked } }); });
+    };
+    await set('replyFooterEnabled', true);
+    await set('replyFooterModel', true);
+    await set('replyFooterBrand', false);
+    expect(toggle('replyFooterEnabled').props.checked).toBe(true);
+    expect(toggle('replyFooterModel').props.checked).toBe(true);
+    expect(toggle('replyFooterBrand').props.checked).toBe(false);
+    expect(backend).toEqual({ replyFooterBrand: false });
     act(() => renderer.unmount());
   });
 });

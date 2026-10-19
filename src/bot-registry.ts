@@ -1,4 +1,4 @@
-import { normalizeReplyFooter, type ReplyFooterPreferences } from './services/reply-footer.js';
+import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
@@ -4314,8 +4314,7 @@ export function resolveReplyFooterPreferences(larkAppId: string): ReplyFooterPre
     } catch { /* isolated send: disk is intentionally unreadable */ }
   }
   if (process.env.BOTMUX_LARK_APP_ID === larkAppId) {
-    try { return normalizeReplyFooter(JSON.parse(process.env.BOTMUX_REPLY_FOOTER ?? '{}')); }
-    catch { /* invalid env uses compatible defaults */ }
+    return parseReplyFooterEnv(process.env.BOTMUX_REPLY_FOOTER);
   }
   return {};
 }

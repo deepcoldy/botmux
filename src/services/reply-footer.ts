@@ -13,3 +13,9 @@ export function normalizeReplyFooter(value: unknown): ReplyFooterPreferences {
   return Object.fromEntries(REPLY_FOOTER_KEYS.flatMap(key =>
     typeof raw[key] === 'boolean' ? [[key, raw[key]]] : []));
 }
+
+/** Host-injected snapshot for env-only sends; malformed input uses defaults. */
+export function parseReplyFooterEnv(value: string | undefined): ReplyFooterPreferences {
+  try { return normalizeReplyFooter(JSON.parse(value ?? '{}')); }
+  catch { return {}; }
+}
