@@ -427,6 +427,11 @@ export interface DaemonSession {
    * captured it). Trusted only while `imageKey === currentImageKey`; a cache
    * restored from disk has no provenance and is treated as legacy. */
   currentImageSource?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
+  /** Read-only preview shown while the card's own turn is waiting for the
+   * previous turn to finish. It is deliberately separate from currentImageKey:
+   * never persisted, never treated as this card turn's frame, and cleared as
+   * soon as the target turn activates or the worker generation changes. */
+  waitingTurnPreview?: { imageKey: string; turnId?: string; dispatchAttempt?: number };
   /** The worker's actual screenshot capture identity, from capture_identity
    * events emitted at real CLI write points (never from input ACKs). Scoped to
    * one worker generation: once a generation announced it, that generation's

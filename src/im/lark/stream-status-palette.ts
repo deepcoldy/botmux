@@ -6,7 +6,6 @@
  */
 export const STREAM_STATUS_TEMPLATE_MAP = {
   starting: 'yellow',
-  queued: 'yellow',
   working: 'blue',
   idle: 'green',
   analyzing: 'purple',

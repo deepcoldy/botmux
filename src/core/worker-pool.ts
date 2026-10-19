@@ -1215,11 +1215,11 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, status),
+    status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1271,11 +1271,11 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, status),
+    status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1460,11 +1460,11 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     buildTerminalUrl(ds),
     ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, status),
+    status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1536,11 +1536,11 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, ds.lastScreenStatus ?? 'working'),
+    ds.lastScreenStatus ?? 'working',
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1626,11 +1626,11 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     buildTerminalUrl(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, status),
+    status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -3016,11 +3016,11 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     readUrl,
     turnTitle,
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, 'limited'),
+    'limited',
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -3643,6 +3643,7 @@ export function bindStreamCardDisplayTarget(
   newTurnId?: string,
 ): void {
   if (!isRealStreamingCardId(messageId) || ds.streamCardId !== messageId) return;
+  ds.waitingTurnPreview = undefined;
   const publication = ++streamCardPublicationSeq;
   const identity = currentCaptureIdentity(ds);
   ds.streamCardDisplayTarget = newTurnId === undefined || identity?.turnId === newTurnId
@@ -3681,13 +3682,18 @@ function promoteWaitingStreamCardTarget(ds: DaemonSession): void {
   if (!identity || identity.turnId !== target.turnId) return;
   // CAS on the exact publication: never upgrade a replaced target.
   if (ds.streamCardDisplayTarget !== target) return;
+  ds.waitingTurnPreview = undefined;
   ds.streamCardDisplayTarget = { ...target, mode: 'follow-live' };
 }
 
 /** Drop the display target (optionally only when it names `messageId`). */
 export function forgetStreamCardDisplayTarget(ds: DaemonSession, messageId?: string): void {
-  if (!ds.streamCardDisplayTarget) return;
+  if (!ds.streamCardDisplayTarget) {
+    ds.waitingTurnPreview = undefined;
+    return;
+  }
   if (messageId !== undefined && ds.streamCardDisplayTarget.messageId !== messageId) return;
+  ds.waitingTurnPreview = undefined;
   ds.streamCardDisplayTarget = undefined;
 }
 
@@ -3722,15 +3728,16 @@ export function streamingCardTurnQueued(ds: DaemonSession, turnId?: string): boo
   return identity?.turnId !== undefined && identity.turnId !== turnId;
 }
 
-/** Preserve worker/runtime truth in `lastScreenStatus` while projecting the
- * card's own turn lifecycle honestly. A queued card must never claim that its
- * turn is already working merely because the predecessor still is. */
-export function streamingCardPresentationStatus(
-  ds: DaemonSession,
-  status: StreamStatus,
-  turnId?: string,
-): StreamStatus {
-  return streamingCardTurnQueued(ds, turnId) ? 'queued' : status;
+/** Image for the card's presentation layer. A waiting card may show the live
+ * predecessor frame only through the explicit in-memory preview slot; it is
+ * never promoted into this turn's currentImageKey. */
+export function streamingCardPresentationImageKey(ds: DaemonSession): string | undefined {
+  if (!streamingCardTurnQueued(ds)) return ds.currentImageKey;
+  const preview = ds.waitingTurnPreview;
+  if (!preview) return undefined;
+  if (screenshotSourceSuppressed(ds, preview.turnId, preview.dispatchAttempt)) return undefined;
+  if (currentCaptureSourcesSuppressed(ds)) return undefined;
+  return preview.imageKey;
 }
 
 /** May a cached image with this source be rendered for the current target? A
@@ -3744,9 +3751,10 @@ function cachedImageAllowedByDisplayTarget(ds: DaemonSession, source: CaptureTup
 
 export type ScreenshotFrameVerdict =
   | { ok: true; source: CaptureTuple }
+  | { ok: false; reason: 'target-waiting'; source: CaptureTuple }
   | { ok: false; reason:
       | 'invalid-revision' | 'unknown-revision' | 'superseded-revision' | 'tuple-mismatch'
-      | 'protocol-downgrade' | 'superseded-attempt' | 'source-suppressed' | 'target-waiting' };
+      | 'protocol-downgrade' | 'superseded-attempt' | 'source-suppressed' };
 
 /** Producer (source) and display-target verdict for one worker frame. Both
  * must pass before the frame may enter the cache or be PATCHed.
@@ -3801,7 +3809,10 @@ export function evaluateScreenshotFrame(
   if (anyCaptureSourceSuppressed(ds, tuples)) return { ok: false, reason: 'source-suppressed' };
   const target = currentStreamCardDisplayTarget(ds);
   if (target?.mode === 'waiting-exact-turn' && source.turnId !== target.turnId) {
-    return { ok: false, reason: 'target-waiting' };
+    // Source/auth/suppression checks already passed. The frame still cannot
+    // enter this turn's durable image cache, but callers may show it through
+    // the isolated, in-memory preview slot to preserve legacy card behavior.
+    return { ok: false, reason: 'target-waiting', source };
   }
   return { ok: true, source };
 }
@@ -3842,6 +3853,7 @@ function currentCaptureSourcesSuppressed(ds: DaemonSession): boolean {
  * provenance (legacy/disk-restored cache) the frame is only shown while no
  * known current source is suppressed. */
 export function displayableStreamingCardImageKey(ds: DaemonSession): string | undefined {
+  if (streamingCardTurnQueued(ds)) return streamingCardPresentationImageKey(ds);
   const key = ds.currentImageKey;
   if (!key) return undefined;
   const source = ds.currentImageSource?.imageKey === key ? ds.currentImageSource : undefined;
@@ -4570,11 +4582,11 @@ function reconcilePostedStartingCard(
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, status),
+    status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -4687,7 +4699,7 @@ async function postTurnStartingStatusCard(
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     '',
-    streamingCardPresentationStatus(ds, status, turnId),
+    status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     nonce,
@@ -4840,11 +4852,11 @@ export async function postFreshStreamingCard(
     readUrl,
     title,
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, status),
+    status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -8462,11 +8474,11 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    streamingCardPresentationStatus(ds, status ?? ds.lastScreenStatus ?? 'starting'),
+    status ?? ds.lastScreenStatus ?? 'starting',
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -14444,17 +14456,17 @@ function setupWorkerHandlers(
         // Committed synchronously (no await before this point) so no later
         // frame of this worker can be judged against an older identity.
         if (ds.workerGeneration !== workerGeneration) break;
-        const cardWasQueued = streamingCardTurnQueued(ds);
+        const cardWasWaiting = streamingCardTurnQueued(ds);
         if (!commitCaptureIdentity(ds, workerGeneration, msg)) {
           logger.debug(
             `[${t}] Rejected capture_identity rev=${String(msg.revision)} `
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
-        } else if (cardWasQueued && !streamingCardTurnQueued(ds)) {
-          // The queued turn has become the terminal producer. Repaint even
+        } else if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
+          // The waiting turn has become the terminal producer. Repaint even
           // when the worker remains working→working and no status edge would
-          // otherwise wake the card; a screenshot frame may follow, but hidden
-          // mode must leave the queued header immediately too.
+          // otherwise wake the card: this immediately removes the predecessor
+          // preview, before the first screenshot from the new turn arrives.
           reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
         }
         break;
@@ -14862,11 +14874,11 @@ function setupWorkerHandlers(
               readOnlyUrl,
               initTitle,
               ds.lastScreenContent ?? '',
-              streamingCardPresentationStatus(ds, initStatus),
+              initStatus,
               effectiveCliId,
               ds.displayMode ?? 'hidden',
               ds.streamCardNonce,
-              ds.currentImageKey,
+              streamingCardPresentationImageKey(ds),
               isAdopt,
               showTakeover,
               loc,
@@ -14988,11 +15000,11 @@ function setupWorkerHandlers(
             // before the first screen_update lands. Fresh worker spawn
             // has lastScreenContent undefined → '' (unchanged).
             ds.lastScreenContent ?? '',
-            streamingCardPresentationStatus(ds, initStatus, pendingTurnIdAtPost),
+            initStatus,
             effectiveCliId,
             ds.displayMode ?? 'hidden',
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15705,11 +15717,11 @@ function setupWorkerHandlers(
             readUrl,
             turnTitle,
             isNewTurn ? '' : msg.content,
-            streamingCardPresentationStatus(ds, ds.lastScreenStatus, newTurnIdAtPost),
+            ds.lastScreenStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15831,11 +15843,11 @@ function setupWorkerHandlers(
             readUrl,
             turnTitle,
             msg.content,
-            streamingCardPresentationStatus(ds, ds.lastScreenStatus),
+            ds.lastScreenStatus,
             effectiveCliId,
             mode,
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15873,8 +15885,31 @@ function setupWorkerHandlers(
         // target must accept it (a new-turn card waits for its exact turn).
         const frameVerdict = evaluateScreenshotFrame(ds, workerGeneration, msg);
         if (!frameVerdict.ok) {
+          let shownAsWaitingPreview = false;
+          if (frameVerdict.reason === 'target-waiting'
+            && frameVerdict.source.turnId !== undefined) {
+            const target = currentStreamCardDisplayTarget(ds);
+            if (target?.mode === 'waiting-exact-turn') {
+              // Keep predecessor pixels observable without laundering them into
+              // the waiting turn's durable cache. This slot is in-memory only,
+              // preserves the legacy card presentation, and is cleared on
+              // target activation/publication or worker replacement.
+              ds.waitingTurnPreview = {
+                imageKey: msg.imageKey,
+                ...frameVerdict.source,
+              };
+              shownAsWaitingPreview = true;
+              if ((ds.displayMode ?? 'hidden') === 'screenshot'
+                && ds.streamCardId
+                && ds.streamCardId !== CARD_POSTING_SENTINEL
+                && workerHasInitialized(ds)) {
+                scheduleCardPatch(ds, buildStreamingCardJson(ds), target.turnId);
+              }
+            }
+          }
           logger.debug(
-            `[${t}] Dropped screenshot (${frameVerdict.reason}) turn=${msg.turnId?.substring(0, 12) ?? '-'} `
+            `[${t}] ${shownAsWaitingPreview ? 'Previewed' : 'Dropped'} screenshot (${frameVerdict.reason}) `
+            + `turn=${msg.turnId?.substring(0, 12) ?? '-'} `
             + `attempt=${msg.dispatchAttempt ?? '-'} rev=${msg.captureRevision ?? '-'}`,
           );
           break;
@@ -15937,11 +15972,11 @@ function setupWorkerHandlers(
           readUrl,
           turnTitle,
           ds.lastScreenContent ?? '',
-          streamingCardPresentationStatus(ds, ds.lastScreenStatus),
+          ds.lastScreenStatus,
           effectiveCliId,
           'screenshot',
           ds.streamCardNonce,
-          ds.currentImageKey,
+          streamingCardPresentationImageKey(ds),
           isAdopt,
           showTakeover,
           loc,
@@ -19713,6 +19748,7 @@ export function reserveWorkerGeneration(ds: DaemonSession): number {
   ) + 1;
   ds.workerGeneration = workerGeneration;
   ds.session.workerGeneration = workerGeneration;
+  ds.waitingTurnPreview = undefined;
   // P1-13：换代边界统一清 previewTarget。fork / refork / 切 CLI / adopt 全部经由这里
   // 预留代次，所以这一处就是「上一代 CLI 起的 dev server 已经失去权威」的唯一判据。
   // 并进同一次 updateSession，代次推进与预览清空要么一起落盘、要么一起回滚——否则

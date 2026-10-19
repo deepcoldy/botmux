@@ -58,7 +58,6 @@ export const messages: Record<string, string> = {
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': '启动中…',
-  'card.status.queued': '排队中',
   'card.status.working': '工作中',
   'card.status.idle': '等待输入',
   'card.status.idle_silent': '✓ 本轮已结束（AI 判断无需回复） · 等待输入',
@@ -77,7 +76,6 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 会话已搬迁',
   'card.status.selected': '已选择',
   'card.status.waiting_screenshot': '_(等待第一张截图…)_',
-  'card.status.queued_screenshot': '_(本轮正在排队；上一轮结束后将自动显示截图。)_',
   'card.status.screenshot_unavailable': '_(当前没有可用截图，请在会话恢复后刷新。)_',
   'card.status.truncated_prefix': '… (已截断)',
 
