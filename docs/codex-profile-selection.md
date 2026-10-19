@@ -46,6 +46,6 @@ Dashboard 在目标 Bot 的 daemon 上扫描候选，提供可搜索下拉、刷
 - 真实浏览器选择、保存、回读、候选删除/刷新、显式清空，截图见 [验证说明](screenshots/codex-profile/README.md)。
 - 本机 Codex 0.163.0，临时 `CODEX_HOME` 的 `debug prompt-input`：基础 `developer_instructions="BASE_FIXTURE"`，profile `developer_instructions="PROFILE_FIXTURE"`，输出包含 profile 标记；加显式 `-c developer_instructions="EXPLICIT_FIXTURE"` 后只包含显式标记。未调用模型或配置真实 hooks。
 - 同版本尝试 `codex --profile selected app-server` 得到明确拒绝（参数仅适用于列出的 runtime commands 和 `codex mcp`）；据此拒绝 RPC 组合。
-- 基线 `5f8175ab5`；`bun run build` 通过。17 个定向测试文件合计 1016 项通过、2 项条件跳过（含真实浏览器）。覆盖保存过程中删除文件的原子拒绝。
+- 初始基线 `5f8175ab5`，随后同步 `ba2ad453f` 的配置一致性更新；`bun run build` 通过。同步后 18 个定向测试文件合计 1029 项通过、2 项条件跳过（含真实浏览器和配置协调器回归）。覆盖保存过程中删除文件的原子拒绝。
 - `bun run daemon:restart` / `daemon:status` / `daemon:stop` 在独立网络/PID 空间、临时配置目录运行真实构建产物；带 profile 的测试 Bot、Dashboard online，IPC 就绪，之后正常停止。
 - 不修改生产配置、不合并、不发版。未跑完整全量测试，不将单测夹具等同真实模型全模式验证。
