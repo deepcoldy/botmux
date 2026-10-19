@@ -61,6 +61,7 @@
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
 | `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
+| `suppressDeliveredFinalFailureNotice` | **实验性、默认关闭**。设为 `true` 后，结构化转写会话（如 Codex）中同一轮、同一次执行尝试已带飞书回执送达显式 final（`botmux send --response-kind final` 或托管 final 卡）时，收尾阶段再遇到模型服务错误（如 527）只记日志与失败终态，不再补发「模型连接失败」通知。该开关信任已送达的 final，不比对模型事后续写的文本；进度 / 补充消息、未带回执或跨轮次的发送不受影响。缺省 / `false` 与此前行为一致。可用 `/botconfig set suppressDeliveredFinalFailureNotice on` / `off` 切换，下个 worker 启动生效 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`，详见下方说明 |
 
@@ -238,7 +239,8 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 
 | 字段 | 说明 |
 |------|------|
-| `brandLabel` | 卡片底部品牌文案（仅在最终回答与顶层广播卡片中展示）。`undefined`=默认 `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。另受机器级总开关 `dashboard.cardBrandLabel` 约束（Dashboard「设置 → 飞书卡片」，缺省开）：关闭后所有 Bot 一律不显示页脚签名，本字段在 Bot 配置页置灰。纯样式，不影响路由 / 权限 |
+| `replyCardMode` | `legacy`（默认）分别发送进度与答复；`unified` 将同一轮公开进度、工具记录、执行状态和最终答复更新到同一张卡。支持未启用文件沙盒的 Claude Code / Codex / Grok 普通飞书会话，从下一轮生效。Grok 展示公开旁白和工具事件，不转发原始思考或 hook 内容；其他入口沿用默认路径。独立终端状态卡由 `disableStreamingCard` 单独控制。 |
+| `brandLabel` | 卡片底部品牌文案（仅在最终回答与顶层广播卡片中展示）。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。另受机器级总开关 `dashboard.cardBrandLabel` 约束（Dashboard「设置 → 飞书卡片」，缺省开）：关闭后所有 Bot 一律不显示页脚签名，本字段在 Bot 配置页置灰。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `modelBackendVariant` 显示 | 已冻结的 TraeX 后端变体只显示在实时流式 session 卡片的运行时标识中；回复卡片页脚只显示 Context / Token 用量，不展示该变体 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |

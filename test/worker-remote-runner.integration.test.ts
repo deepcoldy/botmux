@@ -85,6 +85,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       protocol, version, type: 'ready', requestId: command.requestId, state,
       recoveredTurn: {
         turnId: 'om_turn_survived', generation: state.generation, startedAtMs: 1000,
+        dispatchAttempt: 8,
         trustedCaller: {
           requestUserOpenId: 'ou_remote_user', requestLarkAppId: 'app_remote_takeover', senderType: 'user',
         },
@@ -174,6 +175,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       content: 'follow up during takeover',
       turnId: 'om_turn_followup',
       dispatchAttempt: 9,
+      durablePrimaryInbox: true,
       trustedCaller: {
         requestUserOpenId: 'ou_remote_user',
         requestLarkAppId: 'app_remote_takeover',
@@ -192,6 +194,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 16_000));
     expect(readFileSync(commandsPath, 'utf8')).not.toContain('"type":"turn"');
     expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'turn_input_committed',
+      turnId: 'om_turn_survived',
+      dispatchAttempt: 8,
+      durablePrimaryInbox: true,
+    }));
 
     writeFileSync(releaseRecoveredFinalPath, 'release\n');
     await waitFor(
@@ -220,6 +228,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     ]);
     expect(messages).toEqual(expect.arrayContaining([
       expect.objectContaining({
+        type: 'turn_input_committed',
+        turnId: 'om_turn_followup',
+        dispatchAttempt: 9,
+        durablePrimaryInbox: true,
+      }),
+      expect.objectContaining({
         type: 'final_output',
         turnId: 'om_turn_survived',
         content: 'TAKEOVER_OK',
@@ -233,10 +247,11 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     expect(messages.some(message => message.type === 'error')).toBe(false);
   });
 
-  it('passes persisted provider state to resume after a worker restart', async () => {
+  it('passes persisted provider state and defers a durable refork ACK until provider submission', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-resume-'));
     tempDirs.push(root);
     const commandsPath = join(root, 'commands.jsonl');
+    const releaseSubmitPath = join(root, 'release-submit');
     const provider = join(root, 'provider.mjs');
     writeFileSync(provider, `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -255,8 +270,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   } else if (command.type === 'resume') {
     emit({ type: 'ready', requestId: command.requestId, state: command.state });
   } else if (command.type === 'turn') {
-    emit({ type: 'status', requestId: command.requestId, status: 'busy' });
-    emit({ type: 'final', turnId: command.turnId, content: 'RESUMED_OK' });
+    const submitTimer = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(releaseSubmitPath)})) return;
+      clearInterval(submitTimer);
+      emit({ type: 'status', requestId: command.requestId, status: 'busy' });
+      emit({ type: 'final', turnId: command.turnId, content: 'RESUMED_OK' });
+    }, 10);
   } else if (command.type === 'cancel') {
     emit({ type: 'status', requestId: command.requestId, status: 'closed' });
   }
@@ -314,14 +333,25 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       backendConfig: { expectedProvider: 'resume-provider' },
       remoteBackendState: persistedState,
       prompt: 'resume this turn',
-      turnId: 'turn-after-worker-restart',
+      turnId: 'om_turn_after_worker_restart',
+      dispatchAttempt: 7,
+      durablePrimaryInbox: true,
       larkAppId: 'app_remote_resume',
       larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
 
     await waitFor(
+      () => existsSync(commandsPath)
+        && readFileSync(commandsPath, 'utf8').includes('"type":"turn"'),
+      () => `remote runner did not receive the reforked turn\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    expect(messages.some(message => message.type === 'turn_input_committed'
+      && message.turnId === 'om_turn_after_worker_restart')).toBe(false);
+    writeFileSync(releaseSubmitPath, 'release\n');
+
+    await waitFor(
       () => messages.some(message => message.type === 'turn_terminal'
-        && message.turnId === 'turn-after-worker-restart'
+        && message.turnId === 'om_turn_after_worker_restart'
         && message.status === 'completed'),
       () => `remote runner resume turn did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
     );
@@ -336,8 +366,14 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     });
     expect(messages).toContainEqual(expect.objectContaining({
       type: 'final_output',
-      turnId: 'turn-after-worker-restart',
+      turnId: 'om_turn_after_worker_restart',
       content: 'RESUMED_OK',
+    }));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'turn_input_committed',
+      turnId: 'om_turn_after_worker_restart',
+      dispatchAttempt: 7,
+      durablePrimaryInbox: true,
     }));
   });
 

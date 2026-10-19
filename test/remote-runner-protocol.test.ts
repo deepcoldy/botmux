@@ -183,7 +183,7 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
-  it('accepts only bounded non-terminal outbound message intents', () => {
+  it('accepts only bounded outbound message intents', () => {
     const png = Buffer.from([
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
       0x00, 0x00, 0x00, 0x00,
@@ -254,10 +254,14 @@ describe('remote runner protocol', () => {
       operationId: 'outbound-2',
       turnId: 'turn-1',
       generation: 3,
-      content: 'not allowed',
+      content: 'final answer',
       responseKind: 'final',
       mention: 'none',
-    }))).toBeUndefined();
+    }))).toMatchObject({
+      type: 'outbound_message',
+      operationId: 'outbound-2',
+      responseKind: 'final',
+    });
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,

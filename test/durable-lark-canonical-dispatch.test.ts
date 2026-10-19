@@ -140,6 +140,46 @@ describe('durable Lark canonical dispatch', () => {
     await facade.stop();
   });
 
+  it('propagates explicit retry results without writing Session or Outbox state', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async () => ({ kind: 'retry', reason: 'session has an unfinished turn' }),
+    });
+
+    await expect(dispatch(message(), { claim: claim(), signal: new AbortController().signal }))
+      .resolves.toEqual({ kind: 'retry', reason: 'session has an unfinished turn' });
+    expect(store.writeSession).not.toHaveBeenCalled();
+    expect(store.enqueueOutbox).not.toHaveBeenCalled();
+    await facade.stop();
+  });
+
+  it('fails closed when a retry result queued a post-admission output', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'canonical-boot' });
+    const dispatch = createDurableLarkCanonicalDispatch({
+      facade,
+      store,
+      handle: async (_message, context) => {
+        context.queuePostAdmissionOutput({
+          target: { kind: 'send', chatId: 'oc_chat' },
+          content: 'must not escape a retry',
+          providerUuid: 'retry_output',
+        });
+        return { kind: 'retry', reason: 'session has an unfinished turn' };
+      },
+    });
+
+    await expect(dispatch(message(), {
+      claim: claim(), signal: new AbortController().signal,
+    })).rejects.toThrow(/retry result cannot publish/);
+    expect(store.writeSession).not.toHaveBeenCalled();
+    expect(store.enqueueOutbox).not.toHaveBeenCalled();
+    await facade.stop();
+  });
+
   it('fails closed on aborts, invalid handler results, and Session admission conflicts', async () => {
     const aborted = new AbortController();
     aborted.abort(new Error('claim lost'));

@@ -76,6 +76,9 @@ function harness() {
     durableTurnInFlight: undefined,
     tuiPromptBlocking: false,
     hookReviewInputHold: false,
+    // Codex model-migration picker admission point (owned Codex startup only).
+    codexModelMigrationCheckNeeded: () => false,
+    codexModelMigrationAdmit: async () => 'proceed',
     bareShellCheckInProgress: false,
     ambiguousSubmissionRecoveryHold: undefined,
     currentInputDeliveryQuarantine: vi.fn(() => null),

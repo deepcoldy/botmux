@@ -16,7 +16,7 @@ export function parseOption(o: unknown): AskOption | AskQuestionParseError {
 }
 
 /** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
-export function parseAskQuestions(arr: unknown): AskQuestion[] | AskQuestionParseError {
+export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: boolean }): AskQuestion[] | AskQuestionParseError {
   if (!Array.isArray(arr) || arr.length === 0) return 'bad_questions';
   const result: AskQuestion[] = [];
   for (const q of arr) {
@@ -27,7 +27,7 @@ export function parseAskQuestions(arr: unknown): AskQuestion[] | AskQuestionPars
     if (qq.inputMode !== undefined && qq.inputMode !== 'text') return 'bad_inputMode';
     const textOnly = qq.inputMode === 'text';
     if (textOnly && (qq.multiSelect || qq.defaultSelectedKeys !== undefined)) return 'bad_inputMode';
-    if (!Array.isArray(qq.options) || (textOnly ? qq.options.length !== 0 : qq.options.length < 2)) return 'bad_options';
+    if (!Array.isArray(qq.options) || (textOnly ? qq.options.length !== 0 : qq.options.length < (options?.allowSingleOption ? 1 : 2))) return 'bad_options';
     const opts: AskOption[] = [];
     const seen = new Set<string>();
     for (const o of qq.options) {

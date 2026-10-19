@@ -46,6 +46,15 @@ describe.skipIf(process.platform === 'win32')('PTY nonblocking reader compatibil
         expect(result.output).toBe('READY');
         expect(result.exit.signal).toBe(15);
       });
+      it('nudgeRead keeps keystroke echo off the 20ms idle retry', async () => {
+        // Each round trip starts after an idle gap, so without a nudge the Bun
+        // reader is parked in its 20ms retry and roughly every other echo pays
+        // it. With the nudge the echo is picked up by the fast-poll window.
+        const result = await probe(runtime, 'echo-nudge');
+        expect(result.output).toContain('r:11;');
+        const slow = (result.echoLatencies as number[]).filter(ms => ms >= 15);
+        expect(slow.length, JSON.stringify(result.echoLatencies)).toBeLessThanOrEqual(2);
+      });
       it('preserves buffered output across pause/resume and large bursts', async () => {
         const result = await probe(runtime, 'pause');
         expect(result.output).toBe('first' + 'A'.repeat(262144) + 'last');

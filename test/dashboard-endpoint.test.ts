@@ -619,6 +619,36 @@ describe('PRODUCTION WIRING: `botmux dashboard` recovers the measured failure', 
     expect(paths).toContain('/__cli/ensure');
   });
 
+  it('the wrapper exports only after the dashboard answered, and opts in on the re-read too', async () => {
+    // cmdDashboard passes the Devbox export through the wrapper. The export must
+    // wait for the first call (callDashboard may heal `.dashboard-port` there),
+    // and the post-export `/__cli/current` re-read is an endpoint call like any
+    // other — it needs the same dead-port opt-in.
+    const events: string[] = [];
+    const execution = await executeDashboardCliCommand(['current'], async (path, opts) => {
+      events.push(`${path} ${JSON.stringify(opts)}`);
+      return { ok: true, url: `http://host:7891/?t=current&n=${events.length}` };
+    }, async () => {
+      events.push('export');
+      return 'https://devbox.example.com';
+    });
+    expect(events).toEqual([
+      '/__cli/current {"rescanWhenUnreachable":true}',
+      'export',
+      '/__cli/current {"rescanWhenUnreachable":true}',
+    ]);
+    expect(execution).toMatchObject({ kind: 'endpoint', result: { ok: true, url: 'http://host:7891/?t=current&n=3' } });
+  });
+
+  it.each([[['help']], [['wat']], [['current']]])('the wrapper never exports for %j without a live answer', async (args) => {
+    let exports = 0;
+    await executeDashboardCliCommand(args, async () => ({ ok: false, reason: 'unreachable' }), async () => {
+      exports++;
+      return 'https://devbox.example.com';
+    });
+    expect(exports).toBe(0);
+  });
+
   it('cmdDashboard goes through the wrapper (minimal source pin, no nested parsing)', () => {
     // The behavioural tests above prove the WRAPPER opts in; they cannot see
     // cli.ts choosing the raw helper instead (VERIFIED: that swap left them all
@@ -669,6 +699,23 @@ describe('PRODUCTION WIRING: `botmux dashboard` recovers the measured failure', 
     expect(body).not.toContain('rescanWhenUnreachable');
     // ...and it must not route through the CLI wrapper, which always opts in.
     expect(body).not.toContain('executeDashboardCliCommand');
+  });
+
+  it('printDashboardHintWithRetry exports before branching on a usable link (minimal source pin)', () => {
+    // A fresh Devbox answers no-active-token, which ENDS the poll without a usable
+    // link. Gating the export on `last.ok` (the shape this replaced) silently
+    // skipped it there, leaving every web-terminal link local. exportAfterDashboardAnswer
+    // is behaviourally tested in dashboard-command.test.ts; cli.ts exports nothing,
+    // so pin only that the poll hands it the answer BEFORE the `last.ok` branch.
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
+    const start = src.indexOf('async function printDashboardHintWithRetry(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\n}', start);
+    const body = src.slice(start, end)
+      .split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+    const exportAt = body.indexOf('exportAfterDashboardAnswer(');
+    expect(exportAt).toBeGreaterThan(-1);
+    expect(exportAt).toBeLessThan(body.indexOf('if (last.ok)'));
   });
 
   it('the raw command helper does NOT opt in (the readiness poll shape)', async () => {

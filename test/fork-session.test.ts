@@ -331,8 +331,9 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandbox).toBe(false);
   });
 
-  it('preserves scratch storage, denied paths and the worktree admission decision without shared objects', async () => {
+  it('preserves service tier, scratch storage, denied paths and the worktree admission decision without shared objects', async () => {
     const src = makeSourceDs({ sandbox: 'scratch',
+      serviceTier: 'priority',
       sandboxScratch: { storage: 'tmpfs', tmpfsSizeMb: 192, denyPaths: ['/private'], network: false },
       autoWorktreeFallbackDir: '/tmp/project' });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
@@ -341,6 +342,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandbox).toBe('scratch');
     expect(child.sandboxScratch).toEqual(src.session.sandboxScratch);
     expect(child.sandboxScratch).not.toBe(src.session.sandboxScratch);
+    expect(child.serviceTier).toBe(src.session.serviceTier);
     expect(child.autoWorktreeFallbackDir).toBe('/tmp/project');
     child.sandboxScratch!.denyPaths!.push('/child-only');
     expect(src.session.sandboxScratch!.denyPaths).toEqual(['/private']);

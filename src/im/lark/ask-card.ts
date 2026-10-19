@@ -468,7 +468,7 @@ function renderAskCardWithCap(
     tag: 'div',
     fields: [
       { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${approverSummary(ask, locale)}` } },
     ],
   };
 
@@ -594,7 +594,8 @@ function renderAskCardWithCap(
       tag: 'note',
       elements: [
         { tag: 'plain_text', content: t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
-          : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
+          : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
+            : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
       ],
     });
   }

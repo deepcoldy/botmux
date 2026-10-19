@@ -55,7 +55,7 @@ export function requireConfigPath(): string {
  */
 export async function rmwBotEntry<T>(
   larkAppId: string,
-  mutate: (entry: any, raw: any[]) => { write: boolean; result: T } | T,
+  mutate: (entry: any, raw: any[]) => { write: boolean; result: T } | T | Promise<{ write: boolean; result: T } | T>,
 ): Promise<{ ok: true; result: T } | { ok: false; reason: string }> {
   const path = requireConfigPath();
   return runDurableConfigMutation({
@@ -66,7 +66,7 @@ export async function rmwBotEntry<T>(
       const idx = findEntryIndex(raw, larkAppId);
       if (idx < 0) return { ok: false as const, reason: 'bot_not_in_config' };
       const entry = raw[idx];
-      const out = mutate(entry, raw);
+      const out = await mutate(entry, raw);
       if (out && typeof out === 'object' && 'write' in (out as any)) {
         const wrap = out as { write: boolean; result: T };
         if (wrap.write) {

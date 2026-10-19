@@ -387,12 +387,12 @@ export function normalizeLocalHomeLinks(
 }
 
 /** Default footer brand when a bot has no custom `brandLabel` configured. */
-export const DEFAULT_BRAND_LABEL = 'Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:';
+export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
 
 /**
  * Resolve the brand segment to render in a card footer from a bot's configured
  * `brandLabel` (see {@link resolveBrandLabel}):
- *   • `undefined` (unset)  → `Powered by [botmux](...) with :LOVE:`
+ *   • `undefined` (unset)  → the default botmux link
  *   • `''` / whitespace    → `null` (brand suppressed)
  *   • any other string     → one trimmed line (markdown allowed)
  * Returning `null` lets callers drop the brand — and, when there's also no
@@ -1528,7 +1528,7 @@ export function hasMarkdown(text: string): boolean {
  * addressing line (e.g. top-level broadcasts have no specific recipient).
  *
  * `brand` is the sending bot's configured `brandLabel` (see
- * {@link brandFooterSegment}): unset → default `Powered by [botmux](...) with :LOVE:`, `''` → brand
+ * {@link brandFooterSegment}): unset → default botmux link, `''` → brand
  * suppressed, else custom. When brand, usage, and recipient are all absent the
  * whole footer (HR included) is omitted.
  */

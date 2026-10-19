@@ -344,6 +344,10 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendEphemeralCard: vi.fn(async () => 'eph_picker_msg_id'),
 }));
 
+vi.mock('../src/services/group-auto-title.js', () => ({
+  registerGroupAutoTitle: vi.fn(),
+}));
+
 vi.mock('../src/services/group-creator.js', () => ({
   createGroupWithBots: vi.fn(async (opts: any) => ({
     ok: true,
@@ -674,6 +678,7 @@ import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotM
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
+import { registerGroupAutoTitle } from '../src/services/group-auto-title.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
@@ -2010,6 +2015,22 @@ describe('handleCommand', () => {
       expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_child_seed');
       expect(ds.session.forkPanelCardId).toBe('om_old_panel');
     });
+    it('guards the regular-group in-thread topic reply with the frozen source', async () => {
+      vi.mocked(getChatModeStrict).mockResolvedValue('group');
+      let unavailable = false;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: unavailable }] }) as any);
+      vi.mocked(sendMessage).mockImplementation(async (...args) => {
+        await args[6]?.beforeWrite?.(); writes.push('send'); unavailable = true; return 'om_child_seed';
+      });
+      const result = await startForkSubtopicSession('task', parent(), makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      // The source vanished after the seed: the topic-opening reply must not be
+      // written, and the failure is a topic-creation failure (no topic yet).
+      expect(result).toEqual({ ok: false, error: 'topic_creation_failed', orphanTopic: false });
+      expect(writes).toEqual(['send']);
+      expect(replyMessage).toHaveBeenCalledTimes(1);
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_child_seed');
+    });
     it('keeps the original command as the source of the post-fork panel refresh', async () => {
       let forked = false;
       vi.mocked(forkSession).mockImplementationOnce(async () => { forked = true; return { ok: true, childSessionId: 'child-sess-1' }; });
@@ -2021,7 +2042,15 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
-    it.each(['codex', 'claude-code'] as const)('passes post images into the %s first turn and renders them in the root', async cliId => {
+    it.each([
+      ['codex', 'topic'],
+      ['claude-code', 'topic'],
+      ['codex', 'group'],
+      ['claude-code', 'group'],
+    ] as const)('passes post images into the %s first turn and renders them in the root (%s chat)', async (cliId, chatMode) => {
+      vi.mocked(getChatModeStrict).mockResolvedValue(chatMode);
+      vi.mocked(replyMessage).mockResolvedValue('om_topic_reply');
+      vi.mocked(getMessageThreadId).mockResolvedValue('omt_child');
       const { downloadResources } = await import('../src/core/session-manager.js');
       const attachments = [{ type: 'image' as const, path: '/tmp/fork-image.jpg', name: 'img_source.jpg' }];
       vi.mocked(downloadResources).mockResolvedValueOnce({ attachments, needLogin: false });
@@ -2036,10 +2065,20 @@ describe('handleCommand', () => {
         ] }),
       }), LARK_APP_ID);
       expect(result.ok).toBe(true);
+      // The rich seed (title + images + back link) is always the top-level anchor;
+      // a regular group only adds a plain-text in-thread reply to open the topic.
+      expect(sendMessage).toHaveBeenCalledTimes(1);
       const seed = JSON.parse(vi.mocked(sendMessage).mock.calls[0][2]).zh_cn;
       expect(seed.title).toBe('[分身] 检查图片 设计文档');
       expect(seed.content[1]).toEqual([{ tag: 'img', image_key: 'img_uploaded' }]);
       expect(seed.content.at(-1).at(-1).href).toContain('omt_parent');
+      if (chatMode === 'group') {
+        expect(vi.mocked(replyMessage).mock.calls[0]).toEqual(
+          [LARK_APP_ID, 'card-msg-id', expect.stringContaining('继承上下文'), 'text', true],
+        );
+      } else {
+        expect(vi.mocked(replyMessage).mock.calls.filter(([, target]) => target === 'card-msg-id')).toEqual([]);
+      }
       expect(downloadResources).toHaveBeenLastCalledWith(LARK_APP_ID, 'msg_001',
         [{ type: 'image', key: 'img_source', name: 'img_source.jpg' }], 'ou_sender');
       const options = vi.mocked(forkSession).mock.calls[0][5]!;
@@ -2112,6 +2151,191 @@ describe('handleCommand', () => {
       );
     });
 
+    it('topic group keeps the single top-level seed and never posts an extra in-thread message', async () => {
+      // 话题群里顶层消息本身就是话题：不能为「显式开话题」再往分身话题里多发一条。
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      expect(forkSession).toHaveBeenCalledTimes(1);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      // No message of any kind is replied onto the new anchor (the only
+      // replyMessage traffic left is the parent's fork panel in the parent topic).
+      expect(vi.mocked(replyMessage).mock.calls.filter(([, target]) => target === 'card-msg-id')).toEqual([]);
+      expect(vi.mocked(replyMessage).mock.calls.some(([, , content]) => String(content).includes('继承上下文'))).toBe(false);
+      // The thread id comes straight from the top-level anchor, as before.
+      expect(vi.mocked(getMessageThreadId).mock.calls.map(([, id]) => id)).toEqual(['card-msg-id']);
+      expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({ larkThreadId: 'omt_child' });
+    });
+
+    it('keeps a regular-group top-level chat session out of the topic fork path', async () => {
+      vi.mocked(getChatModeStrict).mockResolvedValue('group');
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({
+          ownerOpenId: 'ou_sender',
+          cliSessionId: 'cli-parent-1',
+          scope: 'chat',
+          rootMessageId: CHAT_ID,
+        }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 继续排查'), deps, LARK_APP_ID);
+
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已有独立会话的话题'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    describe('regular group native topic', () => {
+      const regularParent = (ownerOpenId = 'ou_sender') => makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId, cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+
+      beforeEach(() => {
+        vi.mocked(getChatModeStrict).mockResolvedValue('group');
+        vi.mocked(replyMessage).mockResolvedValue('om_topic_reply');
+        // Only the in-thread reply carries the new topic id; a regular-group
+        // top-level message stays top-level and has none.
+        vi.mocked(getMessageThreadId).mockImplementation(async (_appId, messageId) =>
+          messageId === 'om_topic_reply' ? 'omt_child' : null);
+      });
+
+      it('opens a native topic under the top-level seed via reply_in_thread before forking into it', async () => {
+        const ds = regularParent();
+        const deps = makeDeps(ds);
+        const task = '调研这个问题\n补齐失败清理';
+
+        await handleCommand('/fork', ROOT_ID, makeLarkMessage(`/fork ${task}`, { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+        // The regular group is no longer refused by chat mode.
+        expect(getChatModeStrict).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID);
+        expect(sendMessage).toHaveBeenCalledTimes(1);
+        expect(sendMessage).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, expect.stringContaining('调研这个问题'), 'post');
+        expect(replyMessage).toHaveBeenNthCalledWith(
+          1, LARK_APP_ID, 'card-msg-id', expect.stringContaining('继承上下文'), 'text', true,
+        );
+        // Thread id resolved from the in-thread reply, never from the top-level anchor.
+        expect(vi.mocked(getMessageThreadId).mock.calls.map(([, id]) => id)).toEqual(['om_topic_reply']);
+        expect(vi.mocked(replyMessage).mock.invocationCallOrder[0])
+          .toBeLessThan(vi.mocked(forkSession).mock.invocationCallOrder[0]);
+        expect(forkSession).toHaveBeenCalledWith(
+          'sess-001', CHAT_ID, 'card-msg-id', 'group', 'thread',
+          expect.objectContaining({ forkTaskText: task, larkThreadId: 'omt_child', turnId: 'msg_001' }),
+        );
+        expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
+        expect(deleteMessage).not.toHaveBeenCalled();
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID, expect.stringContaining('omt_child'), undefined, LARK_APP_ID, 'msg_001',
+        );
+      });
+
+      it.each([
+        ['no thread id at all', null],
+        ['a non-topic id', 'om_not_a_thread'],
+      ] as const)('fails closed and recalls the seed and topic reply when the reply returns %s', async (_label, threadId) => {
+        vi.mocked(getMessageThreadId).mockResolvedValue(threadId);
+
+        const result = await startForkSubtopicSession(
+          '继续排查', regularParent(), makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }), LARK_APP_ID,
+        );
+
+        expect(result).toEqual({ ok: false, error: 'topic_creation_failed', orphanTopic: false });
+        expect(vi.mocked(deleteMessage).mock.calls).toEqual([
+          [LARK_APP_ID, 'om_topic_reply'],
+          [LARK_APP_ID, 'card-msg-id'],
+        ]);
+        expect(forkSession).not.toHaveBeenCalled();
+      });
+
+      it('surfaces the fail-closed topic creation to the user instead of a degraded group link', async () => {
+        vi.mocked(getMessageThreadId).mockResolvedValue(null);
+        const ds = regularParent();
+        const deps = makeDeps(ds);
+
+        await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+        const replies = vi.mocked(deps.sessionReply).mock.calls.map(([, text]) => String(text));
+        expect(replies).toEqual([expect.stringContaining('topic_creation_failed')]);
+        expect(forkSession).not.toHaveBeenCalled();
+        expect(ds.session.forkChildSessionIds).toBeUndefined();
+      });
+
+      it('reports an orphan topic when the fail-closed recall itself fails', async () => {
+        vi.mocked(getMessageThreadId).mockResolvedValue(null);
+        vi.mocked(deleteMessage).mockImplementation(async (_appId, id) => id !== 'card-msg-id');
+
+        const result = await startForkSubtopicSession(
+          '继续排查', regularParent(), makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }), LARK_APP_ID,
+        );
+
+        expect(result).toEqual({ ok: false, error: 'topic_creation_failed', orphanTopic: true });
+        expect(vi.mocked(deleteMessage).mock.calls.map(([, id]) => id)).toEqual(['om_topic_reply', 'card-msg-id']);
+      });
+
+      it('classifies a throw while opening the topic as topic creation failure and recalls the seed', async () => {
+        vi.mocked(replyMessage).mockRejectedValueOnce(new Error('reply_in_thread unavailable'));
+
+        const result = await startForkSubtopicSession(
+          '继续排查', regularParent(), makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }), LARK_APP_ID,
+        );
+
+        expect(result).toEqual({ ok: false, error: 'topic_creation_failed', orphanTopic: false });
+        expect(vi.mocked(deleteMessage).mock.calls).toEqual([[LARK_APP_ID, 'card-msg-id']]);
+        expect(forkSession).not.toHaveBeenCalled();
+      });
+
+      it('recalls both the topic reply and the seed when forkSession fails after the topic was opened', async () => {
+        vi.mocked(forkSession).mockResolvedValueOnce({ ok: false, error: 'worker_busy' });
+
+        const result = await startForkSubtopicSession(
+          '继续排查', regularParent(), makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }), LARK_APP_ID,
+        );
+
+        expect(result).toEqual({ ok: false, error: 'worker_busy', orphanTopic: false });
+        expect(vi.mocked(deleteMessage).mock.calls.map(([, id]) => id)).toEqual(['om_topic_reply', 'card-msg-id']);
+      });
+
+      it('treats an unconfirmed chat mode as a regular group and still requires a real topic', async () => {
+        vi.mocked(getChatModeStrict).mockResolvedValue('unknown');
+
+        const result = await startForkSubtopicSession(
+          '继续排查', regularParent(), makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }), LARK_APP_ID,
+        );
+
+        expect(result).toMatchObject({ ok: true, link: expect.stringContaining('omt_child') });
+        expect(replyMessage).toHaveBeenNthCalledWith(
+          1, LARK_APP_ID, 'card-msg-id', expect.stringContaining('继承上下文'), 'text', true,
+        );
+      });
+
+      it('admin forking another user\'s regular-group topic session still hands the child to the admin', async () => {
+        const ds = regularParent('ou_other_user');
+        const deps = makeDeps(ds);
+
+        await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+        expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({
+          childOwnerOpenId: 'ou_sender',
+          larkThreadId: 'omt_child',
+        });
+      });
+    });
     it('reports an orphan topic when fork creation and message recall both fail', async () => {
       vi.mocked(forkSession).mockResolvedValueOnce({ ok: false, error: 'worker_busy' });
       vi.mocked(deleteMessage).mockResolvedValueOnce(false);
@@ -3580,7 +3804,26 @@ describe('handleCommand', () => {
         .map(c => c[1])
         .find((content): content is string => typeof content === 'string' && content.includes('"tag":"table"'));
       expect(confirmCard).toBeTruthy();
-      const confirmTable = JSON.parse(confirmCard as string).body.elements
+      const parsedConfirmCard = JSON.parse(confirmCard as string);
+      expect(parsedConfirmCard.schema).toBe('2.0');
+      expect(parsedConfirmCard.body.elements.some((e: any) => e.tag === 'action')).toBe(false);
+      const confirmButton = parsedConfirmCard.body.elements
+        .find((e: any) => e.tag === 'column_set')?.columns?.[0]?.elements?.[0];
+      expect(confirmButton).toMatchObject({
+        tag: 'button',
+        type: 'danger',
+        behaviors: [{
+          type: 'callback',
+          value: {
+            action: 'close_worktree_confirm',
+            root_id: ROOT_ID,
+            session_id: ds.session.sessionId,
+            invoker_open_id: 'ou_sender',
+          },
+        }],
+      });
+      expect(confirmButton.behaviors[0].value.confirmation_state).toMatch(/^[a-f0-9]{64}$/);
+      const confirmTable = parsedConfirmCard.body.elements
         .find((e: any) => e.tag === 'table');
       expect(confirmTable.row_height).toBe('auto');
       expect(confirmTable.row_max_height).toBe('300px');
@@ -7885,6 +8128,84 @@ describe('handleCommand', () => {
       expect(name).not.toContain('\uFFFD');
     });
 
+    it('/g without a name registers the placeholder for AI titling as soon as the chat exists', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), deps, LARK_APP_ID);
+
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.name).toMatch(/^AI·新会话 \d{2}\/\d{2} \d{2}:\d{2}$/);
+      // Session-group logo by default, like the DM 专属群.
+      expect(opts.customization).toEqual({ tag: undefined, avatar: 'logo', userOpenId: 'ou_sender' });
+      // Registration rides the chat.create boundary, not the end of the call.
+      expect(registerGroupAutoTitle).not.toHaveBeenCalled();
+      opts.onChatCreated!('oc_new_group');
+      expect(registerGroupAutoTitle).toHaveBeenCalledWith(LARK_APP_ID, 'oc_new_group', {
+        placeholderName: opts.name, namePrefix: 'AI·', nameAvatar: undefined,
+      }, expect.any(Promise));
+      // The decoration gate settles once createGroupWithBots has returned.
+      await expect(vi.mocked(registerGroupAutoTitle).mock.calls[0][3]).resolves.toBeUndefined();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('自动更新');
+    });
+
+    it('/g with a name keeps it and does not register AI titling', async () => {
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 支付排障'), deps, LARK_APP_ID);
+
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.name).toBe('支付排障');
+      expect(opts.customization?.avatar).toBe('logo');
+      expect(opts.onChatCreated).toBeUndefined();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('自动更新');
+    });
+
+    it('a configured name avatar is re-rendered after titling', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { avatar: 'name' } } };
+      }) as any);
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), makeDeps(), LARK_APP_ID);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.customization?.avatar).toBe('name');
+      opts.onChatCreated!('oc_new_group');
+      expect(registerGroupAutoTitle).toHaveBeenCalledWith(LARK_APP_ID, 'oc_new_group', expect.objectContaining({ nameAvatar: true }), expect.any(Promise));
+    });
+
+    it('a CLI without a one-shot mode silently keeps the placeholder', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, cliId: 'aiden' } };
+      }) as any);
+      const deps = makeDeps();
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].onChatCreated).toBeUndefined();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('自动更新');
+    });
+
+    it('a sandboxed bot keeps the placeholder: the one-shot title would run outside its sandbox', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, sandbox: true } };
+      }) as any);
+      const deps = makeDeps();
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].onChatCreated).toBeUndefined();
+      expect(mockedCreate.mock.calls[0][0].customization?.avatar).toBe('logo');
+    });
+
+    it('/g --avatar off keeps Feishu\'s default avatar', async () => {
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --avatar off'), makeDeps(), LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0].customization).toBeUndefined();
+    });
+
     it('passes /group --role-profile through and strips it from the group name', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -9220,6 +9541,32 @@ describe('/card — operator / canOperate gate', () => {
     vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(setCardMode).mockResolvedValue({ ok: true } as any);
     vi.mocked(setChatStreamingCardPin).mockResolvedValue({ ok: true, changed: true } as any);
+  });
+
+  it.each([
+    { frozen: 'grok', stale: 'gemini', mode: 'unified', managed: true },
+    { frozen: 'gemini', stale: 'grok', mode: 'unified', managed: false },
+    { frozen: undefined, stale: 'grok', mode: 'unified', managed: true },
+    { frozen: undefined, stale: undefined, mode: 'unified', managed: true },
+    { frozen: 'grok', stale: 'grok', mode: 'legacy', managed: false },
+  ] as const)('describes the effective reply mode for /card on and off: %j', async ({ frozen, stale, mode, managed }) => {
+    vi.mocked(getBot).mockImplementation(((id: string = LARK_APP_ID) => ({
+      config: { larkAppId: id, cliId: 'grok', replyCardMode: mode },
+    })) as any);
+    const ds = stale ? makeDaemonSession({ session: makeSession({ cliId: stale,
+      cliLaunchSnapshot: frozen ? {
+        version: 1, state: 'resolved', entryId: frozen, cliId: frozen, cliRuntime: null,
+        cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+      } : undefined,
+    }) }) : undefined;
+    const deps = makeDeps(ds);
+    for (const sub of ['on', 'off']) {
+      await handleCardCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', `/card ${sub}`, deps);
+      expect(setCardMode).toHaveBeenLastCalledWith(LARK_APP_ID, CHAT_ID, sub === 'off');
+      const reply = vi.mocked(deps.sessionReply).mock.calls.at(-1)![1];
+      expect(reply.includes('动态答复卡')).toBe(managed);
+      if (sub === 'off') expect(reply.includes('答案仍作为新消息发送')).toBe(!managed);
+    }
   });
 
   it('rejects a non-operator (canOperate=false): operator_only notice, no mode change', async () => {

@@ -237,6 +237,28 @@ describe('codex 启动闸：worker 侧接线', () => {
   it('复查节奏受首轮硬上限约束', () => {
     expect(source).toMatch(/const FIRST_PROMPT_STARTUP_RECHECK_MS = [\d_]+;/);
   });
+
+  it('非快照后端在复查循环里也跑恢复历史判据（无恢复标记的 Context-footer resume 补偿）', () => {
+    // 缺陷：observeRestoredStartupHistory() 只对 ZmxBackend 生效。codex 0.154
+    // resume 可能既不重绘横幅、字节流里也没有 "Earlier messages" 标记，直接画
+    // 空 composer + `· Context N%` 页脚；此时 feed/observeStartupScreen 都解不
+    // 开闸，startupHistorySeen 门控的静默捕获也不触发，tmux/PTY 下排队消息被
+    // 永久扣留。修复：复查循环里对非快照后端跑同一条带护栏的历史判据。
+    const releaseStart = source.indexOf('const releaseFirstPromptTimeout');
+    const body = source.slice(releaseStart, source.indexOf('\n  };\n', releaseStart));
+    expect(body).toContain('observeRestoredStartupHistoryOnScreen()');
+
+    const fnStart = source.indexOf('function observeRestoredStartupHistoryOnScreen');
+    expect(fnStart).toBeGreaterThan(-1);
+    const fn = source.slice(fnStart, source.indexOf('\n}\n', fnStart));
+    // 只对非快照后端生效（ZMX 仍走 per-chunk 的 observeRestoredStartupHistory）。
+    expect(fn).toContain('backend instanceof ZmxBackend) return false');
+    // 读渲染后的权威视口，不 shell capture-pane、也不读 scrollback。
+    expect(fn).toContain('renderer?.rawSnapshot({ preserveFormatting: true })');
+    expect(fn).not.toContain('backend.captureCurrentScreen()');
+    // 复用适配器自带的（带 loading/busy/queued/draft/picker 护栏的）历史判据。
+    expect(fn).toContain('idleDetector?.observeStartupHistory(');
+  });
 });
 
 describe('Codex restored ZMX history startup evidence', () => {

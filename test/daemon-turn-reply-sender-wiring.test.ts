@@ -23,6 +23,12 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     );
   });
 
+  it('keeps durable-primary provider commit recovery inert outside primary mode', () => {
+    expect(daemonSource).toMatch(
+      /onTurnInputCommitted\(ds, receipt, context\) \{\s*\/\/[^\n]*\n(?:\s*\/\/[^\n]*\n){2}\s*if \(durableCoordinationRuntime\?\.mode !== 'primary'\s*\|\| !durablePrimaryRuntimeByApp\.has\(ds\.larkAppId\)\) return;/,
+    );
+  });
+
   it('computes a turn window per path and binds participants + incomplete', () => {
     // passthrough (raw command → sender-only window)
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined)');
@@ -60,8 +66,9 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // beginReplyTargetTurn 直连路径，外加 passthrough 经 turn 结构体的透传（单条 + runtime
     // 级联 runPassthroughCascade 两处调用方）；跨 principal 的 daemon 预分流、
     // principal-lane suggestion 与 worker 拒绝回流三条 durable envelope 同样必须保留
-    // inbound 的真实 thread 形态。
-    expect(daemonSource.match(inThreadFromInbound) ?? []).toHaveLength(9);
+    // inbound 的真实 thread 形态；durable-primary 已提交重放分支也会补建一次
+    // canonical per-turn reply context。
+    expect(daemonSource.match(inThreadFromInbound) ?? []).toHaveLength(10);
     expect(daemonSource).toMatch(/participants: initialWindow\.participants, participantsIncomplete: initialWindow\.incomplete, inThread: !!parsed\.threadId/);
     expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete, inThread: !!parsed\.threadId/);
     expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete, inThread: !!parsed\.threadId/);
@@ -71,6 +78,17 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // runtime 级联：定序器同样从 inbound 读，再经 turn 结构体转交。
     expect(daemonSource).toMatch(/substitute: args\.substitute,\s*inThread: !!parsed\.threadId,/);
     expect(daemonSource).toMatch(/participantsIncomplete: passthroughWindow\.incomplete,\s*inThread: turn\.inThread,/);
+  });
+
+  it('replays every user-visible turn patch before completing a durable-primary duplicate', () => {
+    const committedStart = daemonSource.indexOf("if (disposition === 'committed')");
+    const retryStart = daemonSource.indexOf("if (disposition === 'retry')", committedStart);
+    expect(committedStart).toBeGreaterThan(-1);
+    expect(retryStart).toBeGreaterThan(committedStart);
+    const branch = daemonSource.slice(committedStart, retryStart);
+    expect(branch).toContain('publishNativeTopicLinkPatch(ds)');
+    expect(branch).toContain('publishLastInputFromBotPatch(ds)');
+    expect(branch).toContain('rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin)');
   });
 
   it('BOTH registration-race loser handoffs preserve the pre-extracted seed+follow-up post @s', () => {
@@ -87,7 +105,7 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // Both admitted recompute points fold the forward-seed message into the post @s.
     expect(
       daemonSource.match(/collectPostAtMentions\(data\?\.message, ctx\.forwardSeedData\?\.message\)/g),
-    ).toHaveLength(3); // new-topic primary + existing-thread loser + auto-create loser
+    ).toHaveLength(4); // new-topic primary + durable-primary replay + existing-thread loser + auto-create loser
   });
 
   it('buildTurnParticipants concats pre-extracted post @s (extractPostAtParticipants) into the window', () => {

@@ -172,13 +172,14 @@ setInterval(() => {
     }, 30_000);
   }
 
-  for (const { backendType, stopReason, status } of [
-    { backendType: 'pty', stopReason: 'stop', status: 'completed' },
-    { backendType: 'tmux', stopReason: 'stop', status: 'completed' },
-    { backendType: 'pty', stopReason: 'error', status: 'failed' },
-    { backendType: 'pty', stopReason: 'aborted', status: 'ambiguous' },
+  for (const { backendType, stopReason, status, activity } of [
+    { backendType: 'pty', stopReason: 'stop', status: 'completed', activity: true },
+    { backendType: 'tmux', stopReason: 'stop', status: 'completed', activity: true },
+    { backendType: 'pty', stopReason: 'error', status: 'failed', activity: true },
+    { backendType: 'pty', stopReason: 'aborted', status: 'ambiguous', activity: true },
+    { backendType: 'pty', stopReason: 'stop', status: 'completed', activity: false },
   ] as const) {
-    it.skipIf(backendType === 'tmux' && !tmuxAvailable)(`closes a steered-away bubble even when the successor has no CoT (${backendType}, ${stopReason})`, async () => {
+    it.skipIf(backendType === 'tmux' && !tmuxAvailable)(`closes a steered-away timeline even when the successor has no CoT (${backendType}, ${stopReason}, activity=${activity})`, async () => {
       root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-cot-steer-'));
       const dataDir = join(root, 'data');
       const cliSessionId = 'deadbeef-1234-4678-9abc-def012345679';
@@ -232,24 +233,31 @@ setInterval(() => {}, 1000);
         && messages.some(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_warmup'), logs);
       child.send({ type: 'message', content: 'first request', turnId: 'om_first' } satisfies DaemonToWorker);
       await waitUntil(() => logs.some(line => line.includes('Writing to PTY (flush): "first request')), logs);
-      append(user('first request'), { role: 'assistant', stopReason: 'toolUse', content: [
-        { type: 'toolCall', id: 'read-1', name: 'read', arguments: { path: 'src/main.ts' } },
-      ] });
-      await waitUntil(() => messages.some(msg => msg.type === 'thinking_update' && msg.turnId === 'om_first'), logs);
+      append(user('first request'));
+      if (activity) {
+        append({ role: 'assistant', stopReason: 'toolUse', content: [
+          { type: 'toolCall', id: 'read-1', name: 'read', arguments: { path: 'src/main.ts' } },
+        ] });
+        await waitUntil(() => messages.some(msg => msg.type === 'thinking_update' && msg.turnId === 'om_first'), logs);
+      }
       child.send({ type: 'message', content: 'steer request', turnId: 'om_steer' } satisfies DaemonToWorker);
       await waitUntil(() => logs.some(line => line.includes('Writing to PTY (flush): "steer request')), logs);
-      append({ role: 'toolResult', toolCallId: 'read-1', content: [{ type: 'text', text: 'result' }] }, user('steer request'));
+      if (activity) append({ role: 'toolResult', toolCallId: 'read-1', content: [{ type: 'text', text: 'result' }] });
+      append(user('steer request'));
 
       // The old bubble must end at the confirmed steer, before B produces
       // anything at all. Closing the UI must not synthesize a task terminal.
       const events = () => request.mock.calls.flatMap(([req]) => req.data?.events ?? []);
-      await waitUntil(() => events().some(event => event.event_type === 'RUN_FINISHED'), logs);
-      const activity = messages.filter((msg): msg is Extract<WorkerToDaemon, { type: 'thinking_update' }> =>
+      await waitUntil(() => messages.some(msg => msg.type === 'thinking_superseded'), logs);
+      if (activity) await waitUntil(() => events().some(event => event.event_type === 'RUN_FINISHED'), logs);
+      const updates = messages.filter((msg): msg is Extract<WorkerToDaemon, { type: 'thinking_update' }> =>
         msg.type === 'thinking_update' && msg.turnId === 'om_first');
       const superseded = messages.filter(msg => msg.type === 'thinking_superseded');
       expect(superseded).toMatchObject([{ turnId: 'om_first', sessionId: 'sid-pi-steer' }]);
-      expect(activity.at(-1)?.entries.at(-1)).toEqual({ kind: 'tool_result', id: 'read-1', result: 'result' });
-      expect(messages.indexOf(activity.at(-1)!)).toBeLessThan(messages.indexOf(superseded[0]));
+      if (activity) {
+        expect(updates.at(-1)?.entries.at(-1)).toEqual({ kind: 'tool_result', id: 'read-1', result: 'result' });
+        expect(messages.indexOf(updates.at(-1)!)).toBeLessThan(messages.indexOf(superseded[0]));
+      } else expect(updates).toEqual([]);
       expect(messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId !== 'om_warmup')).toEqual([]);
 
       append({ role: 'assistant', stopReason,
@@ -266,11 +274,11 @@ setInterval(() => {}, 1000);
       expect(messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_first')).toEqual([]);
       expect(messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_steer')).toMatchObject([{ status }]);
       expect(messages.filter(msg => msg.type === 'thinking_update' && msg.turnId === 'om_steer')).toEqual([]);
-      expect(messages.filter(msg => msg.type === 'thinking_update' && msg.turnId === 'om_first')).toHaveLength(activity.length);
+      expect(messages.filter(msg => msg.type === 'thinking_update' && msg.turnId === 'om_first')).toHaveLength(updates.length);
       const wireEvents = events();
-      expect(wireEvents.filter(event => event.event_type === 'RUN_STARTED')).toHaveLength(1);
-      expect(wireEvents.filter(event => event.event_type === 'RUN_FINISHED')).toHaveLength(1);
-      expect(wireEvents.findIndex(event => event.event_type === 'TOOL_CALL_RESULT'))
+      expect(wireEvents.filter(event => event.event_type === 'RUN_STARTED')).toHaveLength(activity ? 1 : 0);
+      expect(wireEvents.filter(event => event.event_type === 'RUN_FINISHED')).toHaveLength(activity ? 1 : 0);
+      if (activity) expect(wireEvents.findIndex(event => event.event_type === 'TOOL_CALL_RESULT'))
         .toBeLessThan(wireEvents.findIndex(event => event.event_type === 'RUN_FINISHED'));
     }, 30_000);
   }

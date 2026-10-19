@@ -123,9 +123,8 @@ describe('index-dashboard.ts — Dashboard PM2 entry', () => {
  * 扩散»). ~/.botmux/.env is a general operator file: it commonly holds the
  * legacy single-bot LARK_APP_SECRET, GitHub tokens, model API keys and
  * whatever else the host needs. The dashboard used to dotenv the whole thing
- * into process.env — and it forks debug-terminal shells, `botmux
- * start-bot/stop-bot`, a global npm/pnpm/bun install (arbitrary lifecycle
- * scripts!), herdr plugin installs and plugin PM2 services, all of which
+ * into process.env — and it forks `botmux start-bot/stop-bot`, a global
+ * npm/pnpm/bun install (arbitrary lifecycle scripts!), herdr plugin installs and plugin PM2 services, all of which
  * inherit that environment. Only keys with a named dashboard consumer may
  * cross into the process.
  */
