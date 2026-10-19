@@ -24,6 +24,7 @@ import {
   readTraexThreadTitle,
 } from '../src/services/traex-transcript.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
+import { GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
 let dir: string;
@@ -2928,6 +2929,21 @@ describe('TraeX native thread metadata', () => {
       expect(readTraexThreadTitle(id, dbPath), id).toBeUndefined();
       expect(readTraexThreadMetadataIndex(dbPath).get(id)?.botmuxOrigin, id).toBe(true);
     }
+  });
+
+  it('marks a botmux v3 goal worker as botmux-origin but keeps a user-run goal session', () => {
+    // Measured on TraeX 0.210.1 goal mode: name is a truncated objective,
+    // title / first_user_message empty, preview = the full /goal objective.
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      { id: 'v3-goal', name: 'Read $BOTMUX_GOAL_PATH. Write files', title: '', firstUserMessage: '', preview: GOAL_COMMAND_OBJECTIVE },
+      { id: 'user-goal', name: 'Ship release notes', title: '', firstUserMessage: '', preview: 'ship the release notes' },
+    ]);
+
+    expect(readTraexThreadMetadataIndex(dbPath).get('v3-goal')?.botmuxOrigin).toBe(true);
+    expect(readTraexThreadTitle('v3-goal', dbPath)).toBeUndefined();
+    expect(readTraexThreadMetadataIndex(dbPath).get('user-goal')?.botmuxOrigin).toBeUndefined();
+    expect(readTraexThreadTitle('user-goal', dbPath)).toBe('Ship release notes');
   });
 
   it('reads the title from schemas that predate first_user_message / name / preview', () => {

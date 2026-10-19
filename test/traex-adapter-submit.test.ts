@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
+import { GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
 // TRAE submit verification polls the global submit log history.jsonl (written
@@ -395,5 +396,33 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
       title: '回复确认收到',
       lastActivityAt: 1_792_249_771_000,
     }]);
+  });
+
+  it('hides botmux v3 goal workers but lists user-run goal sessions (0.210 goal mode)', async () => {
+    const sessionsDir = join(traeHome, 'cli', 'sessions', '2026', '10', '19');
+    mkdirSync(sessionsDir, { recursive: true });
+    const goalRollout = (sid: string, objective: string) => [
+      JSON.stringify({ type: 'session_meta', payload: { id: sid, cwd: '/root/project', thread_source: 'user' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'thread_goal_updated', threadId: sid, goal: { threadId: sid, objective } } }),
+      '',
+    ].join('\n');
+    writeFileSync(join(sessionsDir, `rollout-2026-10-19T09-00-00-${SID_1}.jsonl`), goalRollout(SID_1, GOAL_COMMAND_OBJECTIVE));
+    writeFileSync(join(sessionsDir, `rollout-2026-10-19T09-05-00-${SID_2}.jsonl`), goalRollout(SID_2, 'ship the release notes'));
+
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, cwd TEXT NOT NULL,',
+      "  title TEXT NOT NULL, first_user_message TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', name TEXT",
+      ');',
+    ].join('\n'));
+    const insert = db.prepare('INSERT INTO threads VALUES (?, ?, 1792400000, ?, ?, ?, ?, ?)');
+    insert.run(SID_1, '/r1.jsonl', '/root/project', '', '', GOAL_COMMAND_OBJECTIVE, 'Read $BOTMUX_GOAL_PATH. Write files');
+    insert.run(SID_2, '/r2.jsonl', '/root/project', '', '', 'ship the release notes', 'Ship release notes');
+    db.close();
+
+    const rows = await createTraexAdapter('/bin/traex').listResumableSessions!({ limit: 10 });
+
+    expect(rows).toEqual([expect.objectContaining({ cliSessionId: SID_2, title: 'Ship release notes' })]);
   });
 });

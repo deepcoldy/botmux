@@ -25,6 +25,8 @@ import {
   type WorkerProcessFactory,
 } from '../shared/worker-process.js';
 import {
+  GOAL_COMMAND,
+  GOAL_COMMAND_OBJECTIVE,
   GOAL_ENV,
   type RunNode,
   type RunNodeRequest,
@@ -44,7 +46,7 @@ import {
 
 type WorkerEvent = WorkerToDaemon;
 
-export const GOAL_COMMAND = '/goal';
+export { GOAL_COMMAND } from './contract.js';
 
 export interface EphemeralPoolDeps {
   /**
@@ -500,8 +502,7 @@ async function runNodeImpl(
 }
 
 export function buildGoalCommand(req: RunNodeRequest): string {
-  const env = GOAL_ENV;
-  return `${GOAL_COMMAND} Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
+  return `${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`;
 }
 
 /**

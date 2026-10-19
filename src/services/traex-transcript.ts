@@ -67,6 +67,7 @@ import {
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
+import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
@@ -220,7 +221,10 @@ function normalizeTraexThreadMetadata(
   // firstUserMessage fallback). A single hit marks the thread botmux-origin
   // (the live picker then falls back to the project dir, resume drops it).
   const botmuxOrigin = [name, legacyTitle, firstUserMessage]
-    .some(text => text !== undefined && isBotmuxInjectedPrompt(text.trim()));
+    .some(text => text !== undefined && isBotmuxInjectedPrompt(text.trim()))
+    // A botmux v3 goal worker: TraeX 0.210 goal mode keeps the `/goal`
+    // objective as the first input (`preview`, via the fallback above).
+    || [legacyTitle, firstUserMessage].some(text => text !== undefined && isBotmuxGoalObjective(text));
   const cwd = nonEmptyString(row?.cwd);
   const rolloutPath = nonEmptyString(row?.rolloutPath);
   const updatedAtMs = traexUpdatedAtMs(row?.updatedAt);

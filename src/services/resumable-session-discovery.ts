@@ -21,6 +21,7 @@ import { createInterface } from 'node:readline';
 import { basename, join } from 'node:path';
 import type { ResumableSession } from '../adapters/cli/types.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
+import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
 
 const TITLE_MAX = 80;
 
@@ -576,8 +577,10 @@ type RolloutParse =
  *  first prompt, event_msg/user_message, or a verified user input
  *  (options.userInputTexts). Raw history_mutation items and response_items are
  *  WEAK: the first non-synthetic one is remembered as a fallback title (or, if
- *  it is botmux, as "no real turn") and scanning continues to the end of that
- *  first turn for a canonical record, which overrides the weak verdict. */
+ *  it is botmux, as a botmux verdict) and scanning continues to the end of that
+ *  first turn for a canonical record, which overrides the weak verdict. A weak
+ *  botmux verdict that survives the turn rejects the whole thread. TraeX also
+ *  treats botmux v3's own `/goal` objective as botmux-origin. */
 async function parseRolloutTranscript(
   path: string,
   mtimeMs: number,
@@ -600,16 +603,23 @@ async function parseRolloutTranscript(
     /** TraeX: the first non-synthetic weak user item already fixed the weak
      *  origin/title; later weak items must not re-decide it. */
     weakDecided: boolean;
+    /** TraeX: that first weak item was botmux. Rejects the thread at the end
+     *  of the first turn unless a canonical record in it says otherwise. */
+    weakBotmux: boolean;
   } = {
     id: null, cwd: null, title: '', fallbackTitle: '', weakTitle: '', botmux: false,
-    rejected: false, weakDecided: false,
+    rejected: false, weakDecided: false, weakBotmux: false,
   };
   let excluded = false;
   let nativeMetadata: RolloutSessionMetadata | undefined;
   const pathSessionId = options.sessionIdFromPath?.(path);
+  // TraeX also runs botmux v3 goal workers, whose first input is botmux's own
+  // `/goal` objective rather than a Lark envelope.
+  const isBotmuxTurn = (text: string): boolean =>
+    isBotmuxInjected(text) || (traex && isBotmuxGoalObjective(text));
   const recordCanonicalUserText = (text: string): boolean | undefined => {
     if (!text || isSyntheticPreamble(text) || isTraexContextReminder(text)) return;
-    if (isBotmuxInjected(text)) {
+    if (isBotmuxTurn(text)) {
       acc.botmux = true;
       return true;
     }
@@ -619,9 +629,10 @@ async function parseRolloutTranscript(
   const recordWeakUserText = (text: string): void => {
     if (acc.weakDecided || !text || isSyntheticPreamble(text) || isTraexContextReminder(text)) return;
     acc.weakDecided = true;
-    // A botmux first turn leaves no weak title: unless a canonical record
-    // supplies a clean prompt, the session has no real user turn → dropped.
-    if (!isBotmuxInjected(text)) acc.weakTitle = truncateTitle(text);
+    // A botmux first turn leaves no weak title and marks the thread botmux
+    // unless a canonical record of the same turn supplies a clean prompt.
+    if (isBotmuxTurn(text)) acc.weakBotmux = true;
+    else acc.weakTitle = truncateTitle(text);
   };
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
@@ -644,9 +655,16 @@ async function parseRolloutTranscript(
         if (stop) return true;
       }
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
-      if (isBotmuxInjected(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (isBotmuxTurn(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
       if (!acc.title) acc.title = truncateTitle(payload.message);
     } else if (traex) {
+      if (rec.type === 'event_msg' && payload?.type === 'thread_goal_updated') {
+        const objective = asRecord(payload.goal)?.objective;
+        if (typeof objective === 'string' && isBotmuxGoalObjective(objective)) {
+          acc.botmux = true; // a botmux v3 goal worker → drop
+          return true;
+        }
+      }
       for (const text of options.userInputTexts?.(rec, pathSessionId ?? acc.id ?? undefined) ?? []) {
         if (recordCanonicalUserText(text.trim())) return true;
       }
@@ -681,7 +699,10 @@ async function parseRolloutTranscript(
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
-  if (acc.id && (excluded || acc.botmux || acc.rejected)) return { kind: 'rejected', cliSessionId: acc.id };
+  const weakBotmux = acc.weakBotmux && !acc.title && !acc.fallbackTitle;
+  if (acc.id && (excluded || acc.botmux || acc.rejected || weakBotmux)) {
+    return { kind: 'rejected', cliSessionId: acc.id };
+  }
   const inferredTitle = acc.title || acc.fallbackTitle || acc.weakTitle;
   // No real user turn → nothing was origin-checked (and nothing to resume): a
   // native title alone must not admit the session.

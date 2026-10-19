@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
 import { config } from '../src/config.js';
-import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
+import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
@@ -677,6 +677,17 @@ describe('v3 ephemeral pool', () => {
     expect(cmd).not.toContain('status:"fail"');
     expect(cmd).not.toContain('\n');
     expect(Buffer.byteLength(cmd, 'utf-8')).toBeLessThanOrEqual(180);
+  });
+
+  it('recognises its own /goal line, with or without the command, for session discovery', () => {
+    const cmd = buildGoalCommand(request());
+    expect(cmd).toBe(`${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`);
+    expect(isBotmuxGoalObjective(cmd)).toBe(true);
+    // TraeX 0.210 goal mode stores only the objective (threads.preview).
+    expect(isBotmuxGoalObjective(GOAL_COMMAND_OBJECTIVE)).toBe(true);
+    expect(isBotmuxGoalObjective(`  ${GOAL_COMMAND_OBJECTIVE.replace(/ /g, '\n')}  `)).toBe(true);
+    expect(isBotmuxGoalObjective(`${GOAL_COMMAND} ship the release notes`)).toBe(false);
+    expect(isBotmuxGoalObjective(`Please explain: ${GOAL_COMMAND_OBJECTIVE}`)).toBe(false);
   });
 
   it('claims success when the manifest appears but waits for the outer worker exit fence', async () => {

@@ -9,6 +9,7 @@ import {
   isBotmuxInjectedPrompt,
 } from '../src/services/resumable-session-discovery.js';
 import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
+import { GOAL_COMMAND, GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
 
 /** What the TraeX adapter passes: verified user inputs decide origin, raw model
  *  items are weak, filename ids group resume segments. */
@@ -1031,6 +1032,60 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     });
   });
 
+  describe('TraeX botmux v3 goal workers', () => {
+    it('rejects a goal worker whose native first input is the botmux objective (0.210 preview)', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-v3-goal-index.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-v3-goal-index', cwd: '/root/v3' } },
+        { type: 'history_mutation', payload: { operation: 'append', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: `<codex_internal_context source="user_goal">\nUser set the goal: "${GOAL_COMMAND_OBJECTIVE}"\n</codex_internal_context>` }] },
+        ] } },
+      ]);
+      const metadataById = new Map([['traex-v3-goal-index', {
+        title: 'Read $BOTMUX_GOAL_PATH. Write files',
+        firstUserMessage: GOAL_COMMAND_OBJECTIVE,
+      }]]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { ...TRAEX, metadataById })).toEqual([]);
+    });
+
+    it('rejects a goal worker from the rollout alone (thread_goal_updated), without native metadata', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-v3-goal-rollout.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-v3-goal-rollout', cwd: '/root/v3' } },
+        { type: 'event_msg', payload: { type: 'thread_goal_updated', threadId: 'traex-v3-goal-rollout', goal: {
+          threadId: 'traex-v3-goal-rollout', objective: GOAL_COMMAND_OBJECTIVE,
+        } } },
+        { type: 'history_mutation', payload: { operation: 'append', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: `<codex_internal_context source="user_goal">\nUser set the goal: "${GOAL_COMMAND_OBJECTIVE}"\n</codex_internal_context>` }] },
+        ] } },
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('rejects a goal worker whose verified first input is the /goal line', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-v3-goal-dc.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-v3-goal-dc', cwd: '/root/v3' } },
+        traexUserTurn('traex-v3-goal-dc', `${GOAL_COMMAND} ${GOAL_COMMAND_OBJECTIVE}`),
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('keeps a user-run goal-mode session and an ordinary session', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-user-goal.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-user-goal', cwd: '/root/app' } },
+        { type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective: 'ship the release notes' } } },
+      ]);
+      writeRollout('2026/10/19', 'rollout-traex-ordinary.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-ordinary', cwd: '/root/app' } },
+        traexUserTurn('traex-ordinary', 'fix the login redirect'),
+      ]);
+      const metadataById = new Map([['traex-user-goal', { title: 'Ship release notes', firstUserMessage: 'ship the release notes' }]]);
+      const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, { ...TRAEX, metadataById });
+      expect(out.map(s => [s.cliSessionId, s.title]).sort()).toEqual([
+        ['traex-ordinary', 'fix the login redirect'],
+        ['traex-user-goal', 'Ship release notes'],
+      ]);
+    });
+  });
+
   describe('TraeX internal helper sessions (review P2-2)', () => {
     for (const [label, meta] of [
       ['thread_source=subagent', { thread_source: 'subagent' }],
@@ -1087,6 +1142,28 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       write(`rollout-2026-10-18T10-00-00-${SID_A}.jsonl`, SID_A, 'looks external', 1_792_300_000);
       write(`rollout-2026-10-18T11-00-00-${SID_A}_${TURN}.jsonl`, SID_A,
         '<session_id>botmux-id</session_id>\n<user_message>hi</user_message>', 1_792_300_300);
+
+      expect(await discoverRolloutSessions(sessionsRoot, 5, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('rejects a thread whose newer segment opens with a weak envelope, despite a clean older sibling', async () => {
+      // No native metadata, no canonical record: the weak botmux verdict must
+      // reject the thread, not just leave it untitled for a sibling to claim.
+      writeRollout('2026/10/18', `rollout-2026-10-18T10-00-00-${SID_A}.jsonl`, [
+        { type: 'session_meta', payload: { id: SID_A, cwd: '/root/traex' } },
+        { type: 'history_mutation', payload: { operation: 'replace', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'compacted, clean-looking prompt' }] },
+        ] } },
+      ]);
+      utimesSync(join(sessionsRoot, '2026/10/18', `rollout-2026-10-18T10-00-00-${SID_A}.jsonl`), 1_792_300_000, 1_792_300_000);
+      writeRollout('2026/10/18', `rollout-2026-10-18T11-00-00-${SID_A}_${TURN}.jsonl`, [
+        { type: 'session_meta', payload: { id: SID_A, cwd: '/root/traex' } },
+        { type: 'history_mutation', payload: { operation: 'append', items: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<session_id>botmux-id</session_id>\n<user_message>hi</user_message>' }] },
+        ] } },
+        { type: 'event_msg', payload: { type: 'task_complete' } },
+      ]);
+      utimesSync(join(sessionsRoot, '2026/10/18', `rollout-2026-10-18T11-00-00-${SID_A}_${TURN}.jsonl`), 1_792_300_300, 1_792_300_300);
 
       expect(await discoverRolloutSessions(sessionsRoot, 5, undefined, TRAEX)).toEqual([]);
     });
