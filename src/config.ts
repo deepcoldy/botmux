@@ -1,5 +1,6 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType, HerdrBackendConfig } from './adapters/backend/types.js';
+import { normalizeHerdrChatTypes } from './adapters/backend/types.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
@@ -305,6 +306,7 @@ export const config = {
           workspace: process.env.BOTMUX_HERDR_WORKSPACE?.trim() || undefined,
           tab: process.env.BOTMUX_HERDR_TAB?.trim() || undefined,
           splitDirection: process.env.BOTMUX_HERDR_SPLIT_DIRECTION === 'down' ? 'down' : (process.env.BOTMUX_HERDR_SPLIT_DIRECTION === 'right' ? 'right' : undefined),
+          chatTypes: normalizeHerdrChatTypes(process.env.BOTMUX_HERDR_CHAT_TYPES),
         }
       : undefined) as HerdrBackendConfig | undefined,
   },

@@ -51,6 +51,7 @@ import {
   selectSessionBackend,
   retireSupersededRecordedHerdrTarget,
 } from '../src/adapters/backend/session-backend-selector.js';
+import { herdrConfigForChatType, normalizeHerdrChatTypes } from '../src/adapters/backend/types.js';
 
 describe('selectSessionBackend with Herdr placement config', () => {
   beforeEach(() => {
@@ -160,5 +161,30 @@ describe('selectSessionBackend with Herdr placement config', () => {
       },
     });
     expect(mockHerdrState.killedAgents).toHaveLength(0);
+  });
+});
+
+describe('Herdr placement chatTypes', () => {
+  it('normalizes bots.json arrays and comma-separated env values', () => {
+    expect(normalizeHerdrChatTypes(['group'])).toEqual(['group']);
+    expect(normalizeHerdrChatTypes(' group, p2p ,group')).toEqual(['group', 'p2p']);
+    // Nothing valid left means unset, i.e. the placement applies to every chat.
+    expect(normalizeHerdrChatTypes(['dm', 7])).toBeUndefined();
+    expect(normalizeHerdrChatTypes([])).toBeUndefined();
+    expect(normalizeHerdrChatTypes(undefined)).toBeUndefined();
+  });
+
+  it('applies the placement to every session when chatTypes is unset', () => {
+    const config = { sessionName: 'default', placement: 'split' as const };
+    expect(herdrConfigForChatType(config, 'p2p')).toBe(config);
+    expect(herdrConfigForChatType(config, undefined)).toBe(config);
+  });
+
+  it('keeps excluded chat types on the default host', () => {
+    const config = { sessionName: 'default', placement: 'split' as const, chatTypes: ['group' as const] };
+    expect(herdrConfigForChatType(config, 'group')).toBe(config);
+    expect(herdrConfigForChatType(config, 'p2p')).toBeUndefined();
+    expect(herdrConfigForChatType(config, undefined)).toBeUndefined();
+    expect(herdrConfigForChatType(undefined, 'group')).toBeUndefined();
   });
 });

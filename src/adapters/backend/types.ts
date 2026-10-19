@@ -46,6 +46,33 @@ export interface HerdrBackendConfig {
    * Split direction when placement is 'split'. Default 'right'.
    */
   splitDirection?: 'right' | 'down';
+
+  /**
+   * Chat types this placement applies to (e.g. ['group'] keeps DM sessions out
+   * of the user's session). Unset = every session. Sessions of other types use
+   * the default machine-wide 'botmux' host with workspace placement.
+   */
+  chatTypes?: Array<'group' | 'p2p'>;
+}
+
+/** `chatTypes` from bots.json or a comma-separated env value. Unknown entries
+ *  are dropped; nothing valid left means "unset" (applies to every session). */
+export function normalizeHerdrChatTypes(raw: unknown): Array<'group' | 'p2p'> | undefined {
+  const items = typeof raw === 'string' ? raw.split(',') : Array.isArray(raw) ? raw : [];
+  const types = [...new Set(items
+    .map(item => (typeof item === 'string' ? item.trim() : ''))
+    .filter((item): item is 'group' | 'p2p' => item === 'group' || item === 'p2p'))];
+  return types.length > 0 ? types : undefined;
+}
+
+/** The Herdr placement for one session, or undefined when `chatTypes` excludes
+ *  its chat type (the session then uses the default host). */
+export function herdrConfigForChatType(
+  config: HerdrBackendConfig | undefined,
+  chatType: 'group' | 'p2p' | undefined,
+): HerdrBackendConfig | undefined {
+  if (!config?.chatTypes) return config;
+  return chatType && config.chatTypes.includes(chatType) ? config : undefined;
 }
 
 export interface BackendTurnInput {
