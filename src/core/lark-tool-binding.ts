@@ -4,11 +4,12 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { larkTransportEnabled } from './types.js';
+import { isHeadlessSessionChatId, larkTransportEnabled } from './types.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
 import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { headlessChatId, isHeadlessId } from '../services/headless-session-store.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 
 export const LARK_TOOL_BINDING_FILE = 'lark-tool-binding.json';
@@ -53,17 +54,27 @@ export function readLarkToolBinding(path: string): LarkToolBinding {
   return value;
 }
 
-/** Sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
+/** Tool identity is independent of chat delivery. A local headless runner on
+ * a Lark bot can use that bot's tools without acquiring a chat transport. */
+export function larkToolIdentityEnabled(config: { chatId: string; apiOnly?: boolean; headless?: { id: string; source: string } }): boolean {
+  return config.apiOnly !== true
+    && (larkTransportEnabled(config) || !!config.headless
+      && config.headless.source === 'cli' && isHeadlessId(config.headless.id)
+      && headlessChatId(config.headless.id) === config.chatId);
+}
+
+/** Ordinary local and headless sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
  * Old/adopt/remote/workflow sessions do not use it.
  * Note: _dataDir, resume, forkSession are preserved for caller signature compatibility. */
 export function usesLarkToolBinding(config: {
   sessionId: string; larkAppId: string; chatId: string; apiOnly?: boolean;
+  headless?: { id: string; source: string };
   resume?: boolean; forkSession?: boolean; adoptMode?: boolean; existingAppServerEndpoint?: string;
   backendType: import('../adapters/backend/types.js').BackendType;
   larkToolBinding?: boolean;
 }, _dataDir?: string, workflow = false): boolean {
   if (workflow || config.adoptMode || config.existingAppServerEndpoint
-    || isRemoteBackendId(config.backendType) || !larkTransportEnabled(config)) return false;
+    || isRemoteBackendId(config.backendType) || !larkToolIdentityEnabled(config)) return false;
   return config.larkToolBinding !== false;
 }
 
@@ -165,7 +176,10 @@ export function hasLarkToolBinding(dataDir: string, sessionId: string): boolean 
   catch { return false; }
 }
 
-export function larkToolPrompt(appId: string, locale?: string): string {
+export function larkToolPrompt(appId: string, locale?: string, noTransport = false): string {
+  if (noTransport) return locale === 'en'
+    ? `lark-cli uses application ${appId}. Calls default to this bot. This headless session has no human authorization channel; --as user is unavailable. If the bot lacks access, report the blocked resource through the session result channel so the caller can resolve it. Do not change profiles or repeat writes whose result is uncertain.`
+    : `lark-cli 固定使用当前机器人的应用 ${appId}，默认以 bot 身份调用。本后台会话没有真人授权通道，--as user 不可用。bot 无权时，通过会话结果通道报告受阻资源，由调用方处理权限。不要切换 profile，也不要重复执行结果尚不确定的写操作。`;
   return locale === 'en'
     ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user with the current user's authorization to this same application. To use a different application or profile, specify --profile <profile>. If needed, run botmux auth request --scope "<required scopes>" --json. Do not repeat writes whose result is uncertain.`
     : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 使用当前用户对同一应用的授权；若需使用其他应用或 profile，可显式指定 --profile <profile>。缺授权时运行 botmux auth request --scope "<所需权限>" --json。不要重复执行结果尚不确定的写操作。`;
@@ -177,7 +191,7 @@ export function larkToolPromptFromEnv(
 ): string {
   const path = env.BOTMUX_LARK_TOOL_BINDING;
   if (!path) return '';
-  try { return larkToolPrompt(readLarkToolBinding(path).appId, locale); }
+  try { return larkToolPrompt(readLarkToolBinding(path).appId, locale, isHeadlessSessionChatId(env.BOTMUX_CHAT_ID ?? '')); }
   catch { return ''; }
 }
 

@@ -7,6 +7,7 @@ import { larkToolBindingPath } from '../src/core/lark-tool-binding.js';
 import { describe, expect, it } from 'vitest';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
 import {
   GIT_ASKPASS_BASENAME,
   IDENTITY_DENIED_EXIT_CODE,
@@ -26,13 +27,14 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
+  'perBotInjectEnv', 'sandboxRequested',
   'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir', `${assembly}\nreturn identityShellEnv;`);
 
-function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false): Record<string, string> {
+function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false, path?: string, sandboxRequested = false, launch: { cliId?: string; wrapperCli?: string; path?: string } = {}): Record<string, string> {
   return assemble(
-    { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', triggerUserAuth: { enabled, tools } },
-    { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' } },
-    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
+    { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', cliId: launch.cliId ?? 'traex', wrapperCli: launch.wrapperCli, triggerUserAuth: { enabled, tools } },
+    { env: { PATH: path, ...(sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' }) } },
+    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, { PATH: launch.path }, sandboxRequested, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
   );
 }
 
@@ -49,6 +51,46 @@ function shellOverrides(args: string[]): Record<string, string> {
 const routingEnv = { BOTMUX_SESSION_ID: 'botmux-session', BOTMUX_CHAT_ID: 'oc_chat', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_SESSION_SCOPE: 'chat' };
 
 describe('worker trigger-user shell contract', () => {
+  it('uses the configured per-bot PATH ahead of the daemon PATH', () => {
+    const env = workerShellEnv('/tmp/data', false, [], true, '/daemon/bin', false, { path: '/bot/bin:/usr/bin' });
+    expect(env.PATH).toBe(env.BOTMUX_IDENTITY_BIN + ':/bot/bin:/usr/bin');
+  });
+  it.each(['aiden x codex', 'cjadk codex'])('leaves final %s gateway composition unchanged', wrapperCli => {
+    const createAdapter = createCodexAdapter;
+    const current = workerShellEnv('/tmp/data', false, [], true, '/daemon/bin', false, { cliId: 'codex', wrapperCli });
+    const prior = { ...current }; delete prior.PATH;
+    const compose = (shellSubprocessEnv: Record<string, string>) => buildWrappedLaunch(wrapperCli,
+      createAdapter('/bin/cli').buildArgs({ sessionId: 'native-session', shellSubprocessEnv }), bin => '/bin/' + bin);
+    expect(compose(current)).toEqual(compose(prior));
+    expect(current).not.toHaveProperty('PATH');
+  });
+  it('does not change other CLI tool PATH policies', () => {
+    expect(workerShellEnv('/tmp/data', false, [], true, '/daemon/bin', false, { cliId: 'codex' })).not.toHaveProperty('PATH');
+  });
+  it('preserves the sandbox-owned command PATH instead of overriding it with host paths', () => {
+    expect(workerShellEnv('/tmp/data', false, [], true, '/usr/bin:/bin', true)).not.toHaveProperty('PATH');
+  });
+  it('pins the managed wrapper PATH in explicit tool policy after a CLI launcher resets its inherited PATH', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'managed-tool-path-'));
+    try {
+      const inheritedPath = '/usr/bin:/bin';
+      const shellEnv = workerShellEnv(dataDir, false, [], true, inheritedPath);
+      const bin = shellEnv.BOTMUX_IDENTITY_BIN;
+      // Install a harmless wrapper fixture through the same generated layout.
+      const wrapper = installIdentityWrapper(bin, 'bytedcli', '/bin/true')!;
+      for (const createAdapter of [createTraexAdapter]) {
+        const args = createAdapter('/bin/cli').buildArgs({ sessionId: 'native-session', shellSubprocessEnv: shellEnv });
+        const overrides = shellOverrides(args);
+        // CLI tool processes may reset PATH and use sh without reading BASH_ENV.
+        // Only explicit .set entries cross that boundary reliably.
+        const result = spawnSync('/bin/sh', ['-c', 'command -v bytedcli'], {
+          env: { PATH: inheritedPath, ...overrides }, encoding: 'utf8', timeout: 5000,
+        });
+        expect(result.stdout.trim()).toBe(wrapper);
+        expect(overrides.PATH.split(':')[0]).toBe(bin);
+      }
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
   it('uses the credential file identity, not the native CLI resume identity', () => {
     const dataDir = '/tmp/data "quoted"';
     expect(workerShellEnv(dataDir)).toEqual({

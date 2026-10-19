@@ -13729,6 +13729,7 @@ export function forkWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    headless: ds.session.headless ? { id: ds.session.headless.id, source: ds.session.headless.source } : undefined,
     // replyDelivery=transcript 的冻结值（core/reply-delivery.ts）：worker 只用它给
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
@@ -19998,6 +19999,7 @@ export function forkAdoptWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    headless: ds.session.headless ? { id: ds.session.headless.id, source: ds.session.headless.source } : undefined,
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,

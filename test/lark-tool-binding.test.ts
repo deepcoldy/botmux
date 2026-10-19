@@ -87,6 +87,25 @@ describe('managed lark-cli binding', () => {
     });
     expect(parseLarkToolInvocation(['docs', '+fetch'], { ...defaults, defaultAs: 'user' }).mode).toBe('user');
   });
+  it('binds new local headless runners without enabling other API-only sessions', () => {
+    const config = { sessionId: 'headless-session', larkAppId: 'cli_current',
+      chatId: 'headless_hl_11111111-1111-4111-8111-111111111111', backendType: 'pty' as const,
+      headless: { id: 'hl_11111111-1111-4111-8111-111111111111', source: 'cli' } };
+    expect(usesLarkToolBinding(config, dir)).toBe(true);
+    // Same lifecycle as ordinary sessions: resume re-evaluates the bot switch.
+    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: false }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, apiOnly: true }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, chatId: 'http_async_runner' }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, chatId: 'http_wait_runner' }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, headless: undefined }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, chatId: 'headless_forged-http-chat' }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, headless: { id: 'hl_invalid', source: 'cli' } }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, headless: { ...config.headless, source: 'webhook' } }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, adoptMode: true }, dir)).toBe(false);
+    expect(usesLarkToolBinding({ ...config, backendType: 'riff' }, dir)).toBe(false);
+    expect(usesLarkToolBinding(config, dir, true)).toBe(false);
+  });
   it.each([
     ['--profile='], ['--as='], ['--as', 'owner'],
     ['--as', 'bot', '--as=user'], ['--profile=cli_current', '--profile=cli_current'],
@@ -133,6 +152,10 @@ describe('managed lark-cli binding', () => {
     expect(userEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBe('own-user');
     expect(larkToolPromptFromEnv('en', env)).toContain('lark-cli uses application cli_current');
     expect(larkToolPromptFromEnv('zh', env)).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
+    const headlessEnv = { ...env, BOTMUX_CHAT_ID: 'headless_hl_runner' };
+    expect(larkToolPromptFromEnv('en', headlessEnv)).toContain('no human authorization channel');
+    expect(larkToolPromptFromEnv('zh', headlessEnv)).toContain('没有真人授权通道');
+    expect(larkToolPromptFromEnv('en', headlessEnv)).not.toContain('botmux auth request');
     expect(larkToolPromptFromEnv('en', {})).toBe('');
   });
   it('keeps the configured PATH when viewer setup repeats an RPC binding', () => {

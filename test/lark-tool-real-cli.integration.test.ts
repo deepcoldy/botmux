@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -50,17 +50,40 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
   it.skipIf(!canIsolateNetwork)('resolves the injected bot token for a real API command before the isolated network rejects it', () => {
     const env = larkToolChildEnv({ ...process.env, HOME: join(root, 'home') }, binding,
       { mode: 'bot', credential: 'fake-not-a-live-token' });
-    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/', '--',
+    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/',
+      // The verified headless sandbox exposes this isolated config read-only.
+      // Injected bot credentials must work without writing a global keystore.
+      '--ro-bind', binding.configDir, binding.configDir, '--',
       binding.realBinary, 'api', 'GET', '/open-apis/im/v1/messages/fake-message', '--as', 'bot'], {
       env, encoding: 'utf8', timeout: 10_000,
     });
     expect(result.error).toBeUndefined();
-    // lark-cli 1.0.96 classifies an unreachable API caused by --unshare-net as
+    // lark-cli 1.0.73 classifies an unreachable API caused by --unshare-net as
     // a network error and exits 4. Keep both assertions so a CLI upgrade that
     // changes this contract is diagnosed here instead of being mistaken for an
     // identity-binding regression.
     expect(result.status, result.stderr).toBe(4);
     expect(JSON.parse(result.stderr)).toMatchObject({ identity: 'bot', error: { type: 'network' } });
+  });
+  it.skipIf(!canIsolateNetwork)('preserves the existing immutable managed configuration boundary for persistent event daemons', () => {
+    const configPath = join(binding.configDir, 'config.json');
+    const before = readFileSync(configPath, 'utf8');
+    const env = larkToolChildEnv({ ...process.env, HOME: join(root, 'home') }, binding,
+      { mode: 'bot', credential: 'fake-not-a-live-token' });
+    // Normal chat sessions already mount the whole identity subtree read-only.
+    // Headless adds the same immutable tool/config boundary, not a daemon
+    // lifecycle capability or writable credential/cache tree.
+    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/',
+      '--ro-bind', binding.configDir, binding.configDir, '--',
+      binding.realBinary, 'event', 'consume', 'im.message.receive_v1', '--as', 'bot', '--timeout', '1s'], {
+      env, encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(5);
+    expect(result.stderr).toContain('read-only file system');
+    expect(result.stderr).toContain('lark-config/events');
+    expect(existsSync(join(binding.configDir, 'events'))).toBe(false);
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
   });
   it('keeps keyword --as=user and dry-run intact through the real binary', async () => {
     const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--scope', 'keyword', '--keyword', '--as=user', '--dry-run']);
