@@ -18969,7 +18969,12 @@ function scheduleQueuedActivationTailReleaseRetry(
 async function admitFollowerBehindOpening(
   ds: DaemonSession,
   reservation: QueuedActivationTailReservation,
-  follower: { userPrompt: string; turnId: string; build: () => Promise<CliTurnPayload> },
+  follower: {
+    userPrompt: string;
+    turnId: string;
+    dispatchAttempt?: number;
+    build: () => Promise<CliTurnPayload>;
+  },
 ): Promise<void> {
   await runSessionTurn(ds.session.sessionId, async () => {
     const cliInput = await follower.build();
@@ -18977,6 +18982,9 @@ async function admitFollowerBehindOpening(
       userPrompt: follower.userPrompt,
       cliInput,
       turnId: follower.turnId,
+      ...(follower.dispatchAttempt !== undefined
+        ? { dispatchAttempt: follower.dispatchAttempt }
+        : {}),
     }, reservation);
     if (!ds.initialStartPending && !releaseQueuedActivationReservationNow(ds)) {
       scheduleQueuedActivationTailReleaseRetry(ds);
@@ -25783,9 +25791,15 @@ async function handleThreadReplyAdmitted(
       worker: ds.worker,
       cliReady: ds.cliReady,
       activeInteractiveTurn: ds.activeInteractiveTurn,
-      workerStartPending: ds.pendingRepo === true
-        || ds.initialStartPending === true
-        || hasQueuedActivationAdmissionGate(ds),
+      // Durable queued-activation state is recovery INPUT, not proof that a
+      // live handler already owns this dead worker's generation. Let the cold
+      // path below replay that exact journal. Only a pending repository choice
+      // or another handler's live claim token blocks this refork boundary.
+      workerStartBlocker: ds.pendingRepo === true
+        ? 'pending-repo'
+        : ds.initialStartPending === true && ds.initialStartClaimToken !== undefined
+          ? 'in-flight-claim'
+          : undefined,
     }, parsed.messageId);
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
@@ -26910,6 +26924,9 @@ async function handleThreadReplyAdmitted(
       await admitFollowerBehindOpening(ds, tailReservation, {
         userPrompt: promptContent,
         turnId: parsed.messageId,
+        ...(ctx.durablePrimaryDispatch
+          ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt }
+          : {}),
         build: async () => {
           const stagedSender = await getThreadSender();
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);

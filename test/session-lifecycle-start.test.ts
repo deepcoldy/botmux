@@ -831,6 +831,30 @@ describe('host memory pressure worker admission', () => {
 });
 
 describe('ordinary IM worker receipt acknowledgement', () => {
+  it('propagates durable-primary attribution through the actual fork init message', () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'durable opening', {
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    })).toBe(true);
+
+    expect(ds.initConfig).toMatchObject({
+      type: 'init',
+      prompt: 'durable opening',
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    });
+  });
+
   it('starts standalone init delivery only after the Worker IPC bootstrap is ready', async () => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);

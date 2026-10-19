@@ -2,14 +2,15 @@ import type { Session } from '../types.js';
 
 export type DurablePrimaryExistingTurnDisposition = 'committed' | 'retry' | 'ready';
 export type DurablePrimaryInputCommit = NonNullable<Session['durablePrimaryInputCommits']>[number];
+export type DurablePrimaryWorkerStartBlocker = 'pending-repo' | 'in-flight-claim';
 
 export interface DurablePrimaryTurnRuntimeState {
   session: Pick<Session, 'durablePrimaryInputCommits'>;
   worker?: { killed?: boolean } | null;
   cliReady?: boolean;
   activeInteractiveTurn?: unknown;
-  /** Another handler already owns the worker-null start/refork boundary. */
-  workerStartPending?: boolean;
+  /** A real worker-null start conflict, never a durable recovery journal. */
+  workerStartBlocker?: DurablePrimaryWorkerStartBlocker;
 }
 
 /** Pure admission decision used before any daemon-side business-turn effect. */
@@ -25,7 +26,7 @@ export function durablePrimaryExistingTurnDisposition(
     // path. Treating it as merely busy would leave the durable Inbox row in an
     // unbounded retry loop while this replica keeps renewing the Session lease.
     // Only an already-owned start boundary must remain retry-only.
-    return state.workerStartPending ? 'retry' : 'ready';
+    return state.workerStartBlocker ? 'retry' : 'ready';
   }
   if (!state.cliReady || state.activeInteractiveTurn) {
     return 'retry';
