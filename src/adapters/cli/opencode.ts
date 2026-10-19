@@ -283,25 +283,66 @@ export function isOpenCodeSessionBusy(
 
   if (kind === 'v2') {
     return withDb((db) => {
-      // 1. 检查是否存在时效内处于 running 状态的 tool part
-      const runningTool = db.prepare(
+      // V2 的权威「整轮结束」标记：OpenCode 2 在每个执行回合（成功 / 失败 /
+      // interrupted）彻底 drain 后，都会写入一条 type='idle' 的 session_message
+      // （实测 2.0.x：`{ time: { created }, outcome: 'succeeded' | 'failed' | … }`，
+      // 落在最后一条 assistant completed 之后数毫秒）。该标记不参与插件事件流
+      // （`session.idle` 只在 TUI 本地 bus 上），但在 TUI / serve / run 三种模式下
+      // 都会持久化，因此是区分「整轮结束」与「步骤间等待」的唯一权威存储依据。
+      const lastIdle = db.prepare(
+        "SELECT COALESCE(MAX(time_created), 0) AS t FROM session_message " +
+        "WHERE session_id = ? AND type = 'idle'"
+      ).get(cliSessionId) as { t?: number } | undefined;
+
+      // 只把 cutoff 之后的活动算作「当前回合」：cutoff 取时效窗口与最近 idle
+      // 标记的较大值——idle 之前的 running part / 未完成 assistant 都是已结束
+      // 回合的历史，不能再把会话判忙；cutoff 同时保留孤儿记录 fail-open 语义。
+      const cutoff = Math.max(freshBaseline, lastIdle?.t ?? 0);
+
+      // 1. 工具仍在运行。V2 把 part 嵌在 assistant message 的 `content[]` 里
+      //    （`content[*].state.status='running'`，实测 2.0.x 行形状），旧查询只
+      //    查消息顶层 `$.state.status`，而顶层恒为 NULL —— 该判据在 2.0.32 实测
+      //    100% 漏检。顶层查询保留作旧/未来行形状的防御性兜底。
+      const nestedRunningTool = db.prepare(
+        "SELECT 1 AS busy FROM session_message AS m, " +
+        "json_each(json_extract(m.data, '$.content')) AS p " +
+        "WHERE m.session_id = ? AND m.time_created > ? " +
+        "  AND json_extract(p.value, '$.state.status') = 'running' " +
+        "LIMIT 1"
+      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      if (nestedRunningTool?.busy) return true;
+
+      const topLevelRunning = db.prepare(
         "SELECT 1 AS busy FROM session_message " +
         "WHERE session_id = ? AND time_created > ? " +
         "  AND json_extract(data, '$.state.status') = 'running' " +
         "LIMIT 1"
-      ).get(cliSessionId, freshBaseline) as { busy?: number } | undefined;
-      if (runningTool?.busy) return true;
+      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      if (topLevelRunning?.busy) return true;
 
-      // 2. 检查最新 assistant message 是否处于时效内的未完成态（无 completed 时间戳）
-      const lastMsg = db.prepare(
-        "SELECT json_extract(data, '$.time.completed') AS completed " +
-        "FROM session_message " +
-        "WHERE session_id = ? AND type = 'assistant' AND time_created > ? " +
-        "ORDER BY time_created DESC LIMIT 1"
-      ).get(cliSessionId, freshBaseline) as { completed?: number } | undefined;
+      // 2. cutoff 之后已有 assistant message 但尚未 completed（模型生成中）。
+      const incompleteAssistant = db.prepare(
+        "SELECT 1 AS busy FROM session_message " +
+        "WHERE session_id = ? AND time_created > ? AND type = 'assistant' " +
+        "  AND json_extract(data, '$.time.completed') IS NULL " +
+        "LIMIT 1"
+      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      if (incompleteAssistant?.busy) return true;
 
-      if (!lastMsg) return false;
-      if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
+      // 3. cutoff 之后存在 user message：回合已提交但 idle 标记尚未写入。
+      //    覆盖两类屏幕启发式必误判的空档（旧逻辑在这两处都返回 false）：
+      //    a) 提交后、首条 assistant 落库前（relay 首 token 延迟）；
+      //    b) 上一条 assistant 已 completed、下一步 assistant 尚未创建
+      //       （步骤间等待；实测 relay 下 2–8s，超过 IdleDetector 的 2s 静默
+      //       窗口 + 3.5s db-busy 探测周期，卡片会翻成「等待输入」并提前放行
+      //       回合权威 / 推进排队输入）。
+      const openTurnUserMessage = db.prepare(
+        "SELECT 1 AS busy FROM session_message " +
+        "WHERE session_id = ? AND time_created > ? AND type = 'user' " +
+        "LIMIT 1"
+      ).get(cliSessionId, cutoff) as { busy?: number } | undefined;
+      if (openTurnUserMessage?.busy) return true;
+
       return false;
     }, dbPath) ?? false;
   }
