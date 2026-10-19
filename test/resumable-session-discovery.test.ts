@@ -1061,6 +1061,39 @@ describe('discoverRolloutSessions (codex / traex)', () => {
       ]);
     });
 
+    it('accepts a turn-less legacy user_message inside the first turn (mixed dialect): title', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-mixed-title.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-mixed-title', cwd: '/root/traex' } },
+        rawTurnItem('Warning: the workspace is read-only for this turn.', 'turn-1'),
+        { type: 'event_msg', payload: { type: 'user_message', message: 'the real external prompt' } },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-mixed-title', title: 'the real external prompt' }),
+      ]);
+    });
+
+    it('accepts a turn-less legacy user_message inside the first turn (mixed dialect): botmux rejected', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-mixed-botmux.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-mixed-botmux', cwd: '/root/traex' } },
+        rawTurnItem('Warning: the workspace is read-only for this turn.', 'turn-1'),
+        { type: 'event_msg', payload: { type: 'user_message', message: ENVELOPE } },
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([]);
+    });
+
+    it('ignores a turn-less legacy user_message after the first turn ended', async () => {
+      writeRollout('2026/10/19', 'rollout-traex-mixed-after.jsonl', [
+        { type: 'session_meta', payload: { id: 'traex-mixed-after', cwd: '/root/traex' } },
+        rawTurnItem('external first prompt', 'turn-1'),
+        { type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-1', reason: 'interrupted' } },
+        { type: 'event_msg', payload: { type: 'user_message', message: ENVELOPE } },
+      ]);
+      expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX)).toEqual([
+        expect.objectContaining({ cliSessionId: 'traex-mixed-after', title: 'external first prompt' }),
+      ]);
+    });
+
     it('still lets a canonical record of the same turn override the weak verdict', async () => {
       writeRollout('2026/10/19', 'rollout-traex-same-turn.jsonl', [
         { type: 'session_meta', payload: { id: 'traex-same-turn', cwd: '/root/traex' } },

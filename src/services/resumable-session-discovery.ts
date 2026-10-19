@@ -650,9 +650,13 @@ async function parseRolloutTranscript(
     const payload = asRecord(rec.payload);
     const turnId = typeof payload?.turn_id === 'string' && payload.turn_id ? payload.turn_id : undefined;
     // TraeX: may this record's canonical user input still decide origin? Yes
-    // until a weak verdict exists; after that only within the same native turn
-    // (unknown turn on the weak item → no identity to compare, allow).
-    const canDecide = !traex || !acc.weakDecided || acc.weakTurnId === undefined || turnId === acc.weakTurnId;
+    // until a weak verdict exists; after that only within the same native turn.
+    // A side without a turn id (legacy user_message, weak item without one) has
+    // no identity to compare: it is accepted, because scanning already stops at
+    // the first turn's terminal record once a weak verdict exists, so anything
+    // read here is still inside the first turn.
+    const canDecide = !traex || !acc.weakDecided || acc.weakTurnId === undefined
+      || turnId === undefined || turnId === acc.weakTurnId;
     if (rec.type === 'session_meta' && payload) {
       if (typeof payload.id === 'string') {
         acc.id = payload.id;
