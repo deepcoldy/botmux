@@ -566,6 +566,16 @@ export function classifyClaudeTerminalEvent(
     }
     if (code.includes('invalid') || code.includes('terms')
       || (typeof status === 'number' && status >= 400 && status <= 499)) {
+      // A 400 caused by an under-sized image is not an ordinary bad request:
+      // Claude Code's Read tool returned the image bytes into the turn, and
+      // the image block now lives in the session transcript. EVERY later
+      // request replays it, so the session stays 400 until the history is
+      // cleared (/clear) — re-sending the prompt or continuing cannot work.
+      // Give it its own code so the failure card can say that instead of the
+      // generic "invalid request, don't retry" line.
+      if (hasApiErrorSignature(ev, /image data \d+ failed: Image dimensions are too small/i)) {
+        return { status: 'failed', errorCode: 'provider_image_too_small', retryable: false };
+      }
       return { status: 'failed', errorCode: 'provider_invalid_request', retryable: false };
     }
     if (code.includes('cancel')) {

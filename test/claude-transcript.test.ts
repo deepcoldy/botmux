@@ -294,6 +294,30 @@ describe('classifyClaudeTerminalEvent', () => {
     });
   });
 
+  it('classifies the under-sized image 400 as a poisoned-session failure, not generic invalid request', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'image-too-small',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      apiErrorStatus: 400,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{
+          type: 'text',
+          text: 'API Error: 400 image data 0 failed: Image dimensions are too small. Minimum allowed dimension: 14 pixels. Current dimensions: width = 1, height = 1.',
+        }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_image_too_small',
+      retryable: false,
+    });
+  });
+
   it('does not promote an unrecognized unknown API error into an automatic retry', () => {
     const ev: TranscriptEvent = {
       type: 'assistant',

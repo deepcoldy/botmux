@@ -180,7 +180,7 @@ describe('turnRetryOffer', () => {
   it('refuses retry when the CLI explicitly said it cannot help', () => {
     // Auth/permission/invalid-request: re-sending the same bytes cannot succeed.
     for (const errorCode of ['provider_authentication_failed', 'provider_permission_denied',
-      'provider_invalid_request', 'provider_cancelled']) {
+      'provider_invalid_request', 'provider_cancelled', 'provider_image_too_small']) {
       expect(turnRetryOffer({ status: 'failed', errorCode, retryable: false })).toBe('none');
     }
   });
@@ -506,5 +506,52 @@ describe('buildTurnFailedCard', () => {
     expect(body).toMatch(/may have partially executed/i);
     expect(card.header.title.content).toMatch(/[A-Za-z]/);
     expect(card.header.title.content).not.toMatch(/[一-龥]/);
+  });
+
+  it('gives the /clear recovery guide for a poisoned-history image 400', () => {
+    // A 1×1 image read by the CLI stays in session history and is replayed on
+    // every later request, so generic "resend a new message" advice is wrong:
+    // the session must be cleared first. The special advice must win even
+    // though retryOffer is 'none' (same input shape as the generic branch).
+    const card = build({ errorCode: 'provider_image_too_small', retryOffer: 'none' });
+    const body = bodyText(card);
+    expect(body).toContain('/clear');
+    expect(body).toContain('图片');
+    expect(body).not.toContain('重发同样的输入也无法成功');
+    expect(actions(card).find((a: any) => a.value?.action === 'retry_turn')).toBeUndefined();
+  });
+
+  it('renders the image recovery guide in English without zh fallback', () => {
+    const card = build({
+      locale: 'en', errorCode: 'provider_image_too_small', retryOffer: 'none',
+    });
+    const body = bodyText(card);
+    expect(body).toMatch(/\/clear/);
+    expect(body).toMatch(/too small/i);
+    expect(body).not.toMatch(/[一-龥]/);
+  });
+
+  it('offers the one-tap purge-and-continue button for the image 400', () => {
+    const card = build({ errorCode: 'provider_image_too_small', retryOffer: 'none' });
+    const btn = actions(card).find((a: any) => a.value?.action === 'purge_images_continue');
+    expect(btn).toBeTruthy();
+    expect(btn.type).toBe('primary');
+    expect(btn.value.turn_id).toBe('turn-abc123');
+    // The ordinary retry button stays hidden (it would replay the same 400).
+    expect(actions(card).find((a: any) => a.value?.action === 'retry_turn')).toBeUndefined();
+  });
+
+  it('never renders the purge button for a different error', () => {
+    const card = build({ errorCode: 'provider_invalid_request', retryOffer: 'none' });
+    expect(actions(card).find((a: any) => a.value?.action === 'purge_images_continue'))
+      .toBeUndefined();
+  });
+
+  it('omits the purge button when there is no turn credential', () => {
+    const card = build({
+      errorCode: 'provider_image_too_small', retryOffer: 'none', retryTurnId: undefined,
+    });
+    expect(actions(card).find((a: any) => a.value?.action === 'purge_images_continue'))
+      .toBeUndefined();
   });
 });

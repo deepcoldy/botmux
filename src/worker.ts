@@ -367,6 +367,7 @@ import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
+import { purgeUndersizedImages } from './services/transcript-image-purge.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
@@ -24536,6 +24537,79 @@ process.on('message', async (raw: unknown) => {
           });
         }
       } else {
+        // 小图毒化恢复：该消息（失败卡按钮发出的续跑指令）要求先把会话
+        // jsonl 里尺寸不达标的图片块替换成文本，再以 --resume 重启 CLI。
+        // restartCliProcess 的同步前缀会立即置位 cliRestartInProgress，所以
+        // 必须先启动重启、再走下面的 sendToPty —— 消息因此进入 freshness
+        // 队列，respawn 完成、首个 prompt ready 后才送达，绝不会打进内存里
+        // 仍带着毒图的旧进程。只支持本地 Claude Code（其它 CLI 的 transcript
+        // 结构与 resume 语义不同）。
+        let purgeRestartPromise: Promise<void> | undefined;
+        if (msg.purgeUndersizedImages) {
+          const purgeJsonl = backend
+            ? (backend as PtyBackend | TmuxBackend | TmuxPipeBackend | ZellijBackend | ZmxBackend)
+              .claudeJsonlPath
+            : undefined;
+          const purgeSupported = lastInitConfig?.cliId === 'claude-code'
+            && !!purgeJsonl && !cliRestartInProgress;
+          if (!purgeSupported || !purgeJsonl) {
+            send({
+              type: 'user_notify',
+              message: t('worker.purge_images_unsupported'),
+              turnId: msg.turnId,
+            });
+            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+            break;
+          }
+          let purgedFiles: { file: string; removed: number }[];
+          try {
+            purgedFiles = purgeUndersizedImages(purgeJsonl);
+          } catch (err) {
+            send({
+              type: 'user_notify',
+              message: t('worker.purge_images_failed', {
+                reason: err instanceof Error ? err.message : String(err),
+              }),
+              turnId: msg.turnId,
+            });
+            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+            break;
+          }
+          const removedTotal = purgedFiles.reduce((n, f) => n + f.removed, 0);
+          if (removedTotal === 0) {
+            send({
+              type: 'user_notify',
+              message: t('worker.purge_images_none'),
+              turnId: msg.turnId,
+            });
+            if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
+            break;
+          }
+          purgeRestartPromise = restartCliProcess(
+            'purge undersized transcript images',
+            // 用户显式发起的上下文恢复（同 cwd-move respawn）：不计入崩溃重启
+            // 预算，否则「近期手动重启过 + 本次恢复」会被 tier-2 强制 FRESH，
+            // 反而丢掉刚救回来的会话上下文。
+            { immediate: true, preservePending: true, skipRestartBudget: true },
+          );
+          send({
+            type: 'user_notify',
+            message: t('worker.purge_images_done', {
+              files: String(purgedFiles.length),
+              removed: String(removedTotal),
+            }),
+            turnId: msg.turnId,
+          });
+          purgeRestartPromise.catch(err => {
+            send({
+              type: 'user_notify',
+              message: t('worker.purge_images_restart_failed', {
+                reason: err instanceof Error ? err.message : String(err),
+              }),
+              turnId: msg.turnId,
+            });
+          });
+        }
         // Non-adopt: enqueue only. Bridge mark is deferred to flushPending
         // so markTimeMs anchors to the actual PTY-write moment, not IPC
         // arrival. Marking now would race with a still-running previous
