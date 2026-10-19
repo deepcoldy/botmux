@@ -524,6 +524,33 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     });
   });
 
+  it('retries a dead durable-primary worker while repository selection is pending', async () => {
+    const anchor = 'om_thread_primary_pending_repo';
+    const turnId = 'om_primary_during_pending_repo';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.pendingRepo = true;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 3,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'must wait for repository', anchor), ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
   it('clears the previous failed label before reforking for a document comment', async () => {
     const anchor = 'om_doc_refork_failure';
     const ds = seedThreadSession(anchor, 'seeded');
