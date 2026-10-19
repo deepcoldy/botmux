@@ -62,6 +62,35 @@ function inlinePurposeCarrier(root: any[], marker: string): boolean {
   return false;
 }
 
+/** Reuse an existing media/table text field instead of allocating a blank row. */
+function inlineMediaPurposeCarrier(value: any, marker: string): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(child => inlineMediaPurposeCarrier(child, marker));
+  if (RUNTIME_ID.test(value.element_id ?? '')) return false;
+  if (value.tag === 'img') {
+    const alt = typeof value.alt === 'string' ? value.alt : value.alt?.content;
+    value.alt = { tag: 'plain_text', content: `${stripTrailingGroupContextCardPurposeMarker(typeof alt === 'string' ? alt : '')}${marker}` };
+    return true;
+  }
+  if (value.tag === 'table' && Array.isArray(value.columns)) {
+    // The last text cell also stays at the end when a table is flattened.
+    const textColumns = value.columns.filter((column: CardNode) => column?.data_type === 'lark_md');
+    for (const row of [...(Array.isArray(value.rows) ? value.rows : [])].reverse()) {
+      for (const column of [...textColumns].reverse()) {
+        if (!row || typeof row[column.name] !== 'string') continue;
+        row[column.name] = `${stripTrailingGroupContextCardPurposeMarker(row[column.name])}${marker}`;
+        return true;
+      }
+    }
+    const column = [...value.columns].reverse().find((column: CardNode) => typeof column?.display_name === 'string');
+    if (column) {
+      column.display_name = `${stripTrailingGroupContextCardPurposeMarker(column.display_name)}${marker}`;
+      return true;
+    }
+  }
+  return ['elements', 'columns'].some(key => inlineMediaPurposeCarrier(value[key], marker));
+}
+
 /** Stamp an outgoing structured card without mutating the caller's object. */
 export function markGroupContextCardPurpose<T extends Record<string, any>>(card: T, purpose: GroupContextCardPurpose): T;
 export function markGroupContextCardPurpose(card: string, purpose: GroupContextCardPurpose): string;
@@ -77,11 +106,8 @@ export function markGroupContextCardPurpose(card: string | Record<string, any>, 
   if (footer) {
     if (footer.content.includes(REPLY_CARD_FOOTER_MARKER)) footer.content = footer.content.replace(CARRIER, marker);
     else footer.content = footer.content.replace(/(?=<\/font>\s*$)|$/, marker);
-  } else if (!inlinePurposeCarrier(root, marker)) {
-    // Image/table-only cards have no text carrier. Keep the compatibility
-    // fallback for those rare shapes; ordinary text progress cards stay on
-    // their existing Markdown element so an invisible protocol marker does
-    // not allocate a blank footer row in Lark.
+  } else if (!inlinePurposeCarrier(root, marker) && !inlineMediaPurposeCarrier(root, marker)) {
+    // Unsupported custom shapes retain the compatibility carrier.
     root.push({ tag: 'markdown', element_id: REPLY_CARD_FOOTER_ELEMENT_ID, text_size: 'notation',
       content: `<font color='grey'>${marker}</font>` });
   }
@@ -92,9 +118,18 @@ function purposeOf(card: CardNode): GroupContextCardPurpose | 'conflict' | undef
   const purposes = new Set<GroupContextCardPurpose>();
   for (const node of nodes(card, true)) {
     // Read only rendered text carriers, never a callback value or premerged text.
-    for (const field of ['content', 'text']) {
-      if (typeof node[field] !== 'string') continue;
-      for (const run of node[field].matchAll(CARRIER)) {
+    const texts = [node.content, node.text];
+    if (node.tag === 'table' && Array.isArray(node.columns)) {
+      texts.push(...node.columns.map((column: CardNode) => column?.display_name));
+      for (const row of Array.isArray(node.rows) ? node.rows : []) {
+        for (const column of node.columns) {
+          if (column?.data_type === 'lark_md') texts.push(row?.[column.name]);
+        }
+      }
+    }
+    for (const text of texts) {
+      if (typeof text !== 'string') continue;
+      for (const run of text.matchAll(CARRIER)) {
         const purpose = PURPOSE_BY_LENGTH.get(run[0].length);
         if (purpose) purposes.add(purpose);
       }
@@ -140,7 +175,9 @@ function projectNode(value: any, legacy = false, apiFormat = false): any {
   for (const [key, child] of Object.entries(value)) {
     // Never let the generic parser short-circuit on unprojected A+B text.
     if (key === '__botmux_card_text__' || key === 'behaviors' || key === 'callback') continue;
-    const projected = projectNode(child, legacy, apiFormat);
+    const mediaText = value.tag === 'img' && key === 'alt'
+      || value.tag === 'table' && (key === 'rows' || key === 'columns');
+    const projected = projectNode(mediaText ? stripMediaPurposeText(child) : child, legacy, apiFormat);
     if (projected !== undefined) result[key] = projected;
   }
   if (['markdown', 'div', 'plain_text'].includes(result.tag) && Array.isArray(result.property?.elements)
@@ -151,6 +188,15 @@ function projectNode(value: any, legacy = false, apiFormat = false): any {
     result.content = renderedText(result.property.elements);
   }
   return result;
+}
+
+function stripMediaPurposeText(value: any): any {
+  if (typeof value === 'string') return stripTrailingGroupContextCardPurposeMarker(value);
+  if (Array.isArray(value)) return value.map(stripMediaPurposeText);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, stripMediaPurposeText(child)]));
+  }
+  return value;
 }
 
 function isLegacyProcess(node: CardNode): boolean {
@@ -241,7 +287,15 @@ export function projectGroupContextCard(rawContent: string): GroupContextCardPro
     if (!status || root?.some(Array.isArray)) return { kind: 'unresolved' };
     return conversation(card, true);
   }
-  if (!status) return undefined;
+  if (!status) {
+    // Format A drops image alt text. Rehydrate the structured card before
+    // deciding whether an image-only bot message is runtime or conversation.
+    // Unmarked structured cards still follow the ordinary parsing path.
+    const imageOnlyApiCard = root?.length && root.every(paragraph => Array.isArray(paragraph)
+      && paragraph.length > 0 && paragraph.every(node => node?.tag === 'img'
+        || node?.tag === 'text' && typeof node.text === 'string' && !node.text.trim()));
+    return imageOnlyApiCard ? { kind: 'unresolved' } : undefined;
+  }
   const statusText = renderedText(status);
   // The rendered property tree can omit Markdown's bold delimiters. Rebuild
   // only that wrapper, then retain the exact icon/label/duration allowlist.

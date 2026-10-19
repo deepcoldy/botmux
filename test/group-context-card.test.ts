@@ -140,6 +140,43 @@ describe('group-context card projection', () => {
     expect(conversation(simplified(message)).text).toBe('PUBLIC_PROGRESS');
   });
 
+  it.each(['runtime', 'message', 'turn-message'] as const)('carries %s on existing image/table content without a Footer', purpose => {
+    for (const body of ['![Preview](img_v3_purpose)', '| A | B |\n| --- | --- |\n| 1 | 2 |']) {
+      const original = { schema: '2.0', body: { elements: buildImageCardElements(body, [], undefined, undefined, 'medium') } };
+      const saved = structuredClone(original);
+      const marked = markGroupContextCardPurpose(original, purpose);
+      expect(original).toEqual(saved);
+      expect(marked.body.elements).toHaveLength(saved.body.elements.length);
+      expect(JSON.stringify(marked)).not.toContain('botmux_reply_footer');
+      expect(markGroupContextCardPurpose(marked, purpose)).toEqual(marked);
+      expect(projectGroupContextCard(JSON.stringify(marked))?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+      if (body.startsWith('!')) {
+        // The list API drops image alt; it must request structured B rather
+        // than accidentally sharing runtime images as conversation.
+        expect(projectGroupContextCard(simplified(JSON.stringify(marked)))).toEqual({ kind: 'unresolved' });
+      } else {
+        const table = marked.body.elements[0];
+        const flattened = JSON.stringify({ elements: [[{ tag: 'text', text: `A B\n${table.rows[0].c0} ${table.rows[0].c1}` }]] });
+        expect(projectGroupContextCard(flattened)?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+        expect(extractCardContent(flattened)).not.toContain('\u2063');
+      }
+      const message = markGroupContextCardPurpose(marked, 'message');
+      const projection = conversation(JSON.stringify(message));
+      expect(projection.text).not.toContain('\u2063');
+      expect(extractCardContent(JSON.stringify(message))).not.toContain('\u2063');
+      expect(projection.content).not.toContain('\u2063');
+      expect(projection.resources.map(resource => resource.key)).toEqual(body.startsWith('!') ? ['img_v3_purpose'] : []);
+      if (body.startsWith('!')) expect(projection.text).toContain('Preview');
+      else expect(projection.text).toContain('| A | B |');
+    }
+  });
+
+  it('keeps unmarked structured image cards on the ordinary parsing path', () => {
+    expect(projectGroupContextCard(JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'img', img_key: 'img_v3_unmarked', alt: { tag: 'plain_text', content: 'Preview' } },
+    ] } }))).toBeUndefined();
+  });
+
   it('strips an inline purpose marker from a promoted heading in both API shapes', () => {
     const raw = JSON.stringify({
       schema: '2.0',

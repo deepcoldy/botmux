@@ -21,6 +21,44 @@ const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' }
 const presentation = { showProcess: true, showToolResults: true, canStop: true };
 
 describe('real CLI send into a running reply card', () => {
+  it.each([
+    ['table', '| A | B |\n| --- | --- |\n| 1 | 2 |', 'table'],
+    ['image', '![Preview](img_v3_footer_test)', 'column_set'],
+  ])('keeps a pure %s final free of Footer while retaining group-context purpose', (_kind, content, tag) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-footer-carrier-'));
+    const dataDir = join(root, 'data');
+    try {
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'codex',
+        replyCardMode: 'legacy', replyFooterEnabled: false,
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId: 'codex', larkAppId: key.larkAppId,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', '--image-mode', 'medium', content], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const captured = String(result.stdout).split('\n').find(line => line.startsWith('CAPTURE_REPLY='));
+      expect(captured).toBeDefined();
+      const raw = JSON.parse(captured!.slice('CAPTURE_REPLY='.length)).body.content;
+      const card = JSON.parse(raw);
+      expect(card.body.elements.map((element: any) => element.tag)).toEqual([tag]);
+      expect(raw).not.toContain('botmux_reply_footer');
+      const projected = projectGroupContextCard(raw);
+      expect(projected?.kind).toBe('conversation');
+      if (projected?.kind !== 'conversation') throw new Error('Missing group-context message purpose');
+      expect(projected.turnReply).toBe(false);
+      expect(projected.content).not.toContain('\u2063');
+      if (_kind === 'image') expect(projected.content).toContain('img_v3_footer_test');
+      else expect(projected.content).toContain('"c0":"1"');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each<{ cliId: string; configuredCliId: string; frozenCliId?: string; mode?: 'legacy' | 'unified'; layout?: 'result'; footerOff?: boolean }>([
     { cliId: 'codex', configuredCliId: 'codex', footerOff: true },
     { cliId: 'claude-code', configuredCliId: 'claude-code', footerOff: true },

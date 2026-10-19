@@ -214,6 +214,28 @@ describe('group context platform integration', () => {
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_merged')).toMatchObject({ cardContentVersion: 1, updateTime: now - 1 });
   });
 
+  it.each(['runtime', 'message'] as const)('rehydrates image-only list cards to retain %s classification without a Footer', async purpose => {
+    const now = Date.now();
+    const flattened = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_public' }]] });
+    const structured = JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
+      { tag: 'img', img_key: 'img_v3_public', alt: { tag: 'plain_text', content: 'Public image' } },
+    ] } }, purpose));
+    expect(structured).not.toContain('botmux_reply_footer');
+    network.history.mockResolvedValue([{ message_id: 'om_image', chat_id: 'oc_room', create_time: String(now - 100),
+      update_time: String(now - 100), msg_type: 'interactive', sender: { id: 'cli_peer', sender_type: 'app' }, body: { content: flattened } }]);
+    network.detail.mockImplementation(async (_app, _id, options) => ({ items: [{ update_time: String(now - 1),
+      body: { content: options.userCardContent ? structured : flattened } }] }));
+    await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '总结' });
+    expect(network.detail.mock.calls.some(call => call[2]?.userCardContent === true)).toBe(true);
+    const stored = getGroupContextMessage('cli_b', 'oc_room', 'om_image');
+    if (purpose === 'runtime') expect(stored).toBeUndefined();
+    else {
+      expect(stored?.resourceRefs.map(ref => ref.key)).toEqual(['img_v3_public']);
+      expect(stored?.text).toContain('Public image');
+      expect(stored?.text).not.toContain('\u2063');
+    }
+  });
+
   it('excludes a card completed after the triggering message even if the list had an old timestamp', async () => {
     const now = Date.now();
     const flattened = JSON.stringify(markGroupContextCardPurpose({ elements: [[{ tag: 'text', text: 'OLD_PROCESS' }]] }, 'turn-message'));

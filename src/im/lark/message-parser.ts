@@ -1866,7 +1866,7 @@ function extractCardHeaderTagTexts(header: unknown): string[] {
  *  table into extra rows. */
 function cardTableCellText(value: unknown): string {
   const text = nestedCardText(value);
-  return (text ?? '')
+  return stripTrailingGroupContextCardPurposeMarker(text ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
@@ -2053,7 +2053,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    const alt = (typeof el.alt === 'string' ? el.alt : el.alt?.content)?.trim();
+    const rawAlt = typeof el.alt === 'string' ? el.alt : el.alt?.content;
+    const alt = typeof rawAlt === 'string' ? stripTrailingGroupContextCardPurposeMarker(rawAlt).trim() : undefined;
     if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 
