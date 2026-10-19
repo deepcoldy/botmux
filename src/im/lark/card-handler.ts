@@ -81,7 +81,7 @@ import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js'
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, buildStreamingCardJson, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, buildStreamingCardJson, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationStatus } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -3900,7 +3900,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
+          streamingCardPresentationStatus(ds, ds.lastScreenStatus || 'working'),
           effectiveCliId,
           mode,
           ds.streamCardNonce,
@@ -4095,7 +4095,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
+          streamingCardPresentationStatus(ds, ds.lastScreenStatus || 'working'),
           effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,
@@ -4265,7 +4265,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           readUrl,
           turnTitle,
           ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
+          streamingCardPresentationStatus(ds, ds.lastScreenStatus || 'working'),
           effectiveCliId,
           ds.displayMode ?? 'screenshot',
           ds.streamCardNonce,

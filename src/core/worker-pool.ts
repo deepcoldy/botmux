@@ -1215,7 +1215,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    status,
+    streamingCardPresentationStatus(ds, status),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -1271,7 +1271,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    status,
+    streamingCardPresentationStatus(ds, status),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -1460,7 +1460,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     buildTerminalUrl(ds),
     ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
     ds.lastScreenContent ?? '',
-    status,
+    streamingCardPresentationStatus(ds, status),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -1536,7 +1536,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    ds.lastScreenStatus ?? 'working',
+    streamingCardPresentationStatus(ds, ds.lastScreenStatus ?? 'working'),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -1626,7 +1626,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     buildTerminalUrl(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    status,
+    streamingCardPresentationStatus(ds, status),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -3016,7 +3016,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     readUrl,
     turnTitle,
     ds.lastScreenContent ?? '',
-    'limited',
+    streamingCardPresentationStatus(ds, 'limited'),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -3708,6 +3708,29 @@ export function currentStreamCardDisplayTarget(
   if (!isRealStreamingCardId(ds.streamCardId)) return target;
   if (target?.messageId === ds.streamCardId) return target;
   return { messageId: ds.streamCardId, publication: 0, mode: 'follow-live' };
+}
+
+/** True when the visible card belongs to a turn that the terminal has not
+ * started producing yet. `turnId` covers the short POST window before the
+ * card's display target is bound; afterwards the persisted target is the
+ * authority. A missing capture identity is inconclusive, so fresh-session
+ * startup keeps its normal `starting` presentation. */
+export function streamingCardTurnQueued(ds: DaemonSession, turnId?: string): boolean {
+  if (currentStreamCardDisplayTarget(ds)?.mode === 'waiting-exact-turn') return true;
+  if (!turnId) return false;
+  const identity = currentCaptureIdentity(ds);
+  return identity?.turnId !== undefined && identity.turnId !== turnId;
+}
+
+/** Preserve worker/runtime truth in `lastScreenStatus` while projecting the
+ * card's own turn lifecycle honestly. A queued card must never claim that its
+ * turn is already working merely because the predecessor still is. */
+export function streamingCardPresentationStatus(
+  ds: DaemonSession,
+  status: StreamStatus,
+  turnId?: string,
+): StreamStatus {
+  return streamingCardTurnQueued(ds, turnId) ? 'queued' : status;
 }
 
 /** May a cached image with this source be rendered for the current target? A
@@ -4529,19 +4552,25 @@ function bumpStreamCardStatusRevision(ds: DaemonSession): void {
 /** Re-render a just-created starting card when a newer worker status arrived
  * during its POST. The turn id is forwarded to scheduleCardPatch so a late
  * patch from turn N cannot overwrite turn N+1's card. */
-function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefined, revisionAtPost: number): void {
+function reconcilePostedStartingCard(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  revisionAtPost: number,
+  statusOverride?: StreamStatus,
+): void {
   if ((ds.streamCardStatusRevision ?? 0) === revisionAtPost) return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || ds.streamCardPending) return;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? turnStartingCardStatus(ds, effectiveCliId));
+  const status = statusOverride
+    ?? (ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? turnStartingCardStatus(ds, effectiveCliId)));
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    status,
+    streamingCardPresentationStatus(ds, status),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -4658,7 +4687,7 @@ async function postTurnStartingStatusCard(
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     '',
-    status,
+    streamingCardPresentationStatus(ds, status, turnId),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     nonce,
@@ -4811,7 +4840,7 @@ export async function postFreshStreamingCard(
     readUrl,
     title,
     ds.lastScreenContent ?? '',
-    status,
+    streamingCardPresentationStatus(ds, status),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -8433,7 +8462,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    status ?? ds.lastScreenStatus ?? 'starting',
+    streamingCardPresentationStatus(ds, status ?? ds.lastScreenStatus ?? 'starting'),
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -14415,11 +14444,18 @@ function setupWorkerHandlers(
         // Committed synchronously (no await before this point) so no later
         // frame of this worker can be judged against an older identity.
         if (ds.workerGeneration !== workerGeneration) break;
+        const cardWasQueued = streamingCardTurnQueued(ds);
         if (!commitCaptureIdentity(ds, workerGeneration, msg)) {
           logger.debug(
             `[${t}] Rejected capture_identity rev=${String(msg.revision)} `
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
+        } else if (cardWasQueued && !streamingCardTurnQueued(ds)) {
+          // The queued turn has become the terminal producer. Repaint even
+          // when the worker remains working→working and no status edge would
+          // otherwise wake the card; a screenshot frame may follow, but hidden
+          // mode must leave the queued header immediately too.
+          reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
         }
         break;
       }
@@ -14826,7 +14862,7 @@ function setupWorkerHandlers(
               readOnlyUrl,
               initTitle,
               ds.lastScreenContent ?? '',
-              initStatus,
+              streamingCardPresentationStatus(ds, initStatus),
               effectiveCliId,
               ds.displayMode ?? 'hidden',
               ds.streamCardNonce,
@@ -14952,7 +14988,7 @@ function setupWorkerHandlers(
             // before the first screen_update lands. Fresh worker spawn
             // has lastScreenContent undefined → '' (unchanged).
             ds.lastScreenContent ?? '',
-            initStatus,
+            streamingCardPresentationStatus(ds, initStatus, pendingTurnIdAtPost),
             effectiveCliId,
             ds.displayMode ?? 'hidden',
             ds.streamCardNonce,
@@ -15669,7 +15705,7 @@ function setupWorkerHandlers(
             readUrl,
             turnTitle,
             isNewTurn ? '' : msg.content,
-            ds.lastScreenStatus,
+            streamingCardPresentationStatus(ds, ds.lastScreenStatus, newTurnIdAtPost),
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -15795,7 +15831,7 @@ function setupWorkerHandlers(
             readUrl,
             turnTitle,
             msg.content,
-            ds.lastScreenStatus,
+            streamingCardPresentationStatus(ds, ds.lastScreenStatus),
             effectiveCliId,
             mode,
             ds.streamCardNonce,
@@ -15901,7 +15937,7 @@ function setupWorkerHandlers(
           readUrl,
           turnTitle,
           ds.lastScreenContent ?? '',
-          ds.lastScreenStatus,
+          streamingCardPresentationStatus(ds, ds.lastScreenStatus),
           effectiveCliId,
           'screenshot',
           ds.streamCardNonce,

@@ -202,12 +202,14 @@ export interface VcMeetingConsumerConfig {
 
 /** Runtime status the worker derives from screen content. */
 export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited' | 'stalled';
-/** Status shown on a streaming card — adds the pre-spawn 'starting' phase. */
+/** Status shown on a streaming card — adds presentation-only lifecycle phases. */
 // 'interrupted' 是纯卡片侧 transient 状态：仅 card-handler 在「停止当前轮」按钮
 // 点击后重渲染卡片时传入（橙色 header + 已中断文案）。worker 的 screen_update IPC
 // 仍只发 ScreenStatus（不含 'interrupted'），所以 worker-pool 的 patch 永远不会传此值，
 // ~2s 后下一次 screen_update 自然把卡片覆盖回真实状态。
-export type StreamStatus = ScreenStatus | 'starting' | 'interrupted';
+// 'queued' 同样只属于卡片投影：新卡已为 turn B 发布、终端仍由 turn A 产生画面时，
+// worker 的真实 ScreenStatus 仍是 working，但 UI 必须明确说明 B 尚未开始。
+export type StreamStatus = ScreenStatus | 'starting' | 'queued' | 'interrupted';
 
 /** One human/bot who took part in a turn's window — the union of every folded
  *  message's sender and @-mentions (type-ahead follow-ups included), excluding

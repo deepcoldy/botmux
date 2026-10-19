@@ -1903,6 +1903,30 @@ describe('Card integration: full event flow', () => {
       }
     });
 
+    it('renders a waiting current target as queued when the user expands it', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_waiting_B',
+        streamCardNonce: NONCE_CURRENT,
+        displayMode: 'hidden',
+        currentTurnId: 'om_turn_B',
+        streamCardDisplayTarget: {
+          messageId: 'om_waiting_B', publication: 2,
+          mode: 'waiting-exact-turn', turnId: 'om_turn_B',
+        },
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_waiting_B'),
+        makeDeps(sessions),
+        APP_ID,
+      );
+      await flush();
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(parseCard(fakeLark.patches[0].args[2])).toMatchObject({
+        status: 'queued', expanded: true, imageKey: null,
+      });
+    });
+
     it('a cached frame from a silent scheduled turn is not shown; the card says unavailable instead', async () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_live_silent',

@@ -55,6 +55,7 @@ export const messages: Record<string, string> = {
 
   // ─── Card status ─────────────────────────────────────────────────────────
   'card.status.starting': 'Starting…',
+  'card.status.queued': 'Queued',
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
   'card.status.idle_silent': '✓ Turn ended (AI determined no reply was needed) · Awaiting input',
@@ -73,6 +74,7 @@ export const messages: Record<string, string> = {
   'card.status.relay_frozen': '🔄 Relayed away',
   'card.status.selected': 'Selected',
   'card.status.waiting_screenshot': '_(Waiting for first screenshot…)_',
+  'card.status.queued_screenshot': '_(This turn is queued; its screenshot will appear after the previous turn finishes.)_',
   'card.status.screenshot_unavailable': '_(No screenshot is available. Refresh after the session resumes.)_',
   'card.status.truncated_prefix': '… (truncated)',
 

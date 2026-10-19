@@ -839,6 +839,7 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | IdleCardLabel): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
+    case 'queued': return t('card.status.queued', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
     // idleLabel 'silent': the turn completed as DELIBERATE silence (bare
     // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
@@ -893,9 +894,11 @@ function pushStreamBody(
       // no provable card target) instead of waiting forever.
       elements.push({
         tag: 'markdown',
-        content: t(screenshotUnavailable
-          ? 'card.status.screenshot_unavailable'
-          : 'card.status.waiting_screenshot', undefined, locale),
+        content: t(status === 'queued'
+          ? 'card.status.queued_screenshot'
+          : screenshotUnavailable
+            ? 'card.status.screenshot_unavailable'
+            : 'card.status.waiting_screenshot', undefined, locale),
       });
     }
     elements.push({ tag: 'hr' });
@@ -1015,14 +1018,14 @@ export function buildStreamingCard(
       'default',
       { action: 'toggle_display', ...actionBase },
     ));
-    if (displayMode !== 'hidden') {
+    if (displayMode !== 'hidden' && status !== 'queued') {
       headerActions.push(callbackButton(
         t('card.btn.export_text', undefined, locale),
         'default',
         { action: 'export_text', ...actionBase },
       ));
     }
-    if (displayMode === 'screenshot') {
+    if (displayMode === 'screenshot' && status !== 'queued') {
       headerActions.push(callbackButton(
         t('card.btn.refresh', undefined, locale),
         'default',
@@ -1139,7 +1142,7 @@ export function buildStreamingCard(
   // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
   // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
   // 以后再加远端 CLI 不会重复漏改。
-  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
+  if (displayMode === 'screenshot' && status !== 'queued' && !isRemoteCliId(cliId)) {
     const mkKey = (label: string, key: string) => (callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }));
     elements.push({
       tag: 'action',

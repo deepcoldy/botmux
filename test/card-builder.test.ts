@@ -1393,6 +1393,30 @@ describe('buildStreamingCard', () => {
       expect(mdElements[0].content).toBe('_(等待第一张截图…)_');
     });
 
+    it('renders a queued turn explicitly instead of pretending its screenshot is pending', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'queued', 'traex', 'screenshot',
+      ));
+      expect(card.header.title.content).toContain('排队中');
+      expect(card.header.template).toBe('yellow');
+      expect(card.elements.find((e: any) => e.tag === 'markdown').content)
+        .toBe('_(本轮正在排队；上一轮结束后将自动显示截图。)_');
+      const actions = findActions(card);
+      expect(actions.find((a: any) => a.value?.action === 'toggle_display')).toBeDefined();
+      expect(actions.find((a: any) => a.value?.action === 'export_text')).toBeUndefined();
+      expect(actions.find((a: any) => a.value?.action === 'refresh_screenshot')).toBeUndefined();
+      expect(actions.find((a: any) => a.value?.action === 'term_action')).toBeUndefined();
+    });
+
+    it('renders the queued header even while output stays collapsed', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'queued', 'traex', 'hidden',
+      ));
+      expect(card.header.title.content).toContain('排队中');
+      expect(card.elements.some((e: any) => e.tag === 'markdown'
+        && String(e.content).includes('本轮正在排队'))).toBe(false);
+    });
+
     // Positional helper: buildStreamingCard's 23rd argument is screenshotUnavailable.
     const withUnavailable = (imageKey: string | undefined, unavailable: boolean, locale: 'zh' | 'en' = 'zh') =>
       parse(buildStreamingCard(

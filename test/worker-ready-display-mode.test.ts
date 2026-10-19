@@ -1351,6 +1351,9 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(JSON.parse(sessionReplyMock.mock.calls[0][1])).toMatchObject({ status: 'starting' });
 
     fakeWorker.emit('message', {
+      type: 'capture_identity', revision: 1, turnId: 'om_turn_1',
+    });
+    fakeWorker.emit('message', {
       type: 'screen_update',
       content: 'working after cold resume',
       status: 'working',
@@ -2204,7 +2207,9 @@ describe('V3 capture identity and display target', () => {
     frame(worker, 'img_C', 12, 'om_turn_C');
     await flush();
     expect(ds.currentImageKey).toBe('img_C');
-    expect(patchedIds()).toEqual(['om_card_C']);
+    // Activation repaints queued→working immediately; the accepted frame then
+    // adds the image in a second serialized PATCH.
+    expect(patchedIds()).toEqual(['om_card_C', 'om_card_C']);
   });
 
   it('seq 2b: a new-turn card whose turn is already being captured follows live at once', async () => {
@@ -2216,6 +2221,31 @@ describe('V3 capture identity and display target', () => {
     frame(worker, 'img_B', 3, 'om_turn_B');
     await flush();
     expect(ds.currentImageKey).toBe('img_B');
+  });
+
+  it('projects a waiting target as queued, then leaves queued as soon as its turn starts', async () => {
+    const { ds, worker } = liveDs();
+    identity(worker, 1, 'om_turn_A');
+    await flush();
+
+    await publishNewTurnCard(ds, 'om_turn_B', 'om_card_B');
+    const postedCards = sessionReplyMock.mock.calls
+      .map(call => JSON.parse(String(call[1])))
+      .filter(card => card?.type === 'streaming');
+    expect(postedCards.at(-1)).toMatchObject({ status: 'queued' });
+
+    updateMessageMock.mockClear();
+    // The predecessor may have settled idle just before B becomes the producer;
+    // activation still means B is now running, not awaiting input.
+    ds.lastScreenStatus = 'idle';
+    identity(worker, 2, 'om_turn_B');
+    await flush();
+    expect(ds.streamCardDisplayTarget).toMatchObject({
+      messageId: 'om_card_B', mode: 'follow-live', turnId: 'om_turn_B',
+    });
+    expect(updateMessageMock).toHaveBeenCalled();
+    const activated = JSON.parse(String(updateMessageMock.mock.calls.at(-1)?.[2]));
+    expect(activated).toMatchObject({ status: 'working' });
   });
 
   it('seq 2c: a re-posted card for the same turn does not inherit the previous card\'s match; a POST failure keeps the old card\'s own target', async () => {
