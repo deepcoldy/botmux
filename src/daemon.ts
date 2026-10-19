@@ -9,6 +9,7 @@ import { readFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'n
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
+import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from './utils/bot-routing.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
@@ -8038,6 +8039,25 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+/** 已知 peer bot open_id 集合（peer cross-ref + bots-info.json），与
+ *  worker-pool 的 loadKnownBotOpenIdsForApp 同源。ask 卡片用它剔除 bot
+ *  mention：飞书卡片里的 `<at id=botOpenId>` 会以 100290 整卡拒收。 */
+function knownBotOpenIdsForAsk(larkAppId: string): Set<string> {
+  const dataDir = config.session.dataDir;
+  const crossRef = readPeerCrossRef(dataDir, larkAppId);
+  let botEntries: BotMentionEntry[] = [];
+  const botInfoPath = join(dataDir, 'bots-info.json');
+  try {
+    if (existsSync(botInfoPath)) {
+      const parsed = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
+      if (Array.isArray(parsed)) botEntries = parsed as BotMentionEntry[];
+    }
+  } catch {
+    // 损坏的 bots-info.json 不阻塞 ask：降级为只信 cross-ref。
+  }
+  return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
+}
+
 const explicitAskContinuation = createExplicitAskContinuation({
   dir: join(config.session.dataDir, 'explicit-ask-receipts'),
   get appId() { return selfDaemonLarkAppId ?? ''; },
@@ -8165,6 +8185,16 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
+  let askMentionedOpenId: string | undefined;
+  if (boundAsk.mentionedOpenId) {
+    if (knownBotOpenIdsForAsk(boundAsk.larkAppId).has(boundAsk.mentionedOpenId)) {
+      logger.warn(
+        `[ask:${boundAsk.larkAppId}] --mention target ${boundAsk.mentionedOpenId} is a known bot; dropping card <at> (Feishu 100290)`,
+      );
+    } else {
+      askMentionedOpenId = boundAsk.mentionedOpenId;
+    }
+  }
   let documentDelivery: Awaited<ReturnType<typeof resolveDocumentAskDelivery>>;
   const askGeneration = askSession && captureRoutingGeneration(askSession);
   const askWorker = askSession?.worker;
@@ -8197,6 +8227,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     ...(documentDelivery ? { answererOpenId: documentDelivery.openId } : {}),
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
+    ...(askMentionedOpenId ? { mentionedOpenId: askMentionedOpenId } : {}),
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,

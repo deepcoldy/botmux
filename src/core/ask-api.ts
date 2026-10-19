@@ -10,7 +10,6 @@ import { registerAsk } from './ask-broker.js';
 import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
-
 export interface AskApiBody {
   sessionId: string;
   chatId: string;
@@ -27,6 +26,9 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人类成员。daemon 会在发卡前
+   *  剔除 bot open_id（卡片 at bot 触发 100290）。 */
+  mentionedOpenId?: string;
   acknowledge?: boolean;
 }
 
@@ -43,6 +45,7 @@ export type AskApiBodyError =
   | 'bad_option_shape'
   | 'bad_option_key'
   | 'bad_option_label'
+  | 'bad_option_description'
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
@@ -51,6 +54,7 @@ export type AskApiBodyError =
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
   | 'bad_originKind'
+  | 'bad_mentionedOpenId'
   | 'bad_acknowledge';
 
 /** Validate the request body. Returns either the parsed body or an error code
@@ -101,6 +105,18 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     }
     originKind = r.originKind;
   }
+  let mentionedOpenId: string | undefined;
+  if (r.mentionedOpenId !== undefined && r.mentionedOpenId !== null) {
+    // 卡片 `<at id=…>` 只接受 open_id（`ou_` 前缀）。union_id/user_id 等其它
+    // ID 形态进了卡片会整条被飞书拒掉，这里 fail loud。
+    if (
+      typeof r.mentionedOpenId !== 'string'
+      || !/^ou_[A-Za-z0-9]{6,64}$/.test(r.mentionedOpenId)
+    ) {
+      return { error: 'bad_mentionedOpenId' };
+    }
+    mentionedOpenId = r.mentionedOpenId;
+  }
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
 
@@ -142,13 +158,14 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(mentionedOpenId !== undefined ? { mentionedOpenId } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
   };
   // Reject semantics this receiver did not parse instead of silently creating
   // a different kind of Ask. Identity claims remain on the raw body for the
   // route's authorization checks; options/prompt are normalized above.
   const routeFields = new Set(['prompt', 'options', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
-  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+  if (Object.keys(r).some(key => r[key] !== undefined && r[key] !== null && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
     return { error: 'unsupported_fields' };
   }
   return parsed;

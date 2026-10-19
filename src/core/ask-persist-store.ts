@@ -69,6 +69,8 @@ export interface PersistedAsk {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人类 open_id，跨重启保留以保证重发卡片仍带通知。 */
+  mentionedOpenId?: string;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;

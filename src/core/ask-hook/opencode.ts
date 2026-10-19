@@ -64,8 +64,11 @@ const openCodeAdapter: HookAskAdapter = {
         const rawOpts = q.options ?? [];
         const options = rawOpts.map((opt) => {
           const label = opt.label ?? '';
-          // option 无独立 key 时，用 label 作为 key
-          return { key: label, label };
+          // option 无独立 key 时，用 label 作为 key；透传 OpenCode 的选项说明。
+          const description = typeof opt.description === 'string' && opt.description.trim()
+            ? opt.description
+            : undefined;
+          return description ? { key: label, label, description } : { key: label, label };
         });
         return { prompt: qText, options, multiSelect };
       });
