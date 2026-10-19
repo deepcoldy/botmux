@@ -48,6 +48,15 @@ export interface DurableLarkSessionControlRuntimeOptions {
   getPersistedSession(sessionId: string): Session | undefined;
   /** Import a canonical closed snapshot into this replica's local runtime store. */
   materializeClosedSession(session: Session): Session;
+  /**
+   * Claim and materialize a canonical active Session on this replica before a
+   * lifecycle operation. The callback must cross the distributed Session lease
+   * fence before installing any local runtime state.
+   */
+  takeOverActiveSession?(
+    sessionKey: string,
+    canonical: Session,
+  ): Promise<Session | undefined>;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
@@ -123,11 +132,14 @@ export function createDurableLarkSessionControlRuntime(
   };
 
   const resolve: DurableSessionControlDispatchOptions['resolve'] = async (control, context) => {
+    const source = control.source ?? 'lark-card';
+    const trustedHost = source === 'trusted-host';
     if (control.larkAppId !== options.larkAppId) {
       return { kind: 'ignored', reason: 'control belongs to another Lark application' };
     }
     const value = record(record(control.data)?.action)?.value;
-    if (options.privateCard || record(value)?.visibility === 'private') {
+    if (!trustedHost && source === 'lark-card'
+        && (options.privateCard || record(value)?.visibility === 'private')) {
       return { kind: 'ignored', reason: 'private lifecycle cards are not durable yet' };
     }
     const canonicalKey = sessionKey(control.rootId, options.larkAppId);
@@ -147,36 +159,56 @@ export function createDurableLarkSessionControlRuntime(
         && canonicalSession.status !== 'closed') {
       return { kind: 'ignored', reason: 'canonical Session cannot be closed' };
     }
-    if (canonicalSession.streamCardId !== control.cardMessageId) {
+    if (source === 'lark-card' && canonicalSession.streamCardId !== control.cardMessageId) {
       return {
         kind: 'ignored',
         reason: `${control.action} card no longer owns the canonical Session lifecycle`,
       };
     }
-    if (!options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
+    if (!trustedHost && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
       return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
     }
     if (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom) {
       return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
     }
 
-    const live = options.findActiveSession(control.sessionId);
+    let live = options.findActiveSession(control.sessionId);
     let persisted = options.getPersistedSession(control.sessionId);
+    if (control.action === 'close' && canonicalSession.status === 'active') {
+      if (!live) {
+        const remote = normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState);
+        const neverStartedRemote = remote?.generation === 0
+          && !remote.remoteSessionId
+          && !remote.agentThreadId;
+        if (persisted?.status !== 'closed' && neverStartedRemote) {
+          persisted = options.materializeClosedSession({
+            ...structuredClone(canonicalSession),
+            status: 'closed',
+            closedAt: new Date(now()).toISOString(),
+          });
+        }
+        // Prefix fallback may discover an active Session whose prior owner is
+        // gone. Cross the same Session lease + Remote Runner takeover boundary
+        // as a normal follow-up before exposing closeSession to local state.
+        // While the old owner is still live this remains retryable; once its
+        // lease expires, any replica can materialize and apply the control.
+        if (persisted?.status !== 'closed') {
+          await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          live = options.findActiveSession(control.sessionId);
+          persisted = options.getPersistedSession(control.sessionId);
+          if (!live || live.session.sessionId !== canonicalSession.sessionId) {
+            throw new Error('active control target could not be taken over by this replica');
+          }
+        }
+      }
+      if (source === 'lark-card' && live && live.streamCardId !== control.cardMessageId) {
+        return { kind: 'ignored', reason: 'close card no longer owns the active Session lifecycle' };
+      }
+    }
     if (control.action === 'resume' && !persisted) {
       persisted = options.materializeClosedSession(structuredClone(canonicalSession));
     }
     const session = live?.session ?? persisted ?? canonicalSession;
-    if (control.action === 'close' && canonicalSession.status === 'active') {
-      if (!live) {
-        // Prefix fallback may discover an active Session owned by another Pod.
-        // Keep the Inbox row retryable; completing it as ignored would lose the
-        // user's close request before the exact runtime owner can claim it.
-        throw new Error('active control target is not local to this replica');
-      }
-      if (live.streamCardId !== control.cardMessageId) {
-        return { kind: 'ignored', reason: 'close card no longer owns the active Session lifecycle' };
-      }
-    }
     if (control.action === 'resume' && !live && persisted?.status !== 'closed') {
       throw new Error('canonical closed Session could not be materialized locally');
     }
@@ -193,8 +225,14 @@ export function createDurableLarkSessionControlRuntime(
       operatorOpenId: control.operatorOpenId,
       cardMessageId: control.cardMessageId,
     } as unknown as DurableJson;
-    const closeCard = control.action === 'close' && live
-      ? options.buildClosedCard(live)
+    const effectiveCardMessageId = source === 'lark-card'
+      ? control.cardMessageId
+      : canonicalSession.streamCardId;
+    const closeCard = control.action === 'close'
+      && !options.privateCard
+      && typeof effectiveCardMessageId === 'string'
+      && effectiveCardMessageId.startsWith('om_')
+      ? options.buildClosedCard(live ?? session)
       : undefined;
     // A Remote Runner resume may briefly reactivate its local Session while the
     // replacement provider generation is still starting. If startup later
@@ -431,12 +469,14 @@ export function createDurableLarkSessionControlRuntime(
               throw new Error(`durable control ${label} output failed: ${enqueued.kind}`);
             }
           };
-          if (typeof parsed.cardJson === 'string' && parsed.cardJson) {
+          if (typeof parsed.cardJson === 'string' && parsed.cardJson
+              && typeof effectiveCardMessageId === 'string'
+              && effectiveCardMessageId.startsWith('om_')) {
             await enqueue(durableLarkOutboxMessage({
               messageId: `control_update_${digest}`,
               sessionKey: canonicalKey,
               larkAppId: options.larkAppId,
-              target: { kind: 'update', messageId: control.cardMessageId },
+              target: { kind: 'update', messageId: effectiveCardMessageId },
               content: parsed.cardJson,
               msgType: 'interactive',
               providerUuid: `bct_${digest.slice(0, 40)}`,

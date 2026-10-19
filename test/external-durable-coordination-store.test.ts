@@ -106,6 +106,23 @@ describe('external durable coordination provider', () => {
     await expect(store.readControlOperation('fixture-control'))
       .resolves.toMatchObject({ operationId: 'fixture-control', state: 'completed' });
     await expect(store.readSession('missing')).resolves.toBeUndefined();
+    await expect(store.listSessions({ limit: 100 })).resolves.toEqual({
+      records: [{
+        sessionKey: 'session-a',
+        revision: 1,
+        value: { status: 'active' },
+        updatedAt: 2,
+      }],
+    });
+    await expect(store.readAuxiliaryState('missing')).resolves.toBeUndefined();
+    await expect(store.writeAuxiliaryState({
+      lease,
+      expectedRevision: null,
+      value: { type: 'recalls' },
+    })).resolves.toMatchObject({
+      kind: 'written',
+      record: { stateKey: 'session-a', revision: 1, value: { type: 'recalls' } },
+    });
     await expect(store.readControlOperation('missing-control')).resolves.toBeUndefined();
     await store.close();
   });
@@ -122,6 +139,9 @@ describe('external durable coordination provider', () => {
     ['markControlOperationAmbiguous', { kind: 'applied', record: {} }],
     ['reconcileControlOperation', { kind: 'applied', record: {} }],
     ['readControlOperation', { operationId: '', state: 'completed' }],
+    ['listSessions', { records: [{ revision: 'wrong' }] }],
+    ['readAuxiliaryState', { revision: 'wrong' }],
+    ['writeAuxiliaryState', { kind: 'written', record: { revision: 'wrong' } }],
   ] satisfies Array<[DurableCoordinationProviderMethod, DurableJson]>)(
     'fails closed on a malformed %s result',
     (method, result) => {
@@ -144,6 +164,10 @@ describe('external durable coordination provider', () => {
     const store = await ExternalDurableCoordinationStore.connect(providerCommand());
     await expect(store.readSession('invalid-result'))
       .rejects.toThrow(/invalid readSession result/);
+    await expect(store.listSessions({ limit: 999 }))
+      .rejects.toThrow(/invalid listSessions result/);
+    await expect(store.readAuxiliaryState('invalid-result'))
+      .rejects.toThrow(/invalid readAuxiliaryState result/);
     await store.close();
   });
 

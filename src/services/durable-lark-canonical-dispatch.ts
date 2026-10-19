@@ -3,7 +3,11 @@ import type {
   DurableInboxPrimaryDispatchContext,
   DurableInboxPrimaryDispatchResult,
 } from './durable-inbox-primary-consumer.js';
-import type { DurableOutboxStore } from './durable-coordination.js';
+import type {
+  DurableInboxEvent,
+  DurableInboxStore,
+  DurableOutboxStore,
+} from './durable-coordination.js';
 import type { DurableLarkMessageClaim } from './durable-inbox-shadow.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
 import { admitDurableLarkSession } from './durable-session-primary.js';
@@ -13,6 +17,7 @@ import {
 } from './durable-lark-outbox.js';
 
 const MAX_POST_ADMISSION_OUTPUTS = 16;
+const MAX_POST_ADMISSION_CONTROLS = 4;
 
 export interface DurableLarkPostAdmissionOutput {
   target: DurableLarkOutboxTarget;
@@ -37,11 +42,13 @@ export interface DurableLarkCanonicalHandlerContext extends DurableInboxPrimaryD
    * to the durable Outbox before the Inbox claim may complete.
    */
   queuePostAdmissionOutput(output: DurableLarkPostAdmissionOutput): void;
+  /** 仅在本轮 canonical admission 提交后排入生命周期请求。 */
+  queuePostAdmissionControl(event: DurableInboxEvent): void;
 }
 
 export interface DurableLarkCanonicalDispatchOptions {
   facade: DurableSessionFacade;
-  store: Pick<DurableOutboxStore, 'enqueueOutbox'>;
+  store: Pick<DurableOutboxStore, 'enqueueOutbox'> & Pick<DurableInboxStore, 'enqueueInbox'>;
   handle(
     message: DurableLarkMessageClaim,
     context: DurableLarkCanonicalHandlerContext,
@@ -69,6 +76,7 @@ export function createDurableLarkCanonicalDispatch(
   return async (message, context) => {
     if (context.signal.aborted) throw abortError(context.signal);
     const outputs: DurableLarkPostAdmissionOutput[] = [];
+    const controls: DurableInboxEvent[] = [];
     let acceptingOutputs = true;
     let result: DurableLarkCanonicalHandlerResult;
     try {
@@ -83,6 +91,15 @@ export function createDurableLarkCanonicalDispatch(
             throw new Error('durable canonical post-admission output limit exceeded');
           }
           outputs.push(JSON.parse(JSON.stringify(output)) as DurableLarkPostAdmissionOutput);
+        },
+        queuePostAdmissionControl(event) {
+          if (!acceptingOutputs) {
+            throw new Error('durable canonical post-admission control was queued after handler completion');
+          }
+          if (controls.length >= MAX_POST_ADMISSION_CONTROLS) {
+            throw new Error('durable canonical post-admission control limit exceeded');
+          }
+          controls.push(JSON.parse(JSON.stringify(event)) as DurableInboxEvent);
         },
       });
     } finally {
@@ -100,8 +117,8 @@ export function createDurableLarkCanonicalDispatch(
       return { kind: 'retry', reason };
     }
     if (result.kind === 'ignored') {
-      if (outputs.length > 0) {
-        throw new Error('durable canonical ignored result cannot publish post-admission output');
+      if (outputs.length > 0 || controls.length > 0) {
+        throw new Error('durable canonical ignored result cannot publish post-admission effects');
       }
       const reason = result.reason.trim();
       if (!reason || reason.length > 512) {
@@ -139,6 +156,13 @@ export function createDurableLarkCanonicalDispatch(
       });
       if (mutation.kind === 'conflict' || mutation.kind === 'stale_lease') {
         throw new Error(`durable canonical post-admission output failed: ${mutation.kind}`);
+      }
+    }
+    for (const control of controls) {
+      if (context.signal.aborted) throw abortError(context.signal);
+      const mutation = await options.store.enqueueInbox(control);
+      if (mutation.kind === 'conflict') {
+        throw new Error(`durable canonical post-admission control failed: ${mutation.kind}`);
       }
     }
     if (result.session.status !== 'active') {

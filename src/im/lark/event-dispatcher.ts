@@ -90,7 +90,7 @@ import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-r
 import { readBotsInfoJson } from '../../services/bots-info-cache.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
-import type { DurableInboxStore } from '../../services/durable-coordination.js';
+import type { DurableInboxEvent, DurableInboxStore } from '../../services/durable-coordination.js';
 import {
   enqueueDurableLarkMessage,
   type DurableLarkMessageEventType,
@@ -1264,10 +1264,19 @@ export function __resetEventClaimsForTest(): void {
   pendingMessageTriggers.clear();
 }
 
-export async function getGroupStats(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
+export async function getGroupStats(
+  larkAppId: string,
+  chatId: string,
+  options: { requireFresh?: boolean } = {},
+): Promise<{ userCount: number; botCount: number }> {
   const cacheKey = `${larkAppId}:${chatId}`;
   const cached = chatStatsCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
+  // Lark cluster delivery sends one membership event to one connected replica,
+  // not to every process that owns the same app. Primary replicas therefore
+  // cannot authorize the solo-group bypass from their process-local cache.
+  // A required fresh read also refuses the stale fallback on API failure and
+  // safely degrades to "multi-member: require @mention".
+  if (!options.requireFresh && cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
     return { userCount: cached.userCount, botCount: cached.botCount };
   }
   try {
@@ -1278,7 +1287,7 @@ export async function getGroupStats(larkAppId: string, chatId: string): Promise<
     // Soft failure — the fallback below assumes worst case (multi-user,
     // multi-bot → require @mention). No user-visible regression, so debug.
     logger.debug(`Failed to get chat stats for ${chatId}, using safe fallback: ${err}`);
-    if (cached) return { userCount: cached.userCount, botCount: cached.botCount };
+    if (!options.requireFresh && cached) return { userCount: cached.userCount, botCount: cached.botCount };
     // Fallback: assume multi-person, multi-bot → require @mention to be safe.
     return { userCount: 999, botCount: 999 };
   }
@@ -2456,6 +2465,10 @@ async function sendGrantRequestToApproverDm(o: {
  */
 export async function checkGroupMessageAccess(
   larkAppId: string, message: any, chatId: string, senderOpenId: string | undefined, memberUnionId?: string,
+  groupStatsOptions?: {
+    requireFresh?: boolean;
+    snapshot?: { userCount: number; botCount: number };
+  },
 ): Promise<'allowed' | 'not_allowed' | 'ignore'> {
   const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
   // 群消息访问检查只在人路径调用，union 走 memberUnionId 腿（不进 bot-trust）。
@@ -2475,7 +2488,8 @@ export async function checkGroupMessageAccess(
   // 'ignore'，挡住「用户 @ 新 bot、老 bot 跟着回复」。群聊 @ 策略 never/ambient
   // 在调用方（relax 条款）已先行结算，这里不受影响。
   if (isAllowed && isSoloGroupMentionBypassEnabled(larkAppId, chatId) && !mentionsAnotherMember(larkAppId, message)) {
-    const { userCount, botCount } = await getGroupStats(larkAppId, chatId);
+    const { userCount, botCount } = groupStatsOptions?.snapshot
+      ?? await getGroupStats(larkAppId, chatId, groupStatsOptions);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
     if (userCount <= 1 && botCount <= 1) {
       return 'allowed';
@@ -2592,6 +2606,8 @@ export interface RoutingContext {
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
+  /** Durable-primary only: queue one lifecycle control after Session admission. */
+  queuePostAdmissionControl?: (event: DurableInboxEvent) => void;
 }
 
 interface PendingForwardTopicPayload {
@@ -4430,7 +4446,17 @@ export interface LarkEventDispatcherRuntime {
 }
 
 export interface LarkEventDispatcherRuntimeOptions {
+  /** Realtime event ingress. In primary multi-replica mode every connected
+   * Lark SDK client must be allowed to persist the event selected for it. */
   enqueuePrimary?: (input: {
+    eventId: string;
+    eventType?: DurableLarkMessageEventType;
+    partitionKey: string;
+    data: unknown;
+  }) => Promise<unknown>;
+  /** Leader-fenced history recovery ingress. Defaults to enqueuePrimary for
+   * backward compatibility with single-replica callers and tests. */
+  enqueuePrimaryRecovery?: (input: {
     eventId: string;
     eventType?: DurableLarkMessageEventType;
     partitionKey: string;
@@ -4441,6 +4467,20 @@ export interface LarkEventDispatcherRuntimeOptions {
     partitionKey: string;
     data: unknown;
   }) => Promise<unknown>;
+  /** Persist a recall before ACK so another replica cannot retain recalled
+   * group-context text after an owner move. */
+  persistPrimaryGroupContextRecall?: (input: {
+    larkAppId: string;
+    chatId: string;
+    messageId: string;
+    deletedAt: number;
+  }) => Promise<void>;
+  /** Hydrate the local projection from the shared recall log before composing
+   * group background on a replica that may not have received the WS event. */
+  readPrimaryGroupContextRecalls?: (input: {
+    larkAppId: string;
+    chatId: string;
+  }) => Promise<Array<{ messageId: string; deletedAt: number }>>;
   /** ACK 前的同步权限/生命周期预检；consumer 仍会在副作用前再次验证。 */
   authorizePrimaryControl?: (data: unknown) => boolean | Promise<boolean>;
   /**
@@ -4467,7 +4507,8 @@ interface PrimaryProcessContext {
   context: DurableLarkCanonicalHandlerContext;
 }
 
-/** Build routing once; leadership decides whether this replica connects WS. */
+/** Build routing once. In primary mode every replica connects WS; the
+ * application lease elects only the replica that performs history recovery. */
 export function createLarkEventDispatcherRuntime(
   larkAppId: string,
   larkAppSecret: string,
@@ -5504,7 +5545,7 @@ export function createLarkEventDispatcherRuntime(
         const mentionsOther = mentionsAnotherMember(larkAppId, message);
         let stats: { userCount: number; botCount: number } | null = null;
         if (soloGroupMentionBypass && ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
-          stats = await getGroupStats(larkAppId, chatId);
+          stats = await getGroupStats(larkAppId, chatId, { requireFresh: !!primary });
         }
         // 免@ 斜杠命令（commandTriggers）：与「群聊 @ 策略」正交 —— 它不放开整个群
         // 的免@，只放开配置里那几条命令，所以 mentionMode 留在默认 'always' 的群
@@ -5588,7 +5629,17 @@ export function createLarkEventDispatcherRuntime(
           );
         }
         if (!relax) {
-          const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId, humanSenderUnionId);
+          const access = await checkGroupMessageAccess(
+            larkAppId,
+            message,
+            chatId,
+            senderOpenId,
+            humanSenderUnionId,
+            {
+              requireFresh: !!primary,
+              ...(stats ? { snapshot: stats } : {}),
+            },
+          );
           if (access === 'not_allowed') {
             // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
             // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
@@ -5674,6 +5725,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionOutput: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionOutput,
+                queuePostAdmissionControl: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).queuePostAdmissionControl,
               }
             : {}
         ),
@@ -5876,7 +5930,16 @@ export function createLarkEventDispatcherRuntime(
         if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)) {
           const mode = getCachedChatMode(larkAppId, editedChatId) ?? await getChatModeStrict(larkAppId, editedChatId);
           if (mode === 'p2p') data.message.chat_type = 'p2p';
-          else if (mode === 'group' || mode === 'topic') ingestGroupContextEvent(larkAppId, data);
+          else if (mode === 'group' || mode === 'topic') {
+            if (primary && runtimeOptions.readPrimaryGroupContextRecalls) {
+              const recalls = await runtimeOptions.readPrimaryGroupContextRecalls({
+                larkAppId,
+                chatId: editedChatId,
+              });
+              for (const recall of recalls) ingestGroupContextRecall(larkAppId, { chatId: editedChatId, ...recall });
+            }
+            ingestGroupContextEvent(larkAppId, data);
+          }
           else logger.debug(`[message-updated:${larkAppId}] chat mode unconfirmed, group-context skipped msg=${messageId.substring(0, 12)}`);
         }
       } catch (err) {
@@ -5945,21 +6008,6 @@ export function createLarkEventDispatcherRuntime(
     runtimeOptions.primaryRecoverySettleMs ?? PRIMARY_INGRESS_RECOVERY_SETTLE_MS,
   ));
 
-  const enqueuePrimaryAfterRecovery = (
-    input: Parameters<NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>>[0],
-  ): Promise<unknown> => {
-    const enqueue = runtimeOptions.enqueuePrimary;
-    if (!enqueue) return Promise.reject(new Error('durable primary enqueue is not configured'));
-    const recovery = primaryRecovery;
-    if (!recovery) return enqueue(input);
-    return recovery.ready.then(() => {
-      if (recovery.controller.signal.aborted || primaryRecovery !== recovery) {
-        throw new Error('durable primary ingress leadership changed during recovery');
-      }
-      return enqueue(input);
-    });
-  };
-
   type PrimaryIngressInput = Parameters<
     NonNullable<LarkEventDispatcherRuntimeOptions['enqueuePrimary']>
   >[0];
@@ -5978,11 +6026,14 @@ export function createLarkEventDispatcherRuntime(
       .then(async () => {
         try {
           const input = await buildInput();
-          // Register the recovery continuation or concrete partition tail
-          // before releasing the app-wide arrival slot. The durable write is
-          // still awaited only by this event's ACK, so different chats retain
-          // their normal database concurrency.
-          void enqueuePrimaryAfterRecovery(input).then(resolveAck, rejectAck);
+          // Register the concrete partition tail before releasing the app-wide
+          // arrival slot. In primary multi-replica mode this write is valid on
+          // every SDK client: Feishu uses cluster delivery and randomly picks
+          // one connected client, so standby sockets cannot wait for the
+          // recovery-leader gate before durably accepting realtime events.
+          const enqueue = runtimeOptions.enqueuePrimary;
+          if (!enqueue) throw new Error('durable primary enqueue is not configured');
+          void enqueue(input).then(resolveAck, rejectAck);
         } catch (error) {
           rejectAck(error);
         }
@@ -6246,13 +6297,23 @@ export function createLarkEventDispatcherRuntime(
     // 刻意不走 message_id claim（原消息已 claim 过同 id）。
     // 消息撤回：只给群聊上下文共享记录写 tombstone（group-context-ingest 自带开关与
     // 错误隔离），不影响任何会话 / 任务状态。recall 幂等，无需 message_id claim。
-    'im.message.recalled_v1': (data: any) => {
+    'im.message.recalled_v1': async (data: any) => {
       const ev = data?.event ?? data;
-      ingestGroupContextRecall(larkAppId, {
-        chatId: ev?.chat_id ?? ev?.message?.chat_id,
-        messageId: ev?.message_id ?? ev?.message?.message_id,
-        recallTime: ev?.recall_time,
-      });
+      const chatId = ev?.chat_id ?? ev?.message?.chat_id;
+      const messageId = ev?.message_id ?? ev?.message?.message_id;
+      const recallTime = ev?.recall_time;
+      if (runtimeOptions.enqueuePrimary) {
+        if (typeof chatId !== 'string' || !chatId || typeof messageId !== 'string' || !messageId) return;
+        const eventKey = `im.message.recalled_v1:${larkAppId}:${eventIdForKey(data) ?? messageId}`;
+        await enqueuePrimaryInArrivalOrder(() => ({
+          eventId: eventKey,
+          eventType: 'lark.im.message.recalled_v1',
+          partitionKey: rawMessageIngressAnchor(larkAppId, { chat_id: chatId }),
+          data,
+        }));
+        return;
+      }
+      ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime });
     },
     'im.message.updated_v1': async (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;
@@ -6339,12 +6400,13 @@ export function createLarkEventDispatcherRuntime(
     leadershipSignal: AbortSignal;
     resolve: () => void;
   } | undefined;
+  let primaryTransportReady = false;
 
   const beginPrimaryRecovery = (
     leadershipSignal: AbortSignal,
     afterFirstPass?: Promise<void>,
   ): Promise<void> => {
-    const enqueue = runtimeOptions.enqueuePrimary;
+    const enqueue = runtimeOptions.enqueuePrimaryRecovery ?? runtimeOptions.enqueuePrimary;
     if (!enqueue) throw new Error('durable primary recovery requires enqueuePrimary');
     primaryRecovery?.controller.abort(new Error('durable primary ingress recovery superseded'));
     const controller = new AbortController();
@@ -6461,6 +6523,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const settlePrimaryTransportReady = (): void => {
+    primaryTransportReady = true;
     const pending = pendingTransportReady;
     if (!pending || pending.leadershipSignal.aborted
         || pending.leadershipSignal !== primaryLeadershipSignal) return;
@@ -6469,6 +6532,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const restartPrimaryTransportRecovery = (): void => {
+    primaryTransportReady = false;
     if (!runtimeOptions.enqueuePrimary || !primaryLeadershipSignal
         || primaryLeadershipSignal.aborted) return;
     const ready = armPrimaryTransportRecovery(primaryLeadershipSignal);
@@ -6523,7 +6587,9 @@ export function createLarkEventDispatcherRuntime(
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
-    const ready = armPrimaryTransportRecovery(input.signal);
+    const ready = primaryTransportReady
+      ? beginPrimaryRecovery(input.signal, Promise.resolve())
+      : armPrimaryTransportRecovery(input.signal);
     const client = connect();
     return { client, ready };
   };
@@ -6536,6 +6602,7 @@ export function createLarkEventDispatcherRuntime(
       primaryRecovery = undefined;
       primaryLeadershipSignal = undefined;
       pendingTransportReady = undefined;
+      primaryTransportReady = false;
       if (listenerPollTimer) clearInterval(listenerPollTimer);
       if (initialListenerPollTimer) clearTimeout(initialListenerPollTimer);
       listenerPollTimer = undefined;
@@ -6551,7 +6618,33 @@ export function createLarkEventDispatcherRuntime(
       const primary = { message, context };
       const result = await serializeByAnchor(
         message.partitionKey,
-        () => {
+        async () => {
+          if (message.eventType === 'lark.im.message.recalled_v1') {
+            const ev = (message.data as any)?.event ?? message.data as any;
+            const chatId = ev?.chat_id ?? ev?.message?.chat_id;
+            const messageId = ev?.message_id ?? ev?.message?.message_id;
+            const deletedAt = Math.trunc(Number(ev?.recall_time)) || Date.now();
+            if (typeof chatId !== 'string' || !chatId
+                || typeof messageId !== 'string' || !messageId) {
+              throw new Error('durable primary recall is missing chat/message identity');
+            }
+            if (isGroupContextEnabled(larkAppId, chatId)) {
+              if (!runtimeOptions.persistPrimaryGroupContextRecall) {
+                throw new Error('durable primary recall persistence is not configured');
+              }
+              await runtimeOptions.persistPrimaryGroupContextRecall({
+                larkAppId,
+                chatId,
+                messageId,
+                deletedAt,
+              });
+              ingestGroupContextRecall(larkAppId, { chatId, messageId, recallTime: deletedAt });
+            }
+            return {
+              kind: 'ignored' as const,
+              reason: 'durable primary group-context recall committed',
+            };
+          }
           // The legacy path captures synchronously before SDK ACK. Primary has
           // already persisted this exact event before ACK, so capture belongs
           // inside the claimed partition lane. InputCaptureRuntime is
@@ -6574,6 +6667,16 @@ export function createLarkEventDispatcherRuntime(
                 reason: `durable primary input capture rejected: ${error.code}`,
               });
             }
+          }
+          const rawMessage = (message.data as any)?.message ?? (message.data as any)?.event?.message;
+          const chatId = rawMessage?.chat_id;
+          if (rawMessage?.chat_type !== 'p2p'
+              && typeof chatId === 'string'
+              && chatId
+              && isGroupContextEnabled(larkAppId, chatId)
+              && runtimeOptions.readPrimaryGroupContextRecalls) {
+            const recalls = await runtimeOptions.readPrimaryGroupContextRecalls({ larkAppId, chatId });
+            for (const recall of recalls) ingestGroupContextRecall(larkAppId, { chatId, ...recall });
           }
           return message.eventType === 'lark.im.message.updated_v1'
             ? processMessageUpdatedEvent(message.data, primary)

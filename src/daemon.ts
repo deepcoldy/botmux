@@ -26,6 +26,7 @@ import {
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
 import {
+  globalConfigPath,
   readGlobalConfig,
   repoPickerScanOptions,
   isMultiTopicOrchestrationEnabled,
@@ -125,11 +126,26 @@ import {
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import {
   claimDurableLarkActiveSession,
+  listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from './services/durable-session-primary.js';
 import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
+import { requestDurableSessionControl } from './services/durable-session-control-request.js';
+import {
+  createDurableGroupContextRecallFacade,
+  readDurableGroupContextRecalls,
+  recordDurableGroupContextRecall,
+} from './services/durable-group-context-recall.js';
+import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  runDurableConfigMutation,
+  setDurableConfigCoordinator,
+} from './services/durable-config-mutation.js';
 import { closeResidualIsLocal, describeCloseResidual } from './core/close-residual.js';
-import { durableLarkSessionControlPartitionPrefix } from './services/durable-lark-session-control.js';
+import {
+  durableDirectSessionControlEvent,
+  durableLarkSessionControlPartitionPrefix,
+} from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -198,6 +214,8 @@ import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
   setDurableSessionSendHandler(null);
+  setDurableSessionLifecycleHandler(null);
+  setDurableSessionListHandler(null);
 }
 
 interface ScheduleRunLogErrorDetails {
@@ -360,7 +378,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -691,7 +709,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -27930,6 +27948,30 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
+      // durable-primary 下，精确的文字 `/close` 本身也是一条持久化 ingress 事件。
+      // 此处不改副本本地 Session：先提交本消息的 active 快照，再追加独立的
+      // owner-routed control；provider 回收与 canonical closed 提交都由该 control
+      // 负责，当前副本消失后仍可恢复。`/close wt` 暂时保留原确认流程，等待
+      // worktree retirement 接入同一套分布式协议。
+      if (cmd === '/close'
+          && commandContent.trim().toLowerCase() === '/close'
+          && existingDs
+          && senderOpenId
+          && ctx.queuePostAdmissionControl) {
+        const sessionId = existingDs.session.sessionId;
+        ctx.queuePostAdmissionControl(durableDirectSessionControlEvent({
+          source: 'lark-command',
+          larkAppId,
+          operationId: `lark-command.session-control:${larkAppId}:${parsed.messageId}`,
+          action: 'close',
+          sessionId,
+          rootId: storedSessionAnchorId(existingDs.session),
+          operatorOpenId: senderOpenId,
+          cardMessageId: existingDs.streamCardId ?? existingDs.session.streamCardId,
+        }));
+        markIngressAdmitted(ctx);
+        return true;
+      }
       // First message of a fresh thread carrying a session-needing daemon command
       // — e.g. another bot dispatched `/repo <path>` into a brand-new thread.
       // Without a session, handleCommand gets ds=undefined and `/repo` (and other
@@ -29039,10 +29081,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     { allowPrimary: true },
   );
   const durablePrimaryRuntimes: DurableLarkPrimaryRuntime[] = [];
+  const durablePrimaryEventRuntimes: LarkEventDispatcherRuntime[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
     ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
     : undefined;
+  const durableGroupContextRecallFacade = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableGroupContextRecallFacade({
+        store: durableCoordinationRuntime.store,
+        ownerId: `group-context-recall:${getDaemonBootId()}`,
+      })
+    : undefined;
+  const durableConfigCoordinator = durableCoordinationRuntime?.mode === 'primary'
+    ? createDurableConfigCoordinator({
+        store: durableCoordinationRuntime.store,
+        ownerId: `config-daemon:${getDaemonBootId()}`,
+      })
+    : undefined;
+  setDurableConfigCoordinator(durableConfigCoordinator);
   durableSessionShadowFacade = durableSessionFacade;
   const durableInboxShadowConsumer = durableCoordinationRuntime?.mode === 'shadow'
     ? startDurableInboxShadowConsumer({
@@ -29343,7 +29399,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     scheduleAuthorityStore = null;
     scheduler.setScheduleAuthorityUnavailable(error);
   }
-  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
+  void runDurableConfigMutation({
+    scope: 'global',
+    path: globalConfigPath(),
+    mutation: () => migrateOverloadAlertAtStartup(
+      botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })),
+    ),
+  }).catch(error => logger.warn(
+    `[durable-config] overload alert migration skipped: ${error instanceof Error ? error.message : String(error)}`,
+  ));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
@@ -30659,6 +30723,47 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         let primaryControlRuntime: ReturnType<
           typeof createDurableLarkSessionControlRuntime
         > | undefined;
+        const takeOverPrimarySession = async (
+          stableKey: string,
+          canonical: Session,
+        ): Promise<Session | { kind: 'retry'; reason: string } | undefined> => {
+          if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+          try {
+            const claimed = await claimDurableLarkActiveSession({
+              facade: primaryRuntime.session,
+              sessionKey: stableKey,
+              expectedSessionId: canonical.sessionId,
+              expectedLarkAppId: cfg.larkAppId,
+            });
+            if (claimed.kind !== 'claimed') {
+              return {
+                kind: 'retry',
+                reason: claimed.kind === 'occupied'
+                  ? `active Session lease is still owned by ${claimed.ownerId}`
+                  : `active Session takeover is not ready: ${claimed.kind}`,
+              };
+            }
+            const local = activeSessions.get(stableKey);
+            if (local?.session.sessionId === claimed.session.sessionId
+                && local.session.status === 'active') {
+              return local.session;
+            }
+            const takeover = await takeOverDurableActiveRemoteSession(
+              claimed.session,
+              activeSessions,
+            );
+            if (!takeover.ok) {
+              throw new Error(
+                `durable active takeover failed: ${takeover.error}`
+                + (takeover.detail ? ` (${takeover.detail})` : ''),
+              );
+            }
+            return takeover.ds.session;
+          } catch (error) {
+            await primaryRuntime.session.releaseLease(stableKey);
+            throw error;
+          }
+        };
         const eventRuntime = createLarkEventDispatcherRuntime(
           cfg.larkAppId,
           cfg.larkAppSecret,
@@ -30668,56 +30773,36 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           {
             enqueuePrimary: input => {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+              return primaryRuntime.ingress.enqueueClusterBeforeAck(input);
+            },
+            enqueuePrimaryRecovery: input => {
+              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
               return primaryRuntime.ingress.enqueueBeforeAck(input);
             },
             enqueuePrimaryControl: input => {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
-              return primaryRuntime.ingress.enqueueControlBeforeAck(input);
+              return primaryRuntime.ingress.enqueueClusterControlBeforeAck(input);
             },
+            persistPrimaryGroupContextRecall: async input => {
+              if (!primaryRuntime || !durableGroupContextRecallFacade) {
+                throw new Error('durable primary recall runtime is not ready');
+              }
+              await recordDurableGroupContextRecall({
+                facade: durableGroupContextRecallFacade,
+                ...input,
+              });
+            },
+            readPrimaryGroupContextRecalls: input => readDurableGroupContextRecalls({
+              store: durableCoordinationRuntime.store,
+              ...input,
+            }),
             authorizePrimaryControl: async data =>
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             readPrimarySession: async stableKey => {
               const current = await durableCoordinationRuntime.store.readSession(stableKey);
               return current ? parseDurablePrimarySessionRecord(current).session : undefined;
             },
-            takeOverPrimarySession: async (stableKey, canonical) => {
-              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
-              try {
-                const claimed = await claimDurableLarkActiveSession({
-                  facade: primaryRuntime.session,
-                  sessionKey: stableKey,
-                  expectedSessionId: canonical.sessionId,
-                  expectedLarkAppId: cfg.larkAppId,
-                });
-                if (claimed.kind !== 'claimed') {
-                  return {
-                    kind: 'retry' as const,
-                    reason: claimed.kind === 'occupied'
-                      ? `active Session lease is still owned by ${claimed.ownerId}`
-                      : `active Session takeover is not ready: ${claimed.kind}`,
-                  };
-                }
-                const local = activeSessions.get(stableKey);
-                if (local?.session.sessionId === claimed.session.sessionId
-                    && local.session.status === 'active') {
-                  return local.session;
-                }
-                const takeover = await takeOverDurableActiveRemoteSession(
-                  claimed.session,
-                  activeSessions,
-                );
-                if (!takeover.ok) {
-                  throw new Error(
-                    `durable active takeover failed: ${takeover.error}`
-                    + (takeover.detail ? ` (${takeover.detail})` : ''),
-                  );
-                }
-                return takeover.ds.session;
-              } catch (error) {
-                await primaryRuntime.session.releaseLease(stableKey);
-                throw error;
-              }
-            },
+            takeOverPrimarySession,
           },
         );
         startEventDispatchers.push(() => {
@@ -30750,6 +30835,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 throw new Error('canonical closed Session materialization did not persist');
               }
               return materialized;
+            },
+            takeOverActiveSession: async (stableKey, canonical) => {
+              const takeover = await takeOverPrimarySession(stableKey, canonical);
+              return takeover && 'kind' in takeover ? undefined : takeover;
             },
             canOperate: (chatId, operatorOpenId) =>
               canOperate(cfg.larkAppId, chatId, operatorOpenId),
@@ -30836,7 +30925,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 );
               });
             },
-            onLeadershipLost: () => { eventRuntime.close(); },
+            // Leadership fences only REST history recovery. Every replica keeps
+            // an active SDK client because Feishu distributes one event to one
+            // random connection; closing standby sockets recreates the p2p and
+            // WS-only no-owner window that history APIs cannot repair.
             onSessionLeaseLost: stableKey => {
               const ds = activeSessions.get(stableKey);
               if (!ds || ds.larkAppId !== cfg.larkAppId) return;
@@ -30856,7 +30948,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ),
           });
           durablePrimaryRuntimes.push(primaryRuntime);
+          durablePrimaryEventRuntimes.push(eventRuntime);
           durablePrimaryRuntimeByApp.set(cfg.larkAppId, primaryRuntime);
+          eventRuntime.connect();
           void primaryRuntime.ready.then(() => {
             logger.info(`[durable-primary:${cfg.larkAppId}] runtime ready`);
           });
@@ -31039,6 +31133,56 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       },
     }));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
+    const quarantinedDashboardSessionKeys = new Set<string>();
+    setDurableSessionListHandler(async () => {
+      const listSessions = durableCoordinationRuntime.store.listSessions;
+      if (!listSessions) throw new Error('durable_primary_session_listing_unavailable');
+      const sessions = new Map<string, Session>();
+      let afterSessionKey: string | undefined;
+      for (let page = 0; page < 40; page += 1) {
+        const listed = await listSessions.call(durableCoordinationRuntime.store, {
+          ...(afterSessionKey ? { afterSessionKey } : {}),
+          limit: 256,
+        });
+        for (const session of listValidDurablePrimarySessions(
+          listed.records,
+          cfg.larkAppId,
+          (record, error) => {
+            if (quarantinedDashboardSessionKeys.has(record.sessionKey)) return;
+            quarantinedDashboardSessionKeys.add(record.sessionKey);
+            while (quarantinedDashboardSessionKeys.size > 1_024) {
+              quarantinedDashboardSessionKeys.delete(quarantinedDashboardSessionKeys.values().next().value!);
+            }
+            logger.warn(
+              `[dashboard] quarantined invalid canonical Session ${record.sessionKey}: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          },
+        )) {
+          sessions.set(session.sessionId, session);
+        }
+        if (!listed.nextSessionKey) return [...sessions.values()];
+        afterSessionKey = listed.nextSessionKey;
+      }
+      throw new Error('durable_primary_session_listing_limit_exceeded');
+    });
+    setDurableSessionLifecycleHandler(async request => {
+      const local = findActiveBySessionId(request.sessionId)?.session
+        ?? sessionStore.getOwnedSession(request.sessionId);
+      const larkAppId = local?.larkAppId || cfg.larkAppId;
+      const rootId = request.rootId ?? (local ? storedSessionAnchorId(local) : undefined);
+      const runtime = durablePrimaryRuntimeByApp.get(larkAppId);
+      if (!runtime) return { ok: false, error: 'durable_primary_unavailable' };
+      return requestDurableSessionControl({
+        store: durableCoordinationRuntime.store,
+        request: {
+          larkAppId,
+          ...(rootId ? { sessionKey: sessionKey(rootId, larkAppId) } : {}),
+          sessionId: request.sessionId,
+          action: request.action,
+        },
+      });
+    });
   } else {
     useOrdinaryOutputDelivery();
   }
@@ -31892,6 +32036,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
     setTurnResultRuntime(undefined);
+    for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) {
       const stopped = await runtime.stop(remainingBudget());
       if (stopped.kind === 'timed_out') {
@@ -31900,6 +32045,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
+    setDurableSessionLifecycleHandler(null);
+    setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
     await durableInboxShadowConsumer?.stop(remainingBudget());
     const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
     if (durableSessionStop?.kind === 'timed_out') {
@@ -31911,6 +32059,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
+    }
+    const durableRecallStop = await durableGroupContextRecallFacade?.stop(remainingBudget());
+    if (durableRecallStop?.kind === 'timed_out') {
+      logger.warn(
+        `[durable-recall] facade stop timed out `
+        + `(pending=${durableRecallStop.pendingSessionKeys.length}, `
+        + `unreleased=${durableRecallStop.unreleasedSessionKeys.length})`,
+      );
     }
 
     // Flush any pending identity-cache writes before exit. The cache uses a
@@ -31971,9 +32127,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);
+    setDurableSessionLifecycleHandler(null);
+    setDurableSessionListHandler(null);
+    setDurableConfigCoordinator(undefined);
+    for (const runtime of durablePrimaryEventRuntimes) runtime.close();
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();
+    durableGroupContextRecallFacade?.terminate();
     if (durableSessionShadowFacade === durableSessionFacade) {
       durableSessionShadowFacade = undefined;
     }

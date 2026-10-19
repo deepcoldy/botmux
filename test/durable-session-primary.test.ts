@@ -15,6 +15,7 @@ import {
   claimDurableLarkActiveSession,
   commitDurableLarkSessionControl,
   durablePrimarySessionProjection,
+  listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
 } from '../src/services/durable-session-primary.js';
 
@@ -423,5 +424,27 @@ describe('durable primary Session admission', () => {
       value: projected.value,
       updatedAt: 1,
     })).toThrow(/mismatched routing identity/);
+  });
+
+  it('quarantines a malformed legacy row without hiding valid Dashboard rows', () => {
+    const projected = durablePrimarySessionProjection(session(), message('om_current'));
+    const valid: DurableSessionRecord = {
+      sessionKey: projected.sessionKey,
+      revision: 1,
+      value: projected.value,
+      updatedAt: 1,
+    };
+    const invalid: DurableSessionRecord = {
+      ...valid,
+      sessionKey: 'om_stale_legacy::cli_test',
+    };
+    const onInvalid = vi.fn();
+
+    expect(listValidDurablePrimarySessions(
+      [invalid, valid],
+      'cli_test',
+      onInvalid,
+    )).toEqual([expect.objectContaining({ sessionId: 'session-1' })]);
+    expect(onInvalid).toHaveBeenCalledWith(invalid, expect.any(Error));
   });
 });

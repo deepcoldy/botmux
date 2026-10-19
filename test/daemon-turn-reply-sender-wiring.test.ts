@@ -7,6 +7,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const daemonSource = readFileSync(join(__dirname, '..', 'src', 'daemon.ts'), 'utf8');
 
 describe('daemon per-turn reply sender + participant wiring', () => {
+  it('keeps a realtime Lark SDK client on every primary replica and fences only history recovery', () => {
+    expect(daemonSource).toContain('return primaryRuntime.ingress.enqueueClusterBeforeAck(input);');
+    expect(daemonSource).toContain('enqueuePrimaryRecovery: input => {');
+    expect(daemonSource).toContain('return primaryRuntime.ingress.enqueueBeforeAck(input);');
+    expect(daemonSource).toContain('return primaryRuntime.ingress.enqueueClusterControlBeforeAck(input);');
+    expect(daemonSource).toContain('durablePrimaryEventRuntimes.push(eventRuntime);');
+    expect(daemonSource).toContain('eventRuntime.connect();');
+    expect(daemonSource).not.toContain('onLeadershipLost: () => { eventRuntime.close(); }');
+  });
+
   it('wires delayed raw-input credential preparation into worker-pool startup', () => {
     expect(daemonSource).toContain(
       'prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',

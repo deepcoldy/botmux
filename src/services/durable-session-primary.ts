@@ -55,6 +55,7 @@ export interface DurablePrimarySessionControl {
   sessionId: string;
   operatorOpenId: string;
   cardMessageId: string;
+  source?: 'lark-command' | 'trusted-host';
   result: DurableJson;
 }
 
@@ -165,6 +166,9 @@ function parseControl(
     sessionId: boundedText(raw.sessionId, 'durable control sessionId', 256),
     operatorOpenId: boundedText(raw.operatorOpenId, 'durable control operatorOpenId', 256),
     cardMessageId: boundedText(raw.cardMessageId, 'durable control cardMessageId', 256),
+    ...(raw.source === 'lark-command' || raw.source === 'trusted-host'
+      ? { source: raw.source }
+      : {}),
     result: JSON.parse(JSON.stringify(result)) as DurableJson,
   };
 }
@@ -272,6 +276,31 @@ export function parseDurablePrimarySessionRecord(record: DurableSessionRecord): 
   return { session, admission, admissions, controls };
 }
 
+/**
+ * Project a storage page for read-only management views. A single malformed
+ * legacy/corrupt primary row must remain quarantined instead of taking the
+ * whole Dashboard offline; mutation paths still use the strict parser above
+ * and therefore continue to fail closed for that row.
+ */
+export function listValidDurablePrimarySessions(
+  records: readonly DurableSessionRecord[],
+  larkAppId: string,
+  onInvalid?: (record: DurableSessionRecord, error: unknown) => void,
+): Session[] {
+  const sessions: Session[] = [];
+  for (const record of records) {
+    const value = object(record.value);
+    if (value?.type !== 'botmux.session.primary') continue;
+    try {
+      const session = parseDurablePrimarySessionRecord(record).session;
+      if (session.larkAppId === larkAppId) sessions.push(session);
+    } catch (error) {
+      onInvalid?.(record, error);
+    }
+  }
+  return sessions;
+}
+
 function mergePrimaryProjection(
   current: DurableSessionRecord | undefined,
   next: DurablePrimarySessionProjection,
@@ -335,6 +364,9 @@ export async function commitDurableLarkSessionControl(input: {
     sessionId: input.control.sessionId,
     operatorOpenId: boundedText(input.control.operatorOpenId, 'durable control operatorOpenId', 256),
     cardMessageId: boundedText(input.control.cardMessageId, 'durable control cardMessageId', 256),
+    ...(input.control.source === 'lark-command' || input.control.source === 'trusted-host'
+      ? { source: input.control.source }
+      : {}),
     result: JSON.parse(JSON.stringify(input.result)) as DurableJson,
   };
   const sessionValue = cloneSession(input.session);

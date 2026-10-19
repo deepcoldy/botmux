@@ -1,11 +1,16 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { config } from '../config.js';
+import {
+  assertDurableConfigMutationAllowed,
+  runDurableConfigMutation,
+} from './durable-config-mutation.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
 
 export const GROUP_CONTEXT_SETTINGS_STORE_FILE = 'group-context-settings.json';
+export const GROUP_CONTEXT_SETTINGS_FILE_ENV = 'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE';
 const GROUP_CHAT_ID_PATTERN = /^oc_[a-zA-Z0-9_-]+$/;
 
 export interface GroupContextSettings {
@@ -28,6 +33,16 @@ interface GroupContextSettingsRegistry {
 }
 
 function storePath(dataDir: string): string {
+  const configured = process.env[GROUP_CONTEXT_SETTINGS_FILE_ENV]?.trim();
+  if (configured) {
+    if (!isAbsolute(configured)) {
+      throw new Error(`${GROUP_CONTEXT_SETTINGS_FILE_ENV} must be an absolute path`);
+    }
+    return configured;
+  }
+  if (process.env.BOTMUX_COORDINATION_MODE?.trim() === 'primary') {
+    throw new Error(`${GROUP_CONTEXT_SETTINGS_FILE_ENV} is required in primary mode`);
+  }
   return join(dataDir, GROUP_CONTEXT_SETTINGS_STORE_FILE);
 }
 
@@ -76,6 +91,7 @@ function readRegistry(path: string): GroupContextSettingsRegistry {
 }
 
 function writeRegistry(path: string, registry: GroupContextSettingsRegistry): void {
+  assertDurableConfigMutationAllowed('group-context');
   atomicWriteFileSync(path, JSON.stringify(registry, null, 2), {
     mode: 0o600,
     followTargetSymlink: false,
@@ -91,14 +107,14 @@ export function getGroupContextSettings(
   // group-wide and appId must not imply per-app authorization or configuration.
   void appId;
   if (!GROUP_CHAT_ID_PATTERN.test(chatId)) return { ...DEFAULT_GROUP_CONTEXT_SETTINGS };
-  const path = storePath(dataDir);
   try {
+    const path = storePath(dataDir);
     const configs = readRegistry(path).configs;
     const settings = Object.hasOwn(configs, chatId) ? configs[chatId] : undefined;
     return { ...(settings ?? DEFAULT_GROUP_CONTEXT_SETTINGS) };
   } catch (error) {
     logger.warn(
-      `[group-context-settings] failed to load ${path}; sharing disabled: ${error instanceof Error ? error.message : String(error)}`,
+      `[group-context-settings] failed to load settings; sharing disabled: ${error instanceof Error ? error.message : String(error)}`,
     );
     return { ...DEFAULT_GROUP_CONTEXT_SETTINGS };
   }
@@ -132,15 +148,21 @@ export async function setGroupContextSettings(
   if (!GROUP_CHAT_ID_PATTERN.test(chatId)) throw new Error('invalid group chat ID');
   validatePatch(patch);
   const path = storePath(dataDir);
-  let result!: GroupContextSettings;
-  await withFileLock(path, async () => {
-    const registry = readRegistry(path);
-    result = {
-      ...(registry.configs[chatId] ?? DEFAULT_GROUP_CONTEXT_SETTINGS),
-      ...patch,
-    };
-    registry.configs[chatId] = result;
-    writeRegistry(path, registry);
+  return runDurableConfigMutation({
+    scope: 'group-context',
+    path,
+    mutation: async () => {
+      let result!: GroupContextSettings;
+      await withFileLock(path, async () => {
+        const registry = readRegistry(path);
+        result = {
+          ...(registry.configs[chatId] ?? DEFAULT_GROUP_CONTEXT_SETTINGS),
+          ...patch,
+        };
+        registry.configs[chatId] = result;
+        writeRegistry(path, registry);
+      });
+      return { ...result };
+    },
   });
-  return { ...result };
 }

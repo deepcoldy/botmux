@@ -3358,6 +3358,24 @@ describe('handleCommand', () => {
   });
 
   describe('/dismiss', () => {
+    it('fails closed in durable primary before invoking local group deletion', async () => {
+      process.env.BOTMUX_COORDINATION_MODE = 'primary';
+      try {
+        const deps = makeDeps();
+        await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+        expect(dismissSessionGroup).not.toHaveBeenCalled();
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          CHAT_ID,
+          expect.stringContaining('未删除任何会话'),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally {
+        delete process.env.BOTMUX_COORDINATION_MODE;
+      }
+    });
+
     it('registers as sessionless and routes confirmation without spawning a session', async () => {
       const deps = makeDeps();
       expect(SESSIONLESS_DAEMON_COMMANDS.has('/dismiss')).toBe(true);
@@ -3393,6 +3411,30 @@ describe('handleCommand', () => {
   });
 
   describe('/close', () => {
+    it.each(['/close', '/close wt', '/close wt --yes --state=unsafe'])('%s fails closed in durable primary before local close or worktree cleanup', async content => {
+      process.env.BOTMUX_COORDINATION_MODE = 'primary';
+      try {
+        const ds = makeDaemonSession({ scope: 'thread', workingDir: '/home/testuser/project-wt-task' });
+        ds.session.workingDir = '/home/testuser/project-wt-task';
+        const deps = makeDeps(ds);
+
+        await handleCommand('/close', ROOT_ID, makeLarkMessage(content), deps, LARK_APP_ID);
+
+        expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+        expect(removeRepoWorktree).not.toHaveBeenCalled();
+        expect(teardownAuthoritativePersistentBackingBeforeClose).not.toHaveBeenCalled();
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining('已拒绝本地关闭'),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally {
+        delete process.env.BOTMUX_COORDINATION_MODE;
+      }
+    });
+
     it('updates the group tag only after clean close and does not wait to deliver the close card', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -3520,6 +3562,33 @@ describe('handleCommand', () => {
       expect(reply).toContain(expected);
       if ((close as { outcome?: string }).outcome !== 'closed') {
         expect(reply).not.toContain('App Server 和 Codex App 会话仍在运行');
+      }
+    });
+
+    it.each(['/detach', '/disconnect'])('%s fails closed in durable primary before closing an adopted worker', async command => {
+      process.env.BOTMUX_COORDINATION_MODE = 'primary';
+      try {
+        const ds = makeDaemonSession({
+          session: makeSession({
+            cliId: 'codex' as any,
+            cliSessionId: '019e-existing-app-server-thread',
+            existingAppServerEndpoint: 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock',
+          }),
+        });
+        const deps = makeDeps(ds);
+
+        await handleCommand(command, ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+
+        expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining('本次未修改会话状态'),
+          undefined,
+          LARK_APP_ID,
+          'msg_001',
+        );
+      } finally {
+        delete process.env.BOTMUX_COORDINATION_MODE;
       }
     });
 

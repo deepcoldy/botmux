@@ -65,6 +65,45 @@ lines.on('line', line => {
     send({ ...base, type: 'result', result: { revision: 'wrong' } });
     return;
   }
+  if (request.method === 'listSessions') {
+    if (request.input?.limit === 999) {
+      send({ ...base, type: 'result', result: { records: [{ revision: 'wrong' }] } });
+      return;
+    }
+    send({
+      ...base,
+      type: 'result',
+      result: {
+        records: [{
+          sessionKey: 'session-a',
+          revision: 1,
+          value: { status: 'active' },
+          updatedAt: 2,
+        }],
+      },
+    });
+    return;
+  }
+  if (request.method === 'readAuxiliaryState' && request.input === 'invalid-result') {
+    send({ ...base, type: 'result', result: { revision: 'wrong' } });
+    return;
+  }
+  if (request.method === 'writeAuxiliaryState') {
+    send({
+      ...base,
+      type: 'result',
+      result: {
+        kind: 'written',
+        record: {
+          stateKey: request.input.lease.sessionKey,
+          revision: 1,
+          value: request.input.value,
+          updatedAt: 2,
+        },
+      },
+    });
+    return;
+  }
   if (request.method === 'enqueueControlOperation') {
     send({ ...base, type: 'result', result: { kind: 'inserted' } });
     return;
@@ -150,7 +189,8 @@ lines.on('line', line => {
     });
     return;
   }
-  if (request.method === 'readSession' || request.method === 'readOutbox'
+  if (request.method === 'readSession' || request.method === 'readAuxiliaryState'
+      || request.method === 'readOutbox'
       || request.method === 'readControlOperation'
       || request.method === 'claimNextInbox' || request.method === 'reserveNextOutbox') {
     send({ ...base, type: 'result', result: null });

@@ -7145,7 +7145,9 @@ async function prepareLiveRemoteWorkerClose(
       ok: false,
       error: backendType === 'riff'
         ? 'riff_worker_close_failed'
-        : 'remote_runner_close_reconciliation_required',
+        : result.recovery === 'retryable'
+          ? 'remote_runner_worker_close_failed'
+          : 'remote_runner_close_reconciliation_required',
       retryable: backendType === 'riff' || mayRestore,
       ...(result.recovery ? { recovery: result.recovery } : {}),
       ...(taskId ? { taskId } : {}),
@@ -7185,7 +7187,26 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   wakeRequestId: string,
   forkImpl: RemoteRunnerCloseFork = forkWorker,
 ): Promise<boolean> {
-  if (ds.worker && !ds.worker.killed) return true;
+  if (ds.worker && !ds.worker.killed) {
+    // Active-session takeover publishes the local DaemonSession immediately
+    // after fork admission, before the replacement worker has necessarily
+    // completed its provider handshake. Sending `close` in that gap races the
+    // worker's async init and can make it exit without a close_result. Wait for
+    // the exact admitted generation instead of treating mere process existence
+    // as control readiness.
+    const worker = ds.worker;
+    const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (findActiveBySessionId(ds.session.sessionId) !== ds
+          || ds.session.status !== 'active'
+          || ds.worker !== worker
+          || worker.killed) return false;
+      if (ds.workerReady === true) return true;
+      await new Promise(resolve => setTimeout(resolve, REMOTE_RUNNER_CLOSE_WAKE_POLL_MS));
+    }
+    logger.warn(`[${tag(ds)}] Timed out waiting for existing takeover worker readiness`);
+    return false;
+  }
   if (findActiveBySessionId(ds.session.sessionId) !== ds) return false;
   if (!normalizeRemoteRunnerBackendState(ds.session.remoteBackendState)) return false;
   if (isSessionTransferring(ds)
@@ -7298,7 +7319,7 @@ async function prepareRemoteRunnerExplicitClose(
       retryable: true,
     };
   }
-  if (!ds?.worker || ds.worker.killed) {
+  if (!ds?.worker || ds.worker.killed || ds.workerReady !== true) {
     if (!ds) {
       return {
         ok: false,
@@ -7311,7 +7332,8 @@ async function prepareRemoteRunnerExplicitClose(
     // A worker-less wake has no such runtime authority, so it must start only
     // from a valid opaque durable state and must never create a new provider
     // session merely to close it.
-    if (!normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
+    if ((!ds.worker || ds.worker.killed)
+        && !normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
       return {
         ok: false,
         error: 'remote_runner_row_inconsistent',

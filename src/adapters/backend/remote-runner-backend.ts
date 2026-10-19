@@ -40,6 +40,18 @@ type PendingRequest = {
   timer: NodeJS.Timeout;
 };
 
+type RemoteRunnerFailureEvent = Extract<RemoteRunnerEvent, { type: 'failure' }>;
+
+/** Preserve the provider's structured failure classification across the
+ * request Promise boundary. A plain Error loses whether an operation was
+ * provably not applied and therefore safe to retry. */
+class RemoteRunnerRequestError extends Error {
+  constructor(readonly event: RemoteRunnerFailureEvent) {
+    super(`${event.code}: ${event.message}`);
+    this.name = 'RemoteRunnerRequestError';
+  }
+}
+
 type OutboundOperation = {
   fingerprint: string;
   result: Promise<RemoteRunnerOutboundMessageResult>;
@@ -375,6 +387,17 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.closePrepared = true;
       return { ok: true };
     } catch (error) {
+      if (error instanceof RemoteRunnerRequestError
+          && error.event.status === 'failed'
+          && error.event.retryable) {
+        this.closing = false;
+        return {
+          ok: false,
+          error: error.message,
+          recovery: 'retryable',
+          admission: 'restorable',
+        };
+      }
       this.closeOutcomeUncertain = true;
       return {
         ok: false,
@@ -729,7 +752,7 @@ export class RemoteRunnerBackend implements SessionBackend {
         && event.type === 'status' && event.status === 'busy') {
       this.activeTurnAccepted = true;
     }
-    if (event.type === 'failure') pending.reject(new Error(`${event.code}: ${event.message}`));
+    if (event.type === 'failure') pending.reject(new RemoteRunnerRequestError(event));
     else pending.resolve(event);
   }
 
