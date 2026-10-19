@@ -150,7 +150,7 @@ import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, 
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
@@ -16918,7 +16918,11 @@ function setupWorkerHandlers(
           }
           const accessUrl = resolvePluginResultAccessUrl(msg.viewToken);
           if (!accessUrl) throw new Error('plugin_result_access_url_unavailable');
-          const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: msg.expiresAt });
+          const card = buildTrustedResultDeliveryCard({
+            accessUrl,
+            expiresAt: msg.expiresAt,
+            brand: getBotBrand(ds.larkAppId),
+          });
           const messageId = await scopedReply(card, 'interactive', msg.turnId, {
             uuid: deliveryUuid('entry'),
             replyTarget: frozen.target,
