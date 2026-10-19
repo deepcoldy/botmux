@@ -68,7 +68,7 @@ import {
   parseDashboardAskAnswerRequest,
   proxyDashboardAskAnswer,
 } from './dashboard/desktop-asks.js';
-import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
+import { createHostTerminalManager } from './dashboard/host-terminal.js';
 import { createSessionPreviewProxy, type PreviewProxyResolution } from './dashboard/preview-proxy.js';
 import {
   mintPreviewContentCapability,
@@ -908,22 +908,26 @@ aggregator.on(ev => {
   if (dashboardEventInvalidatesGroupsMatrix(ev)) groupsMatrixSnapshot.invalidate();
 });
 
-// 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
-// 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
-const debugTerminalManager = createDebugTerminalManager({
+// 宿主网页终端（管理 → 终端，owner-only）：本机登录 shell / tmux / herdr attach。
+const hostTerminalManager = createHostTerminalManager({
   getActiveToken: currentDashboardToken,
-  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/debug-terminal` 那条 `legacyAuthed`
+  // WS 升级不经 HTTP auth gate，所以在这里把 `/api/host-terminal` 那条 `legacyAuthed`
   // 门禁原样喂进去：解析出的身份必须是本机 legacy 管理身份，平台隧道注入的角色
-  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把裸 shell
+  // （X-Botmux-Role）不算——它带的也是本机活跃 cookie，只比 cookie 会把宿主 shell
   // 开放给平台上的任何人。
   isLegacyManagementRequest: (req) => dashboardRequestIdentity(req)?.kind === 'legacy-dashboard',
-  defaultWorkingDirs: () => {
-    const dirs = new Set<string>();
+  // `bmx-<sessionId 前 8 位>`（TmuxBackend.sessionName）→ 「bot · 话题」，让终端页的
+  // tmux 列表里托管会话有个人话名字。
+  describeManagedTmuxSession: (name) => {
+    const prefix = name.slice('bmx-'.length);
+    if (prefix.length !== 8) return undefined;
     for (const s of aggregator.getSessions()) {
-      const wd = (s as { workingDir?: unknown }).workingDir;
-      if (typeof wd === 'string' && wd.trim()) dirs.add(wd.trim());
+      if (!s.sessionId.startsWith(prefix)) continue;
+      const row = s as { botName?: unknown; title?: unknown };
+      const parts = [row.botName, row.title].filter((v): v is string => typeof v === 'string' && !!v.trim());
+      return parts.length ? parts.join(' · ') : undefined;
     }
-    return [...dirs];
+    return undefined;
   },
 });
 
@@ -4353,19 +4357,16 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // 调试终端（owner-only）：HTTP 路由挂在 auth gate 之后 → 已确保是管理 token。
-    // /api/debug-terminal（创建/关闭）+ /debug-terminal/<id>（xterm 页面）。
-    // WS 升级 /debug-terminal/<id>/ws 在下方 server.on('upgrade') 里由本 manager
-    // 自行校验 cookie（upgrade 不经这段 gate）。
-    if (
-      url.pathname === '/api/debug-terminal'
-      || url.pathname.startsWith('/api/debug-terminal/')
-      || url.pathname.startsWith('/debug-terminal/')
-    ) {
+    // 宿主网页终端（owner-only）：HTTP 路由挂在 auth gate 之后 → 已确保是管理 token，
+    // 这里再收窄到本机 legacy 管理身份。会 spawn 进程的 POST（新建/关闭）另过控制类
+    // CSRF 门禁。WS 升级 /host-terminal/<id>/ws 在下方 server.on('upgrade') 里由 manager
+    // 自行校验 cookie + 身份（upgrade 不经这段 gate）。
+    if (url.pathname === '/api/host-terminal' || url.pathname.startsWith('/api/host-terminal/')) {
       // H5 sessions are scoped to Dashboard/workbench control. They never
-      // inherit the legacy owner's unrestricted debug shell.
-      if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'legacy_owner_required' });
-      if (debugTerminalManager.handleHttp(req, res, url)) return;
+      // inherit the legacy owner's unrestricted host shell.
+      if (!legacyAuthed || !requestIdentity) return jsonRes(res, 403, { ok: false, error: 'legacy_owner_required' });
+      if (!enforceControlCsrf(req, res, requestIdentity)) return;
+      if (hostTerminalManager.handleHttp(req, res, url)) return;
     }
 
     if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
@@ -4631,6 +4632,9 @@ const server = createServer(async (req, res) => {
         settings: authed ? dashboardSettings : redactSettingsForPublic(dashboardSettings),
         lang: readGlobalConfig().lang ?? null,
         authed,
+        // 「终端」页只对本机 legacy 管理身份开放（同 /api/host-terminal 门禁），协管者
+        // 虽然 authed 也看不到这个入口。
+        hostTerminal: legacyAuthed,
         bound: readPlatformBinding() !== null,
       });
     }
@@ -7767,12 +7771,12 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
     // Preview 的 WS 必须第一个判：沙箱化之后它来自不透明来源（`Origin: null`），
     // 凭据是路径里的 content capability，绝不能被下面的管理类 Origin 校验误杀。
     if (sessionPreviewProxy.handleUpgrade(req, clientSocket, head)) return;
-    // P1-11：管理类 WS（终端 / 调试终端）升级不经 HTTP 门禁，浏览器对 WS 握手
+    // P1-11：管理类 WS（会话终端 / 宿主终端）升级不经 HTTP 门禁，浏览器对 WS 握手
     // 一定带 Origin，所以「带了但对不上（含 null）」一律拒——同站兄弟子域和
     // localhost 其它端口正是 SameSite=Lax 挡不住的那一类。
     //
     // 判之前**先按 path 分流**可信来源档位：会话终端 `/s/*` 认平台 `m-`+`t-`（分享
-    // 出去的终端页就住在 `t-`），而 `/debug-terminal/*` 的另一头是宿主裸 bash，只认
+    // 出去的终端页就住在 `t-`），而 `/host-terminal/*` 的另一头是宿主 shell，只认
     // management 档。合在一起判的话，`t-` 就连带成了裸 bash 那条 WS 的可信 Origin。
     const upgradeRoute = classifyManagementUpgrade(rawUrl);
     const upgradeOrigin = managementUpgradeOrigin(req.headers, upgradeRoute.surface);
@@ -7789,9 +7793,9 @@ server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) 
       ].join('\r\n'));
       return;
     }
-    // 调试终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
-    if (upgradeRoute.route === 'debug-terminal') {
-      if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
+    // 宿主终端 WS（owner-only）：manager 内部再自校验管理 cookie + legacy 管理身份。
+    if (upgradeRoute.route === 'host-terminal') {
+      if (hostTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
     if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;
     clientSocket.destroy();
@@ -8047,7 +8051,7 @@ function shutdown(): void {
   registry.stop();
   resourceMonitor.stop();
   platformTunnel?.stop();
-  debugTerminalManager.shutdown();
+  hostTerminalManager.shutdown();
   feedbackAnalyticsService?.close();
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => process.exit(gracefulProcessExitCode()));

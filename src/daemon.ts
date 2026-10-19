@@ -7708,6 +7708,17 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   let body: any;
   try { body = await readJsonBody(req, 32 * 1024); }
   catch { return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' }); }
+  const remoteRunnerSessionTool = body?.remoteRunnerSessionTool === true;
+  if (body?.remoteRunnerSessionTool !== undefined && !remoteRunnerSessionTool) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
+  const remoteRunnerControllerOpenId = body?.remoteRunnerControllerOpenId;
+  if (remoteRunnerControllerOpenId !== undefined
+      && (!remoteRunnerSessionTool
+        || typeof remoteRunnerControllerOpenId !== 'string'
+        || !/^ou_[A-Za-z0-9_-]{1,160}$/.test(remoteRunnerControllerOpenId))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
   const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
   const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
   const trustedHost = isTrustedHostIpcRequest(req);
@@ -7726,6 +7737,13 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     && caller.requestLarkAppId === ds.larkAppId
     && !!caller.requestUserOpenId
     && getDashboardAdminOpenIds(ds.larkAppId).includes(caller.requestUserOpenId);
+  const providerActor = !!ds && trustedHost && remoteRunnerSessionTool
+    && caller?.senderType === 'bot'
+    && caller.requestLarkAppId === ds.larkAppId
+    && typeof remoteRunnerControllerOpenId === 'string';
+  if (remoteRunnerControllerOpenId && !providerActor) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
+  }
   const action = body.action;
   const scheduledTaskId = turnId ? parseScheduledTurnId(turnId) : null;
   const requestedId = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
@@ -7741,12 +7759,44 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   const appId = ds?.larkAppId ?? selfDaemonLarkAppId;
   if (!appId) return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_daemon_unbound' });
+  const authority = scheduleAuthorityStore.getRecord(appId, id);
+  let providerActorAdmin = false;
+  if (providerActor) {
+    const providerTurnId = ds!.managedTurnOrigin?.turnId;
+    const providerGeneration = ds!.workerGeneration;
+    const providerCapability = ds!.managedTurnOrigin?.capability;
+    if (!providerTurnId || providerGeneration === undefined || !providerCapability
+      || !authority || authority.kind !== 'direct'
+      || authority.task.chatId !== ds!.chatId
+      || authority.controlOpenId !== remoteRunnerControllerOpenId
+      || !getDashboardAdminOpenIds(ds!.larkAppId).includes(remoteRunnerControllerOpenId)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_operator_denied' });
+    }
+    const controlUnionId = await resolveUnionIdFromOpenId(
+      ds!.larkAppId,
+      remoteRunnerControllerOpenId,
+    ) ?? undefined;
+    if (!controlUnionId || authority.controlUnionId !== controlUnionId
+      || (ds!.chatType === 'group'
+        && !(await listChatMemberOpenIds(ds!.larkAppId, ds!.chatId))
+          .includes(remoteRunnerControllerOpenId))) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_operator_denied' });
+    }
+    const currentCaller = scheduleCallerForTurn(ds!, providerTurnId);
+    if (ds!.managedTurnOrigin?.turnId !== providerTurnId
+      || ds!.managedTurnOrigin?.capability !== providerCapability
+      || ds!.workerGeneration !== providerGeneration
+      || currentCaller?.senderType !== 'bot'
+      || currentCaller.requestLarkAppId !== ds!.larkAppId) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_mutation_turn_changed' });
+    }
+    providerActorAdmin = true;
+  }
   const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
     && (action === 'pause' || action === 'remove');
-  if (!hostAdmin && !currentHumanAdmin && !potentialScheduledSelfManager) {
+  if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
   }
-  const authority = scheduleAuthorityStore?.getRecord(appId, id);
   if (!authority) return jsonRes(res, 404, { ok: false, error: 'schedule_not_found' });
   if (potentialScheduledSelfManager && action === 'remove' && authority.state === 'revoked') {
     return jsonRes(res, 200, { ok: true, replay: true });
@@ -8241,7 +8291,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
     ? body.originTurnId : askSession?.session.rootMessageId;
   if (asyncInput && (!askSession || !asyncWorker || asyncWorker.killed
-    || (askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId) !== 'codex-app'
+    || !isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
+      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
     || askSession.session.cliSessionId !== asyncInput.threadId)) {
     if (askSession && audience?.kind !== 'silent') await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
       tr('card.ask.async_unavailable', undefined, localeForBot(askSession.larkAppId)));

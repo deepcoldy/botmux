@@ -270,7 +270,7 @@ describe('gate: dashboard:manage 开管理面但不开整机', () => {
 
   it('但仍不是本机 owner —— 三个「拿到就等于拿到整机」的面照旧关着', () => {
     const g = gateFor('/api/settings');
-    // dashboard.ts 里 debug-terminal / write-link / spawn-command 三处直接查
+    // dashboard.ts 里 host-terminal / write-link / spawn-command 三处直接查
     // legacyAuthed，不看 decision，所以这个 false 就是那三处的拒绝依据。
     expect(g.legacyAuthed).toBe(false);
   });

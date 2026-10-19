@@ -809,6 +809,28 @@ describe('/rename production routing — must not pre-create a session (review P
       return { ds, root, send, cards, post, close, bot };
     }
 
+    it.each(['codex-app', 'claude-code'] as const)('uses the frozen CLI snapshot for async card admission: %s', async cliId => {
+      const h = await setup();
+      try {
+        h.ds.session.cliId = cliId === 'codex-app' ? 'claude-code' : 'codex-app';
+        h.bot.config.cliId = h.ds.session.cliId;
+        h.ds.session.cliLaunchSnapshot = { cliId } as NonNullable<typeof h.ds.session.cliLaunchSnapshot>;
+        beginReplyTargetTurn(h.ds, h.root, 'om_async_origin', NOW, { senderOpenId: OWNER });
+        const response = h.post('call_snapshot', 'om_async_origin', false, 1000);
+        if (cliId === 'codex-app') {
+          await vi.waitFor(() => expect(h.cards).toHaveLength(1));
+          expect(submitAsk({ askId: h.cards[0].askId, nonce: h.cards[0].nonce,
+            by: OWNER, selections: [['o0']] })).toBe('accepted');
+          expect((await response).status).toBe(200);
+          expect(h.send.mock.calls.some(([message]) => message.type === 'message')).toBe(true);
+        } else {
+          expect((await response).status).toBe(409);
+          expect(h.cards).toHaveLength(0);
+          expect(h.send).not.toHaveBeenCalled();
+        }
+      } finally { await h.close(); }
+    });
+
     it.each(['thread', 'chat'] as const)('keeps talk-only human origin parity with blocking card clicks in %s scope', async scope => {
       const h = await setup(scope);
       const caller = 'ou_talk_only';

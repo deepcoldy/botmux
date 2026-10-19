@@ -275,6 +275,29 @@ describe('schedule CLI prompt updates', () => {
       remoteRunnerControllerOpenId: 'ou_developer',
     }));
   });
+  it('forwards the frozen Remote Runner controller on a structured mutation', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+      BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID: 'ou_developer',
+    });
+    const result = await f.run([
+      'remove', f.task.id, '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    expect(requests).toContainEqual(expect.objectContaining({
+      action: 'remove',
+      id: f.task.id,
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_developer',
+    }));
+    expect(f.read()[f.task.id]).toBeUndefined();
+  });
   it('rejects an invalid Remote Runner controller before contacting the daemon', async () => {
     const f = fixture(); const requests: Array<Record<string, unknown>> = [];
     await managed(f, undefined, 'om_live', requests);

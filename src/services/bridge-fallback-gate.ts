@@ -241,6 +241,11 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
 }
 
 export interface BridgeGateInput {
+  /** Exact BotMux turn identity. Headless backends may not have a transcript
+   * mark time, so a delivered final marker can still deduplicate by this
+   * stronger correlation (including the durable dispatch attempt). */
+  turnId?: string;
+  dispatchAttempt?: number;
   /** When the user message was queued — defines the lower bound of the
    *  send window. Undefined for legacy turns; the gate degrades to
    *  "never suppress" in that case. */
@@ -399,6 +404,19 @@ export function shouldSuppressBridgeEmit(
   if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled) return true;
   if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
     && turn.terminalStatus !== 'completed') return true;
+  // Headless backends (notably Remote Runner) do not always own a transcript
+  // mark window. An exact delivered final marker is stronger than timestamp
+  // attribution and survives provider completion latency / host recovery.
+  // Keep the dispatch attempt in the identity so a stale durable retry cannot
+  // suppress a later attempt of the same logical turn.
+  if (turn.turnId && markers.some(marker => marker.turnId === turn.turnId
+      && marker.dispatchAttempt === turn.dispatchAttempt
+      && marker.terminalIndependent !== true
+      && isFinalBridgeSendMarker(marker)
+      && (marker.replyCardResponseKind === undefined
+        || marker.replyCardResponseKind === 'final'))) {
+    return true;
+  }
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;

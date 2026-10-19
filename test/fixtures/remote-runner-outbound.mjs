@@ -14,14 +14,21 @@ function emit(event) {
   process.stdout.write(`${JSON.stringify({ protocol, version, ...event })}\n`);
 }
 
-function outbound(operationId, turnId, content, mention = 'none', mentions = undefined) {
+function outbound(
+  operationId,
+  turnId,
+  content,
+  mention = 'none',
+  mentions = undefined,
+  responseKind = 'progress',
+) {
   emit({
     type: 'outbound_message',
     operationId,
     turnId,
     generation: 1,
     content,
-    responseKind: 'progress',
+    responseKind,
     mention,
     ...(mentions ? { mentions } : {}),
   });
@@ -34,7 +41,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       type: 'hello', requestId: command.requestId, provider: 'outbound-test',
       capabilities: [
         'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
-        'outbound_message', 'outbound_message_explicit_mention',
+        'outbound_message', 'outbound_message_explicit_mention', 'outbound_message_final',
       ],
     });
     return;
@@ -66,6 +73,12 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       for (let index = 0; index < expectedResults; index++) {
         outbound(`operation-${index}`, command.turnId, `payload ${index}`);
       }
+    } else if (command.content === 'final-outbound') {
+      expectedResults = 1;
+      outbound(
+        'final-operation', command.turnId, 'final payload',
+        'explicit', ['ou_target:Target'], 'final',
+      );
     }
     return;
   }
