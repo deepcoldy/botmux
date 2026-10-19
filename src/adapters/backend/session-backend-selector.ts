@@ -508,6 +508,11 @@ export function selectSessionBackend(opts: {
 
   if (opts.backendType === 'herdr') {
     const ownedSessionName = HerdrBackend.sessionName(opts.sessionId);
+    const herdrCfg = opts.herdrConfig ?? (opts.backendConfig && typeof opts.backendConfig === 'object' && 'sessionName' in opts.backendConfig ? (opts.backendConfig as HerdrBackendConfig) : undefined);
+    const configuredSession = herdrCfg?.sessionName?.trim();
+    const isCustomSession = Boolean(configuredSession && configuredSession !== HerdrBackend.managedSessionName());
+    const hostSessionName = configuredSession || HerdrBackend.managedSessionName();
+    const placement = herdrCfg ? { herdrConfig: herdrCfg, isCustomHost: isCustomSession } : {};
     // A restarted worker must reattach to the SAME shared host selected by the
     // prior generation. Re-selecting from UI current/default state could pick a
     // different workspace, start a duplicate CLI there, and orphan
@@ -537,6 +542,9 @@ export function selectSessionBackend(opts: {
             isReattach: reattach,
             ownsSession: false,
             ownsAgent: true,
+            // A replacement started in the configured host keeps its Tab/split
+            // placement instead of falling back to a new workspace.
+            ...(recorded.sessionName === hostSessionName ? placement : {}),
           }),
           isTmuxMode: false,
           isPipeMode: true,
@@ -627,10 +635,6 @@ export function selectSessionBackend(opts: {
     // regardless of which Lark bot, dashboard, or other Botmux entry point
     // requested it. Topics remain isolated as distinct managed agents/panes.
     // /adopt stays bound to its explicit user session.
-    const herdrCfg = opts.herdrConfig ?? (opts.backendConfig && typeof opts.backendConfig === 'object' && 'sessionName' in opts.backendConfig ? (opts.backendConfig as HerdrBackendConfig) : undefined);
-    const configuredSession = herdrCfg?.sessionName?.trim();
-    const isCustomSession = Boolean(configuredSession && configuredSession !== HerdrBackend.managedSessionName());
-    const hostSessionName = configuredSession || HerdrBackend.managedSessionName();
     const agentName = managedHerdrAgentName(opts.sessionId, opts.herdrOwnershipScope);
     const hostExists = HerdrBackend.hasSession(hostSessionName);
     const reattach = hostExists && HerdrBackend.hasAgent(hostSessionName, agentName);
@@ -646,8 +650,7 @@ export function selectSessionBackend(opts: {
         isReattach: reattach,
         ownsSession: false,
         ownsAgent: true,
-        herdrConfig: herdrCfg,
-        isCustomHost: isCustomSession,
+        ...placement,
       }),
       isTmuxMode: false,
       isPipeMode: true,

@@ -70,7 +70,8 @@ describe('selectSessionBackend with Herdr placement config', () => {
       sessionName: 'botmux',
     });
     expect((selected.backend as any).sessionName).toBe('botmux');
-    expect((selected.backend as any).opts?.isCustomHost).toBe(false);
+    expect((selected.backend as any).opts?.isCustomHost).toBeUndefined();
+    expect((selected.backend as any).opts?.herdrConfig).toBeUndefined();
   });
 
   it('selects custom running session (e.g. "default") when herdrConfig specifies sessionName', () => {
@@ -109,6 +110,40 @@ describe('selectSessionBackend with Herdr placement config', () => {
         },
       });
     }).toThrow('herdr session "not-running-session" is not running');
+  });
+
+  it('keeps the configured placement when a recorded target in that host is restarted', () => {
+    // A crashed first launch leaves a recorded target whose agent is gone; the
+    // replacement must land in the same Tab/split, not a new workspace.
+    const herdrConfig = { sessionName: 'default', placement: 'split' as const, tab: '3', splitDirection: 'right' as const };
+    const selected = selectSessionBackend({
+      sessionId: 'test-session-1234',
+      backendType: 'herdr',
+      herdrConfig,
+      persistentBackendTarget: { backendType: 'herdr', sessionName: 'default', agentName: 'botmux-recorded' },
+    });
+    expect(selected.isReattach).toBe(false);
+    expect((selected.backend as any).sessionName).toBe('default');
+    expect((selected.backend as any).opts).toMatchObject({
+      agentName: 'botmux-recorded',
+      isReattach: false,
+      ownsSession: false,
+      ownsAgent: true,
+      herdrConfig,
+      isCustomHost: true,
+    });
+  });
+
+  it('does not apply the placement to a recorded target in a different host', () => {
+    const selected = selectSessionBackend({
+      sessionId: 'test-session-1234',
+      backendType: 'herdr',
+      herdrConfig: { sessionName: 'default', placement: 'split', tab: '3' },
+      persistentBackendTarget: { backendType: 'herdr', sessionName: 'botmux', agentName: 'botmux-recorded' },
+    });
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect((selected.backend as any).opts?.herdrConfig).toBeUndefined();
+    expect((selected.backend as any).opts?.isCustomHost).toBeUndefined();
   });
 
   it('does not retire target when recorded target matches configured custom session', () => {
