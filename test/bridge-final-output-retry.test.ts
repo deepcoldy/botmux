@@ -168,7 +168,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, getBotClient, getOwnerOpenId, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getBotClient, getOwnerOpenId, resolveBrandLabel, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import {
   clearMessageListenerRunPreviewStore,
@@ -431,6 +431,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
     expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
     expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted] [Input]');
+  });
+
+  describe.each(['claude-code', 'codex'] as const)('%s adopt_preamble footer controls', cliId => {
+    it.each([
+      { name: 'default enabled', preferences: {}, brand: true, model: true, usage: true, recipients: true },
+      { name: 'master disabled with enabled blocks', preferences: { replyFooterEnabled: false, replyFooterBrand: true, replyFooterModel: true, replyFooterUsage: true, replyFooterRecipients: true }, brand: false, model: false, usage: false, recipients: false },
+      { name: 'brand disabled', preferences: { replyFooterBrand: false }, brand: false, model: true, usage: true, recipients: true },
+      { name: 'model disabled', preferences: { replyFooterModel: false }, brand: true, model: false, usage: true, recipients: true },
+      { name: 'usage disabled', preferences: { replyFooterUsage: false }, brand: true, model: true, usage: false, recipients: true },
+      { name: 'recipients disabled', preferences: { replyFooterRecipients: false }, brand: true, model: true, usage: true, recipients: false },
+      { name: 'all available blocks disabled', preferences: { replyFooterBrand: false, replyFooterModel: false, replyFooterUsage: false, replyFooterRecipients: false }, brand: false, model: false, usage: false, recipients: false },
+    ])('respects $name without changing the quoted exchange', async scenario => {
+      const bot = getBot('app_test');
+      Object.assign(bot.config, scenario.preferences);
+      vi.mocked(resolveBrandLabel).mockReturnValueOnce('adopt-footer-brand');
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.ownerOpenId = 'ou_adopt_owner';
+      if (!ds.worker) throw new Error('Missing fixture worker');
+      __testOnly_setupWorkerHandlers(ds, ds.worker);
+      ds.activeModel = 'adopt-footer-model';
+      ds.activeReasoningEffort = 'high';
+      ds.worker.emit('message', {
+        type: 'adopt_preamble', turnId: 'turn-adopt',
+        userText: 'Previous user request', assistantText: 'Previous assistant answer',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      const card = JSON.parse(sessionReply.mock.calls[0][1]);
+      const footer = card.body.elements.find((element: any) => element.element_id === 'botmux_reply_footer');
+      const content = footer?.content ?? '';
+      expect(content.includes('adopt-footer-brand')).toBe(scenario.brand);
+      expect(content.includes('adopt-footer-model')).toBe(scenario.model);
+      expect(content.includes('12%')).toBe(scenario.usage);
+      expect(content.includes('<at id=ou_adopt_owner></at>')).toBe(scenario.recipients);
+      const hasFooter = scenario.brand || scenario.model || scenario.usage || scenario.recipients;
+      expect(Boolean(footer)).toBe(hasFooter);
+      // The contextual body always separates the user and assistant with one divider.
+      expect(card.body.elements.filter((element: any) => element.tag === 'hr')).toHaveLength(hasFooter ? 2 : 1);
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous user request');
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous assistant answer');
+      // Rendering must preserve saved block choices when the master is off.
+      expect(bot.config).toMatchObject(scenario.preferences);
+    });
   });
 
   it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
