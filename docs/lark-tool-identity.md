@@ -35,6 +35,7 @@ Botmux 提供的短期 bot token。
 - 平台只返回短期变量（lark 为 user_access_token + app id，bytedcli 为 cloud JWT + code JWT），**永不返回刷新凭据**；返回的变量键按工具白名单校验，多余键一律拒绝。
 - 已绑定的机器**不再自动发起本机扫码**：拒绝消息直接给平台凭据页链接。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
+- **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
 - 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
 
 ## 使用
