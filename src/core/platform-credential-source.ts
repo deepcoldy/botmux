@@ -59,7 +59,9 @@ const realDeps: Deps = {
     const b = readPlatformBinding();
     return b ? { platformUrl: b.platformUrl, machineToken: b.machineToken, machineId: b.machineId } : null;
   },
-  resolveUnionId: resolveUnionIdFromOpenId,
+  // Resolved at call time, not module load: tests that stub the lark client
+  // module with a fixed export set must still be able to import this file.
+  resolveUnionId: (larkAppId, openId) => resolveUnionIdFromOpenId(larkAppId, openId),
   requestGrant: (req, opts) => requestCredentialGrant(req, opts),
   now: () => Date.now(),
 };
