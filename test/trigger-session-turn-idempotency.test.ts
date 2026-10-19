@@ -791,3 +791,35 @@ describe('completed turn retry after session leaves active map', () => {
     expect(mockForkWorker).not.toHaveBeenCalled();
   });
 });
+
+
+describe('mailbox internal provenance on existing sessions', () => {
+  it.each(['claude-code', 'codex-app'])('preserves data and source across live and dormant %s delivery', async cliId => {
+    mockGetBot.mockReturnValue({ config: { cliId, apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_mailbox_target', scope: 'chat' });
+    ds.session.chatId = ds.chatId;
+    ds.session.cliId = cliId as typeof ds.session.cliId;
+    const activeSessions = new Map([[sessionKey(ds.chatId, APP), ds]]);
+    const request: TriggerRequest = {
+      source: { type: 'ui', connectorId: 'botmux-mailbox' },
+      target: { kind: 'turn', botId: APP, sessionId: SID },
+      envelope: { format: 'botmux-mailbox/v1', sourceName: 'mailbox', trusted: false },
+    };
+    const fence = vi.fn();
+    const internal = { stableTurnId: 'mb_test', atMostOnce: true,
+      applicationContext: '<botmux_delivery_source trusted="true">source</botmux_delivery_source>',
+      eventDataContext: '<botmux_external_event trusted="false">escaped data</botmux_external_event>',
+      beforeDispatch: fence };
+    // Dormant active sessions resume their existing CLI history.
+    expect((await triggerSessionTurn(request, { larkAppId: APP, activeSessions }, internal)).ok).toBe(true);
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, expect.objectContaining({
+      content: expect.stringContaining(internal.eventDataContext),
+    }), expect.objectContaining({ resume: true, turnId: 'mb_test', atMostOnce: true }));
+    ds.worker = { killed: false } as typeof ds.worker;
+    expect((await triggerSessionTurn(request, { larkAppId: APP, activeSessions }, { ...internal, stableTurnId: 'mb_live' })).ok).toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledWith(ds, expect.objectContaining({
+      content: expect.stringContaining(internal.applicationContext),
+    }), 'mb_live', expect.objectContaining({ atMostOnce: true }));
+    expect(fence).toHaveBeenCalledTimes(2);
+  });
+});

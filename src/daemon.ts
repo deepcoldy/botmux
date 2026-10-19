@@ -1,3 +1,5 @@
+import { SAME_BOT_DELIVERY_ROUTE, SAME_BOT_DELIVERY_MAX_BYTES } from './core/same-bot-delivery.js';
+import { handleMailboxIpc, MAILBOX_STATUS_ROUTE } from './core/mailbox-ipc.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -7820,6 +7822,28 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   }
   return jsonRes(res, ok ? 200 : 409, { ok, ...(error ? { error } : !ok ? { error: 'not_found_or_denied' } : {}) });
 });
+
+for (const [path, operation] of [[SAME_BOT_DELIVERY_ROUTE, 'send'], [MAILBOX_STATUS_ROUTE, 'status']] as const) {
+  ipcRoute('POST', path, async (req, res) => {
+    if (!sessionsRestored) return jsonRes(res, 503, { ok: false, state: 'failed', error: 'startup_not_ready' });
+    let raw: unknown;
+    try { raw = await readJsonBody<unknown>(req, SAME_BOT_DELIVERY_MAX_BYTES); }
+    catch (error) {
+      return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400,
+        { ok: false, state: 'failed', error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json' });
+    }
+    const result = await handleMailboxIpc({
+      operation, raw, socket: req.socket, selfLarkAppId: selfDaemonLarkAppId ?? '',
+      enabled: () => !!selfDaemonLarkAppId && getBot(selfDaemonLarkAppId).config.mailboxPolicy?.enabled === true,
+      findSession: findActiveBySessionId,
+      listSessions: () => [...activeSessions.values()],
+      trigger: (request, internal) => triggerSessionTurn(request, {
+        larkAppId: selfDaemonLarkAppId!, activeSessions,
+      }, internal),
+    });
+    return jsonRes(res, result.status, result.body);
+  });
+}
 
 ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   let raw: unknown;
