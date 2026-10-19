@@ -177,6 +177,52 @@ describe('Codex-compatible runtime editor', () => {
     expect(oldWrapperPayload.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
   });
 
+
+  it.each([
+    ['codex', 'codex', 'codex --profile withhooks'],
+    ['claude-code', 'claude-code', 'custom-launcher claude'],
+    ['codex', 'ttadk-x-codex', 'ttadk codex'],
+  ])('sends replacement intent only after explicitly selecting the launch option for %s', async (cliId, key, wrapperCli) => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (init?.method !== 'PUT') return { ok: true, status: 200, json: async () => ({ models: [], source: 'static', profiles: [] }) } as any;
+      const body = JSON.parse(String(init.body));
+      requests.push(body);
+      return { ok: true, status: 200, json: async () => ({
+        ok: true, cliId, selectionKey: key, model: body.model,
+        wrapperCli: body.replaceCliSelection ? null : wrapperCli,
+      }) } as any;
+    });
+    let renderer: TestRenderer.ReactTestRenderer | undefined;
+    try {
+      const rendered = renderAgent({ cliId, wrapperCli, agentSelectionKey: key });
+      renderer = rendered.renderer;
+      const { root, patchBot } = rendered;
+      const save = async () => { await act(async () => { root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); }); };
+      await save();
+      expect(requests[0]).not.toHaveProperty('replaceCliSelection');
+      expect(requests[0]).not.toHaveProperty('wrapperCli');
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli }));
+      act(() => root.findByProps({ dataInput: 'agentModel' }).props.onChange('new-model'));
+      await save();
+      expect(requests[1]).toMatchObject({ model: 'new-model' });
+      expect(requests[1]).not.toHaveProperty('replaceCliSelection');
+      // The picker can deliberately choose the same key. This is distinguishable
+      // from an untouched fallback key even for an unregistered Codex wrapper.
+      act(() => root.findByProps({ id: 'bd-menu-agentCliId' }).findAllByType('button')
+        .find(button => button.props['aria-current'] === 'true')!.props.onClick());
+      await save();
+      expect(requests[2]).toMatchObject({ cliId: key, replaceCliSelection: true });
+      expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli: null }));
+      await save();
+      expect(requests[3]).not.toHaveProperty('replaceCliSelection');
+    } finally {
+      if (renderer) act(() => renderer!.unmount());
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   it('shows and saves the configured Codex reasoning effort', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
@@ -811,7 +857,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
       expect(requests).toEqual([{
-        cliId: 'traex',
+        cliId: 'traex', replaceCliSelection: true,
         model: 'GPT-5.6-Terra',
         reasoningEffort: 'xhigh',
         modelBackendVariant: '',
@@ -1027,7 +1073,7 @@ describe('Codex-compatible runtime editor', () => {
         value => value === 1,
       );
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
+      expect(requests).toEqual([{ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null }]);
       await waitForObserved(
         () => root.findByProps({ 'data-agent-status': '' }).children.join(''),
         text => text.includes('已保存'),
@@ -1765,7 +1811,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', replaceCliSelection: true, model: '', reasoningEffort: '', cliRuntime: null });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
