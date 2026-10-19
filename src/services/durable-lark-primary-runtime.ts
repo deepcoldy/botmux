@@ -44,6 +44,7 @@ export interface DurableLarkPrimaryRuntimeOptions {
   deliverOutbox: DurableOutboxPumpOptions['deliver'];
   onLeadershipAcquired?: (leadership: DurableLarkIngressLeadership) => void | Promise<void>;
   onLeadershipLost?: (reason: unknown) => void | Promise<void>;
+  onSessionLeaseLost?: (sessionKey: string, error: Error) => void;
   onError?: (error: unknown) => void;
   ingressOwnerId?: string;
   inboxWorkerId?: string;
@@ -92,6 +93,16 @@ function boundedInteger(value: number, name: string, minimum: number, maximum: n
   return value;
 }
 
+function primarySessionOwnsLiveRuntime(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const envelope = value as Record<string, unknown>;
+  if (envelope.type !== 'botmux.session.primary'
+      || !envelope.session
+      || typeof envelope.session !== 'object'
+      || Array.isArray(envelope.session)) return false;
+  return (envelope.session as Record<string, unknown>).status === 'active';
+}
+
 /** Compose the disabled-state primary data plane under one shutdown budget. */
 export function startDurableLarkPrimaryRuntime(
   options: DurableLarkPrimaryRuntimeOptions,
@@ -104,6 +115,15 @@ export function startDurableLarkPrimaryRuntime(
     store: options.store,
     ...(options.sessionOwnerId ? { ownerId: options.sessionOwnerId } : {}),
     shutdownMs,
+    keepLeaseAlive: primarySessionOwnsLiveRuntime,
+    onLeaseLost: (sessionKey, error) => {
+      reportError(new Error(
+        `durable active Session lease lost for ${sessionKey}: ${error.message}`,
+      ));
+      try { options.onSessionLeaseLost?.(sessionKey, error); } catch (callbackError) {
+        reportError(callbackError);
+      }
+    },
   });
   const dispatch = createDurableLarkCanonicalDispatch({
     facade: session,

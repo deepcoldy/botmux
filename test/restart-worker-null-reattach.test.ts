@@ -87,7 +87,7 @@ describe('P1 requestSessionRestart wiring', () => {
     // Live-worker branch still sends the in-worker restart IPC — now also
     // carrying the latest per-bot env AND model (config edits apply on /restart).
     expect(body).toContain(
-      "ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) }",
+      "ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) }",
     );
 
     // No-worker branch: pane teardown MUST precede forkWorker.
@@ -256,23 +256,26 @@ describe('P2 worker onTaskDone generation fence', () => {
     expect(setup).toBeGreaterThanOrEqual(0);
     expect(handlersStart).toBeGreaterThan(setup);
     // The merged worker now carries both upstream strict-env/network handlers
-    // and Remote Runner outbound/final settlement before the shared onExit.
+    // and Remote Runner outbound/final/recovered-turn settlement before the shared onExit.
     // Keep the source contract bounded, but large enough to cover that handler.
-    const region = workerSource.slice(setup, setup + 12_000);
+    const region = workerSource.slice(setup, setup + 15_000);
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');
     const taskDone = region.indexOf('backend.onTaskDone?.(()');
     const turnFinal = region.indexOf('backend.onTurnFinal?.((text, turnId)');
+    const turnRecovered = region.indexOf('backend.onTurnRecovered?.((turn)');
     const onExit = region.indexOf('backend.onExit((code, signal)');
     expect(agentStatus, 'onAgentStatus').toBeGreaterThanOrEqual(0);
     expect(taskDone, 'onTaskDone').toBeGreaterThanOrEqual(0);
     expect(turnFinal, 'onTurnFinal').toBeGreaterThanOrEqual(0);
+    expect(turnRecovered, 'onTurnRecovered').toBeGreaterThanOrEqual(0);
     expect(onExit, 'onExit').toBeGreaterThanOrEqual(0);
 
     for (const [name, start] of [
       ['onAgentStatus', agentStatus],
       ['onTaskDone', taskDone],
       ['onTurnFinal', turnFinal],
+      ['onTurnRecovered', turnRecovered],
       ['onExit', onExit],
     ] as const) {
       // Keep enough source after each callback anchor to include its rationale

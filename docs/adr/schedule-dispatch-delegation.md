@@ -32,7 +32,9 @@
 
 ## 管理动作
 
-`schedule:create` 只允许初始 dispatch turn 执行 `add`。宿主可额外启用固定的 self-management 能力：delegated scheduled turn 只能用 `schedule pause self` / `schedule remove self` 管理当前 task。它不能管理其他 task，也不能 update prompt/目标、resume、force-run 或创建后继任务。其他管理动作继续通过独立 daemon route 验证当前真人管理员；delegated task 的 canonical update 仍拒绝，等待后续显式 rebind 协议。
+`schedule:create` 只允许初始 dispatch turn 执行 `add`。真人当前回合创建的 direct task 天然携带同 Bot、同群的控制者记录；它自己的 scheduled turn 可用 `schedule pause self` / `schedule remove self` 管理当前 task。跨 Bot delegated task 仍必须由宿主额外启用固定的 self-management 能力。两类 self-management 都只允许 pause/remove 当前精确 task，不能管理其他 task，也不能 update prompt/目标、resume、force-run 或创建后继任务；每次执行仍重新校验控制者是目标 Bot 管理员和目标群成员。其他管理动作继续通过独立 daemon route 验证当前真人管理员；delegated task 的 canonical update 仍拒绝，等待后续显式 rebind 协议。
+
+需要“发送最终结果并结束任务”时使用单个 `botmux send --response-kind final --schedule-remove-self`。CLI 只能从当前受认证的 `schedule:<taskId>:<runId>` 推导 task ID，不接受调用方指定；final 投递成功并写入幂等账本后，通过 owning daemon 删除该精确 task，再推进长驻 CLI 的排队 turn。删除失败不得创建或改写另一条 final，结果以结构化 `scheduleSelfCleanup` 返回；原样重试同一命令会复用已投递的 final，只补做自删，已撤销的精确 task 视为幂等成功。
 
 ## 兼容与信任假设
 

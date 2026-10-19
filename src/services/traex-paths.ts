@@ -1,9 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-
-function expandHome(path: string): string {
-  return path.startsWith('~') ? join(homedir(), path.slice(1)) : path;
-}
+import { expandHomePath as expandHome } from '../utils/working-dir.js';
 
 /** TRAE CLI (traex / traecli) stores config, state DB, sessions, and skills
  *  under TRAE_HOME when set; otherwise it defaults to ~/.trae. Keep this

@@ -25,8 +25,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   appendBridgeTurnJournalEntry,
+  BRIDGE_TURN_RECOVERY_MAX_BYTES,
   BridgeRestoreGate,
   clearBridgeTurnJournal,
+  planBridgeTurnRecovery,
   readBridgeTurnJournal,
   removeBridgeTurnJournalEntry,
   selectRestorableBridgeTurns,
@@ -167,6 +169,66 @@ describe('selectRestorableBridgeTurns', () => {
     ];
     const restorable = selectRestorableBridgeTurns(entries, { currentJsonlPath: '/a.jsonl', nowMs: now });
     expect(restorable.map(e => e.turnId)).toEqual(['plain']);
+  });
+});
+
+describe('planBridgeTurnRecovery', () => {
+  it('rejects a legacy zero-offset recovery range larger than the bounded budget', () => {
+    const fileSize = 1_627_904_136;
+    expect(planBridgeTurnRecovery([entry({ offsetAtMark: 0 })], fileSize)).toEqual({
+      kind: 'skip',
+      reason: 'range-too-large',
+      fromOffset: 0,
+      recoveryBytes: fileSize,
+      maxBytes: BRIDGE_TURN_RECOVERY_MAX_BYTES,
+    });
+  });
+
+  it('recovers only the bounded tail when the journal captured the mark offset', () => {
+    const fileSize = 1_627_904_136;
+    const fromOffset = fileSize - 4_096;
+    expect(planBridgeTurnRecovery([entry({ offsetAtMark: fromOffset })], fileSize)).toEqual({
+      kind: 'recover',
+      fromOffset,
+      recoveryBytes: 4_096,
+    });
+  });
+
+  it('uses the earliest offset across multiple pending turns', () => {
+    expect(planBridgeTurnRecovery([
+      entry({ turnId: 'later', offsetAtMark: 9_000 }),
+      entry({ turnId: 'earlier', offsetAtMark: 1_000 }),
+    ], 10_000, 9_000)).toEqual({
+      kind: 'recover',
+      fromOffset: 1_000,
+      recoveryBytes: 9_000,
+    });
+  });
+
+  it('accepts a range exactly at the byte budget and skips the next byte', () => {
+    const atBoundary = entry({ offsetAtMark: 1_000 });
+    expect(planBridgeTurnRecovery([atBoundary], 2_000, 1_000)).toMatchObject({
+      kind: 'recover', recoveryBytes: 1_000,
+    });
+    expect(planBridgeTurnRecovery([atBoundary], 2_001, 1_000)).toMatchObject({
+      kind: 'skip', reason: 'range-too-large', recoveryBytes: 1_001,
+    });
+  });
+
+  it.each([Number.NaN, -1])('fails closed on invalid file size %s', fileSize => {
+    expect(planBridgeTurnRecovery([entry()], fileSize)).toMatchObject({
+      kind: 'skip', reason: 'invalid-file-size', recoveryBytes: 0,
+    });
+  });
+
+  it('fails closed on offsets beyond a truncated rollout', () => {
+    expect(planBridgeTurnRecovery([entry({ offsetAtMark: 101 })], 100)).toEqual({
+      kind: 'skip',
+      reason: 'invalid-offset',
+      fromOffset: 100,
+      recoveryBytes: 0,
+      maxBytes: BRIDGE_TURN_RECOVERY_MAX_BYTES,
+    });
   });
 });
 

@@ -319,35 +319,51 @@ describe('reapLegacyPm2', () => {
     expect(god?.pid).toBe(0);     // socket-only → pid unknown
   });
 
-  it('does not let the pm2 PATH probe touch the ambient PM2_HOME', () => {
+  it('never executes pm2 just to find out whether it exists', () => {
     // `pm2 --version` is NOT read-only: it DAEMONIZES a God (MEASURED: "Spawning
-    // PM2 daemon with pm2_home=… / Successfully daemonized"). With the ambient env
-    // inherited, the probe created one in the caller's PM2_HOME — including a real
-    // ~/.botmux/pm2, which the reaper then "found and killed", reporting a legacy
-    // fleet on a machine that never had one. Plant a pm2 on PATH that RECORDS the
-    // PM2_HOME it was handed, and require it to be a throwaway.
+    // PM2 daemon with pm2_home=… / Successfully daemonized"). The old PATH probe
+    // ran it against a throwaway home and then `pm2 kill` + rm'd that home; when
+    // the kill timed out the God was orphaned with no home left to address it,
+    // and one leaked per `botmux start/restart` on any box with pm2 on PATH.
+    // Plant a pm2 on PATH that RECORDS every invocation: with no legacy God the
+    // reaper must not run it at all.
     const configDir = tmp();
-    const pkgRoot = tmp();          // no bundled pm2 → the PATH probe runs
+    const pkgRoot = tmp();          // no bundled pm2 → PATH lookup
     const binDir = tmp();
-    const seen = join(binDir, 'seen-home.log');
+    const seen = join(binDir, 'invocations.log');
     writeFileSync(join(binDir, 'pm2'), [
       '#!/usr/bin/env node',
-      `require('fs').appendFileSync(${JSON.stringify(seen)}, (process.env.PM2_HOME ?? '<unset>')+'\\n');`,
+      `require('fs').appendFileSync(${JSON.stringify(seen)}, process.argv.slice(2).join(' ')+'\\n');`,
       `process.exit(0);`,
     ].join('\n'), { mode: 0o755 });
     chmodSync(join(binDir, 'pm2'), 0o755);
     process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
 
-    const ambient = join(configDir, 'pm2');   // stands in for ~/.botmux/pm2
-    process.env.PM2_HOME = ambient;
-    reapLegacyPm2(configDir, pkgRoot, () => {});
+    const result = reapLegacyPm2(configDir, pkgRoot, () => {});
 
-    const homes = readFileSync(seen, 'utf-8').trim().split('\n').filter(Boolean);
-    expect(homes.length).toBeGreaterThan(0);           // the probe really ran
-    for (const h of homes) {
-      expect(h).not.toBe(ambient);                     // never the caller's home
-      expect(h).not.toBe('<unset>');                   // and never inherited-empty
-    }
+    expect(result.found).toBe(false);
+    expect(existsSync(seen)).toBe(false);
+  });
+
+  it('uses a pm2 found on PATH once a legacy God is actually present', () => {
+    // The positive half: dropping the exec probe must not drop the PATH CLI. A
+    // source install with only a global pm2 still reaps through pm2 itself.
+    const configDir = tmp();
+    const pkgRoot = tmp();          // no bundled pm2
+    const shimRoot = tmp();
+    const logFile = fakePm2(shimRoot, { jlist: JSON.stringify([{ name: 'botmux-0' }]) });
+    // An EARLIER PATH entry holding a traversable DIRECTORY named pm2 must be
+    // skipped, not returned: X_OK alone accepts it and every pm2 call then EACCESes.
+    const decoy = tmp();
+    mkdirSync(join(decoy, 'pm2'), { mode: 0o755 });
+    process.env.PATH = `${decoy}:${join(shimRoot, 'node_modules', 'pm2', 'bin')}:${process.env.PATH ?? ''}`;
+    liveGodPidfile(join(configDir, 'pm2'));
+
+    const r = reapLegacyPm2(configDir, pkgRoot);
+    expect(r.found).toBe(true);
+    expect(r.deleted).toEqual(['botmux-0']);
+    const calls = readFileSync(logFile, 'utf-8').trim().split('\n');
+    expect(calls).toEqual(['jlist', 'delete botmux-0', 'kill']);   // no `--version` probe
   });
 
   it('clears the God records so the warning cannot come back', () => {

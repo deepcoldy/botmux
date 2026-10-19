@@ -1,5 +1,6 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import type { CliAdapter, PtyHandle, ResumableSession } from './types.js';
 import {
   detectOpenCodeSubmit,
@@ -115,7 +116,7 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
         } else {
           // Raw PTY has no tmux paste-buffer to add these markers. Without
           // them, long or multiline prompts may be split into key events.
-          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
+          pty.write(needsPaste ? wrapBracketedPaste(content) : content);
           await delay(1000);
           pty.write('\r');
         }
@@ -167,5 +168,3 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     // setup 为此 CLI 跳过模型询问（与「模型走配置文件管理」的 CLI 同一语义）。
   };
 }
-
-export const create = createOpenCode2Adapter;

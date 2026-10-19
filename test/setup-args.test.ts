@@ -96,6 +96,14 @@ describe('parseSetupCommand', () => {
     });
   });
 
+  it('parses --lang flag', () => {
+    const res = parseSetupCommand(['add', '--app-id', 'cli_123', '--lang', 'en']);
+    expect(res).toMatchObject({
+      action: 'add',
+      flags: { lang: 'en' },
+    });
+  });
+
   it('parses --open-platform-auto with last-one-wins against --no-open-platform-auto', () => {
     const on = parseSetupCommand(['add', '--open-platform-auto']);
     expect(on).toMatchObject({ action: 'add', openPlatformAuto: true });
@@ -318,6 +326,11 @@ describe('buildBotFromAddFlags', () => {
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'false' }).showInTeam).toBe(false);
     expect(buildBotFromAddFlags({ ...REQUIRED, showInTeam: 'true' }).showInTeam).toBeUndefined();
   });
+
+  it('stores lang when specified', () => {
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'en' }).lang).toBe('en');
+    expect(buildBotFromAddFlags({ ...REQUIRED, lang: 'zh' }).lang).toBe('zh');
+  });
 });
 
 describe('editInputFromFlags', () => {
@@ -331,6 +344,13 @@ describe('editInputFromFlags', () => {
       model: 'opus',
       backendType: 'tmux',
     });
+  });
+
+  it('maps lang and handles clear', () => {
+    expect(editInputFromFlags({ lang: 'en' })).toEqual({ lang: 'en' });
+    expect(editInputFromFlags({ lang: '-' })).toEqual({ lang: '-' });
+    const bot = applyBotConfigEdits({ larkAppId: 'cli_1', larkAppSecret: 'sec', allowedUsers: ['a@b.com'], lang: 'en' }, { lang: '-' });
+    expect(bot.lang).toBeUndefined();
   });
 
   it('clears wrapperCli when switching to a plain cli, keeps it for gateway keys', () => {

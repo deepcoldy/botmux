@@ -2,6 +2,7 @@ import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
 import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { DebugModelCapabilities } from './model-catalog-json.js';
+import type { CodexBridgeEvent } from '../../services/codex-transcript.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -94,7 +95,9 @@ export interface ResumableSession {
   cliSessionId: string;
   /** Working directory the session ran in — where botmux re-spawns the CLI. */
   cwd: string;
-  /** Human title (first real user prompt, truncated). */
+  /** Human title, truncated: the CLI's native title when the transcript has
+   *  one (Claude-family: customTitle > aiTitle), otherwise the first real user
+   *  prompt. */
   title: string;
   /** Epoch ms of last activity (transcript mtime / last submit), for sort + display. */
   lastActivityAt: number;
@@ -885,6 +888,123 @@ export interface CliAdapter {
    *  by the daemon. Undefined means this adapter has no proven native rename
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
+
+  /** Structured-transcript bridge capability (see {@link StructuredBridgeSpec}).
+   *  Declared by CLIs whose final answer can be harvested from an append-only
+   *  transcript file when the model forgets `botmux send`. Absent = no
+   *  path-addressed transcript bridge for this adapter (hermes / mtr read a
+   *  SQLite store and keep dedicated worker paths). The worker reaches this
+   *  through `bridgeSpecFor(cliId)` (registry.ts) so it never has to construct
+   *  an adapter just to ask. */
+  readonly bridgeSpec?: StructuredBridgeSpec;
+}
+
+// ─── Structured transcript bridge ───────────────────────────────────────────
+
+/** How `codexBridgeAttach` positions its cursor on an existing transcript. */
+export type StructuredBridgeAttachMode =
+  | 'baseline-existing'
+  | 'baseline-existing-skip-tail'
+  | 'fresh-empty'
+  | 'split-live';
+
+/** One incremental drain of a path-addressed transcript. */
+export interface StructuredBridgeDrainResult {
+  events: CodexBridgeEvent[];
+  /** Byte offset of the last fully parsed line; hand it back as the next `offset`. */
+  newOffset: number;
+  pendingTail: string;
+  /** Driver-owned incremental state. The worker hands it back verbatim as
+   *  {@link StructuredBridgeDrainContext.state} and never looks inside. */
+  state?: unknown;
+}
+
+export interface StructuredBridgeDrainContext {
+  /** Terminal `/adopt`: the drainer must post transcript text verbatim (no
+   *  synthesised bare-sentinel). */
+  adoptMode: boolean;
+  /** `state` returned by the previous drain; undefined right after attach/detach. */
+  state: unknown;
+  /** Release a provisionally held trailing final (drivers that hold one). */
+  flushTrailingFinal?: boolean;
+}
+
+/**
+ * What the worker needs to bridge one CLI's transcript, declared by the adapter.
+ *
+ * Every field is data or a pure function of (path, offset, ids): anything that
+ * needs live worker state (pid ownership gates, session rotation, CoT readers,
+ * RPC lifecycle) stays in the worker, keyed off these declarations.
+ */
+export interface StructuredBridgeSpec {
+  /** Incrementally read the transcript at `path` from `offset`. */
+  drain(path: string, offset: number, ctx: StructuredBridgeDrainContext): StructuredBridgeDrainResult;
+  /**
+   * When the worker commits `result.state` back into its single state slot:
+   *  - `'drain'`: on every drain, including the one-off attach-time drains
+   *    (codex / omp / ebsd);
+   *  - `'ingest'`: only on the steady-state ingest tick (antigravity — its
+   *    attach-time restore drain deliberately does not retain state);
+   *  - absent: the driver is stateless.
+   */
+  readonly stateCommit?: 'drain' | 'ingest';
+  /** Transcript discovery. Lookups by session id are tried before pid. */
+  readonly locate: {
+    bySessionId(sessionId: string, cwd?: string): string | undefined;
+    /** Absent for drivers addressed only by id (oh-my-pi, ebsd). */
+    byPid?(pid: number): string | undefined;
+  };
+  /** Spawn-time attach policy (botmux-spawned session). Absent = this CLI keeps
+   *  a dedicated spawn branch in the worker (coco: deterministic path + stale-dir
+   *  handling). */
+  readonly spawn?: {
+    /** `'cli'`: pin only an already-known native session id. `'cli-or-adapter'`:
+     *  also fall back to the botmux-controlled adapter session id (CLIs that
+     *  accept `--session-id`). */
+    readonly sessionId: 'cli' | 'cli-or-adapter';
+    /** `'resume-aware'`: resume spawn → `baseline-existing` (history already
+     *  delivered), fresh spawn → `fresh-empty` (the argv/first-write turn must be
+     *  attributable). `'birth-aware'`: as resume-aware, but a transcript born
+     *  after the spawn is the live turn, never history (lazily created files). */
+    readonly baseline: 'resume-aware' | 'birth-aware';
+    /** The bridge exists only for zero-prompt (`promptInjection:'none'`) spawns;
+     *  in default mode this CLI replies via `botmux send`. */
+    readonly zeroPromptOnly?: boolean;
+    /** codex: an existing App Server share attaches `split-live` and forwards
+     *  App-side turns from the attach boundary. */
+    readonly appServerShare?: boolean;
+  };
+  /** Terminal `/adopt` attach policy for CLIs that follow the shared skeleton
+   *  (sid → pid → attach | pending). Absent = dedicated adopt branch in the
+   *  worker (codex: terminal-session refresh; coco: stale-dir notice; mtr: SQLite). */
+  readonly adopt?: {
+    /** `'split-live'`: timestamp-cutoff split of history vs live events.
+     *  `'baseline-skip-tail'`: the transcript carries no per-event timestamps
+     *  (cursor), so history is baselined by byte offset instead. */
+    readonly attach: 'split-live' | 'baseline-skip-tail';
+    /** A rollout found through the pid probe also tells us the native session
+     *  id: parse it with the CLI's OWN path parser and persist it (traex —
+     *  its segmented rollout names need traexSessionIdFromRolloutPath; the
+     *  codex parser would mis-read them). Absent = do not persist. */
+    readonly pidProbedSessionId?: (path: string) => string | undefined;
+  };
 }
 
 export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'mimocode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax' | 'remote-runner';
+
+/**
+ * "这个 CLI 是不是 Codex App" 的唯一字面量出口（CliId 级判定）。
+ *
+ * 只回答「给定一个已经解出来的 cliId 是不是 codex-app」，不决定 cliId 从哪来：
+ * daemon 侧按会话解析 cliId 用 worker-pool 的 `sessionCliId(ds, botCfg)`
+ * （cliLaunchSnapshot → session.cliId → bot），worker 侧用 `lastInitConfig.cliId`。
+ * 各调用点的取值优先级不必一致，但判定本身必须走这里。
+ */
+export function isCodexAppCliId(cliId: string | null | undefined): cliId is 'codex-app' {
+  return cliId === 'codex-app';
+}
+
+/** Codex 家族（官方 codex TUI 与 Codex App runner 共用同一份 rollout / CODEX_HOME / service tier 语义）。 */
+export function isCodexFamilyCliId(cliId: string | null | undefined): cliId is 'codex' | 'codex-app' {
+  return cliId === 'codex' || cliId === 'codex-app';
+}

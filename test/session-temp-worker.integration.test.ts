@@ -77,8 +77,9 @@ setInterval(() => {}, 1000);
       envPolicy: { mode }, larkAppId: 'app_temp_test', larkAppSecret: 'fixture-only',
     } satisfies DaemonToWorker);
     await until(() => hasCompleteJson(workerObservation) && hasCompleteJson(cliObservation), logs);
-    const profile = createHash('sha256').update(resolve(dataDir)).digest('hex').slice(0, 16);
-    const expected = join(root, '.cache', 'botmux', 'session-tmp', profile, 'temp-env-probe');
+    const profile = createHash('sha256').update(resolve(dataDir)).digest('hex').slice(0, 8);
+    const key = createHash('sha256').update('temp-env-probe').digest('hex').slice(0, 16);
+    const expected = join(root, '.cache', 'botmux', 'session-tmp', profile, key);
     for (const file of [workerObservation, cliObservation]) {
       expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ TMPDIR: expected, TMP: expected, TEMP: expected, tmpdir: expected });
     }

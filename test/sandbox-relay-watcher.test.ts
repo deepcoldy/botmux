@@ -113,8 +113,46 @@ describe('sandbox relay watcher host handoff', () => {
     }
   });
 
-  it('rejects a hand-written dispatch --into request at the watcher boundary', async () => {
+  it('relays exactly one bounded dispatch --into root to the host child', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-into-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'dispatch-host.mjs');
+    writeFileSync(fixture, `
+      const argv = process.argv.slice(2);
+      process.stdout.write(JSON.stringify({ argv }));
+    `);
+    const id = 'dispatch-into';
+    writeFileSync(join(outbox, `${id}.content`), 'task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch',
+      contentFile: `${id}.content`,
+      flags: ['--bot-app', 'cli_target', '--into', 'om_existing_root'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const { argv } = JSON.parse(response.stdout) as { argv: string[] };
+      expect(argv[0]).toBe('dispatch');
+      expect(argv[argv.indexOf('--into') + 1]).toBe('om_existing_root');
+      expect(argv.filter(token => token === '--into')).toHaveLength(1);
+      // Still the worker-forced source session.
+      expect(argv[argv.indexOf('--session-id') + 1]).toBe('forced-source');
+    } finally {
+      stop();
+    }
+  });
+
+  it.each([
+    ['a malformed root', ['--bot-app', 'cli_target', '--into', 'oc_not_a_message'], 'dispatch --into is invalid'],
+    ['a path-like root', ['--bot-app', 'cli_target', '--into', 'om_../../x'], 'dispatch --into is invalid'],
+    ['two roots', ['--bot-app', 'cli_target', '--into', 'om_a', '--into', 'om_b'], 'dispatch --into may only be specified once'],
+  ])('rejects a hand-written dispatch request with %s before spawning the host child', async (_label, flags, error) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-into-reject-'));
     roots.push(root);
     const outbox = join(root, 'outbox');
     mkdirSync(outbox);
@@ -123,9 +161,7 @@ describe('sandbox relay watcher host handoff', () => {
     const id = 'dispatch-into-reject';
     writeFileSync(join(outbox, `${id}.content`), 'task');
     writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
-      command: 'dispatch',
-      contentFile: `${id}.content`,
-      flags: ['--bot-app', 'cli_target', '--into', 'om_other'],
+      command: 'dispatch', contentFile: `${id}.content`, flags,
     }));
     const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
     try {
@@ -134,7 +170,7 @@ describe('sandbox relay watcher host handoff', () => {
       const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
       expect(response.code).toBe(1);
       expect(response.stdout).toBe('');
-      expect(response.stderr).toContain('dispatch flag not allowed: --into');
+      expect(response.stderr).toContain(error);
     } finally {
       stop();
     }

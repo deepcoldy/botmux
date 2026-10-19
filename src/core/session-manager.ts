@@ -1,3 +1,4 @@
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
@@ -17,7 +18,7 @@ import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -62,6 +63,7 @@ import {
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
+import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
@@ -95,10 +97,15 @@ import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
+import {
+  hasScheduleTopicTitleRuntimeTemplate,
+  renderScheduleTopicTitle,
+} from './schedule-topic-title.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
+import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
@@ -1193,6 +1200,7 @@ function managedLarkToolAppIdForPrompt(
       adoptMode: !!session?.adoptedFrom,
       existingAppServerEndpoint: session?.existingAppServerEndpoint,
       backendType: session?.backendType ?? botConfig.backendType ?? config.daemon.backendType,
+      larkToolBinding: botConfig.larkToolBinding,
     }, config.session.dataDir, process.env.BOTMUX_WORKFLOW === '1')
       ? larkAppId
       : undefined;
@@ -1349,7 +1357,19 @@ function buildNewTopicBlocks(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
+  const remoteRunnerSkillCatalog = (cliId === 'remote-runner' || opts?.sessionBackendType === 'remote-runner') && !noTransport;
+  if (remoteRunnerSkillCatalog) {
+    // A Remote Runner executes in an ephemeral environment and has no host
+    // skillsDir/pluginDir to discover. Force only the durable-schedule entry
+    // into its opening catalog; explicit user disable still wins in
+    // builtinSkillEntries, and zero prompt injection returned above.
+    const scheduleEntries = builtinSkillEntries({
+      asksViaHook: adapter.asksViaHook,
+      whiteboardEnabled: whiteboardEnabled(),
+      excludeRoutingCovered: true,
+    }).filter(entry => entry.name === 'botmux-schedule');
+    skillBlock = buildBuiltinSkillCatalogBlock(scheduleEntries, locale, { remoteRunner: true });
+  } else if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
@@ -2732,6 +2752,9 @@ export async function restoreActiveSessions(
       if (adoptSandboxBlocked(adoptBotCfg, session)) {
         logger.warn(`[${session.sessionId.substring(0, 8)}] isolated/no-transport session persisted as adopt — converting to cold-start (a sandbox / apiOnly bot can't wrap a live external CLI)`);
         session.adoptedFrom = undefined;
+        // The cold start resumes the external CLI's transcript, which lives on the
+        // default data root: drop any profile an older build froze onto the adopt row.
+        session.cliConfigDir = undefined;
         if (session.title?.startsWith('Adopt:')) {
           const project = session.title.slice('Adopt:'.length).trim();
           session.title = project || 'Session';
@@ -3220,11 +3243,19 @@ export async function restoreActiveSessions(
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
-    ensureOrdinaryTurnRecoveryAttached(ds);
-    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
-    if (!restoredLeaseId
-      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
-      ensureReadonlyTaskContinuationAttached(ds);
+    try {
+      ensureOrdinaryTurnRecoveryAttached(ds);
+      const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+      if (!restoredLeaseId
+        || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+        ensureReadonlyTaskContinuationAttached(ds);
+      }
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Isolated recovery re-arm failure; `
+        + `durable row retained and daemon startup continuing: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -3501,6 +3532,218 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
   return ds.workerPort ?? undefined;
 }
 
+export type DurableActiveSessionTakeoverResult =
+  | { ok: true; ds: DaemonSession }
+  | {
+      ok: false;
+      error:
+        | 'canonical_changed'
+        | 'unsupported_session'
+        | 'anchor_occupied'
+        | 'materialization_failed'
+        | 'worker_start_failed';
+      detail?: string;
+      activeSessionId?: string;
+    };
+
+function activeCanonicalTakeoverUnsupportedReason(session: Session): string | undefined {
+  if (session.status !== 'active') return 'canonical Session is not active';
+  if (!session.larkAppId) return 'canonical Session has no Lark application identity';
+  if (session.backendType !== 'remote-runner' && session.cliId !== 'remote-runner') {
+    return 'canonical Session does not use the Remote Runner backend';
+  }
+  const remote = normalizeRemoteRunnerBackendState(session.remoteBackendState);
+  if (!remote?.remoteSessionId) {
+    return 'canonical Session has no resumable Remote Runner state';
+  }
+  let requiredCapabilities: readonly string[] | undefined;
+  try {
+    requiredCapabilities = getBot(session.larkAppId).config.remoteRunner?.requiredCapabilities;
+  } catch {
+    return 'canonical Session application is not configured on this replica';
+  }
+  if (!requiredCapabilities?.includes('turn_recovery')) {
+    return 'Remote Runner turn_recovery is not required on this replica';
+  }
+  if (session.title?.startsWith('Adopt:') || session.adoptedFrom) {
+    return 'adopted Sessions do not support active takeover';
+  }
+  if (session.workspaceRetirement) return 'workspace-retired Sessions cannot be taken over';
+  if (session.deferredScheduleRun || session.headless || session.queued
+      || session.pendingRepoSetup || session.principalLane
+      || session.xpiSharedCwdAdmissionGroupId
+      || session.queuedActivationPending
+      || (session.queuedActivationTail?.length ?? 0) > 0) {
+    return 'canonical Session uses a lifecycle not supported by active takeover';
+  }
+  return undefined;
+}
+
+/**
+ * Materialize one already-active canonical Remote Runner Session on this
+ * replica after the caller has acquired its distributed Session lease. The
+ * input must be the post-claim canonical snapshot, never the router's earlier
+ * read, so local persistence cannot materialize stale state.
+ */
+export async function takeOverDurableActiveRemoteSession(
+  canonical: Session,
+  activeSessions: Map<string, DaemonSession>,
+): Promise<DurableActiveSessionTakeoverResult> {
+  const unsupported = activeCanonicalTakeoverUnsupportedReason(canonical);
+  if (unsupported) return { ok: false, error: 'unsupported_session', detail: unsupported };
+  const expectedAppId = canonical.larkAppId!;
+  const expectedSessionId = canonical.sessionId;
+  const expectedAnchor = storedSessionAnchorId(canonical);
+  const key = sessionKey(expectedAnchor, expectedAppId);
+
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
+    const existing = activeSessions.get(key);
+    if (existing) {
+      return {
+        ok: false as const,
+        error: 'anchor_occupied' as const,
+        activeSessionId: existing.session.sessionId,
+      };
+    }
+    const sameIdElsewhere = [...activeSessions.values()].find(
+      ds => ds.session.sessionId === expectedSessionId,
+    );
+    if (sameIdElsewhere) {
+      return {
+        ok: false as const,
+        error: 'anchor_occupied' as const,
+        activeSessionId: sameIdElsewhere.session.sessionId,
+        detail: 'the Session id is already registered at another local route',
+      };
+    }
+    const priorLocal = sessionStore.getOwnedSession(expectedSessionId);
+    if (!existing && priorLocal?.status === 'active') {
+      return {
+        ok: false as const,
+        error: 'materialization_failed' as const,
+        detail: 'an unregistered active local Session row requires recovery before takeover',
+      };
+    }
+
+    const localConflict = sessionStore.listSessions().find(session =>
+      session.sessionId !== expectedSessionId
+      && session.status === 'active'
+      && (!session.larkAppId || session.larkAppId === expectedAppId)
+      && (session.scope === 'chat' ? 'chat' : 'thread')
+        === (canonical.scope === 'chat' ? 'chat' : 'thread')
+      && storedSessionAnchorId(session) === expectedAnchor,
+    );
+    if (localConflict) {
+      return {
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: localConflict.sessionId,
+        detail: 'another active local Session row occupies the canonical route',
+      };
+    }
+    // PID, Web Terminal and preview targets are replica-local observations.
+    // Keep the logical workerGeneration so reserveWorkerGeneration advances
+    // across takeover, but never import another Pod's process handles.
+    const materialized = structuredClone(canonical);
+    materialized.pid = undefined;
+    materialized.webPort = undefined;
+    materialized.previewTarget = undefined;
+    materialized.restoreQuarantinedAt = undefined;
+    try {
+      sessionStore.updateSession(materialized);
+    } catch (error) {
+      return {
+        ok: false,
+        error: 'materialization_failed',
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const persisted = sessionStore.getOwnedSession(expectedSessionId);
+    if (!persisted || persisted.status !== 'active'
+        || persisted.larkAppId !== expectedAppId
+        || storedSessionAnchorId(persisted) !== expectedAnchor) {
+      return {
+        ok: false,
+        error: 'materialization_failed',
+        detail: 'canonical active Session materialization did not persist',
+      };
+    }
+
+    const ds: DaemonSession = {
+      session: persisted,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: expectedAppId,
+      chatId: persisted.chatId,
+      chatType: persisted.chatType ?? 'group',
+      scope: persisted.scope === 'chat' ? 'chat' : 'thread',
+      spawnedAt: sessionCreatedAtMs(persisted),
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: sessionLastMessageAtMs(persisted),
+      lastHumanMessageAt: persisted.lastHumanMessageAt
+        ? Date.parse(persisted.lastHumanMessageAt) || undefined
+        : undefined,
+      hasHistory: true,
+      workingDir: persisted.workingDir,
+      ownerOpenId: persisted.ownerOpenId,
+      streamCardId: persisted.streamCardId,
+      streamCardNonce: persisted.streamCardNonce,
+      streamCardReplyTargetKey: persisted.streamCardReplyTargetKey,
+      displayMode: persisted.displayMode ?? (persisted.streamExpanded ? 'screenshot' : 'hidden'),
+      currentImageKey: persisted.currentImageKey,
+      currentTurnTitle: persisted.currentTurnTitle,
+      usageLimit: persisted.usageLimit,
+      modelFallback: persisted.modelFallback,
+      lastUserPrompt: persisted.lastUserPrompt,
+      lastCliInput: persisted.lastCliInput,
+      lastCodexAppInput: persisted.lastCodexAppInput,
+      replyThreadAliases: persisted.replyThreadAliases,
+      currentReplyTarget: persisted.currentReplyTarget,
+      suppressRecoveryCard: true,
+    };
+    messageQueue.ensureQueue(expectedAnchor);
+    if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
+    if (!setActiveSessionIfActive(activeSessions, key, ds)
+        || activeSessions.get(key) !== ds) {
+      return {
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: activeSessions.get(key)?.session.sessionId,
+      };
+    }
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    let started = false;
+    try {
+      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'reattach' }, {
+        deferDuringDeviceIsolation: false,
+        onAdmission: value => { admission = value; },
+      });
+    } catch (error) {
+      logger.warn(
+        `[${expectedSessionId.substring(0, 8)}] Active canonical takeover worker failed to start: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!started || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      if (activeSessions.get(key) === ds) activeSessions.delete(key);
+      persisted.restoreQuarantinedAt = new Date().toISOString();
+      try { sessionStore.updateSession(persisted); } catch { /* retry remains fail-closed */ }
+      return {
+        ok: false,
+        error: 'worker_start_failed',
+        detail: `worker admission ${admission ?? 'not_reported'}`,
+      };
+    }
+    announceSessionRow(ds);
+    logger.info(
+      `[${expectedSessionId.substring(0, 8)}] Took over active canonical Remote Runner Session `
+      + `(anchor: ${expectedAnchor.substring(0, 12)})`,
+    );
+    return { ok: true, ds };
+  });
+}
+
 /**
  * Reactivate a single closed session — used by the "▶️ 恢复会话" card button
  * and the `botmux resume <id>` CLI command. Mirrors the per-session branch
@@ -3526,7 +3769,7 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'workspace_retired' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
+| { ok: false; error: 'codex_unarchive_failed' | 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'workspace_retired' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.workspaceRetirement) return { ok: false, error: 'workspace_retired' };
@@ -3681,6 +3924,20 @@ export async function resumeSession(
     };
   }
 
+  try {
+    await restoreCodexCleanupArchive(session, sessionStore.updateSession, undefined, () => sessionStore.getOwnedSession(sessionId));
+  } catch (error) {
+    logger.warn(`[resume] Codex unarchive failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false as const, error: 'codex_unarchive_failed' as const };
+  }
+  // Recheck after RPC: a concurrent state transition must never be overwritten.
+  if (sessionStore.getSession(sessionId)?.workspaceRetirement) {
+    return { ok: false as const, error: 'workspace_retired' as const };
+  }
+  if (sessionStore.getSession(sessionId)?.status !== 'closed' || activeSessions.has(key)) {
+    return { ok: false as const, error: 'resume_cancelled' as const };
+  }
+
   // Reactivate and abandon any queued/setup ownership in one durable replace.
   // Closed rows created by older releases may still contain a prepared head,
   // tail, or repo picker; generic resume starts a new lifecycle and must never
@@ -3820,6 +4077,19 @@ export async function resumeSession(
     }
   }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
+  // A session group's resident is its chat-scope session. Closing no longer
+  // auto-resumes, so any recovery path (close card, /resume, /adopt <id>, CLI)
+  // may bring back an older resident; keep the registry pointing at it so
+  // /dismiss sees the live resident. No-op for chats that are not session groups.
+  if (scope === 'chat' && isSessionGroup(session.chatId)) touchSessionGroup(session.chatId, sessionId);
+  // Flip connected dashboards back to active for every recovery path (close
+  // card, /resume, /adopt <id>, HTTP, durable control). `null`, not undefined,
+  // so the SSE patch actually clears closedAt. Idempotent with callers that
+  // also publish.
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId, patch: { status: 'active', closedAt: null } },
+  });
   return {
     ok: true,
     ds,
@@ -3987,6 +4257,19 @@ export async function executeScheduledTask(
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
+  const rawTopicTitle = task.topicTitle?.trim();
+  const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
+  const hasDynamicTopicTitle = !!rawTopicTitle
+    && hasScheduleTopicTitleRuntimeTemplate(rawTopicTitle);
+  if (silent && createsOwnTopic && hasDynamicTopicTitle) {
+    throw new Error('topic_title_template_silent_unsupported');
+  }
+  const topicTitle = rawTopicTitle && createsOwnTopic && !silent && hasDynamicTopicTitle
+    ? renderScheduleTopicTitle(rawTopicTitle, {
+        firedAt: new Date(),
+        ownerOpenId: task.ownerOpenId,
+      })
+    : rawTopicTitle;
 
   // Decide where to route the "🕐 task started" notification and where the
   // session conversation lands.
@@ -4032,7 +4315,9 @@ export async function executeScheduledTask(
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
-      const topicSeed = task.topicTitle?.trim()
+      // A custom title is the actual text root; without one the localized
+      // task-start notice remains the backwards-compatible seed.
+      const topicSeed = topicTitle
         || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, task.chatId, topicSeed);
       isContinuation = false;
@@ -4089,7 +4374,9 @@ export async function executeScheduledTask(
               logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
             });
           }
-          const topicSeed = task.topicTitle?.trim()
+          // Dedicated tasks use the same rendered fire-time title contract as
+          // new-topic runs, but persist this first root for later continuations.
+          const topicSeed = topicTitle
             || t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId));
           const seed = await sendMessage(larkAppId, task.chatId, topicSeed);
           // Write the root straight into the task row (store call, not the
@@ -4441,7 +4728,7 @@ export async function executeScheduledTask(
         taskId: task.id,
         turnId: scheduledTurnId,
         routingAnchor: anchor,
-        ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
+        ...(topicTitle ? { topicTitle } : {}),
         createdAt: new Date(now).toISOString(),
       };
     }
@@ -4790,6 +5077,10 @@ export async function spawnDashboardSession(
   const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
   const registered = await withActiveSessionKeyLock(activeSessions, key, async () => {
+    // Re-check under the key lock: the scan above runs before the banner /
+    // attachment awaits, so a restore can quarantine this anchor in between.
+    // Every other creation path performs this check at registration time.
+    if (findQuarantinedRoutingConflict(key, larkAppId)) return undefined;
     const current = activeSessions.get(key);
     if (current) {
       const protectedOwner = current.worker || current.session.queued || current.pendingRepo

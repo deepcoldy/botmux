@@ -107,7 +107,7 @@ export function registerMidsceneSuites(): void {
         `第二张蓝色明细图 ${img2Path} 紧跟在「明细见下表：」这段文字后面；最后再加一句「环比 +12%」。` +
         `关键要求：两张图必须穿插在正文中间的对应位置，不能两张都堆在消息最末尾。发完就结束本轮工作。`;
 
-      await sendMessage(agent, prompt);
+      await sendMessage(agent, prompt, page);
 
       await waitForStreamingCard(agent, {
         timeoutMs: 90_000,

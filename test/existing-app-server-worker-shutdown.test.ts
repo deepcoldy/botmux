@@ -15,7 +15,7 @@ describe('existing App Server shared-adopt worker shutdown', () => {
     expect(body).toContain('process.exit(0);');
     // The guarded branch returns before the ordinary killCli teardown, keeping
     // the bmx-* remote client for the replacement daemon to reattach.
-    expect(body).toMatch(/existingAppServerEndpoint[\s\S]*?cleanup\(\);[\s\S]*?process\.exit\(0\);[\s\S]*?return;[\s\S]*?killCli\(\);/);
+    expect(body).toMatch(/existingAppServerEndpoint[\s\S]*?cleanup\(\);[\s\S]*?process\.exit\(0\);[\s\S]*?return;[\s\S]*?killCli\(\{ preserveSandbox \}\);/);
   });
 
   it('routes SIGTERM, IPC disconnect, and parent-watchdog exit through the shared guard', () => {

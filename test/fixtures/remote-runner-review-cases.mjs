@@ -22,6 +22,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
   if (command.type === 'hello') {
     const capabilities = ['start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'terminal_screen'];
     if (!command.sessionId.includes('no-outbound')) capabilities.push('outbound_message');
+    if (!command.sessionId.includes('no-explicit')) capabilities.push('outbound_message_explicit_mention');
     emit({
       type: 'hello', requestId: command.requestId, provider: 'review-cases',
       capabilities,
@@ -76,6 +77,10 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       usage: { generation: 2, snapshot: { context: null, tokens: null } } });
   } else if (command.content === 'unadvertised-outbound') {
     outbound('not-advertised', command.turnId);
+  } else if (command.content === 'unadvertised-explicit-mention') {
+    emit({ type: 'outbound_message', operationId: 'explicit-not-advertised', turnId: command.turnId,
+      generation: 1, content: 'explicit', responseKind: 'progress', mention: 'explicit',
+      mentions: ['ou_target:Target'] });
   } else if (command.content === 'outbound-future-generation') {
     emit({ type: 'outbound_message', operationId: 'future-generation', turnId: command.turnId,
       generation: 2, content: 'future', responseKind: 'progress', mention: 'none' });

@@ -93,4 +93,42 @@ process.stdout.write(JSON.stringify({ success: true, messageId: 'om_remote_outbo
         message: 'provider response lost',
       });
   });
+
+  it('passes explicit mention arguments to the ordinary host send policy', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-mention-test-'));
+    roots.push(root);
+    const observed = join(root, 'observed.json');
+    const fixture = join(root, 'fixture.mjs');
+    writeFileSync(fixture, `#!/usr/bin/env node
+import fs from 'node:fs';
+const argv = process.argv.slice(2);
+fs.writeFileSync(${JSON.stringify(observed)}, JSON.stringify(argv));
+process.stdout.write(JSON.stringify({ success: true, messageId: 'om_explicit_mention' }) + '\\n');
+`);
+    chmodSync(fixture, 0o755);
+
+    await expect(sendRemoteRunnerOutboundMessage({
+      operationId: 'operation-explicit',
+      turnId: 'turn-explicit',
+      generation: 2,
+      content: '请查看',
+      responseKind: 'auxiliary',
+      mention: 'explicit',
+      mentions: ['ou_target:Target', 'target@example.com:Target by email'],
+    }, {
+      sessionId: 'session-explicit',
+      turnId: 'turn-explicit',
+      cliPath: fixture,
+      env: { PATH: process.env.PATH },
+    })).resolves.toEqual({ outcome: 'delivered', messageId: 'om_explicit_mention' });
+
+    expect(JSON.parse(readFileSync(observed, 'utf8'))).toEqual([
+      'send', '--remote-runner-outbound',
+      '--response-kind', 'auxiliary',
+      '--mention', 'ou_target:Target',
+      '--mention', 'target@example.com:Target by email',
+      '--content-file', expect.any(String),
+      '--session-id', 'session-explicit',
+    ]);
+  });
 });

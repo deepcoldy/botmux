@@ -47,6 +47,8 @@ import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewRepli
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { createTurnResultRuntime, setTurnResultRuntime } from '../src/core/turn-result-runtime.js';
+import { TurnResultStore } from '../src/services/turn-result-store.js';
 import { setDeploymentOwner } from '../src/services/deployment-identity.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
@@ -207,10 +209,80 @@ afterEach(async () => {
   setExactChatGrantHandler(null);
   setCrossPrincipalInterruptionDisableHandler(null);
   setDurableSessionSendHandler(null);
+  setTurnResultRuntime(undefined);
   clearMessageListenerRunPreviewStore();
 });
 
 describe('dashboard IPC server', () => {
+  it('turn result reads require host HMAC and exact bot, turn and attempt', async () => {
+    const appId = 'app_result_ipc';
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', turnResults: { enabled: true } });
+    setLarkAppId(appId);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const runtime = createTurnResultRuntime({ store: new TurnResultStore(), enabled: () => true, eligible: () => true, owns: () => true });
+    setTurnResultRuntime(runtime);
+    const binding = { ref: { botId: appId, sessionId: 'sid_result', turnId: 'om_result' },
+      source: { kind: 'im' as const, platform: 'lark', chatId: 'oc_result', messageId: 'om_result' }, workerGeneration: 1 };
+    runtime.begin(binding);
+    runtime.delivery(binding, { status: 'available', content: 'complete public result', format: 'markdown', source: 'transcript' },
+      { channel: 'im', status: 'delivered', messages: [{ messageId: 'om_sent', kind: 'primary' }] });
+    runtime.terminal(binding, { status: 'completed' });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    const path = '/api/sessions/sid_result/turns/om_result/result';
+    const url = `http://127.0.0.1:${handle.port}${path}`;
+    expect((await fetch(url)).status).toBe(401);
+    const response = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'ready', result: { ref: binding.ref, output: { content: 'complete public result' } } });
+    const attempt = await fetch(`${url}?dispatchAttempt=0`, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await attempt.json()).toEqual({ status: 'not_found' });
+    const invalid = await fetch(`${url}?dispatchAttempt=0&dispatchAttempt=1`, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(invalid.status).toBe(400);
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture' });
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', turnResults: { enabled: true } });
+    const revoked = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await revoked.json()).toEqual({ status: 'not_found' });
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture' });
+    const disabled = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await disabled.json()).toEqual({ status: 'unavailable', reason: 'disabled' });
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', turnResults: { enabled: true } });
+    const reenabled = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await reenabled.json()).toEqual({ status: 'not_found' });
+    setLarkAppId('app_other');
+    const foreign = await fetch(url, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await foreign.json()).toEqual({ status: 'not_found' });
+    setTurnResultRuntime(undefined);
+  });
+
+  it('turn result access is disabled by default and withdrawing enablement discards content', async () => {
+    const appId = 'app_result_disabled';
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture' });
+    setLarkAppId(appId);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/sessions/sid_result/turns/om_result/result';
+    const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, { headers: trustedHostHeaders('GET', path, handle.port) });
+    expect(await response.json()).toEqual({ status: 'unavailable', reason: 'disabled' });
+  });
+  it('turn result normalization is explicitly opt-in', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'turn-result-config-'));
+    const path = join(dir, 'bots.json');
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = path;
+      writeFileSync(path, JSON.stringify([
+        { larkAppId: 'app_on', larkAppSecret: 'fixture', turnResults: { enabled: true } },
+        { larkAppId: 'app_off', larkAppSecret: 'fixture', turnResults: { enabled: false } },
+        { larkAppId: 'app_invalid', larkAppSecret: 'fixture', turnResults: { enabled: 'true' } },
+      ]));
+      const parsed = loadBotConfigs();
+      expect(parsed.map(item => item.turnResults)).toEqual([{ enabled: true }, undefined, undefined]);
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('persists an acyclic quota fallback and rejects an impending cycle atomically', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quota-fallback-'));
     const configPath = join(dir, 'bots.json');
@@ -1839,6 +1911,213 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('native Lark slash-command routes — optional scope degradation', () => {
+  async function withBot(
+    run: (base: string, request: ReturnType<typeof vi.fn>) => Promise<void>,
+    extraConfig: Record<string, unknown> = {},
+  ): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-native-slash-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-native-slash-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', ...extraConfig }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      const request = vi.fn();
+      if (extraConfig.apiOnly !== true) (botRegistry.getBotClient(appId) as any).request = request;
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`, request);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('answers 200 + available:false (not an error) when the read scope is missing', async () => {
+    await withBot(async (base, request) => {
+      request.mockRejectedValue({ response: { status: 400, data: { code: 99991672, msg: 'Access denied' } } });
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        ok: true,
+        available: false,
+        reason: 'missing_scope',
+        missingScopes: ['application:app_slash_command:read'],
+      });
+      expect(body.permissionUrls.read).toContain('application%3Aapp_slash_command%3Aread');
+      // The schema-derived catalog is still returned, read-only.
+      expect(body.commands.length).toBeGreaterThan(0);
+      expect(body.commands.every((c: any) => c.status === 'unknown' && c.source === 'botmux')).toBe(true);
+
+      const sync = await fetch(`${base}/api/bot-slash-commands/sync`, { method: 'POST' });
+      expect(sync.status).toBe(200);
+      expect(await sync.json()).toMatchObject({ ok: false, available: false, reason: 'missing_scope' });
+    });
+  });
+
+  it('reports not_enabled when the OpenAPI is absent for this tenant', async () => {
+    await withBot(async (base, request) => {
+      request.mockRejectedValue({ response: { status: 404, data: '404 page not found' } });
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, available: false, reason: 'not_enabled', missingScopes: [] });
+    });
+  });
+
+  it('surfaces a write-scope denial on sync-one as missing_scope, and rejects commands outside the catalog', async () => {
+    await withBot(async (base, request) => {
+      request.mockImplementation(async (payload: { method: string }) => (
+        payload.method === 'GET'
+          ? { code: 0, msg: 'success', data: { items: [] } }
+          : Promise.reject({ response: { status: 400, data: { code: 99991672, msg: 'Access denied' } } })
+      ));
+      const res = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/help' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: false,
+        available: true,
+        error: 'missing_scope',
+        missingScopes: ['application:app_slash_command:write'],
+      });
+
+      const outside = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/compact' }),
+      });
+      expect(outside.status).toBe(400);
+      expect(await outside.json()).toMatchObject({ ok: false, error: 'slash_command_not_in_catalog' });
+    });
+  });
+
+  it('core-only (apiOnly) bot: read-only core_only state, never resolves a Lark client, writes refused', async () => {
+    await withBot(async base => {
+      const clientSpy = vi.spyOn(botRegistry, 'getBotClient');
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: true, available: false, reason: 'core_only', missingScopes: [] });
+      expect(body.permissionUrls).toBeUndefined();
+      expect(body.commands.length).toBeGreaterThan(0);
+      expect(body.commands.every((c: any) => c.status === 'unknown')).toBe(true);
+
+      for (const [path, init] of [
+        ['/api/bot-slash-commands/sync', { method: 'POST' }],
+        ['/api/bot-slash-commands/sync-one', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ command: '/help' }) }],
+        ['/api/bot-slash-commands/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ command: '/help' }) }],
+      ] as const) {
+        const write = await fetch(`${base}${path}`, init as RequestInit);
+        expect(write.status).toBe(200);
+        expect(await write.json()).toMatchObject({ ok: false, available: false, reason: 'core_only' });
+      }
+      expect(clientSpy).not.toHaveBeenCalled();
+      clientSpy.mockRestore();
+    }, { apiOnly: true });
+  });
+
+  it('degrades on the v7 "lacks permission" envelope (99991640) for both query and write', async () => {
+    await withBot(async (base, request) => {
+      request.mockResolvedValue({ code: 99991640, msg: 'lacks permission' });
+      const res = await fetch(`${base}/api/bot-slash-commands`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, available: false, reason: 'missing_scope' });
+
+      request.mockImplementation(async (payload: { method: string }) => (
+        payload.method === 'GET'
+          ? { code: 0, msg: 'success', data: { items: [] } }
+          : { code: 99991640, msg: 'lacks permission' }
+      ));
+      const write = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/help' }),
+      });
+      expect(write.status).toBe(200);
+      expect(await write.json()).toMatchObject({
+        ok: false,
+        error: 'missing_scope',
+        missingScopes: ['application:app_slash_command:write'],
+      });
+    });
+  });
+
+  it('maps bare HTTP 403/404 write rejections to missing_scope / not_enabled', async () => {
+    await withBot(async (base, request) => {
+      for (const [status, reason] of [[403, 'missing_scope'], [404, 'not_enabled']] as const) {
+        request.mockImplementation(async (payload: { method: string }) => {
+          if (payload.method === 'GET') return { code: 0, msg: 'success', data: { items: [] } };
+          throw Object.assign(new Error(`Request failed with status code ${status}`), { response: { status, data: 'nope' } });
+        });
+        const res = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ command: '/help' }),
+        });
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body).toMatchObject({ ok: false, error: reason, reason });
+        expect(body.report.outcomes[0]).toMatchObject({ ok: false, httpStatus: status });
+        expect(body.report.outcomes[0].uncertain).toBeUndefined();
+      }
+    });
+  });
+
+  it('keeps a confirmed write ok and exposes refreshError separately when the post-write refresh fails', async () => {
+    await withBot(async (base, request) => {
+      let wrote = false;
+      request.mockImplementation(async (payload: { method: string }) => {
+        if (payload.method === 'GET') {
+          if (wrote) throw new Error('refresh ETIMEDOUT');
+          return { code: 0, msg: 'success', data: { items: [] } };
+        }
+        wrote = true;
+        return { code: 0, msg: 'success' };
+      });
+      const res = await fetch(`${base}/api/bot-slash-commands/sync-one`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: '/help' }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ ok: true, available: true, report: { created: 1, failed: 0 } });
+      expect(body.refreshError).toContain('refresh ETIMEDOUT');
+      expect(body.error).toBeUndefined();
+    });
+  });
+
+  it('a thrown write mid-batch returns the accumulated report (not a read-failure 502)', async () => {
+    await withBot(async (base, request) => {
+      let posts = 0;
+      request.mockImplementation(async (payload: { method: string }) => {
+        if (payload.method === 'GET') return { code: 0, msg: 'success', data: { items: [] } };
+        posts += 1;
+        if (posts === 2) throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+        return { code: 0, msg: 'success' };
+      });
+      const res = await fetch(`${base}/api/bot-slash-commands/sync`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ok).toBe(false);
+      expect(body.available).toBe(true);
+      expect(body.report.failed).toBe(1);
+      expect(body.report.created).toBe(posts - 1);
+      expect(posts).toBeGreaterThan(2);
+      expect(body.report.outcomes.filter((o: any) => o.uncertain)).toHaveLength(1);
+    });
   });
 });
 
@@ -9437,6 +9716,7 @@ describe('GET /api/groups (Phase B)', () => {
       oncallChat: null,
       serialInput: false,
       idleClose: { enabled: false, duration: 1, unit: 'days' },
+      replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
@@ -9444,6 +9724,9 @@ describe('GET /api/groups (Phase B)', () => {
       pinStreamingCardMasterEnabled: false,
       pinStreamingCardChatEnabled: true,
       pinStreamingCardEffectiveEnabled: false,
+      streamingCardMasterEnabled: true,
+      streamingCardChatEnabled: true,
+      streamingCardEffectiveEnabled: true,
     }]);
     spy.mockRestore();
   });
@@ -9476,6 +9759,7 @@ describe('GET /api/groups (Phase B)', () => {
         oncallChat: null,
         serialInput: false,
         idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9483,6 +9767,9 @@ describe('GET /api/groups (Phase B)', () => {
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
         pinStreamingCardEffectiveEnabled: false,
+        streamingCardMasterEnabled: true,
+        streamingCardChatEnabled: true,
+        streamingCardEffectiveEnabled: true,
       }]);
       spy.mockRestore();
     } finally {
@@ -9521,6 +9808,7 @@ describe('GET /api/groups (Phase B)', () => {
         oncallChat: null,
         serialInput: false,
         idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9528,6 +9816,9 @@ describe('GET /api/groups (Phase B)', () => {
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: false,
         pinStreamingCardEffectiveEnabled: false,
+        streamingCardMasterEnabled: true,
+        streamingCardChatEnabled: true,
+        streamingCardEffectiveEnabled: true,
       }]);
       spy.mockRestore();
     } finally {
@@ -9556,6 +9847,7 @@ describe('GET /api/groups (Phase B)', () => {
         oncallChat: null,
         serialInput: false,
         idleClose: { enabled: false, duration: 1, unit: 'days' },
+        replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -9563,6 +9855,9 @@ describe('GET /api/groups (Phase B)', () => {
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
         pinStreamingCardEffectiveEnabled: false,
+        streamingCardMasterEnabled: true,
+        streamingCardChatEnabled: true,
+        streamingCardEffectiveEnabled: true,
       }]);
     } finally {
       getBotSpy.mockRestore();
@@ -9604,6 +9899,7 @@ describe('GET /api/groups (Phase B)', () => {
           oncallChat: null,
           serialInput: false,
           idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9611,6 +9907,9 @@ describe('GET /api/groups (Phase B)', () => {
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,
           pinStreamingCardEffectiveEnabled: true,
+          streamingCardMasterEnabled: true,
+          streamingCardChatEnabled: true,
+          streamingCardEffectiveEnabled: true,
         },
         {
           chatId: 'oc_master_on_chat_off',
@@ -9619,6 +9918,7 @@ describe('GET /api/groups (Phase B)', () => {
           oncallChat: null,
           serialInput: false,
           idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9626,6 +9926,9 @@ describe('GET /api/groups (Phase B)', () => {
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: false,
           pinStreamingCardEffectiveEnabled: false,
+          streamingCardMasterEnabled: true,
+          streamingCardChatEnabled: true,
+          streamingCardEffectiveEnabled: true,
         },
         {
           chatId: 'oc_master_on_chat_on',
@@ -9634,6 +9937,7 @@ describe('GET /api/groups (Phase B)', () => {
           oncallChat: null,
           serialInput: false,
           idleClose: { enabled: false, duration: 1, unit: 'days' },
+          replyMode: { override: null, default: 'chat-topic', effective: 'chat-topic', inherited: true },
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9641,6 +9945,9 @@ describe('GET /api/groups (Phase B)', () => {
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,
           pinStreamingCardEffectiveEnabled: true,
+          streamingCardMasterEnabled: true,
+          streamingCardChatEnabled: true,
+          streamingCardEffectiveEnabled: true,
         },
       ]);
       spy.mockRestore();

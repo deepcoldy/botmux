@@ -358,6 +358,48 @@ export function FieldTitle(props: {
   );
 }
 
+/**
+ * 开关行：`<label.toggle-row>` = 复选框 + 滑块 + 「标题（带 ? 提示）+ 可选说明」。
+ * bot-defaults 页与 settings 页共用；两页的差别只在标题用哪一套 FieldTitle
+ * （bot-defaults 的 `bd-*` 页面作用域样式 vs 本文件的 `ui-*`），由 `TitleComponent`
+ * 注入，默认是本文件的 {@link FieldTitle}。
+ */
+export function ToggleRow(props: {
+  checked: boolean;
+  disabled?: boolean;
+  title: ReactNode;
+  help?: ReactNode;
+  description?: ReactNode;
+  className?: string;
+  /** 透传到 `<input data-action>`，供测试/事件委托钉点。 */
+  dataAction?: string;
+  /** 追加到默认 FieldTitle 的 class；使用自定义 `TitleComponent` 时忽略。 */
+  titleClassName?: string;
+  TitleComponent?: (p: { children: ReactNode; help?: ReactNode }) => React.JSX.Element;
+  onChange(checked: boolean): void;
+}): React.JSX.Element {
+  return (
+    <label className={props.className ? `toggle-row ${props.className}` : 'toggle-row'}>
+      <input
+        type="checkbox"
+        data-action={props.dataAction}
+        checked={props.checked}
+        disabled={props.disabled}
+        onChange={event => props.onChange(event.currentTarget.checked)}
+      />
+      <span className="switch" aria-hidden="true" />
+      <span className="toggle-tx">
+        <strong>
+          {props.TitleComponent
+            ? <props.TitleComponent help={props.help}>{props.title}</props.TitleComponent>
+            : <FieldTitle className={props.titleClassName} help={props.help}>{props.title}</FieldTitle>}
+        </strong>
+        {props.description ? <small>{props.description}</small> : null}
+      </span>
+    </label>
+  );
+}
+
 export function OverviewList(props: {
   id?: string;
   className?: string;

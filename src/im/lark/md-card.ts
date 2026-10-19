@@ -158,9 +158,9 @@ export interface CardUsageSnapshot {
     in: number;
     out: number;
   } | null;
-  /** Latest executor-reported model. Rendered by session-status cards only. */
+  /** Observed runtime model, or the configured launch model when unavailable. */
   model?: string;
-  /** Latest executor-reported reasoning effort. */
+  /** Observed reasoning effort, or the configured session effort when unavailable. */
   reasoningEffort?: string;
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {
@@ -579,29 +579,22 @@ export function cardUsageFooterSegment(
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
   }
-  // Runtime identity is formatted separately by cardUsageRuntimeSegment, then
-  // the streaming card appends it to this metric string with ` · ` in one
-  // continuous markdown paragraph. Keep this function metric-only so reply-card
-  // footers remain unchanged and the streaming renderer owns the tail layout.
+  // Runtime identity is formatted separately by cardUsageRuntimeSegment. Keep
+  // this function metric-only so callers can also render identity without usage.
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
-/** Streaming-card runtime tail appended after
- * {@link cardUsageFooterSegment}'s metric text. Returns `**model** variant · effort`
- * (model bolded within the shared grey markdown) or null when there is no model.
- * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
- * standalone runtime-only row when native usage is unavailable. The
- * model↔effort join uses a non-breaking space so the pair never wraps apart. */
+/** Runtime identity shared by status and reply cards, independent of metrics.
+ * Missing model/effort is never guessed. Keep the selected model ID intact
+ * within the label budget: CLIs such as Cursor encode effort in that ID. */
 export function cardUsageRuntimeSegment(
   usage: CardUsageSnapshot,
-  hasMetrics: boolean,
 ): string | null {
-  if (!hasMetrics) return null;
   // Strip a leading `provider/` routing prefix (e.g. `model_hub/es1_orange_o48`
   // \u2192 `es1_orange_o48`) so the card shows the bare model name, not the relay's
   // internal namespace. A value with no slash (e.g. `gpt-5.6-sol`) is untouched.
   // Keep the tail compact so the continuous usage paragraph wraps predictably.
-  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
+  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 64);
   if (!model) return null;
   const variant = usage.modelBackendVariant === 'standard'
     ? 'Standard'
@@ -712,6 +705,8 @@ export function buildReplyCardFooter(opts: {
   if (opts.usage) {
     const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
+    const runtimeSeg = cardUsageRuntimeSegment(opts.usage);
+    if (runtimeSeg) { parts.push(runtimeSeg); hasUsage = true; }
   }
   const durationMs = opts.executionDurationMs;
   const hasDuration = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0;

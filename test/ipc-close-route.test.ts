@@ -69,7 +69,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, outcome: 'closed', alreadyClosed: false });
-    expect(closeSpy).toHaveBeenCalledWith('s-close');
+    expect(closeSpy).toHaveBeenCalledWith('s-close', expect.objectContaining({ onCodexCleanupRelease: expect.any(Function) }));
   });
 
   it('rejects a missing or stale capability without closing anything', async () => {
@@ -120,7 +120,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, outcome: 'closed', alreadyClosed: true });
-    expect(closeSpy).toHaveBeenCalledWith('missing');
+    expect(closeSpy).toHaveBeenCalledWith('missing', expect.objectContaining({ onCodexCleanupRelease: expect.any(Function) }));
   });
 
   it('replays the residual for an already-closed row instead of a bare success', async () => {

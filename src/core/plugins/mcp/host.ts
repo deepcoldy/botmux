@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as NetServer, type Socket } from 'node:net';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { PluginMcpGateway, type GatewayTrustedTurnIdentityProvider } from './gateway.js';
+import {
+  PluginMcpGateway,
+  type GatewayTrustedResultDeliveryHandler,
+  type GatewayTrustedTurnIdentityProvider,
+} from './gateway.js';
 import { acceptMcpGatewayHandshake, mcpGatewayAuthTokenPath } from './socket-auth.js';
 
 export interface SessionMcpGatewayHost {
@@ -26,6 +30,23 @@ export function sessionMcpGatewayPathRegex(
   return `^${escapeForRegex(root)}/bmcp-${uid}-[^/]+(?:/|$)`;
 }
 
+/** Root for every Gateway socket directory.
+ *
+ * spawnCli repoints the worker's own TMPDIR at the per-session scratch tree
+ * (~/.cache/botmux/session-tmp/<profile>/<sessionId>, #1592) before the host
+ * binds. Following tmpdir() after that would place g.sock ~125 bytes deep on
+ * macOS and listen() fails with EINVAL, so the worker pins the inherited root
+ * first. Unpinned callers keep the plain tmpdir() behaviour. */
+let pinnedGatewaySocketRoot: string | undefined;
+
+export function pinSessionMcpGatewaySocketRoot(root: string): void {
+  pinnedGatewaySocketRoot ??= root;
+}
+
+export function sessionMcpGatewaySocketRoot(): string {
+  return pinnedGatewaySocketRoot ?? tmpdir();
+}
+
 /** Deterministic per-session Gateway socket directory.
  *
  * The name is a pure function of (dataDir, sessionId) — NO random component —
@@ -34,8 +55,9 @@ export function sessionMcpGatewayPathRegex(
  * environment, and the relay can simply reconnect instead of the worker having
  * to kill the pane and cold-resume the CLI.
  *
- * Stays under tmpdir (not dataDir) to keep the Unix socket below macOS's short
- * sun_path limit, and keeps the `bmcp-<uid>-` prefix so the existing Seatbelt
+ * Stays under sessionMcpGatewaySocketRoot() (not dataDir, and not the session
+ * scratch TMPDIR) to keep the Unix socket below macOS's short sun_path limit,
+ * and keeps the `bmcp-<uid>-` prefix so the existing Seatbelt
  * deny regex (sessionMcpGatewayPathRegex) covers it unchanged. The predictable
  * name is safe because ensurePrivateGatewayDir fails closed unless the
  * directory is a real 0700 directory owned by this uid — a squatter can only
@@ -49,7 +71,7 @@ export function sessionMcpGatewaySocketDir(sessionId: string, dataDir: string): 
     .update(sessionId)
     .digest('hex')
     .slice(0, 16);
-  return join(tmpdir(), `bmcp-${uid}-${sessionKey}`);
+  return join(sessionMcpGatewaySocketRoot(), `bmcp-${uid}-${sessionKey}`);
 }
 
 /** Deterministic per-session Gateway socket path (see sessionMcpGatewaySocketDir). */
@@ -100,6 +122,7 @@ export async function startSessionMcpGatewayHost(opts: {
   sessionId: string;
   dataDir: string;
   trustedTurnIdentity?: GatewayTrustedTurnIdentityProvider;
+  trustedResultDelivery?: GatewayTrustedResultDeliveryHandler;
   onError?: (error: Error) => void;
 }): Promise<SessionMcpGatewayHost> {
   const socketDir = sessionMcpGatewaySocketDir(opts.sessionId, opts.dataDir);
@@ -132,6 +155,7 @@ export async function startSessionMcpGatewayHost(opts: {
         BOTMUX_SESSION_ID: opts.sessionId,
       }, {
         trustedTurnIdentity: opts.trustedTurnIdentity,
+        trustedResultDelivery: opts.trustedResultDelivery,
       });
       let gatewayClose: Promise<void> | undefined;
       const closeGateway = (): Promise<void> => {

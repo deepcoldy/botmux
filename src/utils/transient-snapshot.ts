@@ -107,7 +107,7 @@ export async function snapshotToPng(
   backend: unknown,
   fallbackCols: number,
   fallbackRows: number,
-): Promise<{ png: Buffer; ansi: string; content: string } | null> {
+): Promise<{ png: Buffer; ansi: string; content: string; cols: number; rows: number } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -119,7 +119,7 @@ export async function snapshotToPng(
     const startY = terminal.buffer.active.baseY;
     const png = await captureToPng(terminal, { cols: snap.cols, rows: snap.rows, startY });
     const content = readViewportText(terminal, { filter: true, startY, rows: snap.rows });
-    return { png, ansi: snap.ansi, content };
+    return { png, ansi: snap.ansi, content, cols: snap.cols, rows: snap.rows };
   } finally {
     terminal.dispose();
   }
@@ -133,7 +133,7 @@ export async function snapshotToText(
   fallbackCols: number,
   fallbackRows: number,
   opts: { filter: boolean },
-): Promise<{ content: string; ansi: string } | null> {
+): Promise<{ content: string; ansi: string; cols: number; rows: number } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -141,7 +141,7 @@ export async function snapshotToText(
     // Read from the actual current viewport (see snapshotToPng comment).
     const startY = terminal.buffer.active.baseY;
     const content = readViewportText(terminal, { filter: opts.filter, startY, rows: snap.rows });
-    return { content, ansi: snap.ansi };
+    return { content, ansi: snap.ansi, cols: snap.cols, rows: snap.rows };
   } finally {
     terminal.dispose();
   }

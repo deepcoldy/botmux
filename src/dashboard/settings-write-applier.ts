@@ -115,6 +115,7 @@ export interface ResolvedDashboardSettingsView {
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退），供设置页回显。 */
   sessionCleanup: {
+    archiveCodex?: boolean;
     enabled: boolean;
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
@@ -123,6 +124,8 @@ export interface ResolvedDashboardSettingsView {
   multiTopic: { enabled: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
+  /** Proxy for binary self-update downloads, null/absent = unset. */
+  httpProxy?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
    *  unset ⇒ the scheduler follows `hostTimeZone`. */
   scheduleTimeZone?: string | null;
@@ -271,10 +274,12 @@ export type ApplySettingsWriteError =
   | 'invalid_workflow_enabled'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
+  | 'invalid_sessionCleanup_archiveCodex'
   | 'invalid_sessionCleanup_olderThanHours'
   | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
   | 'invalid_oauthRedirectBase'
+  | 'invalid_httpProxy'
   | 'invalid_whiteboard'
   | 'invalid_whiteboard_enabled'
   | 'invalid_lang'
@@ -662,6 +667,10 @@ export async function applySettingsWrite(
     // Merge over the validated existing block so a partial patch (e.g. just the
     // toggle) keeps the other supported fields.
     const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
+    if ('archiveCodex' in sc) {
+      if (typeof sc.archiveCodex !== 'boolean') return { ok: false, error: 'invalid_sessionCleanup_archiveCodex' };
+      next.archiveCodex = sc.archiveCodex;
+    }
     if ('enabled' in sc) {
       if (typeof sc.enabled !== 'boolean') {
         return { ok: false, error: 'invalid_sessionCleanup_enabled' };
@@ -687,7 +696,7 @@ export async function applySettingsWrite(
       }
       next.intervalMinutes = Math.floor(sc.intervalMinutes);
     }
-    if (!('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
+    if (!('archiveCodex' in sc) && !('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
       return { ok: false, error: 'invalid_sessionCleanup' };
     }
     deps.mergeGlobalConfig({ sessionCleanup: next });
@@ -761,6 +770,22 @@ export async function applySettingsWrite(
       touched = true;
     } else {
       return { ok: false, error: 'invalid_oauthRedirectBase' };
+    }
+  }
+
+  if ('httpProxy' in obj) {
+    const v = obj.httpProxy;
+    if (v === null || (typeof v === 'string' && v.trim() === '')) {
+      // 清除 → release-download 退回 HTTPS_PROXY / HTTP_PROXY 环境变量。
+      deps.mergeGlobalConfig({ httpProxy: null });
+      touched = true;
+    } else if (typeof v === 'string') {
+      const normalized = normalizeHttpProxy(v);
+      if (!normalized) return { ok: false, error: 'invalid_httpProxy' };
+      deps.mergeGlobalConfig({ httpProxy: normalized });
+      touched = true;
+    } else {
+      return { ok: false, error: 'invalid_httpProxy' };
     }
   }
 
@@ -844,4 +869,18 @@ export async function applySettingsWrite(
 
   if (!touched) return { ok: false, error: 'empty_patch' };
   return { ok: true, settings: deps.resolveDashboardSettings() };
+}
+
+/** `http://[user:pass@]host[:port]` with no path / query — what
+ *  release-download's CONNECT tunnel accepts. It always dials the proxy over
+ *  plain HTTP (then TLS to GitHub inside the tunnel), so an `https://` proxy
+ *  URL would only fail later with an opaque socket error; reject it here.
+ *  Returns the trimmed value without a trailing slash, or null. */
+export function normalizeHttpProxy(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  let url: URL;
+  try { url = new URL(trimmed); } catch { return null; }
+  if (url.protocol !== 'http:') return null;
+  if (!url.hostname || url.pathname !== '/' || url.search || url.hash) return null;
+  return trimmed;
 }

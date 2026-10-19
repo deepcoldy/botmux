@@ -5,6 +5,8 @@
  * roles / message-listeners 同款。单个 bot 的 daemon 离线不该让整页空白。
  */
 
+import { readJson } from './dashboard-api.js';
+
 export type DocWatchMode = 'mention-only' | 'owner-mention' | 'all';
 
 /** owner-mention 与 all 都靠应用身份轮询（飞书不推送未 @ 机器人的评论）。 */
@@ -56,10 +58,6 @@ export interface DocWatchBotResult {
   botName?: string;
   watches: DocWatchRow[];
   error?: string;
-}
-
-async function readJson(r: Response): Promise<any> {
-  return r.json().catch(() => ({}));
 }
 
 export async function loadDocWatches(larkAppId: string): Promise<{ watches: DocWatchRow[]; error?: string }> {

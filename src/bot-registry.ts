@@ -1,5 +1,6 @@
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { readGlobalConfig } from './global-config.js';
+import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
@@ -91,6 +92,7 @@ import {
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
+import { cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1397,7 +1399,8 @@ export interface SessionGroupConfig {
   /**
    * What to do with the group when its session is closed:
    * 'keep' (default) — leave the group and registry entry; a later message in
-   * the group resumes the closed session (same-group resume). 'disband' /
+   * the group starts a fresh session (resume explicitly via the close card or
+   * `/resume`). 'disband' /
    * 'archive' are reserved for a follow-up PR and currently behave as 'keep'.
    */
   onClose?: 'keep' | 'disband' | 'archive';
@@ -1499,6 +1502,16 @@ export interface BotConfig {
   /** @deprecated Prefer cliRuntime.executable for newly configured runtimes. */
   cliPathOverride?: string;
   /**
+   * CLI 配置目录（config profile）。目前仅 claude-code：以
+   * `CLAUDE_CONFIG_DIR=<dir>` 启动，settings.json / 登录态 / transcript 全部来自该
+   * 目录，全局 `~/.claude/settings.json`（其 env 与 model 优先级高于进程环境）不再
+   * 参与。botmux 推导的 hook 安装位置、transcript、`.claude.json`、MCP 网关也跟随该
+   * 目录（见 core/cli-config-dir.ts）。绝对路径或 `~/` 开头；其它 CLI 读到时丢弃。
+   * 与文件沙盒兼容：沙盒仍重定向到 BOT_HOME，但改为从此目录预置 env / 凭证 / 状态。
+   * 按会话冻结（`Session.cliConfigDir`），改动只影响新会话。
+   */
+  cliConfigDir?: string;
+  /**
    * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
    * `<wrapperCli> <CLI 参数>`（首 token 当 bin 走 PATH 解析），无需 wrapper 脚本、跨系统。
    * 典型值 `"aiden x claude"` / `"aiden x codex"`（企业网关 + SSO），也能
@@ -1580,6 +1593,9 @@ export interface BotConfig {
    * `additionalContext`, so the desktop user bubble stays clean. Missing/false
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
+  /** Opt-in Codex model-capacity continuation. Missing/false is off. Each
+   * admitted task may inject up to two recovery inputs into native history. */
+  codexCapacityRecovery?: boolean;
   /**
    * Codex App only: tune or mute the once-per-turn "no observable progress"
    * nudge (#1162). `enabled: false` silences just the Lark push — the worker
@@ -1613,6 +1629,7 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  turnResults?: { enabled: boolean };
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
@@ -1686,6 +1703,12 @@ export interface BotConfig {
    * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
+  /**
+   * lark-cli 应用绑定开关（默认开启）。
+   * 默认开启（未配置或 true）：会话内 lark-cli 默认以当前 Bot 应用凭证以 bot 身份调用，支持 --as user 与 --profile 透传；
+   * 显式关闭（false）：不安装托管包装器，完全沿用宿主机环境及按触发人鉴权规则。需 /restart 重启或新建会话生效。
+   */
+  larkToolBinding?: boolean;
   /**
    * Local file sandbox selection.
    *   true/"oncall" — per-session deny-by-default three-tier whitelist
@@ -1894,7 +1917,7 @@ export interface BotConfig {
    * Codex flagged in review.
    */
   defaultOncallAutoboundChats?: string[];
-  /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
+  /** Per-chat reply mode override: chat_id → 普通群 @bot 后回复形态。缺省时继承 regularGroupReplyMode；由 /reply-mode 或 dashboard 群管理写入，`/reply-mode inherit` 清除。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
@@ -2565,6 +2588,9 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  if (cfg.turnResults?.enabled !== true || cfg.apiOnly || cfg.readIsolation) {
+    getTurnResultRuntime()?.clearBot(cfg.larkAppId);
+  }
   registerCodexInstanceBot(cfg);
   const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
   const normalizedRuntime = cfg.cliId === 'traex'
@@ -3460,6 +3486,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.cliLaunchMode,
       `Bot config [${i}].cliLaunchMode`,
     );
+    // Malformed → throw (an operator must never believe a profile is applied when
+    // it is not); a valid value on a CLI without profile support is dropped like
+    // the other CLI-specific fields.
+    let cliConfigDir: string | undefined;
+    try {
+      cliConfigDir = cliSupportsConfigDir(entryCliId) ? normalizeCliConfigDir(entry.cliConfigDir) : undefined;
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
     let credentialsSourceDir: string | undefined;
     try {
       credentialsSourceDir = normalizeCredentialsSourceDir(entry.credentialsSourceDir);
@@ -3603,8 +3638,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
-    // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
-    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
+    // new-topic｜shared 都保留解析。显式设置即使与当前 per-bot 默认相同也保留为覆盖；
+    // 只有 clearChatReplyMode（`/reply-mode inherit`）才删除键、恢复继承。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};
@@ -3896,6 +3931,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           return undefined;
         }
       })(),
+      codexCapacityRecovery: entry.codexCapacityRecovery === true || undefined,
       noProgressNotify: entry.noProgressNotify === undefined ? undefined : normalizeNoProgressNotifyPolicy(entry.noProgressNotify),
       feedback: entry.feedback === undefined
         ? undefined
@@ -3915,6 +3951,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Compatibility shadow: writers persist it for downgrade safety and the
       // loader requires an exact match so every accepted config is rollback-safe.
       cliPathOverride: entry.cliPathOverride,
+      cliConfigDir,
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
         : undefined,
@@ -3973,6 +4010,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : normalizeRemoteRunnerConfig(entry.remoteRunner),
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
+      larkToolBinding: typeof entry.larkToolBinding === 'boolean' ? entry.larkToolBinding : undefined,
       // Wire representation stays backwards compatible: oncall = legacy `true`;
       // only scratch is a string; off serializes as false.
       sandbox: sandboxMode === 'oncall' ? true : sandboxMode === 'scratch' ? 'scratch' : false,
@@ -4064,6 +4102,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       envPolicy,
       skills,
       plugins,
+      turnResults: entry.turnResults && typeof entry.turnResults === 'object' && entry.turnResults.enabled === true
+        ? { enabled: true } : undefined,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
       skillInjection: entry.skillInjection === 'global' || entry.skillInjection === 'prompt' || entry.skillInjection === 'off'
         ? entry.skillInjection : undefined,

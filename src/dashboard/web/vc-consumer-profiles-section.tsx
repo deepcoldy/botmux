@@ -16,6 +16,7 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, InfoTip, dropdownLabel } from './dashboard-components.js';
 import { useDashboardLocale, useT } from './react-hooks.js';
+import { ModalDialog } from './modal-dialog.js';
 import type {
   VcMeetingAgentOptionDto,
   VcMeetingConsumerProfileDto,
@@ -180,18 +181,14 @@ function VcProfileDialog(props: {
   className?: string;
 }): React.JSX.Element {
   const tr = useT();
-  const ref = useRef<HTMLDialogElement | null>(null);
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog || dialog.open) return;
-    try { dialog.showModal(); } catch { dialog.setAttribute('open', ''); }
-  }, []);
   return (
-    <dialog
-      ref={ref}
+    <ModalDialog
+      open
       className={['vc-profile-dialog', props.className].filter(Boolean).join(' ')}
       onClose={props.onClose}
-      onCancel={(event) => { event.preventDefault(); props.onClose(); }}
+      onRequestClose={props.onClose}
+      backdropClose={false}
+      onOpenError={(_error, dialog) => dialog.setAttribute('open', '')}
     >
       <header className="vc-profile-dialog-head">
         <div>
@@ -201,7 +198,7 @@ function VcProfileDialog(props: {
         <button type="button" className="vc-profile-dialog-close" aria-label={tr('settings.vcProfiles.close')} onClick={props.onClose} />
       </header>
       <div className="vc-profile-dialog-body">{props.children}</div>
-    </dialog>
+    </ModalDialog>
   );
 }
 

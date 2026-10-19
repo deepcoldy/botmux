@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -35,10 +36,16 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
   ).outputText;
   const factory = new Function('deps', `
     const {
-      logScreenshotSkip, snapshotToPng, backend, renderCols, renderRows,
+      logScreenshotSkip, backend, renderCols, renderRows,
       renderer, createHash, clamp, captureToPng, uploadImageBuffer, logError,
       projectedRuntimeScreenStatus, send, classifyScreenUsageLimit, log,
     } = deps;
+    // Production snapshotToPng reports the canvas grid it rendered; mocks that
+    // omit it default to the render grid.
+    const snapshotToPng = async (...args) => {
+      const result = await deps.snapshotToPng(...args);
+      return result ? { cols: renderCols, rows: renderRows, ...result } : result;
+    };
     const {
       MIN_RENDER_COLS = 1, MAX_RENDER_COLS = 1000, MIN_RENDER_ROWS = 1, MAX_RENDER_ROWS = 1000,
     } = deps;
@@ -158,8 +165,8 @@ describe('worker screenshot upload hardening', () => {
     expect(uploadCalls).toBe(2);
     expect(snapshotToPng).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenCalledOnce();
-    // Dedup key = captureRevision:displayGeneration:pixelHash.
-    expect(harness.lastHash()).toBe('0:0:same-frame');
+    // Dedup key = captureRevision:displayGeneration:<cols>x<rows>:pixelHash.
+    expect(harness.lastHash()).toBe('0:0:80x24:same-frame');
     expect(harness.inFlight()).toBe(false);
 
     frame = 'next-frame';
@@ -202,7 +209,7 @@ describe('worker screenshot upload hardening', () => {
     const capture = harness.captureAndUpload();
     await Promise.resolve();
     await Promise.resolve();
-    expect(harness.lastHash()).toBe('0:0:attempted-frame');
+    expect(harness.lastHash()).toBe('0:0:80x24:attempted-frame');
 
     // applyDisplayMode() resets lastShotHash while an old upload may still be
     // pending. The old failure must not resurrect the pre-reset hash.
@@ -261,7 +268,7 @@ describe('worker screenshot upload hardening', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(uploads).toHaveLength(1);
-    expect(harness.lastHash()).toBe('0:0:old-turn-frame');
+    expect(harness.lastHash()).toBe('0:0:80x24:old-turn-frame');
 
     // Successor turn begins (its card POST completes daemon-side) while the
     // old image is still uploading.
@@ -450,9 +457,11 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       expect(at, name).toBeGreaterThanOrEqual(0);
       return source.slice(at, source.indexOf('\n}\n', at));
     };
-    expect(bodyOf('deliverRawInput')).toContain('setCaptureIdentity(msg.turnId, undefined)');
-    expect(bodyOf('writeAdoptMessage')).toContain('setCaptureIdentity(turnId, dispatchAttempt)');
-    expect(bodyOf('flushPending')).toContain('setCaptureIdentity(item.turnId, item.dispatchAttempt)');
+    expect(bodyOf('deliverRawInput')).toContain('setCaptureIdentity(msg.turnId, undefined, msg.turnCallerOpenId)');
+    expect(bodyOf('writeAdoptMessage')).toContain('setCaptureIdentity(turnId, dispatchAttempt, trustedCaller?.requestUserOpenId)');
+    const flushBody = bodyOf('flushPending');
+    expect(flushBody).toContain('setCaptureIdentity(');
+    expect(flushBody).toContain('item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId');
     for (const name of ['adoptInitialActiveTurn', 'adoptDisplacedActiveTurn', 'writeCliPidMarker', 'syncQueuedTurnsFromMarkerDisk', 'advanceQueuedTypeAheadTurn']) {
       const at = source.indexOf(`function ${name}(`);
       expect(at, name).toBeGreaterThanOrEqual(0);
@@ -485,7 +494,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const send = vi.fn();
-    const harness = new Function('send', `
+    const harness = new Function('send', 'isCodexAppCliId', `
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
       let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt = false;
@@ -515,7 +524,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
         state: () => ({ turnId: currentBotmuxTurnId, attempt: currentBotmuxDispatchAttempt,
           revision: captureRevision, queued: queuedTypeAheadTurns, retired: [...retiredTurnIds], started }),
       };
-    `)(send) as {
+    `)(send, isCodexAppCliId) as {
       enqueue(record: { turnId: string; dispatchAttempt: number }): void;
       acknowledge(turnId: string): void;
       advance(): boolean;
@@ -679,7 +688,7 @@ describe('V3 capture await boundaries (sequence 8)', () => {
     await settle();
     expect(t.send).toHaveBeenCalledTimes(1);
     expect(t.send.mock.calls[0][0]).toMatchObject({ turnId: 'turn_b', captureRevision: 1 });
-    expect(t.harness.lastHash()).toBe('1:0:px');
+    expect(t.harness.lastHash()).toBe('1:0:80x24:px');
   });
 });
 
@@ -704,5 +713,74 @@ describe('R2 turn-only capture acceptance', () => {
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(snapshotToPng).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ turnId: 'new_turn' }));
+  });
+
+  it('re-uploads unchanged ANSI once the canvas grid changes (a resized adopted pane)', async () => {
+    let grid = { cols: 200, rows: 50 };
+    const uploadImageBuffer = vi.fn(async () => 'img');
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({
+        ansi: 'same-pixels', png: Buffer.from('png'), content: 'same-pixels', ...grid,
+      })),
+      backend: {},
+      renderCols: 80,
+      renderRows: 24,
+      renderer: null,
+      createHash: vi.fn(),
+      clamp: vi.fn(),
+      captureToPng: vi.fn(),
+      uploadImageBuffer,
+      logError: vi.fn(),
+      log: vi.fn(),
+      projectedRuntimeScreenStatus: () => 'working',
+      send: vi.fn(),
+      classifyScreenUsageLimit: () => ({ status: 'working' }),
+      currentBotmuxTurnId: 'turn_1',
+      currentBotmuxDispatchAttempt: 1,
+    });
+
+    await harness.captureAndUpload();
+    await harness.captureAndUpload();
+    expect(uploadImageBuffer).toHaveBeenCalledOnce();
+
+    // Same pane text, but the user resized the pane: a different picture.
+    grid = { cols: 213, rows: 58 };
+    await harness.captureAndUpload();
+    expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
+    expect(harness.lastHash()).toBe('0:0:213x58:same-pixels');
+  });
+});
+
+describe('turn caller persistence across crash recovery', () => {
+  it('persists the live caller in the PID marker JSON', () => {
+    const at = source.indexOf('function writeCliPidMarker(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('...(currentBotmuxCallerOpenId ? { callerOpenId: currentBotmuxCallerOpenId } : {})');
+  });
+
+  it('persists the queued type-ahead caller so a marker replay does not drop it', () => {
+    const at = source.indexOf('function writeCliPidMarker(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain("...(t.turnCallerOpenId ? { callerOpenId: t.turnCallerOpenId } : {})");
+  });
+
+  it('restores the caller when adopting the initial active turn, falling back to trusted provenance', () => {
+    const at = source.indexOf('function adoptInitialActiveTurn(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('parsed.callerOpenId ?? parsed.trustedCaller?.requestUserOpenId');
+  });
+
+  it('replays queued-turn callers from the marker back into the type-ahead queue', () => {
+    // Two replay sites: writeCliPidMarker's read-back and syncQueuedTurnsFromMarkerDisk.
+    const occurrences = source.split("...(typeof qt.callerOpenId === 'string' && qt.callerOpenId ? { turnCallerOpenId: qt.callerOpenId } : {})").length - 1
+      + source.split("...(typeof t.callerOpenId === 'string' && t.callerOpenId ? { turnCallerOpenId: t.callerOpenId } : {})").length - 1;
+    expect(occurrences).toBeGreaterThanOrEqual(3);
+  });
+
+  it('advances the marker-synced turn with its persisted or queued caller', () => {
+    const at = source.indexOf('function syncQueuedTurnsFromMarkerDisk(');
+    const body = source.slice(at, source.indexOf('\n}\n', at));
+    expect(body).toContain('parsed.callerOpenId ?? advancedRecord.turnCallerOpenId');
   });
 });

@@ -34,7 +34,8 @@ describe('desktop local source installer docs', () => {
 
     expect(readme).toContain('bash src/desktop/install-local.sh');
     expect(readme).toContain('脚本只安装 App');
-    expect(readme).toContain('App 自带版本匹配的 Node、botmux 和 PM2');
+    expect(readme).toContain('App 自带版本匹配的 Node 和 botmux');
+    expect(readme).not.toContain('PM2');
     expect(readme).toContain('BOTMUX_DESKTOP_VERSION');
     expect(readme).not.toContain('pnpm link --global');
     expect(readme).not.toContain('~/.botmux/bin/botmux');

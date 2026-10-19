@@ -49,6 +49,7 @@ describe('session application identity route', () => {
   async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string } = {}) {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+      larkToolBinding: true,
       triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } as any;
     vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
     await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
@@ -82,6 +83,33 @@ describe('session application identity route', () => {
     const response = await request('user');
     expect(await response.json()).toMatchObject({ ok: false, error: expect.stringContaining('original user') });
     expect(response.status).toBe(403);
+  });
+  it('authorizes the delegated human through the bound tool and retries with the target app token', async () => {
+    await delegate();
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    expect(await (await request('user')).json()).toMatchObject({
+      ok: false, error: expect.stringContaining('botmux auth request'),
+    });
+    const poll = vi.fn().mockImplementation(async () => {
+      vi.mocked(tokens.resolveUserToken).mockResolvedValue('target-app-grant');
+      return { status: 'ready', token: 'target-app-grant' };
+    });
+    vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
+      authUrl: 'https://accounts.feishu.cn/oauth/device?user_code=delegated',
+      scopes: ['offline_access', 'im:chat:read'], expiresIn: 600, poll,
+    });
+    const auth = (action: string, body: object) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${action}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify(body),
+    });
+    const grant = await (await auth('auth-request', { scopes: ['im:chat:read'] })).json();
+    expect(grant).toMatchObject({ ok: true, authUrl: expect.stringContaining('accounts.feishu.cn') });
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledExactlyOnceWith(
+      'cli_bound', 'bound-secret', 'feishu', ['im:chat:read'], 'ou_target_human', expect.any(Function),
+    );
+    expect(await (await auth('auth-status', { requestId: grant.requestId })).json()).toEqual({ ok: true, status: 'ready' });
+    expect(await (await request('user')).json()).toMatchObject({ appId: 'cli_bound', mode: 'user', credential: 'target-app-grant' });
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
   });
   it('refuses when target permission is withdrawn while resolving the delegated token', async () => {
     await delegate();
@@ -217,5 +245,19 @@ describe('session application identity route', () => {
     expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
     const user = await run(['docs', '+fetch', '--as=user']); expect(user.code, user.err).toBe(0);
     expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
+    const passthrough = await run(['docs', '+fetch', '--profile=cli_other']); expect(passthrough.code, passthrough.err).toBe(0);
+    expect(passthrough.out).toBe('cli_wrong|||wrong-user|docs +fetch --profile=cli_other');
+  });
+  it('rejects identity request when larkToolBinding is explicitly disabled on the bot', async () => {
+    vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', larkToolBinding: false } } as any);
+    const res = await request('bot');
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ ok: false, error: 'lark_tool_session_unavailable' });
+  });
+  it('allows identity request when larkToolBinding is unconfigured on the bot (default on)', async () => {
+    vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
+    const res = await request('bot');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, appId: 'cli_bound', mode: 'bot', credential: 'bound-bot-token' });
   });
 });

@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
-import { GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import {
@@ -14,7 +15,9 @@ import {
 } from '../../services/grok-paths.js';
 import {
   discoverGrokSessions,
+  drainGrokUpdates,
   findGrokSessionByPid,
+  findGrokUpdatesBySessionId,
   grokFileSize,
   grokSessionDirExists,
   grokSessionExists,
@@ -125,6 +128,22 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *  a path not in authPaths doesn't exist, so they'd be unreachable / lack fcntl
  *  locks.
  */
+/** Grok updates.jsonl. botmux passes `--session-id`, so the adapter id is a valid first
+ *  lookup key; a collision-fallback spawn (grok mints its own id) is recovered through
+ *  writeInput's prompt_history verify. */
+export const grokBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainGrokUpdates(path, offset, { includePublicActivity: true }),
+  locate: {
+    bySessionId: (sessionId, cwd) => findGrokUpdatesBySessionId(sessionId, cwd),
+    byPid: pid => {
+      const probed = findGrokSessionByPid(pid);
+      return probed && existsSync(probed.updatesPath) ? probed.updatesPath : undefined;
+    },
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+  adopt: { attach: 'split-live' },
+};
+
 export function createGrokAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand).
@@ -132,6 +151,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'grok',
+    bridgeSpec: grokBridgeSpec,
     // Absolute runtime paths (not `~/…` literals): GROK_HOME can override the
     // data root, and sandbox/auth carve-outs must track the same resolved dir
     // the spawned CLI uses (split-brain bug if we freezed `~/.grok` at build).
@@ -310,7 +330,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
             return pty.sendText(content) !== false;
           }
           // Raw PTY: wrap the markers ourselves (codex parity).
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
           return true;
         } catch {
           return false;
@@ -414,5 +434,3 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['grok'],
   };
 }
-
-export const create = createGrokAdapter;

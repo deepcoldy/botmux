@@ -3,9 +3,10 @@ import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
@@ -19,6 +20,19 @@ const cursorFirstWriteSeen = new WeakSet<PtyHandle>();
  *  of truth for both the adapter's `pluginDir` field and the spawn-time flag. */
 export const CURSOR_PLUGIN_DIR = join(homedir(), '.botmux', 'cursor-plugin');
 
+/** Cursor agent-transcripts JSONL. Bridge-active only in adopt mode or zero-prompt
+ *  spawns. The transcript carries no per-event timestamps, so adopt baselines the
+ *  history by byte offset instead of the timestamp-cutoff split-live. */
+export const cursorBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainCursorTranscript(path, offset),
+  locate: {
+    bySessionId: sessionId => findCursorTranscriptByChatId(sessionId),
+    byPid: pid => findCursorTranscriptByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware', zeroPromptOnly: true },
+  adopt: { attach: 'baseline-skip-tail' },
+};
+
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
@@ -27,6 +41,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'cursor',
+    bridgeSpec: cursorBridgeSpec,
     // Whole ~/.cursor (chats store.db + projects agent-transcripts + skills):
     // a directory-level readWrite bind under the sandbox, so the host daemon
     // reads the same transcript the CLI writes (zero-prompt final harvest) and
@@ -205,5 +220,3 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['cursor'],
   };
 }
-
-export const create = createCursorAdapter;

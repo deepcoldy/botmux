@@ -137,6 +137,27 @@ describe('schedule form chat picker', () => {
       .toHaveLength(0);
   }
 
+  it('marks the schedule as required and shows its inline error after an empty submit', async () => {
+    const form = await renderForm();
+    const tr = createDashboardTranslator('zh');
+    const nameInput = form.root.findByProps({ name: 'name' });
+    const scheduleInput = form.root.findByProps({ placeholder: tr('schedules.form.scheduleHelp') });
+    const scheduleField = scheduleInput.parent!;
+
+    expect(nameInput.parent!.findByProps({ className: 'schedule-form-label' }).findByType('i').children)
+      .toEqual(['*']);
+    expect(scheduleInput.props.required).toBe(true);
+    expect(scheduleField.findByProps({ className: 'schedule-form-label' }).findByType('i').children)
+      .toEqual(['*']);
+
+    act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+
+    expect(form.onSubmit).not.toHaveBeenCalled();
+    expect(scheduleInput.props['aria-invalid']).toBe(true);
+    expect(scheduleField.findByProps({ className: 'schedule-form-error-inline' }).children)
+      .toEqual(['请输入调度规则']);
+  });
+
   it.each([
     ['create', null],
     ['edit', EDITING],

@@ -11,6 +11,14 @@ import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../servi
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
+import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
+
+/** Shared parser so a malformed payload can't reach the selector half-shaped;
+ *  anything invalid degrades to the registry default (`inherit`). */
+function envPolicyForClient(raw: unknown): EnvPolicy {
+  try { return normalizeEnvPolicy(raw) ?? { mode: 'inherit' }; }
+  catch { return { mode: 'inherit' }; }
+}
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -36,6 +44,8 @@ export interface DashboardBotDescriptor {
   dshRuntime?: 'official' | 'tui' | null;
   /** dsh profile name; dashboard exposes it for the dsh CLI only. */
   dshProfile?: string | null;
+  /** CLI config profile dir (claude-code: CLAUDE_CONFIG_DIR). */
+  cliConfigDir?: string | null;
 }
 
 /**
@@ -98,6 +108,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     ...(typeof bot.turnTimeoutMs === 'number' ? { turnTimeoutMs: bot.turnTimeoutMs } : {}),
     ...(bot.dshRuntime ? { dshRuntime: bot.dshRuntime } : {}),
     ...(bot.dshProfile ? { dshProfile: bot.dshProfile } : {}),
+    ...(bot.cliConfigDir ? { cliConfigDir: bot.cliConfigDir } : {}),
     // 「修改 CLI」下拉的当前选中项（cliId+wrapperCli → 选择键），wrapper 网关形态
     // （aiden×claude / ttadk×codex 等）据此才能高亮回对应选项，否则前端回落到裸
     // cliId、丢失 wrapper 语义（重载后下拉复位、再保存会把 wrapper 剥掉）。
@@ -154,6 +165,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       : null,
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
+    defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
@@ -219,6 +231,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // malformed hand edit degrades to null (feature off) instead of reaching
     // form state as a half-shaped policy the toggle would misrender.
     triggerUserAuth: normalizeTriggerUserAuthForClient(j?.triggerUserAuth),
+    larkToolBinding: j?.larkToolBinding !== false,
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,
     skillInjectionDefault: (j?.skillInjectionDefault === 'global' || j?.skillInjectionDefault === 'off') ? j.skillInjectionDefault : 'prompt',
     skillInjectionSupport: (j?.skillInjectionSupport === 'dynamic' || j?.skillInjectionSupport === 'global') ? j.skillInjectionSupport : 'none',
@@ -235,6 +248,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
+    // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
+    // 页面刷新即显示 ∅，看起来像没存上（而空白再保存会真的清掉）。
+    envKeys: Array.isArray(j?.envKeys) ? j.envKeys.filter((k: unknown): k is string => typeof k === 'string') : [],
+    envPolicy: envPolicyForClient(j?.envPolicy),
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
     remoteRunner: j?.remoteRunner && typeof j.remoteRunner === 'object' ? j.remoteRunner : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,

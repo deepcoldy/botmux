@@ -40,8 +40,6 @@ export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxComman
       ...input.baseEnv,
       // Reuse Electron's embedded Node runtime to execute the packaged CLI.
       ELECTRON_RUN_AS_NODE: '1',
-      // Isolate desktop-managed PM2/session state from any global PM2 daemon.
-      PM2_HOME: join(input.botmuxHome, 'pm2'),
       SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
     },
   };
@@ -57,7 +55,6 @@ export function buildBundledBotmuxCommand(input: BuildBundledBotmuxCommandInput)
     // matching terminal behavior), bundled node as fallback, then well-known
     // install dirs.
     PATH: buildBundledPath(input.baseEnv.PATH, input.nodePath, input.pathEnv),
-    PM2_HOME: join(input.botmuxHome, 'pm2'),
     SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
   };
   delete env.ELECTRON_RUN_AS_NODE;
@@ -75,7 +72,6 @@ export function buildExternalBotmuxCommand(input: BuildExternalBotmuxCommandInpu
     // External CLI bins often use /usr/bin/env node; Finder-launched apps have
     // a small PATH, so put the bin's directory first before invoking it.
     PATH: buildExternalPath(input.baseEnv.PATH, input.binPath, input.pathEnv),
-    PM2_HOME: join(input.botmuxHome, 'pm2'),
     SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
   };
   delete env.ELECTRON_RUN_AS_NODE;
@@ -88,14 +84,11 @@ export function buildExternalBotmuxCommand(input: BuildExternalBotmuxCommandInpu
 }
 
 /**
- * PATH for anything spawned on behalf of the bundled runtime (daemon start and
- * pm2 contact alike — pm2's daemon env sticks and propagates into resurrected
- * apps, so BOTH chains must agree on ordering or which `node` a per-bot CLI
- * gets would depend on pm2 startup order). User shell PATH first: their
- * nvm/fnm node keeps winning like in a terminal; the bundled node dir is only
- * the fallback for `#!/usr/bin/env node` when the user has no node at all.
- * Callers never rely on this PATH to locate node/pm2 themselves — both are
- * invoked via absolute paths.
+ * PATH for anything spawned on behalf of the bundled runtime. User shell PATH
+ * first: their nvm/fnm node keeps winning like in a terminal; the bundled node
+ * dir is only the fallback for `#!/usr/bin/env node` when the user has no node
+ * at all. Callers never rely on this PATH to locate node itself — it is invoked
+ * via an absolute path.
  */
 export function buildBundledPath(current: string | undefined, nodePath: string, pathEnv: string | undefined): string {
   return joinPathEntries([

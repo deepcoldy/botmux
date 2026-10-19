@@ -5,10 +5,15 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
-import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './types.js';
+import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec } from './types.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
-import { findAntigravityConversationId } from '../../services/antigravity-discovery.js';
+import { findAntigravityConversationId, findAntigravityConversationIdByPid } from '../../services/antigravity-discovery.js';
+import {
+  antigravityTranscriptPath,
+  drainAntigravityTranscript,
+  type AntigravityTranscriptState,
+} from '../../services/antigravity-transcript.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -261,6 +266,32 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
   return false;
 }
 
+/** Antigravity brain transcript. Zero-prompt only (no /adopt bridge). The transcript is
+ *  created lazily after the first submit, so a file born after spawn is the live turn
+ *  (`birth-aware`). Its provisional trailing final lives in driver state that the worker
+ *  commits on the steady-state ingest tick only. */
+export const antigravityBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainAntigravityTranscript(
+    path,
+    offset,
+    (ctx.state as AntigravityTranscriptState | undefined) ?? {},
+    { flushTrailingFinal: ctx.flushTrailingFinal },
+  ),
+  stateCommit: 'ingest',
+  locate: {
+    bySessionId: sessionId => {
+      const path = antigravityTranscriptPath(sessionId);
+      return path && existsSync(path) ? path : undefined;
+    },
+    byPid: pid => {
+      const conversationId = findAntigravityConversationIdByPid(pid);
+      const path = conversationId ? antigravityTranscriptPath(conversationId) : null;
+      return path && existsSync(path) ? path : undefined;
+    },
+  },
+  spawn: { sessionId: 'cli', baseline: 'birth-aware', zeroPromptOnly: true },
+};
+
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
@@ -269,6 +300,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'antigravity',
+    bridgeSpec: antigravityBridgeSpec,
     // Whole ~/.gemini (oauth + antigravity-cli brain transcripts + history):
     // a directory-level readWrite bind under the sandbox so the host daemon
     // drains the same transcript the CLI writes. The worker pre-creates the
@@ -446,5 +478,3 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     altScreen: true,
   };
 }
-
-export const create = createAntigravityAdapter;

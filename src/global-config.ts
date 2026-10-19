@@ -161,6 +161,8 @@ export const SESSION_CLEANUP_DEFAULT_INTERVAL_MINUTES = 60;
 export const SESSION_CLEANUP_DEFAULT_HOURS: SessionCleanupHours = 168;
 
 export interface SessionCleanupGlobalConfig {
+  /** 手动关闭或手动/定时清理时归档有明确归属的 Codex 会话；默认关闭。 */
+  archiveCodex?: boolean;
   /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
   enabled?: boolean;
   /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
@@ -234,7 +236,7 @@ export interface GlobalConfig {
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
-   *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
+   *  binary self-update release asset). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
    *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
   httpProxy?: string;
@@ -681,6 +683,7 @@ function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefine
   const value = raw as Record<string, unknown>;
   const out: SessionCleanupGlobalConfig = {};
   if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (typeof value.archiveCodex === 'boolean') out.archiveCodex = value.archiveCodex;
   if (
     typeof value.olderThanHours === 'number'
     && (SESSION_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(value.olderThanHours)

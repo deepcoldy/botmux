@@ -3,6 +3,7 @@ import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -17,11 +18,8 @@ function dshAuthPaths(): string[] {
   return configured ? ['~/.dsh', configured, '~/.dsh-tui'] : ['~/.dsh', '~/.dsh-tui'];
 }
 
-const BRACKETED_PASTE_START = '\x1b[200~';
-const BRACKETED_PASTE_END = '\x1b[201~';
-
 function sendBracketedPaste(pty: PtyHandle, content: string): boolean {
-  const framed = `${BRACKETED_PASTE_START}${content}${BRACKETED_PASTE_END}`;
+  const framed = wrapBracketedPaste(content);
   if (pty.sendText) return pty.sendText(framed) !== false;
   return pty.write(framed) !== false;
 }
@@ -200,5 +198,3 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['dsh-tui'],
   };
 }
-
-export const create = createDshTuiAdapter;

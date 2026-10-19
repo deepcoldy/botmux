@@ -80,12 +80,17 @@ export async function sendRemoteRunnerOutboundMessage(
     return path;
   });
   const invocation = botmuxCliInvocation(context.cliPath);
+  const mentionArgs = message.mention === 'requester'
+    ? ['--mention-back']
+    : message.mention === 'explicit'
+      ? (message.mentions ?? []).flatMap(target => ['--mention', target])
+      : ['--no-mention'];
   const args = [
     ...invocation.args,
     'send',
     '--remote-runner-outbound',
     '--response-kind', message.responseKind,
-    message.mention === 'requester' ? '--mention-back' : '--no-mention',
+    ...mentionArgs,
     '--content-file', contentPath,
     ...imagePaths.flatMap(path => ['--images', path]),
     '--session-id', context.sessionId,

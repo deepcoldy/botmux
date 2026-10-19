@@ -22,6 +22,7 @@ function store(order: string[]): DurableCoordinationStore {
     readSession: vi.fn(),
     writeSession: vi.fn(),
     enqueueInbox: vi.fn(async () => ({ kind: 'inserted' })),
+    enqueueInboxWithLease: vi.fn(async () => ({ kind: 'inserted' })),
     claimNextInbox: vi.fn(async () => undefined),
     renewInboxClaim: vi.fn(),
     completeInboxClaim: vi.fn(),

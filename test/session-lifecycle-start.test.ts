@@ -213,7 +213,10 @@ import {
   initWorkerPool,
   ensureReadonlyTaskContinuationAttached,
   ensureAutomaticTaskContinuationLease,
+  codexAppCleanInputAcceptedForSession,
   promoteQueuedActivationTail,
+  reserveQueuedActivationTailAdmission,
+  resolveQuarantinedForkPlan,
   restartCounts,
   sendWorkerInput,
   setActiveSessionsRegistry,
@@ -3376,7 +3379,9 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it.each([
-    ['codex', {}],
+    ['gemini', {}],
+    ['codex', { adoptedFrom: { sessionId: 'external' } }],
+    ['codex', { chatId: 'http_async_test' }],
     ['claude-code', { adoptedFrom: { sessionId: 'external' } }],
     ['claude-code', { session: { vcMeetingReceiver: { listenerAppId: 'app', meetingId: 'm', memberId: 'u', memberEpoch: 1 } } }],
     ['claude-code', { chatId: 'http_async_test' }],
@@ -4233,6 +4238,34 @@ describe('Codex App clean-input feature gate', () => {
     expect(ds.session.codexAppDispatchLedger?.some(e => e.codexAppSteerable === true)).toBe(true);
   });
 
+  // The promote IPC must take the caller from the FROZEN promote record. A tail
+  // that sat in the queue past the replyTargets eviction window has no live
+  // senderOpenId to look up, and an empty caller makes the wrapper refuse a
+  // legitimate same-principal continuation.
+  it('promoted activation carries turnCallerOpenId from the frozen record, not a live replyTargets lookup', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true } as any);
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'opening' };
+    const trustedCaller = {
+      requestUserOpenId: 'ou_tail', requestLarkAppId: 'app_test', senderType: 'user' as const,
+    };
+    expect(sendWorkerInput(ds, 'follow', 'turn-tail-caller', { trustedCaller })).toBe(true);
+    // The turn never landed in replyTargets — emulate the eviction/prune window.
+    delete ds.session.replyTargets?.['turn-tail-caller'];
+    ds.activeInteractiveTurn = undefined;
+    ds.session.queuedActivationPending = false;
+
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'message',
+      turnId: 'turn-tail-caller',
+      turnCallerOpenId: 'ou_tail',
+    });
+  });
+
   it('R5-B1-2: a missing/false steer authorization stays forced-serial through the same copy chain', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
     const ds = makeDs({ worker: makeFakeWorker(), initialStartPending: true } as any);
@@ -4685,6 +4718,139 @@ describe('Codex App clean-input feature gate', () => {
       // The old head is left exactly where it was — the guard did not promote it.
       expect(ds.session.queuedActivationPending).toBeUndefined();
       expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+  });
+
+  // `/cli <id>` 只在会话「尚未启动」时生效：它写一个 pending 的 cliLaunchSnapshot，既不动
+  // session.cliId（此时仍为空）也不起 worker；首次 forkWorker 的 sessionAgentConfig 才把它
+  // resolve 并把 session.cliId 盖成所选 CLI。所以「snapshot 与 session.cliId 不一致」的窗口只有
+  // 一个：pending 且尚未首次 fork。该窗口里的 admission / 记账判定必须按 snapshot 所选 CLI，
+  // 而不是 bot 默认 CLI——否则和 forkWorker（resolve 之后才判定）对同一会话给出相反结论。
+  describe('/cli-selected CLI before the first fork (pending cliLaunchSnapshot)', () => {
+    function snapshotFor(cliId: string, state: 'pending' | 'resolved' = 'pending') {
+      return {
+        version: 1,
+        state,
+        entryId: cliId,
+        cliId,
+        cliRuntime: null,
+        cliPathOverride: null,
+        wrapperCli: null,
+        cliLaunchMode: null,
+        model: null,
+        reasoningEffort: null,
+        modelBackendVariant: null,
+        launchShell: null,
+        startupCommands: [],
+      } as any;
+    }
+
+    /** 尚未首次 fork 的 /cli 会话：snapshot pending、session.cliId 为空。 */
+    function preForkSelectedDs(selected: string): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliLaunchSnapshot = snapshotFor(selected);
+      expect(ds.session.cliId).toBeUndefined();
+      return ds;
+    }
+
+    function withTail(ds: DaemonSession): DaemonSession {
+      ds.session.queuedActivationTail = [{
+        id: 'tail-follow',
+        order: 1,
+        userPrompt: 'FOLLOW',
+        cliInput: { content: 'FOLLOW' },
+        turnId: 'turn-follow',
+      }];
+      ds.session.queuedActivationTailNextOrder = 1;
+      return ds;
+    }
+
+    it('clean-input gate follows the selected Codex App even when the bot default is another CLI', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('codex-app');
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(true);
+      // follower 的 arrival-time 冻结决定也走同一判定（reserve → admit 把它固化进 durable tail）。
+      expect(reserveQueuedActivationTailAdmission(ds).codexAppInputAccepted).toBe(true);
+    });
+
+    it('clean-input gate rejects a selected non-Codex-App CLI even when the bot default is codex-app', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('claude-code');
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(false);
+      expect(reserveQueuedActivationTailAdmission(ds).codexAppInputAccepted).toBe(false);
+    });
+
+    it('agrees with the post-fork judgement: resolved snapshot (session.cliId stamped) gives the same answer', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code', codexAppCleanInput: true }));
+      const ds = preForkSelectedDs('codex-app');
+      const pending = codexAppCleanInputAcceptedForSession(ds);
+
+      // 首次 fork 之后：snapshot resolved，session.cliId 被盖成所选 CLI。
+      ds.session.cliLaunchSnapshot!.state = 'resolved';
+      ds.session.cliId = 'codex-app';
+      ds.session.agentFrozen = true;
+
+      expect(codexAppCleanInputAcceptedForSession(ds)).toBe(pending);
+      expect(pending).toBe(true);
+    });
+
+    it('promoting a tail head before the first fork opens a Codex App ledger entry for a selected Codex App', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const ds = withTail(preForkSelectedDs('codex-app'));
+
+      expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+
+      expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
+      expect(ds.session.codexAppDispatchLedger?.[0]).toEqual(expect.objectContaining({
+        turnId: 'turn-follow',
+        queuedActivationToken: ds.session.queuedActivationToken,
+      }));
+    });
+
+    it('promoting a tail head before the first fork never opens a Codex App ledger entry for a selected non-Codex-App CLI', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = withTail(preForkSelectedDs('claude-code'));
+
+      expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+    });
+
+    it('quarantined-tail recovery decides ledger-vs-resubmit by the selected CLI, in step with the promote it just ran', () => {
+      // 选了 Codex App、bot 默认不是：promote 开了 ledger entry，恢复 fork 就必须走 ledger（空 prompt），
+      // 不能再按 bot 默认 CLI 重提交 queuedActivationInput（同一 turn 会被投递两次）。
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const codexAppSelected = withTail(preForkSelectedDs('codex-app'));
+      codexAppSelected.quarantinedActivationTailPromotion = true;
+      const viaLedger = resolveQuarantinedForkPlan(codexAppSelected, '', true);
+      expect(viaLedger.fork).toBe(true);
+      expect(viaLedger.promptInput).toBe('');
+      expect(codexAppSelected.session.codexAppDispatchLedger).toHaveLength(1);
+
+      // 反过来：bot 默认是 codex-app、会话选了别的 CLI：不能走 ledger，必须原样重提交。
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const otherSelected = withTail(preForkSelectedDs('claude-code'));
+      otherSelected.quarantinedActivationTailPromotion = true;
+      const resubmit = resolveQuarantinedForkPlan(otherSelected, '', true);
+      expect(resubmit.fork).toBe(true);
+      expect((resubmit.promptInput as { content: string }).content).toBe('FOLLOW');
+      expect(otherSelected.session.codexAppDispatchLedger ?? []).toHaveLength(0);
+    });
+
+    it('sessions without a snapshot keep the session.cliId ?? bot.cliId judgement (unchanged)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+      // 没冻结过 cliId：回落 bot。
+      expect(codexAppCleanInputAcceptedForSession(makeDs())).toBe(true);
+      // 已冻结成别的 CLI：不被 bot 后来改成 codex-app 带偏。
+      const frozen = makeDs();
+      frozen.session.cliId = 'claude-code';
+      expect(codexAppCleanInputAcceptedForSession(frozen)).toBe(false);
+      // adopt 会话永不接受 clean sidecar。
+      const adopted = makeDs({ adoptedFrom: { cliId: 'codex-app' } } as any);
+      expect(codexAppCleanInputAcceptedForSession(adopted)).toBe(false);
     });
   });
 
@@ -6123,6 +6289,7 @@ describe('managed turn authority worker generations', () => {
     requestUserOpenId: 'ou_schedule_owner',
     requestUserUnionId: 'on_schedule_owner',
     requestLarkAppId: 'app_test',
+    senderType: 'user' as const,
     source: 'schedule_creator' as const,
     taskId: 'feedbeef',
   };
@@ -7404,6 +7571,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     requestUserOpenId: 'ou_owner',
     requestUserUnionId: 'on_owner',
     requestLarkAppId: 'cli_creator',
+    senderType: 'user' as const,
     source: 'schedule_creator',
     taskId: 'abcdef12',
   };
@@ -7696,4 +7864,329 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     expect(sentMessages(worker).filter(message => message.turnId !== SCHEDULED_TURN)).toHaveLength(0);
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('attention_required');
   });
+});
+
+describe('Codex capacity recovery', () => {
+  async function boot(botOverrides: Record<string, unknown> = {}) {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true, ...botOverrides }));
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_capacity');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_capacity' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_capacity' });
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null); return true;
+    });
+    worker.send.mockClear(); sessionReply.mockClear();
+    return { ds, worker, sessionReply };
+  }
+  function continuations(worker: any) {
+    return vi.mocked(worker.send).mock.calls.map(call => call[0] as any)
+      .filter(message => message?.type === 'message' && message.turnId?.startsWith('bmx-recovery-'));
+  }
+  function fail(ds: DaemonSession, worker: any, turnId = 'om_capacity', errorCode = 'codex_capacity_exceeded') {
+    worker.emit('message', { type: 'final_output', turnId, lastUuid: turnId, content: 'capacity diagnostic', turnFailed: true, turnFailureCode: errorCode });
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'failed', errorCode });
+  }
+
+  it.each([undefined, false])('does not inject recovery inputs when the opt-in is %s', async codexCapacityRecovery => {
+    const { ds, worker, sessionReply } = await boot({ codexCapacityRecovery });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('does not restore an old persisted Codex backoff when the opt-in is absent', async () => {
+    const { ds, worker, sessionReply } = await boot({ codexCapacityRecovery: undefined });
+    ds.session.ordinaryTurnRecovery = {
+      logicalTurnId: 'om_capacity', currentTurnId: 'om_capacity', status: 'backoff', continuationsStarted: 0,
+      nextAttemptAt: Date.now() - 1, lastErrorCode: 'codex_capacity_exceeded',
+    };
+    expect(ensureOrdinaryTurnRecoveryAttached(ds)).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', warningDispatched: true });
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it.each(['final-first', 'terminal-first'] as const)('opt-off mid-backoff settles durably and sends one card (%s)', async order => {
+    const { ds, worker, sessionReply } = await boot();
+    let durable: any;
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => { durable = structuredClone(s.ordinaryTurnRecovery); });
+    if (order === 'final-first') fail(ds, worker);
+    else worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.agentAttention).toBeDefined();
+    expect(durable).toMatchObject({ status: 'cancelled', lastErrorCode: 'recovery_disabled', warningDispatched: true });
+    // A late rollout must not duplicate the explicit opt-off notice.
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'disabled-diagnostic', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const { disposeOrdinaryTurnRecovery } = await import('../src/services/ordinary-turn-recovery.js');
+    disposeOrdinaryTurnRecovery(ds.session);
+    // Fresh process with only the durable row, and the feature enabled again.
+    const restored = makeDs({ session: { ...structuredClone(ds.session), ordinaryTurnRecovery: structuredClone(durable) } });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true }));
+    ensureOrdinaryTurnRecoveryAttached(restored);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(restored.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(continuations(worker)).toHaveLength(0);
+  });
+
+  it('opt-off followed by a diagnostic before the timer settles once without a second card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'before-opt-off-timer', content: 'capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('turning recovery off after success still suppresses the already recovered predecessor diagnostic', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'success-then-opt-off', content: 'obsolete diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(continuations(worker)).toHaveLength(1);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+  });
+
+  it('opt-off save failure still fences the pending recovery and reports its failure once', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+      if (s.ordinaryTurnRecovery?.status === 'cancelled') throw new Error('disk full on opt-off');
+    });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', warningDispatched: true });
+    expect(ds.agentAttention).toBeDefined();
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('turning the opt-in off before failure keeps the normal failure UI', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: false }));
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+  });
+
+  it('continues capacity failures twice with backoff and one actionable exhaustion card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(continuations(worker)).toHaveLength(1);
+    const first = continuations(worker)[0];
+    expect(first.content).toContain('checkpoint');
+    expect(first.content).not.toContain('original task');
+    worker.emit('message', { type: 'turn_input_received', turnId: first.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: first.turnId });
+    fail(ds, worker, first.turnId);
+    await vi.advanceTimersByTimeAsync(44_999);
+    expect(continuations(worker)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const second = continuations(worker)[1];
+    expect(second.turnId).not.toBe(first.turnId);
+    worker.emit('message', { type: 'turn_input_received', turnId: second.turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: second.turnId });
+    fail(ds, worker, second.turnId);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(2);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'exhausted', continuationsStarted: 2 });
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+  });
+
+  it('uses capacity advice for a Codex runtime with a custom display name', async () => {
+    const { ds, worker } = await boot({ wrapperCli: undefined, cliRuntime: {
+      id: 'vendor-codex', displayName: 'VendorCodex', executable: '/opt/vendor-codex', update: { provider: 'none' },
+    } });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(15_000);
+    fail(ds, worker, continuations(worker)[0].turnId);
+    await vi.advanceTimersByTimeAsync(45_000);
+    fail(ds, worker, continuations(worker)[1].turnId);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.agentAttention?.reason).toContain('VendorCodex');
+    expect(ds.agentAttention?.reason).toMatch(/切换模型|change models/);
+  });
+
+  it.each(['codex_auth_failed', 'codex_rate_limited', 'codex_upstream_error', 'codex_connection_failed'])(
+    'keeps %s on the normal failure path without automatic continuation', async errorCode => {
+      const { ds, worker, sessionReply } = await boot();
+      fail(ds, worker, 'om_capacity', errorCode);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(continuations(worker)).toHaveLength(0);
+      expect(sessionReply).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('new user input cancels the backoff and cannot revive the failed task', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ logicalTurnId: 'om_new', status: 'running' });
+  });
+
+  it('a type-ahead successor prevents late predecessor failure from scheduling recovery', async () => {
+    const { ds, worker } = await boot();
+    expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery?.logicalTurnId).toBe('om_new');
+  });
+
+  it('Ctrl+C cancels recovery during the backoff', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+    expect(sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' })).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+  });
+
+  it('backoff persistence failure still delivers exactly one failure card', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+      if (s.ordinaryTurnRecovery?.status === 'backoff') throw new Error('disk full saving backoff');
+    });
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+  });
+
+  it.each(['ctrlc', 'esc'] as const)('%s cancellation lets a late capacity diagnostic use the failure UI', async key => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+    expect(sendWorkerSessionInput(ds, { type: 'term_action', key })).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('cancelled');
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'late-after-stop', content: 'late capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('a timer persistence failure stops recovery without crashing or executing input', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(1_000);
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(0);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'attention_required', lastErrorCode: 'recovery_persist_failed' });
+    expect(sessionReply).toHaveBeenCalledOnce();
+  });
+
+  it('suppresses a capacity fallback arriving after the RPC terminal', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'om_capacity', content: 'late capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(continuations(worker)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(continuations(worker)).toHaveLength(1);
+  });
+
+  it('does not show an old capacity diagnostic after its continuation succeeded', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_capacity', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('message', { type: 'final_output', turnId: 'om_capacity', lastUuid: 'very-late-capacity', content: 'obsolete capacity diagnostic', turnFailed: true, turnFailureCode: 'codex_capacity_exceeded' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+    expect(continuations(worker)).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('never continues a capacity failure that belongs to an HTTP waiter', async () => {
+    const { ds, worker, sessionReply } = await boot();
+    const reject = vi.fn();
+    ds.pendingWaitPromises = new Map([['om_capacity', { resolve: vi.fn(), reject }]]);
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reject).toHaveBeenCalledOnce();
+    expect(continuations(worker)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('a completed continuation settles recovery without another retry', async () => {
+    const { ds, worker } = await boot();
+    fail(ds, worker);
+    await vi.advanceTimersByTimeAsync(15_000);
+    const turnId = continuations(worker)[0].turnId;
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(continuations(worker)).toHaveLength(1);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('completed');
+  });
+});
+
+it('an admitted Codex successor fences old recovery even when saving its new state fails', async () => {
+  vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true }));
+  vi.useFakeTimers();
+  const ds = makeDs();
+  forkWorker(ds, 'original task', 'om_original');
+  const worker = forkMock.mock.results.at(-1)!.value;
+  worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+  worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+  worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+  await vi.advanceTimersByTimeAsync(0);
+  vi.mocked(worker.send).mockImplementation((_message: any, cb?: (err?: Error | null) => void) => { cb?.(null); return true; });
+  worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+  await vi.advanceTimersByTimeAsync(0);
+  vi.mocked(sessionStore.updateSession).mockImplementation(s => {
+    if (s.ordinaryTurnRecovery?.logicalTurnId === 'om_new' && s.ordinaryTurnRecovery.status === 'running') throw new Error('disk full after admission');
+  });
+  expect(sendWorkerInput(ds, 'new task', 'om_new')).toBe(true);
+  expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', turnId: 'om_new' }), expect.any(Function));
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', logicalTurnId: 'om_new' });
+  expect(vi.mocked(worker.send).mock.calls.map(c => c[0] as any).filter(m => m?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
 });

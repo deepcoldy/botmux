@@ -785,10 +785,11 @@ describe('dashboard schedules React page helpers', () => {
     );
   });
 
-  it('offers three execution positions and allows lazy silent fresh topics', () => {
+  it('offers three execution positions and explains static versus dynamic silent topics', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     expect(page).toContain('onChange={e => setSilent(e.target.checked)}');
     expect(page).toContain('silentNewTopicConflict');
+    expect(page).toContain('silentDynamicTitleConflict');
     expect(page).toContain("value=\"top-level\"");
     expect(page).toContain("value=\"topic\"");
     expect(page).toContain("value=\"new-topic\"");
@@ -796,7 +797,7 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).toContain("tr('schedules.form.topicTitle')");
     expect(page).toContain('maxLength={200}');
     expect(page).not.toContain("disabled={executionPosition === 'new-topic'}");
-    expect(page).toContain("executionPosition === 'new-topic' && silent");
+    expect(page).toContain("(executionPosition === 'new-topic' || executionPosition === 'task') && silent");
     expect(page).toContain("tr('schedules.form.topicRoot')");
     expect(page).toContain("executionPosition === 'topic' && chatIds.length !== 1");
     expect(page).toContain("nextChatIds[0] !== initialTopicChatId");

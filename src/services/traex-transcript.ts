@@ -44,18 +44,21 @@ import {
   statSync,
   type Dirent,
 } from 'node:fs';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import {
   splitCodexEventsByCutoff,
   extractLastCodexTurn,
   type CodexBridgeEvent,
   type CodexDrainResult,
-  codexSessionIdFromRolloutPath,
   codexCotEntriesFromResponseItem,
   codexTaskFailureCode,
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
   isExactCodexOutputLimitError,
   safeFailureSummary,
+  codexHistorySidIsOwned,
+  readLatestRolloutRuntime,
+  rolloutAbortErrorCode,
+  runtimeFromTurnContext,
 } from './codex-transcript.js';
 import {
   BRIDGE_NOTHING_TO_SEND_SENTINEL,
@@ -63,7 +66,7 @@ import {
 } from './bridge-fallback-gate.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
-import { baselineJsonlCursor } from './jsonl-cursor.js';
+import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
@@ -104,6 +107,7 @@ const TRAEX_ROLLOUT_LOOKUP_MISS_CACHE_MAX = 256;
 const TRAEX_YEAR_DIR_RE = /^\d{4}$/;
 const TRAEX_MONTH_DIR_RE = /^(?:0[1-9]|1[0-2])$/;
 const TRAEX_DAY_DIR_RE = /^(?:0[1-9]|[12]\d|3[01])$/;
+const TRAEX_ROLLOUT_SESSION_RE = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i;
 
 interface TraexRolloutLookupMiss {
   nextFilesystemScanAtMs: number;
@@ -114,6 +118,17 @@ interface TraexRolloutLookupMiss {
  *  on every call, so a newly indexed rollout attaches immediately; only the
  *  compatibility filesystem scan is delayed after repeated misses. */
 const traexRolloutLookupMisses = new Map<string, TraexRolloutLookupMiss>();
+
+/** Extract the stable TRAE thread id from a rollout filename.
+ *
+ * Older releases used `rollout-<ts>-<thread-id>.jsonl`. TraeX 0.209.1 also
+ * writes resumed history segments as
+ * `rollout-<ts>-<thread-id>_<first-turn-id>.jsonl`. The suffix after `_` is a
+ * turn id, not a new resumable session id. The generic Codex parser selects
+ * the final UUID and therefore cannot be used for TRAE segmented rollouts. */
+export function traexSessionIdFromRolloutPath(path: string): string | undefined {
+  return TRAEX_ROLLOUT_SESSION_RE.exec(basename(path))?.[1];
+}
 
 type DatabaseSyncLike = {
   prepare(sql: string): StatementSyncLike;
@@ -627,45 +642,12 @@ function eventTimestampMs(value: unknown): number {
   return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
-function abortErrorCode(reason: unknown): string {
-  const normalized = (typeof reason === 'string' ? reason : 'unknown')
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 64) || 'unknown';
-  return `traex_turn_aborted:${normalized}`;
-}
-
-function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
-  if (entry?.type !== 'turn_context') return undefined;
-  const settings = entry?.payload?.collaboration_mode?.settings;
-  const model = entry?.payload?.model ?? settings?.model;
-  const reasoningEffort = entry?.payload?.reasoning_effort
-    ?? entry?.payload?.effort
-    ?? settings?.reasoning_effort;
-  const normalizedModel = typeof model === 'string' && model.trim()
-    ? model.trim()
-    : undefined;
-  const normalizedReasoningEffort = typeof reasoningEffort === 'string' && reasoningEffort.trim()
-    ? reasoningEffort.trim()
-    : undefined;
-  if (!normalizedModel && !normalizedReasoningEffort) return undefined;
-  return {
-    ...(normalizedModel ? { model: normalizedModel } : {}),
-    ...(normalizedReasoningEffort ? { reasoningEffort: normalizedReasoningEffort } : {}),
-  };
-}
-
 function* completeTraexRolloutRecords(
   text: string,
   fromOffset: number,
   sourceSessionId?: string,
 ): Generator<{ entry: any; offset: number; displayIndex?: number }> {
-  let cursor = fromOffset;
-  for (const line of text.split('\n')) {
-    const offset = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-    if (!line) continue;
+  for (const { line, lineStart: offset } of iterateJsonlLines(text, fromOffset)) {
     let entry: any;
     try { entry = JSON.parse(line); } catch { continue; }
     const completions = new Set(traexDisplayCompletions(entry?.payload, sourceSessionId));
@@ -713,22 +695,11 @@ export function drainTraexRollout(
 ): TraexDrainResult {
   const adoptMode = opts?.adoptMode === true;
   const probe = opts?.probe === true;
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
-  let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
-  let start = fromOffset;
-  if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
-
-  const buf = Buffer.alloc(size - start);
-  const fd = openSync(path, 'r');
-  try { readSync(fd, buf, 0, buf.length, start); } finally { closeSync(fd); }
-  const text = buf.toString('utf8');
-  const lastNl = text.lastIndexOf('\n');
-  const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  const newOffset = start + Buffer.byteLength(completeText, 'utf8');
-  const sourceSessionId = codexSessionIdFromRolloutPath(path);
+  const step = beginJsonlDrain(path, fromOffset);
+  if (step.kind !== 'read') return { events: [], newOffset: step.newOffset, pendingTail: '' };
+  const start = step.start;
+  const { completeText, pendingTail, newOffset } = step.window;
+  const sourceSessionId = traexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
   const seenUserTurns = new Set<string>();
@@ -766,7 +737,7 @@ export function drainTraexRollout(
   for (const { entry: obj, offset: lineStart, displayIndex } of completeTraexRolloutRecords(
     completeText, start, sourceSessionId,
   )) {
-    const runtime = runtimeFromTraexEntry(obj);
+    const runtime = runtimeFromTurnContext(obj);
     latestModel = runtime?.model ?? latestModel;
     latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
     const payload = obj?.payload;
@@ -1026,7 +997,7 @@ export function drainTraexRollout(
         kind: 'assistant_final',
         text: '',
         terminalStatus: 'ambiguous',
-        terminalErrorCode: abortErrorCode(payload.reason),
+        terminalErrorCode: rolloutAbortErrorCode('traex_turn_aborted', payload.reason),
         ...(sourceTurnId ? { sourceTurnId } : {}),
       });
     }
@@ -1054,69 +1025,7 @@ export function drainTraexRollout(
  * trailing partial is excluded via baselineJsonlCursor, so a crash mid-write
  * cannot surface a half-written model — matching drainTraexRollout. */
 export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
-  if (!path || !existsSync(path)) return {};
-  let completeEnd: number;
-  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
-  if (completeEnd <= 0) return {};
-
-  let latestModel: string | undefined;
-  let latestReasoningEffort: string | undefined;
-  const emit = (): TraexRuntimeSnapshot => ({
-    ...(latestModel ? { model: latestModel } : {}),
-    ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
-  });
-  // Backward scan keeps the first (newest) value seen for each field; returns
-  // true once both are known so the scan can stop early.
-  const consider = (line: string): boolean => {
-    if (!line.trim()) return false;
-    let runtime: TraexRuntimeSnapshot | undefined;
-    try { runtime = runtimeFromTraexEntry(JSON.parse(line)); } catch { return false; }
-    if (latestModel === undefined && runtime?.model) latestModel = runtime.model;
-    if (latestReasoningEffort === undefined && runtime?.reasoningEffort) {
-      latestReasoningEffort = runtime.reasoningEffort;
-    }
-    return latestModel !== undefined && latestReasoningEffort !== undefined;
-  };
-
-  const floor = Math.max(0, completeEnd - TRAEX_RUNTIME_SCAN_MAX_BYTES);
-  const chunkBytes = 64 * 1024;
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, 'r');
-    let end = completeEnd;
-    let carry = Buffer.alloc(0);
-    while (end > floor) {
-      const start = Math.max(floor, end - chunkBytes);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      for (let i = lineEnd - 1; i >= 0; i--) {
-        if (block[i] !== 0x0a) continue;
-        const line = block.subarray(i + 1, lineEnd).toString('utf8');
-        lineEnd = i;
-        carryEnd = i;
-        if (consider(line)) return emit();
-      }
-      // Carry the partial leading fragment back to the previous chunk. The one
-      // exception is the byte-cap floor (floor > 0 && start === floor): there
-      // the leading fragment is a truncated historical partial and is dropped.
-      // At true file start (start === 0) the fragment is the complete first
-      // record and must be considered.
-      carry = start === floor && floor > 0
-        ? Buffer.alloc(0)
-        : block.subarray(0, carryEnd);
-      end = start;
-    }
-    if (carry.length > 0) consider(carry.toString('utf8'));
-  } catch {
-    return emit();
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-  return emit();
+  return readLatestRolloutRuntime(path, TRAEX_RUNTIME_SCAN_MAX_BYTES);
 }
 
 function normaliseInputText(text: string): string {
@@ -1225,7 +1134,7 @@ function matchTraexRolloutPath(target: string): { path: string; cliSessionId: st
     // share the same rollout-*.jsonl filename shape.
     if (!target.includes('/cli/sessions/')) return undefined;
   }
-  const sid = codexSessionIdFromRolloutPath(target);
+  const sid = traexSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };
 }
@@ -1383,15 +1292,16 @@ export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
  *  FAIL CLOSED — a missing set or a non-member id returns false so the caller
  *  never binds the bridge (or persists a resume id) it can't prove the pid owns.
  *  Extracted so the exact predicate the worker's persist/attach gates use is
- *  unit-testable without a live pid. Mirrors codexHistorySidIsOwned. */
+ *  unit-testable without a live pid. Byte-for-byte the same predicate as
+ *  codexHistorySidIsOwned, so it delegates. A call-time wrapper rather than a
+ *  `const` alias: reading the import at module load makes this module fail to
+ *  load under any partial mock of codex-transcript. */
 export function traexHistorySidIsOwned(
   cliSessionId: string,
   ownedRollouts: Set<string> | undefined,
 ): boolean {
-  if (!ownedRollouts) return false;
-  return ownedRollouts.has(cliSessionId.toLowerCase());
+  return codexHistorySidIsOwned(cliSessionId, ownedRollouts);
 }
-
 
 function readTraexDirectory(path: string): Dirent[] {
   try {
@@ -1404,9 +1314,7 @@ function readTraexDirectory(path: string): Dirent[] {
 function isCanonicalTraexRolloutPath(
   path: string,
   sessionsRoot: string,
-  suffix: string,
 ): boolean {
-  if (!path.endsWith(suffix)) return false;
   const rel = relative(sessionsRoot, path);
   if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) return false;
   const parts = rel.split(sep);
@@ -1420,13 +1328,14 @@ function isCanonicalTraexRolloutPath(
 function findIndexedTraexRollout(
   cliSessionId: string,
   sessionsRoot: string,
-  suffix: string,
 ): string | undefined {
   const rows = withTraeDb((db) => db.prepare(
     'SELECT rollout_path AS rolloutPath FROM threads WHERE id = ? LIMIT 1',
   ).all(cliSessionId) as { rolloutPath?: string }[]) ?? [];
   const path = rows[0]?.rolloutPath;
-  if (typeof path !== 'string' || !isCanonicalTraexRolloutPath(path, sessionsRoot, suffix)) {
+  if (typeof path !== 'string'
+    || !isCanonicalTraexRolloutPath(path, sessionsRoot)
+    || traexSessionIdFromRolloutPath(path)?.toLowerCase() !== cliSessionId.toLowerCase()) {
     return undefined;
   }
   try {
@@ -1436,7 +1345,7 @@ function findIndexedTraexRollout(
   }
 }
 
-function findTraexRolloutInDateTree(sessionsRoot: string, suffix: string): string | undefined {
+function findTraexRolloutInDateTree(sessionsRoot: string, cliSessionId: string): string | undefined {
   const years = readTraexDirectory(sessionsRoot)
     .filter((entry) => entry.isDirectory() && TRAEX_YEAR_DIR_RE.test(entry.name))
     .sort((a, b) => b.name.localeCompare(a.name));
@@ -1453,9 +1362,12 @@ function findTraexRolloutInDateTree(sessionsRoot: string, suffix: string): strin
       for (const day of days) {
         const dayPath = join(monthPath, day.name);
         const rollout = readTraexDirectory(dayPath)
-          .find((entry) => entry.isFile()
-            && entry.name.startsWith('rollout-')
-            && entry.name.endsWith(suffix));
+          .filter((entry) => entry.isFile() && entry.name.startsWith('rollout-'))
+          // ISO timestamps are embedded in the filename, so descending name
+          // order selects the newest resume segment within one day.
+          .sort((a, b) => b.name.localeCompare(a.name))
+          .find((entry) => traexSessionIdFromRolloutPath(entry.name)?.toLowerCase()
+            === cliSessionId.toLowerCase());
         if (rollout) return join(dayPath, rollout.name);
       }
     }
@@ -1484,7 +1396,9 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
  *
  * TRAE's `threads` table is the authoritative session→path index. Older TRAE
  * versions may not expose `rollout_path`, so lookup degrades to the documented
- * `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` tree. The fallback never
+ * `sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl` tree. Newer releases may
+ * append `_<first-turn-id>` after the stable sid for a resumed segment. The
+ * fallback never
  * descends into rollout sidecars (`*.artifacts`, `tool-results`,
  * `rollout-blobs`), whose contents cannot be top-level sessions and may span
  * gigabytes. Repeated fallback misses are backed off, while the cheap indexed
@@ -1492,10 +1406,9 @@ function recordTraexRolloutLookupMiss(key: string, nowMs: number): void {
 export function findTraexRolloutBySessionId(cliSessionId: string): string | undefined {
   if (!cliSessionId) return undefined;
   const sessionsRoot = traeSessionsRoot();
-  const suffix = `-${cliSessionId}.jsonl`;
   const missKey = `${sessionsRoot}\0${cliSessionId.toLowerCase()}`;
 
-  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot, suffix);
+  const indexed = findIndexedTraexRollout(cliSessionId, sessionsRoot);
   if (indexed) {
     traexRolloutLookupMisses.delete(missKey);
     return indexed;
@@ -1506,7 +1419,7 @@ export function findTraexRolloutBySessionId(cliSessionId: string): string | unde
   const miss = traexRolloutLookupMisses.get(missKey);
   if (miss && nowMs < miss.nextFilesystemScanAtMs) return undefined;
 
-  const scanned = findTraexRolloutInDateTree(sessionsRoot, suffix);
+  const scanned = findTraexRolloutInDateTree(sessionsRoot, cliSessionId);
   if (scanned) {
     traexRolloutLookupMisses.delete(missKey);
     return scanned;

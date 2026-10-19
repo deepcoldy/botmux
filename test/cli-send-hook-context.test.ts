@@ -131,6 +131,31 @@ describe('cmdSend hook context wiring', () => {
     expect(relaySend).toContain("'--plugin-card-action'");
   });
 
+  it('finishes a scheduled task only after final delivery and before turn advancement', () => {
+    const relayStart = cliSource.indexOf('async function relaySend(');
+    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
+    const relaySend = cliSource.slice(relayStart, relayEnd);
+    const sendStart = cliSource.indexOf('async function cmdSend(');
+    const sendEnd = cliSource.indexOf('\n// ─── Card subcommand', sendStart);
+    const cmdSend = cliSource.slice(sendStart, sendEnd);
+
+    expect(cliSource).toContain('--schedule-remove-self');
+    expect(relaySend).toContain("'--schedule-remove-self'");
+    expect(cmdSend).toContain("responseKind !== 'final'");
+    expect(cmdSend).toContain('planScheduleFinalCleanup({');
+    expect(cmdSend).toContain("action: 'remove', id: scheduleRemoveSelfTaskId");
+    expect(cmdSend).toContain('while (!scheduleRemoveSelfRequested');
+    expect(cmdSend).toContain("...(isSlashSend ? ['--slash'] : [])");
+    expect(cmdSend).toContain('scheduleSelfCleanup?.removed === true');
+    expect(cmdSend).toContain('--schedule-remove-self 只支持当前会话内的标准 final 卡，不支持文档评论回复');
+    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
+    const cleanup = cmdSend.indexOf('await removeScheduleSelfAfterFinal();', primarySend);
+    const advance = cmdSend.indexOf('advanceAncestorSessionTurn(', cleanup);
+    expect(primarySend).toBeGreaterThanOrEqual(0);
+    expect(cleanup).toBeGreaterThan(primarySend);
+    expect(advance).toBeGreaterThan(cleanup);
+  });
+
   it('keeps completion proposals on the canonical final-card and sandbox outbox paths', () => {
     const relayStart = cliSource.indexOf('async function relaySend(');
     const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
@@ -536,9 +561,16 @@ describe('cmdSend hook context wiring', () => {
       let body = '';
       req.on('data', chunk => { body += String(chunk); });
       req.on('end', () => {
-        const request = JSON.parse(body) as {
-          sessionId: string; channelId: string; originCapability: string; nonce: string;
-        };
+        // Tolerate a loopback port-scanner probe (`GET /` with an empty body):
+        // parsing that as JSON would throw inside an event callback, which is a
+        // hard crash rather than a rejected promise. See helpers/read-request-body.ts.
+        let request: { sessionId: string; channelId: string; originCapability: string; nonce: string };
+        try {
+          request = JSON.parse(body) as typeof request;
+        } catch {
+          res.writeHead(400).end();
+          return;
+        }
         if (request.sessionId === 'session' && request.channelId === channelId
           && request.originCapability === capability) {
           writeManagedOriginAttestationProof({
@@ -791,14 +823,15 @@ describe('cmdSend hook context wiring', () => {
     expect(remoteGuard).toContain('trustedRelayCtx.sessionId !== sid');
     expect(remoteGuard).toContain("['progress', 'auxiliary']");
     expect(remoteGuard).toContain('sendTopLevel || overrideChatId || sendInto');
-    expect(remoteGuard).toContain('mentionArgs.length > 0');
+    expect(remoteGuard).toContain('Number(mentionArgs.length > 0)');
+    expect(remoteGuard).not.toContain('|| mentionArgs.length > 0');
     expect(remoteGuard).not.toContain('images.length > 0');
     expect(remoteGuard).toContain('files.length > 0');
     expect(cmdSend).toContain('...(remoteRunnerOutbound ? { terminalIndependent: true } : {})');
   });
 
   it.each([
-    ['explicit recipient', ['--no-mention', '--mention', 'ou_forbidden']],
+    ['explicit plus none mention decisions', ['--no-mention', '--mention', 'ou_forbidden']],
     ['two mention decisions', ['--no-mention', '--mention-back']],
   ])('rejects Remote Runner outbound sends with %s through the real CLI', async (_name, mentionArgs) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-guard-'));
@@ -831,7 +864,47 @@ describe('cmdSend hook context wiring', () => {
         BOTMUX_LARK_APP_SECRET: '',
       });
       expect(result.code).toBe(2);
-      expect(result.stderr).toContain('supports only current-session Markdown/images with one none/requester mention decision');
+      expect(result.stderr).toContain('supports only current-session Markdown/images with one none/requester/explicit mention decision');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts one explicit Remote Runner recipient before ordinary content validation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-explicit-'));
+    const dataDir = join(root, 'data');
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'app-a', larkAppSecret: 'test', cliId: 'remote-runner',
+    }]));
+    seedPersistedSessionRows(dataDir, 'app-a', {
+      session: {
+        sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+        title: 'remote', status: 'active', createdAt: new Date(0).toISOString(),
+        larkAppId: 'app-a', cliId: 'remote-runner', pid: process.pid,
+      },
+    });
+    try {
+      const missingContent = join(root, 'missing.md');
+      const result = await runCli([
+        'send', '--remote-runner-outbound', '--response-kind', 'auxiliary',
+        '--session-id', 'session', '--mention', 'ou_target:Target',
+        '--content-file', missingContent,
+      ], {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: join(root, 'bots.json'),
+        BOTMUX_SESSION_ID: 'session',
+        BOTMUX_TURN_ID: 'turn-live',
+        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+        BOTMUX_SEND_RELAY: '',
+        BOTMUX_WORKFLOW: '',
+        BOTMUX_LARK_APP_ID: '',
+        BOTMUX_LARK_APP_SECRET: '',
+      });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain(`文件不存在: ${missingContent}`);
+      expect(result.stderr).not.toContain('--remote-runner-outbound supports only');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1025,7 +1098,9 @@ describe('cmdSend hook context wiring', () => {
     expect(primarySend).toBeGreaterThanOrEqual(0);
     // The delivery record is written AFTER the message is actually sent.
     expect(deliveryIndex).toBeGreaterThan(primarySend);
-    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', deliveryIndex), deliveryIndex)).toContain('getSkillFeedbackStore');
+    const storeWrite = cmdSend.indexOf('getSkillFeedbackStore(resolveDataDir())', primarySend);
+    expect(storeWrite).toBeGreaterThan(primarySend);
+    expect(deliveryIndex).toBeGreaterThan(storeWrite);
     // Turn-completion recording is gated on the response KIND, not on the
     // feedback policy — feedback off must still produce a correlatable record.
     expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
@@ -1040,6 +1115,30 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('...(carriesFeedbackControl ? { policy: feedbackPolicy } : {})');
     expect(cmdSend).toContain('...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {})');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
+  });
+
+  it('falls back to daemon indexing only when an isolated CLI cannot open the shared feedback store', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const block = cmdSend.slice(completionIndex, cmdSend.indexOf('turn delivery indexing failed after delivery', completionIndex));
+    const localWrite = block.indexOf('getSkillFeedbackStore(resolveDataDir())');
+    const fallback = block.indexOf('if (indexError !== undefined) {');
+    // The local write is always tried first; wherever the store is writable
+    // nothing changes and no IPC is made.
+    expect(localWrite).toBeGreaterThan(0);
+    expect(fallback).toBeGreaterThan(localWrite);
+    const relay = block.slice(fallback);
+    // Isolation is decided the same way postSessionCliIpc decides it.
+    expect(relay).toContain('let isolated = !!process.env.BOTMUX_SEND_RELAY;');
+    expect(relay).toContain('try { loadDaemonIpcSecret(); } catch { isolated = true; }');
+    expect(relay).toContain('const deliveryIpcPort = isolated');
+    // Only the delivered message id + text cross: every correlation field is
+    // the daemon's to derive from the live session.
+    expect(relay).toContain("postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text })");
+    expect(relay).toContain('if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId)');
+    expect(relay).not.toContain('getSkillFeedbackStore');
   });
 
   it('returns after a concurrent final replay before any post-primary side effects', () => {

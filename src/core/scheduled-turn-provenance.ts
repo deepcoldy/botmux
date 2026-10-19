@@ -92,6 +92,11 @@ export function trustedCallerForScheduledTask(
     ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
     requestUserUnionId: task.ownerUnionId,
     requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
+    // A persisted ownerUnionId is written only for a daemon-authenticated
+    // human creator.  Preserve that positive fact on the synthetic fire so
+    // strict Remote Runner transports do not downgrade the scheduled turn to
+    // an unknown caller (bot-created / legacy tasks returned above).
+    senderType: 'user',
     source: 'schedule_creator',
     taskId: task.id,
   };

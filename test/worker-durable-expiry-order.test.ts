@@ -171,7 +171,9 @@ describe('worker durable lease expiry ordering', () => {
     const flushEndForRotation = workerSource.indexOf('\nfunction sendToPty(', flushStartForRotation);
     const flushForRotation = workerSource.slice(flushStartForRotation, flushEndForRotation);
     // V3: bound through the single capture identity writer.
-    const assignNextTurn = flushForRotation.indexOf('setCaptureIdentity(item.turnId, item.dispatchAttempt);');
+    const assignNextTurn = flushForRotation.indexOf(
+      'item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId',
+    );
     const republish = flushForRotation.indexOf('publishSandboxRelayCapability();', assignNextTurn);
     expect(assignNextTurn).toBeGreaterThanOrEqual(0);
     expect(republish).toBeGreaterThan(assignNextTurn);

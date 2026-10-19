@@ -43,6 +43,25 @@ describe('pickChoice non-TTY fallback', () => {
   it('returns null for an empty item list', async () => {
     expect(await pickChoice(fakeRl(['1']), { title: 't', items: [] })).toBe(null);
   });
+
+  it('toggles language on "l" or "L" when allowLangToggle is true', async () => {
+    const { getDefaultLocale, setDefaultLocale } = await import('../src/i18n/index.js');
+    setDefaultLocale('zh');
+    let callCount = 0;
+    const factory = () => {
+      callCount++;
+      return {
+        title: getDefaultLocale() === 'zh' ? '中文标题' : 'English Title',
+        items: ITEMS,
+        defaultIndex: 0,
+      };
+    };
+    const res = await pickChoice(fakeRl(['L', '2']), factory, { allowLangToggle: true });
+    expect(res).toBe(1);
+    expect(getDefaultLocale()).toBe('en');
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    setDefaultLocale('zh');
+  });
 });
 
 describe('computeViewportTop (长列表视口滚动)', () => {

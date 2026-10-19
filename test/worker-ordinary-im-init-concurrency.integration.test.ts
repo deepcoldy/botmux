@@ -1,5 +1,5 @@
 import { type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -588,20 +588,26 @@ setInterval(() => {}, 1_000);
     });
   }, 12_000);
 
-  it('renames a TraeX native session only after the first Lark prompt is submitted', async () => {
+  it('renames a TraeX native session only after the submitted first turn completes', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-native-title-'));
     tempDirs.add(root);
     const dataDir = join(root, 'session');
     const traeHome = join(root, 'trae-home');
     const inputLog = join(root, 'stdin.log');
+    const nativeSessionId = '00000000-0000-7000-8000-000000000187';
+    const rolloutDir = join(traeHome, 'cli', 'sessions', '2026', '10', '13');
+    const rolloutPath = join(rolloutDir, `rollout-2026-10-13T00-00-00-${nativeSessionId}.jsonl`);
     mkdirSync(dataDir, { recursive: true });
-    mkdirSync(join(traeHome, 'cli'), { recursive: true });
+    mkdirSync(rolloutDir, { recursive: true });
+    writeFileSync(rolloutPath, '');
     const firstPrompt = '<botmux_routing>hidden</botmux_routing>\n<user_message>@TestBot 排查标题问题</user_message>';
     const fakeTraex = join(root, 'fake-traex');
     writeFileSync(fakeTraex, `#!/usr/bin/env node
 const fs = require('node:fs');
 const inputLog = ${JSON.stringify(inputLog)};
 const historyPath = ${JSON.stringify(join(traeHome, 'cli', 'history.jsonl'))};
+const sessionId = ${JSON.stringify(nativeSessionId)};
+const rolloutFd = fs.openSync(${JSON.stringify(rolloutPath)}, 'a');
 const firstPrompt = ${JSON.stringify(firstPrompt)};
 let submittedFirstPrompt = false;
 process.on('uncaughtException', error => {
@@ -610,7 +616,9 @@ process.on('uncaughtException', error => {
 });
 function submitHistory(text) {
   fs.appendFileSync(inputLog, text + '\\n---SUBMIT---\\n');
-  fs.appendFileSync(historyPath, JSON.stringify({ session_id: 'traex-native-title', ts: Date.now(), text }) + '\\n');
+  fs.appendFileSync(historyPath, JSON.stringify({ session_id: sessionId, ts: Date.now(), text }) + '\\n');
+  fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg',
+    payload: { type: 'user_message', message: text, turn_id: 'native_initial' } }) + '\\n');
   setTimeout(() => process.stdout.write('›\\n'), 50);
 }
 setTimeout(() => process.stdout.write('›\\n'), 200);
@@ -676,9 +684,17 @@ setInterval(() => {}, 1_000);
       if (!existsSync(inputLog)) return false;
       const input = readFileSync(inputLog, 'utf8');
       return input.includes('<user_message>@TestBot 排查标题问题</user_message>')
-        && input.includes('/rename [BotMux·Lark] 排查标题问题')
-        && messages.some(message => message.type === 'queued_activation_submitted');
+        && messages.some(message => message.type === 'queued_activation_submitted')
+        && logs.some(line => line.includes('Ignoring prompt-ready heuristic while a structured turn is unfinished'));
     }, logs, 14_000);
+
+    // 提交记录和空闲画面都不是回合结束；改名必须等待真实终止事件。
+    expect(readFileSync(inputLog, 'utf8')).not.toContain('/rename [BotMux·Lark] 排查标题问题');
+    appendFileSync(rolloutPath, JSON.stringify({
+      timestamp: new Date().toISOString(), type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'native_initial', last_agent_message: 'done' },
+    }) + '\n');
+    await waitFor(() => readFileSync(inputLog, 'utf8').includes('/rename [BotMux·Lark] 排查标题问题'), logs);
 
     const input = readFileSync(inputLog, 'utf8');
     expect(input).toContain('<botmux_routing>hidden</botmux_routing>');

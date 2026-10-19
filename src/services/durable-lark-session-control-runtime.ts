@@ -459,6 +459,9 @@ export function createDurableLarkSessionControlRuntime(
               visibleAt: now(),
             }), 'notice');
           }
+          if (status !== 'active') {
+            await options.facade().releaseLease(canonicalKey);
+          }
         },
       },
     };

@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { proxyRouteFor, resolveUpstream } from './helpers/daemon-proxy-harness.js';
 
 describe('Bot Defaults feedback settings', () => {
   it('keeps advanced feedback settings compact until the user expands them', () => {
     const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
     const types = readFileSync(new URL('../src/dashboard/web/bot-defaults.ts', import.meta.url), 'utf8');
-    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
     expect(types).toContain('FeedbackPolicyLayer');
     expect(page).toContain('最终回答反馈');
     expect(page).toContain('高级 JSON');
@@ -26,9 +26,14 @@ describe('Bot Defaults feedback settings', () => {
     expect(page).toContain('<select value={chatId}');
     expect(page).not.toContain('聊天 ID（从群组页选择/复制）');
     expect(page).toContain('/feedback`');
-    expect(dashboard).toContain('/feedback$/');
-    expect(dashboard).toContain('/chats\\/([^/]+)\\/feedback');
-    expect(dashboard).toContain('feedback\\/effective');
+    // 前端调用的三条路径在 Dashboard 代理表里都有对应条目，且指向 daemon 的同名 IPC。
+    const botFeedback = proxyRouteFor('PUT', '/api/bots/cli_a/feedback');
+    expect(resolveUpstream(botFeedback!, '/api/bots/cli_a/feedback')).toBe('/api/bot-feedback');
+    const chatFeedback = proxyRouteFor('PUT', '/api/bots/cli_a/chats/oc_1/feedback');
+    expect(resolveUpstream(chatFeedback!, '/api/bots/cli_a/chats/oc_1/feedback')).toBe('/api/chat-feedback/oc_1');
+    const effective = proxyRouteFor('GET', '/api/bots/cli_a/feedback/effective');
+    expect(resolveUpstream(effective!, '/api/bots/cli_a/feedback/effective', '?chatId=oc_1'))
+      .toBe('/api/feedback-effective?chatId=oc_1');
   });
 
   it('renders a local hosted-team feedback editor without a remote-team write path', () => {

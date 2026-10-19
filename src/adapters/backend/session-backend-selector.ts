@@ -18,7 +18,7 @@ import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
 import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
-import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
+import type { BackendType, PersistentBackendTarget, SessionBackend, SessionProbe } from './types.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
 const MANAGED_HERDR_AGENT_TOKEN_LENGTH = 25;
@@ -180,6 +180,97 @@ export function decideBackendGate(opts: {
   if (opts.existingSessionUnknown) return { action: 'spawn' };
   if (opts.available) return { action: 'spawn' };
   return { action: 'gate', reason: `${opts.requested} 后端在本机不可用` };
+}
+
+/** Inputs {@link decideBackendGate} needs for tmux, plus the frozen tri-state
+ *  existence decision the worker threads into {@link selectSessionBackend}. */
+export interface TmuxGateResolution {
+  /** Frozen existence decision. 'unknown' survives only when the tmux binary is
+   *  on PATH (i.e. the probe timed out under load, not "tmux is absent"). */
+  probe: SessionProbe;
+  available: boolean;
+  reason: string;
+  hasExistingSession: boolean;
+  existingSessionUnknown: boolean;
+}
+
+/**
+ * tmux side of the worker's backend gate, mirroring the zellij fix (#836).
+ *
+ * `TmuxBackend.hasSession()` is `probeSession() === 'exists'`, so it answers
+ * `false` both for "no such session" and for "has-session got no answer". Under
+ * host load the second case is real, and the functional probe (a disposable
+ * `new-session`) times out under the same pressure — so a session whose pane
+ * was alive the whole time got the "tmux 不可用 / brew install tmux" card.
+ *
+ *   exists  → reattach; capability probe skipped (PR#249 semantics).
+ *   missing → authoritative: run the capability probe; failure gates.
+ *   unknown → if the binary is NOT on PATH (`locate` is a fork-free stat, so it
+ *             stays authoritative under load) the "unknown" is really ENOENT:
+ *             treat as missing so the capability probe produces the actionable
+ *             install card instead of a node-pty/tmux `execvp` crash. If the
+ *             binary IS on PATH, spawn instead of gate (existingSessionUnknown).
+ *
+ * Deliberately no "create and swallow `duplicate session`" fallback: a create
+ * that collides never ran its argv/wrapper, so the worker's pre-spawn fresh
+ * state (boot marker, argv prompt, startup commands) would be wrong. The
+ * unknown is resolved BEFORE spawn instead, biased toward reattach — see
+ * {@link persistentReattachBias} and {@link reconcileBiasedReattachProbe}.
+ */
+export function resolveTmuxBackendGate(deps: {
+  probeSession: () => SessionProbe;
+  binaryOnPath: () => boolean;
+  probeFunctional: () => { ok: true } | { ok: false; reason: string };
+}): TmuxGateResolution {
+  let probe = deps.probeSession();
+  if (probe === 'unknown' && !deps.binaryOnPath()) probe = 'missing';
+  if (probe === 'exists') {
+    return { probe, available: true, reason: '', hasExistingSession: true, existingSessionUnknown: false };
+  }
+  if (probe === 'unknown') {
+    return { probe, available: true, reason: '', hasExistingSession: false, existingSessionUnknown: true };
+  }
+  const functional = deps.probeFunctional();
+  return {
+    probe,
+    available: functional.ok,
+    reason: functional.ok ? '' : functional.reason,
+    hasExistingSession: false,
+    existingSessionUnknown: false,
+  };
+}
+
+/**
+ * Reattach-vs-fresh from a frozen tri-state existence probe (tmux / zellij).
+ * Only an authoritative 'missing' cold-spawns. 'unknown' is biased toward
+ * reattach: under load a live pane is likelier than a gone one, and the two
+ * wrong guesses are not symmetric —
+ *   · wrong "reattach" (pane actually gone): `pipe-pane` / `attach` fails
+ *     loudly before any input is accepted; nothing is written as if a new
+ *     generation started, and the next launch re-probes.
+ *   · wrong "fresh" (pane actually alive): `new-session` collides, or worse, a
+ *     duplicate CLI is started and every fresh-path side effect (boot marker,
+ *     argv prompt, startupCommands replay) lands against the wrong process.
+ */
+export function persistentReattachBias(probe: SessionProbe | undefined): boolean | undefined {
+  if (probe === undefined) return undefined;
+  return probe !== 'missing';
+}
+
+/**
+ * Second look at a reattach that rests on an indeterminate probe, taken right
+ * before the worker freezes its predicted outcome (fresh marker / wrapper /
+ * startup commands / initial-prompt routing). An authoritative answer replaces
+ * the bias — notably 'missing' turns a doomed reattach into a proper cold
+ * spawn WITH the fresh-path setup. A still-'unknown' answer keeps the bias.
+ * Authoritative frozen decisions are returned untouched (no extra probe).
+ */
+export function reconcileBiasedReattachProbe(
+  frozen: SessionProbe | undefined,
+  reprobe: () => SessionProbe,
+): SessionProbe | undefined {
+  if (frozen !== 'unknown') return frozen;
+  return reprobe();
 }
 
 /** User-facing card shown when {@link decideBackendGate} gates a session. */
@@ -555,7 +646,11 @@ export function selectSessionBackend(opts: {
   }
 
   const sessionName = TmuxBackend.sessionName(opts.sessionId);
-  if (TmuxBackend.hasSession(sessionName)) {
+  // Prefer the worker's frozen decision (tri-state probe resolved once at the
+  // gate, biased toward reattach on 'unknown', refreshed to 'missing' after any
+  // teardown) so the gate, the pre-spawn fresh/reattach setup and the backend
+  // all agree. Default callers without a decision keep the live boolean probe.
+  if (opts.hasExistingSession ?? TmuxBackend.hasSession(sessionName)) {
     return {
       backend: new TmuxPipeBackend(sessionName, { ownsSession: true, isReattach: true }),
       isTmuxMode: true,

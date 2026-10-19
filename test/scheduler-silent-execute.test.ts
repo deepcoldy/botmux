@@ -352,6 +352,7 @@ describe('executeScheduledTask — silent thread fire', () => {
       requestUserOpenId: 'ou_creator',
       requestUserUnionId: 'on_creator',
       requestLarkAppId: APP,
+      senderType: 'user',
       source: 'schedule_creator',
       taskId: 'task0001',
     });
@@ -445,6 +446,21 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(ds.hasHistory).toBe(false);
   });
 
+  it('renders dynamic date and owner placeholders before creating the text root', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      topicTitle: '{{date:-1d}} 工作总结（00:00-24:00） {{owner}}',
+      ownerOpenId: 'ou_owner123',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    const title = sendMessageMock.mock.calls[0][2] as string;
+    expect(title).toMatch(/^\d{4}-\d{2}-\d{2} 工作总结（00:00-24:00） /);
+    expect(title).toContain('<at user_id="ou_owner123"></at>');
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
   it('uses the standard task-start notice when no custom title is configured', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ executionPosition: 'new-topic', chatType: 'group' }), active, refreshCliVersion);
@@ -486,6 +502,27 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(active.size).toBe(2);
     expect(new Set([...active.values()].map(ds => ds.session.sessionId)).size).toBe(2);
     expect(new Set([...active.values()].map(ds => ds.session.deferredScheduleRun?.routingAnchor)).size).toBe(2);
+  });
+
+  it('fails closed when a silent fresh-topic task uses a runtime title template', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      silent: true,
+      topicTitle: '{{date:-1d}} 日报 {{owner}}',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion)).rejects.toThrow('topic_title_template_silent_unsupported');
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it('does not render a hidden topic title after switching to top-level', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'top-level',
+      topicTitle: '{{owner}}',
+      ownerOpenId: undefined,
+    }), active, refreshCliVersion)).resolves.toBeUndefined();
   });
 
   it('thread task without a real root safely degrades to silent chat scope', async () => {
@@ -605,6 +642,38 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(ds.session.rootMessageId).toBe('om_banner_123');
     expect(ds.session.deferredScheduleRun).toBeUndefined();
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders dynamic date and owner placeholders for the dedicated task root', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      topicTitle: '{{date:-1d}} 数据库巡检 {{owner}}',
+      ownerOpenId: 'ou_owner123',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    const title = sendMessageMock.mock.calls[0][2] as string;
+    expect(title).toMatch(/^\d{4}-\d{2}-\d{2} 数据库巡检 /);
+    expect(title).toContain('<at user_id="ou_owner123"></at>');
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith(
+      'task0001',
+      { rootMessageId: 'om_banner_123' },
+      APP,
+    );
+  });
+
+  it('fails closed before creating a hidden task session for a dynamic title', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      silent: true,
+      topicTitle: '{{date}} 数据库巡检',
+    }), active, refreshCliVersion)).rejects.toThrow('topic_title_template_silent_unsupported');
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(0);
   });
 
   it('non-silent first fire without a custom title seeds the standard task-start notice', async () => {
@@ -1134,6 +1203,7 @@ describe('executeScheduledTask — live-session injection', () => {
         requestUserOpenId: 'ou_creator',
         requestUserUnionId: 'on_creator',
         requestLarkAppId: APP,
+        senderType: 'user',
         source: 'schedule_creator',
         taskId: 'task0001',
       },

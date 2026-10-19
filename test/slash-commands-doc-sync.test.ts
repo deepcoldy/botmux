@@ -8,7 +8,10 @@
  *
  * Run: pnpm vitest run test/slash-commands-doc-sync.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+// app-slash-commands 只为飞书 client 引 bot-registry；doc-sync 只读清单，不碰凭证。
+vi.mock('../src/bot-registry.js', () => ({ formatLarkError: () => null, getBotClient: vi.fn() }));
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -18,6 +21,8 @@ import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registr
 import type { CliId } from '../src/adapters/cli/types.js';
 import { messages as en } from '../src/i18n/en.js';
 import { messages as zh } from '../src/i18n/zh.js';
+import { buildAppSlashCommandCatalog, APP_SLASH_COMMAND_SCOPES } from '../src/im/lark/app-slash-commands.js';
+import { COMMANDS } from '../src/core/command-schema.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const docPath = (loc: 'en' | 'zh') => join(repoRoot, 'docs-site', 'docs', loc, 'slash-commands.md');
@@ -98,4 +103,20 @@ describe('i18n help.* 对称', () => {
     const zhOnly = [...zhKeys].filter(k => !enKeys.has(k));
     expect({ enOnly, zhOnly }).toEqual({ enOnly: [], zhOnly: [] });
   });
+});
+
+describe('飞书原生命令面板清单 ↔ 文档', () => {
+  // 原生面板的候选清单从 command-schema 推导；它注册到飞书的每一条命令，用户在
+  // slash-commands.md 里都必须查得到，否则就是「面板里有、文档里搜不到」。
+  const cliIds = [undefined, ...new Set(COMMANDS.map(spec => spec.cliId).filter(Boolean))] as (string | undefined)[];
+  const catalogNames = new Set(cliIds.flatMap(cliId => buildAppSlashCommandCatalog({ cliId }).map(c => `/${c.command}`)));
+
+  for (const loc of ['en', 'zh'] as const) {
+    it(`${loc}/slash-commands.md 覆盖原生面板候选清单，并说明两个可选权限`, () => {
+      const doc = readDoc(loc);
+      const missing = [...catalogNames].filter(cmd => !docMentions(doc, cmd));
+      expect(missing, `${loc} 文档缺这些原生面板命令`).toEqual([]);
+      for (const scope of APP_SLASH_COMMAND_SCOPES) expect(doc).toContain(scope);
+    });
+  }
 });

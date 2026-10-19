@@ -15,6 +15,7 @@ const outboundRunner = resolve('test/fixtures/remote-runner-outbound.mjs');
 const sessionToolRunner = resolve('test/fixtures/remote-runner-session-tool.mjs');
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
+const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -152,6 +153,7 @@ describe('RemoteRunnerBackend', () => {
 
   it.each([
     ['session-no-session-tool', 'session-tool'],
+    ['session-no-schedule-capability', 'schedule-tool'],
     ['session-session-tool-generation', 'future-generation'],
   ])('fails closed for session tool protocol guard %s', async (sessionId, content) => {
     const backend = new RemoteRunnerBackend(
@@ -173,6 +175,88 @@ describe('RemoteRunnerBackend', () => {
     await ready;
 
     await backend.submitTurn({ turnId: `turn-${content}`, content });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rejects a schedule session tool when the host did not require the schedule capability', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool',
+      ],
+    }, 'session-host-read-only');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-schedule-tool', content: 'schedule-tool' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('accepts a provider-selected schedule Actor only after bilateral capability negotiation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule', 'session_tool_schedule_actor',
+      ],
+    }, 'session-schedule-actor');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-schedule-actor', content: 'schedule-actor' });
+    await final;
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      controllerOpenId: 'ou_developer',
+      request: { tool: 'schedule.add', schedule: '10m', prompt: 'check' },
+    }));
+  });
+
+  it('rejects a provider-selected schedule Actor when the host did not require it', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule',
+      ],
+    }, 'session-schedule-actor-host-disabled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const execute = vi.fn();
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-schedule-actor', content: 'schedule-actor' });
     await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
       code: 'remote_runner_protocol_error',
     })]));
@@ -205,6 +289,18 @@ describe('RemoteRunnerBackend', () => {
       result: expect.objectContaining({ code: 'operation_id_conflict' }),
     }));
     expect(delivery).toHaveBeenCalledTimes(2);
+
+    const mentionConflictFinal = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-mention-conflict', content: 'mention-conflict' });
+    const mentionConflictResults = JSON.parse(await mentionConflictFinal) as Array<{
+      result: { outcome: string; code?: string };
+    }>;
+    expect(mentionConflictResults.map(item => item.result.outcome).sort())
+      .toEqual(['delivered', 'rejected']);
+    expect(mentionConflictResults).toContainEqual(expect.objectContaining({
+      result: expect.objectContaining({ code: 'operation_id_conflict' }),
+    }));
+    expect(delivery).toHaveBeenCalledTimes(3);
   });
 
   it('limits unique outbound messages per turn before invoking the host', async () => {
@@ -319,6 +415,46 @@ describe('RemoteRunnerBackend', () => {
     spawnBackend(backend);
     await ready;
     expect(backend.getBackendState()).toEqual(initialState);
+  });
+
+  it('reattaches a provider-owned turn without submitting its prompt again', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'recovered-test',
+      generation: 7,
+      remoteSessionId: 'tae-session-existing',
+      agentThreadId: 'thread-existing',
+    };
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'recovered-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'turn_recovery',
+      ],
+    }, 'session-recovered', initialState);
+    children.push(backend);
+    const recovered = once<{ turnId: string; dispatchAttempt?: number }>(cb => {
+      backend.onTurnRecovered?.(turn => cb(turn));
+    });
+    const progress: string[] = [];
+    backend.onData(data => progress.push(data));
+    const final = once<{ text: string; turnId?: string }>(cb => {
+      backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
+    });
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, recoveredTurnRunner);
+
+    await ready;
+    await expect(recovered).resolves.toMatchObject({
+      turnId: 'turn-survived',
+      dispatchAttempt: 4,
+    });
+    expect(progress.join('')).toContain('recovered progress');
+    await expect(backend.submitTurn({ turnId: 'turn-new', content: 'must not run' }))
+      .resolves.toMatchObject({ submitted: false });
+    await expect(final).resolves.toEqual({
+      text: 'recovered final',
+      turnId: 'turn-survived',
+    });
   });
 
   it('requires an explicit closed-session rebuild to advance the remote generation', async () => {
@@ -670,6 +806,7 @@ describe('RemoteRunnerBackend', () => {
 
   it.each([
     ['session-no-outbound', 'unadvertised-outbound'],
+    ['session-no-explicit', 'unadvertised-explicit-mention'],
     ['session-outbound-generation', 'outbound-future-generation'],
     ['session-final-before-result', 'final-before-result'],
   ])('fails closed for outbound protocol guard %s', async (sessionId, content) => {

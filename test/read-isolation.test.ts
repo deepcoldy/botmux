@@ -932,6 +932,15 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     }), ['credential', 'read', 'write'])).toBe(false);
   });
 
+  it('cold-spawns v16 credential-only panes that lack the relay scope marker', () => {
+    // v17 adds BOTMUX_SEND_RELAY_SCOPE=send to the credential-only wrapper env;
+    // a v16 pane never received it, so its legacy dispatch forms stay refused.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(16);
+    const current = JSON.parse(isolationPaneMarkerContent('boot', ['credential'])) as Record<string, unknown>;
+    expect(isolatedPaneReattachSafe(JSON.stringify(current), ['credential'])).toBe(true);
+    expect(isolatedPaneReattachSafe(JSON.stringify({ ...current, version: 16 }), ['credential'])).toBe(false);
+  });
+
   it('has moved the version past 12 — the release before the sandboxed-Codex CA env contract', () => {
     // A pane spawned before this change keeps its ORIGINAL process environment, so
     // it would never see the host CA bundle (SSL_CERT_FILE) and its Codex would keep

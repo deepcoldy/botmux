@@ -1,4 +1,4 @@
-import { extractLarkBusinessCode } from './api-gate.js';
+import { extractLarkBusinessCode } from './lark-errors.js';
 
 /**
  * 飞书内容安全审计类拒收。

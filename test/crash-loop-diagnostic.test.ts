@@ -226,10 +226,10 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // First 3 auto-restart in place; the 4th asks the worker to park a
     // diagnostic shell (deferred park) and keeps it alive (no close).
-    // auto-restart 捎带最新 per-bot env + 最新模型（本 fixture 的 mock getBot
-    // 两者都没配 → 均为 null，即「明确清空快照」），并标记 reason: 'cli_crash'
-    // 区分 operator 主动 restart。
-    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', reason: 'cli_crash', env: null, model: null });
+    // auto-restart 捎带最新 per-bot env + 最新模型 + larkToolBinding（本 fixture 的 mock getBot
+    // env/model 未配 → 均为 null；larkToolBinding 默认开启 → 为 true；三分态 contract: true 启用 / null 明确清空 / undefined 保持），
+    // 并标记 reason: 'cli_crash' 区分 operator 主动 restart。
+    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', reason: 'cli_crash', env: null, model: null, larkToolBinding: true });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.

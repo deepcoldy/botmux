@@ -3,6 +3,7 @@ import { createContext, runInContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 
 // Execute the actual worker handler with a controlled backend. Importing the
 // whole worker would start its IPC/runtime; a copy of the handler would miss
@@ -23,7 +24,7 @@ function harness(delivered = true) {
   const send = vi.fn();
   const control = vi.fn(async () => delivered);
   const context = createContext({
-    currentBotmuxTurnId: 'stop', backend: {}, lastInitConfig: { cliId: 'codex' }, effectiveBackendType: 'pty',
+    currentBotmuxTurnId: 'stop', backend: {}, lastInitConfig: { cliId: 'codex' }, effectiveBackendType: 'pty', isCodexAppCliId,
     inflightInputs, pendingMessages, send, log: vi.fn(), tuiPromptBlocking: true,
     flushPending: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),

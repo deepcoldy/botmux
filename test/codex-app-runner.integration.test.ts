@@ -802,7 +802,14 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const http = createHttpServer((req, res) => {
         let body = ''; req.on('data', data => { body += data; });
         req.on('end', () => {
-          posts.push(JSON.parse(body));
+          // A loopback port-scanner probe (`GET /`, empty body) must not crash
+          // this fixture; only real POSTs to /api/asks carry a JSON body.
+          try {
+            posts.push(JSON.parse(body));
+          } catch {
+            res.writeHead(400).end();
+            return;
+          }
           expect(req.url).toBe('/api/asks');
           res.on('close', () => { closed = true; });
           respond = (result, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); };
@@ -1333,20 +1340,28 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         text: 'serial follow', clientUserMessageId: 'om_b3_serial',
       })}\r`);
 
-      // It must produce its own final via a second turn/start — never a steer.
-      await waitFor(harness, () => control.finals.length === 2
+      // /queue admissions omit the same positive flag. Two inputs must keep
+      // their own turns and FIFO order, rather than merge into the active Goal.
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('serial follow 2', {
+        text: 'serial follow 2', clientUserMessageId: 'om_b3_serial_2',
+      })}\r`);
+
+      // Each input must produce its own final — never a steer.
+      await waitFor(harness, () => control.finals.length === 3
         && control.states.filter(state => state.busy === false).length >= 2);
 
       const requests = readRequests(logPath);
       // Zero turn/steer: the non-flag input was NOT merged into the Goal.
       expect(requests.filter(r => r.method === 'turn/steer')).toHaveLength(0);
-      // Two turn/start: the root, then the parked input as its own turn.
+      // Three turn/start: the root, then each parked input as its own turn.
       const starts = requests.filter(r => r.method === 'turn/start');
-      expect(starts).toHaveLength(2);
+      expect(starts).toHaveLength(3);
       expect(starts[1].params).toMatchObject({
         clientUserMessageId: 'om_b3_serial',
         input: [{ type: 'text', text: 'serial follow', text_elements: [] }],
       });
+      expect(starts[2].params.clientUserMessageId).toBe('om_b3_serial_2');
+      expect(control.finals[2]).toMatchObject({ turnId: 'om_b3_serial_2' });
       // The follow-up's final is its own answer, not the Goal's autonomous text.
       expect(control.finals[1]).toMatchObject({ turnId: 'om_b3_serial' });
       expect(control.finals[1].content).not.toContain('autonomous goal text before Lark input');

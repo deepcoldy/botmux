@@ -5,7 +5,7 @@ import {
   replyCardIsTerminal, type ReplyCardTool, type TurnReplyCardRecord, type ReplyCardActivity,
 } from '../../services/turn-reply-card.js';
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
-import { buildCardBodyElements, cardUsageFooterSegment, createReplyCard } from './md-card.js';
+import { buildCardBodyElements, cardUsageFooterSegment, cardUsageRuntimeSegment, createReplyCard } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
 import { markGroupContextCardPurpose } from './group-context-card.js';
 
@@ -155,9 +155,9 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const terminal = replyCardIsTerminal(record);
   const pendingAsks = (record.asks ?? []).filter(entry => !entry.result && !entry.ask.settled);
   const phaseLabels = en
-    ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted' }
-      : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认' };
-  const phaseIcons = { queued: '⏳', working: '💭', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️' };
+    ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted', superseded: 'Continued in a later message' }
+      : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认', superseded: '已由后续消息接续' };
+  const phaseIcons = { queued: '⏳', working: '💭', waiting: '⏳', stopping: '⏹', completed: '✅', failed: '❌', cancelled: '⏹', ambiguous: '⚠️', superseded: '↪️' };
   const toolCount = presentation.showProcess ? record.tools.length : 0;
   const duration = record.durationMs !== undefined ? record.durationMs
     : !terminal && record.startedAtMs ? Date.now() - record.startedAtMs : undefined;
@@ -269,7 +269,10 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${pendingAsks.length ? '🙋' : phaseIcons[record.phase]} **${title}**` });
   const usage = presentation.showLiveUsage && record.usage
     ? cardUsageFooterSegment(record.usage, presentation.locale, 'streaming') : null;
-  if (usage) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usage });
+  // Final cards already carry their frozen runtime identity in the footer.
+  const runtime = !record.finalCard && record.usage ? cardUsageRuntimeSegment(record.usage) : null;
+  const usageLine = [usage, runtime].filter(Boolean).join(' · ');
+  if (usageLine) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usageLine });
   if (!terminal && !record.finalCard && ['working', 'waiting'].includes(record.phase) && presentation.canStop) {
     card.body.elements.push({ tag: 'column_set', element_id: 'botmux_turn_control_0', columns: [{ tag: 'column', width: 'auto', elements: [{
       tag: 'button', text: { tag: 'plain_text', content: en ? '⏹ Stop' : '⏹ 停止' }, type: 'danger',

@@ -7,6 +7,7 @@ import {
 } from '../utils/process-identity.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { procStatFieldsAfterComm } from '../utils/proc-stat.js';
 import type { TrustedCaller } from '../types.js';
 
 export {
@@ -62,10 +63,8 @@ function systemPsBin(): string | undefined {
 function readParentPid(pid: number): number | undefined {
   if (process.platform === 'linux') {
     try {
-      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const closeParen = raw.lastIndexOf(')');
-      if (closeParen < 0) return undefined;
-      const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+      const fields = procStatFieldsAfterComm(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+      if (!fields) return undefined;
       const parent = Number(fields[1]);
       return Number.isSafeInteger(parent) && parent > 0 ? parent : undefined;
     } catch { return undefined; }

@@ -864,3 +864,284 @@ describe('silent scheduled turns keep their silence across continuations', () =>
     expect(ordinaryTurnRecoverySilentTurnIds(state({ status: 'cancelled' }))).toEqual([]);
   });
 });
+
+describe('restricted capacity-recovery policy', () => {
+  function attach(session: any, extras: any = {}) {
+    const runs: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const warn = vi.fn();
+    attachOrdinaryTurnRecovery(session, {
+      schedule: (_delay, run) => { runs.push(run); return run; }, cancel: vi.fn(),
+      persist: vi.fn(), enqueue, warn, recoverableErrorCodes: ['codex_capacity_exceeded'],
+      supersedeOnUserInput: true, backoffMs: [15_000, 45_000], now: () => 1_000, ...extras,
+    });
+    return { runs, enqueue, warn };
+  }
+  it('restores the persisted backoff once and never enqueues on a duplicate timer callback', () => {
+    const session = { sessionId: 'capacity-restore', ordinaryTurnRecovery: state({ status: 'backoff', nextAttemptAt: 16_000 }) };
+    const { runs, enqueue } = attach(session);
+    runs[0](); runs[0]();
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'running', continuationsStarted: 1 });
+    disposeOrdinaryTurnRecovery(session);
+  });
+  it('does not replay a handoff with an unknown execution outcome after restart', () => {
+    const session = { sessionId: 'capacity-handoff', ordinaryTurnRecovery: state({ status: 'dispatching', currentTurnId: 'bmx-recovery-unknown', continuationsStarted: 1 }) };
+    const { runs, enqueue, warn } = attach(session);
+    expect(runs).toHaveLength(0);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'attention_required', lastErrorCode: 'recovery_dispatch_interrupted' });
+    disposeOrdinaryTurnRecovery(session);
+  });
+  it('honours an explicit retry refusal even for a capacity code', () => {
+    const session = { sessionId: 'capacity-refused', ordinaryTurnRecovery: state() };
+    const { runs, enqueue, warn } = attach(session);
+    handleOrdinaryTurnRecoveryTerminal(session, { turnId: 'om_original', status: 'failed', errorCode: 'codex_capacity_exceeded', retryable: false });
+    expect(runs).toHaveLength(0);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+    disposeOrdinaryTurnRecovery(session);
+  });
+});
+
+describe('async recovery persistence failures', () => {
+  it.each(['after-enqueue', 'after-prepare-rejected'] as const)('reports %s without an unhandled rejection or replay', async phase => {
+    let run!: () => void;
+    const saved: OrdinaryTurnRecoveryState[] = [];
+    const enqueue = vi.fn(() => true);
+    const onError = vi.fn();
+    const failure = new Error('disk full during asynchronous dispatch');
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delay, next) => { run = next; return next; }, cancel: vi.fn(),
+      persist: value => {
+        if ((phase === 'after-enqueue' && value.status === 'running')
+          || (phase === 'after-prepare-rejected' && value.status === 'attention_required')) throw failure;
+        saved.push(structuredClone(value));
+      },
+      prepare: phase === 'after-enqueue' ? async () => {} : async () => { throw new Error('prepare failed'); },
+      enqueue, onError, warn: vi.fn(), backoffMs: [0],
+    });
+    coordinator.onTerminal(state(), { turnId: 'om_original', status: 'failed', errorCode: 'provider_server_error', retryable: true });
+    run();
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(failure));
+    expect(onError).toHaveBeenCalledOnce();
+    expect(saved.at(-1)).toMatchObject({ status: 'dispatching', continuationsStarted: 1 });
+    run();
+    expect(enqueue).toHaveBeenCalledTimes(phase === 'after-enqueue' ? 1 : 0);
+  });
+});
+
+describe('Codex cancellation fences', () => {
+  function fixture(options: { prepare?: () => Promise<void>; persist?: (s: OrdinaryTurnRecoveryState) => void } = {}) {
+    const session = { sessionId: `cancel-${Math.random()}` } as any;
+    const timers: Array<{ run: () => void; cancelled: boolean }> = [];
+    const enqueue = vi.fn(() => true);
+    attachOrdinaryTurnRecovery(session, {
+      schedule: (_ms, run) => { const timer = { run, cancelled: false }; timers.push(timer); return timer; },
+      cancel: timer => { timer.cancelled = true; }, persist: options.persist ?? vi.fn(),
+      prepare: options.prepare, enqueue, warn: vi.fn(),
+      recoverableErrorCodes: ['codex_capacity_exceeded'], supersedeOnUserInput: true,
+      backoffMs: [0, 0],
+    });
+    beginOrdinaryTurnRecovery(session, 'om_original');
+    handleOrdinaryTurnRecoveryTerminal(session, { turnId: 'om_original', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    return { session, timers, enqueue };
+  }
+
+  it('stops dispatching before asynchronous preparation can enqueue', async () => {
+    let release!: () => void;
+    const { session, timers, enqueue } = fixture({ prepare: () => new Promise<void>(r => { release = r; }) });
+    timers.at(-1)!.run();
+    expect(session.ordinaryTurnRecovery.status).toBe('dispatching');
+    cancelOrdinaryTurnRecoveryForUserInput(session, 'stop');
+    expect(session.ordinaryTurnRecovery.status).toBe('cancelled');
+    release(); await Promise.resolve(); await Promise.resolve();
+    expect(enqueue).not.toHaveBeenCalled();
+    disposeOrdinaryTurnRecovery(session);
+  });
+
+  it('stops a running continuation and ignores its late capacity terminal', () => {
+    const { session, timers, enqueue } = fixture();
+    timers.at(-1)!.run();
+    const turnId = session.ordinaryTurnRecovery.currentTurnId;
+    expect(enqueue).toHaveBeenCalledOnce();
+    cancelOrdinaryTurnRecoveryForUserInput(session, 'stop');
+    handleOrdinaryTurnRecoveryTerminal(session, { turnId, status: 'failed', errorCode: 'codex_capacity_exceeded' });
+    for (const timer of timers) if (!timer.cancelled) timer.run();
+    expect(session.ordinaryTurnRecovery.status).toBe('cancelled');
+    expect(enqueue).toHaveBeenCalledOnce();
+    disposeOrdinaryTurnRecovery(session);
+  });
+
+  it('an admitted newer input retains a local fence when persistence fails', () => {
+    const { session, timers, enqueue } = fixture({ persist: s => {
+      if (s.logicalTurnId === 'om_new') throw new Error('disk full');
+    } });
+    expect(() => beginOrdinaryTurnRecovery(session, 'om_new')).toThrow('disk full');
+    expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', logicalTurnId: 'om_new' });
+    for (const timer of timers) if (!timer.cancelled) timer.run();
+    expect(enqueue).not.toHaveBeenCalled();
+    disposeOrdinaryTurnRecovery(session);
+  });
+
+  it('retains stop locally on save failure and does not rearm the old backoff', () => {
+    const { session, timers, enqueue } = fixture({ persist: s => {
+      if (s.status === 'cancelled') throw new Error('disk full');
+    } });
+    expect(() => cancelOrdinaryTurnRecoveryForUserInput(session, 'stop')).not.toThrow();
+    expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', cancelledByTurnId: 'stop' });
+    for (const timer of timers) if (!timer.cancelled) timer.run();
+    expect(enqueue).not.toHaveBeenCalled();
+    disposeOrdinaryTurnRecovery(session);
+  });
+});
+
+it('does not restore a possibly cancelled Codex backoff after a process restart', () => {
+  // The old process accepted stop/new input but could not persist it. Its
+  // process-local fence is gone; the stored row alone cannot authorise replay.
+  const session = { sessionId: 'cancelled-before-restart', ordinaryTurnRecovery: state({ status: 'backoff', nextAttemptAt: 0 }) };
+  const schedule = vi.fn();
+  const enqueue = vi.fn(() => true);
+  const warn = vi.fn();
+  attachOrdinaryTurnRecovery(session, {
+    schedule, cancel: vi.fn(), persist: vi.fn(), enqueue, warn,
+    recoverableErrorCodes: ['codex_capacity_exceeded'], supersedeOnUserInput: true,
+    resumeRecoveryOnRestore: false,
+  });
+  expect(schedule).not.toHaveBeenCalled();
+  expect(enqueue).not.toHaveBeenCalled();
+  expect(warn).toHaveBeenCalledOnce();
+  expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'attention_required', lastErrorCode: 'recovery_restart_unverified' });
+  disposeOrdinaryTurnRecovery(session);
+});
+
+it.each(['codex', 'claude'] as const)('%s: cancel-save failure followed by restart honours the CLI restore policy', cli => {
+  let durable!: OrdinaryTurnRecoveryState;
+  const original = { sessionId: `restart-after-cancel-${cli}` } as any;
+  const policy = cli === 'codex'
+    ? { recoverableErrorCodes: ['codex_capacity_exceeded'], supersedeOnUserInput: true, resumeRecoveryOnRestore: false }
+    : {};
+  attachOrdinaryTurnRecovery(original, {
+    ...policy, schedule: (_ms, run) => run, cancel: vi.fn(),
+    persist: s => { if (s.status === 'cancelled') throw new Error('disk full'); durable = structuredClone(s); },
+    enqueue: vi.fn(() => true), warn: vi.fn(), backoffMs: [0],
+  });
+  beginOrdinaryTurnRecovery(original, 'om_original');
+  handleOrdinaryTurnRecoveryTerminal(original, {
+    turnId: 'om_original', status: 'failed', retryable: true,
+    errorCode: cli === 'codex' ? 'codex_capacity_exceeded' : 'provider_server_error',
+  });
+  if (cli === 'codex') expect(() => cancelOrdinaryTurnRecoveryForUserInput(original, 'stop')).not.toThrow();
+  else expect(() => cancelOrdinaryTurnRecoveryForUserInput(original, 'stop')).toThrow('disk full');
+  expect(durable.status).toBe('backoff');
+  disposeOrdinaryTurnRecovery(original);
+
+  // A fresh process sees only the old durable row, not the local stop fence.
+  const restored = { sessionId: original.sessionId, ordinaryTurnRecovery: structuredClone(durable) };
+  const timers: Array<() => void> = [];
+  const enqueue = vi.fn(() => true);
+  const warn = vi.fn();
+  attachOrdinaryTurnRecovery(restored, {
+    ...policy, schedule: (_ms, run) => { timers.push(run); return run; },
+    cancel: vi.fn(), persist: vi.fn(), enqueue, warn,
+  });
+  for (const run of timers) run();
+  expect(enqueue).toHaveBeenCalledTimes(cli === 'codex' ? 0 : 1);
+  expect(warn).toHaveBeenCalledTimes(cli === 'codex' ? 1 : 0);
+  expect(restored.ordinaryTurnRecovery.status).toBe(cli === 'codex' ? 'attention_required' : 'running');
+  disposeOrdinaryTurnRecovery(restored);
+});
+
+
+it.each(['stop', 'new-input'] as const)('Codex restored running after %s save failure cannot retry a late capacity terminal', action => {
+  let durable!: OrdinaryTurnRecoveryState;
+  let run!: () => void;
+  let rejectUserSave = false;
+  const original = { sessionId: `running-cancel-restart-${action}` } as any;
+  const policy = { recoverableErrorCodes: ['codex_capacity_exceeded'], supersedeOnUserInput: true, resumeRecoveryOnRestore: false };
+  attachOrdinaryTurnRecovery(original, {
+    ...policy, schedule: (_ms, next) => { run = next; return next; }, cancel: vi.fn(),
+    persist: s => { if (rejectUserSave) throw new Error('disk full'); durable = structuredClone(s); },
+    enqueue: vi.fn(() => true), warn: vi.fn(), backoffMs: [0, 0],
+  });
+  beginOrdinaryTurnRecovery(original, 'om_original');
+  handleOrdinaryTurnRecoveryTerminal(original, { turnId: 'om_original', status: 'failed', errorCode: 'codex_capacity_exceeded' });
+  run();
+  const oldTurn = durable.currentTurnId;
+  expect(durable).toMatchObject({ status: 'running', continuationsStarted: 1 });
+  rejectUserSave = true;
+  if (action === 'stop') cancelOrdinaryTurnRecoveryForUserInput(original, 'stop');
+  else expect(() => beginOrdinaryTurnRecovery(original, 'om_new')).toThrow('disk full');
+  expect(original.ordinaryTurnRecovery.status).toBe('cancelled');
+  disposeOrdinaryTurnRecovery(original);
+
+  const restored = { sessionId: original.sessionId, ordinaryTurnRecovery: structuredClone(durable) };
+  const timers: Array<() => void> = [];
+  const enqueue = vi.fn(() => true);
+  const warn = vi.fn();
+  attachOrdinaryTurnRecovery(restored, {
+    ...policy, schedule: (_ms, next) => { timers.push(next); return next; }, cancel: vi.fn(),
+    persist: vi.fn(), enqueue, warn, backoffMs: [0, 0],
+  });
+  expect(restored.ordinaryTurnRecovery.status).toBe('running');
+  handleOrdinaryTurnRecoveryTerminal(restored, { turnId: oldTurn, status: 'failed', errorCode: 'codex_capacity_exceeded' });
+  for (const next of timers) next();
+  expect(enqueue).not.toHaveBeenCalled();
+  expect(warn).toHaveBeenCalledOnce();
+  expect(restored.ordinaryTurnRecovery).toMatchObject({ status: 'attention_required', lastErrorCode: 'recovery_restart_unverified' });
+  disposeOrdinaryTurnRecovery(restored);
+});
+
+it.each(['codex', 'claude'] as const)('%s restored running still observes success, and fresh input may recover', cli => {
+  const session = { sessionId: `restored-running-success-${cli}`, ordinaryTurnRecovery: state({ status: 'running', continuationsStarted: 1 }) };
+  const timers: Array<() => void> = [];
+  const enqueue = vi.fn(() => true);
+  const warn = vi.fn();
+  attachOrdinaryTurnRecovery(session, {
+    ...(cli === 'codex' ? { recoverableErrorCodes: ['codex_capacity_exceeded'], supersedeOnUserInput: true, resumeRecoveryOnRestore: false } : {}),
+    schedule: (_ms, next) => { timers.push(next); return next; }, cancel: vi.fn(), persist: vi.fn(), enqueue, warn,
+  });
+  handleOrdinaryTurnRecoveryTerminal(session, { turnId: 'om_original', status: 'completed' });
+  expect(session.ordinaryTurnRecovery.status).toBe('completed');
+  expect(warn).not.toHaveBeenCalled();
+  beginOrdinaryTurnRecovery(session, 'om_fresh');
+  handleOrdinaryTurnRecoveryTerminal(session, {
+    turnId: 'om_fresh', status: 'failed', retryable: true,
+    errorCode: cli === 'codex' ? 'codex_capacity_exceeded' : 'provider_server_error',
+  });
+  for (const next of timers) next();
+  expect(enqueue).toHaveBeenCalledOnce();
+  expect(session.ordinaryTurnRecovery.status).toBe('running');
+  disposeOrdinaryTurnRecovery(session);
+});
+
+it('Claude restored running can still retry its late provider terminal', () => {
+  const session = { sessionId: 'claude-running-restart', ordinaryTurnRecovery: state({ status: 'running', continuationsStarted: 1 }) };
+  const timers: Array<() => void> = [];
+  const enqueue = vi.fn(() => true);
+  attachOrdinaryTurnRecovery(session, {
+    schedule: (_ms, next) => { timers.push(next); return next; }, cancel: vi.fn(), persist: vi.fn(), enqueue, warn: vi.fn(),
+  });
+  handleOrdinaryTurnRecoveryTerminal(session, { turnId: 'om_original', status: 'failed', retryable: true, errorCode: 'provider_server_error' });
+  for (const next of timers) next();
+  expect(enqueue).toHaveBeenCalledOnce();
+  expect(session.ordinaryTurnRecovery).toMatchObject({ status: 'running', continuationsStarted: 2 });
+  disposeOrdinaryTurnRecovery(session);
+});
+
+it.each([
+  { restricted: true, status: 'completed', turnId: 'om_original', code: 'codex_capacity_exceeded', owns: true },
+  { restricted: true, status: 'completed', turnId: 'bmx-recovery-done', code: 'codex_capacity_exceeded', owns: false },
+  { restricted: true, status: 'completed', turnId: 'om_original', code: 'codex_auth_failed', owns: false },
+  { restricted: true, status: 'cancelled', turnId: 'om_original', code: 'codex_capacity_exceeded', owns: false },
+  { restricted: false, status: 'completed', turnId: 'om_original', code: 'provider_server_error', owns: false },
+] as const)('late predecessor notice policy: $restricted / $status / $turnId / $code', ({ restricted, status, turnId, code, owns }) => {
+  const session = { sessionId: `predecessor-${restricted}-${status}-${turnId}-${code}`, ordinaryTurnRecovery: state({ status, currentTurnId: 'bmx-recovery-done', continuationsStarted: 1 }) };
+  attachOrdinaryTurnRecovery(session, {
+    ...(restricted ? { recoverableErrorCodes: ['codex_capacity_exceeded'] } : {}),
+    schedule: vi.fn(), cancel: vi.fn(), persist: vi.fn(), enqueue: vi.fn(() => true), warn: vi.fn(),
+  });
+  expect(ordinaryTurnRecoveryHandlesTerminal(session, { turnId, status: 'failed', errorCode: code })).toBe(owns);
+  disposeOrdinaryTurnRecovery(session);
+});

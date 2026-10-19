@@ -149,6 +149,15 @@ const dashboardSetup = defineProjectSetup<DashboardContext>({
         : {}),
     });
     const page = await browserContext.newPage();
+    // Any 401 opens the 「访问链接已失效」 overlay, which covers the pages under
+    // test; CI hit it once in public read-only mode. Log the request so a
+    // failure names the endpoint instead of only showing the overlay.
+    page.on('response', (response) => {
+      const status = response.status();
+      if (status !== 401 && status !== 403) return;
+      const { pathname } = new URL(response.url());
+      console.warn(`[dashboard] HTTP ${status} ${response.request().method()} ${pathname}`);
+    });
     onTeardown(async () => {
       await browserContext.close();
       try {

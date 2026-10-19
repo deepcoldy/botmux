@@ -8,6 +8,8 @@
  *
  * The logo ships inline so the compiled single-file binary never depends on a
  * real on-disk asset path under `/$bunfs`.
+ *
+ * `/g --avatar logo` reuses the same avatar and cache via applyLogoGroupAvatar.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -509,26 +511,36 @@ async function ensureAvatarImageKey(larkAppId: string, variant: AvatarVariant): 
   }
 }
 
+/**
+ * Apply the deterministic logo-gradient avatar to any chat the bot may edit.
+ * Throws on failure so callers that report decoration errors (`/g --avatar
+ * logo`) can surface the reason; session groups wrap it best-effort below.
+ * Returns the applied variant id.
+ */
+export async function applyLogoGroupAvatar(larkAppId: string, chatId: string): Promise<string> {
+  const variant = pickSessionGroupAvatarVariant(chatId);
+  const imageKey = await ensureAvatarImageKey(larkAppId, variant);
+  if (!imageKey) throw new Error(`avatar upload failed (${variant.id})`);
+
+  const client: any = getBotClient(larkAppId);
+  const res = await client.im.v1.chat.update({
+    path: { chat_id: chatId },
+    data: { avatar: imageKey },
+  });
+  if (res?.code !== 0 && res?.code !== undefined) {
+    throw new Error(`chat.update avatar failed: ${res?.msg} (code ${res?.code})`);
+  }
+  return variant.id;
+}
+
 export async function applySessionGroupAvatar(larkAppId: string, chatId: string): Promise<void> {
   try {
     const cfg = getBot(larkAppId).config;
     if (cfg.sessionGroup?.avatar === 'off') return;
 
-    const variant = pickSessionGroupAvatarVariant(chatId);
-    const imageKey = await ensureAvatarImageKey(larkAppId, variant);
-    if (!imageKey) return;
-
-    const client: any = getBotClient(larkAppId);
-    const res = await client.im.v1.chat.update({
-      path: { chat_id: chatId },
-      data: { avatar: imageKey },
-    });
-    if (res?.code !== 0 && res?.code !== undefined) {
-      logger.warn(`[session-avatar] chat.update avatar failed for ${chatId.substring(0, 12)}: ${res?.msg} (code ${res?.code})`);
-      return;
-    }
-    logger.info(`[session-avatar] applied ${variant.id} to ${chatId.substring(0, 12)}`);
+    const variantId = await applyLogoGroupAvatar(larkAppId, chatId);
+    logger.info(`[session-avatar] applied ${variantId} to ${chatId.substring(0, 12)}`);
   } catch (err) {
-    logger.warn(`[session-avatar] applying to ${chatId.substring(0, 12)} threw: ${err}`);
+    logger.warn(`[session-avatar] applying to ${chatId.substring(0, 12)} failed: ${err}`);
   }
 }

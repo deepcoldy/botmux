@@ -39,6 +39,41 @@ describe('one reply card per turn', () => {
   });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
+  it('settles a superseded turn after its in-flight initial POST is acknowledged', async () => {
+    let acknowledge!: () => void;
+    const send = io.send;
+    io.send = vi.fn(async (content, uuid) => {
+      await new Promise<void>(resolve => { acknowledge = resolve; });
+      return send(content, uuid);
+    });
+    const start = store.update(key, { kind: 'start' }, io);
+    await vi.waitFor(() => expect(io.send).toHaveBeenCalledTimes(1));
+    const supersede = store.update(key, { kind: 'terminal', phase: 'superseded' }, io);
+    acknowledge();
+    await start;
+    const retired = await supersede;
+    expect(retired.record.phase).toBe('superseded');
+    expect(cards.size).toBe(1);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(cards.get(retired.messageId!)).toContain('已由后续消息接续');
+  });
+
+  it('replays an unknown initial POST with its original UUID before marking it superseded', async () => {
+    const send = io.send;
+    io.send = vi.fn(async (content, uuid) => {
+      await send(content, uuid);
+      throw new Error('connection lost after acceptance');
+    });
+    await expect(store.update(key, { kind: 'start' }, io)).rejects.toThrow('connection lost');
+    const original = vi.mocked(io.send).mock.calls[0];
+    io.send = vi.fn(send);
+    const retired = await new TurnReplyCardStore(dir).update(key, { kind: 'terminal', phase: 'superseded' }, io);
+    expect(vi.mocked(io.send).mock.calls[0]).toEqual(original);
+    expect(cards.size).toBe(1);
+    expect(retired.record.pendingCreate).toBeUndefined();
+    expect(cards.get(retired.messageId!)).toContain('已由后续消息接续');
+  });
+
   it.each([false, true])('persists an image-free final after provider rejection with an existing card=%s', async existing => {
     if (existing) await store.update(key, { kind: 'start' }, io);
     const send = io.send;
@@ -736,6 +771,19 @@ describe('public process and fallback compatibility', () => {
     expect(history).toContain('card schema\n💻');
     expect(history).toContain('bun run build\n💻');
     expect(history).toContain('bun run test\n🔧');
+  });
+
+  it('keeps final runtime identity in the footer without duplicating or replacing it on refresh', () => {
+    const finalCard = buildCanonicalFinalReplyCard({ markdown: 'Answer',
+      usage: { context: null, tokens: null, model: 'original-model', reasoningEffort: 'high' },
+    });
+    const card = JSON.parse(buildTurnReplyCard({
+      ...key, ...input, version: 1, phase: 'completed', createdAtMs: 0, progress: [], tools: [], finalCard,
+      usage: { context: null, tokens: null, model: 'later-model', reasoningEffort: 'low' },
+    }, { ...presentation, showLiveUsage: true }));
+    expect(JSON.stringify(card).match(/original-model/g)).toHaveLength(1);
+    expect(JSON.stringify(card)).not.toContain('later-model');
+    expect(card.body.elements.some((e: any) => e.element_id === 'botmux_turn_usage')).toBe(false);
   });
 
   it('keeps the canonical final card and public progress while hiding tools and their counts', () => {

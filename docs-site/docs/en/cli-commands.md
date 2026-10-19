@@ -24,6 +24,8 @@ The local fallback is used only when the owning daemon is confirmed offline. If
 an online daemon rejects the request or IPC fails, the command fails without a
 local hard kill.
 
+When `BOTMUX_COORDINATION_MODE=primary`, the durable PostgreSQL Session is the canonical truth. In this mode, `delete`, `resume`, non-dry-run `suspend`, and delete/wake actions in the interactive `list` are rejected explicitly. `list` remains available as a read-only local view, but skips local auto-pruning. Use the session card in the original topic to close or resume through the fenced durable session-control lane.
+
 ## Auto-Start on Boot
 
 ```bash

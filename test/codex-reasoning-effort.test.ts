@@ -37,6 +37,19 @@ describe('Codex model-aware reasoning efforts', () => {
     expect(codexReasoningEffortsForModel('gpt-5.6-terra')).toContain('ultra');
   });
 
+  it('routes ultra on both Codex clients and normalises GPT-6 names', () => {
+    for (const model of ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.6-terra']) {
+      for (const cliId of ['codex', 'codex-app']) {
+        expect(cliModelSupportsReasoningEffort(cliId, model, 'ultra')).toBe(true);
+      }
+    }
+    expect(codexReasoningEffortsForModel(' GPT-6-Astra ')).toContain('ultra');
+    for (const cliId of ['codex', 'codex-app']) {
+      expect(cliModelSupportsReasoningEffort(cliId, 'gpt-6-luna', 'ultra')).toBe(false);
+      expect(cliModelSupportsReasoningEffort(cliId, 'gpt-6-luna', 'max')).toBe(true);
+    }
+  });
+
   it('allows max but not ultra for luna', () => {
     expect(codexModelSupportsReasoningEffort('gpt-5.6-luna', 'max')).toBe(true);
     expect(codexModelSupportsReasoningEffort('gpt-5.6-luna', 'ultra')).toBe(false);

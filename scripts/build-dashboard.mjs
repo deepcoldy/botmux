@@ -37,7 +37,6 @@ async function copyStatic() {
     cp(join(webSrc, 'favicon.png'), join(outDir, 'favicon.png')),
     cp(join(webSrc, 'apple-touch-icon.png'), join(outDir, 'apple-touch-icon.png')),
     copyIfExists(join(webSrc, 'skins'), join(outDir, 'skins'), { recursive: true }),
-    copyIfExists(join(webSrc, 'game'), join(outDir, 'game'), { recursive: true }),
   ]);
 }
 

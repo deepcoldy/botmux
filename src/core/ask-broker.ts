@@ -157,7 +157,8 @@ export function setCanTalkChecker(
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
   if (ask.answererOpenId && ask.answererOpenId !== by) return false;
-  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
+  if (ask.deliveryTarget && (ask.deliveryTarget.openId !== by || actor?.botSender)) return false;
+  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.deliveryTarget ? 'p2p' : ask.chatType, actor) ?? false;
 }
 
 function gateAskDecision(
@@ -307,6 +308,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
+      deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
       createdAt,
@@ -377,6 +379,7 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
     ask.answererOpenId === input.answererOpenId &&
+    JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
 }
@@ -466,6 +469,7 @@ function sendCardForAsk(ask: InternalPending): void {
         );
         settle(ask.askId, {
           kind: 'invalidated', reason: `card dispatch failed: ${msg}`,
+          failureCode: 'card_delivery_failed',
           selected: null, by: null, comment: null, timedOut: false,
         });
         return;
@@ -555,6 +559,7 @@ function persistFromInternal(ask: InternalPending): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
+    deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
@@ -773,6 +778,25 @@ export function listPendingAsksByAnchor(args: { larkAppId: string; chatId: strin
     && (ask.rootMessageId === null || ask.rootMessageId === args.anchor)).map(snapshot);
 }
 
+/** A DM answer must quote the exact document card. Never consume unrelated
+ * private messages (or guess between simultaneous asks from different docs). */
+export function submitDocumentAskReply(args: {
+  larkAppId: string;
+  chatType: 'group' | 'p2p';
+  parentMessageId?: string;
+  by: string;
+  text: string;
+}): boolean {
+  if (args.chatType !== 'p2p' || !args.parentMessageId?.startsWith('om_')
+    || !args.text.trim() || args.text.trimStart().startsWith('/')) return false;
+  for (const ask of pending.values()) {
+    if (ask.settled || !ask.deliveryTarget || ask.larkAppId !== args.larkAppId
+      || ask.cardMessageId !== args.parentMessageId || ask.deliveryTarget.openId !== args.by) continue;
+    return submitCustomReply({ askId: ask.askId, by: args.by, text: args.text }) === 'accepted';
+  }
+  return false;
+}
+
 /** Resolve attempt from a card-button click. Returns one of the §10 outcomes;
  *  caller (card click handler) maps to user-facing toast.
  *
@@ -891,6 +915,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
+      deliveryTarget: p.deliveryTarget,
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
@@ -1054,6 +1079,7 @@ function snapshot(ask: InternalPending): PendingAsk {
   } = ask;
   return {
     ...rest,
+    ...(ask.deliveryTarget ? { deliveryTarget: { ...ask.deliveryTarget } } : {}),
     ...(ask.terminalResult ? { result: ask.terminalResult } : {}),
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     // EVERY ask carries a scoped dedupe token (codex P1-1): the broker's bounded

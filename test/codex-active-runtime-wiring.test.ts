@@ -43,7 +43,7 @@ describe('Codex active-runtime wiring (source lock)', () => {
     // Live ingest + split-live attach both surface Codex model/effort via the
     // shared publishActiveRuntime path (same channel TRAE uses), reading the
     // drain's latestModel/latestReasoningEffort (from turn_context).
-    const codexIngest = sliceBetween(worker, 'if (structuredBridgeIsCodex()) {\n    const codex = result as CodexDrainResult;', '}');
+    const codexIngest = sliceBetween(worker, "if (structuredBridgeIs('codex')) {\n    const codex = result as CodexDrainResult;", '}');
     expect(codexIngest).toContain('publishActiveRuntime({');
     expect(codexIngest).toContain('codex.latestModel');
     expect(codexIngest).toContain('codex.latestReasoningEffort');
@@ -71,6 +71,6 @@ describe('Codex active-runtime wiring (source lock)', () => {
       'import { normalizeBrand }',
     );
     expect(fn).not.toContain('snapshot.tokens?.model');
-    expect(fn).toContain('ds.activeModel?.trim() || ds.session.model?.trim()');
+    expect(fn).toContain('withCardRuntimeIdentity(ds, snapshot, effectiveCliId)');
   });
 });

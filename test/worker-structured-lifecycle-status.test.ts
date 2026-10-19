@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -14,7 +15,7 @@ function functionSlice(name: string, nextName: string): string {
 describe('worker structured-turn status wiring', () => {
   it('checkpoints adopted Codex attribution at mark and terminal boundaries and restores once at attach', () => {
     const scope = functionSlice('codexAdoptJournalPath', 'checkpointCodexAdoptRecovery');
-    expect(scope).toContain('lastInitConfig?.adoptMode && structuredBridgeIsCodex()');
+    expect(scope).toContain("lastInitConfig?.adoptMode && structuredBridgeIs('codex')");
     const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
     expect(mark.indexOf('checkpointCodexAdoptRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
     const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
@@ -34,16 +35,24 @@ describe('worker structured-turn status wiring', () => {
     expect(scope).toContain('codexBridgeFallbackActive()');
     expect(scope).toContain('.structured');
     const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
+    expect(mark.indexOf('structuredBridgeRecoveryCursorAtMark()')).toBeLessThan(mark.indexOf('codexBridgeQueue.mark('));
+    expect(mark).toContain('recoveryCursorAtMark');
     expect(mark.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
     const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
     expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(emit.indexOf('drainEmittable()'));
     expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
     const checkpoint = functionSlice('checkpointStructuredBridgeRecovery', 'scheduledTaskAnchorsFilePath');
     expect(checkpoint).toContain('!structuredBridgeRecoveryAttempted');
-    const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 6_000);
+    const attachStart = source.indexOf('function codexBridgeAttach(');
+    const attach = source.slice(attachStart, source.indexOf('type CursorAttachMode', attachStart));
     expect(attach).toContain('!structuredBridgeRecoveryAttempted');
-    expect(attach).toContain('!codexBridgeIsCursor()');
+    expect(attach).toContain("!structuredBridgeIs('cursor')");
     expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
+    expect(attach).toContain('planBridgeTurnRecovery(restorable, rolloutSize)');
+    expect(attach).toContain('Structured bridge recovery skipped');
+    const claudeRestore = functionSlice('tryRestoreInterruptedBridgeTurns', 'startBridgeWatcher');
+    expect(claudeRestore).toContain('planBridgeTurnRecovery(restorable, transcriptSize)');
+    expect(claudeRestore).toContain('Bridge recovery skipped');
   });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
@@ -128,7 +137,7 @@ describe('worker structured-turn status wiring', () => {
   });
 
   it('limits the strong ready gate to drivers with a complete terminal contract', () => {
-    const gate = functionSlice('hasStructuredLifecycleBlock', 'structuredBridgeIsCodex');
+    const gate = functionSlice('hasStructuredLifecycleBlock', 'structuredBridgeIs');
     const awaitingGate = gate.indexOf('rpcTurnsAwaitingActivation.size > 0');
     const rpcGate = gate.indexOf('turn.rpcActive === true');
     const transcriptAllowlist = gate.indexOf('isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)');
@@ -399,22 +408,16 @@ describe('worker structured-turn status wiring', () => {
   });
 
   it('attaches fresh Codex-family RPC rollouts from offset zero so a fast first terminal remains hydratable', () => {
-    const spawn = source.slice(
-      source.indexOf('async function spawnCli'),
-      source.indexOf('async function restartCliProcess'),
+    // codex / traex now share attachStructuredBridgeAtSpawn; both adapters declare the
+    // resume-aware baseline (resume -> baseline-existing, fresh -> fresh-empty).
+    const helper = source.slice(
+      source.indexOf('function attachStructuredBridgeAtSpawn('),
+      source.indexOf('async function setupAdoptTranscriptBridges('),
     );
-    const codexBranch = spawn.slice(
-      spawn.indexOf("} else if (cfg.cliId === 'codex')"),
-      spawn.indexOf("} else if (cfg.cliId === 'traex')"),
-    );
-    const traexBranch = spawn.slice(
-      spawn.indexOf("} else if (cfg.cliId === 'traex')"),
-      spawn.indexOf("} else if (cfg.cliId === 'coco')"),
-    );
-    for (const branch of [codexBranch, traexBranch]) {
-      expect(branch).toContain("effectiveResume ? 'baseline-existing' : 'fresh-empty'");
-      expect(branch).not.toContain("codexBridgeAttach(rolloutPath, 'baseline-existing')");
-    }
+    expect(helper).toContain("ids.resume ? 'baseline-existing' : 'fresh-empty'");
+    expect(helper).not.toContain("codexBridgeAttach(path, 'baseline-existing')");
+    expect(bridgeSpecFor('codex')?.spawn?.baseline).toBe('resume-aware');
+    expect(bridgeSpecFor('traex')?.spawn?.baseline).toBe('resume-aware');
   });
 
   it('holds every successor behind an unresolved fail-closed RPC owner even when Codex type-ahead is enabled', () => {
@@ -561,7 +564,7 @@ describe('worker structured-turn status wiring', () => {
     // Working... — an external idle landing while the authoritative viewport
     // still shows busy must defer exactly like a screen idle.
     expect(callback).toContain("evidenceSource === 'screen'");
-    expect(callback).toContain('structuredBridgeIsPi() || structuredBridgeIsOmp()');
+    expect(callback).toContain("structuredBridgeIs('pi') || structuredBridgeIs('oh-my-pi')");
     expect(callback).toContain('deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)');
 
     // The guard fail-opens on non-authoritative screens (ZMX) BEFORE testing
@@ -720,7 +723,7 @@ describe('worker structured-turn status wiring', () => {
     // a new startup-window write whose first ready is owned by the
     // SessionStart busy arm instead.
     const note = functionSlice('noteSpawnArgvTurnStartTranscriptEvidence', 'stopSpawnArgvTurnStartFailOpen');
-    const piGuard = note.indexOf('if (!structuredBridgeIsPi()) return;');
+    const piGuard = note.indexOf("if (!structuredBridgeIs('pi')) return;");
     const latch = note.indexOf('spawnArgvTurnStartEvidenceSeen = true');
     const flush = note.indexOf('flushQueuedInputAfterTurnStartEvidence()');
     expect(piGuard).toBeGreaterThanOrEqual(0);
@@ -728,7 +731,7 @@ describe('worker structured-turn status wiring', () => {
     expect(flush).toBeGreaterThan(latch);
 
     const gate = functionSlice('spawnArgvTurnStartGateHolds', 'noteSpawnArgvTurnStartTranscriptEvidence');
-    expect(gate).toContain('structuredBridgeIsPi()');
+    expect(gate).toContain("structuredBridgeIs('pi')");
 
     // markPromptReady branch boundary: the no-evidence gate must NOT re-kick
     // (startup input protection — the TUI may not accept input yet); the

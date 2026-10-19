@@ -402,6 +402,20 @@ describe('generic lifecycle hook command', () => {
     expect(await run({ ...prepared, phase: 'after-reclaim', eventId: 'end-failed', outcome: 'failed' })).toBe(0);
     expect(JSON.parse(output.mock.calls.at(-1)![0]).status).toBe('aborted');
   });
+
+  it('applies the same not_prepared rule to the finish command', async () => {
+    const f = fixture();
+    vi.stubEnv('SESSION_DATA_DIR', f.dataDir);
+    vi.stubEnv('BOTMUX_SESSION_ID', '');
+    const output = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const finish = (eventId: string, outcome: string) =>
+      runWorkspaceRecycleCommand(['finish', '--operation', 'never-prepared', '--event', eventId, '--outcome', outcome]);
+    expect(await finish('end-failed', 'failed')).toBe(0);
+    expect(JSON.parse(output.mock.calls.at(-1)![0])).toEqual({ ok: true, status: 'not_prepared', operationId: 'never-prepared' });
+    expect(await finish('end-ok', 'succeeded')).toBe(2);
+    expect(JSON.parse(output.mock.calls.at(-1)![0]).error).toContain('recycle_operation_not_prepared');
+    expect(f.recycler.hasOperation('never-prepared')).toBe(false);
+  });
 });
 
 describe('durable process readback', () => {

@@ -11,11 +11,17 @@ export interface GroupMemberBot extends GroupBot {
   pinStreamingCardMasterEnabled?: boolean;
   pinStreamingCardChatEnabled?: boolean;
   pinStreamingCardEffectiveEnabled?: boolean;
+  /** Bot-level run-process card switch (`!disableStreamingCard`). */
+  streamingCardMasterEnabled?: boolean;
+  /** Chat override: false == `/card off` (chat in `noCardChats`); true inherits the bot. */
+  streamingCardChatEnabled?: boolean;
+  streamingCardEffectiveEnabled?: boolean;
   agentCliId?: string;
   agentModel?: string;
   agentReasoningEffort?: string;
   serialInput?: boolean;
   idleClose?: import('../../core/group-idle-close.js').GroupIdleCloseSettings;
+  replyMode?: import('./group-reply-mode.js').GroupReplyModeState;
   defaultModels?: import('../../core/group-default-models.js').GroupDefaultModels;
   oncallChat?: { workingDir?: string } | null;
 }

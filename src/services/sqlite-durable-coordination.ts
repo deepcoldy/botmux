@@ -45,6 +45,7 @@ import type {
   WriteSessionResult,
 } from './durable-coordination.js';
 import { DURABLE_INBOX_LANE_LARK_MESSAGE } from './durable-coordination.js';
+import { durableInboxPayloadsAreEquivalent } from './durable-inbox-idempotency.js';
 
 export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 3;
 
@@ -500,42 +501,65 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
   }
 
   async enqueueInbox(event: DurableInboxEvent): Promise<DurableInsertResult> {
+    return this.transaction(() => this.enqueueInboxUnlocked(event));
+  }
+
+  async enqueueInboxWithLease(input: {
+    lease: SessionLease;
+    event: DurableInboxEvent;
+  }): Promise<DurableInsertResult | { kind: 'stale_lease' }> {
+    const now = this.now();
+    return this.transaction(() => {
+      if (!this.leaseIsCurrent(input.lease, now)) return { kind: 'stale_lease' as const };
+      return this.enqueueInboxUnlocked(input.event);
+    });
+  }
+
+  private enqueueInboxUnlocked(event: DurableInboxEvent): DurableInsertResult {
     nonempty(event.eventId, 'eventId');
     const lane = nonempty(event.lane ?? DURABLE_INBOX_LANE_LARK_MESSAGE, 'lane');
     nonempty(event.partitionKey, 'partitionKey');
     timestamp(event.visibleAt, 'visibleAt');
     timestamp(event.createdAt, 'createdAt');
     const payload = encoded(event.payload);
-    return this.transaction(() => {
-      const inserted = this.db.prepare(
-        'INSERT INTO durable_inbox(event_id, lane, partition_key, payload_json, payload_hash, state, '
-        + 'visible_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, \'queued\', ?, ?, ?) '
-        + 'ON CONFLICT(event_id) DO NOTHING',
-      ).run(
-        event.eventId,
-        lane,
-        event.partitionKey,
-        payload.json,
-        payload.hash,
-        event.visibleAt,
-        event.createdAt,
-        event.createdAt,
-      );
-      if (Number(inserted.changes) === 1) {
-        this.db.prepare(
-          'INSERT INTO durable_inbox_order(event_id) VALUES(?)',
-        ).run(event.eventId);
-        return { kind: 'inserted' as const };
-      }
-      const current = this.db.prepare(
-        'SELECT lane, partition_key, payload_hash FROM durable_inbox WHERE event_id = ?',
-      ).get(event.eventId) as { lane: string; partition_key: string; payload_hash: string };
-      return current.lane === lane
-        && current.partition_key === event.partitionKey
-        && current.payload_hash === payload.hash
-        ? { kind: 'duplicate' as const }
-        : { kind: 'conflict' as const };
-    });
+    const inserted = this.db.prepare(
+      'INSERT INTO durable_inbox(event_id, lane, partition_key, payload_json, payload_hash, state, '
+      + 'visible_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, \'queued\', ?, ?, ?) '
+      + 'ON CONFLICT(event_id) DO NOTHING',
+    ).run(
+      event.eventId,
+      lane,
+      event.partitionKey,
+      payload.json,
+      payload.hash,
+      event.visibleAt,
+      event.createdAt,
+      event.createdAt,
+    );
+    if (Number(inserted.changes) === 1) {
+      this.db.prepare(
+        'INSERT INTO durable_inbox_order(event_id) VALUES(?)',
+      ).run(event.eventId);
+      return { kind: 'inserted' as const };
+    }
+    const current = this.db.prepare(
+      'SELECT lane, partition_key, payload_json, payload_hash FROM durable_inbox WHERE event_id = ?',
+    ).get(event.eventId) as {
+      lane: string;
+      partition_key: string;
+      payload_json: string;
+      payload_hash: string;
+    };
+    return current.lane === lane
+      && current.partition_key === event.partitionKey
+      && (current.payload_hash === payload.hash || durableInboxPayloadsAreEquivalent({
+        eventId: event.eventId,
+        lane: current.lane,
+        partitionKey: current.partition_key,
+        payload: parseJson(current.payload_json),
+      }, event))
+      ? { kind: 'duplicate' as const }
+      : { kind: 'conflict' as const };
   }
 
   async claimNextInbox(input: ClaimInboxInput): Promise<InboxClaim | undefined> {

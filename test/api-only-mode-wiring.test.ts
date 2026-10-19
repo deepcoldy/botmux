@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { isCodexFamilyCliId } from '../src/adapters/cli/types.js';
 
 /**
  * Source-lock for PR D · API-only (core-only / headless) bot mode.
@@ -626,10 +627,13 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // WIRING: both Codex cliIds, sandbox-only, explicit value wins, and the
     // worker's own logger carries the writable-bundle warning.
     expect(workerSource).toContain("from './utils/darwin-ca-bundle.js'");
-    // Assert both cliIds are covered, not the exact clause text: swapping the
-    // two sides of `||` is semantically identical and must not fail this.
-    expect(workerSource).toContain("cfg.cliId === 'codex'");
-    expect(workerSource).toContain("cfg.cliId === 'codex-app'");
+    // Both cliIds must be covered. The pair now goes through the single
+    // isCodexFamilyCliId predicate (adapters/cli/types.ts: codex || codex-app) —
+    // assert the call site AND that the predicate still spans both ids.
+    expect(workerSource).toContain('isCodexFamilyCliId(cfg.cliId)');
+    expect(isCodexFamilyCliId('codex')).toBe(true);
+    expect(isCodexFamilyCliId('codex-app')).toBe(true);
+    expect(isCodexFamilyCliId('traex')).toBe(false);
     // Operator precedence: childEnv starts from the daemon env, so an
     // operator-supplied SSL_CERT_FILE is what this guard preserves.
     expect(workerSource).toContain('&& !childEnv.SSL_CERT_FILE');
@@ -883,7 +887,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // non-empty 4th argument, and it must be the tri-state helper rather than a
     // bare `sender_type` comparison — that one reads a cross-ref-identified peer
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
-    const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
+    const trustedCallerArgs = [...daemonSource.matchAll(/const\s+\w+\s*=\s*trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
     // Three IM entry paths plus the authenticated dispatch launch caller.
     expect(trustedCallerArgs.length).toBe(4);
@@ -905,6 +909,12 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(dispatchArgs.slice(0, 3).join(', ')).toContain('operation.callerUnionId');
     expect(dispatchArgs[3]).toBe('true');
     expect(daemonSource).toContain('trustedCaller: dispatchTrustedCaller');
+    // Inline queue admission uses a previously computed tri-state value. A
+    // regex spanning to its rollback call is not another direct IM entry.
+    const queue = region(daemonSource, 'async function submitQueuedMessage(', '// Dependencies passed to command-handler');
+    expect(queue).toContain('const senderIsBot = senderIsBotTriState(message.senderType,');
+    expect(queue).toContain('isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId)');
+    expect(queue).toContain('trustedCallerForTurn(ds.larkAppId, message.senderId, message.senderUnionId, senderIsBot)');
     // The source testimony must never be reused as evaluateBotTalk's bot union.
     expect(daemonSource).toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId)');
     expect(daemonSource).not.toContain('evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId, callerUnionId)');

@@ -140,6 +140,51 @@ describe('Midscene Pages report', () => {
     );
   });
 
+  it('recovers finished cases from attempt files when a run was killed before its report', async () => {
+    root = await mkdtemp(join(tmpdir(), 'botmux-midscene-killed-'));
+    const dashboardRoot = join(root, 'dashboard');
+    const casesRoot = join(root, 'cases');
+    const caseDir = (caseId: string) => join(root, 'runs', 'r1', 'project-1', 'documents', 'd1', 'cases', caseId);
+    await Promise.all([
+      mkdir(dashboardRoot, { recursive: true }),
+      mkdir(join(root, 'reports'), { recursive: true }),
+      mkdir(casesRoot, { recursive: true }),
+      mkdir(caseDir('c1'), { recursive: true }),
+      mkdir(caseDir('c2'), { recursive: true }),
+    ]);
+    const attempt = (caseId: string, name: string, attemptIndex: number, status: string, error?: string) =>
+      JSON.stringify({
+        caseId, name, attemptIndex, status, attemptId: `${caseId}-${attemptIndex}`,
+        projectName: 'feishu-core-x', durationMs: 1000,
+        beforeEach: [], afterEach: [],
+        steps: [{ status, ...(error ? { error: { message: `Node "feishu.runScenario" failed: ${error}` } } : {}) }],
+      });
+    await writeFile(join(caseDir('c1'), 'a0.json'), attempt('c1', 'Case one', 0, 'failed', 'first try'));
+    await writeFile(join(caseDir('c1'), 'a1.json'), attempt('c1', 'Case one', 1, 'success'));
+    await writeFile(join(caseDir('c2'), 'a0.json'), attempt('c2', 'Case two', 0, 'failed', 'no reply'));
+    await writeFile(
+      join(casesRoot, 'core-x.yaml'),
+      'cases:\n  - name: Case one\n  - name: Case two\n  - name: Case three\n',
+    );
+
+    const manifest = await prepareMidscenePages({
+      'dashboard-report-root': dashboardRoot,
+      'feishu-report-root': join(root, 'reports'),
+      'feishu-results-root': join(root, 'runs'),
+      'feishu-outcome': 'failure',
+      'feishu-cases': 'all',
+      'skipped-cases-dir': casesRoot,
+      output: join(root, 'site'),
+    });
+
+    expect(manifest.cases.map((testCase: { name: string; status: string; attempts: number; failure?: string | null }) =>
+      [testCase.name, testCase.status, testCase.attempts, testCase.failure ?? null])).toEqual([
+      ['Case one', 'success', 2, null],
+      ['Case two', 'failed', 1, 'no reply'],
+      ['Case three', 'not-run', 0, null],
+    ]);
+  });
+
   it('embeds a Playwright replay from the video manifest', async () => {
     root = await mkdtemp(join(tmpdir(), 'botmux-midscene-video-'));
     const reportRoot = join(root, 'report');
@@ -184,8 +229,52 @@ describe('Midscene Pages report', () => {
 
     const landing = await readFile(join(output, 'index.html'), 'utf8');
     expect(landing).toContain('Replay');
-    expect(landing).toContain('<video controls preload="metadata" src="videos/dashboard-smoke.webm">');
+    // A passed case's recording stays in the artifact; the site says so.
+    expect(landing).not.toContain('src="videos/dashboard-smoke.webm"');
+    expect(landing).toContain('Passed — recording kept in the run artifact');
     expect(landing).not.toContain('secret.webm');
+    await expect(readFile(join(output, 'videos', 'dashboard-smoke.webm'), 'utf8')).rejects.toThrow();
+  });
+
+  it('publishes the recording of a failed case', async () => {
+    root = await mkdtemp(join(tmpdir(), 'botmux-midscene-failed-video-'));
+    const reportRoot = join(root, 'report');
+    const casesRoot = join(root, 'cases');
+    const videos = join(root, 'videos');
+    const output = join(root, 'site');
+    await Promise.all([
+      mkdir(reportRoot, { recursive: true }),
+      mkdir(casesRoot, { recursive: true }),
+      mkdir(videos, { recursive: true }),
+    ]);
+    await writeFile(join(reportRoot, 'index.html'), `
+      <script type="midscene_test_run_dump">${JSON.stringify({
+        projects: [{
+          name: 'dashboard-smoke',
+          documents: [{ cases: [{
+            caseId: 'dashboard-case',
+            name: 'Navigate the core read-only Dashboard pages',
+            status: 'failed',
+            attempts: [{ status: 'failed', durationMs: 1000, steps: [] }],
+          }] }],
+        }],
+      })}</script>
+    `);
+    await writeFile(join(casesRoot, 'feishu.yaml'), 'cases:\n  - name: Claude basic bot flow\n');
+    await writeFile(join(videos, 'dashboard-smoke.webm'), 'webm-bytes');
+    await writeFile(join(videos, 'manifest.json'), JSON.stringify({
+      'Navigate the core read-only Dashboard pages': 'dashboard-smoke.webm',
+    }));
+
+    await prepareMidscenePages({
+      'report-root': reportRoot,
+      'skipped-cases-dir': casesRoot,
+      output,
+      'videos-dir': videos,
+    });
+
+    const landing = await readFile(join(output, 'index.html'), 'utf8');
+    expect(landing).toContain('<video controls preload="metadata" src="videos/dashboard-smoke.webm">');
     await expect(readFile(join(output, 'videos', 'dashboard-smoke.webm'), 'utf8')).resolves.toBe('webm-bytes');
   });
 });

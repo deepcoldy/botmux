@@ -30,14 +30,23 @@ export const REMOTE_RUNNER_TERMINAL_CAPABILITIES = [
  * forced to implement a chat-facing side channel when upgrading BotMux. */
 export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message',
+  'outbound_message_explicit_mention',
 ] as const;
 
-/** Optional provider-to-host access to a small, read-only BotMux session tool
- * surface.  The provider contributes structured arguments only; the host
- * freezes the current session/turn and translates them into an allowlisted
- * local CLI invocation. */
+/** Optional provider-to-host access to a small BotMux session tool surface.
+ * The provider contributes structured arguments only; the host freezes the
+ * current session/turn and translates them into an allowlisted local CLI
+ * invocation. Mutating operations remain subject to the daemon's live-turn
+ * authorization. */
 export const REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES = [
   'session_tool',
+  'session_tool_schedule',
+  'session_tool_schedule_actor',
+] as const;
+
+/** Optional recovery of a provider-owned turn that survived the host process. */
+export const REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES = [
+  'turn_recovery',
 ] as const;
 
 export const REMOTE_RUNNER_CAPABILITIES = [
@@ -45,6 +54,7 @@ export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
   ...REMOTE_RUNNER_OUTBOUND_CAPABILITIES,
   ...REMOTE_RUNNER_SESSION_TOOL_CAPABILITIES,
+  ...REMOTE_RUNNER_TURN_RECOVERY_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -104,13 +114,21 @@ export interface RemoteRunnerTrustedCaller {
   requestUserOpenId?: string;
   requestUserUnionId?: string;
   requestLarkAppId?: string;
-  source?: 'schedule_creator';
+  source?: 'schedule_creator' | 'failed_turn_recovery';
   taskId?: string;
   senderType?: 'user' | 'bot';
 }
 
+export interface RemoteRunnerRecoveredTurn {
+  turnId: string;
+  generation: number;
+  dispatchAttempt?: number;
+  startedAtMs?: number;
+  trustedCaller?: RemoteRunnerTrustedCaller;
+}
+
 export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
-export type RemoteRunnerOutboundMention = 'none' | 'requester';
+export type RemoteRunnerOutboundMention = 'none' | 'requester' | 'explicit';
 
 export interface RemoteRunnerOutboundImage {
   name: string;
@@ -128,6 +146,7 @@ export interface RemoteRunnerOutboundMessage {
   content: string;
   responseKind: RemoteRunnerOutboundResponseKind;
   mention: RemoteRunnerOutboundMention;
+  mentions?: string[];
   images?: RemoteRunnerOutboundImage[];
 }
 
@@ -158,13 +177,44 @@ export type RemoteRunnerSessionToolRequest =
   | { tool: 'skill.list' }
   | { tool: 'skill.show'; name: string }
   | { tool: 'skill.read'; name: string; path: string }
-  | { tool: 'skill.resources'; name: string };
+  | { tool: 'skill.resources'; name: string }
+  | { tool: 'schedule.list' }
+  | {
+      tool: 'schedule.add';
+      schedule: string;
+      prompt: string;
+      name?: string;
+      position?: 'top-level' | 'topic' | 'new-topic';
+      followActive?: boolean;
+      topicTitle?: string;
+      silent?: boolean;
+      model?: string;
+      reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+      calendar?: string;
+      calendarDayType?: 'workday' | 'restday';
+    }
+  | {
+      tool: 'schedule.update';
+      taskId: string;
+      prompt?: string;
+      calendar?: string | null;
+      calendarDayType?: 'workday' | 'restday';
+    }
+  | {
+      tool: 'schedule.remove' | 'schedule.pause';
+      taskId: string;
+    }
+  | {
+      tool: 'schedule.resume' | 'schedule.run';
+      taskId: string;
+    };
 
 export interface RemoteRunnerSessionToolOperation {
   operationId: string;
   turnId: string;
   generation: number;
   request: RemoteRunnerSessionToolRequest;
+  controllerOpenId?: string;
 }
 
 export interface RemoteRunnerSessionToolAttachment {
@@ -225,6 +275,7 @@ export type RemoteRunnerCommand =
       type: 'turn';
       turnId: string;
       content: string;
+      dispatchAttempt?: number;
       trustedCaller?: RemoteRunnerTrustedCaller;
     })
   | (RemoteRunnerCommandBase & { type: 'cancel' })
@@ -274,6 +325,7 @@ export type RemoteRunnerEvent =
       type: 'ready';
       requestId: string;
       state: RemoteRunnerBackendState;
+      recoveredTurn?: RemoteRunnerRecoveredTurn;
     })
   | (RemoteRunnerEventBase & {
       type: 'progress';
@@ -288,6 +340,7 @@ export type RemoteRunnerEvent =
       content: string;
       responseKind: RemoteRunnerOutboundResponseKind;
       mention: RemoteRunnerOutboundMention;
+      mentions?: string[];
       images?: RemoteRunnerOutboundImage[];
     })
   | (RemoteRunnerEventBase & {
@@ -296,6 +349,9 @@ export type RemoteRunnerEvent =
       turnId: string;
       generation: number;
       request: RemoteRunnerSessionToolRequest;
+      /** Effective human Actor selected by a trusted provider policy for a
+       * bot-authored schedule.add turn. The host freezes all other scope. */
+      controllerOpenId?: string;
     })
   | (RemoteRunnerEventBase & {
       type: 'final';
@@ -441,6 +497,44 @@ function nonNegativeInteger(value: unknown): number | undefined {
   return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : undefined;
 }
 
+function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | undefined {
+  const raw = record(value);
+  if (!raw) return undefined;
+  const turnId = nonEmptyString(raw.turnId, 256);
+  const generation = nonNegativeInteger(raw.generation);
+  const dispatchAttempt = raw.dispatchAttempt === undefined
+    ? undefined
+    : nonNegativeInteger(raw.dispatchAttempt);
+  const startedAtMs = raw.startedAtMs === undefined
+    ? undefined
+    : nonNegativeInteger(raw.startedAtMs);
+  if (!turnId || !ID_RE.test(turnId) || generation === undefined
+      || (raw.dispatchAttempt !== undefined && dispatchAttempt === undefined)
+      || (raw.startedAtMs !== undefined && startedAtMs === undefined)) return undefined;
+
+  let trustedCaller: RemoteRunnerTrustedCaller | undefined;
+  if (raw.trustedCaller !== undefined) {
+    const caller = record(raw.trustedCaller);
+    const openId = nonEmptyString(caller?.requestUserOpenId, 256);
+    const appId = nonEmptyString(caller?.requestLarkAppId, 256);
+    if (!caller || !openId || !appId || !['user', 'bot'].includes(String(caller.senderType))) {
+      return undefined;
+    }
+    trustedCaller = {
+      requestUserOpenId: openId,
+      requestLarkAppId: appId,
+      senderType: caller.senderType as 'user' | 'bot',
+    };
+  }
+  return {
+    turnId,
+    generation,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    ...(startedAtMs !== undefined ? { startedAtMs } : {}),
+    ...(trustedCaller ? { trustedCaller } : {}),
+  };
+}
+
 function normalizeTokenPair(value: unknown): { in: number; out: number } | undefined {
   const raw = record(value);
   if (!raw) return undefined;
@@ -534,6 +628,19 @@ function hasExactKeys(raw: Record<string, unknown>, keys: readonly string[]): bo
   return actual.length === expected.length
     && actual.every((key, index) => key === expected[index]);
 }
+
+function boundedUtf8String(value: unknown, maxBytes: number, trim = false): string | undefined {
+  if (typeof value !== 'string' || value.includes('\0')) return undefined;
+  const normalized = trim ? value.trim() : value;
+  if (!normalized.trim() || Buffer.byteLength(normalized, 'utf8') > maxBytes) return undefined;
+  return normalized;
+}
+
+const SCHEDULE_TASK_ID_RE = /^[0-9a-f]{8}$/;
+const LARK_OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{1,160}$/;
+const SCHEDULE_REASONING_EFFORTS = new Set([
+  'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+]);
 
 const OUTBOUND_IMAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,122}\.(?:png|jpe?g|gif|webp)$/i;
 const OUTBOUND_IMAGE_MIME_TYPES: ReadonlySet<string> = new Set([
@@ -671,6 +778,104 @@ export function normalizeRemoteRunnerSessionToolRequest(
     return { tool: 'skill.read', name, path: normalizedPath };
   }
 
+  if (raw.tool === 'schedule.list') {
+    return hasExactKeys(raw, ['tool']) ? { tool: 'schedule.list' } : undefined;
+  }
+
+  if (raw.tool === 'schedule.add') {
+    const allowed = new Set([
+      'tool', 'schedule', 'prompt', 'name', 'position', 'followActive',
+      'topicTitle', 'silent', 'model', 'reasoningEffort', 'calendar',
+      'calendarDayType',
+    ]);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const schedule = boundedUtf8String(raw.schedule, 512, true);
+    const prompt = boundedUtf8String(raw.prompt, 32 * 1024);
+    const name = raw.name === undefined ? undefined : boundedUtf8String(raw.name, 512, true);
+    const position = raw.position === undefined ? undefined : String(raw.position);
+    const topicTitle = raw.topicTitle === undefined
+      ? undefined
+      : boundedUtf8String(raw.topicTitle, 1024, true);
+    const model = raw.model === undefined ? undefined : boundedUtf8String(raw.model, 256, true);
+    const calendar = raw.calendar === undefined
+      ? undefined
+      : boundedUtf8String(raw.calendar, 256, true);
+    const reasoningEffort = raw.reasoningEffort === undefined
+      ? undefined
+      : String(raw.reasoningEffort);
+    const calendarDayType = raw.calendarDayType === undefined
+      ? undefined
+      : String(raw.calendarDayType);
+    if (!schedule || !prompt
+      || (raw.name !== undefined && !name)
+      || (position !== undefined && !['top-level', 'topic', 'new-topic'].includes(position))
+      || (raw.followActive !== undefined && typeof raw.followActive !== 'boolean')
+      || (raw.topicTitle !== undefined && !topicTitle)
+      || (raw.silent !== undefined && typeof raw.silent !== 'boolean')
+      || (raw.model !== undefined && (!model || !ID_RE.test(model)))
+      || (reasoningEffort !== undefined && !SCHEDULE_REASONING_EFFORTS.has(reasoningEffort))
+      || (raw.calendar !== undefined && !calendar)
+      || (calendarDayType !== undefined && !['workday', 'restday'].includes(calendarDayType))) {
+      return undefined;
+    }
+    const resolvedPosition = position ?? 'top-level';
+    if (raw.followActive === true && resolvedPosition !== 'topic') return undefined;
+    if (topicTitle && resolvedPosition !== 'new-topic') return undefined;
+    if (topicTitle && Array.from(topicTitle).length > 200) return undefined;
+    return {
+      tool: 'schedule.add',
+      schedule,
+      prompt,
+      ...(name ? { name } : {}),
+      ...(position ? { position: position as 'top-level' | 'topic' | 'new-topic' } : {}),
+      ...(raw.followActive !== undefined ? { followActive: raw.followActive } : {}),
+      ...(topicTitle ? { topicTitle } : {}),
+      ...(raw.silent !== undefined ? { silent: raw.silent } : {}),
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort: reasoningEffort as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } : {}),
+      ...(calendar ? { calendar } : {}),
+      ...(calendarDayType ? { calendarDayType: calendarDayType as 'workday' | 'restday' } : {}),
+    };
+  }
+
+  if (raw.tool === 'schedule.update') {
+    const allowed = new Set(['tool', 'taskId', 'prompt', 'calendar', 'calendarDayType']);
+    if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
+    const taskId = boundedUtf8String(raw.taskId, 8, true);
+    const prompt = raw.prompt === undefined ? undefined : boundedUtf8String(raw.prompt, 32 * 1024);
+    const calendar = raw.calendar === undefined || raw.calendar === null
+      ? raw.calendar
+      : boundedUtf8String(raw.calendar, 256, true);
+    const calendarDayType = raw.calendarDayType === undefined
+      ? undefined
+      : String(raw.calendarDayType);
+    if (!taskId || !SCHEDULE_TASK_ID_RE.test(taskId)
+      || (raw.prompt !== undefined && !prompt)
+      || (raw.calendar !== undefined && raw.calendar !== null && !calendar)
+      || (calendarDayType !== undefined && !['workday', 'restday'].includes(calendarDayType))
+      || (prompt === undefined && raw.calendar === undefined && calendarDayType === undefined)) {
+      return undefined;
+    }
+    return {
+      tool: 'schedule.update',
+      taskId,
+      ...(prompt !== undefined ? { prompt } : {}),
+      ...(raw.calendar !== undefined ? { calendar: calendar as string | null } : {}),
+      ...(calendarDayType ? { calendarDayType: calendarDayType as 'workday' | 'restday' } : {}),
+    };
+  }
+
+  if (raw.tool === 'schedule.remove' || raw.tool === 'schedule.pause'
+      || raw.tool === 'schedule.resume' || raw.tool === 'schedule.run') {
+    const taskId = boundedUtf8String(raw.taskId, 8, true);
+    if (!hasExactKeys(raw, ['tool', 'taskId']) || !taskId
+      || (!SCHEDULE_TASK_ID_RE.test(taskId)
+        && !(taskId === 'self' && (raw.tool === 'schedule.remove' || raw.tool === 'schedule.pause')))) {
+      return undefined;
+    }
+    return { tool: raw.tool, taskId };
+  }
+
   return undefined;
 }
 
@@ -698,9 +903,13 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     if (!state) return undefined;
     if (raw.type === 'ready') {
       const id = requestId(raw);
-      if (!id) return undefined;
+      const recoveredTurn = raw.recoveredTurn === undefined
+        ? undefined
+        : normalizeRecoveredTurn(raw.recoveredTurn);
+      if (!id || (raw.recoveredTurn !== undefined && !recoveredTurn)) return undefined;
       return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
-        type: 'ready', requestId: id, state };
+        type: 'ready', requestId: id, state,
+        ...(recoveredTurn ? { recoveredTurn } : {}) };
     }
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'lineage_changed', state };
@@ -728,6 +937,22 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     const operationId = nonEmptyString(raw.operationId, 256);
     const turnId = nonEmptyString(raw.turnId, 256);
     const images = normalizeRemoteRunnerOutboundImages(raw.images);
+    const mentions = raw.mentions === undefined
+      ? []
+      : (Array.isArray(raw.mentions)
+        && raw.mentions.length > 0
+        && raw.mentions.every(value => (
+          typeof value === 'string' && value.trim() !== '' && !value.includes('\0')
+        ))
+        && Buffer.byteLength(raw.mentions.join('\0'), 'utf8')
+          <= MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
+        ? raw.mentions as string[]
+        : undefined);
+    const mention = String(raw.mention);
+    const mentionShapeValid = mention === 'explicit'
+      ? mentions !== undefined && mentions.length > 0
+      : ['none', 'requester'].includes(mention)
+        && raw.mentions === undefined;
     if (!operationId || !ID_RE.test(operationId)
         || !turnId || !ID_RE.test(turnId)
         || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
@@ -735,7 +960,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         || !raw.content.trim()
         || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
         || !['progress', 'auxiliary'].includes(String(raw.responseKind))
-        || !['none', 'requester'].includes(String(raw.mention))
+        || !mentionShapeValid
         || images === undefined) {
       return undefined;
     }
@@ -748,7 +973,8 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       generation: Number(raw.generation),
       content: raw.content,
       responseKind: raw.responseKind as RemoteRunnerOutboundResponseKind,
-      mention: raw.mention as RemoteRunnerOutboundMention,
+      mention: mention as RemoteRunnerOutboundMention,
+      ...(mention === 'explicit' ? { mentions } : {}),
       ...(images.length ? { images } : {}),
     };
   }
@@ -757,9 +983,14 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     const operationId = nonEmptyString(raw.operationId, 256);
     const turnId = nonEmptyString(raw.turnId, 256);
     const request = normalizeRemoteRunnerSessionToolRequest(raw.request);
+    const controllerOpenId = raw.controllerOpenId === undefined
+      ? undefined
+      : nonEmptyString(raw.controllerOpenId, 163);
     if (!operationId || !ID_RE.test(operationId)
         || !turnId || !ID_RE.test(turnId)
         || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
+        || (raw.controllerOpenId !== undefined
+          && (!controllerOpenId || !LARK_OPEN_ID_RE.test(controllerOpenId)))
         || !request) {
       return undefined;
     }
@@ -771,6 +1002,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       turnId,
       generation: Number(raw.generation),
       request,
+      ...(controllerOpenId ? { controllerOpenId } : {}),
     };
   }
 

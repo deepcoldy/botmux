@@ -1,22 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, isAbsolute, join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { writeRunnerInput } from './runner-input.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
+import { resolveRunnerPath } from './runner-path.js';
 import { locateExecutable } from '../../utils/executable.js';
 import type { CliAdapter } from './types.js';
 import { minimaxDataDir } from '../../services/minimax-paths.js';
 export { minimaxDataDir } from '../../services/minimax-paths.js';
-
-function runnerPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const sibling = resolve(here, '..', '..', 'minimax-runner.js');
-  if (existsSync(sibling)) return sibling;
-  return resolve(here, '..', '..', '..', 'dist', 'minimax-runner.js');
-}
 
 /** npm's bin symlink resolves inside the package. Bind that package, including
  * its chunks/assets/native dependencies, rather than the shared global prefix.
@@ -102,7 +95,7 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
         if (!node) throw new Error('MiniMax Code npm installation requires node on PATH.');
         nodeBin = realpathSync(node);
       }
-      const args = [runnerArgv0('minimax-runner', runnerPath()), '--mcode-bin', nativeBin(), '--data-dir', dataDir];
+      const args = [runnerArgv0('minimax-runner', resolveRunnerPath('minimax-runner.js', { fallback: 'dist' })), '--mcode-bin', nativeBin(), '--data-dir', dataDir];
       if (nodeBin) args.push('--node-bin', nodeBin);
       if (workingDir) args.push('--cwd', workingDir);
       if (resume && resumeSessionId) args.push('--native-session-id', resumeSessionId);
@@ -137,5 +130,3 @@ export function createMinimaxAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES.minimax,
   };
 }
-
-export const create = createMinimaxAdapter;

@@ -233,6 +233,44 @@ daemon 不可达时，`delete` 等命令也不能退回离线写会话库。正�
 持有真实凭据后自行调用 API 或内核逃逸。规则继承与叠加语义见
 [Linux seccomp 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
 
+### 仅凭据隔离（credential-only）的发送通道与威胁模型
+
+设备已注册、但 Bot 没开完整文件沙盒时，Linux 用仅凭据隔离 bwrap：`/` 整体可读写，
+只把设备凭据目录、`.dashboard-secret*` 等宿主权威文件遮掉。这种形态下 pane 内的
+`botmux send` 走与完整沙盒**同一条 relay**：
+
+- 每个会话有自己的 outbox（`<数据目录>/sandboxes/<会话>/outbox`），以读写 bind
+  挂进 pane；`BOTMUX_SEND_RELAY` 由 bwrap 的 `--setenv` 注入（tmux 后端不会把
+  `BOTMUX*` 变量送进 pane，只靠 worker 的环境变量送不到）。
+- `<数据目录>/sandboxes` 整体被 tmpfs 遮住，只重新挂上本会话的 outbox：每个 outbox
+  里都有该会话的 relay capability，不能让一个 pane 读到兄弟会话的。
+- daemon 重启 / 父进程退出、话题转移、挂起时，持久 pane 仍在运行，outbox 保留；
+  只有真正关闭会话才删除。热重连复用原 outbox 目录并重新发布 capability；原目录
+  已丢失时不重连，改为 kill + 冷启。
+- bwrap 同时注入 `BOTMUX_SEND_RELAY_SCOPE=send`，标明这是 credential-only 的 relay。
+  `botmux send` 总是走 relay；`botmux dispatch` 按形态分流：
+  - `--bot-app` 形态（含 `--into`、`--chat-id`、`--delegate`）继续走 relay：宿主侧
+    持有 `.dashboard-secret`，负责建立 talk-only chat grant（pane 内该文件被遮住）；
+    relay 下的 `--into <om_根消息>` 由宿主侧投递路由核对该根消息确实在目标群里
+    （`dispatch_chat_mismatch`）。
+  - relay 不接受的 `--bot`、`--repo`、`--standby`、`--model`、`--reasoning-effort`
+    走直连：该形态下 `bots.json` 与 managed-origin capability 可读，直连全流程不依赖被
+    遮住的 secret。
+  - `--bot-app` 与上述直连选项混用时直接拒绝（两条路径都无法完成）。
+  - 直连同样受 Codex App 输出 sink 约束：daemon 的种子注册 / 投递路由对 capability 鉴权
+    的调用方（隔离 pane）复用 `/api/send` 的同一判定，本轮输出被限定到 `http_wait` /
+    `http_async` / `suppressed` 时拒绝（`origin_not_sendable`），与 relay 侧一致。
+  - 完整沙盒不注入该标记，dispatch 仍只走 relay。
+- 隔离 pane 标记版本因此升至 17（16 引入 outbox，17 引入 scope 标记），旧 pane 冷启动一次。
+
+**威胁模型 / 已知边界**：设备凭据隔离（包括 credential-only）防的是 agent **无意中
+读到**设备凭据，不是对抗恶意 agent 的代码完整性边界。credential-only pane 对 `/` 可写，
+因此可以改动本机 botmux 的构建产物（如 `dist/cli.js`）及其依赖；宿主侧 outbox watcher
+会在 pane 外以同一份 CLI 重新执行请求，daemon 之后启动 worker / CLI 时同样会执行这些
+文件。也就是说，被篡改的构建产物会在宿主执行——这在引入 relay 之前就成立，relay 没有
+增加新能力。需要防恶意代码时请开启完整文件沙盒（只读挂载 botmux 安装目录），或使用
+远端执行后端。
+
 ## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
 
 no-transport 会话（core-only `apiOnly` bot、或 `http_async_*`/`http_wait_*` HTTP virtual 会话）**不被自动强制文件隔离**。它们的磁盘可读写范围和普通聊天会话一样，只由 bot 自己的 `sandbox`/`readIsolation` 配置决定：没配 → 不隔离（以同一 OS 用户身份对宿主文件有完整**读写**权，能读宿主 `bots.json`、也能改写宿主配置）；配了 → 照常隔离。

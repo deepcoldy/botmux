@@ -76,3 +76,20 @@ describe('normalizeCardUsageSnapshot — quota 白名单', () => {
     expect(normalizeCardUsageSnapshot([])).toBeNull();
   });
 });
+
+
+describe('normalizeCardUsageSnapshot — runtime identity', () => {
+  it('preserves runtime identity through daemon IPC even without metrics', () => {
+    expect(normalizeCardUsageSnapshot({
+      context: null, tokens: null, model: ' claude-opus-5-5-high ', reasoningEffort: ' high ', modelBackendVariant: 'max',
+    })).toEqual({ context: null, tokens: null, model: 'claude-opus-5-5-high', reasoningEffort: 'high', modelBackendVariant: 'max' });
+  });
+
+  it('drops malformed/unknown fields independently and does not infer effort from a model ID', () => {
+    expect(normalizeCardUsageSnapshot({
+      model: 'claude-opus-5-5-high', reasoningEffort: 1, modelBackendVariant: ['max'], arbitrary: 'ignored',
+    })).toEqual({ context: null, tokens: null, model: 'claude-opus-5-5-high' });
+    expect(normalizeCardUsageSnapshot({ model: {}, reasoningEffort: ' ', modelBackendVariant: null }))
+      .toEqual({ context: null, tokens: null });
+  });
+});

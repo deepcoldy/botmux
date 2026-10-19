@@ -22,6 +22,7 @@ const presentation = { showProcess: true, showToolResults: true, canStop: true }
 
 describe('real CLI send into a running reply card', () => {
   it.each<{ cliId: string; configuredCliId: string; frozenCliId?: string; mode?: 'legacy' | 'unified'; layout?: 'result' }>([
+    { cliId: 'cursor', configuredCliId: 'cursor' },
     { cliId: 'minimax', configuredCliId: 'minimax' },
     { cliId: 'codex', configuredCliId: 'codex' },
     { cliId: 'traex', configuredCliId: 'traex' },
@@ -35,13 +36,16 @@ describe('real CLI send into a running reply card', () => {
   ])('repairs reply fences for $cliId (default $configuredCliId, launch $frozenCliId, mode $mode, layout $layout)', ({ cliId, configuredCliId, frozenCliId, mode = 'legacy', layout }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-reply-markdown-'));
     const dataDir = join(root, 'data');
+    const runtime = cliId === 'cursor'
+      ? { model: 'claude-opus-5-5-high-fast' }
+      : { model: 'selected-model', reasoningEffort: 'high' };
     const content = [ ...(layout ? ['# 依赖检查完成', ''] : []), '实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '配置： ```JSON', '{\"workingDir\":\"/workspace\"}', '```', '', '执行： ```bash', 'echo ready', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
     try {
       writeFileSync(join(root, 'bots.json'), JSON.stringify([{
         larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: configuredCliId, replyCardMode: mode,
       }]));
       seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
-        sessionId: key.sessionId, status: 'active', cliId, cliSessionId: 'native_reply',
+        sessionId: key.sessionId, status: 'active', cliId, cliSessionId: 'native_reply', ...runtime,
         larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
         ...(frozenCliId ? { cliLaunchSnapshot: {
           version: 1, state: 'resolved', entryId: 'fixture', cliId: frozenCliId, cliRuntime: null,
@@ -70,6 +74,9 @@ describe('real CLI send into a running reply card', () => {
       expect(blocks.map(b => b.info.toLowerCase())).toEqual(['plain_text', 'json', 'bash']);
       expect(blocks[2].content).toBe('echo ready\n');
       expect(markdown).toContain('**请选择：**');
+      const footer = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_footer');
+      expect(footer.content).toContain(`**${runtime.model}**`);
+      if (runtime.reasoningEffort) expect(footer.content).toContain('high');
       const store = openDatabaseSyncOrThrow(join(dataDir, 'session-stores', key.larkAppId, 'sessions.db'), { readOnly: true });
       try {
         const row = store.prepare('SELECT row FROM sessions WHERE session_id = ?').get(key.sessionId) as { row: string };
@@ -85,6 +92,9 @@ describe('real CLI send into a running reply card', () => {
   }>([
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'codex', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'grok', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
+    { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_requester'], senderIsBot: false, merged: true },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
@@ -187,6 +197,12 @@ describe('real CLI send into a running reply card', () => {
       if (merged) {
         expect(requests[0]).toMatchObject({ method: 'PATCH', path: '/open-apis/im/v1/messages/om_original_card' });
         expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
+        if (responseKind === 'progress') {
+          expect(store.read(key)?.progress).toContain('Hello! 这是完整答复。');
+          expect(store.read(key)?.finalDelivered).not.toBe(true);
+          expect(send).toHaveBeenCalledTimes(1);
+          return;
+        }
         const journal = openDatabaseSyncOrThrow(join(dataDir, 'group-context', `${key.larkAppId}.sqlite`));
         try {
           const published = journal.prepare('SELECT text, card_content_version FROM messages WHERE message_id = ? ORDER BY revision DESC LIMIT 1').get('om_original_card') as { text: string; card_content_version: number };
@@ -214,6 +230,101 @@ describe('real CLI send into a running reply card', () => {
         expect(JSON.parse(markers.trim())).not.toHaveProperty('replyCardResponseKind');
         expect(JSON.parse(markers.trim())).toMatchObject({ terminalCarrier: 'standard_reply_card' });
         if (!reserveCard) expect(store.read(key)).toBeUndefined();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  it.each([
+    ['isolated (no host secret): hands the row to the daemon', false],
+    ['host (secret readable): reports the local failure, no relay', true],
+  ])('when the feedback store cannot be opened — %s', (_label, hostSecret) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-index-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId: key.turnId,
+      }));
+      // A directory where the database file belongs: the open fails exactly
+      // like a sandbox deny, without depending on the host's sandbox.
+      mkdirSync(join(dataDir, 'botmux-feedback.sqlite'));
+      if (hostSecret) {
+        mkdirSync(join(root, '.botmux'), { recursive: true, mode: 0o700 });
+        writeFileSync(join(root, '.botmux', '.dashboard-secret'), 'host-secret', { mode: 0o600 });
+      }
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId,
+        larkAppSecret: 'test-secret',
+        cliId: 'claude-code',
+        replyCardMode: 'unified',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key,
+        status: 'active',
+        cliId: 'claude-code',
+        chatId: 'oc_test',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        chatType: 'group',
+        workingDir: root,
+        replyTargets: { [key.turnId]: {
+          updatedAt: new Date().toISOString(),
+          senderOpenId: 'ou_requester',
+          participants: [{ openId: 'ou_requester', isBot: false }],
+        } },
+        turnReplyContexts: { [key.turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_root' },
+          replyTargetSenderOpenId: 'ou_requester',
+          replyTargetSenderIsBot: false,
+        } },
+      } });
+
+      const result = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'final', 'Indexed final',
+      ], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId,
+          BOTMUX_TURN_ID: key.turnId,
+          BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_COORDINATION_MODE: 'primary',
+          BOTMUX_DAEMON_IPC_PORT: '7951',
+          BOTMUX_TEST_DURABLE_SEND: '1',
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      const posts = requests.filter(r => r.method === 'POST');
+      expect(posts[0]).toMatchObject({ path: `/api/sessions/${key.sessionId}/durable-send` });
+      const relayed = posts.filter(r => r.path.endsWith('/turn-delivery'));
+      if (hostSecret) {
+        expect(relayed).toHaveLength(0);
+        expect(String(result.stderr)).toContain('turn delivery indexing failed after delivery');
+      } else {
+        expect(posts).toHaveLength(2);
+        expect(posts[1]).toMatchObject({
+          method: 'POST',
+          path: `/api/sessions/${key.sessionId}/turn-delivery`,
+          body: { messageId: 'om_durable_message' },
+        });
+        expect(posts[1].body.content).toContain('Indexed final');
+        // Correlation fields are the daemon's to derive, never the CLI's.
+        for (const field of ['turnId', 'sessionId', 'chatId', 'botAppId', 'policy']) {
+          expect(posts[1].body).not.toHaveProperty(field);
+        }
+        expect(String(result.stderr)).not.toContain('turn delivery indexing failed');
       }
     } finally {
       rmSync(root, { recursive: true, force: true });

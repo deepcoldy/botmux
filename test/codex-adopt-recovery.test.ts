@@ -38,6 +38,19 @@ function restore(input: readonly CodexBridgeEvent[], now = 20_000, file = rollou
 }
 
 describe('adopted Codex turn recovery', () => {
+  it('persists the mark-time rollout offset and never advances it on later checkpoints', () => {
+    const queue = new CodexBridgeQueue(() => 10_000);
+    queue.mark('om_original', start.text, 10_000, undefined, {
+      jsonlPath: rollout,
+      offsetAtMark: 1_234,
+    });
+    checkpointCodexAdoptTurns(path, rollout, queue, 9_999);
+    expect(readBridgeTurnJournal(path)).toMatchObject([{ turnId: 'om_original', offsetAtMark: 1_234 }]);
+
+    checkpointCodexAdoptTurns(path, rollout, queue, 19_999);
+    expect(readBridgeTurnJournal(path)).toMatchObject([{ turnId: 'om_original', offsetAtMark: 1_234 }]);
+  });
+
   it('keeps progress and the eventual final attached to the original message across restart', () => {
     checkpoint();
     const { queue, live, restored } = restore(events.slice(0, 3));
@@ -173,7 +186,7 @@ describe('adopted Codex turn recovery', () => {
   it('documents why wall-clock Date.now() drainers (like Cursor) cannot use timestamp cutoff replay', () => {
     // When a drainer lacks real event timestamps and stamps Date.now(),
     // all replayed events exceed minMarkTime - 5s, putting everything into live.
-    // This verifies why worker explicitly guards cutoff recovery with !codexBridgeIsCursor().
+    // This verifies why worker explicitly guards cutoff recovery with !structuredBridgeIs('cursor').
     const now = 50_000;
     const wallClockEvents = [
       event('user', now, 'historical prompt'),

@@ -4,6 +4,7 @@ import type {
   RemoteRunnerOutboundMessageResult,
   RemoteRunnerSessionToolOperation,
   RemoteRunnerSessionToolResult,
+  RemoteRunnerRecoveredTurn,
   RemoteRunnerTrustedCaller,
   RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
@@ -14,6 +15,7 @@ export interface BackendTurnInput {
   content: string;
   turnId: string;
   replyTurnId?: string;
+  dispatchAttempt?: number;
   trustedCaller?: RemoteRunnerTrustedCaller;
 }
 
@@ -238,6 +240,9 @@ export interface SessionBackend {
   onSessionTool?(
     cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
   ): void;
+  /** A provider-owned turn survived the host/worker process and is now being
+   * observed without resubmitting its prompt. */
+  onTurnRecovered?(cb: (turn: RemoteRunnerRecoveredTurn) => void): void;
   /** Provider handshake/startup is complete and turns may be accepted. */
   onReady?(cb: () => void): void;
   /** Durable, provider-neutral lineage/runtime state changed. */
