@@ -1,3 +1,4 @@
+import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -2141,6 +2142,9 @@ function persistRow(session: Session): void {
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
     }
+    if (durable.codexProfile !== undefined) {
+      session = { ...session, codexProfile: durable.codexProfile, codexProfileHome: durable.codexProfileHome };
+    }
     if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
       session = { ...session, serviceTier: durable.serviceTier };
     }
@@ -2190,6 +2194,8 @@ function buildNewSession(
     status: 'active',
     createdAt: new Date().toISOString(),
     creationSource: source,
+    codexProfile: intent.inherit ? intent.inherit.codexProfile ?? null : source === 'external' ? null : bot?.codexProfile ?? null,
+    codexProfileHome: intent.inherit ? intent.inherit.codexProfileHome : source !== 'external' && bot?.codexProfile ? resolveCodexProfileHome(bot) : undefined,
     promptInjection: intent.inherit ? intent.inherit.promptInjection ?? 'default'
       : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
@@ -5885,7 +5891,7 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',

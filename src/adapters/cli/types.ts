@@ -241,6 +241,7 @@ export interface CliAdapter {
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** Codex-only thread service tier. Missing inherits the executor's config. */
+    codexProfile?: string;
     serviceTier?: CodexServiceTier;
     /** Optional TraeX process-scoped backend variant. Missing means inherit
      * the user's TraeX global configuration; all non-TraeX adapters ignore it. */

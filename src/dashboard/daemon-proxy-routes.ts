@@ -74,6 +74,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('working-dir-mode'),
   // agent：`{ cliId, model }`，cliId 是 dashboard 的选择键。
   putBotConfig('agent'),
+  { method: 'GET', path: botPath('codex-profiles'), upstream: '/api/bot-codex-profiles', body: NO_BODY },
   // skills：`{ action:'attach'|'detach', name }` 或 `{ action:'set', policy|null }`。
   putBotConfig('skills'),
   // brand-label：`{ brandLabel: string | null }`（'' = 关，null = 默认）。

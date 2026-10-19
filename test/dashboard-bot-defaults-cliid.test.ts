@@ -12,6 +12,11 @@ import {
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
+// Profile scanning has its own component/browser tests. Keep these agent-save
+// contract tests independent of that additional GET request.
+vi.mock('../src/dashboard/web/codex-profile-picker.js', () => ({
+  CodexProfilePicker: (props: any) => React.createElement('codex-profile-picker', props),
+}));
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe('bot defaults task tabs', () => {
@@ -138,6 +143,27 @@ describe('Codex-compatible runtime editor', () => {
     });
     return { renderer, root: renderer.root, patchBot };
   }
+
+  it('sends the Codex profile only when edited, and resets touched state after authoritative clear', async () => {
+    const original = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      if (String(url).includes('/api/cli-options/models')) return { ok: true, json: async () => ({ models: [] }) };
+      const body = JSON.parse(init?.body ?? '{}'); requests.push(body);
+      return { ok: true, json: async () => ({ ...body, ok: true, codexProfile: null }) };
+    });
+    try {
+      const { root, renderer } = renderAgent({ cliId: 'codex', codexProfile: 'saved' });
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[0]).not.toHaveProperty('codexProfile');
+      act(() => root.findByType('codex-profile-picker' as any).props.onChange(''));
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[1].codexProfile).toBeNull();
+      await act(async () => root.findByProps({ 'data-action': 'save-agent' }).props.onClick());
+      expect(requests[2]).not.toHaveProperty('codexProfile');
+      act(() => renderer.unmount());
+    } finally { globalThis.fetch = original; }
+  });
 
   async function flushEffects(cycles = 1): Promise<void> {
     for (let i = 0; i < cycles; i += 1) {

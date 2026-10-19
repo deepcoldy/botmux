@@ -280,7 +280,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, serviceTier, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, serviceTier, codexProfile, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
       if (promptInjection === 'none') {
         assertNoGlobalBotmuxSkills(join(codexHome(), 'skills'));
       }
@@ -295,6 +295,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
         : [];
       if (remoteWsUrl && remoteThreadId) {
+        if (codexProfile) throw new Error('Codex profile is not supported by the RPC app-server/viewer');
         // -c check_for_update_on_startup=false: an RPC pane is a pure viewer with
         // NO terminal input path, so codex's interactive "Update available … Press
         // enter to continue" dialog would block the resume forever and freeze the
@@ -320,6 +321,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // So spawn args are unchanged — keep bypass so codex's own nested sandbox
       // is OFF and the outer Seatbelt profile is the sole enforcer.
       const baseArgs = [
+        ...(codexProfile ? (codexProfile.startsWith('-') ? [`--profile=${codexProfile}`] : ['--profile', codexProfile]) : []),
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
         // Codex 0.14x added a second interactive gate AFTER folder trust: the
         // botmux-installed UserPromptSubmit + Stop hooks in ~/.codex/hooks.json
@@ -432,7 +434,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const subcommandArgs: string[] = [];
       for (let index = 0; index < baseArgs.length; index++) {
         const arg = baseArgs[index]!;
-        if (arg === '-c') rootConfigArgs.push(arg, baseArgs[++index]!);
+        if (arg === '-c' || arg === '--profile') rootConfigArgs.push(arg, baseArgs[++index]!);
+        else if (arg.startsWith('--profile=')) rootConfigArgs.push(arg);
         else if (arg === '--model') subcommandArgs.push(arg, baseArgs[++index]!);
         else subcommandArgs.push(arg);
       }
