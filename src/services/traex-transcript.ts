@@ -179,17 +179,20 @@ export interface TraexThreadIndexEntry {
  *  (see readTraexThreadDetails): prompts can be tens of KiB each. */
 export interface TraexThreadDetails {
   id: string;
-  /** What TraeX itself shows for the thread: `threads.name` (0.208+, written by
-   *  `/rename` and TraeX's own auto-naming) else the legacy `threads.title`
-   *  (≤0.207 kept the display name there; 0.208+ only mirrors the first prompt
-   *  into it, and 0.210 may leave it empty). */
+  /** DISPLAY ONLY. What TraeX itself shows for the thread: `threads.name`
+   *  (0.208+, written by `/rename` and TraeX's own auto-naming) else the legacy
+   *  `threads.title`. Omitted when that text is itself botmux-shaped (an
+   *  envelope / the v3 goal objective), so it is never rendered — but it never
+   *  decides origin either way. */
   title?: string;
-  /** First prompt: `first_user_message`, else `preview` (0.210 leaves the
-   *  former empty and only fills `preview`). */
+  /** ORIGIN EVIDENCE: the thread's original first input, `threads.preview`.
+   *  Unlike `title` / `name` / `first_user_message`, which TraeX rewrites
+   *  (0.210 moves `title` and `first_user_message` to a later input), `preview`
+   *  keeps what the thread started with. Absent (older schemas, or not yet
+   *  written) → the rollout's first-turn rule decides origin instead. */
   firstUserMessage?: string;
-  /** Some text column carries a botmux-injected envelope or botmux v3's own
-   *  `/goal` objective, i.e. botmux spawned this thread. Same origin rules as
-   *  resume discovery: such a thread never surfaces its native title in /adopt. */
+  /** `firstUserMessage` is a botmux envelope or botmux v3's own `/goal`
+   *  objective: botmux started this thread. */
   botmuxOrigin?: boolean;
 }
 
@@ -197,7 +200,6 @@ type TraexThreadRow = {
   id?: unknown;
   name?: unknown;
   title?: unknown;
-  firstUserMessage?: unknown;
   preview?: unknown;
   cwd?: unknown;
   rolloutPath?: unknown;
@@ -228,25 +230,26 @@ function normalizeTraexThreadIndexEntry(row: TraexThreadRow | undefined): TraexT
   };
 }
 
+/** botmux-generated text: a Lark envelope or botmux v3's own `/goal` objective. */
+function isBotmuxShapedText(text: string): boolean {
+  return isBotmuxInjectedPrompt(text.trim()) || isBotmuxGoalObjective(text);
+}
+
 function normalizeTraexThreadDetails(row: TraexThreadRow | undefined): TraexThreadDetails | undefined {
   const id = nonEmptyString(row?.id);
   if (!id) return undefined;
-  const name = nonEmptyString(row?.name);
-  const legacyTitle = nonEmptyString(row?.title);
-  const preview = nonEmptyString(row?.preview);
-  const firstUserMessage = nonEmptyString(row?.firstUserMessage) ?? preview;
-  const title = name ?? legacyTitle;
-  // TraeX derives its default title / preview from the first input, so a
-  // botmux envelope can sit in any of these columns — and `preview` is checked
-  // on its own: a goal-mode thread that later receives a normal turn keeps the
-  // goal objective in `preview` while `title` / `first_user_message` become
-  // that later input (measured on 0.210.1). A single hit marks the thread
-  // botmux-origin (the live picker falls back to the project dir, resume drops
-  // it).
-  const candidates = [name, legacyTitle, firstUserMessage, preview];
-  const botmuxOrigin = candidates
-    .some(text => text !== undefined && isBotmuxInjectedPrompt(text.trim()))
-    || candidates.some(text => text !== undefined && isBotmuxGoalObjective(text));
+  // Origin comes from first-turn evidence only — `preview`, the original first
+  // input. Mutable display fields can't decide it in either direction: an
+  // external thread whose name / later prompt holds an envelope stays
+  // external, and a botmux thread renamed to something clean stays botmux.
+  // Without `preview` the rollout's first-turn rule decides (resume) or origin
+  // stays unknown (live: only the display-safety check below applies).
+  const firstUserMessage = nonEmptyString(row?.preview);
+  const botmuxOrigin = firstUserMessage !== undefined && isBotmuxShapedText(firstUserMessage);
+  // Display safety, not origin: a title that is itself an envelope / the goal
+  // objective (≤0.207 defaulted the title to the first prompt) is never shown.
+  const title = [nonEmptyString(row?.name), nonEmptyString(row?.title)]
+    .find(text => text !== undefined && !isBotmuxShapedText(text));
   return {
     id,
     ...(title ? { title } : {}),
@@ -270,7 +273,6 @@ const TRAEX_THREAD_INDEX_COLUMNS: TraexThreadColumns = [
 const TRAEX_THREAD_DETAIL_COLUMNS: TraexThreadColumns = [
   ['name', 'name'],
   ['title', 'title'],
-  ['first_user_message', 'firstUserMessage'],
   ['preview', 'preview'],
 ];
 /** Bound on `IN (…)` parameters per detail query (SQLite's default limit is
@@ -338,12 +340,12 @@ export function readTraexThreadDetails(
 /** Resolve one live TraeX session's native title for the /adopt picker.
  *
  *  Live discovery (tmux / herdr / zellij) never runs the rollout parser, so the
- *  botmux-origin rule must be applied here: a thread botmux spawned has its
- *  Lark envelope (or a name derived from it) in these columns, and returning
- *  it would render the envelope verbatim as the card title. Such threads get
- *  `undefined`, i.e. the same project-dir fallback as before native titles.
- *  Returned untruncated; display cleaning lives with the other live titles
- *  (traexLiveTitle in core/session-discovery). */
+ *  index evidence is applied here: a thread whose original first input
+ *  (`preview`) is botmux's gets `undefined` — the project-dir fallback — and a
+ *  title that is itself botmux-shaped is never returned (readTraexThreadDetails
+ *  drops it), so a Lark envelope can't be rendered as the card title even when
+ *  origin is unknown (no `preview`). Returned untruncated; display cleaning
+ *  lives with the other live titles (traexLiveTitle in core/session-discovery). */
 export function readTraexThreadTitle(
   cliSessionId: string,
   dbPath = traeStateDbPath(),

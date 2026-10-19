@@ -532,7 +532,11 @@ function isTraexContextReminder(text: string): boolean {
 }
 
 export interface RolloutSessionMetadata {
+  /** Display title only — never decides origin. */
   title?: string;
+  /** The thread's ORIGINAL first input from the native index (TraeX:
+   *  `threads.preview`). Decides origin and the inferred title outright, like a
+   *  canonical record seen before any other; absent → the rollout decides. */
   firstUserMessage?: string;
   /** The native index already proved botmux spawned this session. */
   botmuxOrigin?: boolean;

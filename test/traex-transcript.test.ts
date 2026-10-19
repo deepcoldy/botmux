@@ -2857,10 +2857,11 @@ describe('TraeX native thread metadata', () => {
       rolloutPath: '/root/rollout.jsonl',
       updatedAtMs: 1_787_900_000_000,
     });
+    // No `preview` column: first_user_message is mutable (0.210 rewrites it),
+    // so it is not origin evidence — the rollout's first-turn rule decides.
     expect(readTraexThreadDetails(['traex-native-id'], dbPath).get('traex-native-id')).toEqual({
       id: 'traex-native-id',
       title: 'Native renamed title',
-      firstUserMessage: 'original prompt',
     });
     expect(readTraexThreadTitle('traex-native-id', dbPath)).toBe('Native renamed title');
   });
@@ -2932,8 +2933,38 @@ describe('TraeX native thread metadata', () => {
 
     for (const id of ['botmux-title', 'botmux-title-only', 'botmux-named', 'botmux-preview']) {
       expect(readTraexThreadTitle(id, dbPath), id).toBeUndefined();
+    }
+    // Origin evidence is `preview` only: the two rows that have it are
+    // botmux-origin. Without it (≤0.207 rows) origin is left to the rollout;
+    // their envelope title is still never shown (display safety).
+    for (const id of ['botmux-named', 'botmux-preview']) {
       expect(readTraexThreadDetails([id], dbPath).get(id)?.botmuxOrigin, id).toBe(true);
     }
+    for (const id of ['botmux-title', 'botmux-title-only']) {
+      expect(readTraexThreadDetails([id], dbPath).get(id), id).toEqual({ id });
+    }
+  });
+
+  it('derives origin from the original first input, never from mutable display fields', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    writeModernThreads(dbPath, [
+      // External thread; a later prompt (title / first_user_message, rewritten
+      // by 0.210) and even the name carry an envelope — still external.
+      { id: 'external-later-envelope', name: BOTMUX_ENVELOPE, title: BOTMUX_ENVELOPE, firstUserMessage: BOTMUX_ENVELOPE, preview: 'external first prompt' },
+      // External thread renamed with a clean name, later envelope in title.
+      { id: 'external-renamed', name: 'Release checklist', title: BOTMUX_ENVELOPE, firstUserMessage: BOTMUX_ENVELOPE, preview: 'external first prompt' },
+      // Botmux thread renamed to something clean, later clean input: still botmux.
+      { id: 'botmux-laundered', name: 'Totally normal name', title: 'plain follow-up', firstUserMessage: 'plain follow-up', preview: BOTMUX_ENVELOPE },
+    ]);
+
+    expect(readTraexThreadDetails(['external-later-envelope'], dbPath).get('external-later-envelope'))
+      .toEqual({ id: 'external-later-envelope', firstUserMessage: 'external first prompt' });
+    expect(readTraexThreadTitle('external-later-envelope', dbPath)).toBeUndefined(); // envelope never displayed
+    expect(readTraexThreadDetails(['external-renamed'], dbPath).get('external-renamed'))
+      .toEqual({ id: 'external-renamed', title: 'Release checklist', firstUserMessage: 'external first prompt' });
+    expect(readTraexThreadTitle('external-renamed', dbPath)).toBe('Release checklist');
+    expect(readTraexThreadDetails(['botmux-laundered'], dbPath).get('botmux-laundered')?.botmuxOrigin).toBe(true);
+    expect(readTraexThreadTitle('botmux-laundered', dbPath)).toBeUndefined();
   });
 
   it('marks a botmux v3 goal worker as botmux-origin but keeps a user-run goal session', () => {

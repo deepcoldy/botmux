@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
+import { discoverRolloutSessions } from '../src/services/resumable-session-discovery.js';
+import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
+import { traeSessionsRoot } from '../src/services/traex-paths.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
 // TRAE submit verification polls the global submit log history.jsonl (written
@@ -446,5 +449,84 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     db.close();
 
     expect(await createTraexAdapter('/bin/traex').listResumableSessions!({ limit: 10 })).toEqual([]);
+  });
+
+  it('reaches the same verdict with and without the native index (one fixture, two paths)', async () => {
+    // Each fixture is a rollout plus the threads row TraeX writes for it:
+    // `preview` = the original first input; title / first_user_message / name
+    // are display fields TraeX may rewrite later.
+    const ENV = '<session_id>4f6c2e1a-1111-4222-8333-944455556666</session_id>\n<user_message>\nhi\n</user_message>';
+    const meta = (sid: string) => ({ type: 'session_meta', payload: { id: sid, cwd: '/root/project', thread_source: 'user' } });
+    const dc = (sid: string, text: string, turnId: string) => ({ type: 'history_mutation', payload: {
+      operation: 'append', turn_id: turnId,
+      items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }],
+      display_completions: [{ thread_id: sid, turn_id: turnId, item: { type: 'UserMessage', content: [{ type: 'text', text }] } }],
+    } });
+    const item = (text: string, turnId: string) => ({ type: 'history_mutation', payload: {
+      operation: 'append', turn_id: turnId, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }],
+    } });
+    const done = (turnId: string) => ({ type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } });
+    const goal = (sid: string) => ({ type: 'event_msg', payload: { type: 'thread_goal_updated', threadId: sid, goal: { threadId: sid, objective: GOAL_COMMAND_OBJECTIVE } } });
+    const sid = (n: number) => `01a1600${n}-0000-7000-8000-000000000000`;
+    type Row = { name: string | null; title: string; fum: string; preview: string };
+    const FIXTURES: Array<{ name: string; sid: string; records: unknown[]; row: Row; listed: boolean }> = [
+      { name: 'external', sid: sid(1), listed: true,
+        records: [meta(sid(1)), dc(sid(1), 'external prompt', 't1')],
+        row: { name: 'External task', title: 'external prompt', fum: 'external prompt', preview: 'external prompt' } },
+      { name: 'external, later envelope in mutable fields', sid: sid(2), listed: true,
+        records: [meta(sid(2)), dc(sid(2), 'external first prompt', 't1'), done('t1'), dc(sid(2), ENV, 't2')],
+        row: { name: ENV, title: ENV, fum: ENV, preview: 'external first prompt' } },
+      { name: 'botmux', sid: sid(3), listed: false,
+        records: [meta(sid(3)), dc(sid(3), ENV, 't1')],
+        row: { name: '确认收到消息', title: ENV, fum: ENV, preview: ENV } },
+      { name: 'botmux, renamed and continued cleanly', sid: sid(4), listed: false,
+        records: [meta(sid(4)), dc(sid(4), ENV, 't1'), done('t1'), dc(sid(4), 'plain follow-up', 't2')],
+        row: { name: 'Totally normal name', title: 'plain follow-up', fum: 'plain follow-up', preview: ENV } },
+      { name: 'v3 goal worker that later got a normal turn', sid: sid(5), listed: false,
+        records: [meta(sid(5)), goal(sid(5)), dc(sid(5), 'status?', 't2')],
+        row: { name: 'Read $BOTMUX_GOAL_PATH. Write files', title: 'status?', fum: 'status?', preview: GOAL_COMMAND_OBJECTIVE } },
+      { name: 'no preview (old row), weak botmux first turn', sid: sid(6), listed: false,
+        records: [meta(sid(6)), item(ENV, 't1')],
+        row: { name: null, title: ENV, fum: ENV, preview: '' } },
+      { name: 'no preview (old row), weak external first turn', sid: sid(7), listed: true,
+        records: [meta(sid(7)), item('legacy external prompt', 't1')],
+        row: { name: null, title: 'Legacy title', fum: 'legacy external prompt', preview: '' } },
+      { name: 'no preview, first_user_message rewritten to a later envelope', sid: sid(8), listed: true,
+        records: [meta(sid(8)), dc(sid(8), 'external first prompt', 't1'), done('t1'), dc(sid(8), ENV, 't2')],
+        row: { name: null, title: ENV, fum: ENV, preview: '' } },
+      { name: 'no preview, first_user_message rewritten to a later clean input', sid: sid(9), listed: false,
+        records: [meta(sid(9)), dc(sid(9), ENV, 't1'), done('t1'), dc(sid(9), 'plain follow-up', 't2')],
+        row: { name: null, title: 'plain follow-up', fum: 'plain follow-up', preview: '' } },
+    ];
+
+    const sessionsDir = join(traeHome, 'cli', 'sessions', '2026', '10', '20');
+    mkdirSync(sessionsDir, { recursive: true });
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, cwd TEXT NOT NULL,',
+      "  title TEXT NOT NULL, first_user_message TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', name TEXT",
+      ');',
+    ].join('\n'));
+    const insert = db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    FIXTURES.forEach((f, i) => {
+      const path = join(sessionsDir, `rollout-2026-10-20T10-00-0${i}-${f.sid}.jsonl`);
+      writeFileSync(path, f.records.map(r => JSON.stringify(r)).join('\n') + '\n');
+      insert.run(f.sid, path, 1_792_400_000 + i, '/root/project', f.row.title, f.row.fum, f.row.preview, f.row.name);
+    });
+    db.close();
+
+    const withIndex = await createTraexAdapter('/bin/traex').listResumableSessions!({ limit: 20 });
+    const rolloutOnly = await discoverRolloutSessions(traeSessionsRoot(), 20, undefined, {
+      dialect: 'traex',
+      userInputTexts: traexRolloutUserInputs,
+      sessionIdFromPath: traexSessionIdFromRolloutPath,
+    });
+
+    const expected = FIXTURES.filter(f => f.listed).map(f => f.sid).sort();
+    expect(withIndex.map(s => s.cliSessionId).sort()).toEqual(expected);
+    expect(rolloutOnly.map(s => s.cliSessionId).sort()).toEqual(expected);
+    // The envelope in the external thread's mutable fields is never displayed.
+    expect(withIndex.find(s => s.cliSessionId === sid(2))?.title).toBe('external first prompt');
   });
 });
