@@ -217,6 +217,31 @@ describe('group-context card projection', () => {
     expect(projectGroupContextCard(raw)).toBeUndefined();
   });
 
+  describe.each([undefined, 'Sales'])('native chart title=%s', title => {
+    it.each(['runtime', 'message', 'turn-message'] as const)('carries %s without adding a Footer or changing chart data', purpose => {
+      const fence = '```vega-lite\n' + JSON.stringify({ ...(title ? { title } : {}),
+        data: { values: [{ category: 'A', value: 1 }, { category: 'B', value: 2 }] },
+        mark: 'bar', encoding: { x: { field: 'category' }, y: { field: 'value' } },
+      }) + '\n```';
+      const original = { schema: '2.0', body: { elements: buildImageCardElements(fence, []) } };
+      const snapshot = structuredClone(original);
+      const marked = markGroupContextCardPurpose(original, purpose);
+      expect(original).toEqual(snapshot);
+      expect(marked.body.elements.map((node: any) => node.tag)).toEqual(['chart']);
+      expect(marked.body.elements[0].chart_spec).toEqual(snapshot.body.elements[0].chart_spec);
+      expect(JSON.stringify(marked)).not.toContain('botmux_reply_footer');
+      expect(markGroupContextCardPurpose(marked, purpose)).toEqual(marked);
+      expect(projectGroupContextCard(JSON.stringify(marked))?.kind).toBe(purpose === 'runtime' ? 'runtime' : purpose === 'message' ? 'conversation' : 'unresolved');
+      const message = markGroupContextCardPurpose(marked, 'message');
+      const projected = conversation(JSON.stringify(message));
+      expect(projected.text).toContain('| A | 1 |');
+      expect(projected.text).toContain('| B | 2 |');
+      if (title) expect(projected.text).toContain(title);
+      expect(projected.text).not.toContain('botmux_group_context_chart');
+      expect(projected.text).not.toContain('\u2063');
+    });
+  });
+
   it('keeps unmarked structured image cards on the ordinary parsing path', () => {
     expect(projectGroupContextCard(JSON.stringify({ schema: '2.0', body: { elements: [
       { tag: 'img', img_key: 'img_v3_unmarked', alt: { tag: 'plain_text', content: 'Preview' } },

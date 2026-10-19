@@ -237,6 +237,28 @@ describe('group context platform integration', () => {
     }
   });
 
+  it.each(['runtime', 'message'] as const)('rehydrates a chart snapshot to preserve %s without an empty Footer', async purpose => {
+    const now = Date.now();
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([{ larkAppId: 'cli_peer', botName: 'Fixture' }]));
+    const flattened = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_chart_snapshot' }]] });
+    const structured = JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
+      { tag: 'chart', chart_spec: { type: 'bar', title: { text: 'Sales' }, data: { values: [{ category: 'A', value: 1 }] } } },
+    ] } }, purpose));
+    expect(structured).not.toContain('botmux_reply_footer');
+    network.history.mockResolvedValue([{ message_id: 'om_chart', chat_id: 'oc_room', create_time: String(now - 100),
+      update_time: String(now - 100), msg_type: 'interactive', sender: { id: 'cli_peer', sender_type: 'app' }, body: { content: flattened } }]);
+    network.detail.mockImplementation(async (_app, _id, options) => ({ items: [{ update_time: String(now - 1),
+      body: { content: options.userCardContent ? structured : flattened } }] }));
+    await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '总结' });
+    expect(network.detail.mock.calls.some(call => call[2]?.userCardContent === true)).toBe(true);
+    const stored = getGroupContextMessage('cli_b', 'oc_room', 'om_chart');
+    if (purpose === 'runtime') expect(stored).toBeUndefined();
+    else {
+      expect(stored?.text).toContain('Sales');
+      expect(stored?.text).toContain('| A | 1 |');
+    }
+  });
+
   it.each(['detail-failure', 'detail-still-list', 'over-limit'] as const)('preserves third-party image lists during %s', async scenario => {
     const now = Date.now();
     writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([{ larkAppId: 'cli_peer', botName: 'Fixture' }]));

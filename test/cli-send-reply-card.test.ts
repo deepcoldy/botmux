@@ -24,6 +24,8 @@ describe('real CLI send into a running reply card', () => {
   it.each([
     ['table', '| A | B |\n| --- | --- |\n| 1 | 2 |', 'table'],
     ['image', '![Preview](img_v3_footer_test)', 'column_set'],
+    ['chart', '```vega-lite\n{"data":{"values":[{"d":"a","v":1}]},"mark":"bar","encoding":{"x":{"field":"d"},"y":{"field":"v"}}}\n```', 'chart'],
+    ['titled chart', '```vega-lite\n{"title":"Sales","data":{"values":[{"d":"a","v":1}]},"mark":"bar","encoding":{"x":{"field":"d"},"y":{"field":"v"}}}\n```', 'chart'],
   ])('keeps a pure %s final free of Footer while retaining group-context purpose', (_kind, content, tag) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-footer-carrier-'));
     const dataDir = join(root, 'data');
@@ -55,7 +57,10 @@ describe('real CLI send into a running reply card', () => {
       expect(projected.turnReply).toBe(false);
       expect(projected.content).not.toContain('\u2063');
       if (_kind === 'image') expect(projected.content).toContain('img_v3_footer_test');
-      else expect(projected.content).toContain('"c0":"1"');
+      else if (tag === 'chart') {
+        expect(card.body.elements[0].chart_spec.data.values).toEqual([{ d: 'a', v: 1 }]);
+        expect(projected.content).toContain('"c1":1');
+      } else expect(projected.content).toContain('"c0":"1"');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
