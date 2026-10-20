@@ -327,11 +327,18 @@ describe('agent authorization', () => {
 
   it('does not expose another speaker or application grant to the current turn', async () => {
     requestId = (await (await post()).json()).requestId;
+    // A different human is a turn change; a different application means the
+    // tracked grant itself no longer applies — the two refusals must stay
+    // distinguishable so each guard call point is pinned.
     session.managedTurnOrigin.callerOpenId = 'ou_other';
-    expect((await post('auth-status', { requestId })).status).toBe(409);
+    let response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
     session.managedTurnOrigin.callerOpenId = 'ou_sender';
     session.larkAppId = 'cli_other';
-    expect((await post('auth-status', { requestId })).status).toBe(409);
+    response = await post('auth-status', { requestId });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ ok: false, error: 'auth_request_expired' });
     expect(poll).not.toHaveBeenCalled();
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
