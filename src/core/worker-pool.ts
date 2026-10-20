@@ -422,8 +422,9 @@ export function getDaemonSessionUsageSnapshot(
     if (larkAppId) {
       const bot = getBot(larkAppId);
       const extensionSegments = getCardFooterExtensionSegments(
-        // 命令看到的是本会话实际生效的 CLI（per-session 覆盖也算），与下方快照读取同口径。
-        { larkAppId, cliId: resolveSessionCliId(ds, effectiveCliId), botName: bot.config.name },
+        // 结果按 bot（larkAppId）共享：环境也必须是 bot 级的，不能取本会话的
+        // effectiveCliId——同一 bot 不同会话用不同 CLI 时，变量会在刷新间跳变。
+        { larkAppId, cliId: bot.config.cliId, botName: bot.config.name },
         bot.config.cardFooterExtension,
       );
       if (extensionSegments) return { ...snapshot, extensionSegments };
@@ -432,25 +433,18 @@ export function getDaemonSessionUsageSnapshot(
   return snapshot;
 }
 
-/** 会话实际生效的 CLI id：显式入参 > 会话 / adopt 记录 > bot 配置。快照读取与
- * cardFooterExtension 命令环境共用同一口径，避免 per-session 覆盖对命令不可见。 */
-function resolveSessionCliId(ds: DaemonSession, effectiveCliId?: CliId): CliId {
-  return (
-    effectiveCliId
-    ?? ds.session.cliId
-    ?? ds.session.adoptedFrom?.cliId
-    ?? ds.adoptedFrom?.cliId
-    ?? getBot(ds.larkAppId ?? ds.session.larkAppId).config.cliId
-  ) as CliId;
-}
-
 function readDaemonSessionUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
   try {
-    const resolvedCliId = resolveSessionCliId(ds, effectiveCliId);
+    const resolvedCliId = effectiveCliId ?? (
+      ds.session.cliId
+      ?? ds.session.adoptedFrom?.cliId
+      ?? ds.adoptedFrom?.cliId
+      ?? getBot(ds.larkAppId).config.cliId
+    ) as CliId;
     const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
     if (backendType === 'remote-runner') {
       const usage = normalizeRemoteRunnerUsageReport(ds.session.remoteRunnerUsage);

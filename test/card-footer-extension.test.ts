@@ -4,6 +4,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 import {
   __testOnly_cardFooterExtensionCache,
@@ -120,15 +121,15 @@ describe('getCardFooterExtensionSegments', () => {
 const isPosix = process.platform !== 'win32';
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-/** pgrep -f <marker> 的输出；无匹配时 pgrep 退出码 1，按「无残留」处理。 */
+/** pgrep -f <marker>$ 的输出（行尾锚定，避免 marker 是别的进程名子串时误判）；无匹配退出码 1 按「无残留」处理。 */
 function procsMatching(marker: string): string {
   try {
-    return execFileSync('pgrep', ['-f', marker], { encoding: 'utf8' }).trim();
+    return execFileSync('pgrep', ['-f', `${marker}$`], { encoding: 'utf8' }).trim();
   } catch { return ''; }
 }
 
 function killMarker(marker: string): void {
-  try { execFileSync('pkill', ['-9', '-f', marker], { stdio: 'ignore' }); } catch { /* 无残留 */ }
+  try { execFileSync('pkill', ['-9', '-f', `${marker}$`], { stdio: 'ignore' }); } catch { /* 无残留 */ }
 }
 
 const hasSetsid = isPosix && (() => {
@@ -195,6 +196,22 @@ describe('runCardFooterExtensionCommand', () => {
       .resolves.toBe('done\n');
     expect(Date.now() - startedAt).toBeLessThan(3_000);
   }, 10_000);
+
+  it.skipIf(!isPosix)('an in-flight command does not keep the parent event loop alive', () => {
+    // child / 管道 / 定时器任一忘了 unref，父进程都会等到 3s 超时才退出。
+    const marker = 'sleep 47107';
+    markers.push(marker);
+    const modulePath = new URL('../src/services/card-footer-extension.js', import.meta.url).href;
+    const snippet = [
+      `import { runCardFooterExtensionCommand } from ${JSON.stringify(modulePath)};`,
+      `runCardFooterExtensionCommand('${marker}', { PATH: process.env.PATH }).catch(() => {});`,
+    ].join('\n');
+    const startedAt = Date.now();
+    const result = spawnSyncTsEvalWithRepoImports(snippet, { encoding: 'utf8', timeout: 10_000 });
+    const elapsed = Date.now() - startedAt;
+    expect(result.status ?? result.signal, `child stderr:\n${String(result.stderr ?? '')}`).toBe(0);
+    expect(elapsed).toBeLessThan(2_000);
+  }, 15_000);
 });
 
 describe('extension segments on the card', () => {
