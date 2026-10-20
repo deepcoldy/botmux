@@ -58,7 +58,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `onError` | `"allow"`｜`"deny"` | Optional, meaningful only with `mode:"sync"`. Fallback direction when the hook itself fails (timeout / missing command / crash). Defaults to `allow` (fail-open) |
 | `filter.larkAppId` | string｜string[] | Optional. Only match the specified bot app. `lark_app_id` is accepted as a compatibility input and normalized to camelCase |
 | `filter.chatId` | string｜string[] | Optional. Only match the chat of the specified Lark group / topic |
-| `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id |
+| `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id; not applicable to `chat.bot_added`, which only supplies `operatorOpenId` |
 | `redact.fullContentEvents` | string[] | Optional. Long text is truncated by default; events in this allowlist pass through the full text |
 
 > **`outbound.send` / `outbound.reply` cannot intercept.** They fire *after* the Lark API call succeeds (the `messageId` is required to build the payload), by which point the message is already in the chat; `mode:"sync"` there could only retract after the fact, which is not interception. Declaring `sync` on them degrades to async with a warning.
@@ -106,6 +106,8 @@ Different events carry extra fields:
 By default, `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to **600 characters**, with `xxxLength` / `xxxTruncated` added; only events in `redact.fullContentEvents` pass through the full text.
 
 ## Synchronous gates
+
+Scope `chat.bot_added` with `filter.larkAppId` or `filter.chatId`; inspect `operatorOpenId` inside the gate command when checking the inviter. Do not use `filter.senderOpenId` for join events: it does not match the operator, so `autoStartOnGroupJoinGateRequired: true` would silently prevent auto-start.
 
 A regular hook is a *notification* — nothing reads its result. A gate event with `mode: "sync"` is a *verdict*: the daemon waits for it, reads it, and allows or rejects the action. `prompt.submit` gates a message before it reaches the CLI. `chat.bot_added` gates only `autoStartOnGroupJoin`; it does not block async observers, `groupJoinCommand`, or owner auto-invite.
 

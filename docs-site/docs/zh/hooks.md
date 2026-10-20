@@ -58,7 +58,7 @@ tail -f /tmp/botmux-hook.log
 | `onError` | `"allow"`｜`"deny"` | 可选，仅 `mode:"sync"` 有意义。hook 自身失败（超时/找不到命令/崩溃）时的兜底方向，默认 `allow`（fail-open） |
 | `filter.larkAppId` | string｜string[] | 可选。只匹配指定 Bot 应用；同义字段 `lark_app_id` 只作兼容输入，归一化后统一使用 camelCase |
 | `filter.chatId` | string｜string[] | 可选。只匹配指定飞书群 / 话题所在 chat |
-| `filter.senderOpenId` | string｜string[] | 可选。只匹配指定发送者 open_id |
+| `filter.senderOpenId` | string｜string[] | 可选。只匹配指定发送者 open_id；不适用于只有 `operatorOpenId` 的 `chat.bot_added` |
 | `redact.fullContentEvents` | string[] | 可选。默认截断长文本；列入 allowlist 的事件透传全文 |
 
 > **`outbound.send` / `outbound.reply` 不能用来拦截。** 它们的发射点在飞书 API 调用**成功之后**（需先拿到 `messageId`），那一刻消息已经在群里了；加 `mode:"sync"` 也只能事后撤回，不是拦截。这两个事件写 `sync` 会降级为 async 并告警。
@@ -106,6 +106,8 @@ tail -f /tmp/botmux-hook.log
 默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 **600 字符**，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` 内的事件透传全文。
 
 ## 同步前置校验闸
+
+`chat.bot_added` 可用 `filter.larkAppId`、`filter.chatId` 限定范围；邀请人判断应在 gate 命令内读取 `operatorOpenId`。不要用 `filter.senderOpenId` 过滤入群事件：它不会匹配邀请人，且在 `autoStartOnGroupJoinGateRequired: true` 时会使自动开工静默停止。
 
 普通 hook 是「通知」——跑完没人看结果。gate 事件 + `mode: "sync"` 是「裁决」：daemon 等它、读它、按它放行或拒绝。`prompt.submit` 用于消息进入 CLI 前的自定义权限校验；`chat.bot_added` 只裁决 `autoStartOnGroupJoin`，不会阻止异步观察 hook、`groupJoinCommand` 或 owner 自动入群。
 

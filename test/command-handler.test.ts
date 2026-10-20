@@ -5437,6 +5437,35 @@ describe('handleCommand', () => {
       expect(ds.session.initialUserTurnPending).toBeUndefined();
     });
 
+    it('preserves group-join provenance and caller through text /repo without other buffered input', async () => {
+      const groupJoinContext = {
+        event: 'chat.bot_added' as const,
+        larkAppId: LARK_APP_ID,
+        chatId: CHAT_ID,
+        turnId: 'om_group_join',
+        operatorOpenId: 'ou_inviter',
+        gateMatched: true,
+      };
+      const trustedCaller = { requestLarkAppId: LARK_APP_ID, requestUserOpenId: 'ou_inviter' };
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingTurnId: groupJoinContext.turnId,
+        pendingGroupJoinContext: groupJoinContext,
+        pendingTrustedCaller: trustedCaller,
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), makeDeps(ds), LARK_APP_ID);
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[11]).toMatchObject({ groupJoinContext });
+      expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'WRAPPED:' }, {
+        turnId: groupJoinContext.turnId, trustedCaller,
+      });
+      expect(ds.session.initialUserTurnPending).toBeUndefined();
+      expect(ds.pendingGroupJoinContext).toBeUndefined();
+      expect(ds.pendingTrustedCaller).toBeUndefined();
+    });
+
     it('forwards the pending substitute trigger and complete Codex App sidecar', async () => {
       mockCodexAppBot();
       const substituteTrigger = {

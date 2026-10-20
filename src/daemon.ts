@@ -679,7 +679,7 @@ let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
-import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -21892,7 +21892,8 @@ function hasBufferedOpeningInput(ds: DaemonSession): boolean {
     || (ds.pendingFollowUps?.length ?? 0) > 0
     || (ds.pendingAttachments?.length ?? 0) > 0
     || (ds.pendingCodexAppFollowUps?.length ?? 0) > 0
-    || ds.pendingChatContext !== undefined;
+    || ds.pendingChatContext !== undefined
+    || ds.pendingGroupJoinContext !== undefined;
 }
 
 /**
@@ -24355,16 +24356,30 @@ async function handleBotAdded(
       }
       groupJoinGateMatched = groupJoinGate.matched === true;
 
-      // The lifecycle event's operator is the only candidate human for this
-      // synthetic opening turn. Resolve it for the prompt and carry the same
-      // daemon-owned identity into managed-turn authority; current-actor still
-      // performs a fresh strict contact lookup before granting anything.
-      groupJoinSender = operatorOpenId
-        ? await resolveSender(larkAppId, operatorOpenId, 'user').catch(() => undefined)
-        : undefined;
-      groupJoinTrustedCaller = groupJoinSender?.type === 'user'
-        && groupJoinSender.openId === operatorOpenId
-        ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, false)
+      // bot.added supplies an operator ID, not a platform sender_type. Read
+      // independent bot evidence before resolving any display name: even an
+      // undefined senderType makes resolveSender write "user" into the cache.
+      const cachedOperator = operatorOpenId ? getIdentity(larkAppId, operatorOpenId) : undefined;
+      const operatorIsBot: true | undefined = operatorOpenId
+        && (isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
+          || cachedOperator?.type === 'bot' || cachedOperator?.type === 'app')
+        ? true : undefined;
+      if (operatorOpenId) {
+        let name = cachedOperator?.name;
+        if (operatorIsBot) {
+          const resolved = await resolveSender(larkAppId, operatorOpenId, 'app').catch(() => undefined);
+          name = resolved?.name ?? name;
+        }
+        // Preserve the display vocabulary, but never use this model-facing
+        // default as evidence that the operator is an authenticated human.
+        groupJoinSender = {
+          openId: operatorOpenId,
+          type: operatorIsBot ? 'bot' : 'user',
+          ...(name ? { name } : {}),
+        };
+      }
+      groupJoinTrustedCaller = groupJoinSender?.openId === operatorOpenId
+        ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)
         : undefined;
     }
 
