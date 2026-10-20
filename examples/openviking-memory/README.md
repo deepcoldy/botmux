@@ -121,6 +121,8 @@ python3 pilot.py bind
 
 适配器保持 HOME/CODEX_HOME，固定 Codex `0.160.1 --no-daemon`，按 `-C/--cd` 解析项目并调用同一 `client.mjs`；全局原生插件保持 disabled，仅该启动入口启用 capture。原生记忆 MCP 在本进程关闭，读取改用公共 CLI。短工具使用说明追加到现有 developer instructions，既不查历史也不注入记忆内容。
 
+> 该绑定走 legacy `cliPathOverride` 启动器，Botmux 因此有意不对它启用 hybrid RPC（Codex 的 `--remote` 查看器路径），采集在普通 TUI 进程内完成。注意 `--no-daemon` 与 `--remote` 在 Codex 0.160 互斥（`ERROR: --no-daemon cannot be used with --remote.`）。将来若把该 Bot 迁到结构化 `cliRuntime`，`--remote` 会被启用，届时 wrapper 必须在检测到 `--remote` 启动形状时剥除 `--no-daemon`，否则 RPC 查看器无法启动。`app-server --listen stdio://` 探针与 `--no-daemon` 不冲突，不受此限制。
+
 此适配是本会话唯一的自动写入者；公共 CLI 的 remember 只保存额外的明确事实，避免重复普通对话。
 
 **两个独立开关：** `setup-shared.mjs ...-unbind` 关闭共享 Skill/插件，`pilot.py unbind` 撤回 Codex 采集启动器及其兼容读取说明。完整关闭需撤回当前已启用的两种绑定，并重启对应会话；服务和已有记忆继续保留。

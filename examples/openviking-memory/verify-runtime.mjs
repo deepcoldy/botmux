@@ -1,6 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -9,6 +8,10 @@ const runtime = JSON.parse(await readFile(join(root, 'runtime.json'), 'utf8'));
 process.env.BOTS_CONFIG = runtime.bots_config;
 const { loadBotConfigs } = await import(pathToFileURL(join(runtime.botmux_installed, 'dist/bot-registry.js')));
 const { createCodexAdapter } = await import(pathToFileURL(join(runtime.botmux_installed, 'dist/adapters/cli/codex.js')));
+// Resolve the data dir the same way the daemon does: SESSION_DATA_DIR → the
+// ~/.botmux/.data-dir breadcrumb → ~/.botmux/data. Hard-coding the default
+// breaks installs that redirect their data directory.
+const { resolveBotmuxDataDir } = await import(pathToFileURL(join(runtime.botmux_installed, 'dist/core/data-dir.js')));
 const bots = loadBotConfigs();
 const index = bots.findIndex(bot => bot.larkAppId === runtime.bot_app_id);
 if (index < 0) throw new Error('Selected Bot is missing.');
@@ -23,7 +26,7 @@ if (version.status !== 0 || version.stdout.trim() !== runtime.codex_version) {
   throw new Error('The selected Codex executable changed.');
 }
 const descriptor = JSON.parse(await readFile(
-  join(homedir(), '.botmux/data/dashboard-daemons', runtime.bot_app_id + '.json'), 'utf8',
+  join(resolveBotmuxDataDir(), 'dashboard-daemons', runtime.bot_app_id + '.json'), 'utf8',
 ));
 const botHealth = await fetch(`http://127.0.0.1:${descriptor.ipcPort}/__health`, {
   signal: AbortSignal.timeout(5000),

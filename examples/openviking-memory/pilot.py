@@ -2,6 +2,7 @@
 """Optional Codex dialogue capture adapter for shared OpenViking memory."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -63,7 +64,12 @@ def configure(arguments):
         if previous_runtime.get("bot_app_id") not in (None, bot["larkAppId"]):
             raise SystemExit("This example directory is already configured for another Bot.")
     codex_home = Path(os.environ.get("CODEX_HOME") or USER_ROOT / ".codex").expanduser().resolve()
-    codex_config = tomllib.loads((codex_home / "config.toml").read_text())
+    codex_config_path = codex_home / "config.toml"
+    if not codex_config_path.is_file():
+        raise SystemExit(
+            f"Codex config not found: {codex_config_path}. Log in to Codex (or set CODEX_HOME) "
+            "before configure, or pass --vlm-model explicitly.")
+    codex_config = tomllib.loads(codex_config_path.read_text())
     model = arguments.vlm_model or codex_config.get("model")
     if not model:
         raise SystemExit("Provide --vlm-model or configure a Codex model before setup.")
@@ -91,13 +97,46 @@ def configure(arguments):
         "memory": {"session_auto_commit": {"enabled": True, "check_interval_seconds": 30}},
     }
     server_path = OV_ROOT / "ov.conf"
-    if server_path.exists() and not previous_runtime and not arguments.use_existing_server:
-        raise SystemExit("An existing OpenViking server config needs to be reconciled before this pilot.")
-    if arguments.use_existing_server:
-        server = json.loads(server_path.read_text())
-        if server.get("server", {}).get("host") != "127.0.0.1" or server.get("server", {}).get("port") != 1933:
-            raise SystemExit("This example expects a local OpenViking server on 127.0.0.1:1933.")
-        model = server["vlm"]["model"]
+    # Never silently overwrite an ov.conf that is not our own, untouched,
+    # generated one. Ownership is proven by a sha256 recorded in runtime.json
+    # when configure writes the file:
+    #   - our file, unchanged      -> safe to regenerate (idempotent re-configure)
+    #   - adopted (--use-existing) -> the flag stays required on every configure
+    #   - foreign / hand-edited / no ownership record -> refuse (preserve it)
+    if server_path.exists():
+        current_hash = hashlib.sha256(server_path.read_bytes()).hexdigest()
+        if arguments.use_existing_server:
+            server = json.loads(server_path.read_text())
+            if server.get("server", {}).get("host") != "127.0.0.1" or server.get("server", {}).get("port") != 1933:
+                raise SystemExit("This example expects a local OpenViking server on 127.0.0.1:1933.")
+            # Validate the reused shape BEFORE writing client/runtime files so a
+            # half-shaped shared config fails the command cleanly instead of after
+            # state was written.
+            reused_model = server.get("vlm", {}).get("model")
+            if not reused_model:
+                raise SystemExit(
+                    f"The reused {server_path} is missing vlm.model. Add it to the existing server "
+                    "config, or drop --use-existing-server to let configure generate one.")
+            dense = server.get("embedding", {}).get("dense")
+            if not isinstance(dense, dict) or not dense:
+                raise SystemExit(
+                    f"The reused {server_path} is missing an embedding.dense section. Add the local embedding "
+                    "configuration to the existing server config, or drop --use-existing-server to generate one.")
+            model = reused_model
+            server_owned = False
+        elif previous_runtime.get("server_config_owned") and previous_runtime.get("server_config_hash") == current_hash:
+            server_owned = True
+        else:
+            raise SystemExit(
+                f"An existing OpenViking server config ({server_path}) is preserved. "
+                "Re-run with --use-existing-server to reuse it (still required on every later configure), "
+                "or move it aside before configure.")
+    else:
+        if arguments.use_existing_server:
+            raise SystemExit(
+                f"--use-existing-server set but {server_path} does not exist. "
+                "Start the existing service with its own config, or drop the flag to let configure write one.")
+        server_owned = True
     client_path = Path(previous_runtime.get("client_config")
                        or BOT_ROOT / "openviking" / bot["larkAppId"] / "ovcli.conf")
     previous_client = json.loads(client_path.read_text()) if client_path.exists() else {}
@@ -148,6 +187,11 @@ def configure(arguments):
         runtime["plugin_root"] = previous_runtime["plugin_root"]
     if not arguments.use_existing_server:
         write_json(server_path, server)
+    # Record who owns the resulting ov.conf and its exact hash. A later
+    # configure regenerates it only when the file is still this exact bytes;
+    # an adopted (operator/shared) config is owned=False and stays protected.
+    runtime["server_config_owned"] = server_owned
+    runtime["server_config_hash"] = hashlib.sha256(server_path.read_bytes()).hexdigest()
     write_json(client_path, client)
     write_json(ROOT / "runtime.json", runtime)
     (ROOT / "bin/codex-openviking").chmod(0o755)
@@ -219,7 +263,12 @@ def unbind():
     wrapper = str(ROOT / "bin/codex-openviking")
     if selected.get("cliPathOverride") != wrapper:
         raise SystemExit("The selected Bot no longer uses this wrapper; inspect its config before rollback.")
-    original = json.loads((Path(runtime["client_config"]).parent / "bots.before-openviking.json").read_text())
+    backup_path = Path(runtime["client_config"]).parent / "bots.before-openviking.json"
+    if not backup_path.is_file():
+        raise SystemExit(
+            f"Cannot unbind: pre-bind backup {backup_path} is missing. Inspect bots.json and remove "
+            "this wrapper's cliPathOverride manually instead of guessing the previous value.")
+    original = json.loads(backup_path.read_text())
     _, previous = selected_bot(original, runtime["bot_app_id"])
     if "cliPathOverride" in previous:
         selected["cliPathOverride"] = previous["cliPathOverride"]

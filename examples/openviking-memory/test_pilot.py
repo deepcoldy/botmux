@@ -143,6 +143,85 @@ class PilotConfigurationTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(pilot.load_runtime()["vlm_model"], "existing-model")
 
+    def _valid_existing_server(self, **extra):
+        pilot.OV_ROOT.mkdir(exist_ok=True)
+        server = {"server": {"host": "127.0.0.1", "port": 1933},
+                  "embedding": {"dense": {"provider": "local", "dimension": 512}},
+                  "vlm": {"model": "existing-model"}, **extra}
+        path = pilot.OV_ROOT / "ov.conf"
+        path.write_text(json.dumps(server))
+        return path
+
+    def test_adopted_server_stays_protected_on_every_later_configure(self):
+        # The P2 scenario: reuse an operator-owned ov.conf once, then a later
+        # configure without the flag must NOT silently overwrite it.
+        path = self._valid_existing_server(operator_secret="S3CR3T")
+        self.configure(use_existing_server=True)
+        self.assertFalse(pilot.load_runtime()["server_config_owned"])
+        before = path.read_bytes()
+        with self.assertRaisesRegex(SystemExit, "is preserved"):
+            self.configure(vlm_model="new-model")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertIn("operator_secret", path.read_text())
+
+    def test_our_own_untouched_server_can_be_regenerated(self):
+        self.configure()
+        self.assertTrue(pilot.load_runtime()["server_config_owned"])
+        path = pilot.OV_ROOT / "ov.conf"
+        before = path.read_bytes()
+        # Idempotent re-configure of our own, unchanged file is allowed.
+        self.configure()
+        self.assertTrue(pilot.load_runtime()["server_config_owned"])
+        self.assertEqual(json.loads(path.read_text()), json.loads(before))
+
+    def test_hand_edited_owned_server_is_refused(self):
+        self.configure()
+        path = pilot.OV_ROOT / "ov.conf"
+        path.write_text(path.read_text().rstrip().rstrip("}") + ',"operator_secret":"X"}')
+        with self.assertRaisesRegex(SystemExit, "is preserved"):
+            self.configure()
+
+    def test_missing_codex_config_is_a_readable_error(self):
+        empty_home = self.home / "no-codex"
+        empty_home.mkdir()
+        with patch.dict(os.environ, {"CODEX_HOME": str(empty_home)}):
+            with self.assertRaisesRegex(SystemExit, "Codex config not found"):
+                self.configure()
+        self.assertFalse((pilot.OV_ROOT / "ov.conf").exists())
+
+    def test_reuse_flag_without_server_file_is_readable_and_writes_nothing(self):
+        with self.assertRaisesRegex(SystemExit, "does not exist"):
+            self.configure(use_existing_server=True)
+        self.assertFalse((self.root / "runtime.json").exists())
+
+    def test_reused_server_missing_required_sections_fails_before_writes(self):
+        client_path = self.home / ".botmux/openviking/cli_selected/ovcli.conf"
+        pilot.OV_ROOT.mkdir(exist_ok=True)
+        # Missing vlm.model.
+        (pilot.OV_ROOT / "ov.conf").write_text(json.dumps(
+            {"server": {"host": "127.0.0.1", "port": 1933},
+             "embedding": {"dense": {"provider": "local"}}}))
+        with self.assertRaisesRegex(SystemExit, "missing vlm.model"):
+            self.configure(use_existing_server=True)
+        self.assertFalse((self.root / "runtime.json").exists())
+        self.assertFalse(client_path.exists())
+        # Missing embedding.dense.
+        (pilot.OV_ROOT / "ov.conf").write_text(json.dumps(
+            {"server": {"host": "127.0.0.1", "port": 1933},
+             "vlm": {"model": "existing-model"}}))
+        with self.assertRaisesRegex(SystemExit, "missing an embedding.dense"):
+            self.configure(use_existing_server=True)
+        self.assertFalse((self.root / "runtime.json").exists())
+        self.assertFalse(client_path.exists())
+
+    def test_unbind_without_backup_is_a_readable_error(self):
+        self.configure()
+        pilot.bind()
+        backup = self.home / ".botmux/openviking/cli_selected/bots.before-openviking.json"
+        backup.unlink()
+        with self.assertRaisesRegex(SystemExit, "pre-bind backup"):
+            pilot.unbind()
+
 
 if __name__ == "__main__":
     unittest.main()
