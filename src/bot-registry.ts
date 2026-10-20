@@ -2199,6 +2199,13 @@ export interface BotConfig {
    */
   autoStartOnGroupJoin?: boolean;
   /**
+   * Require at least one matching `chat.bot_added` sync hook to allow before
+   * group-join auto-start may create a session or visible seed. Missing,
+   * invalid or unmatched hook config therefore fails closed. Default off keeps
+   * the historical allowedUsers-only behaviour.
+   */
+  autoStartOnGroupJoinGateRequired?: boolean;
+  /**
    * 主动开工 — 场景① optional pre-configured first-turn prompt. When set, it
    * becomes the user_message of the auto-started session; when unset/blank the
    * session starts with an empty user_message and the bot reads the group
@@ -4133,6 +4140,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
       showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
+      autoStartOnGroupJoinGateRequired: entry.autoStartOnGroupJoinGateRequired === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank

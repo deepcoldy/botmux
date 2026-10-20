@@ -6285,6 +6285,8 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingChatContext = undefined;
+  ds.pendingGroupJoinContext = undefined;
+  ds.pendingTrustedCaller = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
 }
@@ -18730,6 +18732,7 @@ function buildReservedInitialInput(
       // master: thread the joined-chat context into the opening prompt (group-join
       // auto-start passes this via pendingChatContext).
       chatContext: ds.pendingChatContext,
+      groupJoinContext: ds.pendingGroupJoinContext,
       // #794 后续：opening 也走 hook 注入（sender/mentions 进 envelope，PTY 文本
       // 只剩正文）。turnId 必须与 forkReservedInitialSession 传给 forkWorker 的
       // 权威 turnId 一致（= 最终 managedTurnOrigin.turnId），sidecar 才能被 claim。
@@ -18762,6 +18765,8 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingAttachments = undefined;
   ds.pendingMentions = undefined;
   ds.pendingSubstituteTrigger = undefined;
+  ds.pendingGroupJoinContext = undefined;
+  ds.pendingTrustedCaller = undefined;
   ds.pendingSender = undefined;
   ds.pendingCodexAppSteerable = undefined;
   ds.pendingFollowUps = undefined;
@@ -20059,6 +20064,7 @@ function forkReservedInitialSession(
   trustedCaller?: TrustedCaller,
   forkOptions: ForkWorkerOptions = {},
 ): boolean {
+  trustedCaller ??= ds.pendingTrustedCaller;
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
   if (trustedCaller) input.trustedCaller = trustedCaller;
@@ -24322,6 +24328,46 @@ async function handleBotAdded(
     if (chatContext.mode === 'unknown') {
       logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 群模式未知，按普通群路由`);
     }
+    let groupJoinSender: ResolvedSender | undefined;
+    let groupJoinTrustedCaller: TrustedCaller | undefined;
+    let groupJoinGateMatched = false;
+    if (!forced) {
+      const groupJoinGate = await evaluatePromptGate('chat.bot_added', {
+        larkAppId,
+        chatId,
+        operatorOpenId,
+        chatName: chatContext.name,
+        chatDescription: chatContext.description,
+        chatMode: chatContext.mode,
+        chatFetchStatus: chatContext.fetchStatus,
+      }, {
+        // event-dispatcher already emitted the async chat.bot_added observers.
+        // This call consumes only sync adjudicators so observers run exactly once.
+        emitObservers: false,
+      });
+      if (!groupJoinGate.allowed
+        || (botCfg.autoStartOnGroupJoinGateRequired === true && groupJoinGate.matched !== true)) {
+        logger.info(
+          `[auto-start:入群] ${chatId.substring(0, 12)} 同步 gate 未放行，静默跳过`
+          + `${groupJoinGate.reason ? ` (${groupJoinGate.reason})` : ''}`,
+        );
+        return;
+      }
+      groupJoinGateMatched = groupJoinGate.matched === true;
+
+      // The lifecycle event's operator is the only candidate human for this
+      // synthetic opening turn. Resolve it for the prompt and carry the same
+      // daemon-owned identity into managed-turn authority; current-actor still
+      // performs a fresh strict contact lookup before granting anything.
+      groupJoinSender = operatorOpenId
+        ? await resolveSender(larkAppId, operatorOpenId, 'user').catch(() => undefined)
+        : undefined;
+      groupJoinTrustedCaller = groupJoinSender?.type === 'user'
+        && groupJoinSender.openId === operatorOpenId
+        ? trustedCallerForTurn(larkAppId, operatorOpenId, undefined, false)
+        : undefined;
+    }
+
     const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
     const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
     // 入群 seed 消息文案：bot 配置了 autoStartOnGroupJoinSeed 用之，否则回退内置 i18n。
@@ -24400,6 +24446,18 @@ async function handleBotAdded(
       // 新建话题：session 刚创建、尚无 cliId / cliLaunchSnapshot（`/cli use` 只能在之后触发），bot 配置是唯一来源。
       pendingCodexAppText: isCodexAppCliId(botCfg.cliId) ? codexAppText : undefined,
       pendingChatContext: chatContext,
+      ...(!forced ? {
+        pendingGroupJoinContext: {
+          event: 'chat.bot_added' as const,
+          larkAppId,
+          chatId,
+          turnId: joinTurnId,
+          ...(operatorOpenId ? { operatorOpenId } : {}),
+          gateMatched: groupJoinGateMatched,
+        },
+      } : {}),
+      pendingSender: groupJoinSender,
+      pendingTrustedCaller: groupJoinTrustedCaller,
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
@@ -24493,6 +24551,7 @@ async function handleBotAdded(
     const armSharedReplyTarget = (): void => {
       if (!sharedReplyRootId) return;
       ds.pendingTurnId = sharedReplyRootId;
+      if (ds.pendingGroupJoinContext) ds.pendingGroupJoinContext.turnId = sharedReplyRootId;
       beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
       sessionStore.updateSession(ds.session);
     };
@@ -24590,9 +24649,11 @@ async function handleBotAdded(
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      forkReservedInitialSession(ds, availableBots, groupJoinTrustedCaller);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
+      ds.pendingGroupJoinContext = undefined;
+      ds.pendingTrustedCaller = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
     }
@@ -24654,9 +24715,11 @@ async function handleBotAdded(
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      forkReservedInitialSession(ds, availableBots, groupJoinTrustedCaller);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
+      ds.pendingGroupJoinContext = undefined;
+      ds.pendingTrustedCaller = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录${projects.length > 0 ? '且 repo 卡不可用' : '且无可选项目'}，直接开工`);
     }
   } finally {

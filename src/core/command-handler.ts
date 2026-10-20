@@ -3016,6 +3016,8 @@ export async function handleCommand(
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
+            current.pendingGroupJoinContext = undefined;
+            current.pendingTrustedCaller = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;
             current.pendingSubstituteTrigger = undefined;

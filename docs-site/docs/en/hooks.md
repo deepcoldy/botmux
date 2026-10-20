@@ -2,7 +2,7 @@
 
 botmux can invoke external commands when key lifecycle events occur. By default they are **asynchronous**: if a command fails, times out, or doesn't exist, it only writes to the log and never blocks botmux's main flow.
 
-There is also a **synchronous pre-submit gate** (`mode: "sync"`, supported only on the `prompt.submit` event): the daemon waits for it and uses its verdict to decide whether the message reaches the CLI. See [Synchronous pre-submit gate](#synchronous-pre-submit-gate-promptsubmit).
+There are also **synchronous gates** (`mode: "sync"`): `prompt.submit` decides whether a message reaches the CLI, while `chat.bot_added` decides whether enabled join auto-start may continue. See [Synchronous gates](#synchronous-gates).
 
 ## Configuration Location
 
@@ -54,8 +54,9 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `event` | string | Required. The event name to subscribe to (see table below) |
 | `command` | string | Required. The external executable command; supports arguments, but is not run through a shell |
 | `timeoutMs` | number | Optional. Defaults to 5000; on timeout, sends `SIGTERM` first, then falls back to `SIGKILL` |
-| `mode` | `"sync"`｜`"async"` | Optional, defaults to `async` (notification, non-blocking). `sync` (awaited, can block) is supported **only on gate events** (currently `prompt.submit`); declaring it on any other event degrades to `async` with a warning in the log. **Gate events also support `async`** — one event can carry both observers and adjudicators |
+| `mode` | `"sync"`｜`"async"` | Optional, defaults to `async` (notification, non-blocking). `sync` (awaited, can block) is supported **only on gate events** (currently `prompt.submit` and `chat.bot_added`); declaring it on any other event degrades to `async` with a warning in the log. **Gate events also support `async`** — one event can carry both observers and adjudicators |
 | `onError` | `"allow"`｜`"deny"` | Optional, meaningful only with `mode:"sync"`. Fallback direction when the hook itself fails (timeout / missing command / crash). Defaults to `allow` (fail-open) |
+| `filter.larkAppId` | string｜string[] | Optional. Only match the specified bot app. `lark_app_id` is accepted as a compatibility input and normalized to camelCase |
 | `filter.chatId` | string｜string[] | Optional. Only match the chat of the specified Lark group / topic |
 | `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id |
 | `redact.fullContentEvents` | string[] | Optional. Long text is truncated by default; events in this allowlist pass through the full text |
@@ -66,10 +67,10 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 
 | Event | Trigger |
 |------|----------|
-| `chat.bot_added` | The bot was added to a chat (requires subscribing `im.chat.member.bot.added_v1` in the Feishu console). Payload: `chatId`, `operatorOpenId`. For a per-bot join script you can also use `groupJoinCommand` in bots.json (editable under Auto-start in the Dashboard) |
+| `chat.bot_added` | The bot was added to a chat (requires subscribing `im.chat.member.bot.added_v1`). Async observers receive `larkAppId`, `chatId`, and `operatorOpenId`; a sync gate also receives host-read `chatName`, `chatDescription`, `chatMode`, and `chatFetchStatus`, and adjudicates before join auto-start creates a session or seed. For an independent per-bot join script you can still use `groupJoinCommand` in bots.json |
 | `topic.new` | A new topic / @mention is received |
 | `thread.reply` | A reply to an existing topic is received |
-| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. Usable as a plain notification (default `async`), and the only event that supports `mode:"sync"` blocking |
+| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. Usable as a plain notification (default `async`) or a `mode:"sync"` pre-submit gate |
 | `outbound.send` | botmux successfully sends a regular message |
 | `outbound.reply` | botmux successfully replies to a topic message |
 | `schedule.fired` | A scheduled task finishes its precondition check and dispatch attempt (success, skip, or error) |
@@ -86,7 +87,7 @@ Different events carry extra fields:
 
 | Event | Extra fields |
 |------|----------|
-| `chat.bot_added` | `chatId`, `operatorOpenId` |
+| `chat.bot_added` | Observer: `larkAppId`, `chatId`, `operatorOpenId`; sync gate additionally receives `chatName`, `chatDescription`, `chatMode`, `chatFetchStatus` |
 | `topic.new` | `messageId`, `senderOpenId`, `senderType`, `msgType`, `content` |
 | `prompt.submit` | `messageId`, `chatId`, `chatType`, `anchor`, `senderOpenId`, `senderUnionId`, `memberUnionId`, `botSender`, `talkReason`, `content`, `attachments` (`[{type,name}]`, metadata only) |
 | `thread.reply` | `messageId`, `rootId`, `parentId`, `senderOpenId`, `senderType`, `msgType`, `content` |
@@ -104,9 +105,11 @@ Different events carry extra fields:
 
 By default, `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to **600 characters**, with `xxxLength` / `xxxTruncated` added; only events in `redact.fullContentEvents` pass through the full text.
 
-## Synchronous pre-submit gate (prompt.submit)
+## Synchronous gates
 
-A regular hook is a *notification* — nothing reads its result. `prompt.submit` with `mode: "sync"` is a *verdict*: the daemon waits for it, reads it, and allows or rejects the message accordingly. Use it to add a custom authorization layer before a message reaches the CLI (an internal permission service, working-hours limits, dangerous-command interception, …).
+A regular hook is a *notification* — nothing reads its result. A gate event with `mode: "sync"` is a *verdict*: the daemon waits for it, reads it, and allows or rejects the action. `prompt.submit` gates a message before it reaches the CLI. `chat.bot_added` gates only `autoStartOnGroupJoin`; it does not block async observers, `groupJoinCommand`, or owner auto-invite.
+
+For join automation that must have zero visible effects outside its target chats, set `autoStartOnGroupJoinGateRequired: true` on the bot and `onError: "deny"` on the gate. Missing, unmatched, timed-out, or crashed gates then fail closed instead of starting in every new group. Explicit human `forcePrompt` paths bypass the join gate.
 
 ```json
 [

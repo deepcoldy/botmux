@@ -2,7 +2,7 @@
 
 botmux 可以在关键生命周期事件发生时调用外部命令。默认是**异步**的：命令失败、超时或不存在只会写日志，不阻塞 botmux 主流程。
 
-另有一类**同步前置校验闸**（`mode: "sync"`，仅 `prompt.submit` 事件支持）：daemon 会等它跑完，并按它的裁决决定这条消息要不要提交给 CLI。见下文[同步前置校验闸](#同步前置校验闸-promptsubmit)。
+另有一类**同步前置校验闸**（`mode: "sync"`）：`prompt.submit` 可决定消息是否提交给 CLI；`chat.bot_added` 可决定已开启的入群自动开工是否继续。见下文[同步前置校验闸](#同步前置校验闸)。
 
 ## 配置位置
 
@@ -54,8 +54,9 @@ tail -f /tmp/botmux-hook.log
 | `event` | string | 必填。订阅的事件名（见下表） |
 | `command` | string | 必填。外部可执行命令；支持参数，但不经 shell 执行 |
 | `timeoutMs` | number | 可选。默认 5000；超时先 `SIGTERM`，再兜底 `SIGKILL` |
-| `mode` | `"sync"`｜`"async"` | 可选。默认 `async`（通知，不阻塞）。`sync`（等裁决、可拦截）**仅 gate 事件支持**（当前为 `prompt.submit`）；其它事件写 `sync` 会降级为 `async` 并在日志告警。**gate 事件同样支持 `async`**——同一事件上可以既挂通知又挂裁决 |
+| `mode` | `"sync"`｜`"async"` | 可选。默认 `async`（通知，不阻塞）。`sync`（等裁决、可拦截）**仅 gate 事件支持**（当前为 `prompt.submit`、`chat.bot_added`）；其它事件写 `sync` 会降级为 `async` 并在日志告警。**gate 事件同样支持 `async`**——同一事件上可以既挂通知又挂裁决 |
 | `onError` | `"allow"`｜`"deny"` | 可选，仅 `mode:"sync"` 有意义。hook 自身失败（超时/找不到命令/崩溃）时的兜底方向，默认 `allow`（fail-open） |
+| `filter.larkAppId` | string｜string[] | 可选。只匹配指定 Bot 应用；同义字段 `lark_app_id` 只作兼容输入，归一化后统一使用 camelCase |
 | `filter.chatId` | string｜string[] | 可选。只匹配指定飞书群 / 话题所在 chat |
 | `filter.senderOpenId` | string｜string[] | 可选。只匹配指定发送者 open_id |
 | `redact.fullContentEvents` | string[] | 可选。默认截断长文本；列入 allowlist 的事件透传全文 |
@@ -66,10 +67,10 @@ tail -f /tmp/botmux-hook.log
 
 | 事件 | 触发时机 |
 |------|----------|
-| `chat.bot_added` | bot 被拉进一个群（需在飞书后台订阅 `im.chat.member.bot.added_v1`）。payload：`chatId`、`operatorOpenId`。只想给某个 bot 配入群脚本时，也可以用 bots.json 的 `groupJoinCommand`（Dashboard 主动开工里可编辑） |
+| `chat.bot_added` | bot 被拉进一个群（需在飞书后台订阅 `im.chat.member.bot.added_v1`）。异步观察 payload 含 `larkAppId`、`chatId`、`operatorOpenId`；同步 gate 还会收到宿主读取的 `chatName`、`chatDescription`、`chatMode`、`chatFetchStatus`，并在入群自动开工创建会话／seed 前裁决。只想给某个 bot 配独立入群脚本时，也可以用 bots.json 的 `groupJoinCommand`（Dashboard 主动开工里可编辑） |
 | `topic.new` | 收到新话题 / @mention |
 | `thread.reply` | 收到已有话题回复 |
-| `prompt.submit` | 消息通过内置权限校验、**即将提交给 CLI 之前**。既可当普通通知（默认 `async`），也是唯一支持 `mode:"sync"` 前置拦截的事件 |
+| `prompt.submit` | 消息通过内置权限校验、**即将提交给 CLI 之前**。既可当普通通知（默认 `async`），也可用 `mode:"sync"` 前置拦截 |
 | `outbound.send` | botmux 发送普通消息成功 |
 | `outbound.reply` | botmux 回复话题消息成功 |
 | `schedule.fired` | 定时任务的前置检查与提交结束（成功、跳过或报错） |
@@ -86,7 +87,7 @@ tail -f /tmp/botmux-hook.log
 
 | 事件 | 额外字段 |
 |------|----------|
-| `chat.bot_added` | `chatId`、`operatorOpenId` |
+| `chat.bot_added` | 观察通知：`larkAppId`、`chatId`、`operatorOpenId`；同步 gate 另含 `chatName`、`chatDescription`、`chatMode`、`chatFetchStatus` |
 | `topic.new` | `messageId`、`senderOpenId`、`senderType`、`msgType`、`content` |
 | `prompt.submit` | `messageId`、`chatId`、`chatType`、`anchor`、`senderOpenId`、`senderUnionId`、`memberUnionId`、`botSender`、`talkReason`、`content`、`attachments`（`[{type,name}]`，仅元信息） |
 | `thread.reply` | `messageId`、`rootId`、`parentId`、`senderOpenId`、`senderType`、`msgType`、`content` |
@@ -104,9 +105,11 @@ tail -f /tmp/botmux-hook.log
 
 默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 **600 字符**，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` 内的事件透传全文。
 
-## 同步前置校验闸（prompt.submit）
+## 同步前置校验闸
 
-普通 hook 是「通知」——跑完没人看结果。`prompt.submit` + `mode: "sync"` 是「裁决」：daemon 等它、读它、按它放行或拒绝。用于在消息进入 CLI 前做一层**自定义权限校验**（内部权限服务、工作时间限制、高危指令拦截等）。
+普通 hook 是「通知」——跑完没人看结果。gate 事件 + `mode: "sync"` 是「裁决」：daemon 等它、读它、按它放行或拒绝。`prompt.submit` 用于消息进入 CLI 前的自定义权限校验；`chat.bot_added` 只裁决 `autoStartOnGroupJoin`，不会阻止异步观察 hook、`groupJoinCommand` 或 owner 自动入群。
+
+对需要“非目标群零可见副作用”的入群自动化，建议同时设置 Bot 的 `autoStartOnGroupJoinGateRequired: true`，并给 gate 配 `onError: "deny"`。这样 hook 缺失、无匹配、超时或崩溃都不会退化为对全部新群开工。显式 `forcePrompt` 的人工入口不走这道入群 gate。
 
 ```json
 [
