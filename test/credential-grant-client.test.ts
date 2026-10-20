@@ -70,11 +70,33 @@ describe('requestCredentialGrant', () => {
     ['extra variables', { LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't', PATH: '/evil' }],
     ['missing required', { LARKSUITE_CLI_APP_ID: 'a' }],
     ['newline in value', { LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't\nexport X=1' }],
-  ])('rejects a grant with %s — the platform cannot inject arbitrary env', async (_label, variables) => {
+  ])('rejects a lark-cli grant with %s — the platform cannot inject arbitrary env', async (_label, variables) => {
     const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'lark-cli', unionId: 'on_alice', expiresAt: future(), variables } }]);
     const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
     expect(r.ok).toBe(false);
     expect(!r.ok && r.reason).toBe('invalid_response');
+  });
+
+  it.each([
+    ['missing cloud JWT', { BYTEDCLI_USER_CODE_JWT: 'code' }],
+    ['lark keys smuggled into a bytedcli grant', { BYTEDCLI_USER_CLOUD_JWT: 'c', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't' }],
+    ['empty required value', { BYTEDCLI_USER_CLOUD_JWT: '' }],
+  ])('rejects a bytedcli grant with %s', async (_label, variables) => {
+    const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(!r.ok && r.reason).toBe('invalid_response');
+  });
+
+  it('accepts a bytedcli grant with only the cloud JWT (Codebase JWT is optional)', async () => {
+    const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: { BYTEDCLI_USER_CLOUD_JWT: 'cloud' } } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(r.ok && r.value.variables).toEqual({ BYTEDCLI_USER_CLOUD_JWT: 'cloud' });
+  });
+
+  it('passes retryAfterMs through on 429 so callers can back off', async () => {
+    const { http } = fakeHttp([{ status: 429, json: { error: 'rate_limited', retryAfterMs: 750 } }]);
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect(!r.ok && r.reason === 'rate_limited' && r.retryAfterMs).toBe(750);
   });
 
   it.each([

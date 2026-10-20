@@ -88,6 +88,30 @@ describe('companion wrapper', () => {
     expect(out).toBe('code-jwt|unset|mr list');
   });
 
+  it('a refused bytedcli identity makes the codebase wrapper refuse too, never running the real binary', () => {
+    const real = join(dir, 'real-codebase-denied.sh');
+    writeFileSync(real, '#!/bin/sh\necho RAN_AS_MACHINE\n');
+    chmodSync(real, 0o755);
+    const wrapper = join(dir, 'codebase');
+    writeFileSync(wrapper, renderIdentityWrapper('codebase', real));
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', mode: 'denied', message: 'botmux: 需要授权 bytedcli' });
+    let status = 0; let stderr = ''; let stdout = '';
+    try {
+      stdout = execFileSync('/bin/sh', [wrapper, 'mr', 'list'], {
+        encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e: any) { status = e.status; stderr = String(e.stderr ?? ''); stdout = String(e.stdout ?? ''); }
+    expect(status).toBe(77);
+    expect(stderr).toContain('需要授权 bytedcli');
+    expect(stdout).not.toContain('RAN_AS_MACHINE');
+    // Same when bytedcli was granted but no Codebase JWT came with it.
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cloud' });
+    let status2 = 0;
+    try { execFileSync('/bin/sh', [wrapper], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (e: any) { status2 = e.status; }
+    expect(status2).toBe(77);
+  });
+
   it('prepareTriggerUserCliEnv wraps codebase whenever bytedcli is governed', () => {
     const fakeBin = join(dir, 'fakebin');
     mkdirSync(fakeBin);

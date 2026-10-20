@@ -11,7 +11,7 @@
  * Run:  npx vitest run --project unit test/turn-cli-identity-platform.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -91,7 +91,26 @@ const granted = (tool: 'lark-cli' | 'bytedcli') => ({
   },
 });
 
+describe('policy off', () => {
+  it('a bot without triggerUserAuth never consults the platform and publishes nothing', async () => {
+    grantResponse = granted('lark-cli');
+    const out = await publish(botConfig({ enabled: false }), ALICE);
+    expect(out.every(o => o.state === 'off')).toBe(true);
+    expect(grantCalls).toHaveLength(0);
+    expect(existsSync(sessionIdentityPath(dir, SESSION, 'lark-cli'))).toBe(false);
+    expect(existsSync(sessionIdentityPath(dir, SESSION, 'bytedcli'))).toBe(false);
+  });
+});
+
 describe('credentialSource = local', () => {
+  it('bytedcli in local mode mints from the per-person login on this machine', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'local-cloud', codeJwt: 'local-code' });
+    const out = await publish(botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' }), ALICE);
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
+    expect(grantCalls).toHaveLength(0);
+    expect(read('bytedcli')).toContain("BYTEDCLI_USER_CLOUD_JWT='local-cloud'");
+  });
+
   it('never consults the platform even when bound', async () => {
     larkHomes.set(ALICE, '/homes/alice');
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'local' }), ALICE);
@@ -194,6 +213,16 @@ describe('credentialSource = auto, machine bound', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
     expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
     expect(grantCalls).toHaveLength(0);
+    expect(beginLarkCliLogin).not.toHaveBeenCalled();
+  });
+
+  it("with an unresolvable union id, the sender's OWN existing local HOME is still honoured (same person, keyed by open_id)", async () => {
+    unionIds.set(ALICE, null);
+    larkHomes.set(ALICE, '/homes/alice');
+    const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'] }), ALICE);
+    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('user');
+    expect(read('lark-cli')).toContain("BOTMUX_IDENTITY_HOME='/homes/alice'");
+    expect(grantCalls).toHaveLength(0);
   });
 
   it('withholds for a turn with no human sender without asking the platform', async () => {
@@ -228,15 +257,33 @@ describe('credentialSource = platform', () => {
     const out = await publish(botConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' }), ALICE);
     expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('user');
   });
+
+  it.each([
+    ['network', { ok: false, reason: 'network', error: 'ECONNRESET' }],
+    ['5xx', { ok: false, reason: 'unavailable', status: 503, error: 'store_unavailable' }],
+    ['not deployed', { ok: false, reason: 'not_deployed', status: 404 }],
+  ])('platform unreachable (%s): reports unavailable, ignores a local HOME and starts no local login', async (_label, resp) => {
+    grantResponse = resp;
+    larkHomes.set(ALICE, '/homes/alice');
+    const out = await publish(botConfig({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), ALICE);
+    expect(out.find(o => o.tool === 'lark-cli')?.state).toBe('unavailable');
+    expect(read('lark-cli')).toContain('中心化平台暂时不可达');
+    expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    expect(beginLarkCliLogin).not.toHaveBeenCalled();
+  });
 });
 
 describe('delegated identity (signed cross-bot dispatch)', () => {
+  // credentialOpenId is the requester as seen by the ISSUING app; targetOpenId is
+  // the same human in the receiving app. The platform key must come from the
+  // former (that is what the daemon verified), so keep the two distinct here.
   const delegated = (tools: Array<'lark-cli' | 'bytedcli'>) => ({
-    credentialOpenId: 'ou_requester', targetOpenId: 'ou_requester', tools, dispatchRoot: 'om_root',
+    credentialOpenId: 'ou_requester', targetOpenId: 'ou_requester_in_target_app', tools, dispatchRoot: 'om_root',
   });
 
   it('asks the platform for the original requester, not the dispatching bot', async () => {
     unionIds.set('ou_requester', 'on_requester');
+    unionIds.set('ou_requester_in_target_app', 'on_wrong_key');
     grantResponse = (req: any) => (req.unionId === 'on_requester' ? granted('lark-cli') : { ok: false, reason: 'not_authorized', error: 'x' });
     const out = await publishTurnCliIdentity({
       botConfig: botConfig({ enabled: true, tools: ['lark-cli'] }), sessionDataDir: dir, sessionId: SESSION,
