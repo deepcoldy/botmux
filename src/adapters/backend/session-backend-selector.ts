@@ -508,7 +508,10 @@ export function selectSessionBackend(opts: {
 
   if (opts.backendType === 'herdr') {
     const ownedSessionName = HerdrBackend.sessionName(opts.sessionId);
-    const herdrCfg = opts.herdrConfig ?? (opts.backendConfig && typeof opts.backendConfig === 'object' && 'sessionName' in opts.backendConfig ? (opts.backendConfig as HerdrBackendConfig) : undefined);
+    // The caller has already applied chatTypes (herdrConfigForSession); never
+    // re-derive placement from backendConfig, or an excluded session would get
+    // it back.
+    const herdrCfg = opts.herdrConfig;
     const configuredSession = herdrCfg?.sessionName?.trim();
     const isCustomSession = Boolean(configuredSession && configuredSession !== HerdrBackend.managedSessionName());
     const hostSessionName = configuredSession || HerdrBackend.managedSessionName();

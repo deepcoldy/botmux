@@ -51,7 +51,7 @@ import {
   selectSessionBackend,
   retireSupersededRecordedHerdrTarget,
 } from '../src/adapters/backend/session-backend-selector.js';
-import { herdrConfigForChatType, normalizeHerdrChatTypes } from '../src/adapters/backend/types.js';
+import { herdrConfigForChatType, herdrConfigForSession, normalizeHerdrChatTypes } from '../src/adapters/backend/types.js';
 
 describe('selectSessionBackend with Herdr placement config', () => {
   beforeEach(() => {
@@ -186,5 +186,52 @@ describe('Herdr placement chatTypes', () => {
     expect(herdrConfigForChatType(config, 'p2p')).toBeUndefined();
     expect(herdrConfigForChatType(config, undefined)).toBeUndefined();
     expect(herdrConfigForChatType(undefined, 'group')).toBeUndefined();
+  });
+});
+
+describe('Herdr placement from worker decision to backend selection', () => {
+  beforeEach(() => {
+    mockHerdrState.sessions = new Set(['botmux', 'default']);
+    mockHerdrState.agents = new Set();
+    mockHerdrState.killedAgents = [];
+  });
+
+  // Same wiring as worker.ts: the full herdr block arrives as backendConfig,
+  // the worker decides the placement for this chat, the selector only obeys it.
+  const backendConfig = { sessionName: 'default', placement: 'split' as const, tab: '3', chatTypes: ['group' as const] };
+  const select = (chatType: 'group' | 'p2p') => selectSessionBackend({
+    sessionId: 'test-session-1234',
+    backendType: 'herdr',
+    backendConfig,
+    herdrConfig: herdrConfigForSession(backendConfig, chatType),
+  });
+
+  it('keeps an excluded chat type on the default host even though backendConfig carries the block', () => {
+    const selected = select('p2p');
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect((selected.backend as any).opts?.herdrConfig).toBeUndefined();
+    expect((selected.backend as any).opts?.isCustomHost).toBeUndefined();
+  });
+
+  it('places an included chat type in the configured session', () => {
+    const selected = select('group');
+    expect((selected.backend as any).sessionName).toBe('default');
+    expect((selected.backend as any).opts?.herdrConfig).toBe(backendConfig);
+    expect((selected.backend as any).opts?.isCustomHost).toBe(true);
+  });
+
+  it('never re-derives placement from backendConfig alone', () => {
+    const selected = selectSessionBackend({
+      sessionId: 'test-session-1234',
+      backendType: 'herdr',
+      backendConfig: { sessionName: 'default', placement: 'split' },
+    });
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect((selected.backend as any).opts?.herdrConfig).toBeUndefined();
+  });
+
+  it('reads no placement from a non-herdr backendConfig', () => {
+    expect(herdrConfigForSession({ baseUrl: 'https://riff.example' }, 'group')).toBeUndefined();
+    expect(herdrConfigForSession(undefined, 'group')).toBeUndefined();
   });
 });

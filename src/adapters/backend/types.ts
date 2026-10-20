@@ -65,6 +65,20 @@ export function normalizeHerdrChatTypes(raw: unknown): Array<'group' | 'p2p'> | 
   return types.length > 0 ? types : undefined;
 }
 
+/** The Herdr placement a worker applies, from its init `backendConfig`.
+ *  Undefined (default host and placement) when there is no herdr block or
+ *  `chatTypes` excludes this session's chat type. */
+export function herdrConfigForSession(
+  backendConfig: unknown,
+  chatType: 'group' | 'p2p' | undefined,
+): HerdrBackendConfig | undefined {
+  const config = backendConfig && typeof backendConfig === 'object'
+    && ('sessionName' in backendConfig || 'placement' in backendConfig)
+    ? backendConfig as HerdrBackendConfig
+    : undefined;
+  return herdrConfigForChatType(config, chatType);
+}
+
 /** The Herdr placement for one session, or undefined when `chatTypes` excludes
  *  its chat type (the session then uses the default host). */
 export function herdrConfigForChatType(
