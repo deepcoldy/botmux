@@ -510,6 +510,10 @@ export interface DaemonSession {
   turnTerminalCarriers?: Map<string, {
     messageId: string;
     kind: 'standard_reply_card' | 'non_patchable';
+    /** Explicit send classification. `progress` / `auxiliary` are visible
+     *  interim output and must never be promoted to a completed-turn carrier.
+     *  Undefined is retained for rolling compatibility with older workers. */
+    responseKind?: 'progress' | 'final' | 'auxiliary';
   }>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a

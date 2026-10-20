@@ -1359,13 +1359,35 @@ const TERMINAL_RECEIPT_DEDUPE_MAX = 64;
 const TERMINAL_RECEIPT_RETRY_BACKOFF_MS = [0, 1000, 5000] as const;
 const TURN_TERMINAL_CARRIER_MAX = 64;
 
+type TurnTerminalCarrier = {
+  messageId: string;
+  kind: 'standard_reply_card' | 'non_patchable';
+  responseKind?: 'progress' | 'final' | 'auxiliary';
+};
+
+function isFinalTurnTerminalCarrier(
+  carrier: TurnTerminalCarrier | undefined,
+): carrier is TurnTerminalCarrier {
+  return !!carrier
+    && carrier.responseKind !== 'progress'
+    && carrier.responseKind !== 'auxiliary';
+}
+
 function recordTurnTerminalCarrier(
   ds: DaemonSession,
   turnId: string,
-  carrier: { messageId: string; kind: 'standard_reply_card' | 'non_patchable' },
+  carrier: TurnTerminalCarrier,
 ): void {
   if (!turnId || !carrier.messageId) return;
   const carriers = ds.turnTerminalCarriers ?? (ds.turnTerminalCarriers = new Map());
+  const previous = carriers.get(turnId);
+  // A final is the authoritative completion carrier. Later auxiliary/progress
+  // sends are supplemental and must neither steal its footer patch nor turn
+  // themselves into a completed-turn strip. Undefined preserves rolling
+  // compatibility with workers that predate responseKind propagation.
+  const previousIsFinal = isFinalTurnTerminalCarrier(previous);
+  const nextIsFinal = isFinalTurnTerminalCarrier(carrier);
+  if (previousIsFinal && !nextIsFinal) return;
   carriers.delete(turnId);
   carriers.set(turnId, carrier);
   while (carriers.size > TURN_TERMINAL_CARRIER_MAX) {
@@ -17028,6 +17050,7 @@ function setupWorkerHandlers(
           recordTurnTerminalCarrier(ds, msg.turnId, {
             messageId: msg.messageId,
             kind: msg.terminalCarrier,
+            ...(msg.responseKind ? { responseKind: msg.responseKind } : {}),
           });
         }
         if (ds.session.principalLane && msg.messageId) {
@@ -17527,13 +17550,22 @@ function setupWorkerHandlers(
         // must retain their pre-existing explicit-@ text receipt instead;
         // managed turns remain suppressed by the existing gate below.
         const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
-        const terminalCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
-        const terminalReceiptKind: TurnTerminalReceiptKind | undefined = msg.status === 'completed'
+        const visibleCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
+        const terminalCarrier = isFinalTurnTerminalCarrier(visibleCarrier)
+          ? visibleCarrier
+          : undefined;
+        let terminalReceiptKind: TurnTerminalReceiptKind | undefined;
+        // An explicit progress/auxiliary send is positive proof that the
+        // visible card is non-final. The CLI already persists responseKind;
+        // never overwrite that contract with a mechanical completion footer.
+        if (msg.status === 'completed' && !(visibleCarrier && !terminalCarrier)) {
           // A successful explicit send is visible output even though the
           // model's final assistant block is the required suppression sentinel.
           // Only a genuinely bodyless turn may claim "AI determined no reply".
-          ? (msg.outputDisposition === 'nothing_to_send' && !terminalCarrier ? 'silent' : 'completed')
-          : undefined;
+          terminalReceiptKind = msg.outputDisposition === 'nothing_to_send' && !terminalCarrier
+            ? 'silent'
+            : 'completed';
+        }
         const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
           && !!terminalReplyContext
           && !recoveryHandled
@@ -17556,7 +17588,7 @@ function setupWorkerHandlers(
         //     it must never re-trigger the bot (or a peer bot) that went quiet.
         if (msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
-          && !terminalCarrier
+          && !visibleCarrier
           && !ds.session.vcMeetingReceiver) {
           // Consume the origin record ONLY when this attempt could actually post:
           // a suppressed attempt that ate the record would leave a later,
@@ -19783,6 +19815,7 @@ function deliverFinalOutput(
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
           kind: 'standard_reply_card',
+          responseKind: 'final',
         });
       }
       recordPrimaryOutput(messageId);

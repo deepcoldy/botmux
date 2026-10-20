@@ -228,6 +228,103 @@ describe('independent turn terminal receipt', () => {
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
+  it.each(['progress', 'auxiliary'] as const)(
+    'does not promote an explicit %s card to completed',
+    async responseKind => {
+      const ds = makeDs();
+      bindLarkTurn(ds, `om_turn_${responseKind}`);
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'explicit_reply_observed',
+        turnId: `om_turn_${responseKind}`,
+        messageId: `om_${responseKind}_card`,
+        responseKind,
+        terminalCarrier: 'standard_reply_card',
+      } satisfies WorkerToDaemon);
+      (ds.worker as any).emit('message', terminalMsg(`om_turn_${responseKind}`, {
+        outputDisposition: 'nothing_to_send',
+      }));
+
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(patchCardStreamElement).not.toHaveBeenCalled();
+      expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+      expect(sessionReplyMock).not.toHaveBeenCalled();
+      expect(ds.terminalReceiptTurnIds?.has(`om_turn_${responseKind}`)).not.toBe(true);
+    },
+  );
+
+  it.each(['progress', 'auxiliary'] as const)(
+    'keeps the explicit final carrier when a later %s send is observed',
+    async responseKind => {
+      const ds = makeDs();
+      bindLarkTurn(ds, `om_turn_final_then_${responseKind}`);
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'explicit_reply_observed',
+        turnId: `om_turn_final_then_${responseKind}`,
+        messageId: 'om_final_card',
+        responseKind: 'final',
+        terminalCarrier: 'standard_reply_card',
+      } satisfies WorkerToDaemon);
+      (ds.worker as any).emit('message', {
+        type: 'explicit_reply_observed',
+        turnId: `om_turn_final_then_${responseKind}`,
+        messageId: `om_later_${responseKind}_card`,
+        responseKind,
+        terminalCarrier: 'standard_reply_card',
+      } satisfies WorkerToDaemon);
+      (ds.worker as any).emit('message', terminalMsg(`om_turn_final_then_${responseKind}`));
+
+      await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalled());
+      expect(getMessageDetail).toHaveBeenCalledWith(
+        'app_test',
+        'om_final_card',
+        { userCardContent: true },
+      );
+      expect(getMessageDetail).not.toHaveBeenCalledWith(
+        'app_test',
+        `om_later_${responseKind}_card`,
+        expect.anything(),
+      );
+    },
+  );
+
+  it('promotes a later explicit final over an earlier progress carrier', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_progress_then_final');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_progress_then_final',
+      messageId: 'om_progress_card',
+      responseKind: 'progress',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_progress_then_final',
+      messageId: 'om_final_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_progress_then_final'));
+
+    await vi.waitFor(() => expect(patchCardStreamElement).toHaveBeenCalled());
+    expect(getMessageDetail).toHaveBeenCalledWith(
+      'app_test',
+      'om_final_card',
+      { userCardContent: true },
+    );
+    expect(getMessageDetail).not.toHaveBeenCalledWith(
+      'app_test',
+      'om_progress_card',
+      expect.anything(),
+    );
+  });
+
   it('treats a suppression sentinel as completed when an explicit body was sent', async () => {
     const ds = makeDs();
     bindLarkTurn(ds, 'om_turn_explicit_then_sentinel');
