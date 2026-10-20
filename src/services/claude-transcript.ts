@@ -1391,6 +1391,18 @@ export interface JsonlFingerprintSearchOptions {
    *  under a busier sibling. Default (no callback): accept the first
    *  fingerprint match like the original behaviour. */
   acceptCandidate?: (path: string) => boolean;
+  /** Also scan Task/Agent subagent transcripts at
+   *  `<projectDir>/<sessionId>/subagents/*.jsonl`. A prompt submitted while a
+   *  Task tool agent is running is delivered to that subagent and recorded in
+   *  ITS jsonl ("The user sent a new message while you were working: …"), not
+   *  in the session jsonl the bridge is watching — the top-level-only scan
+   *  then reports a false submit_unconfirmed even though the prompt landed
+   *  and ran. Only `<uuid>/subagents/` is descended (one level), matching
+   *  Claude Code's on-disk layout, so unrelated nested directories are not
+   *  walked. Callers that PIN the matched path as the new bridge target must
+   *  leave this off: a subagent jsonl must never replace the session jsonl as
+   *  the watched transcript. */
+  includeSubagentTranscripts?: boolean;
 }
 
 /** Scan a single jsonl file's tail for a Lark message fingerprint. Same
@@ -1466,6 +1478,92 @@ export function jsonlContainsFingerprint(
   return false;
 }
 
+/** A Claude Code session directory is named by the session uuid; subagent
+ *  transcripts live directly under `<uuid>/subagents/`. Matching this shape
+ *  (instead of descending every subdirectory) keeps the fingerprint fan-out
+ *  bounded when a project dir accumulates unrelated nested folders. */
+const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Tail-scan one jsonl file for the fingerprint. Mirrors the event-decoding
+ *  rules used everywhere else: role:user text (pure tool_result events
+ *  skipped), optionally queue-operation enqueue, whitespace-normalised
+ *  substring match, with a per-event timestamp guard. Returns:
+ *  - 'match' when a fingerprint-bearing event was found,
+ *  - 'veto' when a match was found but acceptCandidate rejected the file,
+ *  - 'none' otherwise. */
+function jsonlTailMatchFingerprint(
+  path: string,
+  fingerprint: string,
+  opts: JsonlFingerprintSearchOptions,
+): 'match' | 'veto' | 'none' {
+  let hit = false;
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const size = statSync(path).size;
+      // Read at most the trailing 1MB — fingerprints land near the end
+      // of the jsonl when Claude just wrote them. Cheaper than reading
+      // an entire long-lived session.
+      const len = Math.min(size, 1024 * 1024);
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      const text = buf.toString('utf8');
+      // We must NOT do a raw includes() here: Claude writes user content
+      // as a JSON-encoded string, so any newline in the Lark message is
+      // serialized as `\n` on disk while our fingerprint has it
+      // collapsed to a single space. Parse each complete jsonl line,
+      // pick role:user events, and apply the same stringify+normalise
+      // we use in BridgeTurnQueue.ingest. Skip the leading partial line
+      // when we read a strict tail (size > len), since it likely begins
+      // mid-line.
+      const lines = text.split('\n');
+      const startIdx = size > len ? 1 : 0;
+      for (let i = startIdx; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let ev: any;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (!ev || typeof ev !== 'object') continue;
+        // Per-event timestamp guard — see jsonlContainsFingerprint for
+        // the full rationale. Required to keep short fingerprints
+        // ("hello", "test") from matching old user lines in unrelated
+        // sibling jsonls.
+        if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
+          const evMs = Date.parse(ev.timestamp);
+          if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
+        }
+        const role = ev.message?.role ?? ev.type;
+        let text = '';
+        if (role === 'user') {
+          // Skip pure tool_result events — see jsonlContainsFingerprint
+          // for the full rationale; in short, tool_result content is
+          // log output, not user input, and would false-match short
+          // fingerprints like "hello" in unrelated jsonls.
+          if (isPureToolResultUserEvent(ev.message?.content)) continue;
+          text = stringifyUserContent(ev.message?.content);
+        } else if (
+          opts.includeQueueOperations &&
+          ev.type === 'queue-operation' &&
+          ev.operation === 'enqueue'
+        ) {
+          text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+        } else {
+          continue;
+        }
+        const normalisedText = normaliseForFingerprint(text);
+        if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
+          hit = true;
+          break;
+        }
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch { /* unreadable — treat as no match */ }
+  if (!hit) return 'none';
+  return opts.acceptCandidate && !opts.acceptCandidate(path) ? 'veto' : 'match';
+}
+
 export function findJsonlContainingFingerprint(
   dir: string,
   fingerprint: string,
@@ -1486,89 +1584,47 @@ export function findJsonlContainingFingerprint(
   // ones; if two files contain the fingerprint (rare, e.g. user pasted
   // the same message into two panes) we prefer the more recent.
   const candidates: Array<{ path: string; mtime: number }> = [];
+  const addCandidateFile = (full: string, mtimeMs: number): void => {
+    if (opts.excludePath && full === opts.excludePath) return;
+    if (opts.minMtimeMs !== undefined && mtimeMs < opts.minMtimeMs) return;
+    candidates.push({ path: full, mtime: mtimeMs });
+  };
   for (const name of entries) {
-    if (!name.endsWith('.jsonl')) continue;
     const full = join(dir, name);
-    if (opts.excludePath && full === opts.excludePath) continue;
     try {
       const st = statSync(full);
-      if (!st.isFile()) continue;
-      if (opts.minMtimeMs !== undefined && st.mtimeMs < opts.minMtimeMs) continue;
-      candidates.push({ path: full, mtime: st.mtimeMs });
+      if (st.isFile()) {
+        if (name.endsWith('.jsonl')) addCandidateFile(full, st.mtimeMs);
+        continue;
+      }
+      // Subagent transcripts: <projectDir>/<session-uuid>/subagents/*.jsonl.
+      // A prompt submitted while a Task tool agent is running lands in the
+      // SUBAGENT's jsonl, not the session jsonl. Only this exact shape is
+      // descended (one level) — see SESSION_SUBDIR_RE.
+      if (!st.isDirectory() || !opts.includeSubagentTranscripts) continue;
+      if (!SESSION_SUBDIR_RE.test(name)) continue;
+      const subDir = join(full, 'subagents');
+      let subEntries: string[];
+      try {
+        subEntries = readdirSync(subDir);
+      } catch {
+        continue;
+      }
+      for (const subName of subEntries) {
+        if (!subName.endsWith('.jsonl')) continue;
+        const subFull = join(subDir, subName);
+        try {
+          const subSt = statSync(subFull);
+          if (subSt.isFile()) addCandidateFile(subFull, subSt.mtimeMs);
+        } catch { /* ignore */ }
+      }
     } catch { /* ignore */ }
   }
   candidates.sort((a, b) => b.mtime - a.mtime);
   for (const { path } of candidates) {
-    try {
-      const fd = openSync(path, 'r');
-      try {
-        const size = statSync(path).size;
-        // Read at most the trailing 1MB — fingerprints land near the end
-        // of the jsonl when Claude just wrote them. Cheaper than reading
-        // an entire long-lived session.
-        const len = Math.min(size, 1024 * 1024);
-        const buf = Buffer.alloc(len);
-        readSync(fd, buf, 0, len, size - len);
-        const text = buf.toString('utf8');
-        // We must NOT do a raw includes() here: Claude writes user content
-        // as a JSON-encoded string, so any newline in the Lark message is
-        // serialized as `\n` on disk while our fingerprint has it
-        // collapsed to a single space. Parse each complete jsonl line,
-        // pick role:user events, and apply the same stringify+normalise
-        // we use in BridgeTurnQueue.ingest. Skip the leading partial line
-        // when we read a strict tail (size > len), since it likely begins
-        // mid-line.
-        const lines = text.split('\n');
-        const startIdx = size > len ? 1 : 0;
-        for (let i = startIdx; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (!line) continue;
-          let ev: any;
-          try { ev = JSON.parse(line); } catch { continue; }
-          if (!ev || typeof ev !== 'object') continue;
-          // Per-event timestamp guard — see jsonlContainsFingerprint for
-          // the full rationale. Required to keep short fingerprints
-          // ("hello", "test") from matching old user lines in unrelated
-          // sibling jsonls.
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
-          const role = ev.message?.role ?? ev.type;
-          let text = '';
-          if (role === 'user') {
-            // Skip pure tool_result events — see jsonlContainsFingerprint
-            // for the full rationale; in short, tool_result content is
-            // log output, not user input, and would false-match short
-            // fingerprints like "hello" in unrelated jsonls.
-            if (isPureToolResultUserEvent(ev.message?.content)) continue;
-            text = stringifyUserContent(ev.message?.content);
-          } else if (
-            opts.includeQueueOperations &&
-            ev.type === 'queue-operation' &&
-            ev.operation === 'enqueue'
-          ) {
-            text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
-          } else {
-            continue;
-          }
-          const normalisedText = normaliseForFingerprint(text);
-          if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
-            // Allow caller to veto this candidate (e.g., sibling-pane
-            // hijack guard rejecting an untrusted sessionId). On veto,
-            // break out of the line loop so we move to the next, older
-            // candidate instead of returning `null` after the first
-            // fingerprint hit.
-            if (opts.acceptCandidate && !opts.acceptCandidate(path)) {
-              break;
-            }
-            return path;
-          }
-        }
-      } finally {
-        closeSync(fd);
-      }
-    } catch { /* unreadable — skip */ }
+    // A veto moves on to the next-older candidate instead of returning null
+    // after the first fingerprint hit (sibling-pane hijack guard).
+    if (jsonlTailMatchFingerprint(path, fingerprint, opts) === 'match') return path;
   }
   return null;
 }
