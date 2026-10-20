@@ -1648,6 +1648,8 @@ export interface BotConfig {
    * discoverable together.
    */
   senderTag?: boolean;
+  /** Omit only email from prompt sender tags; keep daemon identity intact. Default false. */
+  senderTagHideEmail?: boolean;
   /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
@@ -4126,6 +4128,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
+      senderTagHideEmail: entry.senderTagHideEmail === true ? true : undefined,
       noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
         ? (() => {
           const filtered = entry.noPinStreamingCardChats

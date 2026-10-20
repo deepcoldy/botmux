@@ -623,6 +623,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     privateCard: body.privateCard,
     cotEnabled: body.cotEnabled,
     senderTag: body.senderTag,
+    senderTagHideEmail: body.senderTagHideEmail,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -5145,13 +5146,16 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   );
 }
 
-function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const [on, setOn] = useState(props.bot.senderTag !== false);
+  const [hideEmail, setHideEmail] = useState(props.bot.senderTagHideEmail === true);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => setOn(props.bot.senderTag !== false), [props.bot.senderTag]);
+
+  useEffect(() => setHideEmail(props.bot.senderTagHideEmail === true), [props.bot.senderTagHideEmail]);
 
   async function save(next: boolean): Promise<void> {
     const previous = on;
@@ -5167,6 +5171,20 @@ function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putC
     });
   }
 
+  async function saveHideEmail(next: boolean): Promise<void> {
+    const previous = hideEmail;
+    setHideEmail(next);
+    await saveBotField({
+      request: () => props.putCardPref({ senderTagHideEmail: next }),
+      strict: false,
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: () => props.patchBot(props.bot.larkAppId, { senderTagHideEmail: next }),
+      rollback: () => setHideEmail(previous),
+    });
+  }
+
   return (
     <section className="bd-section" data-sender-tag>
       <h3 className="bd-section-title">{tr('botDefaults.senderTag')}</h3>
@@ -5177,6 +5195,14 @@ function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putC
         title={tr('botDefaults.senderTagInject')}
         help={tr('botDefaults.senderTagHelp')}
         onChange={checked => void save(checked)}
+      />
+      <ToggleRow
+        checked={hideEmail}
+        disabled={busy}
+        dataAction="toggle-sender-tag-hide-email"
+        title={tr('botDefaults.senderTagHideEmail')}
+        help={tr('botDefaults.senderTagHideEmailHelp')}
+        onChange={checked => void saveHideEmail(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.senderTagNote')}</small>
       <div className="actions">

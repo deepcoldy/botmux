@@ -183,6 +183,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     privateCard: j?.privateCard === true,
     cotEnabled: normalizeCotEnabled(j),
     senderTag: j?.senderTag !== false,
+    senderTagHideEmail: j?.senderTagHideEmail === true,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,

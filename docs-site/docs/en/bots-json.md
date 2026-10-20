@@ -255,6 +255,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | Field | Description |
 |-------|-------------|
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
+| `senderTagHideEmail` | Boolean, default `false` (off). Omits only the `email` attribute from newly built `<sender>` tags, retaining name, ID and type. Saved independently of `senderTag`; does not change identity caches, authorization or `--mention-back`, nor scrub queued inputs, history or message text. Hot-update with `/botconfig set senderTagHideEmail on\|off` |
 | `replyDelivery` | `"transcript"` or `"send"`; **every CLI defaults to `send`** (matching upstream behaviour), and `transcript` must be turned on explicitly. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
 
 ### `replyDelivery: "transcript"`

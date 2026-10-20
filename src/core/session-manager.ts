@@ -783,11 +783,12 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
  * matching `cotEnabled`'s convention — only an explicit `false` disables, so
  * a config-read failure can never silently strip per-turn attribution.
  */
-function senderTagEnabled(larkAppId: string): boolean {
+function senderTagOptions(larkAppId: string): { enabled: boolean; hideEmail: boolean } {
   try {
-    return getBot(larkAppId).config.senderTag !== false;
+    const { senderTag, senderTagHideEmail } = getBot(larkAppId).config;
+    return { enabled: senderTag !== false, hideEmail: senderTagHideEmail === true };
   } catch {
-    return true;
+    return { enabled: true, hideEmail: false };
   }
 }
 
@@ -802,15 +803,17 @@ function senderTagEnabled(larkAppId: string): boolean {
  * at the call sites, so all five injection points (new topic, its codex-app
  * sidecar, follow-up blocks, the follow-up codex-app sidecar, and daemon's
  * buffered-follow-up path via {@link renderBufferedSenderBlock}) share one
- * judgment and cannot drift apart. Omitting `larkAppId` — synthetic callers and
- * existing tests — keeps the historical always-inject behavior.
+ * judgment and cannot drift apart. `senderTagHideEmail: true` omits only the
+ * email attribute without mutating the resolved sender or daemon identity.
+ * Omitting `larkAppId` — synthetic callers and existing tests — keeps the historical always-inject behavior.
  */
 export function renderSenderTag(sender?: ResolvedSender, larkAppId?: string): string {
   if (!sender || !sender.openId) return '';
-  if (larkAppId && !senderTagEnabled(larkAppId)) return '';
+  const options = larkAppId ? senderTagOptions(larkAppId) : { enabled: true, hideEmail: false };
+  if (!options.enabled) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
-  if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
+  if (sender.email && !options.hideEmail) attrs.push(`email="${xmlEscape(sender.email)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
 

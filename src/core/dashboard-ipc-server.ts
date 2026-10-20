@@ -7437,6 +7437,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
+    senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
@@ -7587,6 +7588,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
+    senderTagHideEmail?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
@@ -7603,6 +7605,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
+    senderTagHideEmail?: boolean;
   } = {};
   for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
     if (body[key] !== undefined) {
@@ -7645,6 +7648,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
+  if (typeof body.senderTagHideEmail === 'boolean') patch.senderTagHideEmail = body.senderTagHideEmail;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
