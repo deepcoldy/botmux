@@ -237,6 +237,69 @@ export function sweepIdleWorkersByAge(
   return { candidates, suspended, failures };
 }
 
+/**
+ * Batch variant for the operator route. The verifier's kill/probe are
+ * synchronous spawns (tmux/herdr/zellij CLI calls with multi-second deadlines,
+ * up to two attempts each), so back-to-back candidates block the daemon event
+ * loop for the sum of their worst-case durations. Yielding between candidates
+ * (setImmediate, which runs after pending I/O) keeps Lark events, other
+ * sessions and dashboard IPC flowing and bounds any single stall to one
+ * candidate's teardown.
+ *
+ * Every candidate is re-checked against live state immediately before acting:
+ * the previous candidate's kill/probe yielded the loop, so a worker screen can
+ * have flipped idle→working (a scheduled turn) or an attention/prompt marker
+ * can have arrived without a new admitted turn — the mutation gate blocks
+ * admissions, not worker IPC observations.
+ */
+export async function sweepIdleWorkersByAgeAsync(
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleAgeSweepOptions,
+  yieldBetweenCandidates: () => Promise<void> = () => new Promise<void>(resolve => setImmediate(resolve)),
+): Promise<IdleAgeSweepResult> {
+  const candidates = selectIdleSuspendCandidates(activeSessions, opts);
+  const suspended: IdleSuspendCandidate[] = [];
+  const failures: IdleAgeSweepFailure[] = [];
+  for (const candidate of candidates) {
+    await yieldBetweenCandidates();
+    // Re-run the full guard set rather than re-checking one field: the
+    // eligibility predicate must stay identical to the dry-run selection.
+    const stillEligible = selectIdleSuspendCandidates(activeSessions, {
+      ...opts,
+      now: opts.now ?? Date.now(),
+    }).some(item => item.sessionId === candidate.sessionId);
+    if (!stillEligible) {
+      failures.push({ candidate, error: 'session_changed' });
+      continue;
+    }
+    const bySessionId = new Map(
+      uniqueLiveWorkers(activeSessions).map(ds => [ds.session.sessionId, ds] as const),
+    );
+    const ds = bySessionId.get(candidate.sessionId);
+    if (!ds) {
+      failures.push({ candidate, error: 'session_changed' });
+      continue;
+    }
+    try {
+      if (suspendWorker(ds, 'idle_timeout')) {
+        suspended.push({
+          ...candidate,
+          backingReleased: true,
+          workerRetirementRequested: true,
+        });
+      }
+      else failures.push({ candidate, error: 'suspend_refused' });
+    } catch (error) {
+      failures.push({ candidate, error: 'suspend_failed' });
+      logger.error(
+        `[idle-suspend] failed session=${candidate.sessionId} bot=${candidate.larkAppId}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return { candidates, suspended, failures };
+}
+
 export function sweepIdleWorkersByAgeAfterTurnDrain(
   larkAppId: string,
   activeSessions: Map<string, DaemonSession>,
@@ -245,7 +308,7 @@ export function sweepIdleWorkersByAgeAfterTurnDrain(
   return tryWithBotTurnMutation(
     larkAppId,
     opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
-    () => sweepIdleWorkersByAge(activeSessions, opts),
+    () => sweepIdleWorkersByAgeAsync(activeSessions, opts),
   ).then(result => result.acquired ? result.value : null);
 }
 

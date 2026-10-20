@@ -26,7 +26,9 @@ function runCli(
   return new Promise((resolve, reject) => {
     const child = spawnTsScript(CLI_PATH, args, {
       cwd: join(__dirname, '..'),
-      env: { ...process.env, ...env, BOTMUX_WORKFLOW: '', BOTMUX_COORDINATION_MODE: '' },
+      // Defaults clear inherited mode, but an explicitly passed value in `env`
+      // wins (the primary-mode rejection test needs to set one).
+      env: { ...process.env, BOTMUX_WORKFLOW: '', BOTMUX_COORDINATION_MODE: '', ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     }) as ChildProcessWithoutNullStreams;
     let stdout = '';
@@ -57,7 +59,11 @@ function setupDaemon(
     const chunks: Buffer[] = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
-      capturedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      // Only the maintenance POST carries JSON; ignore unrelated probes (e.g.
+      // host-wide localhost port scanners) so they can't raise an unhandled
+      // parse error against this ephemeral test server.
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (req.method === 'POST' && raw.length > 0) capturedBody = JSON.parse(raw);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(responseBody));
     });
@@ -164,5 +170,21 @@ describe('maintenance suspend-idle CLI', () => {
     );
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('必须且只能指定 --dry-run 或 --yes');
+  });
+
+  it('refuses --yes locally in durable primary mode before contacting any daemon', async () => {
+    // A daemon registry that must never be consulted in primary mode.
+    const daemon = await setupDaemon({
+      ok: true, execute: true, candidates: [], suspended: [], failures: [], affected: 0,
+    });
+    const result = await runCli(
+      ['maintenance', 'suspend-idle', '--yes'],
+      { ...daemon.env, BOTMUX_COORDINATION_MODE: 'primary' },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BOTMUX_COORDINATION_MODE=primary');
+    expect(result.stderr).toContain('maintenance suspend-idle');
+    // The rejection happens before daemon discovery: no request body captured.
+    expect(daemon.captured()).toBeUndefined();
   });
 });

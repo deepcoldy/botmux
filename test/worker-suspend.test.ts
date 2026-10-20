@@ -24,6 +24,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   __testOnly_setSuspendBackingVerifier,
   destroySuspendBackingVerified,
+  retiringWorkersForSession,
   suspendWorker,
 } from '../src/core/worker-pool.js';
 import { isSuspendableBackendType } from '../src/core/persistent-backend.js';
@@ -216,6 +217,27 @@ describe('suspendWorker', () => {
     expect(ds.worker).toBe(worker);
     expect(ds.session.suspendedColdResume).toBeUndefined();
     expect(dashboardEventBus.publish).not.toHaveBeenCalled();
+    // The retirement tracked before the verifier ran must be rolled back: a
+    // still-live worker left in the retiring index biases the VC fence's
+    // producer-liveness gate against this session.
+    expect(retiringWorkersForSession('sid-unverified')).toEqual([]);
+  });
+
+  it('tracks the worker as retiring only after teardown is verified', () => {
+    const worker = fakeWorker();
+    const ds: any = {
+      session: { sessionId: 'sid-retiring', status: 'active' },
+      initConfig: { backendType: 'tmux' },
+      worker,
+      workerPort: 3456,
+      workerToken: 'token',
+      lastScreenStatus: 'idle',
+      exitEventEmitted: false,
+    };
+
+    expect(suspendWorker(ds, 'idle_budget')).toBe(true);
+    // Verified suspend marks retirement; release happens on the worker's exit.
+    expect(retiringWorkersForSession('sid-retiring')).toContain(worker);
   });
 
   it('refuses suspension while the durable Codex App dispatch ledger is non-empty', () => {

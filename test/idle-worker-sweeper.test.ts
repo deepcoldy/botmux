@@ -24,6 +24,7 @@ import {
   sweepIdleWorkers,
   sweepIdleWorkersAfterTurnDrain,
   sweepIdleWorkersByAge,
+  sweepIdleWorkersByAgeAsync,
   sweepIdleWorkersByAgeAfterTurnDrain,
   reclaimIdleWorkersForAdmission,
   reclaimIdleWorkersForAdmissionAfterTurnDrain,
@@ -221,6 +222,87 @@ describe('maintenance idle suspension', () => {
 
     release();
     await admission;
+  });
+
+  // Every unsettled-state exclusion must be independently distinguishable:
+  // deleting the corresponding OR clause in hasUnsettledIdleSuspendState (or
+  // dropping one of the protected-ownership predicates) must make exactly its
+  // row select a candidate.
+  it.each([
+    ['protected: queued todo', (d: any) => { d.session.queued = true; }],
+    ['protected: activation head', (d: any) => { d.session.queuedActivationPending = true; }],
+    ['protected: activation tail', (d: any) => { d.session.queuedActivationTail = [{ turnId: 't' }]; }],
+    ['protected: repository setup', (d: any) => { d.session.pendingRepoSetup = { mode: 'picker' }; }],
+    ['protected: initial start', (d: any) => { d.initialStartPending = true; }],
+    ['protected: codex app dispatch', (d: any) => {
+      d.session.codexAppDispatchLedger = [{ dispatchId: 'd', turnId: 't', state: 'accepted', content: 'x' }];
+    }],
+    ['pending repo picker', (d: any) => { d.pendingRepo = true; }],
+    ['pending repo commit', (d: any) => { d.pendingRepoCommitInFlight = true; }],
+    ['worktree creating', (d: any) => { d.worktreeCreating = true; }],
+    ['pending raw input', (d: any) => { d.pendingRawInput = '/goal'; }],
+    ['pending follow-up input', (d: any) => { d.pendingFollowUpInput = { userPrompt: 'p', cliInput: 'p' }; }],
+    ['pending follow-ups', (d: any) => { d.pendingFollowUps = ['queued']; }],
+    ['cascade in flight', (d: any) => { d.cascadeInFlight = true; }],
+    ['cascade deferred', (d: any) => { d.cascadeDeferred = [{ data: 1, ctx: 2 }]; }],
+    ['tui prompt card', (d: any) => { d.tuiPromptCardId = 'om_prompt'; }],
+    ['tui prompt options', (d: any) => { d.tuiPromptOptions = [{ text: 'a', selected: false }]; }],
+    ['tui prompt processing', (d: any) => { d.tuiPromptProcessing = true; }],
+    ['agent attention', (d: any) => { d.agentAttention = { kind: 'decision', reason: 'pick', at: now }; }],
+    ['usage limit', (d: any) => { d.usageLimit = { kind: 'rate_limited' }; }],
+    ['final output delivery', (d: any) => { d.finalOutputDeliveriesInFlight = new Set([Promise.resolve()]); }],
+    ['queued suspend reason', (d: any) => { d.pendingSuspendReason = 'manual_suspend'; }],
+    ['queued suspend generation', (d: any) => { d.pendingSuspendGeneration = 0; }],
+    ['remote close state', (d: any) => { d.remoteCloseState = { phase: 'preparing', requestId: 'r' }; }],
+    ['remote shutdown state', (d: any) => { d.remoteShutdownState = { phase: 'preparing', requestId: 'r' }; }],
+  ] as const)('excludes a session with %s', (_label, mutate) => {
+    const session = ds('unsettled', 'tmux', now - 8 * day);
+    mutate(session);
+    expect(selectIdleSuspendCandidates(new Map([['unsettled', session]]), {
+      olderThanMs: 7 * day,
+      now,
+    })).toEqual([]);
+  });
+
+  it('yields to the event loop once per candidate in the async batch sweep', async () => {
+    const first = ds('ay', 'tmux', now - 9 * day);
+    const second = ds('by', 'tmux', now - 8 * day);
+    const sessions = new Map<string, any>([['ay', first], ['by', second]]);
+    const yields: string[] = [];
+
+    const result = await sweepIdleWorkersByAgeAsync(
+      sessions,
+      { olderThanMs: 7 * day, now },
+      () => { yields.push('yield'); return Promise.resolve(); },
+    );
+
+    expect(result.suspended.map(c => c.sessionId)).toEqual(['ay', 'by']);
+    expect(yields).toHaveLength(2);
+  });
+
+  it('re-checks every guard immediately before acting and skips changed candidates', async () => {
+    // A is older and suspends first; while its (synchronous) suspend runs, B's
+    // worker screen flips to a scheduled turn. B must be re-evaluated and
+    // skipped, never suspended, while the batch stays isolated per candidate.
+    const a = ds('aaa', 'tmux', now - 9 * day);
+    const b = ds('bbb', 'tmux', now - 8 * day);
+    const sessions = new Map<string, any>([['aaa', a], ['bbb', b]]);
+    __testOnly_setSuspendBackingVerifier((target: any) => {
+      if (target.session.sessionId === 'aaa') b.lastScreenStatus = 'working';
+      return true;
+    });
+
+    const result = await sweepIdleWorkersByAgeAsync(
+      sessions,
+      { olderThanMs: 7 * day, now },
+      () => Promise.resolve(),
+    );
+
+    expect(result.suspended.map(c => c.sessionId)).toEqual(['aaa']);
+    expect(result.failures).toEqual([
+      { candidate: expect.objectContaining({ sessionId: 'bbb' }), error: 'session_changed' },
+    ]);
+    expect(b.worker).not.toBe(null);
   });
 });
 

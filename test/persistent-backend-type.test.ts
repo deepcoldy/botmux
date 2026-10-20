@@ -134,6 +134,45 @@ describe('shared Herdr persistent target', () => {
     killAgent.mockRestore();
     killSession.mockRestore();
   });
+
+  it('fails closed on a Herdr target without an agent name: unknown probe, throwing kill', () => {
+    // Legacy/malformed rows resolve to an agent-less whole-session target.
+    // Probing the host session would answer for unrelated agents and deleting it
+    // could destroy a shared ('botmux') or user-owned session, so exact-target
+    // teardown must refuse rather than collapse to whole-session semantics.
+    const resolved = resolvePersistentBackendTarget('herdr', 'abcdef123456', undefined);
+    expect(resolved).toEqual({ backendType: 'herdr', sessionName: 'bmx-abcdef12' });
+    expect('agentName' in resolved).toBe(false);
+
+    const killAgent = vi.spyOn(HerdrBackend, 'killAgent').mockImplementation(() => {});
+    const killSession = vi.spyOn(HerdrBackend, 'killSession').mockImplementation(() => {});
+    const probeSession = vi.spyOn(HerdrBackend, 'probeSession').mockReturnValue('exists');
+    const probeAgent = vi.spyOn(HerdrBackend, 'probeAgent').mockReturnValue('exists');
+
+    expect(probePersistentBackendTarget(resolved)).toBe('unknown');
+    expect(() => killPersistentBackendTarget(resolved, 'abcdef123456')).toThrow(/agent name/);
+
+    expect(probeAgent).not.toHaveBeenCalled();
+    expect(killAgent).not.toHaveBeenCalled();
+    expect(killSession).not.toHaveBeenCalled();
+    probeSession.mockRestore();
+    probeAgent.mockRestore();
+    killAgent.mockRestore();
+    killSession.mockRestore();
+  });
+
+  it('fails closed on a Herdr target with a blank agent name', () => {
+    const target = { backendType: 'herdr' as const, sessionName: 'botmux', agentName: '   ' };
+    const killAgent = vi.spyOn(HerdrBackend, 'killAgent').mockImplementation(() => {});
+    const killSession = vi.spyOn(HerdrBackend, 'killSession').mockImplementation(() => {});
+
+    expect(probePersistentBackendTarget(target)).toBe('unknown');
+    expect(() => killPersistentBackendTarget(target, 'abcdef123456')).toThrow(/agent name/);
+    expect(killAgent).not.toHaveBeenCalled();
+    expect(killSession).not.toHaveBeenCalled();
+    killAgent.mockRestore();
+    killSession.mockRestore();
+  });
 });
 
 // ── Freeze-once (PR #397) — cover the ACTUAL call sites, not just the helper.

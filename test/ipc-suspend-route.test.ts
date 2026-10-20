@@ -263,4 +263,52 @@ describe('POST /api/maintenance/suspend-idle', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ ok: false, error: 'mutation_gate_busy' });
   });
+
+  // The handler-level gate must remain even when the server runs without the
+  // global HMAC middleware (tests / dev servers): loopback alone is not
+  // identity for a batch process-kill route.
+  it('still refuses when the server was started without authRequired', async () => {
+    const unauth = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`http://127.0.0.1:${unauth.port}/api/maintenance/suspend-idle`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ execute: false, olderThanMs: 7 * 24 * 60 * 60_000 }),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, error: 'trusted_host_required' });
+    } finally {
+      await unauth.close();
+    }
+  });
+
+  it('rejects in durable primary coordination mode before reading any state', async () => {
+    const previous = process.env.BOTMUX_COORDINATION_MODE;
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      workerPool.setActiveSessionsRegistry(new Map());
+      const res = await postIdle({ execute: false, olderThanMs: 7 * 24 * 60 * 60_000 });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ ok: false, error: 'durable_primary_unsupported' });
+    } finally {
+      if (previous === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+      else process.env.BOTMUX_COORDINATION_MODE = previous;
+    }
+  });
+
+  it.each([
+    ['two app ids in one daemon', ['cli_a', 'cli_b'], 'cli_a'],
+    ['registry app id mismatches the bound app id', ['cli_b'], 'cli_a'],
+  ])('refuses ambiguous daemon scope (%s)', async (_label, appIds, boundAppId) => {
+    setLarkAppId(boundAppId);
+    workerPool.setActiveSessionsRegistry(new Map(appIds.map((appId, index) => [
+      `s-${index}`,
+      activeSession({ larkAppId: appId }),
+    ])));
+
+    const res = await postIdle({ execute: false, olderThanMs: 7 * 24 * 60 * 60_000 });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'ambiguous_daemon_scope' });
+  });
 });

@@ -248,7 +248,12 @@ export function probePersistentBackendTarget(target: PersistentBackendTarget): S
   if (target.backendType === 'zmx' && target.socketDir !== undefined) {
     return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
   }
-  if (target.backendType === 'herdr' && target.agentName) {
+  if (target.backendType === 'herdr') {
+    // A managed Herdr resource is an AGENT inside a host session. A target
+    // without its agent name cannot be probed precisely — probing the host
+    // session would answer for unrelated agents — so stay indeterminate and
+    // let exact-target callers fail closed.
+    if (!target.agentName || !target.agentName.trim()) return 'unknown';
     return HerdrBackend.probeAgent(target.sessionName, target.agentName);
   }
   return probePersistentSession(target.backendType, target.sessionName);
@@ -269,7 +274,13 @@ export function killPersistentBackendTarget(
     ZmxBackend.killManagedSession(target.sessionName, sessionId, undefined, zmxEnv(process.env, target.socketDir));
     return;
   }
-  if (target.backendType === 'herdr' && target.agentName) {
+  if (target.backendType === 'herdr') {
+    // Never collapse an agent-less Herdr target to a whole-session stop/delete:
+    // host sessions are shared ('botmux') or user-owned, and the recorded
+    // target is missing precisely the identity that scopes this kill. Refuse.
+    if (!target.agentName || !target.agentName.trim()) {
+      throw new Error('Herdr teardown requires the recorded managed agent name');
+    }
     HerdrBackend.killAgent(target.sessionName, target.agentName);
     return;
   }
