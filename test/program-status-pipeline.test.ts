@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ProgramStatusFramingStream } from '../src/utils/program-status-parser.js';
 import { IdleDetector } from '../src/utils/idle-detector.js';
+import { readFileSync } from 'node:fs';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createSeedAdapter } from '../src/adapters/cli/seed.js';
 import { createRelayAdapter } from '../src/adapters/cli/relay.js';
@@ -205,5 +207,130 @@ describe('ProgramStatus pipeline (FramingStream + IdleDetector)', () => {
     feedPipeline(`\x1b]7501;state=done:app=pi:msg=${b64SessionName}\x1b\\`);
     expect(idleEvents).toEqual(['program-status']);
     expect(detector.programStatusBlock()).toBeNull();
+  });
+});
+
+describe('ProgramStatus pipeline: oh-my-pi', () => {
+  const fx = JSON.parse(readFileSync(new URL('./fixtures/omp-band-footer-v18.10.1.json', import.meta.url), 'utf8'));
+  const report = (state: string) => `\x1b]7501;state=${state}:app=omp\x1b\\`;
+
+  function harness() {
+    const stream = new ProgramStatusFramingStream();
+    const detector = new IdleDetector(createOhMyPiAdapter('/bin/omp'));
+    const idle: string[] = [];
+    const busy = vi.fn();
+    detector.onIdle((source) => { idle.push(source); });
+    detector.onBusy(busy);
+    const feed = (raw: string) => {
+      for (const part of stream.feed(raw)) {
+        if (part.type === 'status') detector.observeProgramStatus(part.event);
+        else if (part.type === 'data') detector.feed(part.text);
+      }
+    };
+    return { detector, idle, busy, feed };
+  }
+
+  it('parses the reports omp 18.10.1 actually emitted', () => {
+    expect(fx.programStatusReports).toEqual([
+      report('idle'), report('working'), report('idle'), report('working'), report('idle'),
+    ]);
+  });
+
+  it('uses OMP OSC 7501 working/idle as authoritative turn edges once startup is proven', () => {
+    const { detector, idle, busy, feed } = harness();
+    try {
+      // Startup already proven by other evidence (screen quiescence / transcript).
+      detector.fireIdle();
+      feed(report('idle'));
+      expect(detector.programStatusActive()).toBe(true);
+      expect(idle).toEqual(['external']);
+      // A local-terminal submit: omp reports working before any footer redraw.
+      feed(report('working'));
+      expect(busy).toHaveBeenCalledTimes(1);
+      // The idle-looking footer cannot end an authoritative working turn.
+      feed(fx.idleFrame);
+      vi.useFakeTimers();
+      vi.advanceTimersByTime(10_000);
+      vi.useRealTimers();
+      expect(idle).toEqual(['external']);
+      feed(fx.workingFrame + report('idle'));
+      expect(idle).toEqual(['external', 'program-status']);
+      expect(busy).toHaveBeenCalledTimes(1);
+    } finally {
+      detector.dispose();
+    }
+  });
+
+  it('does not take the init-time idle report as composer-ready (slow session_start hook)', () => {
+    vi.useFakeTimers();
+    const { detector, idle, busy, feed } = harness();
+    try {
+      // omp 18.10.1 InteractiveMode.init(): the composer is painted and
+      // `state=idle` reported BEFORE session_start hooks run (here a 1.2s
+      // extension). A paste + Enter in that window is dropped, so this
+      // report must not release the queued first prompt.
+      feed(fx.idleFrame + report('idle'));
+      expect(idle).toEqual([]);
+      expect(detector.programStatusActive()).toBe(false);
+      vi.advanceTimersByTime(1_200);
+      expect(idle).toEqual([]);
+      // Hook done: omp redraws the composer; startup readiness comes from the
+      // screen heuristics, exactly as with terminal.programStatus off.
+      feed(fx.idleFrame);
+      vi.advanceTimersByTime(1_900);
+      expect(idle).toEqual([]);
+      vi.advanceTimersByTime(5_000);
+      expect(idle).toEqual(['screen']);
+
+      // Botmux flushes the first prompt (reset), omp reports working: from
+      // here on OSC 7501 is authoritative as usual.
+      detector.reset();
+      feed(report('working'));
+      expect(detector.programStatusActive()).toBe(true);
+      feed(fx.idleFrame);
+      vi.advanceTimersByTime(10_000);
+      expect(idle).toEqual(['screen']);
+      feed(fx.workingFrame + report('idle'));
+      expect(idle).toEqual(['screen', 'program-status']);
+      // A later local-terminal submit revives busy from the report alone.
+      feed(report('working'));
+      expect(busy).toHaveBeenCalledTimes(1);
+      feed(report('idle'));
+      expect(idle).toEqual(['screen', 'program-status', 'program-status']);
+    } finally {
+      detector.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls back to the screen footer when omp sends no reports (older omp)', () => {
+    const { detector, busy, feed } = harness();
+    try {
+      detector.fireIdle();
+      feed(fx.idleFrame);
+      expect(busy).not.toHaveBeenCalled();
+      feed(fx.workingFrame);
+      expect(detector.programStatusActive()).toBe(false);
+      expect(busy).toHaveBeenCalledTimes(1);
+    } finally {
+      detector.dispose();
+    }
+  });
+
+  it('returns to the screen footer after terminal.programStatus is turned off (state=clear)', () => {
+    const { detector, busy, feed } = harness();
+    try {
+      detector.fireIdle();
+      feed(report('idle'));
+      expect(detector.programStatusActive()).toBe(true);
+      feed(report('clear'));
+      expect(detector.programStatusActive()).toBe(false);
+      feed(fx.idleFrame);
+      expect(busy).not.toHaveBeenCalled();
+      feed(fx.workingFrame);
+      expect(busy).toHaveBeenCalledTimes(1);
+    } finally {
+      detector.dispose();
+    }
   });
 });

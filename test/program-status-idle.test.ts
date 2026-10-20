@@ -226,6 +226,61 @@ describe('IdleDetector program status', () => {
     detector.dispose();
   });
 
+  it('keeps an untrusted startup terminal report off the prompt-ready path until another idle proves startup', () => {
+    const detector = new IdleDetector({ ...makeCli(), programStatusStartupIdleUntrusted: true });
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    for (const state of ['idle', 'done', 'error'] as const) {
+      detector.observeProgramStatus({ state });
+      detector.observeProgramStatus({ state, id: 'child' });
+    }
+    expect(cb).not.toHaveBeenCalled();
+    expect(detector.programStatusActive()).toBe(false);
+
+    // Startup readiness stays on the screen heuristics.
+    detector.feed('prompt ❯');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith('screen');
+
+    // After that first idle, a terminal report is authoritative again.
+    detector.observeProgramStatus({ state: 'idle' });
+    expect(detector.programStatusActive()).toBe(true);
+    detector.reset();
+    detector.observeProgramStatus({ state: 'working' });
+    detector.observeProgramStatus({ state: 'idle' });
+    expect(cb).toHaveBeenCalledTimes(2);
+    expect(cb).toHaveBeenLastCalledWith('program-status');
+    detector.dispose();
+  });
+
+  it('lets a busy report during an untrusted startup engage authority and its terminal edge', () => {
+    for (const busy of [{ state: 'working' }, { state: 'blocked', kind: 'question' }] as const) {
+      const detector = new IdleDetector({ ...makeCli(), programStatusStartupIdleUntrusted: true });
+      const cb = vi.fn();
+      detector.onIdle(cb);
+      detector.observeProgramStatus(busy);
+      expect(detector.programStatusActive()).toBe(true);
+      detector.feed('prompt ❯');
+      vi.advanceTimersByTime(10_000);
+      expect(cb).not.toHaveBeenCalled();
+      detector.observeProgramStatus({ state: 'idle' });
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb).toHaveBeenCalledWith('program-status');
+      detector.dispose();
+    }
+  });
+
+  it('still trusts the first terminal report from adapters that do not opt out', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.observeProgramStatus({ state: 'idle' });
+    expect(detector.programStatusActive()).toBe(true);
+    expect(cb).toHaveBeenCalledWith('program-status');
+    detector.dispose();
+  });
+
   it('drops authority on a root clear and lets the screen path resume', () => {
     const detector = new IdleDetector(makeCli());
     const cb = vi.fn();

@@ -126,6 +126,8 @@ export class IdleDetector {
   private programStatusFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private programStatusBlockInfo: ProgramStatusBlock | null = null;
   private programStatusErrorMsg: string | undefined;
+  /** See CliAdapter.programStatusStartupIdleUntrusted. */
+  private programStatusStartupIdleUntrusted: boolean;
 
   constructor(cli: CliAdapter, private readonly captureStartupScreen?: () => string) {
     this.completionPattern = cli.completionPattern;
@@ -138,6 +140,7 @@ export class IdleDetector {
     this.startupResume = cli.startupResume;
     this.firstPromptQuiescenceMs = cli.firstPromptQuiescenceMs;
     this.startupReadyFromHistory = cli.startupReadyFromHistory;
+    this.programStatusStartupIdleUntrusted = cli.programStatusStartupIdleUntrusted === true;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
@@ -383,6 +386,18 @@ export class IdleDetector {
   observeProgramStatus(event: ProgramStatusEvent): void {
     if (!PROGRAM_STATUS_STATES.has(event.state)) return;
     if (event.id !== undefined && !isProgramStatusId(event.id)) return;
+    // A terminal report the CLI sends before its composer accepts input
+    // (omp: InteractiveMode.init() reports idle ahead of session_start hooks)
+    // must not release the queued first prompt. Leave startup on the screen
+    // heuristics; a busy report or this process's first idle lifts the gate.
+    if (
+      this.programStatusStartupIdleUntrusted
+      && !this.programStatusAuthority
+      && !this.firstIdlePublished
+      && (event.state === 'idle' || event.state === 'done' || event.state === 'error')
+    ) {
+      return;
+    }
 
     if (event.state === 'clear') {
       if (event.id === undefined) {
