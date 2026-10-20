@@ -8,20 +8,24 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
-import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
+import { hasTrailingBridgeSentinelLine, shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTranscript,
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
   trailingAssistantText,
+  isClaudeMemoryToolUse,
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
+  isScheduledTurnStartEvent,
+  cronCreateToolUseIds,
+  cronCreateAcks,
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
@@ -1101,6 +1105,128 @@ describe('isMeaningfulUserEvent', () => {
   });
 });
 
+describe('isScheduledTurnStartEvent', () => {
+  const fire = (extra: Record<string, unknown> = {}): TranscriptEvent =>
+    userEv('cron prompt', {
+      isMeta: true,
+      turnOrigin: 'scheduled',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-uuid-1',
+      ...extra,
+    });
+  it('recognises a real CronCreate fire record', () => {
+    expect(isScheduledTurnStartEvent(fire())).toBe(true);
+  });
+  it('stays excluded from meaningful human input (no fingerprint bind)', () => {
+    expect(isMeaningfulUserEvent(fire())).toBe(false);
+  });
+  it('rejects a plain isMeta record without turnOrigin scheduled', () => {
+    expect(isScheduledTurnStartEvent(userEv('x', { isMeta: true }))).toBe(false);
+  });
+  it('rejects turnOrigin scheduled without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, turnOrigin: 'scheduled' }),
+    )).toBe(false);
+  });
+  it('rejects sidechain / compact records', () => {
+    expect(isScheduledTurnStartEvent(fire({ isSidechain: true }))).toBe(false);
+    expect(isScheduledTurnStartEvent(fire({ isCompactSummary: true }))).toBe(false);
+  });
+  it('rejects assistant / nullish events', () => {
+    expect(isScheduledTurnStartEvent(assistantEv('hi'))).toBe(false);
+    expect(isScheduledTurnStartEvent(null)).toBe(false);
+    expect(isScheduledTurnStartEvent(undefined)).toBe(false);
+  });
+
+  // Legacy fire records (Claude Code ≤2.1.280) carry no turnOrigin; they mark
+  // the prompt with promptSource:"system". The predicate must accept that
+  // shape while staying strict about isMeta and the mandatory fire id.
+  it('recognises a LEGACY fire: isMeta + promptSource system, no turnOrigin', () => {
+    const legacy = userEv('cron prompt', {
+      isMeta: true,
+      promptSource: 'system',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-legacy-1',
+    });
+    expect(isScheduledTurnStartEvent(legacy)).toBe(true);
+  });
+  it('rejects a turnOrigin other than scheduled even with a fire id', () => {
+    expect(isScheduledTurnStartEvent(fire({ turnOrigin: 'human' }))).toBe(false);
+  });
+  it('rejects a non-isMeta record even when promptSource is system and a fire id exists', () => {
+    const sneaky = userEv('cron prompt', {
+      promptSource: 'system',
+      scheduledFireId: 'fire-x',
+    });
+    expect(isScheduledTurnStartEvent(sneaky)).toBe(false);
+  });
+  it('rejects a legacy-shaped isMeta+system record without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, promptSource: 'system' }),
+    )).toBe(false);
+  });
+  it('requires promptSource system for a legacy (no-turnOrigin) isMeta record', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, scheduledFireId: 'fire-y' }),
+    )).toBe(false);
+  });
+});
+
+describe('cronCreateToolUseIds / cronCreateAcks', () => {
+  const callEv = (blockId: string, name = 'CronCreate'): TranscriptEvent => ({
+    type: 'assistant',
+    uuid: `call-${blockId}`,
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: blockId, name }] as any },
+  } as TranscriptEvent);
+  const resultEv = (blockId: string, text: string): TranscriptEvent => ({
+    type: 'user',
+    uuid: `res-${blockId}`,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: blockId, content: text }] as any },
+  } as TranscriptEvent);
+
+  it('collects CronCreate tool_use block ids and ignores other tools', () => {
+    expect(cronCreateToolUseIds(callEv('b1'))).toEqual(['b1']);
+    expect(cronCreateToolUseIds(callEv('b2', 'Read'))).toEqual([]);
+    expect(cronCreateToolUseIds(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateToolUseIds(null)).toEqual([]);
+  });
+
+  it('parses the recurring and one-shot ack task ids using REAL CLI wording', () => {
+    const recurring = resultEv('b1', 'Scheduled recurring job 08e02324 (7,37 * * * *). Use CronDelete to cancel sooner.');
+    // Real one-shot success text uses TASK, not job (Claude Code 2.1.276/2.1.284).
+    const oneshotTask = resultEv('b2', 'Scheduled one-shot task bf15f538 (34 18 20 9 *). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(recurring)).toEqual([{ toolUseId: 'b1', taskId: '08e02324' }]);
+    expect(cronCreateAcks(oneshotTask)).toEqual([{ toolUseId: 'b2', taskId: 'bf15f538' }]);
+  });
+
+  it('still accepts the older "one-shot job" wording and rejects lookalikes', () => {
+    const oneshotLegacy = resultEv('b3', 'Scheduled one-shot job abc_12-3 (2026-10-01 ...). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(oneshotLegacy)).toEqual([{ toolUseId: 'b3', taskId: 'abc_12-3' }]);
+    // A different noun must not match (defence in depth beyond the pending gate).
+    expect(cronCreateAcks(resultEv('b4', 'Scheduled one-shot thing 02b077c4 (x)'))).toEqual([]);
+    expect(cronCreateAcks(resultEv('b5', 'Scheduled recurring task 02b077c4 (x)'))).toEqual([]);
+  });
+
+  it('ignores unrelated tool_results and array-of-block content', () => {
+    expect(cronCreateAcks(resultEv('b1', 'tool ran successfully'))).toEqual([]);
+    const arrayContent: TranscriptEvent = {
+      type: 'user',
+      uuid: 'res-x',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'b9',
+          content: [{ type: 'text', text: 'Scheduled recurring job de137a7b (x).' }],
+        }] as any,
+      },
+    } as TranscriptEvent;
+    expect(cronCreateAcks(arrayContent)).toEqual([{ toolUseId: 'b9', taskId: 'de137a7b' }]);
+    expect(cronCreateAcks(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateAcks(null)).toEqual([]);
+  });
+});
+
 describe('extractLastAssistantTurn', () => {
   it('happy path: real prompt + multi-block assistant text + interleaved tool_use', () => {
     const turn = extractLastAssistantTurn([
@@ -1641,5 +1767,99 @@ describe('trailingAssistantText', () => {
     expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: joined }, undefined, markers, false)).toBe(false);
     // 新行为：尾段 900 < 749×2 → 抑制 ✓
     expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: trailing }, undefined, markers, false)).toBe(true);
+  });
+});
+
+// ─── transcript 投递：回答之后的 Claude Code memory 写入不得截掉回答 ──
+//
+// 2026-10-20 现场（零注入 bot，后台任务回调轮）：模型先写出 1278 字的分配结果，
+// 再 Write ×2 + Bash 维护自身 memory，最后补一句 240 字附言。尾段算法停在 memory
+// 写入处，只把附言发进了群，分配结果丢失。
+describe('trailingAssistantText across memory writes', () => {
+  const projects = '/root/.claude-api/projects/';
+  const transcriptPath = `${projects}-root-iserver-edenx/359e31a6.jsonl`;
+  const aText = (uuid: string, text: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'text', text }] },
+  });
+  const aTool = (uuid: string, name: string, input: Record<string, unknown>): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'tool_use', id: `tu-${uuid}`, name, input } as any] },
+  });
+  const toolResult = (uuid: string, toolUseUuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `tu-${toolUseUuid}` } as any] },
+  });
+  const opts = {
+    isHousekeepingToolUse: (block: { name?: unknown; input?: unknown }) => isClaudeMemoryToolUse(block, transcriptPath),
+    endsWithSentinel: hasTrailingBridgeSentinelLine,
+  };
+  const memWrite = (uuid: string) => aTool(uuid, 'Write', { file_path: `${projects}-root-iserver-edenx/memory/${uuid}.md` });
+  const answer = '已写进文档：末尾新增了「十、Reviewer 分配」一节。'.padEnd(400, '表');
+  const postscript = 'I also saved two notes in memory.';
+
+  const fieldTurn = (): TranscriptEvent[] => [
+    aTool('w0', 'Bash', { command: 'cat /tmp/out.log' }), toolResult('r0', 'w0'),
+    aText('ans', answer),
+    memWrite('m1'), toolResult('r1', 'm1'),
+    { type: 'attachment' } as TranscriptEvent,
+    memWrite('m2'), toolResult('r2', 'm2'),
+    aTool('m3', 'Bash', { command: `cd ${projects}-root-iserver-edenx/memory && printf '%s\\n' x >> MEMORY.md` }),
+    toolResult('r3', 'm3'),
+    aText('ps', postscript),
+  ];
+  const fieldUuids = ['w0', 'ans', 'm1', 'm2', 'm3', 'ps'];
+
+  it('field replay: answer before the memory writes is delivered together with the postscript', () => {
+    expect(trailingAssistantText(fieldTurn(), fieldUuids)).toBe(postscript);
+    expect(trailingAssistantText(fieldTurn(), fieldUuids, opts)).toBe(`${answer}\n\n${postscript}`);
+  });
+
+  it('a short "saving memory" note before the writes stays out when the answer follows them', () => {
+    const final = '结论：'.padEnd(300, '答');
+    const events = [aText('n', '先把这次结论记到 memory。'), memWrite('m1'), toolResult('r1', 'm1'), aText('f', final)];
+    expect(trailingAssistantText(events, ['n', 'm1', 'f'], opts)).toBe(final);
+  });
+
+  it('a substantive run is not prepended when the trailing run is longer', () => {
+    const before = '中间分析：'.padEnd(300, '析');
+    const final = '最终结论：'.padEnd(500, '答');
+    const events = [aText('a', before), memWrite('m1'), toolResult('r1', 'm1'), aText('f', final)];
+    expect(trailingAssistantText(events, ['a', 'm1', 'f'], opts)).toBe(final);
+  });
+
+  it('a trailing run ending with the sentinel is returned unchanged', () => {
+    for (const tail of ['BOTMUX_NOTHING_TO_SEND', 'CI 还在跑，继续等。\n\nBOTMUX_NOTHING_TO_SEND']) {
+      const events = [aText('a', answer), memWrite('m1'), toolResult('r1', 'm1'), aText('f', tail)];
+      expect(trailingAssistantText(events, ['a', 'm1', 'f'], opts)).toBe(tail);
+    }
+  });
+
+  it('any non-memory tool call between the runs keeps the trailing run alone', () => {
+    const events = [
+      aText('a', answer),
+      memWrite('m1'), toolResult('r1', 'm1'),
+      aTool('w', 'Write', { file_path: '/root/iserver/edenx/notes.md' }), toolResult('r2', 'w'),
+      aText('f', postscript),
+    ];
+    expect(trailingAssistantText(events, ['a', 'm1', 'w', 'f'], opts)).toBe(postscript);
+  });
+
+  it('text from another turn before the memory writes is never swept in', () => {
+    const events = [aText('prev', answer), memWrite('m1'), toolResult('r1', 'm1'), aText('f', postscript)];
+    expect(trailingAssistantText(events, ['m1', 'f'], opts)).toBe(postscript);
+  });
+
+  it('isClaudeMemoryToolUse: only writes into the owning data dir\'s project memory', () => {
+    const home = homedir();
+    const homePath = `${home}/.claude-api/projects/-root-iserver-botmux-wt-3/s.jsonl`;
+    const mem = `${home}/.claude-api/projects/-root-iserver-botmux/memory`;
+    // 工作树会话的 memory 落在主仓库的 project 目录下，不要求 slug 一致。
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Edit', input: { file_path: `${mem}/MEMORY.md` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cd ${mem} && ls` } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: 'cat ~/.claude-api/projects/-root-iserver-botmux/memory/MEMORY.md' } }, homePath)).toBe(true);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: '/root/iserver/botmux/memory/a.md' } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${home}/.claude/projects/-root-iserver-botmux/memory/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cat ${mem}-backup/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Read', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(false);
+    expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, undefined)).toBe(false);
   });
 });

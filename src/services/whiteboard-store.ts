@@ -120,10 +120,6 @@ function writeIndex(index: WhiteboardIndex): void {
   atomicWriteFileSync(indexPath(), JSON.stringify(index, null, 2) + '\n');
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 // Locks reuse the cross-process file-lock primitive (utils/file-lock.ts): it
 // writes the holder PID + acquire time and stale-breaks a lock whose holder
 // PID is dead (atomic rename — exactly one waiter wins). This is the recovery
@@ -409,9 +405,7 @@ export function writeWhiteboard(id: string, content: string, opts?: { actor?: st
     if (opts?.expectedUpdatedAt && existing.updatedAt !== opts.expectedUpdatedAt) {
       throw new Error('whiteboard_cas_mismatch');
     }
-    const tmp = `${whiteboardBoardPath(clean)}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tmp, content.endsWith('\n') ? content : content + '\n', 'utf-8');
-    renameSync(tmp, whiteboardBoardPath(clean));
+    atomicWriteFileSync(whiteboardBoardPath(clean), content.endsWith('\n') ? content : content + '\n', { followTargetSymlink: false });
     appendLog(clean, { kind: opts?.kind ?? 'write', actor: opts?.actor, content: `[overwrite ${content.length} chars]` });
     return touchWhiteboard(clean);
   });

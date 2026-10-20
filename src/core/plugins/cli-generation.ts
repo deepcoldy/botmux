@@ -99,6 +99,7 @@ export function prepareCliPluginGeneration(opts: {
     deferredSkillCatalog: prompt.trim().length === 0 && catalog ? catalog : undefined,
     diagnostics: [
       ...pluginSkills.diagnostics.map(value => `plugin_skill:${value}`),
+      ...(preparedSkills.snapshotDiagnostics ?? []).map(value => `skill_snapshot:${value}`),
       ...delivery.diagnostics.map(value => `skill_delivery:${value}`),
     ],
     fatal: delivery.fatal,

@@ -136,4 +136,4 @@ The following fields belong only to the richer `/api/sessions` rows and `/events
 
 ## Deployment details
 
-The dashboard runs as a separate pm2 process `botmux-dashboard`, starting and stopping together with the daemon. Each daemon exposes an internal IPC on `127.0.0.1` (local only), and the dashboard process acts as a reverse proxy + HMAC auth: the secret file `~/.botmux/.dashboard-secret` (mode 0600) is the internal daemon↔dashboard signing key and is **never sent down to the browser** (the browser side uses the rotating login token above).
+The dashboard runs as a separate supervisor-managed process `botmux-dashboard`, starting and stopping together with the daemon. Each daemon exposes an internal IPC on `127.0.0.1` (local only), and the dashboard process acts as a reverse proxy + HMAC auth: the secret file `~/.botmux/.dashboard-secret` (mode 0600) is the internal daemon↔dashboard signing key and is **never sent down to the browser** (the browser side uses the rotating login token above).

@@ -4,7 +4,8 @@ import { resolveCliRuntime, runtimePathOverride } from '../adapters/cli/runtime.
 import { decorateResumeForWrapper } from '../setup/cli-selection.js';
 import { decorateResumeForCliLaunchMode } from './cli-launch-mode.js';
 import { buildSessionClosedCard } from '../im/lark/card-builder.js';
-import { sessionAnchorId, type DaemonSession } from './types.js';
+import type { Session } from '../types.js';
+import { sessionAnchorId, storedSessionAnchorId, type DaemonSession } from './types.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import type { Locale } from '../i18n/index.js';
@@ -26,23 +27,32 @@ function replaceResumeExecutable(command: string, executable: string): string {
  * anchor — so the card keeps it visible and carries the terminal
  * `claude --resume` command as the real recovery path.
  *
- * MUST be called BEFORE killWorker/closeSession: it reads the live session's
- * identity (sessionId, cliSessionId, title, workingDir, anchor) straight off
- * `ds`. Returns the card JSON; the caller decides how to deliver it.
+ * A live DaemonSession should still be captured before displacement so its
+ * runtime-only launch override can be reflected. Lifecycle reconciliation may
+ * also pass the persisted closed Session after a failed resume; every field
+ * required for the Resume button and durable routing anchor lives on that row.
+ * Returns the card JSON; the caller decides how to deliver it.
  */
-export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): string {
-  const botCfg = getBot(ds.larkAppId).config;
-  const closedSessionId = ds.session.sessionId;
-  const closedCliId = ds.session.cliId ?? botCfg.cliId;
-  const mayInheritLiveRuntime = !ds.session.agentFrozen && closedCliId === botCfg.cliId;
+export function buildClosedSessionCard(
+  source: DaemonSession | Session,
+  locale: Locale,
+): string {
+  const live = 'session' in source ? source : undefined;
+  const session = live?.session ?? (source as Session);
+  const larkAppId = live?.larkAppId ?? session.larkAppId;
+  if (!larkAppId) throw new Error('closed session card requires a Lark application id');
+  const botCfg = getBot(larkAppId).config;
+  const closedSessionId = session.sessionId;
+  const closedCliId = session.cliId ?? botCfg.cliId;
+  const mayInheritLiveRuntime = !session.agentFrozen && closedCliId === botCfg.cliId;
   // Prefer the session snapshot on every closed/resume surface. A session
   // frozen by an older botmux may only carry cliPathOverride; migrate that
   // descriptor from the SESSION'S path here instead of borrowing today's bot
   // runtime (which may be another Codex distribution after a hot switch).
-  const frozenRuntime = ds.session.cliRuntime ?? resolveCliRuntime({
+  const frozenRuntime = session.cliRuntime ?? resolveCliRuntime({
     cliId: closedCliId,
-    ...(ds.session.cliPathOverride
-      ? { cliPathOverride: ds.session.cliPathOverride }
+    ...(session.cliPathOverride
+      ? { cliPathOverride: session.cliPathOverride }
       : !mayInheritLiveRuntime
         ? {}
         : botCfg.cliRuntime
@@ -51,14 +61,14 @@ export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): strin
     context: 'closed session cliRuntime',
   });
   const frozenPath = runtimePathOverride(frozenRuntime);
-  const frozenWrapper = ds.session.wrapperCli
-    ?? (ds.session.agentFrozen ? undefined : botCfg.wrapperCli);
-  const frozenLaunchMode = ds.session.cliLaunchMode
-    ?? (ds.session.agentFrozen ? undefined : botCfg.cliLaunchMode);
+  const frozenWrapper = session.wrapperCli
+    ?? (session.agentFrozen ? undefined : botCfg.wrapperCli);
+  const frozenLaunchMode = session.cliLaunchMode
+    ?? (session.agentFrozen ? undefined : botCfg.cliLaunchMode);
   // The `-m` in the printed ttadk resume command must match what botmux itself
   // would launch, and the model is NOT frozen with the rest of the launch
   // posture — it follows the live bot config on every spawn.
-  const frozenModel = resolveSessionLaunchModel(ds, botCfg);
+  const frozenModel = resolveSessionLaunchModel(live ?? { session }, botCfg);
   // `cliPathOverride` historically changed only the executable, never the
   // product copy. Preserve that contract for legacy snapshots; only an
   // explicitly configured runtime opts into a distinct display identity.
@@ -70,7 +80,7 @@ export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): strin
       const adapter = createCliAdapterSync(closedCliId, frozenPath);
       const raw = adapter.buildResumeCommand?.({
         sessionId: closedSessionId,
-        cliSessionId: ds.session.cliSessionId,
+        cliSessionId: session.cliSessionId,
       }) ?? null;
       // ttadk 网关：resume 命令必须带 `-m <model> --skip-check`（模型取 bot.model），
       // 否则用户复制粘贴这条命令会卡在 ttadk 的交互式选模型菜单（CoCo 不带 -m）。
@@ -86,16 +96,16 @@ export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): strin
   })();
   return buildSessionClosedCard(
     closedSessionId,
-    sessionAnchorId(ds),
-    ds.session.title,
+    live ? sessionAnchorId(live) : storedSessionAnchorId(session),
+    session.title,
     closedCliId,
-    ds.session.workingDir,
+    session.workingDir,
     cliResumeCommand,
     locale,
     runtimeDisplayName,
     // No precise resume command AND the adapter can only resume a precise id:
     // resuming reactivates the route but starts a FRESH session — the card
     // must not imply history is restored.
-    !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: ds.session.cliSessionId }),
+    !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId }),
   );
 }

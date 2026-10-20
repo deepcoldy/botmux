@@ -7,7 +7,10 @@
 
 import type { ServerResponse } from 'node:http';
 import { registerAsk } from './ask-broker.js';
+import { parseOption, parseAskQuestions } from './ask-questions.js';
+export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
+import { CODEX_ASYNC_ASK_ORIGIN, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
 
 export interface AskApiBody {
   sessionId: string;
@@ -25,10 +28,14 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  acknowledge?: boolean;
+  asyncUserInput?: CodexAsyncUserInput;
+  asyncFailure?: 'limit' | 'invalid_questions';
 }
 
 export type AskApiBodyError =
   | 'bad_body'
+  | 'unsupported_fields'
   | 'bad_sessionId'
   | 'bad_chatId'
   | 'bad_larkAppId'
@@ -42,41 +49,13 @@ export type AskApiBodyError =
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
+  | 'bad_inputMode'
   | 'bad_multiSelect'
+  | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
-  | 'bad_originKind';
-
-/** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
-function parseOption(o: unknown): AskOption | AskApiBodyError {
-  if (!o || typeof o !== 'object') return 'bad_option_shape';
-  const oo = o as Record<string, unknown>;
-  if (typeof oo.key !== 'string' || !oo.key.trim()) return 'bad_option_key';
-  if (typeof oo.label !== 'string') return 'bad_option_label';
-  return { key: oo.key, label: oo.label };
-}
-
-/** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
-function parseQuestions(arr: unknown[]): AskQuestion[] | AskApiBodyError {
-  const result: AskQuestion[] = [];
-  for (const q of arr) {
-    if (!q || typeof q !== 'object' || Array.isArray(q)) return 'bad_question_shape';
-    const qq = q as Record<string, unknown>;
-    if (typeof qq.prompt !== 'string' || !qq.prompt.trim()) return 'bad_question_shape';
-    if (typeof qq.multiSelect !== 'boolean') return 'bad_multiSelect';
-    if (!Array.isArray(qq.options) || qq.options.length < 2) return 'bad_options';
-    const opts: AskOption[] = [];
-    const seen = new Set<string>();
-    for (const o of qq.options) {
-      const parsed = parseOption(o);
-      if (typeof parsed === 'string') return parsed;
-      if (seen.has(parsed.key)) return 'duplicate_option_key';
-      seen.add(parsed.key);
-      opts.push(parsed);
-    }
-    result.push({ prompt: qq.prompt, multiSelect: qq.multiSelect, options: opts });
-  }
-  return result;
-}
+  | 'bad_originKind'
+  | 'bad_acknowledge'
+  | 'bad_asyncUserInput';
 
 /** Validate the request body. Returns either the parsed body or an error code
  *  ready to be sent back as `{ ok: false, error }` with HTTP 400.
@@ -116,15 +95,31 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     if (typeof r.originKind !== 'string' || !r.originKind.trim() || r.originKind.length > 32) {
       return { error: 'bad_originKind' };
     }
+    // The `host_*` namespace ('host_explicit', 'host_cross_principal_*') is
+    // daemon-internal: those claimants are constructed in-process and the
+    // broker grants the label GC / handoff / persistence exemptions. An HTTP
+    // client must never mint one by typing it — it would collect the privileges
+    // without any daemon-owned record. Reject at the boundary.
+    if (r.originKind.startsWith('host_')) {
+      return { error: 'bad_originKind' };
+    }
     originKind = r.originKind;
   }
 
+  if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
+
+  if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
+    || (r.asyncFailure !== 'limit' && r.asyncFailure !== 'invalid_questions'))) return { error: 'bad_asyncUserInput' };
   let questions: AskQuestion[];
+  const asyncUserInput = r.asyncUserInput === undefined ? undefined : parseCodexAsyncUserInput(r.asyncUserInput);
+  if ((r.asyncUserInput !== undefined && !asyncUserInput)
+    || (originKind === CODEX_ASYNC_ASK_ORIGIN) !== (asyncUserInput !== undefined)
+    || (asyncUserInput && requestId !== asyncUserInput.itemId)) return { error: 'bad_asyncUserInput' };
 
   if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseQuestions(r.questions);
+    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput });
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {
@@ -148,7 +143,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     return { error: 'bad_options' };
   }
 
-  return {
+  const parsed: AskApiBody = {
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,
@@ -157,7 +152,18 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
+    ...(asyncUserInput ? { asyncUserInput } : {}),
+    ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),
   };
+  // Reject semantics this receiver did not parse instead of silently creating
+  // a different kind of Ask. Identity claims remain on the raw body for the
+  // route's authorization checks; options/prompt are normalized above.
+  const routeFields = new Set(['prompt', 'options', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
+  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+    return { error: 'unsupported_fields' };
+  }
+  return parsed;
 }
 
 /** The response, not IncomingMessage.close, tracks the long-poll lifetime:

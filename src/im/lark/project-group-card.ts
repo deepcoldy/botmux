@@ -1,3 +1,4 @@
+import { t, type Locale } from '../../i18n/index.js';
 import { threadAppLink, type Brand } from './lark-hosts.js';
 import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
@@ -35,6 +36,17 @@ function escapeMarkdown(value: string): string {
 function truncate(value: string, max: number): string {
   const text = value.trim();
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
+
+function displayProjectTitle(value: string): string {
+  const title = value.replace(TASK_TITLE_MARKER_RE, '').trim();
+  return truncate(title || '项目进度', 42);
+}
+
+function displayProjectGoal(value: string): string {
+  return truncate(value.replace(/\s+/g, ' ').trim(), 120);
 }
 
 function topicLink(project: ProjectGroupState, item: ProjectWorkstream, brand: Brand): string | undefined {
@@ -114,6 +126,16 @@ function heroElement(label: string, content: string, color: string, background: 
       { tag: 'markdown', content: `<font color='${color}'>**${label}**</font>`, text_align: 'left', text_size: 'notation' },
       { tag: 'markdown', content: `**${escapeMarkdown(content)}**`, text_align: 'left', text_size: 'heading-3' },
     ],
+  };
+}
+
+/** Replace an obsolete setup guide after the live progress card is published. */
+export function buildProjectGroupStartedNoticeCard(locale?: Locale): Record<string, unknown> {
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: t('project.started.summary', undefined, locale) } },
+    header: { template: 'blue', title: { tag: 'plain_text', content: t('project.started.title', undefined, locale) } },
+    body: { elements: [{ tag: 'markdown', content: t('project.started.body', undefined, locale) }] },
   };
 }
 
@@ -287,7 +309,7 @@ function sectionEnabled(config: ProjectProgressCardConfig, section: ProjectProgr
 function focusElements(project: ProjectGroupState, config: ProjectProgressCardConfig): Array<Record<string, unknown>> {
   return [
     ...(sectionEnabled(config, 'goal')
-      ? [heroElement('目标', project.goal, 'indigo', 'indigo-50')]
+      ? [heroElement('目标', displayProjectGoal(project.goal), 'indigo', 'indigo-50')]
       : []),
     heroElement('当前推进', project.focus || '等待更新', 'blue', 'blue-50'),
   ];
@@ -399,6 +421,7 @@ export function buildProjectGroupCard(
     : project.status === 'paused'
       ? { label: '已暂停', color: 'neutral', header: 'grey' }
       : { label: '进行中', color: 'blue', header: 'blue' };
+  const title = displayProjectTitle(project.title);
   const body = TEMPLATE_BODY_BUILDERS[config.templateId]({ project, brand, config });
   body.push(
     { tag: 'hr', margin: '12px 0px 0px 0px' },
@@ -413,11 +436,11 @@ export function buildProjectGroupCard(
     config: {
       update_multi: true, compact_width: false, enable_forward: true,
       streaming_mode: false, width_mode: 'fill',
-      summary: { content: truncate(`${project.title} · ${projectProgressSummary(project)} · 当前 ${project.focus}`, 60) },
+      summary: { content: truncate(`${title} · ${projectProgressSummary(project)} · 当前 ${project.focus}`, 60) },
     },
     header: {
       template: statusMeta.header,
-      title: { tag: 'plain_text', content: project.title, text_align: 'left' },
+      title: { tag: 'plain_text', content: title, text_align: 'left' },
       subtitle: { tag: 'plain_text', content: `项目控制面 · 更新于 ${updatedLabel}`, text_align: 'left' },
       text_tag_list: [{
         tag: 'text_tag', text: { tag: 'plain_text', content: statusMeta.label, text_align: 'left' }, color: statusMeta.color,

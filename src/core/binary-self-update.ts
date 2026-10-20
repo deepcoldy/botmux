@@ -57,10 +57,9 @@
  *           the matching asset, verify its published SHA-256, then atomically
  *           rename over the target. Nothing else owns that path.
  *
- * A shape we cannot positively identify returns null, and every caller keeps its
- * existing "unsupported install" behaviour. Fail closed: guessing wrong here
- * means either writing into a tree npm owns, or downloading a binary for the
- * wrong libc.
+ * Other binary locations require a manual release installation at the default
+ * launcher path. The original binary is retained; scheduled updates are disabled
+ * until the installed release is running.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import {
@@ -69,6 +68,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { GITHUB_REPO } from './restart-report.js';
 import { getReleaseStream, resolveHttpProxy } from './release-download.js';
@@ -176,13 +176,27 @@ export interface BinarySelfUpdateResult {
   bytes: number;
 }
 
+export type BinaryUpdatePhase = 'download' | 'checksum' | 'probe' | 'swap';
+
+export interface BinaryUpdateProgress {
+  /** Current stage. `download` events carry live byte counts; later stages
+   *  report the fully-downloaded size so the UI stays busy past 100%. */
+  phase: BinaryUpdatePhase;
+  bytesReceived: number;
+  /** Asset size from the response's Content-Length, or null when the
+   *  (injected or chunked) stream does not announce one. */
+  bytesTotal: number | null;
+}
+
 export interface BinarySelfUpdateDeps {
   /** Fetch a URL as a readable stream (injected for tests). */
   fetchStream?: (url: string) => Promise<NodeJS.ReadableStream>;
   /** Read the published checksum for `asset`, or null when none is published. */
   fetchChecksum?: (url: string) => Promise<string | null>;
   /** Execute the downloaded candidate before activation (injected for tests). */
-  probeBinary?: (path: string) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stderr?: string | Buffer | null };
+  probeBinary?: (path: string) => { status: number | null; signal?: NodeJS.Signals | null; error?: Error; stdout?: string | Buffer | null; stderr?: string | Buffer | null };
+  /** Observe download byte counts and stage transitions (dashboard progress). */
+  onProgress?: (progress: BinaryUpdateProgress) => void;
 }
 
 /**
@@ -254,7 +268,25 @@ export async function replaceStandaloneBinary(
 
   try {
     const res = await fetchStream(`${base}/${asset}`);
-    await pipeline(res, createWriteStream(tmp));
+    // The default transport resolves an IncomingMessage carrying
+    // Content-Length; injected test streams (and chunked responses) do not.
+    const headers = (res as { headers?: Record<string, string | string[] | undefined> }).headers;
+    const declared = headers ? Number(Array.isArray(headers['content-length']) ? headers['content-length'][0] : headers['content-length']) : NaN;
+    const bytesTotal = Number.isFinite(declared) && declared > 0 ? declared : null;
+    let bytesReceived = 0;
+    const emit = (phase: BinaryUpdatePhase): void => {
+      deps.onProgress?.({ phase, bytesReceived, bytesTotal });
+    };
+    const counter = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytesReceived += chunk.length;
+        emit('download');
+        callback(null, chunk);
+      },
+    });
+    emit('download');
+    await pipeline(res, counter, createWriteStream(tmp));
+    emit('checksum');
     const expected = await fetchChecksum(`${base}/${asset}.sha256`);
     if (expected) {
       const actual = await sha256File(tmp);
@@ -275,13 +307,19 @@ export async function replaceStandaloneBinary(
     // floor; an embedded native built on a newer distro can still fail at dlopen.
     // Probe the complete module graph before the atomic rename so self-update has
     // the same fail-safe contract as npm postinstall and install.sh.
+    emit('probe');
     const probe = probeBinary(tmp);
     if (probe.error || probe.status !== 0) {
       const raw = probe.error?.message || probe.stderr || `exit ${probe.status ?? probe.signal ?? 'unknown'}`;
       const detail = String(raw).trim().split('\n').slice(0, 8).join(' | ');
       throw new Error(`${asset} 与当前主机不兼容，保留现有版本：${detail || 'candidate probe failed'}`);
     }
+    const candidateVersion = String(probe.stdout ?? '').trim();
+    if (candidateVersion !== version) {
+      throw new Error(`${asset} 版本校验失败（期望 ${version}，实际 ${candidateVersion || 'unknown'}），保留现有版本`);
+    }
     // Atomic swap. NOT a write to `target` — that is ETXTBSY (see header).
+    emit('swap');
     renameSync(tmp, target);
     return { asset, target, bytes };
   } catch (error) {

@@ -8,17 +8,17 @@ cd botmux
 bun install --frozen-lockfile
 bun run build
 
-# Run directly (no PM2)
+# Run directly (foreground)
 bun run daemon
 
-# Or with PM2
+# Or under the built-in supervisor
 bun run daemon:start
 bun run daemon:logs
 ```
 
 > Every code change requires `bun run build` then `bun run daemon:restart`.
 
-> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.2`,
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.3`,
 > lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
 > `node-pty`: bun does not run dependency lifecycle scripts by default, and
 > `node-pty` needs its install hook to build `build/Release/pty.node` — without
@@ -31,6 +31,24 @@ bun run daemon:logs
 > is a separate matter — `pnpm i -g botmux` is still a supported install path
 > (see `InstallKind` in `src/utils/install-diagnostics.ts`), so don't "convert"
 > those to bun.
+
+## Midscene Test · Feishu browser E2E
+
+The existing Feishu browser scenarios in `test/e2e-browser/` run through
+`@midscene/test`. Their Playwright and Midscene Web assertions are registered as
+native YAML cases, preserving the original scenario behavior while adding
+Midscene Test selection, retries, summaries, and unified reports.
+
+Create `storageState.json` and provide the Feishu and `MIDSCENE_MODEL_*`
+variables shown in `.env.example`, then run:
+
+```bash
+bun run test:midscene:typecheck
+bun run test:e2e-browser
+```
+
+Each invocation writes its replayable report below the gitignored
+`midscene_run/runs/<run-id>/` directory.
 
 ## Architecture
 
@@ -184,13 +202,16 @@ Tests are split into two Vitest projects with different execution profiles
   Runs with **file parallelism on** (one process per file). This is what
   `bun run test` runs, so the default is fast (~10s) and needs no real CLI binary
   or browser.
-- **`e2e`** (`*.e2e.ts`) — spawns real CLIs / drives the Feishu web UI through a
-  shared daemon, so files run **sequentially**. Opt-in only.
+- **`e2e`** (`*.e2e.ts`, excluding `test/e2e-browser/`) — spawns real CLIs and
+  runs sequentially. Opt-in only.
+- **Feishu browser E2E** (`test/e2e-browser/cases/*.yaml`) — runs through
+  `@midscene/test` against a shared daemon and logged-in browser session.
 
 ```bash
 bun run test                # Unit tests only — parallel, ~10s (default)
 bun run test:all            # Unit + E2E (needs real CLIs / browser session)
 bun run test:e2e            # All *.e2e.ts (sequential)
+bun run test:e2e-browser    # Feishu browser cases through Midscene Test
 bun run test:codex          # Codex input E2E
 bun run test:gemini         # Gemini CLI input E2E
 bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)

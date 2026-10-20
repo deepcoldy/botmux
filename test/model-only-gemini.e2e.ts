@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runIsolatedGemini } from '../src/services/constrained-invocation/gemini-runtime.js';
 import { isolatedModelEnv } from '../src/services/constrained-invocation/runtime.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 const executable = process.env.BOTMUX_MODEL_ONLY_GEMINI;
 const roots: string[] = []; const servers: Server[] = [];
 afterEach(async () => {
@@ -17,7 +18,9 @@ async function fixture(mode: 'normal' | 'hang' | 'hostile' | 'invalid' = 'normal
   const secret = join(root, 'secret.txt'); writeFileSync(secret, 'FILE_MUST_NOT_REACH_MODEL');
   const requests: any[] = [];
   const s = createServer(async (req, res) => {
-    let raw = ''; for await (const chunk of req) raw += chunk; const body = JSON.parse(raw); requests.push(body);
+    const body = await readRequestBodyJson<any>(req);
+    if (!body) { res.writeHead(400).end(); return; }
+    requests.push(body);
     if (mode === 'hang') return;
     const part = mode === 'hostile' ? { functionCall: { name: 'run_shell_command', args: { command: `touch ${join(root, 'must-not-exist')}` } } } : { text: mode === 'invalid' ? '{}' : '{"content":"42"}' };
     res.writeHead(200, { 'content-type': 'text/event-stream' });

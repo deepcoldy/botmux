@@ -87,6 +87,8 @@ After confirming, run `botmux restart`. See [FAQ / Troubleshooting](/en/faq) for
 
 Editing a message that has not yet triggered the bot to add an @ mention requires the optional `im.message.updated_v1` subscription with long-connection delivery. Missing this event does not affect ordinary new messages.
 
+Group context sharing (`/context-sharing`) marks recalled messages in its record only when the optional `im.message.recalled_v1` event is subscribed. Without it, recalls are not reflected and the bot's startup log reports the gap; ordinary new messages are unaffected.
+
 At startup, botmux uses an existing Feishu Open Platform login session to add this event to an existing long-connection configuration. It does not switch delivery modes, change permissions, or publish an app version. Logs reporting a successful update request or a configuration readback do not verify the published version or actual event delivery. After adding the subscription to a production app, inspect the pending changes in the Open Platform and publish a version, then test by adding an @ mention to a message that has not previously triggered the bot.
 
 If the sender relies on team membership for chat access, edited messages also require a contact lookup to recover the sender's `union_id`. The app needs contact read permissions (the default permission manifest includes `contact:user.id:readonly`), and the sender must be within its visibility scope. If permission is missing or the lookup fails, botmux uses only the original message author's `open_id` under the existing access rules; team membership alone cannot grant access. It never borrows the editor's identity.

@@ -32,7 +32,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
-import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
+import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
@@ -93,14 +93,15 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    // Remote backends (riff/mojo) never have the worker spawn a local binary —
+    // Riff/Mojo never have the worker spawn a local binary —
     // riff is pure HTTP and MojoBackend shells out per turn from the backend, so
-    // their adapter deliberately reports an empty resolvedBin. Exempting them via
-    // the shared predicate keeps this loop honest for every local CLI.
-    if (isRemoteCliId(id)) expect(adapter.resolvedBin).toBe('');
+    // their adapters deliberately report an empty resolvedBin. Remote Runner is
+    // also off-box execution, but it intentionally launches a local provider
+    // bridge process, so its configured executable must remain observable.
+    if (isRemoteCliId(id) && id !== 'remote-runner') expect(adapter.resolvedBin).toBe('');
     // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
     // the node binary, not the pinned path.
-    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
+    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh' || id === 'minimax') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -329,6 +330,24 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('points to the send guide in both locales and injection paths', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const prompts = [
+        buildBotmuxSystemPromptText({ locale }),
+        buildBotmuxShellHints(locale).join('\n'),
+      ];
+      for (const prompt of prompts) {
+        expect(prompt).toContain('botmux skill show botmux-send');
+      }
+      // No-transport and transcript delivery must keep their existing contract:
+      // these modes do not advertise explicit send commands in routing hints.
+      expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
+    }
+  });
+
   it('keeps the final-answer feedback hint aligned across both injection paths', () => {
     // 回归守卫：feedbackResponseKindHint 必须同时出现在 system-prompt 路径
     // （injectsSessionContext CLI）与 shell-hints 路径，否则启用最终回答反馈时
@@ -470,6 +489,49 @@ describe('claude-code buildArgs', () => {
       expect(prompt).toContain('botmux history');
     }
     expect(sys).not.toBe(buildBotmuxSystemPromptText({ locale: 'en' }));
+  });
+
+  // ── #1504: Cursor detaches an over-long shell command into a background task
+  //    and, on completion, injects a synthetic "Briefly inform the user about
+  //    the task result…" turn with no Lark message behind it. The only lever is
+  //    a Cursor-scoped routing line; every other CLI's hints must stay
+  //    byte-identical.
+  it('adds the Cursor background-task note only for cliId=cursor, in both delivery modes', () => {
+    const baseLines = buildBotmuxShellHints('en');
+    const base = baseLines.join('\n');
+    const cursorLines = buildBotmuxShellHints('en', false, 'send', 'cursor');
+    const cursor = cursorLines.join('\n');
+    expect(cursor).toContain('background task');
+    expect(cursor).toContain('Briefly inform the user about the task result');
+    expect(cursor).toContain('NOT a new message from the Lark user');
+    expect(cursor).toContain('do not `botmux send` again');
+    expect(cursor).not.toBe(base);
+    // Exactly one extra line; everything else is the shared baseline, in order.
+    const noteLines = cursorLines.filter((l) => l.includes('Briefly inform the user about the task result'));
+    expect(noteLines).toHaveLength(1);
+    expect(cursorLines.filter((l) => l !== noteLines[0])).toEqual(baseLines);
+
+    const cursorZh = buildBotmuxShellHints('zh', false, 'send', 'cursor').join('\n');
+    expect(cursorZh).toContain('后台任务');
+    expect(cursorZh).toContain('Briefly inform the user about the task result');
+    expect(cursorZh).toContain('不是飞书用户的新消息');
+    expect(cursorZh).toContain('不要再 botmux send');
+
+    // transcript mode: same warning, but it must not reintroduce `botmux send`.
+    const cursorTranscript = buildBotmuxShellHints('en', false, 'transcript', 'cursor').join('\n');
+    expect(cursorTranscript).toContain('background task');
+    expect(cursorTranscript).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(cursorTranscript).not.toContain('botmux send');
+    expect(cursorTranscript).not.toBe(buildBotmuxShellHints('en', false, 'transcript').join('\n'));
+
+    // Other CLIs: byte-identical to the no-cliId baseline.
+    for (const cliId of ['codex', 'gemini', 'coco', 'opencode'] as const) {
+      expect(buildBotmuxShellHints('en', false, 'send', cliId).join('\n')).toBe(base);
+      expect(buildBotmuxShellHints('en', false, 'transcript', cliId))
+        .toEqual(buildBotmuxShellHints('en', false, 'transcript'));
+    }
+    // noTransport collapses to the hidden-context defense only — cursor included.
+    expect(buildBotmuxShellHints('en', true, 'send', 'cursor')).toEqual(buildBotmuxShellHints('en', true));
   });
 
   it('transcript identity keeps the three routing rules minus mention_must; solo drops routing_rules; noTransport still wins', () => {
@@ -1858,6 +1920,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Positional prompt is inside the tmux launch command. 8192 matches
+    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBe(true);
@@ -1875,6 +1940,39 @@ describe('cursor buildArgs', () => {
     // Guard against over-broad matching: the arrow-prefixed composer glyph is
     // required, so unrelated screen text with the phrase must not false-match.
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
+  });
+
+  it('injects built-in plugin-dir by default and supports session-scoped skillPluginDir', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+    });
+    expect(args).toContain('--plugin-dir');
+    const pluginIndices = args.flatMap((arg, i) => (arg === '--plugin-dir' ? [i] : []));
+    expect(pluginIndices.length).toBe(2);
+    expect(args[pluginIndices[0] + 1]).toBe(CURSOR_PLUGIN_DIR);
+    expect(args[pluginIndices[1] + 1]).toBe('/tmp/runtime-skills/sess-cursor/claude-plugin');
+  });
+
+  it('omits --plugin-dir when promptInjection is none', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+      promptInjection: 'none',
+    });
+    expect(args).not.toContain('--plugin-dir');
+  });
+
+  it('declares dynamic pluginDir and claude-plugin skillDelivery capabilities alongside a discoverable skillsDir', () => {
+    expect(adapter.pluginDir).toBe(CURSOR_PLUGIN_DIR);
+    expect(adapter.skillsDir).toBe('~/.cursor/skills');
+    expect(adapter.skillDelivery).toEqual({
+      nativeKind: 'claude-plugin',
+      supportsScopedSession: true,
+      supportsExclusive: false,
+    });
   });
 });
 
@@ -1958,6 +2056,11 @@ describe('gemini buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // -i bakes the full first prompt into argv, same tmux ceiling as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
   it('does not include session id', () => {
@@ -2051,6 +2154,17 @@ describe('pi buildArgs', () => {
     expect(args[nameIdx + 1]).toBe('[BotMux·Lark] Fix login flow');
     expect(args.at(-1)).toBe('hello pi');
     expect(adapter.buildSessionRenameCommand?.('Renamed in Botmux')).toBe('/name Renamed in Botmux');
+  });
+
+  it('does not pass --name on resume, so a restart cannot overwrite a renamed Pi session', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: true,
+      nativeSessionTitle: 'Original title',
+      initialPrompt: 'hello pi',
+    });
+    expect(args).not.toContain('--name');
+    expect(args).toContain('--session-id');
   });
 
   it('loads the turn-boundary extension on every spawn so mid-turn retries are not read as failures', () => {
@@ -2175,17 +2289,6 @@ describe('pi buildArgs', () => {
     } finally {
       vi.unstubAllEnvs();
     }
-  });
-
-  it('buildPiArgs supports appendSystemPrompt when explicitly passed', () => {
-    const args = buildPiArgs({
-      sessionId: 'sess-pi',
-      turnBoundaryExtension: undefined,
-      appendSystemPrompt: ['<botmux_routing>fallback rules</botmux_routing>'],
-    });
-    expect(args).not.toContain('--extension');
-    expect(args).toContain('--append-system-prompt');
-    expect(args).toContain('<botmux_routing>fallback rules</botmux_routing>');
   });
 
   it('throws when turnBoundaryExtension cannot be resolved or materialized', () => {
@@ -2813,6 +2916,11 @@ describe('mtr buildArgs', () => {
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
+  });
 });
 
 describe('hermes buildArgs', () => {
@@ -3155,7 +3263,7 @@ describe('busyPattern', () => {
     expect(busy.test(busyProbeRegion('\x1b[5C' + plainBusy))).toBe(true);
   });
 
-  it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
+  it('traex matches spinner, queue, and live activity rows but not history or idle composer', () => {
     // Regression: a static capacity-queue screen matches readyPattern's
     // `\d+% left` status-bar arm and survives the 2s quiescence window,
     // flipping the card/Dashboard to Idle while the session is still waiting
@@ -3171,12 +3279,12 @@ describe('busyPattern', () => {
     //   spinner frames:  "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     //   working labels:  "Working…", "Thinking…", "Pondering…",
     //                    "Working it out…" (full rotation in traex.ts)
-    //   queue strings:   "Queued for capacity",
+    //   queue strings:   "Queued for capacity", "Queued for next turn",
     //                    "Too many requests right now. You're in the queue."
     //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
-    // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
-    // (0 hits across all releases + the 94MB TUI logs), so the Codex
-    // pattern's second anchor is invalid here.
+    // TraeX 0.207.x also restored the line-anchored "esc to interrupt" hint.
+    // Live 0.201.6 raw-PTY + screen captures verified all seven rotating
+    // activity glyphs and hook-runner labels with the same footer shape.
     const busy = createTraexAdapter('/bin/traex').busyPattern;
     expect(busy).toBeDefined();
     // Spinner-anchored working labels: "<braille frame> <label>".
@@ -3188,6 +3296,7 @@ describe('busyPattern', () => {
     // braille frame in front of the label, and the label is part of the
     // compiled-in spinner string table.
     expect(busy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(busy!.test('⠋ Queued for next turn')).toBe(true);
     // Standalone capacity-queue strings — the queue screen may render
     // statically (no animating spinner), so no frame anchor is required.
     // Line-anchored: bare line, indented line, and `at position N` suffix
@@ -3195,12 +3304,27 @@ describe('busyPattern', () => {
     expect(busy!.test('Queued for capacity')).toBe(true);
     expect(busy!.test('  Queued for capacity')).toBe(true);
     expect(busy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(busy!.test('Queued for next turn')).toBe(true);
+    expect(busy!.test('  esc to interrupt')).toBe(true);
     expect(busy!.test("Too many requests right now. You're in the queue.")).toBe(true);
     expect(busy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
+    // Live activity and hook-runner shapes across the full rotating glyph set.
+    for (const glyph of [...'⋄✧◇✦❖◈◆']) {
+      expect(busy!.test(`${glyph} Working… (2s • esc to interrupt)`)).toBe(true);
+    }
+    expect(busy!.test('⋄ Running 4 PreToolUse hooks (7s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('❖ Running 2 PostToolUse hooks (13s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('✦ Running 3 UserPromptSubmit hooks (0s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('◆ Running 2 Stop hooks (21s • ↓ 73 tokens • esc to interrupt)')).toBe(true);
+    expect(busy!.test('✦ Running Notification hook (22s • ↓ 73 tokens • esc to interrupt)')).toBe(true);
+    expect(busy!.test('◈ 读取 Bubble resource draft… (36m 20s • ↑ 68.7K tokens • esc to interrupt)')).toBe(true);
+    expect(busy!.test('  ⋄Working… (0s • esc to interrupt)────────────────────')).toBe(true);
+    expect(busy!.test('✧ Reading 2 files… (5s • esc to interrupt)\r\n')).toBe(true);
     // Mid-sentence prose quotes must NOT match — the line anchor is the
     // discriminator for the standalone arms (the braille frame for the
     // spinner arms).
     expect(busy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(busy!.test('The status line says Queued for next turn right now')).toBe(false);
     expect(busy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
     // Idle composer must NOT match.
     expect(busy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
@@ -3208,6 +3332,57 @@ describe('busyPattern', () => {
     expect(busy!.test('Working… on the fix')).toBe(false);
     expect(busy!.test('Working through the implementation')).toBe(false);
     expect(busy!.test('press esc to interrupt')).toBe(false);
+    expect(busy!.test('The previous status was ✦ Running 2 PreToolUse hooks')).toBe(false);
+    expect(busy!.test('◆ Ran rg for esc to interrupt')).toBe(false);
+    expect(busy!.test('◆ Ran echo "(36m 20s • ↑ 68.7K tokens • esc to interrupt)"')).toBe(false);
+    expect(busy!.test("◆ Ran echo '(36m 20s • ↑ 68.7K tokens • esc to interrupt)'")).toBe(false);
+    expect(busy!.test('◆ Ran echo `(36m 20s • ↑ 68.7K tokens • esc to interrupt)`')).toBe(false);
+    expect(busy!.test('◆ Ran grep (2m 3s) for "esc to interrupt" in logs')).toBe(false);
+    expect(busy!.test('◇ diff (12s): -◈ old (1m 1s • esc to interrupt)')).toBe(false);
+    // Accepted recall-first residual: tightening this would reject observed PTY
+    // footer redraws that append separators/content in the same logical line.
+    expect(busy!.test('◈ note: the footer reads (36m 20s • esc to interrupt) now')).toBe(true);
+
+    // TraeX 0.209.1 live tmux captures: the working row carries trailing
+    // shell-status segments after the footer, and the capacity queue renders
+    // as a glyph row (the line-start queue arms miss both).
+    expect(busy!.test('✦ Working… (3s • esc to interrupt) · 1 shell running… · /ps to manage')).toBe(true);
+    expect(busy!.test('❖ Running command… (12s • esc to interrupt) · 1 shell running… · /ps to manage')).toBe(true);
+    expect(busy!.test('◆ Queued for capacity (1s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('◇ Queued for capacity (3m 27s • esc to interrupt)')).toBe(true);
+    // ...and the completed 0.209.1 screen must stay idle: the assistant reply
+    // and tool-history rows reuse the ◆ glyph, plus the "Worked for" summary.
+    const idleScreen0209 = [
+      '▍ Run the shell command `sleep 12` and then reply with just OK.',
+      '◆ Ran sleep 12',
+      '  └ (no output)',
+      '◆ OK',
+      '  Worked for 17s • 12:03 PM',
+      '──────────────────────────────────────────────────────── Run sleep 12 command ─',
+      '❯ Improve documentation in @filename',
+      '────────────────────────────────────────────────────────────────────────────────',
+      '  GPT-5.5 (MAX) xhigh · Context 99% left · /tmp/x · master      ☢ Full Access (shift+tab to cycle) · ← for agents',
+    ].join('\n');
+    expect(busy!.test(idleScreen0209)).toBe(false);
+    expect(busy!.test('◆ OK')).toBe(false);
+    expect(busy!.test('◆ The job finished (took 12s) — press esc to interrupt next time')).toBe(false);
+    expect(busy!.test('  Worked for 17s • 12:03 PM')).toBe(false);
+  });
+
+  it('traex activity pattern rejects near-miss long lines without quadratic backtracking', () => {
+    // IdleDetector feeds unbounded PTY chunks to this pattern. A line starting
+    // with an activity glyph and a parenthesis full of elapsed-time-shaped
+    // tokens but WITHOUT the `esc to interrupt` phrase must fail fast: without
+    // the lookahead guard in TRAEX_ACTIVITY_PATTERN this 45K input backtracks
+    // quadratically (~2s locally, ~31s at 211K); with the guard it is <1ms.
+    const busy = createTraexAdapter('/bin/traex').busyPattern;
+    expect(busy).toBeDefined();
+    const nearMissSoup = '◆ ( ' + 'abc 123s '.repeat(5000);
+    expect(nearMissSoup.length).toBeGreaterThan(40_000);
+    const startedAt = performance.now();
+    expect(busy!.test(nearMissSoup)).toBe(false);
+    const elapsedMs = performance.now() - startedAt;
+    expect(elapsedMs).toBeLessThan(500);
   });
 
   it('traex staticBusyPattern latches only on line-anchored queue evidence', () => {
@@ -3222,10 +3397,13 @@ describe('busyPattern', () => {
     expect(staticBusy!.test('  Queued for capacity')).toBe(true);
     expect(staticBusy!.test('Queued for capacity at position 3.')).toBe(true);
     expect(staticBusy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('Queued for next turn')).toBe(true);
+    expect(staticBusy!.test('esc to interrupt')).toBe(true);
     expect(staticBusy!.test("Too many requests right now. You're in the queue.")).toBe(true);
     expect(staticBusy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
     // Mid-sentence prose quotes must NOT latch.
     expect(staticBusy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(staticBusy!.test('The status line says Queued for next turn right now')).toBe(false);
     expect(staticBusy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
     // Idle composer must NOT latch.
     expect(staticBusy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
@@ -3271,6 +3449,9 @@ describe('idleToBusyPattern', () => {
     // Standalone queue strings.
     expect(adapter.idleToBusyPattern!.test('Queued for capacity')).toBe(true);
     expect(adapter.idleToBusyPattern!.test("Too many requests right now. You're in the queue.")).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('⋄ Running 4 PreToolUse hooks (7s • esc to interrupt)')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('❖ Running 2 PostToolUse hooks (13s • esc to interrupt)')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test('◈ Updating resources (12m 4s • ↑ 8.2K tokens • esc to interrupt)')).toBe(true);
     // Prose without the braille frame anchor must NOT flip idle→busy.
     expect(adapter.idleToBusyPattern!.test('Working… on the fix')).toBe(false);
   });
@@ -3332,6 +3513,8 @@ describe('readyPattern', () => {
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.postTerminalPromptFence).toBe(true);
+    expect(adapter.quarantineUnconfirmedSubmits).toBe(true);
   });
 
   it('hermes defers the first-prompt timeout without type-ahead', () => {
@@ -3670,6 +3853,12 @@ describe('altScreen property', () => {
     expect(createPiAdapter('/bin/pi').altScreen).toBe(true);
   });
 
+  it('pi read-only viewers may forward wheel-only scroll', () => {
+    // Pi >= 1.0 defaults to fullscreen mode, so its transcript lives inside
+    // the TUI rather than xterm/tmux scrollback.
+    expect(createPiAdapter('/bin/pi').readOnlyRemoteScroll).toBe(true);
+  });
+
   it('copilot uses alt screen (Ink TUI)', () => {
     expect(createCopilotAdapter('/bin/copilot').altScreen).toBe(true);
   });
@@ -3815,6 +4004,8 @@ describe('native session rename capability', () => {
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))
       .toBe('/rename 新标题');
+    expect(createCursorAdapter('/usr/bin/cursor-agent').buildSessionRenameCommand?.('Cursor 标题'))
+      .toBe('/rename Cursor 标题');
     expect(createPiAdapter('/bin/pi').buildSessionRenameCommand?.('Pi 标题'))
       .toBe('/name Pi 标题');
 
@@ -3898,6 +4089,8 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Tighter than 8192: `--rules` is already in the tmux command.
+    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 
   it('resumes with --resume using resumeSessionId when available', () => {
@@ -3982,9 +4175,9 @@ describe('grok buildArgs', () => {
     expect(args.includes('--session-id')).toBe(false);
   });
 
-  it('enables type-ahead, ready-hook gate, and grok-hooks SessionStart install', () => {
+  it('enables type-ahead, disables ready-hook gate, and configures grok-hooks SessionStart install', () => {
     expect(adapter.supportsTypeAhead).toBe(true);
-    expect(adapter.injectsReadyHook).toBe(true);
+    expect(adapter.injectsReadyHook).toBeFalsy();
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.readyPattern?.test('│ ❯')).toBe(true);
     expect(adapter.hookInstall?.format).toBe('grok-hooks');

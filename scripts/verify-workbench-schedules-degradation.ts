@@ -25,7 +25,7 @@
 import assert from 'node:assert/strict';
 import { constants } from 'node:fs';
 import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type Server, type ServerResponse } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';

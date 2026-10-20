@@ -13,7 +13,6 @@ describe('desktop paths', () => {
 
     expect(paths.botmuxHome).toBe('/Users/alice/.botmux');
     expect(paths.logsDir).toBe('/Users/alice/.botmux/logs');
-    expect(paths.pm2Home).toBe('/Users/alice/.botmux/pm2');
   });
 
   it('does not create app-owned runtime paths in packaged builds', () => {
@@ -29,7 +28,6 @@ describe('desktop paths', () => {
       'botmuxHome',
       'dataDir',
       'logsDir',
-      'pm2Home',
     ]);
   });
 

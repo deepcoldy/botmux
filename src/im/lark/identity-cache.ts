@@ -26,6 +26,7 @@ import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { larkGet, getMessageDetail } from './client.js';
+import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
 
 export type IdentityType = 'user' | 'bot' | 'app' | 'unknown';
 
@@ -271,7 +272,7 @@ async function fetchUserProfile(larkAppId: string, openId: string): Promise<void
       return;
     }
     // 99991672 = app身份缺权限 (contact:user.base:readonly 没开)
-    if (res?.code === 99991672) {
+    if (res?.code === LARK_CODE_APP_SCOPE_MISSING) {
       if (!scopeUnavailable.has(larkAppId)) {
         scopeUnavailable.add(larkAppId);
         logger.warn(

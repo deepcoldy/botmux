@@ -3,7 +3,6 @@
  * Run: pnpm vitest run test/p2p-open.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
@@ -12,6 +11,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { registerBot, getBot } from '../src/bot-registry.js';
 import { canTalk, canOperate, evaluateTalk } from '../src/im/lark/event-dispatcher.js';
+import { handleCardAction } from '../src/im/lark/card-handler.js';
+import { sessionKey } from '../src/core/types.js';
+import { localeForBot, t } from '../src/i18n/index.js';
 
 describe('p2pOpen', () => {
   beforeEach(() => {
@@ -71,65 +73,47 @@ describe('p2pOpen', () => {
     expect(canOperate('p3', 'oc_group', 'ou_anyone')).toBe(false);
   });
 
-  // /quote 的 confirm 按钮能触发真实 CLI turn（sendWorkerInput / forkWorker），
-  // 所以点击时要现场复查权限。这里钉住 chatType 被传进那道复查：漏了它，
-  // canRunDaemonCommand 的 p2pOpen 腿失效（docstring 明写 chatType 省略即 fail-closed），
-  // 配了 p2pOpen 的 bot 在私聊里会变成「卡片能召唤、点确认永远被拒」。
-  // 与上面「chatType 缺省时按原语义（不放行）」是同一道防线在新调用点上的延续。
-  it('/quote confirm 的权限复查把 chatType 传进 canRunDaemonCommand', () => {
-    const source = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
-    const start = source.indexOf("if (value?.action === 'quote_confirm'");
-    expect(start).toBeGreaterThanOrEqual(0);
-    const block = source.slice(start, start + 4000);
-    // 闸必须在，且必须真的是「取反后守卫一个 return」的形状。
-    // 只断言 `canRunDaemonCommand(` 出现是不够的：我实测把条件改成
-    // `if (false && !canRunDaemonCommand(...))` 时那种断言照样绿——调用还在，
-    // 但闸已失效。所以这里钉住 `if (!canRunDaemonCommand(` 这个开头，
-    // 并要求它后面紧跟着拒绝分支。
-    expect(block).toMatch(/if \(!canRunDaemonCommand\(/);
-    // chatType 实参必须是 ds.chatType，不能省（省了 p2pOpen 腿失效）
-    expect(block).toMatch(/if \(!canRunDaemonCommand\([\s\S]*?ds\.chatType,\s*\)\) \{/);
-    // 命中时必须拒绝（返回 toast），不能只记日志放行
-    const gateBody = block.slice(block.indexOf('if (!canRunDaemonCommand('));
-    expect(gateBody.slice(0, 600)).toMatch(/return \{ toast:/);
-  });
+  // /quote 的 confirm 按钮能触发真实 CLI turn（sendWorkerInput / forkWorker），所以点击时要现场复查权限：
+  // 与命令入口同一个谓词 canRunDaemonCommand('/quote')、带上 ds.chatType（漏了它 p2pOpen 腿失效），
+  // operator 缺失时 fail-closed。会话设成 busy：过了权限闸就停在「忙」提示，不会去拉话题、碰网络。
+  describe('/quote confirm 点击时的权限复查', () => {
+    const loc = () => localeForBot('p1');
+    const quoteSession = (chatType: 'p2p' | 'group', chatId: string) => ({
+      chatId, chatType, session: { sessionId: 'quote-session' },
+      worker: { killed: false }, lastScreenStatus: 'working',
+    });
+    const clickConfirm = (ds: ReturnType<typeof quoteSession>, operatorOpenId: string | undefined, invokerOpenId?: string) => {
+      const activeSessions = new Map([[sessionKey('om_quote_root', 'p1'), ds]]);
+      return handleCardAction({
+        ...(operatorOpenId ? { operator: { open_id: operatorOpenId } } : {}),
+        action: { value: {
+          action: 'quote_confirm', chat_id: ds.chatId, root_id: 'om_quote_root',
+          container_id: 'omt_quoted', invoker_open_id: invokerOpenId,
+        } },
+      } as any, { activeSessions, sessionReply: vi.fn(), lastRepoScan: new Map() } as any, 'p1');
+    };
+    const toast = (key: string) => t(key, undefined, loc());
 
-  // operator 缺失时必须拒绝。re-render 分支已经是 fail-closed（要求 operatorOpenId），
-  // 而 confirm 是真正触发 CLI turn 的那条，不能比它更松。
-  it('/quote confirm 的 invoker 校验在 operator 缺失时 fail-closed', () => {
-    const source = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
-    const start = source.indexOf("if (value?.action === 'quote_confirm'");
-    const block = source.slice(start, start + 4000);
-    // 必须以 !operatorOpenId 起头短路；旧形状 `invokerOpenId && operatorOpenId && …`
-    // 在 operator 缺失时整个条件为 false，等于放行。
-    expect(block).toMatch(/if \(!operatorOpenId \|\| \(invokerOpenId && invokerOpenId !== operatorOpenId\)\)/);
-    expect(block).not.toMatch(/if \(invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId\)/);
-  });
+    it('operator 缺失或不是召唤者时 fail-closed', async () => {
+      const ds = quoteSession('p2p', 'oc_dm');
+      expect((await clickConfirm(ds, undefined))?.toast?.content).toBe(toast('card.quote.toast_not_invoker'));
+      expect((await clickConfirm(ds, 'ou_stranger', 'ou_owner'))?.toast?.content).toBe(toast('card.quote.toast_not_invoker'));
+    });
 
-  it('/quote confirm 用命令入口的同一个谓词，不是硬 canOperate', () => {
-    // canRunDaemonCommand = canOperate ∪ (cmd ∈ canTalkDaemonCommands && canTalk)。
-    // /quote 可以被 owner 配进 canTalkDaemonCommands 交给 talk-only 用户，此时若
-    // confirm 处用硬 canOperate，这类 bot 上会「能召唤、点确认必拒」。
-    const source = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
-    const start = source.indexOf("if (value?.action === 'quote_confirm'");
-    const block = source.slice(start, start + 4000);
-    const gate = block.slice(block.indexOf('canRunDaemonCommand('));
-    // 判据是 '/quote'（与命令入口同一条命令），而不是别的命令名
-    expect(gate).toMatch(/'\/quote'/);
-  });
+    it('/quote 交给 talk-only 时，私聊陌生人（p2pOpen）能通过复查——chatType 与命令名都传对了', async () => {
+      getBot('p1').config.canTalkDaemonCommands = ['/quote'];
+      const result = await clickConfirm(quoteSession('p2p', 'oc_dm'), 'ou_stranger', 'ou_stranger');
+      expect(result?.toast?.content).toBe(toast('card.quote.toast_busy'));
+    });
 
-  it('Saved Workflow 的独立 quota 闸把 chatType 传进 canTalk 复查', () => {
-    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('async function handleV3SavedWorkflowCommandIfAny(');
-    const end = source.indexOf('async function replyInvalidWorkingDirs(', start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const block = source.slice(start, end);
-    // 只钉住 chatType 确实被传进这道复查（漏了它，p2pOpen 放行的私聊会在这里被丢掉）。
-    // 不锁它是不是最后一个实参——后面又追加了 botSender（bot 发送方走 evaluateBotTalk），
-    // 把「参数列表到此为止」写进断言只会让每次加参数都误报。
-    expect(block).toMatch(
-      /consumeMessageQuotaOnce:\s*\(\)\s*=>\s*enforceMessageQuotaForCliInput\([\s\S]*memberUnionId,\s*chatType,/,
-    );
+    it('/quote 没交给 talk-only、或在未放开的群里时，陌生人点确认被拒', async () => {
+      expect((await clickConfirm(quoteSession('p2p', 'oc_dm'), 'ou_stranger', 'ou_stranger'))?.toast?.content)
+        .toBe(toast('card.quote.toast_need_auth'));
+      getBot('p1').config.canTalkDaemonCommands = ['/quote'];
+      expect((await clickConfirm(quoteSession('group', 'oc_group'), 'ou_stranger', 'ou_stranger'))?.toast?.content)
+        .toBe(toast('card.quote.toast_need_auth'));
+      expect((await clickConfirm(quoteSession('group', 'oc_group'), 'ou_owner', 'ou_owner'))?.toast?.content)
+        .toBe(toast('card.quote.toast_busy'));
+    });
   });
 });

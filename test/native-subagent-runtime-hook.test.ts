@@ -279,7 +279,11 @@ describe('native-subagent-runtime-hook CLI', () => {
     const result = await runHook('x'.repeat(256 * 1024 + 1), {
       startServer: false,
       endStdin: false,
-      exitTimeoutMs: 3_000,
+      // The bound includes a cold CLI import, which alone can take several
+      // seconds on a loaded CI shard (3s flaked at 3045ms). Without the
+      // internal stdin cutoff the hook would never exit, so any finite bound
+      // well above import + 750ms still catches the hang.
+      exitTimeoutMs: 15_000,
     });
 
     expect(result.timedOut).toBe(false);
@@ -292,7 +296,11 @@ describe('native-subagent-runtime-hook CLI', () => {
     const result = await runHook('{"hook_event_name":', {
       startServer: false,
       endStdin: false,
-      exitTimeoutMs: 3_000,
+      // The bound includes a cold CLI import, which alone can take several
+      // seconds on a loaded CI shard (3s flaked at 3045ms). Without the
+      // internal stdin cutoff the hook would never exit, so any finite bound
+      // well above import + 750ms still catches the hang.
+      exitTimeoutMs: 15_000,
     });
 
     expect(result.timedOut).toBe(false);

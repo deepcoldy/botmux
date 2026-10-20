@@ -375,10 +375,6 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   }
 }
 
-function isLocalBackend(value: InventoryBackend): value is Exclude<BackendType, 'riff' | 'mojo'> {
-  return value === 'pty' || isPersistentBackend(value);
-}
-
 function safeProcessExists(pid: number): boolean {
   try {
     process.kill(pid, 0);

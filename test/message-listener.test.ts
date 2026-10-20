@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   evaluateMessageListener,
+  evaluateMessageListenerWithDocumentTitles,
   extractListenerMessageText,
   extractListenerMessageTitle,
   normalizeMessageListenerPreviewLimit,
@@ -45,6 +46,121 @@ function interactiveMessage(overrides: Record<string, unknown> = {}) {
 }
 
 describe('message listener evaluation', () => {
+  function documentTitleListener(policy: Record<string, unknown> = {}) {
+    return bot({ globalMessageListener: {
+      enabled: true,
+      prompt: 'listener',
+      senderPolicy: { mode: 'include_only', includeSenderOpenIds: ['ou_allowed'], includeSenderTypes: ['user'] },
+      messagePolicy: { includeMsgTypes: ['text', 'post'], scope: 'top_level' },
+      contentPolicy: { includeKeywords: ['智能纪要'], resolveDocumentTitles: true, ...policy },
+    }});
+  }
+
+  function dashboardDefaultDocumentTitleListener(policy: Record<string, unknown> = {}) {
+    return bot({ globalMessageListener: {
+      enabled: true,
+      prompt: 'listener',
+      senderPolicy: { mode: 'include_only', includeSenderOpenIds: ['ou_allowed'], includeSenderTypes: ['user'] },
+      messagePolicy: { includeMsgTypes: ['text', 'post', 'image', 'interactive'], scope: 'top_level' },
+      contentPolicy: { includeKeywords: ['智能纪要'], resolveDocumentTitles: true, ...policy },
+    }});
+  }
+
+  it('matches a custom post link when only its resolved document title contains the keyword', async () => {
+    const resolveDocumentTitles = vi.fn(async () => ['智能纪要：测试会议']);
+    const message = textMessage({
+      message_type: 'post',
+      content: JSON.stringify({ content: [[{ tag: 'a', text: '点击查看', href: 'https://bytedance.feishu.cn/docx/DocToken1234567890AbCd' }]] }),
+    });
+    const match = await evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener(), chatId: 'oc_chat', message, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles });
+    expect(resolveDocumentTitles).toHaveBeenCalledTimes(1);
+    expect(match?.messageText).toContain('文档标题：智能纪要：测试会议');
+  });
+
+  it('does not query titles when the local message already matches or a gate rejects it', async () => {
+    const resolveDocumentTitles = vi.fn(async () => ['智能纪要：测试会议']);
+    const localHit = textMessage({ content: JSON.stringify({ text: '智能纪要 https://bytedance.feishu.cn/docx/DocToken1234567890AbCd' }) });
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener(), chatId: 'oc_chat', message: localHit, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles })).resolves.toBeDefined();
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener(), chatId: 'oc_chat', message: textMessage(), senderOpenId: 'ou_blocked', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles })).resolves.toBeUndefined();
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener(), chatId: 'oc_chat', message: textMessage(), senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: true,
+    }, { resolveDocumentTitles })).resolves.toBeUndefined();
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener(), chatId: 'oc_chat', message: interactiveMessage(), senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles })).resolves.toBeUndefined();
+    expect(resolveDocumentTitles).not.toHaveBeenCalled();
+  });
+
+  it('does not query document titles for card or image messages allowed by Dashboard defaults', async () => {
+    const resolveDocumentTitles = vi.fn(async () => ['智能纪要：测试会议']);
+    const card = interactiveMessage({
+      content: JSON.stringify({ title: '文档卡片', elements: [[{ tag: 'text', text: 'https://bytedance.feishu.cn/docx/DocToken1234567890AbCd' }]] }),
+    });
+    const image = textMessage({ message_type: 'image', content: JSON.stringify({ image_key: 'img_v3_demo' }) });
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: dashboardDefaultDocumentTitleListener(), chatId: 'oc_chat', message: card, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles })).resolves.toBeUndefined();
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: dashboardDefaultDocumentTitleListener(), chatId: 'oc_chat', message: image, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles })).resolves.toBeUndefined();
+    expect(resolveDocumentTitles).not.toHaveBeenCalled();
+  });
+
+  it('does not query document titles when the option is explicitly disabled', async () => {
+    const resolveDocumentTitles = vi.fn(async () => ['智能纪要：测试会议']);
+    const message = textMessage({ content: JSON.stringify({ text: 'https://bytedance.feishu.cn/docx/DocToken1234567890AbCd' }) });
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener({ resolveDocumentTitles: false }), chatId: 'oc_chat', message, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles })).resolves.toBeUndefined();
+    expect(resolveDocumentTitles).not.toHaveBeenCalled();
+  });
+
+  it('keeps a document-title label out of matching keywords and falls back safely on failure', async () => {
+    const message = textMessage({ content: JSON.stringify({ text: 'https://bytedance.feishu.cn/docx/DocToken1234567890AbCd' }) });
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener({ includeKeywords: ['文档'] }), chatId: 'oc_chat', message, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles: async () => ['无关会议'] })).resolves.toBeUndefined();
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener(), chatId: 'oc_chat', message, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles: async () => { throw new Error('forbidden'); } })).resolves.toBeUndefined();
+  });
+
+  it('applies all-mode across local text and resolved document titles', async () => {
+    const message = textMessage({ content: JSON.stringify({ text: '会议链接 https://bytedance.feishu.cn/docx/DocToken1234567890AbCd' }) });
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener({ includeKeywords: ['会议', '智能纪要'], matchMode: 'all' }), chatId: 'oc_chat', message, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles: async () => ['智能纪要：测试会议'] })).resolves.toMatchObject({ msgType: 'text' });
+    await expect(evaluateMessageListenerWithDocumentTitles({
+      bot: documentTitleListener({ includeKeywords: ['会议', '不存在'], matchMode: 'all' }), chatId: 'oc_chat', message, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false,
+    }, { resolveDocumentTitles: async () => ['智能纪要：测试会议'] })).resolves.toBeUndefined();
+  });
+
+  it('matches a rich-post title and link label without inventing a document message type', () => {
+    const state = bot({ globalMessageListener: {
+      enabled: true, prompt: 'listener',
+      senderPolicy: { includeSenderOpenIds: ['ou_allowed'], includeSenderTypes: ['user'] },
+      messagePolicy: { includeMsgTypes: ['post'], scope: 'top_level' },
+      contentPolicy: { includeKeywords: ['智能纪要'] },
+    }});
+    const message = textMessage({
+      message_type: 'post',
+      content: JSON.stringify({ title: '会议资料', content: [[{ tag: 'a', text: '智能纪要：测试会议', href: 'https://example.feishu.cn/docx/DEMO_TOKEN' }]] }),
+    });
+    const match = evaluateMessageListener({ bot: state, chatId: 'oc_chat', message, senderOpenId: 'ou_allowed', senderTypeRaw: 'user', explicitlyMentionedThisBot: false });
+    expect(match?.msgType).toBe('post');
+    expect(match?.messageText).toBe('会议资料\n智能纪要：测试会议 (https://example.feishu.cn/docx/DEMO_TOKEN)');
+  });
+
+  it('separates post title and body for keyword matching', () => {
+    expect(extractListenerMessageText(textMessage({ message_type: 'post', content: JSON.stringify({ title: '智能', content: [[{ tag: 'text', text: '纪要' }]] }) }))).toBe('智能\n纪要');
+  });
+
   it('matches enabled top-level non-mention messages after deterministic filters', () => {
     const state = bot({
       messageListeners: {
@@ -974,5 +1090,37 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
     expect(prompt).toContain('查看详情');
     // Title recovered from the merged card is surfaced as an attribute too.
     expect(prompt).toContain('message_title="Argos 报警"');
+  });
+
+  it('resolves <at id=...> tags when extracting listener interactive card text (P3-1)', () => {
+    const message = {
+      message_type: 'interactive',
+      content: JSON.stringify({
+        schema: '2.0',
+        body: {
+          elements: [
+            { tag: 'markdown', content: '<at id=ou_pure></at> 线上报警请关注' },
+          ],
+        },
+      }),
+      mentions: [
+        { key: '@_user_1', name: 'Pure(pi)', openId: 'ou_pure' },
+      ],
+    };
+    expect(extractListenerMessageText(message)).toBe('@Pure(pi) 线上报警请关注');
+
+    // And strips bare tags when mentions is absent / unmatched
+    const messageWithoutMention = {
+      message_type: 'interactive',
+      content: JSON.stringify({
+        schema: '2.0',
+        body: {
+          elements: [
+            { tag: 'markdown', content: '<at id=ou_deadbeef></at> 线上报警请关注' },
+          ],
+        },
+      }),
+    };
+    expect(extractListenerMessageText(messageWithoutMention)).toBe('线上报警请关注');
   });
 });

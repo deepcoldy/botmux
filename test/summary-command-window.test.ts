@@ -28,6 +28,10 @@ vi.mock('../src/im/lark/client.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotOpenId: () => BOT_OPEN_ID,
+  // message-parser imports this name. Bun 的整模块 mock 缺 named 绑定会在加载期
+  // SyntaxError（vitest 容忍工厂子集，所以 vitest 下此前一直是绿的）。
+  effectiveBotDisplayName: (state: any) =>
+    state?.config?.displayName || state?.botName || state?.config?.larkAppId,
   // logger / client import graph. Bun's mock is the whole module.
   getLoadedConfigPath: () => undefined,
   loadBotConfigs: () => [],

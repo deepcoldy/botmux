@@ -1,19 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
+import { sendJson } from './dashboard-api.js';
 import { toast } from './toast.js';
 
 type Tr = (key: string, values?: Record<string, string | number>) => string;
-type JsonResponse = { ok: boolean; status: number; body: any };
-
-async function sendJson(method: string, url: string, body?: unknown): Promise<JsonResponse> {
-  const r = await fetch(url, {
-    method,
-    headers: { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const parsed = await r.json().catch(() => ({}));
-  return { ok: r.ok && parsed?.ok !== false, status: r.status, body: parsed };
-}
-
 /**
  * Bot 默认配置 · 安全页：blockedUsers 原始条目编辑。
  *

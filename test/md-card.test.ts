@@ -199,6 +199,102 @@ describe('buildCardBodyElements', () => {
     expect(content).toMatch(/```\n\nnext prose/);
   });
 
+  it('lifts a code fence out of an ordered list into its own card element', () => {
+    const input = [
+      '1. Read the value.',
+      '2. When it is missing, run:',
+      '   ```cpp',
+      '   values.assign(128, 0.f);',
+      '   return true;',
+      '   ```',
+      '3. Continue processing.',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '1. Read the value.\n2. When it is missing, run:' },
+      { tag: 'markdown', content: '```cpp\nvalues.assign(128, 0.f);\nreturn true;\n```' },
+      { tag: 'markdown', content: '3. Continue processing.' },
+    ]);
+  });
+
+  it.each([
+    ['- Run:', '  ', '- Done.'],
+    ['- Outer\n  - Run:', '    ', '  - Done.'],
+    ['> Run:', '> ', '> Done.'],
+    ['> - Run:', '>   ', '> - Done.'],
+  ])('lifts nested fences after %s without treating code as prose', (before, prefix, after) => {
+    const code = ['if (ready) {', '  execute();', '', '', '', '}', '![literal](https://example.com/image.png)', '', ''];
+    const input = [before, prefix + '````text', ...code.map(line => prefix + line), prefix + '````', after].join('\n');
+    const elements = buildCardBodyElements(input);
+    expect(elements).toHaveLength(3);
+    expect(elements[1]).toEqual({ tag: 'markdown', content: '````text\n' + code.join('\n') + '\n````' });
+    expect(elements[0].content).toContain('Run:');
+    expect(elements[2].content).toContain('Done.');
+  });
+
+  it('keeps multiple code blocks and intervening list-item prose in order', () => {
+    const input = [
+      '- Start', '  ```js', '  first();', '  ```',
+      '', '  Continue', '',
+      '  ~~~js', '  second();', '  ~~~', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue' },
+      { tag: 'markdown', content: '~~~js\nsecond();\n~~~' },
+      { tag: 'markdown', content: '- Done' },
+    ]);
+  });
+
+  it('lifts indented code in a list without closing on literal backticks', () => {
+    const input = ['- Example:', '', '      ```', '      literal', '      ```', '', '- Done'].join('\n');
+    expect(buildCardBodyElements(input)[1]).toEqual({
+      tag: 'markdown', content: '````\n```\nliteral\n```\n````',
+    });
+  });
+
+  it('does not turn deeply indented continuation paragraphs into code after a lifted fence', () => {
+    const input = [
+      '- Outer', '  - Start', '    ```js', '    first();', '    ```',
+      '', '    Continue', '', '    Another paragraph', '', '- Done',
+    ].join('\n');
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- Outer\n  - Start' },
+      { tag: 'markdown', content: '```js\nfirst();\n```' },
+      { tag: 'markdown', content: 'Continue\n\nAnother paragraph\n\n- Done' },
+    ]);
+  });
+
+  it('keeps code-only list items and empty code fences', () => {
+    expect(buildCardBodyElements('- ```js\n  run();\n  ```\n- ```\n  ```')).toEqual([
+      { tag: 'markdown', content: '```js\nrun();\n```' },
+      { tag: 'markdown', content: '```\n```' },
+    ]);
+  });
+
+  it('keeps other blocks between lifted code and continuation paragraphs', () => {
+    const input = '- Start\n  ```js\n  run();\n  ```\n\n  ### Details\n\n  First paragraph\n\n  Second paragraph';
+    const elements = buildCardBodyElements(input);
+    expect(elements[2].content).toBe('### Details\n\nFirst paragraph\n\nSecond paragraph');
+  });
+
+  it('keeps source indentation of multi-paragraph list items when no code is lifted', () => {
+    // The startLine > map[0] guard must keep the generic source-slice path
+    // for paragraphs before any lifted code: stripping their indentation here
+    // would make CommonMark render the later paragraphs outside the list item.
+    const input = '- a\n\n  p1\n\n  p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- a\n\n  p1\n\n  p2' },
+    ]);
+  });
+
+  it('keeps source markers of multi-paragraph quotes when no code is lifted', () => {
+    const input = '> q\n>\n> p1\n>\n> p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '> q\n>\n> p1\n>\n> p2' },
+    ]);
+  });
+
   it('Bug B: 3-backtick nested fences don\'t corrupt later prose', () => {
     // CommonMark treats this as TWO adjacent code blocks (the "outer" closes
     // at the first inner ```). markdown-it parses the same way. The
@@ -936,29 +1032,37 @@ describe('buildMarkdownCard', () => {
   it('cardUsageRuntimeSegment renders a compact model (bold) + effort tail', () => {
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
-      true,
     )).toBe('**GPT-5.6-Sol** xhigh');
     // no effort -> model only, no trailing space/placeholder
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'gpt-4o' },
-      true,
     )).toBe('**gpt-4o**');
     // no model -> nothing
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, reasoningEffort: 'xhigh' },
-      true,
     )).toBeNull();
-    // no metric line to anchor to -> nothing (matches footer contract)
-    expect(cardUsageRuntimeSegment(
-      { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
-      false,
-    )).toBeNull();
+  });
+
+  it('preserves Cursor effort and fast variants encoded in the selected model ID', () => {
+    for (const model of ['claude-opus-5-5-high', 'claude-opus-5-5-high-fast']) {
+      expect(cardUsageRuntimeSegment({ context: null, tokens: null, model })).toBe(`**${model}**`);
+    }
+  });
+
+  it('includes known model/effort in a signed final footer without token metrics', () => {
+    const card = JSON.parse(buildCanonicalFinalReplyCard({
+      markdown: 'Answer', brand: '',
+      usage: { context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    }));
+    const footer = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_footer');
+    expect(footer.content).toContain('**gpt-5.6-sol** high');
+    expect(footer.content).toContain(REPLY_CARD_FOOTER_MARKER);
+    expect(footer.content).not.toMatch(/Context|上下文|↑|↓/);
   });
 
   it('renders a backend variant between the model and reasoning effort', () => {
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'GPT-5.6-Terra', modelBackendVariant: 'max', reasoningEffort: 'xhigh' },
-      true,
     )).toBe('**GPT-5.6-Terra** Max · xhigh');
   });
 
@@ -967,21 +1071,18 @@ describe('buildMarkdownCard', () => {
     // underscores are markdown-escaped by the shared compact formatter.
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'model_hub/es1_orange_o48' },
-      true,
     )).toBe('**es1\\_orange\\_o48**');
     // a value with no slash is untouched
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'gpt-5.6-sol' },
-      true,
     )).toBe('**gpt-5.6-sol**');
     // only a clean single-token prefix + one slash is removed
     expect(cardUsageRuntimeSegment(
       { context: null, tokens: null, model: 'a/b/c' },
-      true,
     )).toBe('**b/c**');
   });
 
-  it('does not create a standalone runtime line without native usage metrics', () => {
+  it('keeps the metric formatter empty when only runtime identity is known', () => {
     expect(cardUsageFooterSegment(
       {
         context: null,
@@ -1002,7 +1103,6 @@ describe('buildMarkdownCard', () => {
         model: `[very-long-${'x'.repeat(60)}] <at id=ou_fake></at>`,
         reasoningEffort: '*xhigh*',
       },
-      true,
     )!;
     expect(seg).toContain('**\\[very-long-');
     expect(seg).toContain('…** \\*xhigh\\*');
@@ -1516,11 +1616,11 @@ describe('buildImageCardElements', () => {
     expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a)');
   });
 
-  it('group with all indices out of range → literal text preserved', () => {
+  it('group with all indices out of range → readable omitted-image notice', () => {
     const out = buildImageCardElements('![](img:7,8)', [K[0]]);
     expect(out.some(e => e.tag === 'column_set')).toBe(false);
     const md = mdElements(out).map(e => e.content).join('');
-    expect(md).toContain('![](img:7,8)');
+    expect(md).toContain('[Image omitted] [](img:7,8)');
   });
 });
 

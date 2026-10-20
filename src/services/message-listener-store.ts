@@ -94,6 +94,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
       contentPolicy = {
         includeKeywords,
         ...(rawContent.matchMode === 'all' ? { matchMode: 'all' as const } : {}),
+        ...(rawContent.resolveDocumentTitles === true ? { resolveDocumentTitles: true } : {}),
       };
     }
   }

@@ -58,4 +58,21 @@ describe('buildProjectGroupCard workstream table', () => {
     const card = buildProjectGroupCard(makeProject({ workstreams: [] })) as any;
     expect(card.body.elements.some((e: any) => e.tag === 'table')).toBe(false);
   });
+
+  it('keeps runtime identity in ProjectStore but hides it from the compact card copy', () => {
+    const marker = '[task:0917f0d4099c854321c8aca3f1459c31]';
+    const title = `社区编辑器丰富度检测终态刷新修复 ${marker}`;
+    const goal = '页面从隐藏或休眠恢复时先拉取服务端最新状态，优先展示真实终态，不修改服务端检测标准；'.repeat(4);
+    const project = makeProject({ title, goal });
+    const card = buildProjectGroupCard(project) as any;
+    const serialized = JSON.stringify(card);
+    const goalText = card.body.elements[0].elements[1].content;
+
+    expect(project.title).toBe(title);
+    expect(card.header.title.content).toBe('社区编辑器丰富度检测终态刷新修复');
+    expect(card.config.summary.content).not.toContain('[task:');
+    expect(serialized).not.toContain(marker);
+    expect(goalText).toContain('…');
+    expect(goalText).not.toContain(goal);
+  });
 });

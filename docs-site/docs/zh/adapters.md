@@ -130,8 +130,31 @@ BotMux 把“协议能力”和“发行版身份”分开：`cliId: "codex"` �
 1. `src/adapters/cli/` 下新建文件，实现 `CliAdapter` 接口
 2. `src/adapters/cli/types.ts` 的 `CliId` 联合类型加新 ID
 3. `src/adapters/cli/registry.ts` 加 import / switch case / export
-4. `src/worker.ts` 的 `CLI_DISPLAY_NAMES`、`card-builder.ts` 的 `cliDisplayNames` 加显示名
+4. `src/adapters/cli/display-names.ts` 的 `CLI_DISPLAY_NAMES` 加显示名（卡片、worker、setup / dashboard 共用）
 5. `src/cli.ts` setup 交互菜单加选项
 6. 更新 README
 
 详见 [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md)。
+
+## Codex App 原生提问
+
+Botmux 管理的 `codex-app` 会话，以及启用 app-server RPC 的 `codex` 会话，会把原生 `request_user_input` 转成飞书问答卡片。用户选择或在当前会话文字作答后，答案按原问题 ID 回传给同一个原生轮次，无需新发一轮提示。TRAE RPC 也使用同一桥接。
+
+- 一次请求里的多个问题保留为同一批问题，选项说明随问题展示；推荐文案不会被自动当成答案。
+- 原生纯文本题会显示为等待文字回复的卡片；含纯文本题的整批问题统一通过会话文字回复作答。直接文字答复作为整批问题的答案回传；不要把未提交的选项当作已回答。
+- 复用现有 Ask 的会话路由和答复权限。等待最多一小时；发卡失败、超时、卡片失效或无法表达的问题会中断原轮次，避免空答案使 Agent 继续执行。
+- 原轮次结束、进程退出或会话关闭后，会取消等待；迟到答复不再回传。daemon 重启时此类原生请求不自动重试或恢复。
+- 选择题要求至少两个选项；秘密输入题和畸形问题会明确失败，整批不做部分回答。不要在聊天中输入密码等秘密。
+- Workflow 子任务仍使用 `humanGate` / decision 节点。无飞书传输的 API-only 会话、普通终端粘贴模式，以及 App 历史查看服务不走此问答桥接。
+
+验证时，在普通 Codex App 会话中让模型用原生 `request_user_input` 问一个选择题，确认飞书卡片能收到问题，提交后同一轮继续并能复述所选答案。原生工具是否可用仍由 Codex 的版本和运行模式决定。
+
+Codex App 的 `request_user_input_async` 会从带 `delivery: async` / `questions` 的消息事件生成独立飞书问答卡片。模型可以继续处理其他工作；原轮次正常结束后，卡片仍可作答。答案保留原调用 ID 和问题序号，经现有会话投递队列进入同一原生线程，开始后续轮次。重复事件只发一张卡片，推荐选项必须主动提交。
+
+异步提问支持单选项、重复标签与任意非空题数组。真人轮按现有 canTalk 权限发卡，注册时冻结唯一答复人，后来插话或来源记录淘汰不改变答复权；定时/自治轮通过来源授权后允许 canTalk 成员代答，定时任务创建者仍需 canOperate 权限，silent 定时任务不弹卡。文档评论轮沿用经校验的原评论人私信投递，只有原评论人可答；答案产生的新轮次保留原文档评论回复位置，不借用后来的评论或会话 owner。
+
+多张待答卡并存时，文字答案必须引用目标卡片；未引用的消息仍作为普通输入，并收到消歧提示。题组按卡片批次一次提交，含文字题时回复整个题组，文字作为共同备注；不支持 TUI 的逐题部分提交。最多等待一小时，超时、无法发卡或答案未送达会给出提示。原轮次失败或中断、runner 退出、会话关闭或更换时取消请求。待答卡不跨 daemon/runner 重启恢复，也不补发历史提问；原生可用性取决于 Codex 版本，此异步事件桥接适用于 `codex-app`。
+
+卡片结构示意（由实际卡片 JSON 本地渲染，尚未进行真人飞书点击验收）：
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

@@ -53,6 +53,7 @@ import {
   generateCodexAppControlEpoch,
   generateCodexAppPosixSocketEndpoint,
   generateCodexAppWindowsPipeEndpoint,
+  hardenWindowsCodexAppControlDirectory,
   mergeCodexAppControlCandidate,
   parseCodexAppControlWireRecord,
   parseWindowsCurrentSid,
@@ -67,6 +68,7 @@ import {
   verifyWindowsCodexAppControlDacl,
   writeCodexAppControlLocator,
   writeCodexAppControlState,
+  type WindowsControlCommandRunner,
 } from '../src/utils/codex-app-control.js';
 
 const tempDirs: string[] = [];
@@ -494,19 +496,38 @@ describe('Windows Codex App control root, locator, and filesystem policy', () =>
     )).toBe(false);
   });
 
-  it('uses trusted absolute whoami/icacls argv without a shell and verifies saved SDDL', () => {
-    const source = readFileSync(join(process.cwd(), 'src/utils/codex-app-control.ts'), 'utf8');
-    const start = source.indexOf('function defaultWindowsControlCommandRunner(');
-    const end = source.indexOf('/**\n * Remove inherited ACLs', start);
-    const acl = source.slice(start, end);
-    expect(acl).toContain('spawnSync(command, args, {');
-    expect(acl).toContain('shell: false');
-    expect(source).toContain("win32.join(systemRoot, 'System32', 'whoami.exe')");
-    expect(source).toContain("win32.join(systemRoot, 'System32', 'icacls.exe')");
-    expect(source).toContain("['/user', '/fo', 'csv', '/nh']");
-    expect(source).toContain("[path, '/inheritance:r', '/q']");
-    expect(source).toContain("[path, '/save', snapshotPath, '/q']");
-    expect(source).toContain('verifyWindowsCodexAppControlDacl(snapshot, sid, kind)');
+  it('hardens with SystemRoot-pinned whoami/icacls and fails closed on a loose saved DACL', () => {
+    const root = tempDir();
+    const target = join(root, 'control');
+    const sid = 'S-1-5-21-111-222-333-1001';
+    let savedDacl = `D:PAI(A;OICI;FA;;;${sid})(A;OICI;FA;;;SY)`;
+    const commands = new Set<string>();
+    const runner: WindowsControlCommandRunner = (command, args) => {
+      commands.add(command);
+      const save = args.indexOf('/save');
+      if (save >= 0) writeFileSync(args[save + 1]!, Buffer.from(`${args[0]}\r\n${savedDacl}\r\n`, 'utf16le'));
+      const stdout = command.endsWith('whoami.exe') ? `"HOST\\alice","${sid}"\r\n` : '';
+      return { status: 0, stdout, stderr: '', error: undefined };
+    };
+    const previousCwd = process.cwd();
+    const previousSystemRoot = process.env.SystemRoot;
+    try {
+      // On POSIX the win32-joined snapshot name is a cwd-relative file; keep it in the temp dir.
+      process.chdir(root);
+      process.env.SystemRoot = 'C:\\Windows';
+      hardenWindowsCodexAppControlDirectory(target, runner);
+      expect([...commands].sort()).toEqual([
+        'C:\\Windows\\System32\\icacls.exe',
+        'C:\\Windows\\System32\\whoami.exe',
+      ]);
+      savedDacl += '(A;OICI;FA;;;S-1-1-0)';
+      expect(() => hardenWindowsCodexAppControlDirectory(target, runner))
+        .toThrow(/not exactly current SID \+ SYSTEM/);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousSystemRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = previousSystemRoot;
+    }
   });
 
   it('validates random 256-bit pipe endpoints and rejects wrong/corrupt locators', () => {

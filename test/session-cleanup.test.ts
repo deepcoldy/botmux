@@ -84,6 +84,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 1,
       failed: 1,
       residual: 0,
+      archiveFailed: 0,
       results: [
         { sessionId: 'old-idle', ok: true },
         { sessionId: 'fails', ok: false, error: 'close_failed' },
@@ -128,6 +129,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 2,
       failed: 0,
       residual: 0,
+      archiveFailed: 0,
       results: [
         { sessionId: 'a', ok: true },
         { sessionId: 'b', ok: true },
@@ -147,6 +149,7 @@ describe('dashboard idle session cleanup selection', () => {
       closed: 0,
       failed: 0,
       residual: 0,
+      archiveFailed: 0,
       results: [],
     });
   });

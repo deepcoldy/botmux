@@ -1,0 +1,11 @@
+# Lane: a Claude topic used as a conversation — follow-up turns and in-topic
+# slash commands, the paths every real user hits after the first reply.
+cases:
+  - name: Follow-up in the same topic keeps context
+    tags: [conversation, topic, core]
+    steps:
+      - feishu.runScenario: { scenario: conversation-follow-up }
+  - name: Thread /status and /close commands
+    tags: [conversation, command, core]
+    steps:
+      - feishu.runScenario: { scenario: thread-status-close }

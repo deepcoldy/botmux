@@ -12,6 +12,7 @@ import { config } from '../../config.js';
 import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS } from '../../workflows/v3/dag.js';
 import { splitV3HostGatePrompt } from '../../workflows/v3/host-bindings.js';
+import { short, truncate, escapeMd } from './v3-card-common.js';
 
 export const V3_GATE_APPROVE_ACTION = 'v3_gate_approve';
 export const V3_GATE_REJECT_ACTION = 'v3_gate_reject';
@@ -207,16 +208,3 @@ function titleText(nodeId: string): string {
   return `humanGate · ${nodeId}`;
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…（截断，完整见 Web 详情）`;
-}
-
-function short(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, max)}…`;
-}
-
-/** 转义 lark_md 里会被解析的字符，防 prompt 注入破坏卡片结构。 */
-function escapeMd(s: string): string {
-  return s.replace(/[\\*_~`\[\]]/g, (c) => `\\${c}`);
-}

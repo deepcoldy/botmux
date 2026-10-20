@@ -15,6 +15,8 @@ describe('parseDispatchArgs', () => {
       '--brief-file=/tmp/brief.md',
       '--chat-id', 'oc_chat',
       '--repo=/repo',
+      '--model=gpt-6-astra',
+      '--reasoning-effort', 'high',
       '--into', 'om_root',
       '--session-id=sid',
       '--standby',
@@ -29,6 +31,8 @@ describe('parseDispatchArgs', () => {
         briefFile: '/tmp/brief.md',
         chatId: 'oc_chat',
         repo: '/repo',
+        model: 'gpt-6-astra',
+        reasoningEffort: 'high',
         into: 'om_root',
         sessionId: 'sid',
         standby: true,
@@ -57,8 +61,6 @@ describe('parseDispatchArgs', () => {
   });
 
   it.each([
-    ['--model', ['--model', 'gpt-5']],
-    ['--reasoning-effort', ['--reasoning-effort', 'high']],
     ['--mdoel', ['--mdoel', 'gpt-5']],
     ['--unknown=value', ['--unknown=value']],
   ])(
@@ -85,11 +87,22 @@ describe('parseDispatchArgs', () => {
     },
   );
 
+  it.each(['--model', '--reasoning-effort'])(
+    'rejects missing launch-spec value for %s',
+    (option) => expect(parseDispatchArgs([option]))
+      .toMatchObject({ ok: false, errorCode: 'OPTION_VALUE_REQUIRED' }),
+  );
+
   it('preserves first-wins singleton and idempotent boolean behavior', () => {
     expect(parseDispatchArgs(['--title', 'a', '--title', 'b']))
       .toMatchObject({ ok: true, value: { title: 'a' } });
     expect(parseDispatchArgs(['--standby', '--standby', '--steer', '--steer']))
       .toMatchObject({ ok: true, value: { standby: true, steer: true } });
+  });
+
+  it.each(['--model', '--reasoning-effort'])('rejects duplicate launch option %s', option => {
+    expect(parseDispatchArgs([option, 'one', option, 'two']))
+      .toMatchObject({ ok: false, errorCode: 'DUPLICATE_OPTION', option });
   });
 
   it('preserves repeatable bot flags', () => {
@@ -105,15 +118,28 @@ describe('parseDispatchArgs', () => {
       });
   });
 
+  it('parses explicit schedule delegation without changing legacy calls', () => {
+    expect(parseDispatchArgs([
+      '--title', 'task', '--bot-app', 'cli_a', '--brief', 'b',
+      '--delegate', 'schedule:create',
+    ])).toMatchObject({ ok: true, value: { delegates: ['schedule:create'] } });
+    const legacy = parseDispatchArgs(['--title', 'task']);
+    expect(legacy).toMatchObject({ ok: true, value: { title: 'task' } });
+    if (legacy.ok) expect('delegates' in legacy.value).toBe(false);
+    expect(parseDispatchArgs(['--no-delegate', 'schedule:create'])).toMatchObject({
+      ok: true, value: { noDelegates: ['schedule:create'] },
+    });
+  });
+
   it('preserves help short-circuit even alongside incomplete or unknown arguments', () => {
     expect(parseDispatchArgs(['--help', '--title'])).toMatchObject({ ok: true, value: { help: true } });
     expect(parseDispatchArgs(['--unknown', '-h'])).toMatchObject({ ok: true, value: { help: true } });
   });
 
-  it('rejects unknown options at the CLI boundary before transport setup', () => {
+  it('rejects a misspelled launch option at the CLI boundary before transport setup', () => {
     const result = spawnSyncTsScript(
       resolve('src/cli.ts'),
-      ['dispatch', '--title', 'task', '--model', 'gpt-5'],
+      ['dispatch', '--title', 'task', '--mdoel', 'gpt-5'],
       { cwd: resolve('.'), encoding: 'utf8' },
     ) as SpawnSyncReturns<string>;
 
@@ -122,8 +148,8 @@ describe('parseDispatchArgs', () => {
     expect(JSON.parse(result.stderr)).toEqual({
       success: false,
       errorCode: 'UNKNOWN_OPTION',
-      detail: 'unknown option: --model',
-      option: '--model',
+      detail: 'unknown option: --mdoel',
+      option: '--mdoel',
     });
   });
 });

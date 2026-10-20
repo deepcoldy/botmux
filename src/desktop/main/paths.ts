@@ -19,6 +19,5 @@ export function resolveDesktopPaths(input: ResolveDesktopPathsInput): DesktopPat
     botmuxHome,
     dataDir: join(botmuxHome, 'data'),
     logsDir: join(botmuxHome, 'logs'),
-    pm2Home: join(botmuxHome, 'pm2'),
   };
 }

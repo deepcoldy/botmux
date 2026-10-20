@@ -19,6 +19,9 @@ import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
+import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import { larkToolPrompt } from '../../core/lark-tool-binding.js';
+import type { CliId } from './types.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
  *  by default, but a user customization can force it on/off. Keyed by the i18n
@@ -84,7 +87,24 @@ function hiddenContextDefense(locale?: Locale): string {
   return escapeXmlText(text);
 }
 
-export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, replyDelivery?: ReplyDelivery): string[] {
+/** Cursor-only routing line (#1504). cursor-agent detaches a shell command that
+ *  outlives its wait limit into a background task and, when it completes,
+ *  injects a synthetic user prompt ("Briefly inform the user about the task
+ *  result…") that starts a fresh turn with no Lark message behind it. botmux
+ *  cannot intercept that (it happens inside Cursor / its backend), so the only
+ *  lever is telling the model what it is. Returns [] for every other CLI so
+ *  the shared hints stay byte-identical for them. */
+function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean, locale?: Locale): string[] {
+  if (cliId !== 'cursor') return [];
+  return [t(transcript ? 'ai.cursor.background_task_note_transcript' : 'ai.cursor.background_task_note', undefined, locale)];
+}
+
+export function buildBotmuxShellHints(
+  locale?: Locale,
+  noTransport?: boolean,
+  replyDelivery?: ReplyDelivery,
+  cliId?: CliId,
+): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
   // system-prompt path in buildBotmuxSystemPromptText. `ai.shell.when_to_send`
@@ -112,6 +132,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       ...(xpiAsHintOn() ? [t('ai.shell.xpi_as_hint', undefined, locale)] : []),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
+      ...cursorBackgroundTaskNote(cliId, true, locale),
       hiddenContextDefense(locale),
     ]
     : [
@@ -129,8 +150,10 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       // a toggle takes effect on the next session without a daemon restart.
       ...(noVisibleOutputHintOn() ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
       t('ai.shell.mention_gate', undefined, locale),
+      t('ai.routing.usage_attachments', undefined, locale),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
+      ...cursorBackgroundTaskNote(cliId, false, locale),
       hiddenContextDefense(locale),
     ]).map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {
@@ -188,18 +211,62 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  * directory to debug an auth failure — which a clear instruction does prevent —
  * and it does NOT survive a determined user or a prompt injection.
  */
-export function buildCredentialBoundaryBlock(locale?: Locale): string {
+export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | undefined, locale?: Locale): string {
+  if (!policy?.enabled || policy.tools.length === 0) return '';
+  const lark = triggerUserAuthApplies(policy, 'lark-cli');
+  const bytedcli = triggerUserAuthApplies(policy, 'bytedcli');
+  const line = (key: string, params?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, params, locale))}`;
+  return [
+    '<botmux_credentials>',
+    line('ai.credentials.acting_identity', { tools: policy.tools.join(' / ') }),
+    ...(bytedcli && policy.gitHost ? [line('ai.credentials.git_identity', { host: policy.gitHost })] : []),
+    line('ai.credentials.never_read_others'),
+    line('ai.credentials.never_forward'),
+    ...(lark ? [line('ai.credentials.on_auth_failure')] : []),
+    ...(bytedcli ? [line('ai.credentials.on_bytedcli_auth_failure')] : []),
+    line('ai.credentials.on_auth_link'),
+    ...(lark ? [line('ai.credentials.on_missing_scope')] : []),
+    '</botmux_credentials>',
+  ].join('\n');
+}
+
+function buildCredentialSafetyBlock(locale?: Locale): string {
   const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
   return [
     '<botmux_credentials>',
-    line('ai.credentials.acting_identity'),
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
-    line('ai.credentials.on_auth_failure'),
-    line('ai.credentials.on_auth_link'),
-    line('ai.credentials.on_missing_scope'),
     '</botmux_credentials>',
   ].join('\n');
+}
+
+/** Build the identity guidance that must match the managed lark-cli wrapper.
+ *
+ * A bound session no longer publishes lark-cli through the legacy per-turn
+ * trigger-user wrapper: it defaults to the receiving bot and switches to the
+ * current user only with an explicit `--as user`. Keep that statement beside
+ * the credential block so both system-prompt and inline-prompt paths use the
+ * same wording and the same filtered legacy policy. */
+export function buildManagedLarkToolPromptBlocks(
+  policy: TriggerUserAuthConfig | undefined,
+  larkToolAppId: string | undefined,
+  locale?: Locale,
+): string {
+  const effectivePolicy = larkToolAppId && policy
+    ? { ...policy, tools: policy.tools.filter(tool => tool !== 'lark-cli') }
+    : policy;
+  const credentialBoundary = buildCredentialBoundaryBlock(effectivePolicy, locale)
+    || (larkToolAppId && policy?.enabled && policy.tools.includes('lark-cli')
+      ? buildCredentialSafetyBlock(locale)
+      : '');
+  const larkToolBoundary = larkToolAppId
+    ? [
+      '<botmux_lark_tool>',
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale))}`,
+      '</botmux_lark_tool>',
+    ].join('\n')
+    : '';
+  return [credentialBoundary, larkToolBoundary].filter(Boolean).join('\n\n');
 }
 
 export function buildBotmuxSystemPromptText(opts: {
@@ -226,10 +293,14 @@ export function buildBotmuxSystemPromptText(opts: {
   noTransport?: boolean;
   /**
    * Trigger-user CLI auth is on for this session: add the credential boundary
-   * block. Off → nothing is emitted, so a bot that never enabled the feature
-   * gets no extra prompt text.
+   * block for tools that still use per-turn initiator identity. Managed
+   * lark-cli guidance is emitted independently through larkToolAppId.
    */
-  triggerUserAuth?: boolean;
+  triggerUserAuth?: TriggerUserAuthConfig;
+  /** App id of this session's managed lark-cli binding. When present, lark-cli
+   *  is removed from the legacy per-turn identity claim and receives its own
+   *  bot-default / explicit-user guidance instead. */
+  larkToolAppId?: string;
   /** Per-bot replyDelivery frozen for this session (core/reply-delivery.ts).
    *  'transcript': the daemon forwards the final assistant message from the CLI
    *  transcript, so the routing block never mentions `botmux send` at all —
@@ -245,7 +316,7 @@ export function buildBotmuxSystemPromptText(opts: {
    *  name/open_id but drops routing_rules — there is no other bot to route to. */
   solo?: boolean;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, replyDelivery, solo } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -316,6 +387,7 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.intro_transcript'),
       '',
       prose('ai.routing.usage_helpers'),
+      prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
       ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
       hiddenContextDefense(locale),
@@ -330,6 +402,7 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.usage_mention_gate'),
       prose('ai.routing.usage_attachments'),
       prose('ai.routing.usage_helpers'),
+      prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
       escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
       ...(xpiAsHintOn() ? [prose('ai.routing.xpi_as_hint')] : []),
@@ -350,15 +423,13 @@ export function buildBotmuxSystemPromptText(opts: {
   // determined user or a prompt injection. It exists because the likeliest way
   // these files get read is an agent troubleshooting an auth failure and
   // grepping the data directory, which a clear instruction does prevent.
-  const credentialBoundaryBlock = triggerUserAuth
-    ? ['', buildCredentialBoundaryBlock(locale)]
-    : [];
+  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale);
   return [
     '<botmux_routing>',
     ...routingInner,
     '</botmux_routing>',
     ...identityBlock,
-    ...credentialBoundaryBlock,
+    ...(credentialBoundaryBlock ? ['', credentialBoundaryBlock] : []),
     ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
   ].join('\n');
 }

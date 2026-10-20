@@ -141,6 +141,7 @@ describe('botmux root help workflow surface', () => {
       expect(stdout).toContain('--help, -h');
       expect(stdout).toContain('--image-mode <mode>');
       expect(stdout).toContain('--video-covers <path>');
+      expect(stdout).toContain('--schedule-remove-self');
       expect(stdout).toContain('@ 硬门：每条回复须三选一');
       expect(stdout).not.toContain('没有内容可发送');
     } finally {

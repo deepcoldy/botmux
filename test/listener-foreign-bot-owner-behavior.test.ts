@@ -2,9 +2,9 @@
  * Behavioral route-level guard for upstream PR #723 review blocker P1-2.
  *
  * The reviewer asked for a test that ACTUALLY reaches session creation and
- * verifies the owner is never set to a bot (the source-level guard in
- * test/listener-foreign-bot-owner.test.ts pins the invariant on daemon.ts
- * source text, but does not exercise the running route).
+ * verifies the owner is never set to a bot. This is the sole guard for that
+ * invariant (an earlier source-text pin on daemon.ts was retired in favour of
+ * it).
  *
  * This file drives the REAL handleNewTopic route with a bot-typed sender
  * (sender_type='app', as a third-party alert bot / message-listener match

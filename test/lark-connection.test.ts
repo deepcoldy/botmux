@@ -73,14 +73,25 @@ describe('startLarkConnection — lifecycle', () => {
 
   it('defaults to Feishu, honors DEBUG and retains connection diagnostics', () => {
     vi.stubEnv('DEBUG', '1');
-    startLarkConnection('app-test', 'secret', eventDispatcher);
+    const onReady = vi.fn();
+    const onReconnecting = vi.fn();
+    const onReconnected = vi.fn();
+    startLarkConnection('app-test', 'secret', eventDispatcher, 'feishu', {
+      onReady,
+      onReconnecting,
+      onReconnected,
+    });
     expect(capturedWsClientOptions?.domain).toBe('https://open.feishu.cn');
     expect(capturedWsClientOptions?.loggerLevel).toBe(Lark.LoggerLevel.info);
     capturedWsClientOptions?.onReconnecting();
+    capturedWsClientOptions?.onReady();
     capturedWsClientOptions?.onReconnected();
     capturedWsClientOptions?.onError(new Error('offline'));
     expect(logger.warn).toHaveBeenCalledWith('[ws] app-test reconnecting…');
+    expect(onReconnecting).toHaveBeenCalledOnce();
     expect(logger.info).toHaveBeenCalledWith('[ws] app-test reconnected');
+    expect(onReconnected).toHaveBeenCalledOnce();
+    expect(onReady).toHaveBeenCalledOnce();
     expect(logger.info).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test connecting domain=https:\/\/open\.feishu\.cn proxy=.+ runtime=.+$/));
     expect(logger.error).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test terminal error: offline \(proxy=.+ runtime=.+\)$/));
   });
@@ -93,13 +104,15 @@ describe('startLarkConnection — lifecycle', () => {
   });
 
   it('restarts a failed connection with the same dispatcher and does not overlap pending recovery', async () => {
-    const client = startLarkConnection('app-test', 'secret', eventDispatcher);
+    const onRestarting = vi.fn();
+    const client = startLarkConnection('app-test', 'secret', eventDispatcher, 'feishu', { onRestarting });
     vi.mocked(client.getConnectionStatus).mockReturnValue({ state: 'failed', reconnectAttempts: 3 });
     let finish!: () => void;
     vi.mocked(client.start).mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
     await probeRecovery();
     expect(client.start).toHaveBeenCalledTimes(2);
     expect(logger.warn).toHaveBeenCalledWith(expect.stringMatching(/^\[ws\] app-test connection failed \(reconnect exhausted, proxy=.+ runtime=.+\), restarting WSClient$/));
+    expect(onRestarting).toHaveBeenCalledOnce();
     expect(client.start).toHaveBeenLastCalledWith({ eventDispatcher });
     await probeRecovery();
     expect(client.start).toHaveBeenCalledTimes(2);

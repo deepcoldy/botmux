@@ -19,6 +19,11 @@ export const DEFAULT_VERIFY_RETRY_DELAY_MS = 1_000;
  *  ERR_LISTEN_RELEASE_WEDGED instead of hanging silently. */
 export const DEFAULT_RELEASE_TIMEOUT_MS = 5_000;
 
+/** Budget for `portAvailable()` to settle before treating the port as
+ *  unavailable and stepping up. A hung pre-bind check must not block the entire
+ *  listenWithProbe forever. */
+export const DEFAULT_PORT_AVAILABLE_TIMEOUT_MS = 3_000;
+
 export const LISTEN_RELEASE_WEDGED_CODE = 'ERR_LISTEN_RELEASE_WEDGED';
 
 /**
@@ -43,6 +48,13 @@ export interface ListenWithProbeOpts {
   maxProbe?: number;
   /** Optional caller-specific availability gate before attempting a bind. */
   portAvailable?: (port: number) => boolean | Promise<boolean>;
+  /**
+   * Budget for `portAvailable()` to settle before treating the port as
+   * unavailable and stepping up (default DEFAULT_PORT_AVAILABLE_TIMEOUT_MS).
+   * Note: timed out gate checks treat the port as unavailable (step up to next
+   * port), so custom gates must settle quickly.
+   */
+  portAvailableTimeoutMs?: number;
   /**
    * Optional post-bind verification, run AFTER a successful listen with the
    * actually-bound port. This exists to catch a wildcard (0.0.0.0) bind that
@@ -90,6 +102,7 @@ export function listenWithProbe(opts: ListenWithProbeOpts): Promise<number> {
   const { server, host } = opts;
   const maxProbe = opts.maxProbe ?? DEFAULT_PROBE_SPAN;
   const portAvailable = opts.portAvailable;
+  const portAvailableTimeoutMs = opts.portAvailableTimeoutMs ?? DEFAULT_PORT_AVAILABLE_TIMEOUT_MS;
   const verifyBound = opts.verifyBound;
   const verifyRetries = opts.verifyRetries ?? DEFAULT_VERIFY_RETRIES;
   const verifyRetryDelayMs = opts.verifyRetryDelayMs ?? DEFAULT_VERIFY_RETRY_DELAY_MS;
@@ -243,15 +256,28 @@ export function listenWithProbe(opts: ListenWithProbeOpts): Promise<number> {
     const attemptListen = () => {
       if (settled) return;
       if (port !== 0 && portAvailable) {
+        let gateSettled = false;
+        const gateTimer = setTimeout(() => {
+          if (gateSettled || settled) return;
+          gateSettled = true;
+          log(`port ${port} availability check timed out after ${portAvailableTimeoutMs}ms; stepping up`);
+          if (!tryNext('availability check timed out')) rejectUnavailable();
+        }, portAvailableTimeoutMs);
+        gateTimer.unref?.();
+
         Promise.resolve(portAvailable(port)).then((ok) => {
-          if (settled) return;
+          if (gateSettled || settled) return;
+          gateSettled = true;
+          clearTimeout(gateTimer);
           if (!ok) {
             if (!tryNext('unavailable')) rejectUnavailable();
             return;
           }
           server.listen(port, host);
         }).catch((err) => {
-          if (settled) return;
+          if (gateSettled || settled) return;
+          gateSettled = true;
+          clearTimeout(gateTimer);
           fail(err);
         });
         return;

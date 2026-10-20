@@ -28,9 +28,26 @@
  */
 import { chmodSync, lstatSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { mountsAtOrUnder } from '../../src/adapters/backend/sandbox.js';
 
+/**
+ * NEVER recurses into a mount. A test that mounted something under its scratch
+ * dir (a scratch overlay with `lowerdir=/`, a tmpfs, fuse-overlayfs) and failed
+ * to unmount it must not walk — let alone chmod/delete — through it: through a
+ * full-root overlay that is the whole host view (Bun's rmSync does descend
+ * into mount points). Such a dir is kept and reported instead.
+ */
 export function rmSandboxScratch(root: string | undefined | null): void {
   if (!root) return;
+  const mounts = mountsAtOrUnder(root);
+  if (mounts === null || mounts.length > 0) {
+    console.warn(
+      `[test cleanup] keeping ${root}: `
+      + (mounts === null ? 'mount table unreadable' : `still mounted (${mounts.join(', ')})`)
+      + ' — unmount it by hand, then delete it',
+    );
+    return;
+  }
   // Depth-first, chmod-then-descend: a 0o000 dir is unreadable until it is
   // chmod'ed, so the restore has to happen BEFORE readdir, not after.
   const stack = [root];

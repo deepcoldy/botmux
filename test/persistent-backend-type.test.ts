@@ -294,3 +294,22 @@ describe('isRiffBackendSession (restart guard freeze-once)', () => {
     expect(isRiffBackendSession(ds({ sessionBackend: 'tmux' }))).toBe(false);
   });
 });
+
+describe('resolvePairedBackendId (browser-safe spawn pairing)', () => {
+  it('matches reconcileRiffBackendType and resolves override → daemon default', async () => {
+    const { reconcilePairedBackendId, resolvePairedBackendId } = await import('../src/core/remote-cli-ids.js');
+    const { reconcileRiffBackendType } = await import('../src/core/persistent-backend.js');
+    for (const [cli, resolved, fallback] of [
+      ['claude-code', 'tmux', 'zmx'], ['claude-code', 'riff', 'zmx'], ['claude-code', 'riff', 'mojo'],
+      ['riff', 'tmux', 'tmux'], ['mojo', 'pty', 'riff'], ['codex', 'zmx', 'riff'],
+    ] as const) {
+      expect(reconcilePairedBackendId(cli, resolved, fallback)).toBe(reconcileRiffBackendType(cli, resolved as any, fallback as any));
+    }
+    expect(resolvePairedBackendId('claude-code', null, 'riff')).toBe('pty');
+    expect(resolvePairedBackendId('claude-code', 'tmux', 'zmx')).toBe('tmux');
+    expect(resolvePairedBackendId('claude-code', '', 'zmx')).toBe('zmx');
+    expect(resolvePairedBackendId('riff', 'tmux', 'zmx')).toBe('riff');
+    // Older daemon that does not report its default, no override: unknown.
+    expect(resolvePairedBackendId('claude-code', null, null)).toBeUndefined();
+  });
+});

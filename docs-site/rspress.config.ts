@@ -32,6 +32,7 @@ const zhSidebar = [
     collapsed: false,
     items: [
       { text: '实时流式卡片', link: '/cards' },
+      { text: '原话题不可用策略', link: '/topic-unavailable-policy' },
       { text: 'Web 终端', link: '/web-terminal' },
       { text: '多机器人协作', link: '/multi-bot' },
       { text: '多话题协作模式', link: '/multi-topic' },
@@ -52,6 +53,7 @@ const zhSidebar = [
       { text: 'Dashboard 管控面', link: '/dashboard' },
       { text: '接入点（Webhook）', link: '/webhook' },
       { text: 'API 编程式触发任务', link: '/api-task-trigger' },
+      { text: '通用单轮结果', link: '/turn-results' },
       { text: 'Core-only API 控制', link: '/api-core-only' },
       { text: 'Workflow（实验性）', link: '/workflow' },
       { text: '生命周期 Hooks', link: '/hooks' },
@@ -118,6 +120,7 @@ const enSidebar = [
     collapsed: false,
     items: [
       { text: 'Streaming Cards', link: '/en/cards' },
+      { text: 'Unavailable Topic Policy', link: '/en/topic-unavailable-policy' },
       { text: 'Web Terminal', link: '/en/web-terminal' },
       { text: 'Multi-Bot Collaboration', link: '/en/multi-bot' },
       { text: 'Multi-Topic Orchestration', link: '/en/multi-topic' },
@@ -138,6 +141,7 @@ const enSidebar = [
       { text: 'Dashboard', link: '/en/dashboard' },
       { text: 'Webhook Ingress', link: '/en/webhook' },
       { text: 'Programmatic Task Trigger API', link: '/en/api-task-trigger' },
+      { text: 'Turn Results', link: '/en/turn-results' },
       { text: 'Core-only API Control', link: '/en/api-core-only' },
       { text: 'Workflow (Experimental)', link: '/en/workflow' },
       { text: 'Lifecycle Hooks', link: '/en/hooks' },

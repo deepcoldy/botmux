@@ -6,8 +6,12 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import { composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
+import { createBinding, updateBinding } from '../src/services/issue-board-store.js';
+import type { Session } from '../src/types.js';
 
 const APP_ID = 'cli_report_worker';
 const REVIEWER = 'ou_report_reviewer';
@@ -24,6 +28,11 @@ afterEach(() => {
 
 async function runReport(options: {
   args?: string[];
+  topicPolicy?: 'stop' | 'legacy';
+  unavailableMessage?: string;
+  unavailableState?: 'deleted' | 'unknown' | 'missing';
+  retryThenWithdraw?: boolean;
+  issueInReview?: boolean;
   recipientRoot?: string;
   source?: Record<string, unknown>;
   current?: Record<string, unknown>;
@@ -35,6 +44,7 @@ async function runReport(options: {
   turnPlacement?: 'thread' | 'quote' | 'top-level';
   relayStatus?: number;
   relayBody?: Record<string, unknown>;
+  daemonLookup?: boolean;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'report-cli-'));
   roots.push(root);
@@ -61,11 +71,20 @@ async function runReport(options: {
       updatedAt: '2026-08-07T08:00:00.000Z',
     } } } : {}),
   };
-  seedPersistedSessionRows(data, APP_ID, {
+  const rows: Record<string, Record<string, unknown>> = {
     [source.sessionId]: { ...source, replyTargets: current.replyTargets, currentReplyTarget: current.currentReplyTarget, ...options.source },
     [current.sessionId]: { ...current, ...options.current },
     ...(options.ambiguous ? { duplicate: { ...source, sessionId: 'duplicate', creatorOpenId: 'ou_other_human' } } : {}),
-  });
+  };
+  seedPersistedSessionRows(data, APP_ID, rows);
+  if (options.issueInReview) {
+    // Use an already-settled local issue: the real report path must not call
+    // the platform API just to retry its independent delivery notice.
+    createBinding(data, { anchorId: CHAT, larkAppId: APP_ID, scope: 'chat', issueId: 'fixture-issue',
+      teamId: 'fixture-team', platformBaseUrl: 'https://platform.example.invalid', claimId: 'c'.repeat(32),
+      claimEpoch: 1, chatId: CHAT });
+    updateBinding(data, CHAT, { bindState: 'bound', platformStateRev: 1, lastSyncedStatus: 'in_review' });
+  }
   if (options.peer !== 'missing' && options.peer !== 'global-only') {
     writeFileSync(join(data, `bot-openids-${options.peer === 'other-app' ? 'cli_other' : APP_ID}.json`),
       options.peer === 'malformed' ? 'null' : JSON.stringify({ Reviewer: REVIEWER, CurrentPeer: 'ou_current_peer' }));
@@ -81,32 +100,75 @@ async function runReport(options: {
     token: CAPABILITY, turnId: 'turn-report', dispatchAttempt: 2,
   }), { mode: 0o600 });
   const requests: Array<{ url?: string; body: Record<string, unknown> }> = [];
+  const lookups: string[] = [];
   const server = createServer(async (req, res) => {
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    requests.push({ url: req.url, body: JSON.parse(body) });
+    const lookup = options.daemonLookup && req.method === 'GET'
+      ? /^\/api\/sessions\/([^/?]+)$/.exec(req.url ?? '') : null;
+    const row = lookup ? rows[decodeURIComponent(lookup[1])] : undefined;
+    if (row) {
+      // Answer like the daemon's by-id route: the dashboard projection, not the persisted row.
+      lookups.push(req.url!);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ session: composeRowFromPersistedActive(row as unknown as Session, { includeTokenUsage: false }) }));
+      return;
+    }
+    // A read-only context probe is not a report submission.
+    if (req.method !== 'POST') {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not_found' }));
+      return;
+    }
+    const body = await readRequestBodyJson(req, { strict: true });
+    if (body === undefined) { res.writeHead(400, { 'content-type': 'application/json' }); res.end('{}'); return; }
+    requests.push({ url: req.url, body });
     res.writeHead(options.relayStatus ?? 404, { 'content-type': 'application/json' });
     res.end(JSON.stringify(options.relayBody ?? { error: 'dispatch_target_unavailable' }));
   });
   await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
+  if (options.daemonLookup) {
+    mkdirSync(join(home, '.botmux'));
+    writeFileSync(join(home, '.botmux', '.dashboard-secret'), 'report-cli-fixture', { mode: 0o600 });
+    mkdirSync(join(data, 'dashboard-daemons'));
+    writeFileSync(join(data, 'dashboard-daemons', `${APP_ID}.json`), JSON.stringify({
+      larkAppId: APP_ID, ipcPort: (server.address() as AddressInfo).port, pid: process.pid, lastHeartbeat: Date.now(),
+    }));
+  }
   if (options.turnPlacement) {
     const markers = join(data, '.botmux-cli-pids');
     mkdirSync(markers);
     writeFileSync(join(markers, String(process.pid)), JSON.stringify({ sessionId: options.chatScope ? source.sessionId : current.sessionId, turnId: 'turn-report' }));
   }
   const captureFile = join(root, 'outbound.json');
+  const topicReadsFile = join(root, 'topic-reads.json');
   const script = `
     import { writeFileSync } from 'node:fs';
     import { registerBot } from ${JSON.stringify(pathToFileURL(resolve('src/bot-registry.ts')).href)};
-    const state = registerBot({ larkAppId: ${JSON.stringify(APP_ID)}, larkAppSecret: 'test-secret', cliId: 'claude-code', allowedUsers: [] });
+    const state = registerBot({ larkAppId: ${JSON.stringify(APP_ID)}, larkAppSecret: 'test-secret', cliId: 'claude-code', allowedUsers: [], topicUnavailablePolicy: ${JSON.stringify(options.topicPolicy)} });
+    const topicReads = [];
+    let writes = 0;
+    state.client.request = async ({ method, url }) => {
+      if (method !== 'GET' || !url.includes('/im/v1/messages/')) throw new Error('Unexpected provider request');
+      const id = url.split('/').at(-1);
+      topicReads.push(id);
+      writeFileSync(${JSON.stringify(topicReadsFile)}, JSON.stringify(topicReads));
+      const unavailable = id === ${JSON.stringify(options.unavailableMessage)}
+        && (!${!!options.retryThenWithdraw} || writes > 0);
+      const mode = ${JSON.stringify(options.unavailableState ?? 'deleted')};
+      return { code: 0, data: { items: unavailable && mode === 'missing' ? [] : [{ message_id: id,
+        ...(unavailable && mode === 'unknown' ? {} : { deleted: unavailable }) }] } };
+    };
     for (const method of ['create', 'reply']) {
       state.client.im.v1.message[method] = async request => {
         writeFileSync(${JSON.stringify(captureFile)}, JSON.stringify({ method, request }));
+        writes++;
+        if (${!!options.retryThenWithdraw} && writes === 1) {
+          throw { isAxiosError: true, response: { status: 429 } };
+        }
         return { code: 0, data: { message_id: 'om_report_sent' } };
       };
     }
     process.argv = ['node', 'botmux', 'report', ...${JSON.stringify([
-      '--session-id', options.chatScope ? source.sessionId : current.sessionId,
+      ...(options.args?.includes('--session-id') ? [] : ['--session-id', options.chatScope ? source.sessionId : current.sessionId]),
       ...(options.inlineContent ? ['Ready for review'] : ['--content-file', contentFile]),
       ...(options.recipientRoot === undefined ? [] : ['--recipient-root', options.recipientRoot]),
       ...(options.args ?? []),
@@ -120,7 +182,7 @@ async function runReport(options: {
       const child = spawnTsEvalWithRepoImports(script, {
         env: {
           ...env, HOME: home, USERPROFILE: home, SESSION_DATA_DIR: data, BOTS_CONFIG: config,
-          BOTMUX_SEND_RELAY: relay,
+          BOTMUX_SEND_RELAY: relay, BOTMUX_LARK_GATE_RETRY_BASE_MS: '1',
           BOTMUX_DAEMON_IPC_PORT: String((server.address() as AddressInfo).port),
         },
         stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
@@ -134,7 +196,8 @@ async function runReport(options: {
     });
     const outputLine = result.stdout.split('\n').find(line => line.startsWith('{"success":'));
     return {
-      ...result, output: outputLine ? JSON.parse(outputLine) : undefined, requests,
+      topicReads: existsSync(topicReadsFile) ? JSON.parse(readFileSync(topicReadsFile, 'utf8')) as string[] : [],
+      ...result, output: outputLine ? JSON.parse(outputLine) : undefined, requests, lookups,
       outbound: existsSync(captureFile) ? JSON.parse(readFileSync(captureFile, 'utf8')) : undefined,
     };
   } finally {
@@ -175,6 +238,21 @@ describe('report CLI recipient root and authenticated relay', () => {
 
   it('keeps the session creator without an explicit recipient root', async () => {
     expectRecipient(await runReport(), USER);
+  });
+
+  it('resolves the recipient root from the persisted row when the daemon answers the session lookup', async () => {
+    const result = await runReport({ recipientRoot: SEED, daemonLookup: true });
+    expect(result.lookups).toContain('/api/sessions/current-thread');
+    expectRecipient(result, REVIEWER);
+    expect(result.output.recipient).toMatchObject({ source: 'recipient-root-chat-creator', sourceSessionId: 'source-chat' });
+    expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
+  });
+
+  it('keeps the persisted creator ahead of owner and quote sender when the daemon answers the session lookup', async () => {
+    const result = await runReport({ chatScope: true, daemonLookup: true, source: { ownerOpenId: USER, quoteTargetSenderOpenId: USER } });
+    expect(result.lookups).toContain('/api/sessions/source-chat');
+    expectRecipient(result, REVIEWER);
+    expect(result.output.recipient.source).toBe('session-creator');
   });
 
   it('accepts an equals-form recipient root and inline content', async () => {
@@ -321,5 +399,96 @@ describe('report CLI recipient root and authenticated relay', () => {
     expect(result.status).toBe(1);
     expect(result.outbound).toBeUndefined();
     expect(result.requests).toHaveLength(1);
+  });
+});
+
+
+describe('report source topic preservation', () => {
+  it('refuses top-level publication when the thread source message identity is missing', async () => {
+    const result = await runReport({ args: ['--top-level'], current: { rootMessageId: '' }, topicPolicy: 'stop' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_CHECK_FAILED');
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it.each([['--top-level'], ['--into', 'om_other'], ['--legacy-dispatch']])(
+    'blocks a withdrawn thread before publishing despite %j', async (...args) => {
+      const result = await runReport({ args, topicPolicy: 'stop', unavailableMessage: THREAD });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+      expect(result.outbound).toBeUndefined();
+      expect(result.topicReads).toContain(THREAD);
+    },
+  );
+  it.each(['thread', 'quote'] as const)('retains the live chat turn %s source under top-level override', async turnPlacement => {
+    const result = await runReport({ args: ['--top-level'], chatScope: true, turnPlacement,
+      topicPolicy: 'stop', unavailableMessage: 'om_live_target' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+    expect(result.outbound).toBeUndefined();
+    expect(result.topicReads).toEqual(['om_live_target']);
+  });
+  it.each(['unknown', 'missing'] as const)('pauses on %s source evidence', async unavailableState => {
+    const result = await runReport({ args: ['--top-level'], topicPolicy: 'stop', unavailableMessage: THREAD, unavailableState });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_CHECK_FAILED');
+    expect(result.outbound).toBeUndefined();
+  });
+  it('keeps a different executing session source when report selects another session', async () => {
+    const result = await runReport({ turnPlacement: 'thread', args: ['--session-id', 'source-chat', '--top-level'],
+      topicPolicy: 'stop', unavailableMessage: THREAD });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+    expect(result.outbound).toBeUndefined();
+    expect(result.topicReads).toEqual([THREAD]);
+  });
+  it('rechecks the source inside the transport retry for top-level reporting', async () => {
+    const result = await runReport({ args: ['--top-level'], topicPolicy: 'stop', unavailableMessage: THREAD, retryThenWithdraw: true });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+    expect(result.topicReads).toEqual([THREAD, THREAD]);
+  });
+  it('permits an available source and still protects the selected destination', async () => {
+    const result = await runReport({ args: ['--into', 'om_other'], topicPolicy: 'stop', unavailableMessage: 'om_other' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+    expect(result.outbound).toBeUndefined();
+    expect(result.topicReads).toEqual(['om_other']);
+    const live = await runReport({ args: ['--top-level'], topicPolicy: 'stop' });
+    expectRecipient(live, USER);
+    expect(live.topicReads).toEqual([THREAD]);
+  });
+  it('does not infer a source from an old chat root or change legacy reads', async () => {
+    const plain = await runReport({ args: ['--top-level'], chatScope: true, topicPolicy: 'stop', unavailableMessage: SEED });
+    expectRecipient(plain, REVIEWER);
+    expect(plain.topicReads).toEqual([]);
+    const legacy = await runReport({ args: ['--top-level'], topicPolicy: 'legacy', unavailableMessage: THREAD });
+    expectRecipient(legacy, USER);
+    expect(legacy.topicReads).toEqual([]);
+  });
+});
+
+
+describe('report issue notice source', () => {
+  it('retains the settled issue receipt but does not publish its notice after source withdrawal', async () => {
+    const result = await runReport({ issueInReview: true, topicPolicy: 'stop', unavailableMessage: THREAD });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ success: true, delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: false });
+    expect(result.outbound).toBeUndefined(); expect(result.topicReads).toEqual([THREAD]);
+    expect(result.requests).toEqual([]); expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+  });
+  it('rechecks the issue notice source before retrying a rate-limited write', async () => {
+    const result = await runReport({ issueInReview: true, topicPolicy: 'stop', unavailableMessage: THREAD, retryThenWithdraw: true });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: false });
+    expect(result.topicReads).toEqual([THREAD, THREAD]); expect(result.requests).toEqual([]);
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+  });
+  it.each(['stop', 'legacy'] as const)('delivers an issue notice under %s without losing its original chat', async topicPolicy => {
+    const result = await runReport({ issueInReview: true, topicPolicy, ...(topicPolicy === 'legacy' ? { unavailableMessage: THREAD } : {}) });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: true });
+    expect(result.outbound).toMatchObject({ method: 'create', request: { data: { receive_id: CHAT } } });
+    expect(result.topicReads).toEqual(topicPolicy === 'stop' ? [THREAD] : []); expect(result.requests).toEqual([]);
   });
 });

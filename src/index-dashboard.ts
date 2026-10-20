@@ -51,8 +51,8 @@ loadDashboardEnvFile(existsSync(globalEnv) ? globalEnv : '.env');
 // identity into this long-lived process. Every key scrubbed here is one
 // index-daemon.ts scrubs and has NO consumer anywhere in the dashboard's code
 // (dashboard.ts + src/dashboard/**), while the dashboard DOES fork children
-// that must not inherit it — debug terminals, start/stop-bot CLI runs, the
-// detached update/restart driver. Per-key take:
+// that must not inherit it — start/stop-bot CLI runs, the detached
+// update/restart driver. Per-key take:
 //  - BOTMUX_SESSION_ID/BOTMUX_CHAT_ID/BOTMUX_CHAT_TYPE/BOTMUX_ROOT_MESSAGE_ID:
 //    session routing identity; a leaked BOTMUX_SESSION_ID would make hook/CLI
 //    gates in forked children mistake them for session context.
@@ -66,15 +66,15 @@ loadDashboardEnvFile(existsSync(globalEnv) ? globalEnv : '.env');
 // list index-daemon.ts scrubs. The hand-picked 7-key subset this used to be
 // had fallen behind that list (e.g. BOTMUX_MCP_GATEWAY_SOCKET, IS_SANDBOX
 // were never in it), silently letting a growing set of session-only values
-// ride into every child this process forks (debug terminals, start/stop-bot
-// CLI runs, the detached update/restart driver).
+// ride into every child this process forks (start/stop-bot CLI runs, the
+// detached update/restart driver).
 scrubSessionTurnMarkerEnv(process.env);
 // CLAUDE_CONFIG_DIR / CODEX_HOME: per-session CLI data roots. No dashboard
-// consumer; inherited into a debug-terminal CLI they redirect it into the
+// consumer; inherited into a CLI forked from here they redirect it into the
 // leaking bot's home.
 scrubSessionCliHomeEnv(process.env);
-// Claude session-identity markers: inherited into a CLI forked from here (debug
-// terminal) they mark it a nested child session → transcript saving OFF.
+// Claude session-identity markers: inherited into a CLI forked from here they
+// mark it a nested child session → transcript saving OFF.
 scrubClaudeSessionMarkerEnv(process.env);
 // Workflow/goal worker identity: the dashboard is a workflow HOST surface,
 // never a worker. dashboard.ts repeats this scrub at its own module top — kept
@@ -83,8 +83,8 @@ scrubClaudeSessionMarkerEnv(process.env);
 // the new boundary complete without relying on that legacy call.
 scrubWorkflowWorkerEnv(process.env);
 // Invoker-terminal fingerprints (NO_COLOR=1 / CODEX_CI=1 / PAGER=cat from a
-// non-interactive restart shell): inherited into a forked debug terminal they
-// render it colorless. Re-pin TERM after, same constant index-daemon.ts uses.
+// non-interactive restart shell): inherited into a forked child they render
+// it colorless. Re-pin TERM after, same constant index-daemon.ts uses.
 scrubInvokerTerminalEnv(process.env);
 process.env.TERM = 'xterm-256color';
 // Deliberately NOT scrubbed, unlike index-daemon.ts: the Feishu H5 family

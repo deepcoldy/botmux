@@ -15,6 +15,7 @@ export interface ChatRenameOperationDeps {
       beforeUpdate?: () =>
         | { ok: true }
         | { ok: false; error: 'rate_limited'; retryAfterSeconds: number };
+      expectedOldName?: string;
     },
   ) => Promise<RenameChatResult>;
   activeSessions: () => Iterable<ActiveChatSession>;
@@ -29,12 +30,14 @@ export interface ChatRenameOperationInput {
   larkAppId: string;
   chatId: string;
   name: string;
-  trigger: 'ai_proactive' | 'user_explicit' | 'host_api';
+  trigger: 'ai_proactive' | 'user_explicit' | 'host_api' | 'auto_title';
   sessionId?: string;
   botOpenId?: string;
   beforeUpdate?: () =>
     | { ok: true }
     | { ok: false; error: 'rate_limited'; retryAfterSeconds: number };
+  /** Only rename while the live name still equals this (see renameChat). */
+  expectedOldName?: string;
 }
 
 export interface ChatRenameOperationResponse {
@@ -47,6 +50,7 @@ export interface ChatRenameOperationResponse {
 function failureStatus(result: Extract<RenameChatResult, { ok: false }>): number {
   if (result.error === 'bot_not_in_chat' || result.error === 'permission_denied') return 403;
   if (result.error === 'rate_limited') return 429;
+  if (result.error === 'name_changed') return 409;
   return 502;
 }
 
@@ -72,6 +76,7 @@ export async function executeChatRename(
 ): Promise<ChatRenameOperationResponse> {
   const result = await deps.renameChat(input.larkAppId, input.chatId, input.name, {
     beforeUpdate: input.beforeUpdate,
+    ...(input.expectedOldName !== undefined ? { expectedOldName: input.expectedOldName } : {}),
   });
   const context = auditContext(input);
 

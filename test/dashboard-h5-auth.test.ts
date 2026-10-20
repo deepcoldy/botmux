@@ -207,6 +207,23 @@ describe('Feishu H5 passwordless dashboard auth', () => {
     ]);
   });
 
+  it('mints a result-only identity for the bound result flow without granting dashboard access', async () => {
+    const { base, sessions } = await startController('ou_unused', undefined, {
+      exchanger: { exchange: async () => ({ openId: 'ou_stranger', unionId: 'on_result_owner123' }) },
+    });
+    const response = await fetch(`${base}/auth/feishu/exchange`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: 'result-only-code', resultOnly: true }),
+    });
+    expect(response.status).toBe(200);
+    const cookie = cookiePair(response.headers.get('set-cookie') ?? '');
+    const token = parseNamedCookie(cookie, DASHBOARD_SESSION_COOKIE);
+    expect(sessions.resolveToken(token)).toMatchObject({
+      userId: 'ou_stranger', unionId: 'on_result_owner123', resultOnly: true,
+    });
+  });
+
   it('rejects simple cross-origin form media types before exchanging a code', async () => {
     const { base, audit } = await startController('ou_allowed');
     const response = await fetch(`${base}/auth/feishu/exchange`, {

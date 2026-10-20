@@ -431,11 +431,11 @@ describe('resolveSessionTranscriptPath — sandboxed-bot BOT_HOME fallback', () 
 
 describe('cliSupportsNativeUsage', () => {
   it('is true only for CLIs with a resolvable transcript (sync with the resolver switch)', () => {
-    for (const id of ['claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'grok', 'antigravity']) {
+    for (const id of ['claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity']) {
       expect(cliSupportsNativeUsage(id)).toBe(true);
     }
     // CLIs the resolver's switch has no case for → no native usage → hide the UI.
-    for (const id of ['gemini', 'opencode', 'pi', 'mtr', 'hermes', 'kiro-cli', 'unknown', undefined]) {
+    for (const id of ['gemini', 'opencode', 'mtr', 'hermes', 'kiro-cli', 'unknown', undefined]) {
       expect(cliSupportsNativeUsage(id)).toBe(false);
     }
   });

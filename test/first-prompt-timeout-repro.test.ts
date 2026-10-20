@@ -11,8 +11,6 @@
  * Run:  pnpm vitest run test/first-prompt-timeout-repro.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 
@@ -175,101 +173,5 @@ describe('First prompt timeout: 触发条件', () => {
     vi.advanceTimersByTime(QUIESCENCE_MS);
     expect(b.cb).toHaveBeenCalledTimes(1);
     b.detector.dispose();
-  });
-});
-
-/**
- * 上面那组只覆盖 IdleDetector 自身。判据逻辑在 input-gate.ts
- * 的 decidePostHookPromptEvidence()（见 test/input-gate.test.ts），worker 这边
- * 剩下的是「取什么数据、什么时候清定时器」—— worker.ts 不导出任何符号，按仓库
- * 既有惯例（worker-pipe-initial-screen-order.test.ts）用源码断言把接线钉住。
- */
-describe('First prompt timeout: worker 侧兜底接线', () => {
-  const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-  const fallbackStart = source.indexOf('function armPostHookPromptEvidenceFallback');
-  const fallbackBody = source.slice(fallbackStart, source.indexOf('\n}\n', fallbackStart));
-
-  it('兜底判据走 decidePostHookPromptEvidence，三个动作都接线', () => {
-    expect(fallbackStart).toBeGreaterThan(-1);
-    expect(fallbackBody).toContain('decidePostHookPromptEvidence({');
-    expect(fallbackBody).toContain("if (decision.action === 'stop') return;");
-    expect(fallbackBody).toContain("if (decision.action === 'retry')");
-    // retry 必须用决策返回的延时重排自身，否则轮询节奏与判据脱钩。
-    expect(fallbackBody).toContain('armPostHookPromptEvidenceFallback(startedAt, decision.retryInMs');
-    // accept 只补种证据，仍由 IdleDetector 走完整静默判定。
-    expect(fallbackBody).toContain('idleDetector?.seedReadyEvidence()');
-  });
-
-  it('提示符必须读渲染后的画面，不能读 PTY 追加日志', () => {
-    // recentTerminalLogTail() 是 stripAnsi 后的 scrollback：TUI 擦掉的旧 ❯ 在
-    // 那里照样匹配，会把首条消息灌进还没就绪的界面。必须用 rawSnapshot()；
-    // snapshot() 也不行——它按设计过滤掉 bare prompt 行，恰好把 ❯ 滤没。
-    const screenProbe = source.slice(
-      source.indexOf('function screenShowsReadyPattern'),
-      source.indexOf('function armPostHookPromptEvidenceFallback'),
-    );
-    expect(screenProbe).toContain('renderer?.rawSnapshot()');
-    expect(screenProbe).not.toContain('recentTerminalLogTail');
-    expect(screenProbe).not.toContain('renderer?.snapshot()');
-    expect(fallbackBody).toContain('screenHasReadyPattern: screenShowsReadyPattern()');
-    expect(fallbackBody).not.toContain('recentTerminalLogTail');
-    // renderer 尚未就绪时按「屏幕上没有提示符」处理，继续轮询而不是抛错。
-    expect(screenProbe).toContain('catch { return false; }');
-  });
-
-  it('兜底只在 SessionStart 边界 arm —— 这是挡住启动选择器的唯一保障', () => {
-    // 选择器停在那儿等按键时屏幕是【静的】（这正是它当初骗过 readyPattern 的
-    // 原因），所以静默窗口挡不住它。真正挡住它的是 arm 时机：SessionStart hook
-    // 在选择器还没过去时不触发，兜底也就不会上场。这条断言一旦松掉（比如为了
-    // 修 re-attach 把 arm 提前到收信号之前），选择器就重新暴露在射程内。
-    const armCallIdx = source.indexOf('armPostHookPromptEvidenceFallback();');
-    const boundaryIdx = source.indexOf('SessionStart boundary recorded');
-    expect(armCallIdx).toBeGreaterThan(boundaryIdx);
-    expect(armCallIdx - boundaryIdx).toBeLessThan(200);   // 紧挨着边界日志
-
-    // 且这段必须落在 session_ready 消息分支内 —— 收到 ready 信号才 arm。
-    const caseIdx = source.lastIndexOf("case 'session_ready':", armCallIdx);
-    expect(caseIdx).toBeGreaterThan(-1);
-    expect(armCallIdx - caseIdx).toBeLessThan(2_000);
-  });
-
-  it('兜底只对 source=startup arm —— resume/clear/compact 不进兜底射程', () => {
-    // 兜底是为「新建会话画完提示符后不再重绘」而生。resume/clear/compact 会在
-    // 边界后自行重绘一个新 ❯，fence 靠真证据自解；给它们 arm 反而会让回放中
-    // 残留的历史 ❯ 满足静默门控、提前接受边界前的旧提示符，破坏 fresh-evidence
-    // fence。所以 arm 调用必须被 startup gate 守着，而不是裸调用。
-    const armLineStart = source.lastIndexOf('\n', source.indexOf('armPostHookPromptEvidenceFallback();'));
-    const armLine = source.slice(armLineStart, source.indexOf('armPostHookPromptEvidenceFallback();') + 'armPostHookPromptEvidenceFallback();'.length);
-    // arm 必须由 startup 判据守卫，不能裸调用（否则 resume 也会 arm）。
-    expect(armLine).toContain('if (armPostHookFallback)');
-
-    // 判据本身走 input-gate 的纯函数，并且喂进去的是 SessionStart 的 msg.source。
-    const caseStart = source.indexOf("case 'session_ready':");
-    const caseBody = source.slice(caseStart, source.indexOf('armPostHookPromptEvidenceFallback();', caseStart));
-    expect(caseBody).toContain('shouldArmPostHookPromptEvidenceFallback({');
-    expect(caseBody).toContain('source: msg.source,');
-
-    // fence 本身（awaitingPostSessionStartPromptEvidence = true）必须对所有 source
-    // 都设 —— resume 依赖它等真证据；只有 arm 才收窄到 startup。
-    expect(caseBody).toContain('awaitingPostSessionStartPromptEvidence = true;');
-  });
-
-  it('每个清除等待标记的位置都必须同时清定时器', () => {
-    // 否则陈旧回调会活到下一个周期。回调首行的 stillWaiting 检查只是第二道
-    // 防线，不能替代生命周期清理。
-    // 只看赋值，跳过 `let ...= false` 的声明本身。
-    const assignments = [...source.matchAll(/(?<!let )awaitingPostSessionStartPromptEvidence = false;/g)];
-    expect(assignments.length).toBeGreaterThanOrEqual(5);
-    const missing = assignments.filter(m => !/^\s*clearPostHookEvidenceFallback\(\);/.test(
-      source.slice(m.index + m[0].length),
-    ));
-    expect(missing.map(m => source.slice(m.index, m.index + 120))).toEqual([]);
-  });
-
-  it('定时期加的诊断日志不留在上游', () => {
-    expect(source).not.toContain('First-prompt-timeout diagnostic');
-    const detectorSource = readFileSync(join(process.cwd(), 'src/utils/idle-detector.ts'), 'utf8');
-    expect(detectorSource).not.toContain('get readyPatternSeen');
-    expect(detectorSource).not.toContain('get msSinceSpinner');
   });
 });

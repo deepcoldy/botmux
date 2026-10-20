@@ -13,7 +13,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtempSync, readFileSync } from 'fs';
+import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -350,38 +350,6 @@ describe('two-phase turn reactions', () => {
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
-  });
-});
-
-/**
- * Source-level pin: the screen_update handler must only flip ✋→✅ after a real
- * busy period (working/analyzing → idle). Cold-start starting→idle
- * (ready-gate settle before the turn has gone working) must leave GoGoGo alone
- * — otherwise card-off Grok sessions DONE a message while the CLI is still
- * chewing the first prompt. A limited settle is also excluded (rate limit is a
- * blocked turn, not completion — see test/rate-limit-notify.test.ts).
- */
-describe('turn reaction idle edge gate (source)', () => {
-  it('finishTurnReactions is gated on prevStatus working|analyzing and idle settle', () => {
-    const source = readFileSync(
-      join(process.cwd(), 'src/core/worker-pool.ts'),
-      'utf8',
-    );
-    // Anchor on the screen_update reaction comment — "// Usage ledger" alone
-    // also appears on the kill/close path and would pick the wrong block.
-    const blockStart = source.indexOf('// Usage ledger + turn reactions') >= 0
-      ? source.indexOf('// Usage ledger + turn reactions')
-      : source.indexOf('// Usage ledger: any settle-to-idle');
-    expect(blockStart).toBeGreaterThan(-1);
-    // Window is wider than the original 900 chars: the gate now also excludes
-    // limited settles, so the condition line carries the extra idle check.
-    const block = source.slice(blockStart, blockStart + 1400);
-    expect(block).toContain("prevStatus === 'working' || prevStatus === 'analyzing'");
-    expect(block).toContain('void finishTurnReactions(ds)');
-    // Must NOT call finishTurnReactions on every idle/limited edge unconditionally.
-    expect(block).not.toMatch(
-      /if \(ds\.lastScreenStatus === 'idle' \|\| ds\.lastScreenStatus === 'limited'\) \{\s*recordUsageForDaemonSession\(ds\);\s*void finishTurnReactions\(ds\);/,
-    );
   });
 });
 

@@ -7,7 +7,8 @@ import {
 } from 'react';
 import { Cron } from 'croner';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
-import { useStoreSelector, useT } from './react-hooks.js';
+import { ModalDialog } from './modal-dialog.js';
+import { useStoreSelector, useT, useDashboardLocale } from './react-hooks.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -24,6 +25,7 @@ import { chatDisplayTitle, loadNameMaps, ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
+import { fetchWorkCalendars, type WorkCalendarOption } from './work-calendars-api.js';
 
 type ScheduleRow = Record<string, any> & {
   id: string;
@@ -38,6 +40,9 @@ type ScheduleRow = Record<string, any> & {
   model?: string;
   reasoningEffort?: string;
 };
+export function scheduleCalendarLabel(id: string, names: Partial<Record<'zh' | 'en', string>> | undefined, locale: 'zh' | 'en'): string {
+  return names?.[locale] ?? names?.zh ?? names?.en ?? id;
+}
 type ScheduleBotOption = {
   larkAppId: string;
   botName?: string;
@@ -46,7 +51,7 @@ type ScheduleBotOption = {
 };
 type ScheduleAction = 'run' | 'pause' | 'resume';
 type ActionFeedback = 'success' | 'error';
-type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'error';
+type ScheduleRunOutcome = 'model_dispatched' | 'precondition_skipped' | 'calendar_skipped' | 'error';
 type ScheduleTargetRunResult = {
   chatId: string;
   outcome: 'model_dispatched' | 'error';
@@ -60,7 +65,8 @@ type ScheduleRunLogEntry = {
   finishedAt: string;
   durationMs: number;
   outcome: ScheduleRunOutcome;
-  precondition: 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
+  calendarCheck?: { calendar: string; reason: string; date?: string; timeZone?: string; dayType?: 'workday' | 'restday'; displayNames?: Partial<Record<'zh' | 'en', string>> };
+  precondition: 'not_checked' | 'none' | 'disabled' | 'passed' | 'skipped' | 'error';
   additionalPrompt: boolean;
   errorCode?: string;
   error?: string;
@@ -87,6 +93,7 @@ const SCHEDULE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ul
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
 const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
 const MAX_SCHEDULE_TARGET_CHATS = 5;
+const SCHEDULE_TOPIC_TITLE_RUNTIME_TEMPLATE = /\{\{owner\}\}|\{\{date(?::[+-]\d+d)?\}\}/;
 const PRECONDITION_SCRIPT_EXAMPLE = String.raw`if test -f /srv/my-service/ready.flag; then
   printf '1\n'
 else
@@ -555,6 +562,7 @@ export function countScheduleRunHistory(
   const counts: Record<ScheduleRunOutcome, number> = {
     model_dispatched: 0,
     precondition_skipped: 0,
+    calendar_skipped: 0,
     error: 0,
   };
   for (const log of logs) counts[log.outcome] += 1;
@@ -600,7 +608,7 @@ export function scheduleRunTargetResults(value: unknown): ScheduleTargetRunResul
 }
 
 function isScheduleRunOutcome(value: unknown): value is ScheduleRunOutcome {
-  return value === 'model_dispatched' || value === 'precondition_skipped' || value === 'error';
+  return value === 'model_dispatched' || value === 'precondition_skipped' || value === 'calendar_skipped' || value === 'error';
 }
 
 async function fetchScheduleRunHistoryPreview(
@@ -671,6 +679,7 @@ function ScheduleRunLogDialog(props: {
   onClose(): void;
 }) {
   const { open, schedule, scheduleTimeZone, tr } = props;
+  const locale = useDashboardLocale();
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
@@ -784,11 +793,13 @@ function ScheduleRunLogDialog(props: {
 
   function outcomeLabel(outcome: ScheduleRunLogEntry['outcome']): string {
     if (outcome === 'model_dispatched') return tr('schedules.logs.outcomeDispatched');
+    if (outcome === 'calendar_skipped') return tr('schedules.logs.outcomeCalendarSkipped');
     if (outcome === 'precondition_skipped') return tr('schedules.logs.outcomeSkipped');
     return tr('schedules.logs.outcomeError');
   }
 
   function preconditionLabel(precondition: ScheduleRunLogEntry['precondition']): string {
+    if (precondition === 'not_checked') return tr('schedules.logs.preconditionNotChecked');
     if (precondition === 'none') return tr('schedules.logs.preconditionNone');
     if (precondition === 'disabled') return tr('schedules.logs.preconditionDisabled');
     if (precondition === 'passed') return tr('schedules.logs.preconditionPassed');
@@ -917,6 +928,7 @@ function ScheduleRunLogDialog(props: {
                         {outcomeLabel(selected.outcome)}
                       </strong>
                     </header>
+                    {selected.calendarCheck ? <p>{tr('schedules.form.calendar')}: {scheduleCalendarLabel(selected.calendarCheck.calendar, selected.calendarCheck.displayNames, locale)} · {tr(`schedules.calendarDayType.${selected.calendarCheck.dayType ?? 'workday'}`)} · {selected.calendarCheck.date} · {selected.calendarCheck.timeZone} · {tr(`schedules.calendarReason.${selected.calendarCheck.reason}`)}</p> : null}
                     <dl className="schedule-run-log-facts">
                       <div>
                         <dt>{tr('schedules.logs.trigger')}</dt>
@@ -1105,7 +1117,7 @@ function scheduleRunHistoryLabel(
     shown: displayed.length,
     total: preview.total,
     dispatched: counts.model_dispatched,
-    skipped: counts.precondition_skipped,
+    skipped: counts.precondition_skipped + counts.calendar_skipped,
     failed: counts.error,
   });
 }
@@ -1148,6 +1160,7 @@ function ScheduleRowCard(props: {
   onDelete(schedule: ScheduleRow): void;
 }) {
   const { schedule: s, scheduleTimeZone, tr } = props;
+  const locale = useDashboardLocale();
   const chatPresentation = scheduleChatPresentation(s, tr);
   const kind = String(s.parsed?.kind ?? 'unknown');
   const toggleOp: ScheduleAction = s.enabled ? 'pause' : 'resume';
@@ -1246,6 +1259,7 @@ function ScheduleRowCard(props: {
                 : tr('schedules.precondition')}
             </span>
           ) : null}
+          {s.calendar ? <span>{tr('schedules.form.calendar')}: {scheduleCalendarLabel(s.calendar, s.calendarCheck?.displayNames ?? s.lastCalendarCheck?.displayNames, locale)} · {tr(`schedules.calendarDayType.${s.calendarDayType ?? 'workday'}`)} · {tr('schedules.calendarNext')}: {fmtScheduleDate(s.nextEligibleRunAt, scheduleTimeZone)} · {s.calendarCheck?.reason ? tr(`schedules.calendarReason.${s.calendarCheck.reason}`) : ''}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
           <span>{tr('schedules.last')}: {fmtScheduleDate(s.lastRunAt, scheduleTimeZone)}</span>
           {repeat !== null ? <span>{tr('schedules.repeat')}: {repeat}</span> : null}
@@ -1434,7 +1448,7 @@ function SchedulesPage() {
     topicTitle: string;
     updateExecutionPosition: boolean;
     chatIds: string[]; larkAppId: string;
-    model: string; reasoningEffort: string;
+    model: string; reasoningEffort: string; calendar: string; calendarDayType: 'workday' | 'restday';
   }): Promise<void> {
     setFormError(null);
     try {
@@ -1469,6 +1483,8 @@ function SchedulesPage() {
             } : {}),
             // Always submitted, including empty: on the update path an empty
             // string is how the form clears an override back to the bot's.
+            calendar: data.calendar || null,
+            calendarDayType: data.calendar ? data.calendarDayType : null,
             model: data.model,
             reasoningEffort: data.reasoningEffort,
           }
@@ -1491,6 +1507,8 @@ function SchedulesPage() {
             topicTitle: data.topicTitle,
             chatIds: data.chatIds,
             larkAppId: data.larkAppId,
+            calendar: data.calendar || null,
+            calendarDayType: data.calendar ? data.calendarDayType : null,
             model: data.model,
             reasoningEffort: data.reasoningEffort,
           };
@@ -1698,6 +1716,8 @@ interface ScheduleFormData {
   larkAppId: string;
   /** Per-task model / effort. `''` means "use the bot's configuration". */
   model: string;
+  calendar: string;
+  calendarDayType: 'workday' | 'restday';
   reasoningEffort: string;
 }
 
@@ -1712,7 +1732,7 @@ export function ScheduleFormModal(props: {
   onSubmit(data: ScheduleFormData): void;
 }) {
   const { editing, tr, bots, open, scheduleTimeZone } = props;
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const locale = useDashboardLocale();
   const chatPickerRef = useRef<HTMLDivElement | null>(null);
   const chatPickerTriggerRef = useRef<HTMLButtonElement | null>(null);
   const chatSearchRef = useRef<HTMLInputElement | null>(null);
@@ -1738,6 +1758,12 @@ export function ScheduleFormModal(props: {
   const preconditionTestRunningRef = useRef(false);
   const preconditionTestRevisionRef = useRef(0);
   const [silent, setSilent] = useState(editing?.silent === true);
+  const [calendar, setCalendar] = useState(editing?.calendar ?? '');
+  const [calendarDayType, setCalendarDayType] = useState<'workday' | 'restday'>(editing?.calendarDayType ?? 'workday');
+  const [calendars, setCalendars] = useState<WorkCalendarOption[]>([]);
+  const [calendarsLoading, setCalendarsLoading] = useState(false);
+  const [calendarsError, setCalendarsError] = useState(false);
+  const [calendarsReload, setCalendarsReload] = useState(0);
   const [model, setModel] = useState(editing?.model ?? '');
   const [reasoningEffort, setReasoningEffort] = useState<string>(editing?.reasoningEffort ?? '');
   const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic' | 'task'>(
@@ -1761,18 +1787,25 @@ export function ScheduleFormModal(props: {
   const [touched, setTouched] = useState(false);
   const [scheduleTouched, setScheduleTouched] = useState(false);
   const localDelivery = editing?.deliver === 'local';
+  const hasDynamicTopicTitle = SCHEDULE_TOPIC_TITLE_RUNTIME_TEMPLATE.test(topicTitle);
 
-  // open 时 showModal + 聚焦首个输入；关闭时 close()（Esc/遮罩点击走 onClose）
   useEffect(() => {
-    const dlg = dialogRef.current;
-    if (!dlg) return;
-    if (open && !dlg.open) {
-      dlg.showModal();
-      dlg.querySelector<HTMLElement>('input[name="name"]')?.focus();
-    } else if (!open && dlg.open) {
-      dlg.close();
-    }
-  }, [open]);
+    if (!open || !larkAppId) return;
+    const controller = new AbortController();
+    setCalendars([]);
+    setCalendarsLoading(true);
+    setCalendarsError(false);
+    fetchWorkCalendars(larkAppId, controller.signal)
+      .then(body => {
+        if (!controller.signal.aborted) {
+          setCalendars(body.calendars);
+          setCalendarsError(!!body.localError);
+        }
+      })
+      .catch(() => { if (!controller.signal.aborted) setCalendarsError(true); })
+      .finally(() => { if (!controller.signal.aborted) setCalendarsLoading(false); });
+    return () => controller.abort();
+  }, [open, larkAppId, calendarsReload]);
 
   useEffect(() => {
     if (!open || !chatPickerOpen) return;
@@ -1823,7 +1856,7 @@ export function ScheduleFormModal(props: {
   }, [editing, larkAppId, bots]);
 
   const check = useMemo(
-    () => schedule.trim() ? checkSchedule(schedule, tr, scheduleTimeZone) : null,
+    () => checkSchedule(schedule, tr, scheduleTimeZone),
     [schedule, tr, scheduleTimeZone],
   );
 
@@ -1883,8 +1916,8 @@ export function ScheduleFormModal(props: {
     })
     ?? chatId
   ));
-  const scheduleInvalid = scheduleTouched && check !== null && !check.ok;
-  const schedulePreview = check?.ok ? check.preview : undefined;
+  const scheduleInvalid = scheduleTouched && !check.ok;
+  const schedulePreview = check.ok ? check.preview : undefined;
   const nameMissing = touched && !name.trim();
   const promptMissing = touched && !prompt.trim();
   const chatMissing = touched && !localDelivery && chatIds.length === 0;
@@ -2106,6 +2139,8 @@ export function ScheduleFormModal(props: {
       updateExecutionPosition: !localDelivery,
       chatIds,
       larkAppId,
+      calendar: calendar.trim(),
+      calendarDayType,
       model: model.trim(),
       reasoningEffort,
     });
@@ -2113,11 +2148,12 @@ export function ScheduleFormModal(props: {
 
   return (
     <>
-    <dialog
-      ref={dialogRef}
+    <ModalDialog
+      open={open}
       className="schedule-form-dialog"
       onClose={props.onClose}
-      onClick={e => { if (e.target === dialogRef.current) props.onClose(); }}
+      // 打开后聚焦首个输入（Esc/遮罩点击走 onClose）
+      onOpen={dialog => dialog.querySelector<HTMLElement>('input[name="name"]')?.focus()}
     >
       <h2>{editing ? tr('schedules.edit') : tr('schedules.create')}</h2>
       <form onSubmit={handleSubmit} className="schedule-form" noValidate>
@@ -2149,7 +2185,9 @@ export function ScheduleFormModal(props: {
           </div>
         )}
         <label className="schedule-form-field">
-          <span className="schedule-form-label">{tr('schedules.form.name')}</span>
+          <span className="schedule-form-label">
+            {tr('schedules.form.name')} <i className="req" aria-hidden="true">*</i>
+          </span>
           <input
             type="text"
             name="name"
@@ -2164,7 +2202,9 @@ export function ScheduleFormModal(props: {
           ) : null}
         </label>
         <div className="schedule-form-field">
-          <span className="schedule-form-label">{tr('schedules.form.schedule')}</span>
+          <span className="schedule-form-label">
+            {tr('schedules.form.schedule')} <i className="req" aria-hidden="true">*</i>
+          </span>
           <div className="schedule-templates" role="group" aria-label={tr('schedules.form.templates')}>
             {CRON_TEMPLATES.map(t => (
               <button
@@ -2185,7 +2225,7 @@ export function ScheduleFormModal(props: {
             required
             aria-invalid={scheduleInvalid || undefined}
           />
-          {scheduleInvalid && check && !check.ok ? (
+          {scheduleInvalid ? (
             <small className="schedule-form-error-inline">{check.error}</small>
           ) : schedulePreview ? (
             <small className="schedule-form-preview">✓ {tr('schedules.form.nextRun')}：{schedulePreview}</small>
@@ -2709,9 +2749,42 @@ export function ScheduleFormModal(props: {
             <small className="schedule-form-help">{tr('schedules.form.silentHelp')}</small>
           </span>
         </label>
-        {executionPosition === 'new-topic' && silent ? (
-          <p className="schedule-form-help">{tr('schedules.form.silentNewTopicConflict')}</p>
+        {(executionPosition === 'new-topic' || executionPosition === 'task') && silent ? (
+          <p className="schedule-form-help">
+            {tr(hasDynamicTopicTitle
+              ? 'schedules.form.silentDynamicTitleConflict'
+              : 'schedules.form.silentNewTopicConflict')}
+          </p>
         ) : null}
+        <fieldset className="schedule-calendar-fields">
+          <legend className="schedule-form-label">{tr('schedules.form.calendar')}</legend>
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.calendarSelect')}</span>
+            <select value={calendar} onChange={e => setCalendar(e.target.value)} disabled={calendarsLoading}>
+              <option value="">{tr('schedules.form.calendarNone')}</option>
+              {calendar && !calendars.some(option => option.id === calendar) ? (
+                <option value={calendar}>{scheduleCalendarLabel(calendar, editing?.calendarCheck?.displayNames ?? editing?.lastCalendarCheck?.displayNames, locale)}</option>
+              ) : null}
+              {calendars.map(option => <option key={option.id} value={option.id} disabled={!!option.error}>
+                {scheduleCalendarLabel(option.id, option.displayNames, locale)}{option.error ? ` · ${tr('schedules.calendarReason.calendar_invalid')}` : ''}
+              </option>)}
+            </select>
+          </label>
+          {calendar ? <>
+            <label className="schedule-form-field">
+              <span className="schedule-form-label">{tr('schedules.form.calendarDayType')}</span>
+              <select value={calendarDayType} onChange={e => setCalendarDayType(e.target.value as 'workday' | 'restday')}>
+                <option value="workday">{tr('schedules.calendarDayType.workday')}</option>
+                <option value="restday">{tr('schedules.calendarDayType.restday')}</option>
+              </select>
+            </label>
+            {calendars.find(option => option.id === calendar)?.coverage ? <small className="schedule-form-help">
+              {tr('schedules.form.calendarCoverage', { start: calendars.find(option => option.id === calendar)!.coverage!.start, end: calendars.find(option => option.id === calendar)!.coverage!.end })}
+            </small> : null}
+          </> : null}
+          {calendarsError ? <div className="schedule-form-help schedule-form-error">{tr('schedules.form.calendarLoadFailed')} <button type="button" onClick={() => setCalendarsReload(value => value + 1)}>{tr('schedules.logs.retry')}</button></div> : null}
+          <small className="schedule-form-help">{tr('schedules.form.calendarHelp')}</small>
+        </fieldset>
         <label className="schedule-form-field">
           <span className="schedule-form-label">{tr('schedules.form.model')}</span>
           <input
@@ -2762,7 +2835,7 @@ export function ScheduleFormModal(props: {
           </button>
         </div>
       </form>
-    </dialog>
+    </ModalDialog>
     <SchedulePreconditionHelpDialog
       open={open && preconditionHelpSource !== null}
       mode={preconditionMode}

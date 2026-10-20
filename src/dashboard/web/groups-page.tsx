@@ -1,3 +1,6 @@
+import { GroupIdleCloseRow } from './group-idle-close.js';
+import { GroupCardModeRow } from './group-card-mode.js';
+import { GroupReplyModeSection } from './group-reply-mode.js';
 import { GroupSerialInputRow } from './group-serial-input.js';
 import { GroupDefaultModelsRow } from './group-default-models.js';
 import { describeCloseResidual } from '../../core/close-residual.js';
@@ -30,6 +33,7 @@ import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
 import { confirm } from './confirm-modal.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed-groups.js';
 import { BotMultiSelect } from './bot-multi-select.js';
 import {
   CreateActionButton,
@@ -41,12 +45,8 @@ import {
   OverviewListTail,
   RefreshIconButton,
 } from './dashboard-components.js';
-import {
-  hasExplicitChatRole,
-  summarizeGroupProfileMatches,
-  type EffectiveRoleValue,
-  type RoleProfileSummaryLike,
-} from './role-profile-match.js';
+import { GroupProfileStatus } from './group-profile-status.js';
+import type { RoleProfileSummaryLike } from './role-profile-match.js';
 import {
   allExpectedInChat,
   availableBotsForPicker,
@@ -87,7 +87,6 @@ type DialogState =
   | { type: 'manage'; chat: GroupChat };
 
 type DialogErrorState = { title: string; reason: unknown };
-type FeedGroupOption = { groupId: string; name: string; type: string };
 
 function emptyRoleContext(): RoleProfileContext {
   return {
@@ -197,44 +196,6 @@ function AddBotsResult(props: { summary: AddBotsSummary; bots: GroupBot[] }) {
   );
 }
 
-function GroupProfileStatus(props: {
-  chat: GroupChat;
-  context: RoleProfileContext;
-  tr: Translator;
-}) {
-  const { chat, context, tr } = props;
-  if (!context.profiles.length || !context.loaded) return null;
-
-  const rolesByBot = new Map<string, EffectiveRoleValue>();
-  for (const bot of chat.memberBots ?? []) {
-    if (!bot?.inChat) continue;
-    rolesByBot.set(bot.larkAppId, context.groupRoleContentByBot.get(roleKey(bot.larkAppId, chat.chatId)) ?? null);
-  }
-  if (!hasExplicitChatRole(rolesByBot)) return null;
-
-  const matches = summarizeGroupProfileMatches(
-    chat.memberBots ?? [],
-    context.profiles,
-    context.entriesById,
-    rolesByBot,
-  );
-  const best = matches[0];
-  if (!best) {
-    return <div className="g-profile-status muted">{tr('groups.profileStatusUnmatched')}</div>;
-  }
-  const key = best.kind === 'full' ? 'groups.profileStatusFullChat' : 'groups.profileStatusPartial';
-  return (
-    <div className={`g-profile-status ${best.kind}`}>
-      {tr(key, {
-        name: best.profileId,
-        matched: best.matched,
-        total: best.total,
-        chat: best.chatMatched,
-      })}
-    </div>
-  );
-}
-
 function groupBotStatus(member: GroupChat['memberBots'][number] | undefined): 'in' | 'out' | 'error' | 'unknown' {
   if (!member) return 'unknown';
   if (member.error) return 'error';
@@ -318,7 +279,15 @@ export const GroupListRow = memo(function GroupListRow(props: {
             ) : null}
           </span>
         </div>
-        <GroupProfileStatus chat={chat} context={props.roleContext} tr={tr} />
+        <GroupProfileStatus
+          className="g-profile-status"
+          memberBots={chat.memberBots ?? []}
+          profiles={props.roleContext.profiles}
+          entriesByProfile={props.roleContext.entriesById}
+          loaded={props.roleContext.loaded}
+          roleOf={larkAppId => props.roleContext.groupRoleContentByBot.get(roleKey(larkAppId, chat.chatId))}
+          tr={tr}
+        />
       </OverviewListMain>
       <span className="groups-row-count">{tr('groups.memberSummary', { count: inCount, total: props.bots.length })}</span>
       <div className="groups-row-lower">
@@ -359,86 +328,12 @@ function CreateDialog(props: {
   const [copied, setCopied] = useState(false);
   const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const [roleProfileId, setRoleProfileId] = useState('');
-  const [feedGroups, setFeedGroups] = useState<FeedGroupOption[]>([]);
-  const [feedGroupAppId, setFeedGroupAppId] = useState('');
-  const [feedGroupId, setFeedGroupId] = useState('');
-  const [newFeedGroupName, setNewFeedGroupName] = useState('');
-  const [feedGroupsLoading, setFeedGroupsLoading] = useState(true);
-  const [feedGroupsError, setFeedGroupsError] = useState('');
-  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
-  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
-  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
-
-  useEffect(() => {
-    let alive = true;
-    void fetch('/api/feed-groups')
-      .then(async response => {
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-        if (!alive) return;
-        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-      })
-      .catch(error => { if (alive) setFeedGroupsError(error instanceof Error ? error.message : String(error)); })
-      .finally(() => { if (alive) setFeedGroupsLoading(false); });
-    return () => { alive = false; };
-  }, []);
-
-  useEffect(() => {
-    if (!feedGroupAuthUrl) return;
-    let alive = true;
-    const timer = window.setInterval(() => {
-      void fetch('/api/feed-groups')
-        .then(async response => {
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok || !body.ok || !alive) return;
-          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-          setFeedGroupsError('');
-          setFeedGroupAuthUrl('');
-          setFeedGroupCallbackUrl('');
-        })
-        .catch(() => { /* remote/manual fallback remains visible */ });
-    }, 1_000);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, [feedGroupAuthUrl]);
-
-  async function openFeedGroupLogin(): Promise<void> {
-    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
-    const response = await fetch(`/api/feed-groups/auth-url${query}`);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body.authUrl) {
-      setError({ title: '无法发起标签授权', reason: body.error ?? `HTTP ${response.status}` });
-      return;
-    }
-    setFeedGroupAuthUrl(String(body.authUrl));
-    setFeedGroupCallbackUrl('');
-  }
-
-  async function completeFeedGroupLogin(callbackUrl: string): Promise<void> {
-    setFeedGroupAuthSubmitting(true);
-    try {
-      const response = await fetch('/api/feed-groups/oauth-callback', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-      const groupsResponse = await fetch('/api/feed-groups');
-      const groupsBody = await groupsResponse.json().catch(() => ({}));
-      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
-      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
-      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
-      setFeedGroupsError('');
-      setFeedGroupAuthUrl('');
-      setFeedGroupCallbackUrl('');
-    } catch (error) {
-      setError({ title: '标签授权失败', reason: error instanceof Error ? error.message : String(error) });
-    } finally {
-      setFeedGroupAuthSubmitting(false);
-    }
-  }
+  const feed = useFeedGroups({
+    onAuthError: (kind, reason) => setError({
+      title: kind === 'open' ? '无法发起标签授权' : '标签授权失败',
+      reason,
+    }),
+  });
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
@@ -463,9 +358,9 @@ function CreateDialog(props: {
           larkAppIds: ids,
           bindWorkingDir: bindWorkingDir || undefined,
           roleProfileId: roleProfileId || undefined,
-          feedGroupId: feedGroupId || undefined,
-          newFeedGroupName: newFeedGroupName || undefined,
-          feedGroupAppId: (feedGroupId || newFeedGroupName) ? feedGroupAppId : undefined,
+          feedGroupId: feed.selectedId || undefined,
+          newFeedGroupName: feed.newName || undefined,
+          feedGroupAppId: (feed.selectedId || feed.newName) ? feed.appId : undefined,
         }),
       });
       const respBody = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
@@ -601,48 +496,22 @@ function CreateDialog(props: {
           </fieldset>
           <fieldset className="g-modal-field g-feed-group-field">
             <legend>飞书标签（可选）</legend>
-            <input type="hidden" name="feedGroupId" value={feedGroupId} />
+            <input type="hidden" name="feedGroupId" value={feed.selectedId} />
             <FeedGroupPicker
-              groups={feedGroups}
-              selectedId={feedGroupId}
-              newName={newFeedGroupName}
-              disabled={feedGroupsLoading || !!feedGroupsError}
-              onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
+              groups={feed.groups}
+              selectedId={feed.selectedId}
+              newName={feed.newName}
+              disabled={feed.loading || !!feed.error}
+              onChange={feed.select}
             />
             <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
-            {feedGroupsLoading ? <small>正在读取飞书标签…</small> : null}
-            {feedGroupsError ? (
-              <div className="hint-warn-inline">
-                <small>{feedGroupsError}</small>{' '}
-                <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
-                  {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
-                </button>
-                <small> 授权后会弹窗提示你粘贴回调地址。</small>
-              </div>
-            ) : null}
-            {!feedGroupsLoading && !feedGroupsError && feedGroups.length === 0 ? <small>当前没有标签，可直接创建一个。</small> : null}
+            {feed.loading ? <small>正在读取飞书标签…</small> : null}
+            <FeedGroupAuthPrompt feed={feed} className="hint-warn-inline" />
+            {!feed.loading && !feed.error && feed.groups.length === 0 ? <small>当前没有标签，可直接创建一个。</small> : null}
           </fieldset>
         </div>
 
-        {feedGroupAuthUrl ? (
-          <div className="feed-group-auth-overlay">
-            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="feed-group-auth-title">
-              <h3 id="feed-group-auth-title">授权飞书标签</h3>
-              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
-              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
-              <label>
-                <span>请把点击授权后的完整链接粘贴在这里</span>
-                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
-              </label>
-              <div className="actions">
-                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
-                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
-                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
-                </button>
-              </div>
-            </section>
-          </div>
-        ) : null}
+        <FeedGroupAuthOverlay feed={feed} titleId="feed-group-auth-title" />
 
         <div className="g-create-status" data-create-status aria-live="polite">{error ? <DialogError {...error} /> : null}</div>
         <div className="actions g-create-actions">
@@ -1788,6 +1657,23 @@ export function ManageDialog(props: {
         />)}
       </fieldset>
 
+      {chat.sessionGroup ? null : <GroupReplyModeSection
+        chat={chat} disabled={!available}
+        onSaved={() => props.onReloadGroups({ force: true })}
+      />}
+
+      <fieldset data-group-idle-close>
+        <legend>{tr('groups.idleClose')}</legend>
+        <p><small>{tr('groups.idleCloseHelp')}</small></p>
+        {inChat.length === 0 ? <p className="empty">没有机器人在群里</p> : inChat.map(member => <GroupIdleCloseRow
+          key={`${chat.chatId}-${member.larkAppId}`}
+          chatId={chat.chatId} appId={member.larkAppId}
+          botName={member.botName ?? member.larkAppId}
+          settings={member.idleClose} disabled={!available}
+          onSaved={() => props.onReloadGroups({ force: true })}
+        />)}
+      </fieldset>
+
       <fieldset>
         <legend>新话题默认模型</legend>
         <p><small>CLI 跟随 Bot 的 Agent 配置；模型和思考强度可单独覆盖，选择继承则沿用 Agent 配置。修改仅影响新话题。</small></p>
@@ -1797,6 +1683,20 @@ export function ManageDialog(props: {
           botName={member.botName ?? member.larkAppId}
           cliId={member.agentCliId} botModel={member.agentModel} botEffort={member.agentReasoningEffort}
           models={member.defaultModels} disabled={!available}
+          onSaved={() => props.onReloadGroups({ force: true })}
+        />)}
+      </fieldset>
+
+      <fieldset data-group-card-mode>
+        <legend>{tr('groups.cardMode')}</legend>
+        <p><small>{tr('groups.cardModeHelp')}</small></p>
+        {inChat.length === 0 ? <p className="empty">没有机器人在群里</p> : inChat.map(member => <GroupCardModeRow
+          key={`${chat.chatId}-${member.larkAppId}`}
+          chatId={chat.chatId} appId={member.larkAppId}
+          botName={member.botName ?? member.larkAppId}
+          chatEnabled={member.streamingCardChatEnabled !== false}
+          masterEnabled={member.streamingCardMasterEnabled !== false}
+          disabled={!available}
           onSaved={() => props.onReloadGroups({ force: true })}
         />)}
       </fieldset>

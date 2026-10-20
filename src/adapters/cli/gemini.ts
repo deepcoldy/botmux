@@ -1,9 +1,9 @@
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { writeTextThenEnter } from './tui-input.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter } from './types.js';
 
-import { delay } from '../../utils/timing.js';
 
 export function createGeminiAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -35,18 +35,11 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // -i bakes the full first prompt (routing envelope included) into argv.
+    // Same tmux command-string ceiling as OpenCode/Cursor.
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
-    async writeInput(pty: PtyHandle, content: string) {
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
-      }
-    },
+    writeInput: writeTextThenEnter,
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Ink TUI — '>' is too generic; rely on quiescence + spinner guard
@@ -56,5 +49,3 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     modelChoices: CLI_MODEL_CHOICES['gemini'],
   };
 }
-
-export const create = createGeminiAdapter;

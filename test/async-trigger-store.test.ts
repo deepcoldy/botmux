@@ -352,6 +352,14 @@ describe('recordFailedStrict (authoritative dispatch_unknown terminal)', () => {
 });
 
 describe('recordTerminalFailureStrict (explicit worker terminal)', () => {
+  it('preserves an explicit failure when a late completion arrives after a reload', () => {
+    recordPending('failed-turn', 'turn1', 1000, 'cli_test');
+    recordTerminalFailureStrict('failed-turn', 'turn1', 2000, 'cli_test', 'codex_quota_exceeded');
+    const before = lookupStrict('failed-turn', 'turn1');
+    recordCompleted('failed-turn', 'turn1', 'late diagnostic', 3000, 'cli_test');
+    expect(lookupStrict('failed-turn', 'turn1')).toEqual(before);
+  });
+
   it('persists the structured terminal code and preserves createdAt', () => {
     recordPending('sessT', 'trg_t', 1000, 'cli_test');
     recordTerminalFailureStrict('sessT', 'trg_t', 7000, 'cli_test', 'provider_unexpected_eof');

@@ -30,11 +30,6 @@ export interface SkillPolicy {
   include?: string[];
 }
 
-export interface DashboardRequestError extends Error {
-  status?: number;
-  body?: any;
-}
-
 export interface SkillJob {
   id: string;
   status: 'running' | 'succeeded' | 'failed';

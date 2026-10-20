@@ -6,7 +6,6 @@ import type { InvocationRequest } from './contract.js';
 import type { ModelOnlyRuntime, NativeInvocationOutput } from './runtime.js';
 import { runCodexInvocation } from './codex-runtime.js';
 import { runClaudeInvocation } from './claude-runtime.js';
-import { runMinimaxInvocation } from './minimax-runtime.js';
 import { runPiInvocation } from './pi-runtime.js';
 import { runGeminiInvocation } from './gemini-runtime.js';
 import { runOpenCodeInvocation } from './opencode-runtime.js';
@@ -40,10 +39,6 @@ const adapters: ReadonlyMap<string, ModelOnlyAdapter> = new Map<string, ModelOnl
     cli: 'claude-code', authSubdir: 'claude', nativeProtocol: 'print-stream-json', modelPolicy: 'caller_selected',
     acceptsIdentity: () => true,
     run: runClaudeInvocation,
-  }],
-  ['minimax', {
-    cli: 'minimax', authSubdir: 'minimax', nativeProtocol: 'text-chat-json', modelPolicy: 'caller_selected',
-    acceptsIdentity: () => true, run: runMinimaxInvocation,
   }],
   ['pi', {
     cli: 'pi', authSubdir: 'pi', nativeProtocol: 'print-json', modelPolicy: 'caller_selected_native_catalog',

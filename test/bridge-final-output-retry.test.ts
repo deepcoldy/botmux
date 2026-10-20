@@ -1,3 +1,4 @@
+import * as registrationStore from '../src/services/idempotency-store.js';
 /**
  * P2: daemon-side retry of `final_output` on transient Lark failures.
  *
@@ -10,10 +11,19 @@
  *   - 3 consecutive failures give up and DO NOT commit the dedup marker
  *     (so any retransmit can still deliver)
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { config } from '../src/config.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { bindGroupContextDelivery, readGroupContextDeliveryBinding, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
+import { groupContextEpoch } from '../src/services/group-context-prompt.js';
+import MarkdownIt from 'markdown-it';
+import * as cotMessage from '../src/im/lark/cot-message.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
+const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
+const uploadImageMock = vi.fn(async (_appId: string, _image: string | Buffer) => 'img_v3_uploaded_preview');
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
@@ -24,7 +34,9 @@ const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: str
   entryStatus: new Map(entries.map(entry => [entry, 'resolved' as const])),
 }));
 vi.mock('../src/im/lark/client.js', () => ({
+  getMessageDetail: (...args: any[]) => topicDetailMock(...args),
   updateMessage: (...args: any[]) => updateMessageMock(...args),
+  uploadImage: (appId: string, image: string | Buffer) => uploadImageMock(appId, image),
   addReaction: (...args: any[]) => addReactionMock(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
   removeReaction: vi.fn(async () => {}),
@@ -48,6 +60,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildSessionCard: vi.fn(() => '{}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
+  buildTurnFailedCard: vi.fn((opts: { mentionOpenId?: string }) => JSON.stringify({ turnFailed: true, mentionOpenId: opts.mentionOpenId })),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
 
@@ -75,13 +88,19 @@ vi.mock('../src/bot-registry.js', () => ({
   resolveReplyDelivery: vi.fn((): 'send' | 'transcript' | undefined => 'send'),
 }));
 
-vi.mock('../src/config.js', () => ({
-  config: {
-    web: { externalHost: 'localhost' },
-    session: { dataDir: '/tmp/test-sessions' },
-    daemon: { backendType: 'tmux', cliId: 'claude-code' },
-  },
-}));
+vi.mock('../src/config.js', async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return {
+    config: {
+      web: { externalHost: 'localhost' },
+      // Concurrent checkouts/processes must never reset each other's journals.
+      session: { dataDir: mkdtempSync(join(tmpdir(), 'bridge-final-output-')) },
+      daemon: { backendType: 'tmux', cliId: 'claude-code' },
+    },
+  };
+});
 
 vi.mock('../src/core/cost-calculator.js', () => ({
   getSessionTokenUsage: vi.fn(() => null),
@@ -107,6 +126,12 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
   saveFrozenCards: vi.fn(),
 }));
 
+vi.mock('../src/services/session-lifecycle-hooks.js', () => ({
+  emitSessionLifecycleHook: vi.fn(() => true),
+  emitSessionStateTransitionHook: vi.fn(() => true),
+  setSessionLifecycleShutdown: vi.fn(),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -116,6 +141,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import {
   getDaemonReplyCardUsageSnapshot,
+  getDaemonReplyCardRenderSnapshot,
   initWorkerPool,
   postTurnStartingCard,
   pruneSteerFanoutState,
@@ -125,6 +151,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
@@ -142,7 +169,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, getOwnerOpenId, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getBotClient, getOwnerOpenId, resolveBrandLabel, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import {
   clearMessageListenerRunPreviewStore,
@@ -220,14 +247,14 @@ function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
   const memberKey = {
     listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
   };
-  expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+  expect(applyVcMeetingMemberProjection(config.session.dataDir, {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'app_test', role: 'minutes',
     membershipGeneration: 1, status: 'active', responseMode, joinedAtIngestSeq: 0,
     capabilities: ['meeting.read', 'listener.output.request'], ownedSinks: [], sinkOwnerGeneration: 1,
     receiverSessionId: 'sid-final-out', outputChatId: 'oc_chat',
   })).toMatchObject({ ok: true });
-  expect(acceptVcMeetingDelivery('/tmp/test-sessions', {
+  expect(acceptVcMeetingDelivery(config.session.dataDir, {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, membershipGeneration: 1,
     deliveryKey: 'delivery-stable-key', inputHash: 'input-hash', fromSeq: 1, toSeq: 1,
@@ -235,7 +262,7 @@ function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
     listenerOutputProtocol: responseMode === 'listener_thread' ? 'decision_v1' : 'plain',
     receiverBootId: 'receiver-boot',
   })).toMatchObject({ kind: 'accepted' });
-  expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', {
+  expect(markVcMeetingDeliveryDispatched(config.session.dataDir, {
     ...memberKey, deliveryKey: 'delivery-stable-key',
   }, { receiverBootId: 'receiver-boot', workerGeneration: 1 })).toMatchObject({
     ok: true,
@@ -249,12 +276,19 @@ function seedSilentReceiverReceipt(): void {
 
 const SCOPED_DEDUPE_KEY = 'sid-final-out:uuid-1';
 
+afterAll(async () => {
+  const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
+  await __testOnly_closeSkillFeedbackStores();
+  rmSync(config.session.dataDir, { recursive: true, force: true });
+});
+
 describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
+    uploadImageMock.mockReset().mockResolvedValue('img_v3_uploaded_preview');
     resolveAllowedUsersWithMapMock.mockImplementation(async (_appId: string, entries: string[]) => ({
       resolved: entries,
       map: new Map(entries.map(entry => [entry, entry])),
@@ -269,21 +303,639 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // clearAllMocks wipes the factory return; re-arm footer mode so the
     // positive usage-render tests see footer usage (individual tests override).
     vi.mocked(resolveUsageDisplay).mockReturnValue('footer');
-    rmSync('/tmp/test-sessions', { recursive: true, force: true });
-    mkdirSync('/tmp/test-sessions', { recursive: true });
+    rmSync(config.session.dataDir, { recursive: true, force: true });
+    mkdirSync(config.session.dataDir, { recursive: true });
   });
 
   afterEach(async () => {
+    const { setDurableBridgeFinalOutputHandler } = await import('../src/core/worker-pool.js');
+    setDurableBridgeFinalOutputHandler(undefined);
     __testOnly_resetOrdinaryImDeliveries();
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
     setActiveSessionsRegistry(undefined);
-    rmSync('/tmp/test-sessions', { recursive: true, force: true });
+    rmSync(config.session.dataDir, { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
   });
 
-  it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {
+  it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)(
+    'forwards %s screenshot replies without exposing a local path as an image key', async kind => {
+      const sessionReply = vi.fn(async (_anchor: string, card: string) => {
+        if (card.includes('![Preview](/tmp/preview.png)')) {
+          throw new Error('card contains invalid image keys');
+        }
+        return 'om_reply';
+      });
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = 'codex';
+      if (kind === 'bridge') ds.adoptedFrom = undefined;
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), kind, content: 'Ready.\n\n![Preview](/tmp/preview.png)', userText: 'Show preview' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+      expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted]');
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    },
+  );
+
+  it.each((['bridge', 'local-turn', 'local-turn-headless'] as const).flatMap(kind =>
+    (['minimax', 'traex', 'codex', 'claude-code'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
+    const content = ['实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = cliId;
+    if (kind === 'bridge') ds.adoptedFrom = undefined;
+    const msg = { ...finalOutputMsg(), kind, content, userText: '查看进程状态' };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const card = JSON.parse(sessionReply.mock.calls[0][1]);
+    const markdown = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    const code = new MarkdownIt().parse(markdown, {}).find(token => token.type === 'fence')!;
+    expect(code.content).toBe('123 update\n└ 456 download\n');
+    expect(msg.content).toBe(content);
+  });
+
+  it('keeps valid Codex code and following prose unchanged', async () => {
+    const content = ['实际进程：', '```plain_text', '123 update', '```', '', '**请选择：**', '1. 保持下载'].join('\n');
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); ds.session.cliId = 'codex'; ds.adoptedFrom = undefined;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const card = JSON.parse(sessionReply.mock.calls[0][1]);
+    const markdown = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    const code = new MarkdownIt().parse(markdown, {}).find(token => token.type === 'fence')!;
+    expect(code.content).toBe('123 update\n');
+    expect(markdown).toContain('**请选择：**');
+  });
+
+  it('repairs reply display even when the frozen launch identity differs', async () => {
+    const content = ['实际进程：```plain_text', '123 update', '```', '', '**请选择：**'].join('\n');
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); ds.session.cliId = 'minimax'; ds.adoptedFrom = undefined;
+    ds.session.cliLaunchSnapshot = {
+      version: 1, state: 'resolved', entryId: 'fixture', cliId: 'codex', cliRuntime: null,
+      cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+    };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const card = JSON.parse(sessionReply.mock.calls[0][1]);
+    const markdown = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(new MarkdownIt().parse(markdown, {}).find(token => token.type === 'fence')!.content).toBe('123 update\n');
+    expect(markdown).toContain('**请选择：**');
+  });
+
+  it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)('uploads an adopted session screenshot before delivering the %s card', async kind => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+    const image = `${config.session.dataDir}/preview.png`;
+    writeFileSync(image, png);
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    ds.session.cliId = 'codex';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), kind, content: `Ready.\n\n![Preview](${image})` }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('[Image omitted]');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('uploads a Claude adopt preamble screenshot but never uploads paths from its quoted user text', async () => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+    writeFileSync(`${config.session.dataDir}/preview.png`, png);
+    writeFileSync(`${config.session.dataDir}/input.png`, png);
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt',
+      userText: 'Check ![Input](input.png)', assistantText: 'Ready. ![Preview](preview.png)',
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
+    expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted] [Input]');
+  });
+
+  describe.each(['claude-code', 'codex'] as const)('%s adopt_preamble footer controls', cliId => {
+    it.each([
+      { name: 'default enabled', preferences: {}, brand: true, model: true, usage: true, recipients: true },
+      { name: 'master disabled with enabled blocks', preferences: { replyFooterEnabled: false, replyFooterBrand: true, replyFooterModel: true, replyFooterUsage: true, replyFooterRecipients: true }, brand: false, model: false, usage: false, recipients: false },
+      { name: 'brand disabled', preferences: { replyFooterBrand: false }, brand: false, model: true, usage: true, recipients: true },
+      { name: 'model disabled', preferences: { replyFooterModel: false }, brand: true, model: false, usage: true, recipients: true },
+      { name: 'usage disabled', preferences: { replyFooterUsage: false }, brand: true, model: true, usage: false, recipients: true },
+      { name: 'recipients disabled', preferences: { replyFooterRecipients: false }, brand: true, model: true, usage: true, recipients: false },
+      { name: 'all available blocks disabled', preferences: { replyFooterBrand: false, replyFooterModel: false, replyFooterUsage: false, replyFooterRecipients: false }, brand: false, model: false, usage: false, recipients: false },
+    ])('respects $name without changing the quoted exchange', async scenario => {
+      const bot = getBot('app_test');
+      Object.assign(bot.config, scenario.preferences);
+      vi.mocked(resolveBrandLabel).mockReturnValueOnce('adopt-footer-brand');
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.ownerOpenId = 'ou_adopt_owner';
+      if (!ds.worker) throw new Error('Missing fixture worker');
+      __testOnly_setupWorkerHandlers(ds, ds.worker);
+      ds.activeModel = 'adopt-footer-model';
+      ds.activeReasoningEffort = 'high';
+      ds.worker.emit('message', {
+        type: 'adopt_preamble', turnId: 'turn-adopt',
+        userText: 'Previous user request', assistantText: 'Previous assistant answer',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      const card = JSON.parse(sessionReply.mock.calls[0][1]);
+      const footer = card.body.elements.find((element: any) => element.element_id === 'botmux_reply_footer');
+      const content = footer?.content ?? '';
+      expect(content.includes('adopt-footer-brand')).toBe(scenario.brand);
+      expect(content.includes('adopt-footer-model')).toBe(scenario.model);
+      expect(content.includes('12%')).toBe(scenario.usage);
+      expect(content.includes('<at id=ou_adopt_owner></at>')).toBe(scenario.recipients);
+      const hasFooter = scenario.brand || scenario.model || scenario.usage || scenario.recipients;
+      expect(Boolean(footer)).toBe(hasFooter);
+      // The contextual body always separates the user and assistant with one divider.
+      expect(card.body.elements.filter((element: any) => element.tag === 'hr')).toHaveLength(hasFooter ? 2 : 1);
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous user request');
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous assistant answer');
+      // Rendering must preserve saved block choices when the master is off.
+      expect(bot.config).toMatchObject(scenario.preferences);
+    });
+  });
+
+  it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
+    'does not add host image uploads to %s sessions', async mode => {
+      writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.workingDir = config.session.dataDir;
+      if (mode === 'non-adopted') ds.adoptedFrom = undefined;
+      if (mode === 'sandbox') ds.session.sandbox = true;
+      if (mode === 'remote') ds.session.backendType = 'remote-runner';
+      const bot = getBot('app_test');
+      if (mode === 'read-isolation') bot.config.readIsolation = true;
+      if (mode === 'api-only') bot.config.apiOnly = true;
+      vi.mocked(getBot).mockReturnValue(bot);
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(uploadImageMock).not.toHaveBeenCalled();
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+    },
+  );
+
+  it('reuses the uploaded key and UUID after a final-output send failure', async () => {
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[0][1]).toContain('img_v3_uploaded_preview');
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+    expect(sessionReply.mock.calls[1][5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+  });
+
+  it('delivers the body when the automatic image upload fails', async () => {
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    uploadImageMock.mockRejectedValueOnce(new Error('upload failed'));
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+    expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted]');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('does not send a completed upload after the adopted worker loses ownership', async () => {
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    let owned = true;
+    uploadImageMock.mockImplementationOnce(async () => {
+      owned = false;
+      return 'img_v3_uploaded_preview';
+    });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = config.session.dataDir;
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it('forwards an adopt preamble with local screenshots in both sides of the exchange', async () => {
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt',
+      userText: 'Check ![Input](/tmp/input.png)',
+      assistantText: 'Ready. ![Preview](/tmp/preview.png)',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const card = sessionReply.mock.calls[0][1];
+    expect(card).toContain('Ready.');
+    expect(card).toContain('Check');
+    expect(card).not.toContain('![Input]');
+    expect(card).not.toContain('![Preview]');
+  });
+
+  it('downgrades only rejected image keys and retries the image-free card with the same UUID', async () => {
+    const invalidImage = { response: { status: 400, data: {
+      code: 230099, msg: 'Failed to create card content, ErrCode: 200570; ErrMsg: card contains invalid image keys',
+    } } };
+    const sessionReply = vi.fn()
+      .mockRejectedValueOnce(invalidImage)
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_rejected)' }, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(3);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_rejected)');
+    for (const call of sessionReply.mock.calls.slice(1)) {
+      expect(call[1]).toContain('Ready.');
+      expect(call[1]).toContain('[Image omitted]');
+      expect(call[1]).not.toContain('![Preview]');
+      expect(call[2]).toBe('interactive');
+      expect(call[5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+    }
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply');
+  });
+
+  it.each([
+    { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } },
+    { response: { status: 400, data: { code: 230001, msg: 'Invalid request' } } },
+    { response: { status: 400, data: { code: 230099, msg: 'ErrCode: 200571; card contains invalid image keys' } } },
+    new Error('Request failed with status code 400'),
+    new Error('card contains invalid image keys'),
+  ])('does not treat an unrelated rejection as permission to downgrade images: %j', async error => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(error).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_key)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+  });
+
+  it('uses the same image-free fallback for an adopt preamble and a flattened SDK error', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error(
+      'Failed to reply message: ErrCode: 200570; ErrMsg: card contains invalid image keys (code: 230099)',
+    )).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt', userText: 'Show preview',
+      assistantText: 'Ready. ![Preview](img_v3_rejected)',
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toContain('[Image omitted]');
+    expect(sessionReply.mock.calls[1][1]).toContain('Ready.');
+    expect(sessionReply.mock.calls[1][1]).not.toContain('![Preview]');
+    expect(sessionReply.mock.calls[1][4]).toBe('turn-adopt');
+  });
+
+  it('does not send the image fallback after the worker loses ownership', async () => {
+    let owned = true;
+    const sessionReply = vi.fn(async () => {
+      owned = false;
+      throw new Error('Failed to reply message: ErrCode: 200570; card contains invalid image keys (code: 230099)');
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_key)' }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it.each([['codex', false], ['claude-code', true]] as const)(
+    'persists the actual downgraded %s bridge card with an existing message=%s', async (cliId, existing) => {
+      vi.useRealTimers();
+      getBot('app_test').config.replyCardMode = 'unified';
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = cliId;
+      ds.currentTurnId = 'om_image_turn';
+      const sessionReply = vi.fn(async () => 'om_image_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
+      if (existing) await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'start' }, sessionReply);
+      const error = new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      if (existing) updateMessageMock.mockRejectedValueOnce(error);
+      else sessionReply.mockRejectedValueOnce(error);
+      const complete = vi.fn();
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), turnId: ds.currentTurnId, kind: 'bridge', content: 'Answer. ![Preview](img_v3_rejected)' }, 'tag', 0, complete);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_image_reply'));
+      const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+      const record = new TurnReplyCardStore(config.session.dataDir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      });
+      expect(record?.finalCard).toContain('[Image omitted]');
+      expect(record?.lastCard).not.toContain('![Preview]');
+      expect(record?.finalDelivered).toBe(true);
+      await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'terminal', phase: 'completed' }, sessionReply);
+      expect(updateMessageMock.mock.calls.at(-1)?.[2]).toContain('Answer.');
+      expect(updateMessageMock.mock.calls.at(-1)?.[2]).not.toContain('![Preview]');
+      expect(sessionReply).toHaveBeenCalledTimes(existing ? 1 : 2);
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    },
+  );
+
+  it('routes ordinary bridge final output through the durable handler without direct sessionReply', async () => {
+    const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const {
+      __testOnly_deliverFinalOutput: deliver,
+      setDurableBridgeFinalOutputHandler,
+    } = await import('../src/core/worker-pool.js');
+    const durable = vi.fn(async () => ({ kind: 'delivered' as const, messageId: 'om_durable' }));
+    setDurableBridgeFinalOutputHandler(durable);
+    const ds = makeDs();
+    const onComplete = vi.fn();
+
+    deliver(ds, finalOutputMsg(), 'tag', 0, onComplete, () => true,
+      { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(durable).toHaveBeenCalledWith(expect.objectContaining({
+      daemonSession: ds,
+      turnId: 'turn-1',
+      providerUuid: expect.stringMatching(/^bf_/),
+      target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+      msgType: 'interactive',
+    }));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(onComplete).toHaveBeenCalledWith(true, 'om_durable');
+  });
+
+  it('keeps the reply-card write fence on the non-primary final path', async () => {
+    vi.useRealTimers();
+    const bot = getBot('app_test');
+    Object.assign(bot.config, { replyCardMode: 'unified', apiOnly: false });
+    vi.mocked(getBot).mockReturnValue(bot);
+    let beforeWrite: (() => void | Promise<void>) | undefined;
+    const sessionReply = vi.fn(async (...args: any[]) => {
+      beforeWrite = args[5]?.beforeWrite;
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const onComplete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+
+    deliver(ds, { ...finalOutputMsg(), kind: 'bridge', turnId: 'om_fenced_final' },
+      'tag', 0, onComplete, () => true);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+
+    // Delivery continues asynchronously after sessionReply returns. Wait for
+    // its completion before changing policy to exercise the retained fence.
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_reply'));
+    expect(beforeWrite).toBeTypeOf('function');
+    bot.config.apiOnly = true;
+    await expect(Promise.resolve().then(() => beforeWrite!()))
+      .rejects.toThrow('Reply-card turn no longer owns delivery');
+    bot.config.apiOnly = false;
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_reply'));
+  });
+
+  it('fails closed on an ambiguous durable settlement without falling back to direct delivery', async () => {
+    const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const {
+      __testOnly_deliverFinalOutput: deliver,
+      setDurableBridgeFinalOutputHandler,
+    } = await import('../src/core/worker-pool.js');
+    setDurableBridgeFinalOutputHandler(vi.fn(async () => ({
+      kind: 'ambiguous' as const,
+      error: 'provider result unknown',
+    })));
+    const ds = makeDs();
+    const onComplete = vi.fn();
+
+    deliver(ds, finalOutputMsg(), 'tag', 0, onComplete, () => true,
+      { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.agentAttention).toMatchObject({
+      kind: 'blocked',
+      reason: 'Durable final output is ambiguous: provider result unknown',
+    });
+    expect(onComplete).toHaveBeenCalledWith(false);
+  });
+
+  it.each([undefined, 'native_before_fork'])('binds prepared native input to its reserved worker before execution (native=%s)', async nativeSessionId => {
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.cliSessionId = nativeSessionId;
+    ds.session.workerGeneration = 3;
+    ds.workerGeneration = 3;
+    const binding = { appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: 'om_prepared', workerGeneration: 2,
+      epoch: groupContextEpoch(ds.session.sessionId, nativeSessionId, 'claude-code', 'om_prepared') };
+    writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, config.session.dataDir);
+    bindGroupContextDelivery(binding, config.session.dataDir);
+    const workerPool = await import('../src/core/worker-pool.js') as any;
+    expect(workerPool.__testOnly_bindPreparedGroupContextWorker).toBeTypeOf('function');
+    workerPool.__testOnly_bindPreparedGroupContextWorker(ds, 'om_prepared', 3);
+    expect(readGroupContextDeliveryBinding(binding.appId, binding.chatId, binding.turnId, config.session.dataDir))
+      .toEqual({ ...binding, workerGeneration: 3 });
+    ds.session.cliSessionId = 'replacement_native';
+    ds.session.workerGeneration = 4;
+    ds.workerGeneration = 4;
+    if (nativeSessionId) {
+      workerPool.__testOnly_bindPreparedGroupContextWorker(ds, 'om_prepared', 4);
+      expect(readGroupContextDeliveryBinding(binding.appId, binding.chatId, binding.turnId, config.session.dataDir)?.workerGeneration).toBe(3);
+    }
+  });
+
+  it('binds an adopted bridge input before its real reservation callback can dispatch', async () => {
+    initWorkerPool({ sessionReply: vi.fn(async () => 'unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.cliSessionId = 'native_adopted';
+    ds.session.workerGeneration = 2;
+    ds.workerGeneration = 2;
+    const binding = { appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: 'om_adopted', workerGeneration: 2,
+      epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, 'claude-code', 'om_adopted') };
+    writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, config.session.dataDir);
+    bindGroupContextDelivery(binding, config.session.dataDir);
+    const stopBeforeSpawn = new Error('test stops before worker spawn');
+    let recordedGeneration: number | undefined;
+    const { forkAdoptWorker } = await import('../src/core/worker-pool.js');
+    expect(() => forkAdoptWorker(ds, { prompt: 'prepared native input', turnId: binding.turnId,
+      onWorkerGenerationReserved: generation => {
+        expect(generation).toBe(3);
+        recordedGeneration = readGroupContextDeliveryBinding(binding.appId, binding.chatId, binding.turnId, config.session.dataDir, binding.epoch)?.workerGeneration;
+        throw stopBeforeSpawn;
+      } })).toThrow(stopBeforeSpawn);
+    expect(recordedGeneration).toBe(3);
+    expect(ds.worker?.kill).not.toHaveBeenCalled();
+  });
+
+  it('keeps Grok legacy activity from creating an extra native process message', async () => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'grok';
+    ds.currentTurnId = 'om_grok_legacy';
+    const sessionReply = vi.fn(async () => 'om_unexpected');
+    getBot('app_test').config.replyCardMode = 'legacy';
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    vi.mocked(getBotClient).mockClear();
+    ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      entries: [{ kind: 'text', text: 'Public progress' }] });
+    await Promise.resolve();
+    expect(getBotClient).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastThinkingUpdate?.entries).toEqual([{ kind: 'text', text: 'Public progress' }]);
+  });
+
+  it.each([
+    ['grok', 'codex', false, false], ['codex', 'grok', false, true], ['grok', 'codex', true, true],
+  ] as const)('uses frozen %s instead of stale %s for legacy activity (forced=%s)', async (frozen, stale, forced, expected) => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = stale;
+    ds.session.cliLaunchSnapshot = {
+      version: 1, state: 'resolved', entryId: 'fixture', cliId: frozen, cliRuntime: null,
+      cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+    };
+    ds.currentTurnId = 'om_frozen_legacy';
+    ds.cotForced = forced;
+    getBot('app_test').config.replyCardMode = 'legacy';
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const handler = vi.spyOn(cotMessage, 'handleCotThinkingUpdate').mockReturnValue(true);
+    try {
+      ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+        entries: [{ kind: 'text', text: 'Public progress' }] });
+      await Promise.resolve();
+      expect(handler).toHaveBeenCalledTimes(expected ? 1 : 0);
+    } finally { handler.mockRestore(); }
+  });
+
+  it.each([false, true])('settles only the superseded Grok card before its successor finishes (activity=%s)', async activity => {
+    vi.useRealTimers();
+    getBot('app_test').config.replyCardMode = 'unified';
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'grok';
+    ds.currentTurnId = 'om_second';
+    ds.replyCardRunningTurnId = 'om_second';
+    let sent = 0;
+    const sessionReply = vi.fn(async () => `om_card_${++sent}`);
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const store = new TurnReplyCardStore(config.session.dataDir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_first' };
+    await updateTurnReplyCard(ds, 'om_first', { kind: 'start' }, sessionReply);
+    await updateTurnReplyCard(ds, 'om_second', { kind: 'start' }, sessionReply);
+    const secondBefore = store.read({ ...key, turnId: 'om_second' });
+    const queue = new CodexBridgeQueue(() => 10_000);
+    queue.setCotObserver((entries, turn) => ds.worker!.emit('message', {
+      type: 'thinking_update', sessionId: ds.session.sessionId, turnId: turn.turnId, entries,
+    }));
+    queue.setCotSupersededObserver(turn => ds.worker!.emit('message', {
+      type: 'thinking_superseded', sessionId: ds.session.sessionId, turnId: turn.turnId,
+    }));
+    queue.mark('om_first', 'first input', 10_000);
+    queue.mark('om_second', 'second input', 10_000);
+    queue.ingest([{ uuid: 'user1', timestampMs: 10_000, kind: 'user', text: 'first input' },
+      ...(activity ? [{ uuid: 'tool1', timestampMs: 10_001, kind: 'cot' as const, text: '',
+        cotEntries: [{ kind: 'tool_call' as const, id: 'read1', name: 'Read', args: '{}', subject: 'README.md' }] }] : []),
+      { uuid: 'user2', timestampMs: 10_002, kind: 'user', text: 'second input' },
+    ]);
+    await vi.waitFor(() => expect(store.read(key)?.phase).toBe('superseded'), { timeout: 3000 });
+    const first = store.read(key)!;
+    expect(first.lastCard).toContain('已由后续消息接续');
+    expect(first.lastCard).not.toContain('stop_turn');
+    expect(first.tools).toHaveLength(activity ? 1 : 0);
+    expect(store.read({ ...key, turnId: 'om_second' })).toEqual(secondBefore);
+    expect(ds.replyCardRunningTurnId).toBe('om_second');
+    expect(ds.worker!.send).not.toHaveBeenCalled();
+    expect(queue.drainEmittable()).toEqual([]);
+    ds.worker!.emit('message', { type: 'thinking_superseded', sessionId: 'wrong-session', turnId: 'om_second' });
+    ds.worker!.emit('message', { type: 'thinking_superseded', sessionId: ds.session.sessionId, turnId: 'om_second', dispatchAttempt: 99 });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(store.read({ ...key, turnId: 'om_second' })).toEqual(secondBefore);
+    expect(store.read({ ...key, turnId: 'om_second', dispatchAttempt: 99 })).toBeUndefined();
+    queue.ingest([{ uuid: 'final2', timestampMs: 10_003, kind: 'assistant_final', text: 'Merged answer.' }]);
+    const [final] = queue.drainEmittable();
+    expect(final.turnId).toBe('om_second');
+    ds.worker!.emit('message', { type: 'final_output', sessionId: ds.session.sessionId, turnId: final.turnId,
+      kind: 'bridge', content: final.finalText, lastUuid: 'merged-final' });
+    ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: final.turnId, status: 'completed' });
+    await vi.waitFor(() => expect(store.read({ ...key, turnId: 'om_second' })).toMatchObject({ phase: 'completed', finalText: 'Merged answer.' }));
+    expect(store.read(key)?.phase).toBe('superseded');
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([['claude-code', 'bridge'], ['claude-code', 'explicit'], ['grok', 'bridge'], ['grok', 'explicit']] as const)('keeps the %s %s answer and Oncall source in the existing reply card', async (cliId, source) => {
     vi.useRealTimers();
     const bot = getBot('app_test');
     bot.config.replyCardMode = 'unified';
@@ -292,7 +944,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const ds = makeDs();
     ds.adoptedFrom = undefined;
     ds.scope = 'thread';
-    ds.session.cliId = 'claude-code';
+    ds.session.cliId = cliId;
     ds.currentTurnId = 'om_managed_turn';
     const sessionReply = vi.fn(async () => 'om_managed_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -318,13 +970,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
     await vi.waitFor(() => {
       expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('已完成') && call[2]?.includes('oncall_group_create'))).toBe(true);
-      expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_managed_reply'))
+      expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_managed_reply'))
         .toMatchObject({ chatId: 'oc_chat', questionId: ds.currentTurnId, answer: expectedAnswer });
     }, { timeout: 5000 });
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_managed_reply')).toBe(true);
     const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
-    const record = new TurnReplyCardStore('/tmp/test-sessions').read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
+    const record = new TurnReplyCardStore(config.session.dataDir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
     if (source === 'bridge') expect(record?.tools[0]?.subject).toBe('README.md');
     expect(record?.finalDelivered).toBe(true);
     expect(record?.finalSource).toBe(source);
@@ -333,6 +985,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   it.each([
     ['claude-code', 'on'], ['claude-code', 'bot-off'], ['claude-code', 'chat-off'],
     ['codex', 'on'], ['codex', 'bot-off'], ['codex', 'chat-off'],
+    ['grok', 'on'], ['grok', 'bot-off'], ['grok', 'chat-off'],
   ] as const)('%s unified replies keep the %s status card independent through ready and final output', async (cliId, statusMode) => {
     vi.useRealTimers();
     const bot = getBot('app_test');
@@ -406,7 +1059,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(4);
   });
 
-  it.each(['unified', 'unified-status-off', 'legacy'] as const)('keeps delayed worker receipt consistent with %s mode', async mode => {
+  it.each(['unified', 'unified-status-off', 'legacy'] as const)('waits quietly for the worker receipt with no late notice in %s mode', async mode => {
     vi.useRealTimers();
     const bot = getBot('app_test');
     bot.config.replyCardMode = mode === 'legacy' ? 'legacy' : 'unified';
@@ -424,18 +1077,25 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
     await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'refresh' },
       (body, type, uuid) => sessionReply(ds.session.rootMessageId, body, type, ds.larkAppId, ds.currentTurnId, { uuid }));
+    const beforeEnqueueReplies = sessionReply.mock.calls.length;
+    const beforeEnqueueTypes = sessionReply.mock.calls.map(call => call[2]);
     const enqueuedAt = Date.now();
     expect(sendWorkerInput(ds, 'hello', ds.currentTurnId)).toBe(true);
-    if (mode === 'legacy') {
-      await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1), { timeout: 4000 });
-      expect(sessionReply.mock.calls[0][2]).toBe('text');
-    } else {
+    // The old 2s "delivery delayed" nudge (text in legacy, card refresh in
+    // unified) has been removed: a turn waiting for its worker receipt must stay
+    // completely quiet now. Wait past the old settlement window and assert no
+    // new outgoing message of any kind was produced.
+    await new Promise(resolve => setTimeout(resolve, 2_500));
+    expect(sessionReply).toHaveBeenCalledTimes(beforeEnqueueReplies);
+    expect(sessionReply.mock.calls.map(call => call[2])).toEqual(beforeEnqueueTypes);
+    expect(sessionReply.mock.calls.every(call => call[2] !== 'text')).toBe(true);
+    if (mode !== 'legacy') {
       const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
-      await vi.waitFor(() => expect(new TurnReplyCardStore('/tmp/test-sessions').read({
+      // No quiet card refresh either: the stored card must not have been
+      // rewritten after enqueue.
+      expect(new TurnReplyCardStore(config.session.dataDir).read({
         larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId!,
-      })?.updatedAtMs).toBeGreaterThan(enqueuedAt), { timeout: 4000 });
-      expect(sessionReply).toHaveBeenCalledTimes(1);
-      expect(sessionReply.mock.calls.every(call => call[2] === 'interactive')).toBe(true);
+      })?.updatedAtMs).not.toBeGreaterThan(enqueuedAt);
     }
   });
 
@@ -564,6 +1224,51 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
+  it('strict topic policy blocks automatic final output before publishing', async () => {
+    const current = getBot('app_test');
+    vi.mocked(getBot).mockReturnValue({ ...current, config: { ...current.config, topicUnavailablePolicy: 'stop' } } as any);
+    const sessionReply = vi.fn(async () => 'om_sent');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    // The blocked state must be pushed to Dashboard immediately, not wait for the
+    // next row refresh (every other attention raise in worker-pool calls
+    // publishAttentionPatch alongside the in-memory flag).
+    const patches: any[] = [];
+    const off = dashboardEventBus.subscribe(event => {
+      if (event.type === 'session.update' && event.body.sessionId === ds.session.sessionId) patches.push(event.body.patch);
+    });
+    try {
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(topicDetailMock).toHaveBeenCalledWith('app_test', 'om_root');
+      const lookups = topicDetailMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(30000);
+      expect(topicDetailMock).toHaveBeenCalledTimes(lookups);
+      expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: expect.stringContaining('TOPIC_SEND_BLOCKED') });
+      expect(patches.some(patch => patch.agentAttention?.kind === 'blocked')).toBe(true);
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    } finally { off(); }
+  });
+
+  it('shares the automatic final precheck with the provider send boundary', async () => {
+    const current = getBot('app_test');
+    vi.mocked(getBot).mockReturnValue({ ...current, config: { ...current.config, topicUnavailablePolicy: 'stop' } } as any);
+    topicDetailMock.mockResolvedValueOnce({ items: [{ message_id: 'om_root', deleted: false }] });
+    const sessionReply = vi.fn(async (...args: any[]) => {
+      await args[5].topicMessageLookup('app_test', 'om_root');
+      return 'om_sent';
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const before = topicDetailMock.mock.calls.length;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(makeDs(), finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(topicDetailMock.mock.calls.length - before).toBe(1);
+  });
+
   it('turnFailed final_output on a session WITHOUT a human recipient @mentions the bot admin', async () => {
     // Bot-to-bot dispatched sessions are ownerless: a model-gateway failure
     // card would otherwise ping nobody and scroll by silently.
@@ -620,9 +1325,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).toContain('oncall_group_create');
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
-    expect(new OncallGroupStore('/tmp/test-sessions').findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
+    expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_oncall_answer')).toMatchObject({ chatId: 'oc_chat' });
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_oncall_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -648,7 +1353,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
 
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
-    const feedbackStore = await getSkillFeedbackStore('/tmp/test-sessions');
+    const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
     expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
     await vi.advanceTimersByTimeAsync(10);
 
@@ -722,7 +1427,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    expect((await getSkillFeedbackStore('/tmp/test-sessions'))
+    expect((await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_everyone_feedback'))
       .toMatchObject({ policy: { audience: 'everyone', reviewers: [] } });
   });
@@ -749,7 +1454,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(resolveAllowedUsersWithMapMock).toHaveBeenCalledWith('app_test', ['reviewer@example.com']);
     expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
-    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_email_feedback');
     expect(delivery?.policy?.reviewers).toEqual(['ou_email_reviewer']);
     expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
@@ -789,7 +1494,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // But the delivery is still recorded so a later turn_terminal correlates to
     // a turn.completed event — feedback is independent of completion bookkeeping.
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    const delivery = (await getSkillFeedbackStore('/tmp/test-sessions'))
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
       .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_plain_answer');
     expect(delivery).toMatchObject({ cardMode: 'card' });
     expect(delivery?.policy).toBeUndefined();
@@ -850,6 +1555,27 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
       return sessionReply;
     }
+
+    it('carries the exact native author into final publication and omits it after an epoch change', async () => {
+      const sessionReply = armTranscript();
+      const ds = makeDs();
+      ds.session.cliId = 'claude-code';
+      ds.session.cliSessionId = 'native_final';
+      ds.session.workerGeneration = 1;
+      const binding = { appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: 'turn-1', workerGeneration: 1,
+        epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, ds.session.cliId, 'turn-1') };
+      writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, config.session.dataDir);
+      bindGroupContextDelivery(binding, config.session.dataDir);
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply.mock.calls[0]?.[5]?.groupContextAuthorOrigin).toEqual(binding);
+      sessionReply.mockClear();
+      ds.session.cliSessionId = 'replacement_native';
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), assistantMsgUuid: 'second-final' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply.mock.calls[0]?.[5]?.groupContextAuthorOrigin).toBeUndefined();
+    });
 
     it('marks the turn only AFTER the canonical send succeeds', async () => {
       const sessionReply = armTranscript();
@@ -1588,6 +2314,35 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
+  it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {
+    let resolveReply!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => {
+      resolveReply = resolve;
+    }));
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.finalOutputDeliveriesInFlight?.size).toBe(1);
+
+    resolveReply('om_reply');
+    await vi.waitFor(() => {
+      expect(ds.finalOutputDeliveriesInFlight).toBeUndefined();
+    });
+  });
+
   it('drops final_output whose worker sessionId does not match the daemon session', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -1910,7 +2665,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   it('does not address daemon final-output footers to a known bot owner', async () => {
     writeFileSync(
-      join('/tmp/test-sessions', 'bot-openids-app_test.json'),
+      join(config.session.dataDir, 'bot-openids-app_test.json'),
       JSON.stringify({ Claude: 'ou_foreign_bot' }),
     );
 
@@ -2150,7 +2905,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // which records the dispatching bot as ownerOpenId (daemon /repo
     // session-create path) instead of nulling it like @-mention auto-create.
     writeFileSync(
-      join('/tmp/test-sessions', 'bot-openids-app_test.json'),
+      join(config.session.dataDir, 'bot-openids-app_test.json'),
       JSON.stringify({ Orchestrator: 'ou_orch_bot' }),
     );
 
@@ -2177,6 +2932,151 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     const cardJson = sessionReply.mock.calls[0][1] as string;
     expect(cardJson).toContain('<at id=ou_orch_bot></at>');
+  });
+
+  describe('in a topic opened by botmux dispatch', () => {
+    // The dispatcher already gets the result through `botmux report
+    // --dispatch-root`; an @ in the sub-topic only starts a fresh dispatcher
+    // session there without the dispatch context (#1887).
+    async function bindTopicToDispatcher(tamper = false): Promise<void> {
+      vi.stubEnv('BOTMUX_CORE_ONLY', '1');
+      const { createDispatchReportBinding, loadOrCreateDispatchReportBindingSecret } = await import('../src/core/dispatch-report-binding.js');
+      const reportBinding = createDispatchReportBinding(loadOrCreateDispatchReportBindingSecret(config.session.dataDir), {
+        dispatchRoot: 'om_root', targetLarkAppId: 'cli_orchestrator', targetSessionId: 'session-orchestrator',
+        targetChatId: 'oc_chat', targetScope: 'chat', sourceName: 'review', issuedAt: '2026-10-18T00:00:00.000Z',
+      });
+      if (tamper) reportBinding.signature = 'forged';
+      writeFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding } }));
+    }
+
+    afterEach(() => { vi.unstubAllEnvs(); });
+
+    async function deliverDispatchedFinal(ds: DaemonSession): Promise<string> {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      return String(sessionReply.mock.calls[0][1]);
+    }
+
+    function dispatchedRunnerDs(cliId: string): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.ownerOpenId = undefined;
+      ds.ownerOpenId = undefined;
+      ds.session.creatorOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      return ds;
+    }
+
+    it.each(['mira', 'mir', 'dsh'] as const)('does not address %s fallback output to the dispatcher', async (cliId) => {
+      await bindTopicToDispatcher();
+      const card = await deliverDispatchedFinal(dispatchedRunnerDs(cliId));
+      expect(card).toContain('final answer');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('does not address a known-bot owner either (/repo-primed dispatch)', async () => {
+      await bindTopicToDispatcher();
+      writeFileSync(join(config.session.dataDir, 'bot-openids-app_test.json'), JSON.stringify({ Orchestrator: 'ou_orch_bot' }));
+      const ds = dispatchedRunnerDs('mira');
+      ds.session.ownerOpenId = 'ou_orch_bot';
+      ds.ownerOpenId = 'ou_orch_bot';
+      expect(await deliverDispatchedFinal(ds)).not.toContain('ou_orch_bot');
+    });
+
+    it('still @mentions the bot admin when the dispatched turn failed', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_notice');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(dispatchedRunnerDs('dsh'), { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      const card = String(sessionReply.mock.calls[0][1]);
+      expect(card).toContain('<at id=ou_admin_human></at>');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('addresses the ambiguous-terminal failure card to the bot admin, not the dispatcher', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_card');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = dispatchedRunnerDs('dsh');
+      ds.adoptedFrom = undefined;
+      const { __testOnly_setupWorkerHandlers } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      ds.worker!.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'turn-1', status: 'ambiguous' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(sessionReply.mock.calls[0][1]))).toEqual({ turnFailed: true, mentionOpenId: 'ou_admin_human' });
+    });
+
+    it('lets a zero-prompt CLI report to the dispatcher instead of @-ing it', async () => {
+      await bindTopicToDispatcher();
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
+    });
+
+    it('falls back to the bot admin for a failed zero-prompt turn in a dispatched topic', async () => {
+      await bindTopicToDispatcher();
+      vi.mocked(getOwnerOpenId).mockReturnValue('ou_admin_human');
+      const sessionReply = vi.fn(async () => 'om_failed_notice');
+      initWorkerPool({ sessionReply, onZeroPromptFinal: vi.fn(async () => {}), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '⚠️ 模型网关故障', turnFailed: true }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      const card = String(sessionReply.mock.calls[0][1]);
+      expect(card).toContain('<at id=ou_admin_human></at>');
+      expect(card).not.toContain('ou_dispatcher_bot');
+    });
+
+    it('keeps the zero-prompt @ and skips the report when the topic binding does not verify', async () => {
+      await bindTopicToDispatcher(true);
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_dispatcher_bot></at>');
+      expect(onZeroPromptFinal).not.toHaveBeenCalled();
+    });
+
+    it('keeps addressing the dispatcher when the topic binding does not verify', async () => {
+      await bindTopicToDispatcher(true);
+      expect(await deliverDispatchedFinal(dispatchedRunnerDs('dsh'))).toContain('<at id=ou_dispatcher_bot></at>');
+    });
   });
 
   it('keeps daemon final-output footer addressing for a human owner', async () => {
@@ -2434,7 +3334,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_a',
       replyTargetSenderOpenId: 'ou_human_a',
     };
-    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
       memberId: origin.memberId,
@@ -2477,7 +3377,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).not.toContain('<at');
     expect(cardJson).toContain('＜at');
     const providerUuid = sessionReply.mock.calls[0][5].uuid;
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
       targetChatId: ds.chatId,
@@ -2519,7 +3419,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       membershipGeneration: 1, sinkOwnerGeneration: 1,
       receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_envelope',
     };
-    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
       memberId: origin.memberId,
@@ -2571,7 +3471,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       } | undefined;
       // Model the exact daemon sequence: the quote RPC was already in flight,
       // then the member was removed before Lark answered "withdrawn".
-      expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+      expect(applyVcMeetingMemberProjection(config.session.dataDir, {
         listenerAppId: 'listener-app', meetingId: 'meeting-im-race',
         memberId: 'member-im-race', memberEpoch: 1,
         agentAppId: 'app_test', ownerBootId: 'owner-boot', ownerEpoch: 1,
@@ -2604,7 +3504,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       membershipGeneration: 1, sinkOwnerGeneration: 1,
       receiverSessionId: ds.session.sessionId, larkMessageId: 'om_human_race',
     };
-    expect(applyVcMeetingMemberProjection('/tmp/test-sessions', {
+    expect(applyVcMeetingMemberProjection(config.session.dataDir, {
       ...origin,
       role: 'minutes', status: 'active', responseMode: 'silent',
       capabilities: ['meeting.read'], ownedSinks: [], joinedAtIngestSeq: 0,
@@ -2623,7 +3523,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(plainFallbackCalls).toBe(0);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
-    const actions = listVcMeetingActions('/tmp/test-sessions', {
+    const actions = listVcMeetingActions(config.session.dataDir, {
       listenerAppId: origin.listenerAppId,
       meetingId: origin.meetingId,
     });
@@ -2666,13 +3566,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       sourceSessionId: ds.session.sessionId,
       suppressHook: true,
     });
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
-    expect((await getSkillFeedbackStore('/tmp/test-sessions')).findDeliveryByPlatformMessage(
+    expect((await getSkillFeedbackStore(config.session.dataDir)).findDeliveryByPlatformMessage(
       'lark', ds.larkAppId, 'om_meeting_fallback',
     )).toBeUndefined();
   });
@@ -2707,7 +3607,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
@@ -2742,7 +3642,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
-    expect(listVcMeetingActions('/tmp/test-sessions', {
+    expect(listVcMeetingActions(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1',
     })).toEqual([]);
   });
@@ -2774,7 +3674,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
     })).toEqual([]);
   });
@@ -2823,11 +3723,11 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       memberId: 'member-1', memberEpoch: 1,
       deliveryKey: 'delivery-stable-key',
     };
-    expect(markVcMeetingDeliveryAmbiguous('/tmp/test-sessions', deliveryKey, {
+    expect(markVcMeetingDeliveryAmbiguous(config.session.dataDir, deliveryKey, {
       workerGeneration: 1,
       dispatchAttempt: 1,
     })).toMatchObject({ ok: true, receipt: { status: 'ambiguous' } });
-    expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', deliveryKey, {
+    expect(markVcMeetingDeliveryDispatched(config.session.dataDir, deliveryKey, {
       receiverBootId: 'receiver-boot-2',
       workerGeneration: 2,
     })).toMatchObject({ ok: true, receipt: { dispatchAttempt: 2 } });
@@ -2849,7 +3749,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][5]).toMatchObject({ suppressHook: true });
     expect(sessionReply.mock.calls[1][5]).toMatchObject({ suppressHook: true });
     expect(providerMessages).toEqual(new Map([[firstUuid, 'om_provider_once']]));
-    expect(listVcMeetingActions('/tmp/test-sessions', {
+    expect(listVcMeetingActions(config.session.dataDir, {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
     })).toEqual([
@@ -2877,7 +3777,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       memberId: 'member-1', memberEpoch: 1,
     };
     seedReceiverReceipt('listener_thread');
-    expect(failVcMeetingDelivery('/tmp/test-sessions', {
+    expect(failVcMeetingDelivery(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1',
       memberId: 'member-1', memberEpoch: 1,
       deliveryKey: 'delivery-stable-key',
@@ -2898,7 +3798,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).not.toHaveBeenCalled();
-    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+    expect(listVcMeetingListenerMessageIds(config.session.dataDir, {
       listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
     })).toEqual([]);
   });
@@ -2937,6 +3837,44 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.session.docCommentTargets).toBeUndefined();
     expect(removeCommentReactionMock).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('cleans a pre-upgrade persisted Typing target that has no reaction metadata', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.chatId = 'doc:doc-token';
+    ds.session.scope = 'chat';
+    ds.session.chatId = 'doc:doc-token';
+    ds.session.docCommentTargets = {
+      'turn-1': {
+        fileToken: 'doc-token',
+        fileType: 'docx',
+        commentId: 'comment-1',
+        turnId: 'turn-1',
+        replyId: 'reply-1',
+      },
+    };
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(removeCommentReactionMock).toHaveBeenCalledWith(
+      ds.larkAppId,
+      { fileToken: 'doc-token', fileType: 'docx' },
+      'comment-1',
+      'reply-1',
+      'Typing',
+      { identity: undefined },
+    );
   });
 
   it('consumes doc-comment turn state after posting even when reaction cleanup fails', async () => {
@@ -3218,6 +4156,91 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
+  it('observes native starts per worker generation and exact dispatch attempt', async () => {
+    const bot = getBot('app_test');
+    bot.config.showReplyTiming = true;
+    bot.config.replyFooterEnabled = false;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const ds = makeDs();
+    ds.workerGeneration = 1; ds.session.workerGeneration = 1;
+    ds.turnReceivedAtMs = new Map([['turn-observed', Date.now() - 6000]]);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'turn_execution_started', turnId: 'turn-observed', startedAtMs: Date.now() - 4000 });
+    await vi.advanceTimersByTimeAsync(0);
+    const snapshot = getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed' });
+    expect(snapshot.timing).toEqual({ executionDurationMs: 4000, waitingDurationMs: 2000, executionInProgress: true });
+    expect(snapshot.footerPreferences.replyFooterEnabled).toBe(false);
+    expect(snapshot.usage).not.toHaveProperty('replyFooter');
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'other' }).timing).toBeUndefined();
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed', dispatchAttempt: 2 }).timing).toBeUndefined();
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1; ds.session.workerGeneration = ds.workerGeneration;
+    (ds.worker as any).emit('message', { type: 'turn_execution_started', turnId: 'turn-observed', startedAtMs: Date.now() - 1000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed' }).timing).toBeUndefined();
+  });
+
+  it('freezes timing and its display setting across final reply retries', async () => {
+    const bot = getBot('app_test'); bot.config.showReplyTiming = true;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.turnReceivedAtMs = new Map([['turn-1', Date.now() - 7000]]);
+    const msg = { ...finalOutputMsg(), durationMs: 5000, executionStartedAtMs: Date.now() - 5000 };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    bot.config.showReplyTiming = false;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[0][1]).toContain('5.0');
+    expect(sessionReply.mock.calls[0][1]).toContain('2.0');
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+  });
+
+  it('keeps the entire footer hidden across daemon final-output retries', async () => {
+    const bot = getBot('app_test');
+    bot.config.replyFooterEnabled = false;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.activeModel = 'observed-model';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    // A retry must use the first render policy, even if settings later change.
+    bot.config.replyFooterEnabled = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(call[1]).not.toContain('botmux_reply_footer');
+      expect(call[1]).not.toContain('observed-model');
+      expect(call[1]).not.toContain('"tag":"hr"');
+    }
+  });
+
+  it('freezes the observed model and effort across final reply retries', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    vi.mocked(resolveUsageDisplay).mockReturnValue('off');
+    const ds = makeDs();
+    ds.activeModel = 'observed-model';
+    ds.activeReasoningEffort = 'high';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    ds.activeModel = 'next-turn-model';
+    ds.activeReasoningEffort = 'low';
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(call[1]).toContain('**observed-model** high');
+      expect(call[1]).not.toContain('next-turn-model');
+    }
+  });
+
   it('does not read or render footer usage when this bot is not in footer mode', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -3231,6 +4254,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     vi.mocked(resolveUsageDisplay).mockReturnValue('off');
 
     const ds = makeDs();
+    ds.session.model = 'claude-opus-5-5-high';
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
@@ -3238,6 +4262,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(getSessionUsageSnapshot).not.toHaveBeenCalled();
     const card = sessionReply.mock.calls[0]?.[1] as string;
     expect(card).toContain('[botmux](');
+    expect(card).toContain('**claude-opus-5-5-high**');
     expect(card).not.toContain('上下文');
     expect(card).not.toContain('Token');
   });
@@ -3262,6 +4287,72 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(3);
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
+  it('treats a Lark content-audit rejection as permanent: no retries, visible notice, settled', async () => {
+    const auditError = {
+      isAxiosError: true,
+      name: 'AxiosError',
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } },
+    };
+    // Primary reply is audit-rejected; the follow-up notice (same reply channel) succeeds.
+    const sessionReply = vi
+      .fn()
+      .mockRejectedValueOnce(auditError)
+      .mockResolvedValueOnce('om_notice');
+    const closeSession = vi.fn();
+    const complete = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    });
+
+    const ds = makeDs();
+    // Use PRODUCTION-LENGTH ids: randomUUID sessionId (36) + om_ turnId (~35).
+    // Naive concatenation would build an 80+ char dedupe uuid, which Feishu
+    // hard-rejects at 50 — defeating this very notice. The fixture's short ids
+    // (sid-final-out/turn-1) hid that in the first iteration.
+    ds.session.sessionId = '01234567-89ab-4def-8234-56789abcdef0';
+    const productionMsg = { ...finalOutputMsg(), turnId: 'om_x100b63519db838a4b32f' };
+    vi.mocked(emitSessionLifecycleHook).mockClear();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, productionMsg, 'tag', 0, complete);
+
+    await vi.advanceTimersByTimeAsync(0);
+    // Even after the full backoff window elapses, attempts stay at 2:
+    // rejected primary + one audit notice, never a same-payload retry.
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    // The second call is the audit-safe notice (plain text), carrying the code
+    // and a dedup uuid that respects Feishu's 50-char hard cap — never the
+    // rejected answer body.
+    const noticeCall = sessionReply.mock.calls[1];
+    expect(noticeCall[2]).toBe('text');
+    expect(String(noticeCall[1])).toContain('230028');
+    expect(String(noticeCall[1])).not.toContain('final answer');
+    const noticeUuid = noticeCall[5].uuid as string;
+    expect(noticeUuid.startsWith('ab_')).toBe(true);
+    expect(noticeUuid.length).toBe(50);
+
+    // The turn settles (identical retransmits cannot pass the audit) and the
+    // dashboard attention row is lit.
+    expect(ds.lastBridgeEmittedUuid).toBe('01234567-89ab-4def-8234-56789abcdef0:uuid-1');
+    expect(complete).toHaveBeenCalledWith(true);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
+    // External lifecycle channel must see the block, matching the
+    // TOPIC_SEND_BLOCKED branch (operators may route on session.requires_attention).
+    expect(emitSessionLifecycleHook).toHaveBeenCalledWith(
+      ds,
+      'session.requires_attention',
+      expect.objectContaining({ reason: 'content_audit_blocked', turnId: productionMsg.turnId }),
+    );
     expect(closeSession).not.toHaveBeenCalled();
   });
 
@@ -3437,10 +4528,6 @@ describe('Worker turn_terminal routing', () => {
       type: 'screen_update', content: 'silent progress', status: 'working', turnId: 'schedule-turn',
     } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
     (ds.worker as any).emit('message', {
-      type: 'tui_prompt', description: 'silent approval',
-      options: [{ text: 'allow', selected: false }], turnId: 'schedule-turn',
-    } satisfies Extract<WorkerToDaemon, { type: 'tui_prompt' }>);
-    (ds.worker as any).emit('message', {
       type: 'user_notify', message: 'silent warning', turnId: 'schedule-turn',
     } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
     (ds.worker as any).emit('message', {
@@ -3513,6 +4600,32 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply.mock.calls[0][1]).toBe('ordinary notice');
   });
 
+  it('keeps an internal receipt private after human interruption while preserving progress and later replies', async () => {
+    const ds = makeDs();
+    ds.suppressedTriggerFinalTurns = new Map([['trg_background', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const emit = (msg: WorkerToDaemon) => (ds.worker as any).emit('message', msg);
+
+    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'trg_background', turnId: 'om_human_update' });
+    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'om_human_update', turnId: 'om_second_update' });
+    const receipt = 'TASK_RESULT {"status":"completed"}';
+    emit({ type: 'final_output', sessionId: ds.session.sessionId,
+      content: receipt, lastUuid: 'private-receipt', turnId: 'om_second_update' });
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    emit({ type: 'user_notify', message: 'Background task completed', turnId: 'om_second_update' });
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    emit({ type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'Answer to a later question', lastUuid: 'later-answer', turnId: 'om_later_question' });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls[1][1]).toContain('Answer to a later question');
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('TASK_RESULT'))).toBe(false);
+  });
+
   it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {
     const ds = makeDs();
     // A loud connector opted into suppressFinalOutput; trigger-session armed this
@@ -3554,6 +4667,35 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply).toHaveBeenCalledTimes(2);
     expect(sessionReply.mock.calls[1][1]).toContain('human turn answer');
     expect(sessionReply.mock.calls[1][4]).toBe('other-turn');
+  });
+
+  it.each([
+    { silent: false, notice: 'Model service refused this turn', expected: 1 },
+    { silent: true, notice: 'Model service refused this turn', expected: 0 },
+    { silent: false, notice: undefined, expected: 0 },
+  ])('handles suppressed trigger failure diagnostics without leaking partial text: %j', async ({ silent, notice, expected }) => {
+    const ds = makeDs();
+    ds.suppressedTriggerFinalTurns = new Map([['trg_failed', Date.now()]]);
+    if (silent) ds.silentScheduledTurns = new Map([['trg_failed', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const output: Extract<WorkerToDaemon, { type: 'final_output' }> = {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'trg_failed', lastUuid: 'failed-uuid',
+      content: 'INTERNAL_PARTIAL_RECEIPT\nModel service refused this turn',
+      turnFailed: true, turnFailureNotice: notice,
+    };
+    (ds.worker as any).emit('message', output);
+    await new Promise(r => setTimeout(r, 10));
+    expect(sessionReply).toHaveBeenCalledTimes(expected);
+    if (expected) {
+      expect(sessionReply.mock.calls[0][1]).toContain(notice);
+      expect(sessionReply.mock.calls[0][1]).not.toContain('INTERNAL_PARTIAL_RECEIPT');
+      (ds.worker as any).emit('message', output);
+      await new Promise(r => setTimeout(r, 10));
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('keeps a newer silent retry armed when stale output and terminal arrive first', async () => {
@@ -3607,7 +4749,7 @@ describe('Worker turn_terminal routing', () => {
     expect(ds.suppressedFinalOutputTurns.get('delivery-stable-key')).toBe(2);
   });
 
-  it('suppresses non-final streaming, TUI, and diagnostic UI for a listener_thread receiver', async () => {
+  it('suppresses non-final streaming and diagnostic UI for a listener_thread receiver', async () => {
     const ds = makeDs();
     ds.scope = 'chat';
     ds.session.scope = 'chat';
@@ -3626,7 +4768,7 @@ describe('Worker turn_terminal routing', () => {
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       onTurnTerminal: (_ds, terminal) => {
-        completeVcMeetingDelivery('/tmp/test-sessions', {
+        completeVcMeetingDelivery(config.session.dataDir, {
           listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
           deliveryKey: terminal.turnId,
         }, { workerGeneration: 1, dispatchAttempt: terminal.dispatchAttempt });
@@ -3644,13 +4786,6 @@ describe('Worker turn_terminal routing', () => {
       turnId: 'delivery-stable-key',
       dispatchAttempt: 1,
     } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
-    (ds.worker as any).emit('message', {
-      type: 'tui_prompt',
-      description: 'permission needed',
-      options: [{ text: 'allow', selected: false }],
-      turnId: 'delivery-stable-key',
-      dispatchAttempt: 1,
-    } satisfies Extract<WorkerToDaemon, { type: 'tui_prompt' }>);
     (ds.worker as any).emit('message', {
       type: 'user_notify', message: 'submit failed', turnId: 'delivery-stable-key', dispatchAttempt: 1,
     } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
@@ -3790,5 +4925,44 @@ describe('Worker turn_terminal routing', () => {
       turnId: 'om_replacement',
     });
     expect(onCliExit).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('keyed turn input-commit observation', () => {
+  it('records only matching live commit ACKs and leaves write failures unknown', async () => {
+    const ds = makeDs();
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    ds.idempotentAsyncTurns = new Map([['trg_keyed', {
+      ownerLarkAppId: ds.larkAppId, key: 'original-key', kind: 'turn', workerGeneration: 1,
+    }]]);
+    const record = vi.spyOn(registrationStore, 'recordTurnInputCommit').mockReturnValue(true);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, 1);
+    try {
+      worker.emit('message', { type: 'turn_input_received', turnId: 'trg_keyed' });
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_other' });
+      await Promise.resolve();
+      expect(record).not.toHaveBeenCalled();
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        ownerLarkAppId: ds.larkAppId, sessionId: ds.session.sessionId, triggerId: 'trg_keyed',
+        key: 'original-key', workerGeneration: 1, ownerBootId: expect.any(String),
+      }));
+      record.mockImplementationOnce(() => { throw new Error('disk full'); });
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(ds.idempotentAsyncTurns.has('trg_keyed')).toBe(true);
+      ds.workerGeneration = ds.session.workerGeneration = 2;
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledTimes(2);
+      ds.worker = new EventEmitter() as any;
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledTimes(2);
+    } finally { record.mockRestore(); }
   });
 });

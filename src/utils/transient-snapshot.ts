@@ -24,7 +24,6 @@ import xtermHeadless from '@xterm/headless';
 const { Terminal } = xtermHeadless;
 import { isObserveBackend } from '../adapters/backend/types.js';
 import { readViewportText } from './terminal-renderer.js';
-import { captureToPng } from './screenshot-renderer.js';
 import { clamp, MIN_RENDER_COLS, MAX_RENDER_COLS, MIN_RENDER_ROWS, MAX_RENDER_ROWS } from './render-dimensions.js';
 
 export interface TransientSnapshot {
@@ -107,7 +106,7 @@ export async function snapshotToPng(
   backend: unknown,
   fallbackCols: number,
   fallbackRows: number,
-): Promise<{ png: Buffer; ansi: string; content: string } | null> {
+): Promise<{ png: Buffer; ansi: string; content: string; cols: number; rows: number } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -117,9 +116,13 @@ export async function snapshotToPng(
     // the *current* visible rows, not buffer rows 0..N-1 which may be
     // stale scrollback after that scroll.
     const startY = terminal.buffer.active.baseY;
+    // Loaded lazily: @napi-rs/canvas is a native addon that a compiled binary may
+    // lack. A static import here would fail the worker at module init instead of
+    // only failing this screenshot.
+    const { captureToPng } = await import('./screenshot-renderer.js');
     const png = await captureToPng(terminal, { cols: snap.cols, rows: snap.rows, startY });
     const content = readViewportText(terminal, { filter: true, startY, rows: snap.rows });
-    return { png, ansi: snap.ansi, content };
+    return { png, ansi: snap.ansi, content, cols: snap.cols, rows: snap.rows };
   } finally {
     terminal.dispose();
   }
@@ -133,7 +136,7 @@ export async function snapshotToText(
   fallbackCols: number,
   fallbackRows: number,
   opts: { filter: boolean },
-): Promise<{ content: string; ansi: string } | null> {
+): Promise<{ content: string; ansi: string; cols: number; rows: number } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -141,7 +144,7 @@ export async function snapshotToText(
     // Read from the actual current viewport (see snapshotToPng comment).
     const startY = terminal.buffer.active.baseY;
     const content = readViewportText(terminal, { filter: opts.filter, startY, rows: snap.rows });
-    return { content, ansi: snap.ansi };
+    return { content, ansi: snap.ansi, cols: snap.cols, rows: snap.rows };
   } finally {
     terminal.dispose();
   }

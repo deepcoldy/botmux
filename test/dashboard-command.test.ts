@@ -3,11 +3,24 @@ import {
   DASHBOARD_COMMAND_USAGE,
   DASHBOARD_LINK_SAFETY_HINT,
   DASHBOARD_LOCAL_TOKEN_FLAG,
+  dashboardExportTimeoutForBudget,
   executeDashboardCommand,
+  executeDashboardCommandWithExportRefresh,
+  exportAfterDashboardAnswer,
   formatDashboardFallbackFailure,
   formatDashboardSuccessLines,
+  refreshDashboardResultAfterExport,
 } from '../src/cli/dashboard-command.js';
 import type { DashboardEndpoint } from '../src/cli/dashboard-endpoint.js';
+
+describe('dashboardExportTimeoutForBudget', () => {
+  it('skips doomed sub-500ms exports and caps a healthy budget at five seconds', () => {
+    expect(dashboardExportTimeoutForBudget(499)).toBeNull();
+    expect(dashboardExportTimeoutForBudget(500)).toBe(500);
+    expect(dashboardExportTimeoutForBudget(1_234.9)).toBe(1_234);
+    expect(dashboardExportTimeoutForBudget(6_000)).toBe(5_000);
+  });
+});
 
 describe('executeDashboardCommand', () => {
   it.each([['--help'], ['-h'], ['help']])('%s is non-mutating', async (...args) => {
@@ -226,6 +239,180 @@ describe('executeDashboardCommand', () => {
       argument: 'wat',
     });
     expect(callEndpoint).not.toHaveBeenCalled();
+  });
+});
+
+describe('refreshDashboardResultAfterExport', () => {
+  it('exports only after a live result, then re-reads current without rotating', async () => {
+    const events: string[] = [];
+    const ensureExport = vi.fn(async () => {
+      events.push('export');
+      return 'https://devbox.example.com';
+    });
+    const callEndpoint = vi.fn(async (path: DashboardEndpoint) => {
+      events.push(path);
+      return { ok: true as const, url: 'https://devbox.example.com/?t=token' };
+    });
+
+    await expect(refreshDashboardResultAfterExport(
+      { ok: true, url: 'http://127.0.0.1:9002/?t=token' },
+      ensureExport,
+      callEndpoint,
+    )).resolves.toEqual({ ok: true, url: 'https://devbox.example.com/?t=token' });
+    expect(events).toEqual(['export', '/__cli/current']);
+    expect(callEndpoint).not.toHaveBeenCalledWith('/__cli/rotate');
+  });
+
+  it('keeps the usable local response when export is unavailable', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    const callEndpoint = vi.fn();
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => null,
+      callEndpoint,
+    )).resolves.toBe(original);
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('keeps the first live response when the post-export refresh fails', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => 'https://devbox.example.com',
+      async () => ({ ok: false, reason: 'unreachable' }),
+    )).resolves.toBe(original);
+  });
+
+  it('keeps the first live response when export rejects', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    const callEndpoint = vi.fn();
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => { throw new Error('cache raced with another process'); },
+      callEndpoint,
+    )).resolves.toBe(original);
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('keeps the first live response when the post-export refresh rejects', async () => {
+    const original = { ok: true as const, url: 'http://127.0.0.1:9002/?t=token' };
+    await expect(refreshDashboardResultAfterExport(
+      original,
+      async () => 'https://devbox.example.com',
+      async () => { throw new Error('dashboard stopped'); },
+    )).resolves.toBe(original);
+  });
+});
+
+describe('executeDashboardCommandWithExportRefresh', () => {
+  it('discovers the dashboard before export and refreshes only with current', async () => {
+    const events: string[] = [];
+    let currentCalls = 0;
+    const callEndpoint = vi.fn(async (path: DashboardEndpoint) => {
+      events.push(path);
+      currentCalls += path === '/__cli/current' ? 1 : 0;
+      return {
+        ok: true as const,
+        url: currentCalls > 1
+          ? 'https://devbox.example.com/?t=token'
+          : 'http://127.0.0.1:9002/?t=token',
+      };
+    });
+    const ensureExport = vi.fn(async () => {
+      events.push('export');
+      return 'https://devbox.example.com';
+    });
+
+    await expect(executeDashboardCommandWithExportRefresh(
+      ['current'],
+      callEndpoint,
+      ensureExport,
+    )).resolves.toMatchObject({
+      kind: 'endpoint',
+      result: { ok: true, url: 'https://devbox.example.com/?t=token' },
+    });
+    expect(events).toEqual(['/__cli/current', 'export', '/__cli/current']);
+    expect(callEndpoint).not.toHaveBeenCalledWith('/__cli/rotate');
+  });
+
+  it('does not export for help, invalid argv, or a failed first endpoint', async () => {
+    const ensureExport = vi.fn();
+    const failedEndpoint = vi.fn(async () => ({ ok: false as const, reason: 'unreachable' as const }));
+    await executeDashboardCommandWithExportRefresh(['help'], failedEndpoint, ensureExport);
+    await executeDashboardCommandWithExportRefresh(['wat'], failedEndpoint, ensureExport);
+    await executeDashboardCommandWithExportRefresh(['current'], failedEndpoint, ensureExport);
+    expect(ensureExport).not.toHaveBeenCalled();
+  });
+});
+
+describe('exportAfterDashboardAnswer', () => {
+  // A fresh Devbox where nobody ran `botmux dashboard` answers `/__cli/current`
+  // with no-active-token. That answer still proves the dashboard owns the port,
+  // and the web-terminal links (buildTerminalUrl, PTY and tmux alike) read the
+  // export cache without any dashboard token — so the export must happen.
+  it('exports on an authenticated no-active-token answer without touching any endpoint', async () => {
+    const answer = { ok: false as const, reason: 'no-active-token' as const };
+    const ensureExport = vi.fn(async () => 'https://devbox.example.com');
+    const callEndpoint = vi.fn();
+    await expect(exportAfterDashboardAnswer(answer, ensureExport, callEndpoint)).resolves.toBe(answer);
+    expect(ensureExport).toHaveBeenCalledTimes(1);
+    // No ensure / rotate (token creation), and nothing to re-read either.
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('keeps the no-active-token answer when the export rejects', async () => {
+    const answer = { ok: false as const, reason: 'no-active-token' as const };
+    await expect(exportAfterDashboardAnswer(
+      answer,
+      async () => { throw new Error('merlin-cli missing'); },
+      vi.fn(),
+    )).resolves.toBe(answer);
+  });
+
+  it.each([
+    ['unreachable'],
+    ['wrong-service'],
+    ['no-secret'],
+    ['http-error'],
+  ] as const)('never exports on a %s failure (the port is not proven)', async (reason) => {
+    const ensureExport = vi.fn(async () => 'https://devbox.example.com');
+    const callEndpoint = vi.fn();
+    const failure = { ok: false as const, reason };
+    await expect(exportAfterDashboardAnswer(failure, ensureExport, callEndpoint)).resolves.toBe(failure);
+    expect(ensureExport).not.toHaveBeenCalled();
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('exports and re-reads current on a usable link', async () => {
+    const events: string[] = [];
+    await expect(exportAfterDashboardAnswer(
+      { ok: true, url: 'http://127.0.0.1:9002/?t=token' },
+      async () => { events.push('export'); return 'https://devbox.example.com'; },
+      async (path) => { events.push(path); return { ok: true, url: 'https://devbox.example.com/?t=token' }; },
+    )).resolves.toEqual({ ok: true, url: 'https://devbox.example.com/?t=token' });
+    expect(events).toEqual(['export', '/__cli/current']);
+  });
+
+  it('does nothing without a budget (null exporter)', async () => {
+    const callEndpoint = vi.fn();
+    const answer = { ok: false as const, reason: 'no-active-token' as const };
+    await expect(exportAfterDashboardAnswer(answer, null, callEndpoint)).resolves.toBe(answer);
+    expect(callEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('the command wrapper exports when its final answer is no-active-token', async () => {
+    // The wrapper routes every final endpoint answer through the helper: a
+    // no-token answer exports, and adds no endpoint call of its own (the only
+    // call below is the command's own rotate).
+    const ensureExport = vi.fn(async () => 'https://devbox.example.com');
+    const paths: string[] = [];
+    const execution = await executeDashboardCommandWithExportRefresh(['rotate'], async (path) => {
+      paths.push(path);
+      return { ok: false, reason: 'no-active-token' };
+    }, ensureExport);
+    expect(execution).toMatchObject({ kind: 'endpoint', result: { ok: false, reason: 'no-active-token' } });
+    expect(ensureExport).toHaveBeenCalledTimes(1);
+    expect(paths).toEqual(['/__cli/rotate']);
   });
 });
 

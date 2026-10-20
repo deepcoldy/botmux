@@ -11,12 +11,17 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer, type Server, type Socket } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
+import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
+import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
+import { deliverCodexAsyncAnswer } from '../src/services/codex-async-user-input.js';
+import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
   CodexAppControlLineDecoder,
@@ -475,9 +480,12 @@ function startRunner(
   if (controlBootstrapPath !== null) env.BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP = controlBootstrapPath;
   // argv is assembled as a variable here, so take the loader prefix rather than
   // the spawnTsScript wrapper: Node needs `--import tsx`, Bun needs nothing.
-  const { command: runnerCommand, prefixArgs } = tsRunnerPrefix();
+  const compiledRunner = process.env.BOTMUX_TEST_CODEX_APP_RUNNER_BINARY;
+  const { command: runnerCommand, prefixArgs } = compiledRunner
+    ? { command: compiledRunner, prefixArgs: ['__codex-app-runner'] }
+    : tsRunnerPrefix();
   const runnerArgs = [
-    ...prefixArgs, RUNNER_PATH,
+    ...prefixArgs, ...(compiledRunner ? [] : [RUNNER_PATH]),
     '--session-id', SESSION_ID,
     '--codex-bin', fakeCodex,
     '--cwd', cwd,
@@ -658,6 +666,217 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
+  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap'] as const)(
+    'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
+      resetAskBroker();
+      setCanTalkChecker(() => true);
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-async-user-input-'));
+      const fakeCodex = join(dir, 'fake-codex');
+      const logPath = join(dir, 'requests.jsonl');
+      copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex); chmodSync(fakeCodex, 0o755);
+      const control = new ControlCollector(dir); await control.listen();
+      const cards: PendingAsk[] = [];
+      setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: 'om_async_card' }; } });
+      const posts: any[] = [];
+      const deliveries: string[] = [];
+      let responseClosed = false;
+      let routeError: unknown;
+      let harness!: Harness;
+      const http = createHttpServer((req, res) => {
+        let raw = ''; req.on('data', data => { raw += data; });
+        req.on('end', () => { void (async () => {
+          const body = JSON.parse(raw); posts.push(body);
+          const input = parseAskBody(body);
+          if ('error' in input || !input.asyncUserInput) throw new Error('invalid async ask');
+          res.on('close', () => { responseClosed = true; });
+          if (input.asyncFailure) { res.writeHead(409); res.end('async question could not be displayed'); return; }
+          if (outcome === 'refused') { res.writeHead(400); res.end('refused'); return; }
+          const result = await registerAskForResponse({ ...input, timeoutMs: outcome === 'timedOut' ? 1000 : input.timeoutMs,
+            answererOpenId: 'ou_owner', backendSurvivesRestart: false }, res);
+          if (!res.destroyed) {
+            await deliverCodexAsyncAnswer(input.asyncUserInput, input.questions, result, {
+              isCurrent: () => harness.child.exitCode === null,
+              deliver: async text => {
+                deliveries.push(text);
+                harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(text,
+                  { text, clientUserMessageId: 'async-answer-turn' }, 'async-answer-turn')}\r`);
+                return true;
+              },
+            });
+            res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result));
+          }
+        })().catch(error => { routeError = error; res.writeHead(500); res.end(); }); });
+      });
+      await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+      const port = (http.address() as { port: number }).port;
+      writeFileSync(join(dir, '.botmux-origin-capability.json'), JSON.stringify({
+        sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_async_input', dispatchAttempt: 1, ipcPort: port,
+      }), { mode: 0o600 });
+      harness = startRunner(fakeCodex, dir, logPath, '0.162.1', `async-user-input-${outcome}`, control.bootstrap.path, {
+        env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
+          BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test',
+          BOTMUX_WORKFLOW: outcome === 'workflow' ? '1' : '0' },
+      });
+      try {
+        await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', undefined, 'om_async_input')}\r`);
+        if (outcome === 'limit') {
+          await waitFor(harness, () => posts.some(p => p.asyncFailure === 'limit') && control.finals.length > 0);
+          expect(cards).toHaveLength(32);
+          expect(posts.filter(p => p.asyncFailure === 'limit')).toHaveLength(1);
+          expect(deliveries).toHaveLength(0);
+        } else if (outcome === 'refused') {
+          await waitFor(harness, () => control.finals.length > 0 && harness.stdout.includes('async question call_async_question failed'));
+          expect(cards).toHaveLength(0); expect(deliveries).toHaveLength(0);
+          expect(control.finals[0].content).toBe('Independent work completed');
+        } else if (outcome === 'foreign' || outcome === 'malformed' || outcome === 'workflow') {
+          await waitFor(harness, () => control.finals.length > 0);
+          if (outcome === 'malformed') {
+            await waitFor(harness, () => posts.length === 1);
+            expect(posts[0].asyncFailure).toBe('invalid_questions');
+          } else expect(posts).toHaveLength(0);
+          expect(cards).toHaveLength(0);
+        } else {
+          await waitFor(harness, () => cards.length === 1);
+          await waitFor(harness, () => posts.length === (outcome === 'corrected' ? 2 : 1));
+          expect(posts.filter(p => p.asyncFailure)).toHaveLength(outcome === 'corrected' ? 1 : 0);
+          expect(posts.find(p => !p.asyncFailure)).toMatchObject({ originKind: 'native-user-input-async', requestId: 'call_async_question',
+            originTurnId: 'om_async_input', asyncUserInput: { threadId: 'thread-fake', itemId: 'call_async_question' } });
+          expect(cards[0].replyCardTarget).toBeUndefined();
+          expect(submitCustomReply({ askId: cards[0].askId, by: 'ou_other', text: 'Production' })).toBe('unauthorized');
+          if (outcome === 'exit' || outcome === 'interrupted' || outcome === 'timedOut') {
+            await waitFor(harness, () => responseClosed);
+            expect(submitCustomReply({ askId: cards[0].askId, by: 'ou_owner', text: 'Elia' })).toBe('already_settled');
+            expect(deliveries).toEqual([]);
+          } else {
+            // The model finishes independent work BEFORE the user answers;
+            // the question remains live and did not leak into the final.
+            await waitFor(harness, () => control.finals.length > 0);
+            if (outcome === 'overlap') {
+              expect(control.finals[0].content).toBe('Example: Which environment?\nPPE (Recommended) / Production END EXAMPLE\nIndependent work completed');
+              expect(harness.stdout.match(/END EXAMPLE/g)).toHaveLength(1);
+            } else {
+              expect(control.finals[0].content).toBe('Independent work completed');
+              expect(harness.stdout).not.toContain('PPE (Recommended) / Production');
+            }
+            expect(deliveries).toHaveLength(0);
+            const ask = cards[0];
+            if (outcome === 'selected') {
+              expect(submitAsk({ askId: ask.askId, nonce: ask.nonce, by: 'ou_owner',
+                selections: [['o1'], ['o0']] })).toBe('accepted');
+            } else {
+              expect(submitCustomReply({ askId: ask.askId, by: 'ou_owner', text: 'Use PPE and Elia' })).toBe('accepted');
+            }
+            await waitFor(harness, () => control.finals.length >= 2);
+            expect(deliveries).toHaveLength(1); expect(posts.filter(p => !p.asyncFailure)).toHaveLength(1);
+            const starts = readRequests(logPath).filter(r => r.method === 'turn/start');
+            expect(starts).toHaveLength(2);
+            expect(starts[1].params.threadId).toBe(starts[0].params.threadId);
+            expect(starts[1].params.clientUserMessageId).toBe('async-answer-turn');
+            const reply = starts[1].params.input.find((i: any) => i.type === 'text').text;
+            expect(reply).toContain('send_user_message_question_reply');
+            expect(reply).toContain('call_async_question');
+            expect(reply).toContain(outcome === 'selected' ? 'Production' : 'Use PPE and Elia');
+            expect(control.finals[1].replyTurnId ?? control.finals[1].turnId).toBe('async-answer-turn');
+          }
+        }
+        expect(routeError).toBeUndefined();
+      } finally {
+        await stopChild(harness.child); await control.close(); resetAskBroker();
+        http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['selected', 'string', 'custom', 'text', 'timedOut', 'refused', 'interrupt-error', 'cancelled', 'exit', 'unsupported', 'workflow'] as const)(
+    'bridges native user input through the real runner/IPC exchange: %s', async outcome => {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-native-user-input-'));
+      const fakeCodex = join(dir, 'fake-codex');
+      const logPath = join(dir, 'requests.jsonl');
+      copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex); chmodSync(fakeCodex, 0o755);
+      const control = new ControlCollector(dir); await control.listen();
+      const posts: any[] = [];
+      let closed = false;
+      let respond!: (result: unknown, status?: number) => void;
+      const http = createHttpServer((req, res) => {
+        let body = ''; req.on('data', data => { body += data; });
+        req.on('end', () => {
+          // A loopback port-scanner probe (`GET /`, empty body) must not crash
+          // this fixture; only real POSTs to /api/asks carry a JSON body.
+          try {
+            posts.push(JSON.parse(body));
+          } catch {
+            res.writeHead(400).end();
+            return;
+          }
+          expect(req.url).toBe('/api/asks');
+          res.on('close', () => { closed = true; });
+          respond = (result, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); };
+        });
+      });
+      await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+      const port = (http.address() as { port: number }).port;
+      writeFileSync(join(dir, '.botmux-origin-capability.json'), JSON.stringify({
+        sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_native_input', dispatchAttempt: 1, ipcPort: port,
+      }), { mode: 0o600 });
+      const requestId = outcome === 'string' ? 'native-question-1' : 9201;
+      const behavior = ['cancelled', 'exit', 'unsupported', 'text', 'string', 'interrupt-error'].includes(outcome) ? `user-input-${outcome}` : 'user-input';
+      const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path, {
+        env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
+          BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test',
+          BOTMUX_WORKFLOW: outcome === 'workflow' ? '1' : '0' },
+      });
+      try {
+        await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask me', undefined, 'om_native_input')}\r`);
+        if (outcome === 'unsupported' || outcome === 'workflow') {
+          await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/interrupt'));
+          expect(posts).toEqual([]);
+          await waitFor(harness, () => control.finals.length > 0);
+          expect(control.finals[0].content).toContain('Codex user input failed');
+        } else {
+          await waitFor(harness, () => posts.length === 1);
+          expect(posts[0]).toMatchObject({ sessionId: SESSION_ID, originCapability: 'a'.repeat(64), originTurnId: 'om_native_input',
+            questions: [{ prompt: expect.stringContaining('Test first') }, { prompt: expect.stringContaining('Choose channel') }] });
+          expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
+          if (outcome === 'cancelled' || outcome === 'exit') {
+            await waitFor(harness, () => closed);
+            // A late result cannot revive or reply to the completed/dead turn.
+            respond({ kind: 'answered', answers: [['Production'], ['Lark']], comment: null });
+            expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
+          } else {
+            if (outcome === 'refused') respond({ error: 'unsupported' }, 400);
+            else if (outcome === 'timedOut' || outcome === 'interrupt-error') respond({ kind: 'timedOut' });
+            else respond({ kind: 'answered', answers: (outcome === 'custom' || outcome === 'text') ? [[], []] : [['Production'], ['Lark']],
+              comment: (outcome === 'custom' || outcome === 'text') ? 'Staging and Lark please' : null });
+            if (outcome === 'selected' || outcome === 'string' || outcome === 'custom' || outcome === 'text') {
+              await waitFor(harness, () => control.finals.length > 0);
+              const answer = readRequests(logPath).find(r => r.id === requestId && r.result !== undefined)?.result;
+              expect(answer).toEqual({ answers: { environment: { answers: [(outcome === 'custom' || outcome === 'text') ? 'Staging and Lark please' : 'Production'] },
+                notify: { answers: [(outcome === 'custom' || outcome === 'text') ? 'Staging and Lark please' : 'Lark'] } } });
+              expect(readRequests(logPath).filter(r => r.method === 'turn/start')).toHaveLength(1);
+            } else {
+              await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/interrupt'));
+              expect(harness.stdout).toContain('Codex user input failed');
+              if (outcome === 'interrupt-error') {
+                await waitFor(harness, () => control.markers.some(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal'));
+              } else {
+                await waitFor(harness, () => control.finals.length > 0);
+                expect(control.finals[0].content).toContain('Codex user input failed');
+              }
+              expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
+            }
+          }
+        }
+      } finally {
+        await stopChild(harness.child); await control.close();
+        http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('refuses to start without a worker-established control bootstrap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-no-key-'));
     const harness = startRunner('/does/not/matter', dir, join(dir, 'requests.jsonl'), '0.136.0', 'success', null);
@@ -1121,20 +1340,28 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         text: 'serial follow', clientUserMessageId: 'om_b3_serial',
       })}\r`);
 
-      // It must produce its own final via a second turn/start — never a steer.
-      await waitFor(harness, () => control.finals.length === 2
+      // /queue admissions omit the same positive flag. Two inputs must keep
+      // their own turns and FIFO order, rather than merge into the active Goal.
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('serial follow 2', {
+        text: 'serial follow 2', clientUserMessageId: 'om_b3_serial_2',
+      })}\r`);
+
+      // Each input must produce its own final — never a steer.
+      await waitFor(harness, () => control.finals.length === 3
         && control.states.filter(state => state.busy === false).length >= 2);
 
       const requests = readRequests(logPath);
       // Zero turn/steer: the non-flag input was NOT merged into the Goal.
       expect(requests.filter(r => r.method === 'turn/steer')).toHaveLength(0);
-      // Two turn/start: the root, then the parked input as its own turn.
+      // Three turn/start: the root, then each parked input as its own turn.
       const starts = requests.filter(r => r.method === 'turn/start');
-      expect(starts).toHaveLength(2);
+      expect(starts).toHaveLength(3);
       expect(starts[1].params).toMatchObject({
         clientUserMessageId: 'om_b3_serial',
         input: [{ type: 'text', text: 'serial follow', text_elements: [] }],
       });
+      expect(starts[2].params.clientUserMessageId).toBe('om_b3_serial_2');
+      expect(control.finals[2]).toMatchObject({ turnId: 'om_b3_serial_2' });
       // The follow-up's final is its own answer, not the Goal's autonomous text.
       expect(control.finals[1]).toMatchObject({ turnId: 'om_b3_serial' });
       expect(control.finals[1].content).not.toContain('autonomous goal text before Lark input');
@@ -2754,6 +2981,32 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it('forwards --service-tier into thread/start as a top-level field', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-tier-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      extraArgs: ['--service-tier', 'priority'],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart).toBeTruthy();
+      expect(threadStart.params.serviceTier).toBe('priority');
+      expect(threadStart.params.config?.serviceTier).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-browser-tool-'));
     const fakeCodex = join(dir, 'fake-codex');
@@ -2787,7 +3040,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('SUPPRESSES model/effort on thread/resume even when --model/--reasoning-effort are passed (no resume drift)', async () => {
+  it('SUPPRESSES model/effort on thread/resume but keeps --service-tier (thread-level tier)', async () => {
     // PR #639 P2 regression lock, runner side: a resume (--thread-id present)
     // routes to thread/resume, and even though the adapter still forwards
     // --model/--reasoning-effort on argv, the resume request must carry NEITHER
@@ -2806,6 +3059,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         '--thread-id', 'thread-existing-1',
         '--model', 'gpt-5.6-terra',
         '--reasoning-effort', 'xhigh',
+        '--service-tier', 'priority',
         '--browser-family', 'chrome',
       ],
     });
@@ -2820,6 +3074,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       expect(start).toBeFalsy();            // a warm resume must not fresh-start
       expect(resume.params.model).toBeUndefined();                          // no top-level model
       expect(resume.params.config?.model_reasoning_effort).toBeUndefined(); // no effort
+      expect(resume.params.serviceTier).toBe('priority');                    // tier is thread-level
       expect(resume.params.dynamicTools).toEqual([
         expect.objectContaining({
           type: 'function',
@@ -2906,6 +3161,100 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
       await waitFor(harness, () => control.finals.length >= 1);
       expect(control.finals[0].usage).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Codex App live reasoning effort', () => {
+  it.each([
+    ['effort-live', 'ultra', 'applied', true],
+    ['effort-paginated', 'high', 'applied', true],
+    ['effort-resume', 'high', 'applied', true],
+    ['effort-race', 'high', 'future_only', true],
+    ['effort-partial', 'high', 'future_only', true],
+    ['effort-feature-disabled', 'high', 'future_only', true],
+    ['effort-rejected', 'high', 'future_only', true],
+    ['effort-thread-rejected', 'high', 'error', false],
+    ['effort-model-missing', 'high', 'error', false],
+    ['effort-empty-choices', 'high', 'invalid', false],
+    ['effort-unsupported', 'high', 'error', false],
+    ['effort-invalid', 'ultra', 'invalid', false],
+    ['success', 'high', 'future_only', false],
+  ] as const)('%s updates settings without starting or steering a model turn', async (behavior, effort, status, updatesTurn) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-effort-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path,
+      behavior === 'effort-resume' ? { threadId: 'thread-fake' } : {});
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      if (behavior !== 'success') {
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('business task', undefined, 'om_business')}\r`);
+        await waitFor(harness, () => harness.stdout.includes('effort task running'));
+      }
+      const before = readRequests(logPath).filter(r => r.method === 'turn/start' || r.method === 'turn/steer').length;
+      harness.child.stdin.write(`${CONTROL_PREFIX}${Buffer.from(JSON.stringify({ type: 'effort', requestId: 'request-effort', effort })).toString('base64')}\r`);
+      await waitFor(harness, () => control.markers.some(m => m.kind === 'effort_result'));
+      const result = control.markers.find(m => m.kind === 'effort_result')?.payload;
+      expect(result).toMatchObject({ requestId: 'request-effort', status });
+      expect(result?.reason).toBe(behavior === 'effort-feature-disabled' ? 'step_model_switching_disabled'
+        : behavior === 'effort-race' ? 'target_unavailable' : undefined);
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => r.method === 'model/list').every(r => r.params.includeHidden === true)).toBe(true);
+      if (behavior === 'effort-paginated') {
+        expect(requests.filter(r => r.method === 'model/list').map(r => r.params.cursor)).toEqual([undefined, 'next-model-page', 'last-model-page']);
+      }
+      expect(requests.filter(r => r.method === 'turn/start' || r.method === 'turn/steer')).toHaveLength(before);
+      expect(requests.filter(r => r.method === 'thread/settings/update').map(r => r.params)).toEqual(status === 'invalid' || behavior === 'effort-model-missing' ? [] : [{ threadId: 'thread-fake', effort }]);
+      if (status === 'invalid') expect(result?.choices).toEqual(behavior === 'effort-empty-choices' ? [] : ['low', 'medium']);
+      expect(requests.filter(r => r.method === 'turn/settings/update').map(r => r.params)).toEqual(updatesTurn ? [{ threadId: 'thread-fake', turnId: 'turn-fake-1', effort }] : []);
+      expect(requests.some(r => r.method === 'turn/interrupt')).toBe(false);
+      expect(control.finals).toEqual([]);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent effort commands through the active-turn response', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-effort-serial-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'effort-serial', control.bootstrap.path);
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('business task', undefined, 'om_business')}\r`);
+      await waitFor(harness, () => harness.stdout.includes('effort task running'));
+      harness.child.stdin.write(['low', 'high'].map(effort =>
+        `${CONTROL_PREFIX}${Buffer.from(JSON.stringify({ type: 'effort', requestId: effort, effort })).toString('base64')}\r`,
+      ).join(''));
+      await waitFor(harness, () => control.markers.filter(m => m.kind === 'effort_result').length === 2);
+      expect(control.markers.filter(m => m.kind === 'effort_result').map(m => m.payload)).toEqual([
+        { requestId: 'low', status: 'applied' },
+        { requestId: 'high', status: 'applied' },
+      ]);
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => ['model/list', 'thread/settings/update', 'turn/settings/update'].includes(r.method))
+        .map(r => [r.method, r.params.effort])).toEqual([
+        ['model/list', undefined], ['thread/settings/update', 'low'], ['turn/settings/update', 'low'],
+        ['model/list', undefined], ['thread/settings/update', 'high'], ['turn/settings/update', 'high'],
+      ]);
+      expect(requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
+      expect(requests.some(r => r.method === 'turn/steer' || r.method === 'turn/interrupt')).toBe(false);
+      expect(control.finals).toEqual([]);
     } finally {
       await stopChild(harness.child);
       await control.close();

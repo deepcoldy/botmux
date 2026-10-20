@@ -11,10 +11,17 @@ export interface GroupMemberBot extends GroupBot {
   pinStreamingCardMasterEnabled?: boolean;
   pinStreamingCardChatEnabled?: boolean;
   pinStreamingCardEffectiveEnabled?: boolean;
+  /** Bot-level run-process card switch (`!disableStreamingCard`). */
+  streamingCardMasterEnabled?: boolean;
+  /** Chat override: false == `/card off` (chat in `noCardChats`); true inherits the bot. */
+  streamingCardChatEnabled?: boolean;
+  streamingCardEffectiveEnabled?: boolean;
   agentCliId?: string;
   agentModel?: string;
   agentReasoningEffort?: string;
   serialInput?: boolean;
+  idleClose?: import('../../core/group-idle-close.js').GroupIdleCloseSettings;
+  replyMode?: import('./group-reply-mode.js').GroupReplyModeState;
   defaultModels?: import('../../core/group-default-models.js').GroupDefaultModels;
   oncallChat?: { workingDir?: string } | null;
 }
@@ -232,13 +239,6 @@ export async function setGroupPinStreamingCard(
   );
   const body = await r.json().catch(() => ({}));
   return { ok: r.ok && body?.ok !== false, status: r.status, body };
-}
-
-export async function fetchGroupCollaborationMode(chatId: string): Promise<GroupCollaborationModeResponse> {
-  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`);
-  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
-  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
-  return body;
 }
 
 export async function saveGroupCollaborationMode(

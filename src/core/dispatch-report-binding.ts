@@ -1,5 +1,7 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { readSecureHostFileSync, withSecureHostParentSync } from '../platform/secure-host-file.js';
 
 const DOMAIN = 'botmux.dispatch-report-binding.v1';
 
@@ -22,8 +24,71 @@ export interface SignedDispatchReportBinding {
   signature: string;
 }
 
-export function dispatchReportBindingSecretPath(dataDir: string): string {
-  return join(dirname(dataDir), '.dashboard-secret.report-binding');
+/**
+ * dispatch report 的宿主密钥位置。
+ *
+ * 普通 fleet 保持历史位置：`<botmuxHome>/.dashboard-secret.report-binding`，使同一
+ * fleet 的各 bot dataDir 共享一个签名域。core-only 的 stateDir 可以是任意显式绝对目录
+ * （例如 `/tmp/<isolated-state>`）；若仍取其 parent，会把密钥落到 `/tmp` 这类非当前
+ * 用户目录，严格宿主凭证校验应当且会拒绝。因此 core-only 将密钥限定在自己的 stateDir，
+ * 不读取或修改同 HOME fleet 的共享密钥。
+ */
+export function dispatchReportBindingSecretPath(
+  dataDir: string,
+  options: { coreOnly?: boolean } = {},
+): string {
+  const coreOnly = options.coreOnly ?? process.env.BOTMUX_CORE_ONLY === '1';
+  return coreOnly
+    ? join(dataDir, '.dashboard-secret.report-binding')
+    : join(dirname(dataDir), '.dashboard-secret.report-binding');
+}
+
+/**
+ * 读取 dispatch-report 宿主密钥，必要时为旧 core-only state-dir 做一次安全迁移。
+ *
+ * 历史 core-only 把密钥放在 `dirname(dataDir)`；新路径改为 dataDir 内，避免显式
+ * `/tmp/<state>` 时写到共享 `/tmp`。为了保留已经签发的 report binding，新路径缺失
+ * 时只迁移通过 secure-host-file 校验的旧叶子。旧路径缺失则创建新密钥；旧路径不安全
+ * 时抛错，绝不为了兼容读取、删除或覆盖可疑凭证。
+ */
+export function loadOrCreateDispatchReportBindingSecret(
+  dataDir: string,
+  options: { coreOnly?: boolean } = {},
+): string {
+  const coreOnly = options.coreOnly ?? process.env.BOTMUX_CORE_ONLY === '1';
+  const currentPath = dispatchReportBindingSecretPath(dataDir, { coreOnly });
+  return withSecureHostParentSync(currentPath, (parent) => parent.withLeafLock(() => {
+    const current = parent.readLeaf(256)?.trim();
+    if (current) return current;
+
+    if (coreOnly) {
+      const legacyPath = join(dirname(dataDir), '.dashboard-secret.report-binding');
+      // Do not run the strict legacy-parent check merely to discover a missing
+      // leaf. An explicit state dir may be a direct child of sticky /tmp: that
+      // parent is intentionally unsuitable for a credential, but its absence
+      // must not prevent a new credential from being created inside stateDir.
+      // If the legacy leaf exists, keep the strict reader: a symlink, unsafe
+      // mode, or untrusted parent is an ambiguous authority and fails closed.
+      let legacyPresent = false;
+      try {
+        lstatSync(legacyPath);
+        legacyPresent = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+      if (legacyPresent) {
+        const legacy = readSecureHostFileSync(legacyPath, 256)?.trim();
+        if (legacy) {
+          parent.writeLeaf(legacy);
+          return legacy;
+        }
+      }
+    }
+
+    const secret = randomBytes(32).toString('base64url');
+    parent.writeLeaf(secret);
+    return secret;
+  }));
 }
 
 function validDispatchRoot(value: string): boolean {

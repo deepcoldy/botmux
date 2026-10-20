@@ -57,7 +57,7 @@ describe('desktop renderer runtime boundary', () => {
     expect(emptyDashboardMessage(runtimeState({ status: 'stopped' }), t)).toBe('启动 CLI 后加载控制台。');
     expect(shouldKeepLoadedDashboardDuringDegradedState(runtimeState({
       status: 'degraded',
-      message: 'pm2 jlist timed out',
+      message: 'Invalid fleet state',
     }))).toBe(true);
     expect(shouldKeepLoadedDashboardDuringDegradedState(runtimeState({
       status: 'degraded',

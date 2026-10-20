@@ -55,6 +55,11 @@ describe('serializeByAnchor', () => {
   it('rejects the returned promise when the work rejects (so callers can log)', async () => {
     await expect(serializeByAnchor('A', async () => { throw new Error('nope'); })).rejects.toThrow('nope');
   });
+
+  it('preserves a typed work result for durable admission callers', async () => {
+    await expect(serializeByAnchor('A', async () => ({ kind: 'admitted' as const, revision: 3 })))
+      .resolves.toEqual({ kind: 'admitted', revision: 3 });
+  });
 });
 
 describe('serializeByAnchor — wait cap (head-of-line-blocking guard)', () => {

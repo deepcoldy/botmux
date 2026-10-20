@@ -16,6 +16,12 @@ export interface PendingCliInput {
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  /** This item belongs to the durable-primary Lark Inbox commit protocol. */
+  durablePrimaryInbox?: true;
+  /** Open id of the human whose turn this is. The worker publishes it beside
+   *  the live-turn marker so the identity wrapper can keep a same-principal
+   *  credential across consecutive turns. */
+  turnCallerOpenId?: string;
   codexAppDispatchId?: string;
   /** Explicit positive steer authorization copied from the daemon ledger entry
    * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */
@@ -229,15 +235,15 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
 
 /**
  * Whether markPromptReady must treat the first post-spawn ready as
- * "pre-execution SessionStart" (report working, keep busy) rather than true
+ * "pre-execution working" (report working, keep busy) rather than true
  * end-of-turn idle.
  *
- * Strict conditions (PR #633 review):
+ * Strict conditions:
  *  - adapter actually bakes the first prompt into argv (`passesInitialPromptViaArgs`)
  *  - an argv prompt exists and was NOT deferred to the write queue
- *  - SessionStart ready exists (`injectsReadyHook`) so first ready ≠ completion
- *  - turn terminal is authoritative (`reliableTurnTerminal`) so a later
- *    assistant_final/fireIdle will produce a real idle edge
+ *  - turn terminal is authoritative (`reliableTurnTerminal`), meaning turn
+ *    completion is signaled independently (e.g. structured updates.jsonl)
+ *    rather than by quiescence / initial ready edge.
  *
  * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
  * — must return false, or the first markPromptReady would clear isPromptReady
@@ -245,27 +251,35 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
  * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
  * idle signal — first ready IS completion; must return false or they stick
  * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
+ *
+ * Grok passes prompt via argv and provides an authoritative turn terminal
+ * via updates.jsonl (`reliableTurnTerminal`), so its first ready (when the
+ * composer/TUI mounts) is pre-execution / in-flight (not completion) and must
+ * arm busy to avoid a false working→idle transition before updates.jsonl completes.
  */
 export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   passesInitialPromptViaArgs: boolean;
   preparedInitialPrompt?: string | null;
   queuedInitialPrompt?: string | null;
-  injectsReadyHook: boolean;
   reliableTurnTerminal: boolean;
 }): boolean {
   if (!shouldTrackArgvBakedFirstPrompt(opts)) return false;
-  if (!opts.injectsReadyHook) return false;
   if (!opts.reliableTurnTerminal) return false;
   return true;
 }
 
-/** Once either side of a queue boundary is durable, stop this batch and wait
- *  for the next reliable idle edge before writing the following turn. */
+/** Stop this batch when back-to-back writes are disabled or either side of the
+ *  queue boundary is durable. A message can arrive while writeInput is awaiting
+ *  its receipt; `isFlushing` admits it to the queue so the active drain can see
+ *  it, but an opted-in adapter must leave it there until the next real idle
+ *  edge. */
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  allowBackToBackWrites = true,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return !allowBackToBackWrites
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken
