@@ -139,6 +139,30 @@ export function refreshListenerCardTextFromResolved(match: MessageListenerMatch,
   if (title?.trim()) match.messageTitle = title;
 }
 
+/**
+ * A merge_forward event carries no useful body at listener-match time. The
+ * daemon expands it later through the same parser used by direct mentions;
+ * copy that expanded XML into the listener match before rendering the prompt.
+ *
+ * Idempotent across reroutes: when a new-topic claim loses the session
+ * registration it re-enters the thread route carrying the SAME parsed object,
+ * whose content was already replaced by the rendered listener prompt. Feeding
+ * that prompt back here would nest the whole prompt inside
+ * <observed_message> (double-escaped). Expanded forward XML always roots at
+ * <forwarded_messages>, so a prompt-shaped argument means this same match was
+ * already filled — leave it untouched (only ever upgrade, never replace).
+ */
+export function refreshListenerForwardTextFromParsed(
+  match: MessageListenerMatch,
+  parsedContent: string,
+): void {
+  if (match.msgType !== 'merge_forward') return;
+  const text = parsedContent.trim();
+  if (!text) return;
+  if (text.startsWith('<message_listener>')) return;
+  match.messageText = text;
+}
+
 function contains(list: readonly string[] | undefined, value: string | undefined): boolean {
   return !!value && !!list && list.includes(value);
 }

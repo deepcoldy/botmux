@@ -28,6 +28,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persist
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
+import { buildDismissConfirmCard } from '../im/lark/dismiss-card.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -2286,16 +2287,24 @@ export async function handleCommand(
         }
         const result = await dismissSessionGroup({
           larkAppId: appId, chatId, rootId, senderId: message.senderId,
-          confirmedState: parsed[1], activeSessions,
+          confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
           // The deleted group cannot receive the receipt; notify privately.
           try { await sendUserMessage(appId, message.senderId, t('cmd.dismiss.dismissed', undefined, loc)); }
           catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+        } else if (result.status === 'confirm') {
+          await sessionReply(rootId, buildDismissConfirmCard({
+            chatId,
+            invokerOpenId: message.senderId,
+            confirmationState: result.state,
+            rows: result.sessions.map(s => closeWorktreeSessionRow({ ...s.session, larkAppId: s.larkAppId }, s.resident, loc)),
+            loc,
+          }), 'interactive');
+        } else if (result.status === 'peer_offline') {
+          await sessionReply(rootId, t('cmd.dismiss.peer_offline', { bots: result.larkAppIds.map(botDisplayName).join('、') }, loc));
         } else {
-          const reply = result.status === 'confirm'
-            ? t('cmd.dismiss.confirm', { command: `/dismiss --confirm=${result.state}` }, loc)
-            : t(`cmd.dismiss.${result.status}`, undefined, loc);
+          const reply = t(`cmd.dismiss.${result.status}`, undefined, loc);
           await sessionReply(rootId, reply + ('detail' in result && result.detail ? `\n${result.detail}` : ''));
         }
         break;
@@ -2996,7 +3005,8 @@ export async function handleCommand(
               || current.pendingCodexAppText !== undefined
               || (current.pendingAttachments?.length ?? 0) > 0
               || (current.pendingFollowUps?.length ?? 0) > 0
-              || current.pendingChatContext !== undefined;
+              || current.pendingChatContext !== undefined
+              || current.pendingGroupJoinContext !== undefined;
             let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
             if (hasBufferedInput) {
               const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
@@ -3030,6 +3040,7 @@ export async function handleCommand(
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
                   chatContext: current.pendingChatContext,
+                  groupJoinContext: current.pendingGroupJoinContext,
                   // Pending repo selection still owns the original fresh
                   // launch; the paired forkWorker call does not resume.
                   larkToolResume: false,
@@ -3069,7 +3080,10 @@ export async function handleCommand(
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
-              !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+              !emptyStart && !pendingRawInput && pendingTurnId ? {
+                turnId: pendingTurnId,
+                ...(current.pendingTrustedCaller ? { trustedCaller: current.pendingTrustedCaller } : {}),
+              } : false,
             );
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
@@ -3088,6 +3102,8 @@ export async function handleCommand(
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
+            current.pendingGroupJoinContext = undefined;
+            current.pendingTrustedCaller = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;
             current.pendingSubstituteTrigger = undefined;

@@ -476,6 +476,7 @@ import type {
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
+import { herdrConfigForSession } from './adapters/backend/types.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import {
   IdleDetector,
@@ -17642,6 +17643,9 @@ async function spawnCli(
   );
   const hasMcpRuntimeEntries = !!cliAdapter.mcpGateway && !!mcpRuntimeManifest?.entries.length;
   const reuseRecordedHerdrTarget = !sandboxRequested && !hasMcpRuntimeEntries;
+  // `chatTypes` can keep e.g. DM sessions on the default host; retirement and
+  // selection below must see the same decision.
+  const effectiveHerdrConfig = herdrConfigForSession(cfg.backendConfig, cfg.chatType);
   if (effectiveBackend === 'herdr' && !reuseRecordedHerdrTarget) {
     // Isolation/MCP incarnations move historical shared-host agents to the
     // data-root-scoped managed target. Retire the exact old pane before backend
@@ -17651,12 +17655,14 @@ async function spawnCli(
       ownershipScope: isolationRuntimeDataDir,
       reuseRecordedHerdrTarget,
       persistentBackendTarget: cfg.persistentBackendTarget,
+      herdrConfig: effectiveHerdrConfig,
     });
   }
   const selectBackend = () => selectSessionBackend({
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    herdrConfig: effectiveHerdrConfig,
     remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
@@ -20871,6 +20877,7 @@ async function spawnCli(
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
+      cliId: cfg.cliId,
       model: cfg.model,
       modelBackendVariant: cfg.modelBackendVariant,
       reasoningEffort: cfg.reasoningEffort,

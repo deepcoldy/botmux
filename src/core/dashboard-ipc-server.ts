@@ -146,6 +146,14 @@ import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TUR
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
+import { readDeferredTopicBinding, writeDeferredTopicBinding } from './deferred-topic-binding.js';
+import {
+  DEFERRED_TOPIC_CLAIM_MAX_BYTES,
+  DEFERRED_TOPIC_CLAIM_ROUTE,
+  DeferredTopicClaimRegistry,
+  deferredTopicRootFactsFromDetail,
+  parseDeferredTopicClaimRequest,
+} from './deferred-topic-claim.js';
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
@@ -186,7 +194,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -1084,7 +1092,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|durable-send|turn-delivery|deferred-topic|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1831,6 +1839,40 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
     return result.ok
       ? jsonRes(res, 200, result)
       : jsonRes(res, result.status, { ok: false, error: result.error });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+const deferredTopicClaims = new DeferredTopicClaimRegistry({
+  readBinding: sessionId => readDeferredTopicBinding(config.session.dataDir, sessionId),
+  writeBinding: binding => writeDeferredTopicBinding(config.session.dataDir, binding),
+  lookupRoot: async (larkAppId, rootMessageId) => deferredTopicRootFactsFromDetail(
+    await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false, timeoutMs: 10_000 }),
+  ),
+});
+
+/** First-message claim of a silent fresh-topic schedule run for an isolated
+ * CLI that cannot write the host binding sidecar (see deferred-topic-claim). */
+ipcRoute('POST', `/api/sessions/:sessionId/${DEFERRED_TOPIC_CLAIM_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req, DEFERRED_TOPIC_CLAIM_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  const request = parseDeferredTopicClaimRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_deferred_topic_request' });
+  try {
+    const result = await deferredTopicClaims.handle(ds, request);
+    return result.ok
+      ? jsonRes(res, 200, result)
+      : jsonRes(res, result.status, result);
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
@@ -7481,6 +7523,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
+    senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
@@ -7631,6 +7674,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
+    senderTagHideEmail?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
@@ -7647,6 +7691,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
+    senderTagHideEmail?: boolean;
   } = {};
   for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
     if (body[key] !== undefined) {
@@ -7689,6 +7734,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
+  if (typeof body.senderTagHideEmail === 'boolean') patch.senderTagHideEmail = body.senderTagHideEmail;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;

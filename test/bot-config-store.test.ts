@@ -238,6 +238,20 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('hot-updates sender email hiding through botconfig and reloads it', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    const spec = store.findConfigField('senderTagHideEmail')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate' });
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.senderTagHideEmail).toBe(true);
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('senderTagHideEmail');
+    expect(registry.loadBotConfigs()[0].senderTagHideEmail).toBeUndefined();
+  });
+
   it('defaults Codex capacity recovery off and round-trips its explicit opt-in', async () => {
     const { registry, store } = await loaded({ cliId: 'codex' });
     expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);

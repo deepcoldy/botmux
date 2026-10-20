@@ -92,6 +92,35 @@ if (process.env.BOTMUX_TEST_REPLY_RENDER_SNAPSHOT) {
     return new Response(JSON.stringify({ snapshot: JSON.parse(process.env.BOTMUX_TEST_REPLY_RENDER_SNAPSHOT!) }), { status: 200 });
   });
 }
+if (process.env.BOTMUX_TEST_DEFERRED_TOPIC_DAEMON === '1') {
+  // The real daemon claim handler behind the loopback route, with the session
+  // the daemon would hold and a provider lookup that reports what this fixture
+  // published (or BOTMUX_TEST_DEFERRED_ROOT_FACTS to simulate a forged root).
+  const { DeferredTopicClaimRegistry, parseDeferredTopicClaimRequest } = await import('../../src/core/deferred-topic-claim.js');
+  const { readDeferredTopicBinding, writeDeferredTopicBinding } = await import('../../src/core/deferred-topic-binding.js');
+  const daemonDataDir = process.env.BOTMUX_TEST_DAEMON_DATA_DIR!;
+  const ds = JSON.parse(process.env.BOTMUX_TEST_DEFERRED_DAEMON_SESSION!);
+  const registry = new DeferredTopicClaimRegistry({
+    readBinding: id => readDeferredTopicBinding(daemonDataDir, id),
+    writeBinding: b => writeDeferredTopicBinding(daemonDataDir, b),
+    lookupRoot: async () => JSON.parse(process.env.BOTMUX_TEST_DEFERRED_ROOT_FACTS ?? 'null')
+      ?? { chatId: ds.chatId, senderAppId: ds.larkAppId, isReply: false, createdAtMs: Date.now() },
+  });
+  __setLoopbackTransportForTests(async (url, init) => {
+    const target = new URL(url);
+    const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+    console.log('CAPTURE_DAEMON=' + JSON.stringify({ method: init.method, path: target.pathname, body }));
+    if (!target.pathname.endsWith('/deferred-topic')) throw new Error(`Unexpected daemon request ${target.pathname}`);
+    const request = parseDeferredTopicClaimRequest(body ?? {});
+    const result = request
+      ? await registry.handle(ds, request)
+      : { ok: false, status: 400, error: 'invalid_deferred_topic_request' };
+    return new Response(JSON.stringify(result), {
+      status: result.ok ? 200 : (result as { status: number }).status,
+      headers: { 'content-type': 'application/json' },
+    });
+  });
+}
 // Any non-SDK network request also fails closed; this fixture never contacts Feishu.
 globalThis.fetch = async () => { throw new Error('Unexpected test fetch'); };
 process.argv = [process.execPath, './src/cli.ts', ...process.argv.slice(2)];

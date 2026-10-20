@@ -1,5 +1,6 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import { normalizeHerdrBackendConfig } from './adapters/backend/types.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
@@ -296,6 +297,14 @@ export const config = {
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
+    herdr: normalizeHerdrBackendConfig({
+      sessionName: process.env.BOTMUX_HERDR_SESSION_NAME,
+      placement: process.env.BOTMUX_HERDR_PLACEMENT,
+      workspace: process.env.BOTMUX_HERDR_WORKSPACE,
+      tab: process.env.BOTMUX_HERDR_TAB,
+      splitDirection: process.env.BOTMUX_HERDR_SPLIT_DIRECTION,
+      chatTypes: process.env.BOTMUX_HERDR_CHAT_TYPES,
+    }),
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',

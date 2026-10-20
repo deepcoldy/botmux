@@ -98,6 +98,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { handleCommand } from '../../core/command-handler.js';
+import { DISMISS_CONFIRM_ACTION, buildDismissSubmittedCard } from './dismiss-card.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
@@ -600,7 +601,8 @@ export async function commitRepoSelection(
         (ds.pendingPrompt?.trim().length ?? 0) > 0 ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
+        ds.pendingChatContext !== undefined ||
+        ds.pendingGroupJoinContext !== undefined;
       const availableBots = needsPromptContext
         ? await getAvailableBots(ds.larkAppId, ds.chatId)
         : [];
@@ -619,7 +621,8 @@ export async function commitRepoSelection(
         ds.pendingCodexAppText !== undefined ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0 ||
-        ds.pendingChatContext !== undefined;
+        ds.pendingChatContext !== undefined ||
+        ds.pendingGroupJoinContext !== undefined;
       // Nothing to submit at all (session created by a bare `/repo`, i.e. the
       // message IS the command). Boot the CLI idle instead of burning an empty
       // `<user_message>` opening on it, and mark the session so the user's NEXT
@@ -651,6 +654,7 @@ export async function commitRepoSelection(
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
               codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
               chatContext: ds.pendingChatContext,
+              groupJoinContext: ds.pendingGroupJoinContext,
               // Repo selection commits the original fresh launch. Restoring
               // the pending card does not turn it into a CLI resume.
               larkToolResume: false,
@@ -698,7 +702,10 @@ export async function commitRepoSelection(
       forkWorker(
         ds,
         prompt,
-        !emptyStart && !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+        !emptyStart && !pendingRawInput && pendingTurnId ? {
+          turnId: pendingTurnId,
+          ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
+        } : false,
       );
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every
@@ -715,6 +722,8 @@ export async function commitRepoSelection(
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
       ds.pendingChatContext = undefined;
+      ds.pendingGroupJoinContext = undefined;
+      ds.pendingTrustedCaller = undefined;
       ds.pendingAttachments = undefined;
       ds.pendingMentions = undefined;
       ds.pendingSubstituteTrigger = undefined;
@@ -1605,6 +1614,42 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       getActiveCount: () => activeSessions.size,
     }, larkAppId);
     return { toast: { type: 'success', content: t('cmd.close.worktree_confirm_received', undefined, localeForBot(larkAppId)) } };
+  }
+
+  if (value?.action === DISMISS_CONFIRM_ACTION) {
+    const loc = localeForBot(larkAppId);
+    const chatId = String(value.chat_id ?? '');
+    const confirmationState = String(value.confirmation_state ?? '');
+    if (!chatId || !/^[a-f0-9]{64}$/.test(confirmationState) || !larkAppId || !operatorOpenId) {
+      return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+    }
+    // The state hash is bound to the invoker; reject others before the card
+    // is replaced, so a stray click cannot hide the owner's button.
+    if (String(value.invoker_open_id ?? '') !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('cmd.close.worktree_confirm_not_invoker', undefined, loc) } };
+    }
+    // Closing several sessions can outlast the 3s callback window: swap the
+    // card first, then run the same path as a typed `/dismiss --confirm=`,
+    // which re-checks permission and state and reports into the group.
+    return {
+      card: { type: 'raw', data: buildDismissSubmittedCard(loc) },
+      afterAck: () => handleCommand('/dismiss', chatId, {
+        messageId: cardMessageId ?? `dismiss-confirm-${chatId}`,
+        rootId: chatId,
+        chatId,
+        chatType: 'group',
+        senderId: operatorOpenId,
+        senderType: 'user',
+        msgType: 'interactive',
+        content: `/dismiss --confirm=${confirmationState}`,
+        createTime: String(Date.now()),
+      }, {
+        activeSessions,
+        sessionReply: deps.sessionReply,
+        lastRepoScan,
+        getActiveCount: () => activeSessions.size,
+      }, larkAppId),
+    };
   }
 
   if (isAskCardAction(value?.action)) {
