@@ -30,6 +30,7 @@ import {
   builtinSkillEntries,
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
+  chatManagerEnabledForApp,
 } from '../skills/injection-mode.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
@@ -1395,7 +1396,7 @@ function buildNewTopicBlocks(
       const entries = builtinSkillEntries({
         asksViaHook: adapter.asksViaHook,
         whiteboardEnabled: whiteboardEnabled(),
-        chatManagerEnabled: opts?.larkAppId ? getBot(opts.larkAppId).config.chatManagerEnabled === true : false,
+        chatManagerEnabled: chatManagerEnabledForApp(opts?.larkAppId),
         excludeRoutingCovered: true,
       });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);

@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { existsSync, readFileSync as nodeReadFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { withFileLockSync } from '../src/utils/file-lock.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -26,7 +25,7 @@ describe('pid marker reentrancy + capability persistence', () => {
     Object.assign(scope, {
       heldPidMarkerPaths: new Set<string>(),
       // node/path primitives
-      existsSync, readFileSync: nodeReadFileSync, basename,
+      existsSync, readFileSync, basename,
       readProcessStartIdentity: () => undefined,
       withFileLockSync,
       atomicWriteFileSync,
