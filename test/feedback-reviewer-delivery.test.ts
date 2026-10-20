@@ -158,6 +158,74 @@ describe('materializeFeedbackPolicyForDelivery', () => {
     expect(cached.map).toEqual({});
   });
 
+  it('does not evict another chat\'s last-known-good ids on a clean pass', async () => {
+    // The cache is APP-scoped while each delivery only knows ITS OWN reviewer
+    // list. A healthy send in chat B must not prune chat A's cached ids: chat
+    // A's next transient would then look like a cold cache and silently lose
+    // the control this cache exists to keep.
+    await materializeFeedbackPolicyForDelivery({
+      policy: reviewers(['a@example.com']),
+      larkAppId: appId, dataDir,
+      resolveAllowedUsersWithMap: resolver({
+        map: new Map([['a@example.com', 'ou_a']]),
+        entryStatus: new Map([['a@example.com', 'resolved']]),
+      }),
+    });
+    await materializeFeedbackPolicyForDelivery({
+      policy: reviewers(['b@example.com']),
+      larkAppId: appId, dataDir,
+      resolveAllowedUsersWithMap: resolver({
+        map: new Map([['b@example.com', 'ou_b']]),
+        entryStatus: new Map([['b@example.com', 'resolved']]),
+      }),
+    });
+    const out = await materializeFeedbackPolicyForDelivery({
+      policy: reviewers(['a@example.com']),
+      larkAppId: appId, dataDir,
+      resolveAllowedUsersWithMap: resolver({
+        map: new Map(),
+        errored: true,
+        entryStatus: new Map([['a@example.com', 'transient']]),
+      }),
+    });
+    expect(out?.reviewers).toEqual(['ou_a']);
+  });
+
+  it('prunes a definitively-gone id even on a DEGRADED pass (mixed batch)', async () => {
+    // One email definitively gone, another transient → the pass is degraded.
+    // The definitive verdict is still a verdict: dropping it from the cache
+    // now is what stops a LATER all-transient pass from reviving a reviewer
+    // the API already reported gone.
+    await materializeFeedbackPolicyForDelivery({
+      policy: reviewers(['gone@example.com', 'blip@example.com']),
+      larkAppId: appId, dataDir,
+      resolveAllowedUsersWithMap: resolver({
+        map: new Map([['gone@example.com', 'ou_dead'], ['blip@example.com', 'ou_ok']]),
+        entryStatus: new Map([['gone@example.com', 'resolved'], ['blip@example.com', 'resolved']]),
+      }),
+    });
+    const mixed = await materializeFeedbackPolicyForDelivery({
+      policy: reviewers(['gone@example.com', 'blip@example.com']),
+      larkAppId: appId, dataDir,
+      resolveAllowedUsersWithMap: resolver({
+        map: new Map(),
+        errored: true,
+        entryStatus: new Map([['gone@example.com', 'definitive'], ['blip@example.com', 'transient']]),
+      }),
+    });
+    expect(mixed?.reviewers).toEqual(['ou_ok']);
+    const later = await materializeFeedbackPolicyForDelivery({
+      policy: reviewers(['gone@example.com', 'blip@example.com']),
+      larkAppId: appId, dataDir,
+      resolveAllowedUsersWithMap: resolver({
+        map: new Map(),
+        errored: true,
+        entryStatus: new Map([['gone@example.com', 'transient'], ['blip@example.com', 'transient']]),
+      }),
+    });
+    expect(later?.reviewers).toEqual(['ou_ok']);
+  });
+
   it('keeps literal ou_/on_ reviewers working through a full email-batch failure', async () => {
     const out = await materializeFeedbackPolicyForDelivery({
       policy: reviewers(['ou_literal', 'on_union']),

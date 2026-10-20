@@ -85,18 +85,31 @@ export async function materializeFeedbackPolicyForDelivery(input: {
       );
     }
     // Partial healthy resolutions are still worth caching, but a degraded pass
-    // never prunes or marks entries definitive — the API never gave a verdict.
-    if (outcome.freshMap.size > 0) {
-      writeFeedbackReviewersCache(dataDir, larkAppId, { map: outcome.freshMap });
+    // never PRUNES and never marks unknown entries definitive — for those the
+    // API gave no verdict. A DEFINITIVE verdict, however, is still a verdict on
+    // a degraded pass (a mixed batch: one email omitted from a code-0 response,
+    // another entry's GET timed out): drop those cached ids now, otherwise a
+    // later all-transient pass would revive a reviewer the API already
+    // reported gone.
+    if (outcome.freshMap.size > 0 || outcome.definitiveEntries.length > 0) {
+      writeFeedbackReviewersCache(dataDir, larkAppId, {
+        map: outcome.freshMap,
+        deleteEntries: outcome.definitiveEntries,
+      });
     }
   } else {
-    // Clean pass: write healthy mappings through and prune the cache to the
-    // current reviewer emails minus entries proven definitively gone, so a
-    // later blip cannot revive a removed reviewer.
+    // Clean pass: write healthy mappings through and drop entries proven
+    // definitively gone, so a later blip cannot revive a removed reviewer.
+    // Deliberately NO retainKeys: this cache is app-scoped while `pending` is
+    // only THIS delivery's reviewer list, so pruning to it would evict the
+    // last-known-good ids of every other chat/team on the same bot — their next
+    // transient would then look like a cold cache and lose the control the
+    // cache exists to protect. A key left over from an entry removed from
+    // config is harmless: recovery only ever reads keys that are in the current
+    // config and transient THIS pass.
     writeFeedbackReviewersCache(dataDir, larkAppId, {
       map: outcome.freshMap,
       deleteEntries: outcome.definitiveEntries,
-      retainKeys: pending,
     });
   }
 
