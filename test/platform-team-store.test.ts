@@ -154,4 +154,36 @@ describe('applyPlatformTeamSync', () => {
     expect(resolvePlatformTeamBotOwner(dataDir, 'cli_target', 'on_unowned')).toEqual({ status: 'missing' });
   });
 
+  it('never accepts an owner from a team the target bot does not belong to', () => {
+    // The source bot + owner pair is fully consistent inside "foreign", but
+    // cli_target is only in "home". The same-team gate must keep a roster
+    // entry scoped to another team from minting an owner for cli_target.
+    applyPlatformTeamSync(dataDir, payload('rev1', [
+      team('foreign', ['oc_f'], [
+        { appId: 'cli_source', unionId: 'on_source_bot', ownerUnionId: 'on_sourceowner' },
+      ], ['on_sourceowner']),
+      team('home', ['oc_h'], [
+        { appId: 'cli_target', unionId: 'on_target' },
+      ], []),
+    ]));
+    expect(resolvePlatformTeamBotOwner(dataDir, 'cli_target', 'on_source_bot')).toEqual({ status: 'missing' });
+  });
+
+  it('rejects non-canonical target appId and source bot unionId prefixes', () => {
+    // sanitizeTeam accepts arbitrary non-empty appId/unionId strings, so the
+    // cli_ / on_ prefix gates inside the resolver are what keep such roster
+    // rows from producing an owner attribution.
+    applyPlatformTeamSync(dataDir, payload('rev1', [
+      team('foreign-app', ['oc_fa'], [
+        { appId: 'weird-app', unionId: 'on_source_bot', ownerUnionId: 'on_ownerfa' },
+      ], ['on_ownerfa']),
+      team('home', ['oc_h'], [
+        { appId: 'cli_target', unionId: 'on_target' },
+        { appId: 'cli_source', unionId: 'weird-bot-union', ownerUnionId: 'on_ownerh' },
+      ], ['on_ownerh']),
+    ]));
+    expect(resolvePlatformTeamBotOwner(dataDir, 'weird-app', 'on_source_bot')).toEqual({ status: 'missing' });
+    expect(resolvePlatformTeamBotOwner(dataDir, 'cli_target', 'weird-bot-union')).toEqual({ status: 'missing' });
+  });
+
 });

@@ -883,10 +883,14 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // one silently degrades to "unknown" exactly where a bot could slip through.
     expect(daemonSource).toContain('senderIsBot?: boolean,');
     expect(daemonSource).toContain("senderType: senderIsBot ? 'bot' as const : 'user' as const");
-    // Pin the SEMANTICS, not the argument's spelling: every call must pass a
-    // non-empty 4th argument, and it must be the tri-state helper rather than a
-    // bare `sender_type` comparison — that one reads a cross-ref-identified peer
-    // bot as `'user'`, i.e. it vouches for a bot turn as a person.
+    // Pin the SEMANTICS per call site, not with a whole-file count: every IM
+    // entry must pass a non-empty 4th argument, and it can never be a boolean
+    // literal (literal `false` vouches a cross-ref peer bot as a person). The
+    // queue and ask sites forward a previously computed tri-state local
+    // (senderIsBot / byType); the three inline sites must each name the
+    // tri-state helper and the foreign-bot leg themselves. A global
+    // `>= 3` count is satisfied by unrelated buildTurnParticipants windows
+    // and misses a single downgraded entry.
     const trustedCallerArgs = [...daemonSource.matchAll(/const\s+\w+\s*=\s*(?:await\s+)?trustedCallerForInboundTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
     expect(trustedCallerArgs.length).toBe(5);
@@ -894,10 +898,21 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
       expect(senderTypeArg).not.toBe('');
+      expect(senderTypeArg).not.toBe('false');
+      expect(senderTypeArg).not.toBe('true');
       expect(senderTypeArg).not.toMatch(/^isBotSenderType\)?$/);
     }
-    expect(daemonSource.match(/senderIsBotTriState\(parsed\.senderType, isForeignBot(?:Sender)?\)/g)?.length)
-      .toBeGreaterThanOrEqual(3);
+    // Exactly the three inline entries (new topic, principal-lane proposer,
+    // thread reply); assert EACH site individually so downgrading one to a
+    // literal or a bare sender_type comparison goes red.
+    const inlineTriStateSites = trustedCallerArgs
+      .map(args => args.slice(3).join(', '))
+      .filter(arg => arg.startsWith('senderIsBotTriState('));
+    expect(inlineTriStateSites.length).toBe(3);
+    for (const senderTypeArg of inlineTriStateSites) {
+      expect(senderTypeArg).toContain('parsed.senderType');
+      expect(senderTypeArg).toMatch(/isForeignBot(?:Sender)?/);
+    }
     // Dispatch launch is not an IM event on the target app: its same-host HMAC
     // authenticated and policy-allowlisted source daemon attests the human
     // caller union_id, while the immediate trigger is known to be that bot.

@@ -541,11 +541,16 @@ function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | und
       || botOwner === null || (botOwner !== undefined && caller.senderType !== 'bot')) {
       return undefined;
     }
+    // botOwner is host-attested: the daemon mints it only for an outbound turn
+    // command after roster + Contact API verification. A provider reporting it
+    // back inside recoveredTurn cannot be the source of truth, so the field is
+    // validated above (malformed shapes still reject the event) but never
+    // carried into the recovered caller. The next outbound turn command sends a
+    // freshly attested owner; host-side authorization never reads the field.
     trustedCaller = {
       requestUserOpenId: openId,
       requestLarkAppId: appId,
       senderType: caller.senderType as 'user' | 'bot',
-      ...(botOwner ? { botOwner } : {}),
     };
   }
   return {
