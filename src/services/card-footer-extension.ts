@@ -15,7 +15,8 @@
  * 每段收成单行、去控制字符、截断到 MAX_SEGMENT_CHARS；最多 MAX_SEGMENTS 段。
  * markdown 转义在渲染端做（md-card），这里只保证是短的纯文本。
  */
-import { execFile } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
 
 export interface CardFooterExtensionConfig {
   /** 交给 `/bin/sh -c` 执行的命令。 */
@@ -82,22 +83,94 @@ export type CardFooterExtensionRunner = (
   env: NodeJS.ProcessEnv,
 ) => Promise<string>;
 
-/** 默认执行器：`/bin/sh -c`，关 stdin、限时、限输出；非 0 退出视为失败。 */
+/** stdio 管道运行时是 Socket：解引用读端，避免在跑的命令吊住进程正常退出。
+ * 类型层面是 Readable（无 unref），按可选方法调用即可。 */
+function unrefStream(stream: Readable | Writable | null): void {
+  try {
+    (stream as ((Readable | Writable) & { unref?: () => void }) | null)?.unref?.();
+  } catch { /* 非 Socket 形态：无需处理 */ }
+}
+
+/**
+ * 默认执行器：`/bin/sh -c`，关 stdin、限时、限输出；非 0 退出视为失败。
+ *
+ * 必须用 spawn（不是 execFile）起独立进程组：execFile 的 timeout / maxBuffer
+ * 只把信号发给直接子进程 sh，sh fork 出去的命令（查网关时挂起的 curl 等）会
+ * 成孤儿常驻——已在 node 与 bun 下用真实函数实证三种命令形态都残留。
+ *
+ * 超时 / 超限杀整个进程组，且**立即结算**、destroy 自己的管道读端，不等
+ * stdio `'close'`：命令若 setsid / 双 fork 逃出进程组，组 kill 打不到它，
+ * 而它仍继承着管道写端，等 close 会让这次刷新永久挂起。范式见
+ * core/update-check.ts 的 spawnNpmConfigRegistry。
+ */
 export const runCardFooterExtensionCommand: CardFooterExtensionRunner = (command, env) =>
   new Promise((resolve, reject) => {
-    const child = execFile('/bin/sh', ['-c', command], {
-      env,
-      timeout: COMMAND_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-      maxBuffer: MAX_OUTPUT_BYTES,
-      encoding: 'utf8',
-      windowsHide: true,
-    }, (error, stdout) => {
+    let settled = false;
+    let stdout = '';
+    let child: ChildProcess;
+    let timer: NodeJS.Timeout | undefined;
+
+    const killGroup = () => {
+      if (child.pid === undefined) return;
+      try {
+        if (process.platform === 'win32') {
+          spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+        } else {
+          process.kill(-child.pid, 'SIGKILL');
+        }
+      } catch { /* 已退出，或命令 setsid 逃出了本进程组 */ }
+    };
+
+    const finish = (error: Error | null, output?: string) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      // 释放读端：逃出进程组的孙进程可能仍持有写端，不 destroy 会吊住 event loop。
+      try { child.stdout?.destroy(); } catch { /* already closed */ }
+      try { child.stderr?.destroy(); } catch { /* already closed */ }
       if (error) reject(error);
-      else resolve(stdout);
+      else resolve(output ?? '');
+    };
+
+    try {
+      child = spawn('/bin/sh', ['-c', command], {
+        env,
+        // POSIX 下让 sh 当新进程组 leader，超时才能连它的后代一起杀。
+        detached: process.platform !== 'win32',
+        // stdin 直接 ignore：不主动 end 的话，读 stdin 的命令会一直挂到超时。
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    // 在跑的命令不吊住 daemon 正常退出：只 unref child 不够，piped 读端也要解引用。
+    child.unref();
+    unrefStream(child.stdout);
+    unrefStream(child.stderr);
+
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => {
+      stdout += chunk;
+      if (Buffer.byteLength(stdout, 'utf8') > MAX_OUTPUT_BYTES) {
+        killGroup();
+        finish(new Error('cardFooterExtension output exceeded the size limit'));
+      }
     });
-    // 不关 stdin 的话，读 stdin 的命令会一直挂到超时。
-    child.stdin?.end();
+    child.stderr?.resume();
+    child.on('error', (error) => finish(error));
+    // 从 exit 结算（不等 close）：setsid 逃逸者持管时 close 可能永远不来。
+    child.on('exit', (code, signal) => {
+      if (code === 0) finish(null, stdout);
+      else finish(new Error(`cardFooterExtension command exited with ${code ?? signal}`));
+    });
+
+    timer = setTimeout(() => {
+      killGroup();
+      finish(new Error('cardFooterExtension command timed out'));
+    }, COMMAND_TIMEOUT_MS);
+    timer.unref();
   });
 
 interface CacheEntry {

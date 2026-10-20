@@ -2,7 +2,8 @@
  * card-footer-extension — bots.json `cardFooterExtension`：配置校验、输出解析、
  * 按 bot 缓存的后台刷新（不阻塞、失败沿用、陈旧隐藏），以及卡片渲染与 IPC 规范化。
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
 
 import {
   __testOnly_cardFooterExtensionCache,
@@ -13,7 +14,7 @@ import {
   STALE_MS,
   type CardFooterExtensionRunner,
 } from '../src/services/card-footer-extension.js';
-import { cardUsageFooterSegment } from '../src/im/lark/md-card.js';
+import { cardUsageFooterSegment, buildReplyCardFooter } from '../src/im/lark/md-card.js';
 import { normalizeCardUsageSnapshot } from '../src/cli/card-usage-normalize.js';
 
 const cache = __testOnly_cardFooterExtensionCache();
@@ -47,6 +48,11 @@ describe('parseCardFooterExtensionOutput', () => {
     const [long] = parseCardFooterExtensionOutput('x'.repeat(100));
     expect([...long].length).toBe(40);
     expect(long.endsWith('…')).toBe(true);
+  });
+
+  it('collapses runs of regular spaces, NBSP and ideographic space into one', () => {
+    // 控制符替换只吃 C0/DEL；连续普通空格、U+00A0、U+3000 靠空白折叠归一，两者不能互省。
+    expect(parseCardFooterExtensionOutput('a  b 　c')).toEqual(['a b c']);
   });
 });
 
@@ -94,9 +100,47 @@ describe('getCardFooterExtensionSegments', () => {
     expect(getCardFooterExtensionSegments(ctx, { command: 'two' }, { runner })).toBeUndefined();
     expect(getCardFooterExtensionSegments(ctx, undefined)).toBeUndefined();
   });
+
+  it('a successful refresh with no usable segments replaces (does not keep) the last result', async () => {
+    // 用真实时钟：第二次刷新的 okAt 是真实 now，假时钟会让 STALE_MS 判定把「清掉」和「陈旧」混在一起。
+    let call = 0;
+    const runner: CardFooterExtensionRunner = async () => (call++ === 0 ? 'keep me' : '  \n ');
+    const ext = { command: 'q', refreshSeconds: 10 };
+    const t0 = Date.now();
+    getCardFooterExtensionSegments(ctx, ext, { runner, now: t0 });
+    await cache.pending(ctx.larkAppId);
+    expect(getCardFooterExtensionSegments(ctx, ext, { now: t0 + 1_000 })).toEqual(['keep me']);
+    getCardFooterExtensionSegments(ctx, ext, { runner, now: t0 + 11_000 });
+    await cache.pending(ctx.larkAppId);
+    // 刚成功、绝不陈旧；这里只能是「空成功清掉了上次结果」。
+    expect(getCardFooterExtensionSegments(ctx, ext)).toBeUndefined();
+  });
 });
 
+const isPosix = process.platform !== 'win32';
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/** pgrep -f <marker> 的输出；无匹配时 pgrep 退出码 1，按「无残留」处理。 */
+function procsMatching(marker: string): string {
+  try {
+    return execFileSync('pgrep', ['-f', marker], { encoding: 'utf8' }).trim();
+  } catch { return ''; }
+}
+
+function killMarker(marker: string): void {
+  try { execFileSync('pkill', ['-9', '-f', marker], { stdio: 'ignore' }); } catch { /* 无残留 */ }
+}
+
+const hasSetsid = isPosix && (() => {
+  try { execFileSync('sh', ['-c', 'command -v setsid'], { stdio: 'ignore' }); return true; }
+  catch { return false; }
+})();
+
 describe('runCardFooterExtensionCommand', () => {
+  // 真实进程测试：每个命令带唯一标记，结束后兜底清理，绝不在机器上留 sleep / yes。
+  const markers: string[] = [];
+  afterEach(() => { for (const marker of markers.splice(0)) killMarker(marker); });
+
   it('runs through /bin/sh with stdin closed', async () => {
     expect(await runCardFooterExtensionCommand('cat; echo "$BOTMUX_LARK_APP_ID"', { PATH: process.env.PATH, BOTMUX_LARK_APP_ID: 'cli_x' }))
       .toBe('cli_x\n');
@@ -105,6 +149,52 @@ describe('runCardFooterExtensionCommand', () => {
   it('rejects on a non-zero exit', async () => {
     await expect(runCardFooterExtensionCommand('echo partial; exit 3', { PATH: process.env.PATH })).rejects.toThrow();
   });
+
+  it.skipIf(!isPosix)('kills the whole process group on timeout, leaving no orphan grandchildren', async () => {
+    // 三种形态都查：单命令、分号后续命令、管道——旧 execFile 实现里 sh 被杀而 sleep 全部残留。
+    const forms: Array<[string, string]> = [
+      ['sleep 47101', 'sleep 47101'],
+      ['sleep 47102; true', 'sleep 47102'],
+      ['sleep 47103 | cat', 'sleep 47103'],
+    ];
+    for (const [command, marker] of forms) {
+      markers.push(marker);
+      const startedAt = Date.now();
+      await expect(runCardFooterExtensionCommand(command, { PATH: process.env.PATH })).rejects.toThrow(/timed out/);
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+      await sleep(400);
+      expect(procsMatching(marker), `orphan survived timeout: ${marker}`).toBe('');
+    }
+  }, 20_000);
+
+  it.skipIf(!isPosix)('kills the whole process group when output exceeds the size limit', async () => {
+    const marker = 'botmux-cfe-buffer-47104';
+    markers.push(marker);
+    await expect(runCardFooterExtensionCommand(`yes ${marker}`, { PATH: process.env.PATH }))
+      .rejects.toThrow(/size limit/);
+    await sleep(400);
+    expect(procsMatching(marker), 'orphan survived maxBuffer kill').toBe('');
+  }, 10_000);
+
+  it.skipIf(!hasSetsid)('settles on timeout even when the command escapes the process group via setsid', async () => {
+    // 逃逸者（新会话里的 sleep）杀不到也不持有结算：Promise 必须按时 reject，不能等 stdio close。
+    const marker = 'sleep 47105';
+    markers.push(marker);
+    const startedAt = Date.now();
+    await expect(runCardFooterExtensionCommand(`setsid sh -c '${marker}'`, { PATH: process.env.PATH }))
+      .rejects.toThrow(/timed out|exited with/);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  }, 10_000);
+
+  it.skipIf(!hasSetsid)('resolves from exit without waiting for a setsid escapee holding the stdout pipe', async () => {
+    // sh 立刻退出 0，但 setsid 孙进程仍持有 stdout 写端：从 close 结算会挂到孙进程结束。
+    const marker = 'sleep 47106';
+    markers.push(marker);
+    const startedAt = Date.now();
+    await expect(runCardFooterExtensionCommand(`setsid sh -c 'exec ${marker}' & echo done`, { PATH: process.env.PATH }))
+      .resolves.toBe('done\n');
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+  }, 10_000);
 });
 
 describe('extension segments on the card', () => {
@@ -118,5 +208,18 @@ describe('extension segments on the card', () => {
     expect(normalizeCardUsageSnapshot({ context: null, tokens: null, extensionSegments: ['ok', '', 5, 'x'.repeat(41)] }))
       .toEqual({ context: null, tokens: null, extensionSegments: ['ok'] });
     expect(normalizeCardUsageSnapshot({ context: null, tokens: null })).toEqual({ context: null, tokens: null });
+  });
+
+  it('follow the reply-footer usage switch: shown by default, hidden with replyFooterUsage=false', () => {
+    // 扩展段是用量行的一部分：新页脚策略关掉用量时必须随之隐藏，缺省策略保持显示。
+    const usage = { context: null, tokens: null, extensionSegments: ['01 5h 1%'] };
+    const shown = buildReplyCardFooter({ brand: '', usage, locale: 'zh' });
+    expect(shown?.content).toContain('01 5h 1%');
+    const hidden = buildReplyCardFooter({
+      brand: '', usage, locale: 'zh',
+      presentation: { footerPreferences: { replyFooterUsage: false } },
+    });
+    // 页脚只剩扩展段一个内容源：用量关掉后整段页脚都不存在。
+    expect(hidden).toBeNull();
   });
 });

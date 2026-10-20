@@ -77,7 +77,7 @@ You can append your own text to the usage line (`ctx 23% · 5h 18% · 7d 5%`), e
 }
 ```
 
-- The daemon runs `/bin/sh -c <command>` in the background every `refreshSeconds` (default 60, range 10–3600); all of the bot's sessions share one result. Rendering a card only reads the cache and never waits for the command
+- The daemon runs `/bin/sh -c <command>` lazily, only while cards are being rendered: when the cached result is at least `refreshSeconds` old (default 60, range 10–3600) a refresh starts in the background. There is no standalone timer, so no command runs while the bot sends no cards, and the first card after a long idle period may still show the previous result for up to 10 minutes; all of the bot's sessions share one result. Rendering a card only reads the cache and never waits for the command
 - Output one segment per line, or JSON `{"segments": ["…", "…"]}`; at most 4 segments of at most 40 characters each, rendered as plain text (markdown is escaped)
 - The environment carries `BOTMUX_LARK_APP_ID`, `BOTMUX_CLI_ID` and `BOTMUX_BOT_NAME`; stdin is closed, the timeout is 3 seconds, and a non-zero exit counts as a failure
 - On failure or timeout the last good result is kept; once the last success is older than 10 minutes nothing is shown

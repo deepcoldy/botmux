@@ -240,7 +240,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 |------|------|
 | `brandLabel` | 卡片底部品牌文案（仅在最终回答与顶层广播卡片中展示）。`undefined`=默认 `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。另受机器级总开关 `dashboard.cardBrandLabel` 约束（Dashboard「设置 → 飞书卡片」，缺省开）：关闭后所有 Bot 一律不显示页脚签名，本字段在 Bot 配置页置灰。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
-| `cardFooterExtension` | 在卡片用量段末尾追加自定义文本。`{"command": "<shell 命令>", "refreshSeconds": 60}`：daemon 按 bot 定时执行命令（同一 bot 的会话共用结果），输出接在用量后面，显示位置跟随 `usageDisplay`。详见 [卡片用量段自定义扩展](/cards#卡片用量段自定义扩展) |
+| `cardFooterExtension` | 在卡片用量段末尾追加自定义文本。`{"command": "<shell 命令>", "refreshSeconds": 60}`：daemon 在卡片渲染时按 bot 懒执行命令（缓存到刷新间隔才在后台跑，同一 bot 的会话共用结果），输出接在用量后面，显示位置跟随 `usageDisplay`。详见 [卡片用量段自定义扩展](/cards#卡片用量段自定义扩展) |
 | `modelBackendVariant` 显示 | 已冻结的 TraeX 后端变体只显示在实时流式 session 卡片的运行时标识中；回复卡片页脚只显示 Context / Token 用量，不展示该变体 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
 | `hiddenStreamingCardButtons` | 隐藏实时流式卡片中的指定主按钮。可选值：`output`（同时隐藏导出文字、截图刷新）、`terminal`、`writeLink`、`compact`、`stop`、`close`（接管会话中对应“断开”）。缺省或空数组显示全部，例如 `["terminal", "writeLink", "close"]`。也可用 `/botconfig set hiddenStreamingCardButtons terminal,writeLink,close` 热更新，`unset` 恢复全部 |
