@@ -20,6 +20,7 @@ import {
   codebaseCompanionOf,
   prepareTriggerUserCliEnv,
   identityWrapperInstalled,
+  IDENTITY_ENV_KEYS,
 } from '../src/core/cli-identity.js';
 
 const SESSION = 'sess-cb';
@@ -66,7 +67,12 @@ describe('companion publication', () => {
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'codebase'))).toBe(false);
   });
 
-  it('identityToolsFor adds codebase only when bytedcli is governed', () => {
+  it('the companion exports exactly the variable the Codebase CLI reads (`codebase auth login --help`: CODEBASE_CLI_USER_JWT)', () => {
+    expect(IDENTITY_ENV_KEYS.codebase).toEqual(['CODEBASE_CLI_USER_JWT']);
+  });
+
+  it('identityToolsFor adds codebase only when bytedcli is governed, without duplicates', () => {
+    expect(identityToolsFor(['bytedcli', 'bytedcli'])).toEqual(['bytedcli', 'codebase']);
     expect(identityToolsFor(['lark-cli'])).toEqual(['lark-cli']);
     expect(identityToolsFor(['bytedcli'])).toEqual(['bytedcli', 'codebase']);
     expect(identityToolsFor(['lark-cli', 'bytedcli'])).toEqual(['lark-cli', 'bytedcli', 'codebase']);

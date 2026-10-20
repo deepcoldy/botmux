@@ -210,7 +210,9 @@ export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
 
 /** The identity tools a policy actually governs (policy tools + companions). */
 export function identityToolsFor(tools: readonly TriggerUserAuthTool[]): IdentityTool[] {
-  return tools.includes('bytedcli') ? [...tools, CODEBASE_COMPANION_TOOL] : [...tools];
+  const out = new Set<IdentityTool>(tools);
+  if (out.has('bytedcli')) out.add(CODEBASE_COMPANION_TOOL);
+  return [...out];
 }
 
 /** Common to every variant: the turn these credentials were published FOR.
@@ -400,15 +402,27 @@ export function writeSessionIdentity(
   atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
   // Companion: every bytedcli publication (grant OR refusal) is mirrored for
   // the Codebase CLI, so the two can never disagree about whose turn it is.
+  // Two files cannot be committed atomically; if the mirror fails, take the
+  // bytedcli file down with it rather than leave a granted bytedcli next to a
+  // stale codebase identity (an absent file is a refusal for both wrappers).
   if (identity.tool === 'bytedcli') {
     const companion = codebaseCompanionOf(identity);
-    atomicWriteFileSync(
-      sessionIdentityPath(sessionDataDir, sessionId, companion.tool),
-      renderIdentityEnv(companion),
-      { mode: 0o600 },
-    );
+    try {
+      atomicWriteFileSync(
+        sessionIdentityPath(sessionDataDir, sessionId, companion.tool),
+        renderIdentityEnv(companion),
+        { mode: 0o600 },
+      );
+    } catch (e) {
+      try { rmSync(path, { force: true }); } catch { /* best-effort */ }
+      throw e;
+    }
   }
   return path;
+}
+
+function isDeniedIdentity(identity: CliIdentity): identity is DeniedIdentity {
+  return 'mode' in identity && identity.mode === 'denied';
 }
 
 /** The codebase identity implied by a bytedcli one. A bytedcli grant without a
@@ -416,8 +430,7 @@ export function writeSessionIdentity(
  *  it fall back to the machine's own Codebase login. */
 export function codebaseCompanionOf(identity: BytedCliIdentity | DeniedIdentity): CodebaseCliIdentity | DeniedIdentity {
   const turn = identity.turnId ? { turnId: identity.turnId } : {};
-  // A BytedCliIdentity has no `mode` at all, so `in` alone narrows.
-  if ('mode' in identity) {
+  if (isDeniedIdentity(identity)) {
     return { tool: CODEBASE_COMPANION_TOOL, mode: 'denied', message: identity.message, ...turn };
   }
   if (!identity.codeJwt) {
